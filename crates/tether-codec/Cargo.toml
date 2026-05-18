@@ -5,3 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Codec trait + ffmpeg-backed encoders/decoders (H.264 first, HEVC and AV1 planned)."
+
+[lints]
+workspace = true

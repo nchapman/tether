@@ -5,3 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Transport trait + quinn (QUIC) implementation for Tether."
+
+[lints]
+workspace = true

@@ -8,5 +8,10 @@ description = "Wire protocol, message types, and timing structs for Tether."
 
 [dependencies]
 serde = { workspace = true }
-bincode = { version = "2", features = ["serde"] }
+# Pinned to a specific version: bincode 3.0 just released and we haven't
+# vetted the API changes. Revisit when we're ready to migrate.
+bincode = { version = "=2.0.1", features = ["serde"] }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

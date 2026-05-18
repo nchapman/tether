@@ -47,7 +47,8 @@ impl MonoNanos {
         use std::time::Instant;
         static PROCESS_START: OnceLock<Instant> = OnceLock::new();
         let start = PROCESS_START.get_or_init(Instant::now);
-        Self(Instant::now().duration_since(*start).as_nanos() as u64)
+        let nanos = Instant::now().duration_since(*start).as_nanos();
+        Self(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 
     pub fn saturating_sub(self, other: Self) -> u64 {
@@ -63,6 +64,12 @@ pub enum CodecError {
     Decode(#[from] bincode::error::DecodeError),
 }
 
+// bincode (over postcard / rkyv / prost) because: we control both endpoints
+// and ship them together, so schema evolution via protobuf-style tags isn't
+// worth the verbosity; varint encoding keeps the per-frame header compact;
+// and the serde adapter lets us keep #[derive(Serialize, Deserialize)] on
+// every protocol type so the same definitions can flow into telemetry JSON
+// or debug printing without a parallel set of derives.
 fn bincode_config() -> impl bincode::config::Config {
     bincode::config::standard()
 }
@@ -71,6 +78,11 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     Ok(bincode::serde::encode_to_vec(value, bincode_config())?)
 }
 
+// TODO(security): decode of untrusted input can allocate large Vec<u8> from
+// a forged length prefix. Transport caps incoming datagrams at the network
+// boundary, which mitigates this, but defense in depth says the decoder
+// should also refuse oversize payloads. Wire bincode's Limit config or wrap
+// here once the transport is in place and we can measure realistic sizes.
 pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> {
     let (value, _) = bincode::serde::decode_from_slice(bytes, bincode_config())?;
     Ok(value)
@@ -209,7 +221,7 @@ mod tests {
         // Stress test: max-valued numeric fields + a realistic input echo +
         // payload sized so the whole packet stays under the datagram budget.
         let p = VideoPacket::First {
-            stream_epoch: u8::MAX,
+            stream_epoch: u16::MAX,
             frame_seq: u32::MAX,
             fragment_count: u16::MAX,
             meta: VideoFrameMeta {
@@ -240,9 +252,9 @@ mod tests {
     fn continuation_video_packet_fits_in_datagram() {
         // Even with max-valued numeric fields (worst case for varint
         // expansion), a continuation packet must fit in the datagram budget.
-        // ~13 bytes of header overhead in the worst case for this variant.
+        // ~14 bytes of header overhead in the worst case for this variant.
         let p = VideoPacket::Continuation {
-            stream_epoch: u8::MAX,
+            stream_epoch: u16::MAX,
             frame_seq: u32::MAX,
             fragment_index: u16::MAX,
             payload: vec![0; 1180],

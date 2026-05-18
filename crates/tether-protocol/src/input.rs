@@ -11,6 +11,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HidUsage(pub u32);
 
+/// Modifier-key state at the time the event was captured.
+///
+/// Sent on every key event (rather than inferred from key down/up of
+/// modifier keys) so the host doesn't have to reconstruct modifier state
+/// from the event stream. Belt-and-braces against dropped reorders on the
+/// input stream and against the client's modifier state diverging from the
+/// host's after a focus change or hotkey escape.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Modifiers {
     pub shift: bool,
@@ -41,8 +48,12 @@ pub enum InputEventKind {
     KeyDown { key: HidUsage, modifiers: Modifiers },
     KeyUp { key: HidUsage, modifiers: Modifiers },
     /// Absolute mouse position normalised to `[0.0, 1.0]` along each axis of
-    /// the client's rendered video surface. The host scales to its own
-    /// display resolution before injection.
+    /// the client's rendered video surface (the area showing host pixels,
+    /// excluding any letterbox bars introduced by an aspect-ratio mismatch
+    /// between the client window and the host display). The host scales
+    /// these normalised coordinates to its own display resolution before
+    /// injection. Clients must clamp to `[0.0, 1.0]` and suppress events
+    /// whose pointer falls outside the video region.
     MousePosition { x: f32, y: f32 },
     MouseButton { button: MouseButton, pressed: bool },
     MouseScroll { dx: f32, dy: f32, kind: ScrollKind },

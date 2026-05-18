@@ -33,20 +33,24 @@ pub struct VideoFrameMeta {
 /// A single video datagram. Frames larger than the transport's max datagram
 /// size are sliced into multiple packets sharing `(stream_epoch, frame_seq)`.
 ///
-/// The `stream_epoch` field is bumped by the host whenever the encoder is
-/// restarted (resize, codec switch, HW context loss). Clients drop all
-/// packets from prior epochs.
+/// `stream_epoch` is `u16` (varint-encoded as 1 byte for typical values) so
+/// a long-lived session that restarts the encoder thousands of times can't
+/// collide with prior epochs.
+///
+/// The host bumps `stream_epoch` whenever the encoder is restarted
+/// (resize, codec switch, HW context loss). Clients drop all packets from
+/// prior epochs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoPacket {
     First {
-        stream_epoch: u8,
+        stream_epoch: u16,
         frame_seq: u32,
         fragment_count: u16,
         meta: VideoFrameMeta,
         payload: Vec<u8>,
     },
     Continuation {
-        stream_epoch: u8,
+        stream_epoch: u16,
         frame_seq: u32,
         fragment_index: u16,
         payload: Vec<u8>,

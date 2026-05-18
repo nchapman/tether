@@ -32,6 +32,14 @@ pub struct ClockProbe {
     pub t2_receiver_send: MonoNanos,
 }
 
+/// First message a client sends after the QUIC handshake completes.
+///
+/// **Version policy (v0):** the receiver compares
+/// [`Self::protocol_version`] against the local [`crate::PROTOCOL_VERSION`]
+/// and treats any mismatch as fatal — no negotiation, no minimum-version
+/// fallback. The connection is closed with `Goodbye { reason: "protocol
+/// version mismatch" }`. We can revisit once we have multiple shipped
+/// versions in the wild.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
     pub protocol_version: u32,

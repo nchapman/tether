@@ -2303,6 +2303,12 @@ dependencies = [
 [[package]]
 name = "tether-capture"
 version = "0.0.1"
+dependencies = [
+ "crossbeam-channel",
+ "tether-protocol",
+ "thiserror 2.0.18",
+ "tracing",
+]
 
 [[package]]
 name = "tether-client"

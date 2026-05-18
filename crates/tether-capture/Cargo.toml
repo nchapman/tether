@@ -6,5 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 description = "Screen capture trait + per-platform backends (ScreenCaptureKit on macOS, PipeWire+portal on Linux)."
 
+[dependencies]
+tether-protocol = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+
 [lints]
 workspace = true

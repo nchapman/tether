@@ -1,0 +1,7 @@
+[package]
+name = "tether-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Input event capture (client) and injection (host) for keyboard, mouse, and cursor."

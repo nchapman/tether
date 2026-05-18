@@ -1,0 +1,7 @@
+[package]
+name = "tether-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Screen capture trait + per-platform backends (ScreenCaptureKit on macOS, PipeWire+portal on Linux)."

@@ -2315,6 +2315,10 @@ name = "tether-client"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
+ "tether-protocol",
+ "tether-render",
+ "tether-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2329,6 +2333,9 @@ name = "tether-host"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "tether-capture",
+ "tether-protocol",
+ "tether-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2345,6 +2352,7 @@ dependencies = [
  "bincode",
  "serde",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ serde = { workspace = true }
 # vetted the API changes. Revisit when we're ready to migrate.
 bincode = { version = "=2.0.1", features = ["serde"] }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

@@ -94,7 +94,10 @@ mod tests {
     use crate::control::*;
     use crate::cursor::*;
     use crate::input::*;
-    use crate::video::*;
+    use crate::video::{
+        FrameFragmenter, FrameReassembler, HostFrameTiming, InputEchoBatch, VideoFrameMeta,
+        VideoPacket, CONTINUATION_PAYLOAD_BUDGET, FIRST_PAYLOAD_BUDGET,
+    };
 
     #[test]
     fn mono_nanos_monotonic() {
@@ -250,6 +253,103 @@ mod tests {
             bytes.len(),
             MAX_DATAGRAM_PAYLOAD
         );
+    }
+
+    #[test]
+    fn fragment_then_reassemble_round_trips() {
+        let body: Vec<u8> = (0..10_000u32).map(|i| (i & 0xFF) as u8).collect();
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: true,
+            input_echo: InputEchoBatch::default(),
+        };
+
+        let mut fragmenter = FrameFragmenter::new(0);
+        let packets = fragmenter.fragment(meta.clone(), &body);
+
+        // First fragment carries FIRST_PAYLOAD_BUDGET, remainder split into
+        // CONTINUATION_PAYLOAD_BUDGET chunks.
+        let expected_count = 1
+            + body
+                .len()
+                .saturating_sub(FIRST_PAYLOAD_BUDGET)
+                .div_ceil(CONTINUATION_PAYLOAD_BUDGET);
+        assert_eq!(packets.len(), expected_count);
+
+        // Encode every packet to wire and back to simulate the network
+        // boundary, then reassemble.
+        let mut reassembler = FrameReassembler::new();
+        let mut got = None;
+        for p in packets {
+            let bytes = encode(&p).unwrap();
+            assert!(bytes.len() <= MAX_DATAGRAM_PAYLOAD);
+            let p2: VideoPacket = decode(&bytes).unwrap();
+            if let Some(frame) = reassembler.handle(p2) {
+                got = Some(frame);
+            }
+        }
+        let frame = got.expect("reassembled frame");
+        assert_eq!(frame.body, body);
+        assert_eq!(frame.frame_seq, 0);
+        assert_eq!(frame.display, 0);
+        assert!(frame.meta.keyframe);
+    }
+
+    #[test]
+    fn reassembler_handles_out_of_order_fragments() {
+        let body: Vec<u8> = (0..5_000u32).map(|i| (i & 0xFF) as u8).collect();
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+        };
+        let mut fragmenter = FrameFragmenter::new(2);
+        let mut packets = fragmenter.fragment(meta, &body);
+        // Reverse the order — reassembler should still produce the frame.
+        packets.reverse();
+
+        let mut reassembler = FrameReassembler::new();
+        let mut got = None;
+        for p in packets {
+            if let Some(frame) = reassembler.handle(p) {
+                got = Some(frame);
+            }
+        }
+        let frame = got.expect("reassembled out-of-order frame");
+        assert_eq!(frame.body, body);
+        assert_eq!(frame.display, 2);
+    }
+
+    #[test]
+    fn reassembler_drops_stale_fragments() {
+        let mut fragmenter = FrameFragmenter::new(0);
+        let mut reassembler = FrameReassembler::new().with_max_age(1);
+
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+        };
+
+        // Advance latest_seq on the reassembler to 5 by feeding it 6
+        // fully-assembled tiny frames (seqs 0..=5).
+        for _ in 0..6 {
+            for p in fragmenter.fragment(meta.clone(), &[0u8; 100]) {
+                reassembler.handle(p);
+            }
+        }
+
+        // Now inject a stale Continuation claiming to belong to seq 0 —
+        // 5 frames behind latest, max_age=1, so the reassembler should
+        // drop it silently.
+        let stale = VideoPacket::Continuation {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_index: 1,
+            payload: vec![0u8; 10],
+        };
+        assert!(reassembler.handle(stale).is_none());
     }
 
     #[test]

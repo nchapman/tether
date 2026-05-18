@@ -124,6 +124,7 @@ mod tests {
     #[test]
     fn round_trip_video_packet_first() {
         let p = VideoPacket::First {
+            display: 0,
             stream_epoch: 0,
             frame_seq: 42,
             fragment_count: 3,
@@ -146,12 +147,14 @@ mod tests {
         let p2: VideoPacket = decode(&bytes).unwrap();
         match p2 {
             VideoPacket::First {
+                display,
                 stream_epoch,
                 frame_seq,
                 fragment_count,
                 meta,
                 payload,
             } => {
+                assert_eq!(display, 0);
                 assert_eq!(stream_epoch, 0);
                 assert_eq!(frame_seq, 42);
                 assert_eq!(fragment_count, 3);
@@ -221,6 +224,7 @@ mod tests {
         // Stress test: max-valued numeric fields + a realistic input echo +
         // payload sized so the whole packet stays under the datagram budget.
         let p = VideoPacket::First {
+            display: u8::MAX,
             stream_epoch: u16::MAX,
             frame_seq: u32::MAX,
             fragment_count: u16::MAX,
@@ -252,8 +256,9 @@ mod tests {
     fn continuation_video_packet_fits_in_datagram() {
         // Even with max-valued numeric fields (worst case for varint
         // expansion), a continuation packet must fit in the datagram budget.
-        // ~14 bytes of header overhead in the worst case for this variant.
+        // ~15 bytes of header overhead in the worst case for this variant.
         let p = VideoPacket::Continuation {
+            display: u8::MAX,
             stream_epoch: u16::MAX,
             frame_seq: u32::MAX,
             fragment_index: u16::MAX,

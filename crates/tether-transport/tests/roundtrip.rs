@@ -56,6 +56,7 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
         .await?;
 
     let video = VideoPacket::First {
+        display: 0,
         stream_epoch: 0,
         frame_seq: 7,
         fragment_count: 1,
@@ -137,6 +138,7 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
 
     // Construct a video packet whose encoded form exceeds MAX_DATAGRAM_PAYLOAD.
     let oversized = VideoPacket::First {
+        display: 0,
         stream_epoch: 0,
         frame_seq: 0,
         fragment_count: 1,

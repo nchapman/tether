@@ -6,5 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 description = "Client-side display: wgpu + winit, YUV->RGB shader, jitter buffer, present timing."
 
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+wgpu = "29"
+winit = "0.30"
+pollster = "0.4"
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+
 [lints]
 workspace = true

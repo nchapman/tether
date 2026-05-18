@@ -122,6 +122,64 @@ async fn pinned_fingerprint_rejects_wrong_cert() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_stream_wrong_role_errors() -> anyhow::Result<()> {
+    let server = Server::bind((Ipv4Addr::LOCALHOST, 0).into()).await?;
+    let server_addr = server.local_addr()?;
+    let fingerprint = server.fingerprint();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("server closed")?;
+        // Host opens the input stream as Recv. Calling send_input on it
+        // must surface the role mismatch as a typed error rather than
+        // silently misbehaving.
+        let evt = InputEvent {
+            event_id: 1,
+            t_client: MonoNanos::now(),
+            kind: InputEventKind::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+            },
+        };
+        let result = conn.send_input(&evt).await;
+        assert!(
+            matches!(
+                result,
+                Err(tether_transport::TransportError::InputStreamWrongRole)
+            ),
+            "expected InputStreamWrongRole, got {result:?}"
+        );
+        anyhow::Ok(())
+    });
+
+    let client = Client::new()?;
+    let conn = client
+        .connect(server_addr, "tether-host", fingerprint)
+        .await?;
+
+    // Client opens the input stream as Send. recv_input must error
+    // immediately, not block waiting for data that can never arrive.
+    let result = conn.recv_input().await;
+    assert!(
+        matches!(
+            result,
+            Err(tether_transport::TransportError::InputStreamWrongRole)
+        ),
+        "expected InputStreamWrongRole, got {result:?}"
+    );
+
+    server_task.await??;
+    Ok(())
+}
+
+// TODO(testing): verify the receive-side `MAX_FRAMED_MESSAGE` cap rejects
+// a forged oversize length prefix. The send path is covered by
+// `write_framed`'s pre-check; the read path requires either a test-only
+// "raw write" hook on the connection or a unit test inside connection.rs
+// with direct access to a quinn SendStream. Skipping for v0; the
+// `read_framed` check at connection.rs is short enough to verify by
+// inspection.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
     let server = Server::bind((Ipv4Addr::LOCALHOST, 0).into()).await?;
     let server_addr = server.local_addr()?;

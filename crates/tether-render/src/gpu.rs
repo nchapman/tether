@@ -211,11 +211,43 @@ impl GpuState {
         );
     }
 
-    pub(crate) fn render(&self) -> std::result::Result<(), String> {
-        let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            other => return Err(format!("surface not in Success state: {other:?}")),
+    pub(crate) fn render(&mut self) -> std::result::Result<(), String> {
+        use wgpu::CurrentSurfaceTexture::*;
+        // Handle all seven variants from wgpu 29 deliberately. Defaults
+        // matter: Outdated/Lost without reconfigure leaves the window
+        // permanently black; Occluded without silencing spams logs while
+        // the window is minimised; Suboptimal still has a valid texture
+        // that should be presented for this frame.
+        let (output, reconfigure_after) = match self.surface.get_current_texture() {
+            Success(f) => (f, false),
+            Suboptimal(f) => {
+                tracing::debug!("wgpu surface suboptimal; reconfigure after present");
+                (f, true)
+            }
+            Outdated => {
+                tracing::debug!("wgpu surface outdated; reconfiguring");
+                self.surface.configure(&self.device, &self.surface_config);
+                return Ok(());
+            }
+            Lost => {
+                // Per wgpu docs, full recovery from Lost may require
+                // recreating the surface via Instance::create_surface,
+                // which needs the window handle we no longer own here.
+                // Best-effort configure; if the surface stays Lost the
+                // user can close and reopen the window.
+                tracing::warn!("wgpu surface lost; attempting best-effort reconfigure");
+                self.surface.configure(&self.device, &self.surface_config);
+                return Ok(());
+            }
+            Timeout | Occluded => {
+                // Expected transient states — silently skip this frame.
+                return Ok(());
+            }
+            Validation => {
+                return Err("wgpu surface validation error".into());
+            }
         };
+
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -248,6 +280,10 @@ impl GpuState {
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        if reconfigure_after {
+            self.surface.configure(&self.device, &self.surface_config);
+        }
         Ok(())
     }
 }

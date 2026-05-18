@@ -3,7 +3,9 @@
 //!
 //! Task #4 (minimal): RGBA passthrough only. Task #9 will add a YUV→RGB
 //! fragment shader, an adaptive jitter buffer, zero-copy decoded-texture
-//! import, and present-time telemetry hooks.
+//! import, present-time telemetry hooks, and aspect-ratio aware
+//! letterboxing so the rendered frame matches the normalised mouse
+//! coordinate space promised by `tether_protocol::input`.
 
 mod gpu;
 

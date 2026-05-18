@@ -60,8 +60,18 @@ impl Client {
         ))
     }
 
+    /// Close the endpoint immediately, without waiting for in-flight
+    /// CONNECTION_CLOSE frames to flush. Use [`Self::close_and_wait`] for
+    /// graceful shutdown.
     pub fn close(&self, code: u32, reason: &[u8]) {
         self.endpoint.close(code.into(), reason);
+    }
+
+    /// Close the endpoint and await the flush of all open connections.
+    /// Prefer this when the calling process is about to exit.
+    pub async fn close_and_wait(&self, code: u32, reason: &[u8]) {
+        self.endpoint.close(code.into(), reason);
+        self.endpoint.wait_idle().await;
     }
 }
 

@@ -5,21 +5,19 @@
 //! it into the client, scans a QR code, etc.). The client pins that
 //! fingerprint via [`PinnedCertVerifier`] and accepts no other cert.
 //!
-//! [`PinnedCertVerifier::verify_tls12_signature`] /
-//! [`PinnedCertVerifier::verify_tls13_signature`] currently return
-//! `Ok(HandshakeSignatureValid::assertion())` without checking the
-//! algorithm-specific signature. This is safe for our threat model: an
-//! attacker who has only the cert's public key cannot complete the TLS
-//! handshake at all (they cannot sign with the private key), so by the
-//! time control reaches our verifier we already know the peer holds the
-//! pinned private key. Revisit if we ever support certificates not bound
-//! to a fixed private key (e.g. CA-issued).
+//! Signature verification is delegated to
+//! [`rustls::crypto::verify_tls12_signature`] /
+//! [`rustls::crypto::verify_tls13_signature`] using the ring provider's
+//! `WebPkiSupportedAlgorithms`, so the cryptographic handshake is checked
+//! the same way standard rustls does it — we only override the *trust*
+//! decision (fingerprint match instead of PKI chain).
 
 use std::sync::Arc;
 
 use rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
+use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
@@ -56,11 +54,17 @@ pub(crate) fn sha256(bytes: &[u8]) -> CertFingerprint {
 #[derive(Debug)]
 pub struct PinnedCertVerifier {
     expected: CertFingerprint,
+    supported_schemes: WebPkiSupportedAlgorithms,
 }
 
 impl PinnedCertVerifier {
     pub fn new(expected: CertFingerprint) -> Arc<Self> {
-        Arc::new(Self { expected })
+        let supported_schemes = rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms;
+        Arc::new(Self {
+            expected,
+            supported_schemes,
+        })
     }
 }
 
@@ -85,34 +89,24 @@ impl ServerCertVerifier for PinnedCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_schemes)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_schemes)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ED25519,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
+        self.supported_schemes.supported_schemes()
     }
 }
 

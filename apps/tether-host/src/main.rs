@@ -288,6 +288,12 @@ fn run_capture_and_send(
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut frame_count: u64 = 0;
+    // Sum of (t_encode_done - t_encode_submit) across frames in the
+    // current log window. Pairs with frame_count to produce an average
+    // encode latency per stats log — the headline number for
+    // confirming a HW encoder swap actually moved the needle without
+    // having to instrument every frame.
+    let mut encode_latency_sum_ns: u64 = 0;
     let mut last_log = std::time::Instant::now();
     let mut slot: Option<EncoderSlot> = None;
     let mut pts: i64 = 0;
@@ -370,6 +376,8 @@ fn run_capture_and_send(
             }
         };
         let t_encode_done = MonoNanos::now();
+        encode_latency_sum_ns =
+            encode_latency_sum_ns.saturating_add(t_encode_done.saturating_sub(t_encode_submit));
         pts += 1;
 
         // Concatenate all packets the encoder spat out for this input
@@ -412,12 +420,19 @@ fn run_capture_and_send(
 
         frame_count += 1;
         if last_log.elapsed() >= std::time::Duration::from_secs(2) {
+            #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
+            let avg_encode_ms = if frame_count > 0 {
+                (encode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
+            } else {
+                0.0
+            };
             info!(
                 frames = frame_count,
-                "sent {} encoded frames in last 2s",
-                frame_count
+                avg_encode_ms = format!("{avg_encode_ms:.2}"),
+                "send stats"
             );
             frame_count = 0;
+            encode_latency_sum_ns = 0;
             last_log = std::time::Instant::now();
         }
     }

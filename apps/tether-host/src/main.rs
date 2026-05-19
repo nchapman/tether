@@ -22,6 +22,8 @@ use tether_protocol::control::{
 use tether_protocol::video::{FrameFragmenter, HostFrameTiming, InputEchoBatch, VideoFrameMeta};
 use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
 use tether_transport::{Connection, Datagram, Server};
+use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 const ENCODER_BITRATE_KBPS: u32 = 4_000;
@@ -56,6 +58,21 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(remote = %conn.remote_address(), "client connected");
 
+    handle_client(conn, use_test_pattern).await?;
+
+    server.close_and_wait(0, b"host shutdown").await;
+    Ok(())
+}
+
+/// Owns every piece of per-connection state — encoder thread, injector,
+/// recv tasks. When this function returns the whole graph drops together:
+/// the libei session releases, the QUIC connection closes, the encoder
+/// frees its hardware context. Anything that needs to survive across
+/// reconnects must live in `main`, not here.
+async fn handle_client(
+    conn: Arc<Connection>,
+    use_test_pattern: bool,
+) -> anyhow::Result<()> {
     // Application-layer handshake. The closure picks the codec from the
     // client's preference list (H264-only for now), and the transport
     // layer stamps the clock-probe timestamps right around the send to
@@ -106,166 +123,228 @@ async fn main() -> anyhow::Result<()> {
     // primitive that fits the "one-shot until next frame" semantic.
     let force_idr = Arc::new(AtomicBool::new(false));
 
-    // Force-IDR signal already created above. Shared display-dimensions
-    // channel: the capture thread learns the real host display size on
-    // the first frame and posts (w, h) here; the input recv loop reads
-    // it and feeds the injector via set_display_size. We use a single-
-    // slot watch so the injector always reads the latest known dims
-    // even if it polls late.
+    // Shared display-dimensions channel: the capture thread learns the
+    // real host display size on the first frame and posts (w, h) here;
+    // the dims-follower task reads it and feeds the injector via
+    // set_display_size. We use a single-slot watch so the injector
+    // always reads the latest known dims even if it polls late.
     let (display_dims_tx, display_dims_rx) = tokio::sync::watch::channel::<Option<(u32, u32)>>(None);
 
     // Capture + send runs on a dedicated OS thread per the expert review:
     // the hot path doesn't share the tokio runtime with anything else.
-    // Naming the JoinHandle is informational — dropping it doesn't kill
-    // the thread in Rust, and v0 has no clean way to signal the PipeWire
-    // main loop to stop, so we rely on process exit to tear capture down.
+    // We keep the JoinHandle so the disconnect path can wait for the
+    // thread to actually exit before we return — otherwise the encoder
+    // and capture receiver would still be live in the background while
+    // a follow-on session tried to grab the same resources. The shutdown
+    // flag breaks the send loop out of its idle wait on a quiet desktop,
+    // where `frames.recv` would otherwise block past disconnect detection.
+    let send_shutdown = Arc::new(AtomicBool::new(false));
     let conn_send = conn.clone();
     let force_idr_for_send = force_idr.clone();
-    let _send_handle = std::thread::Builder::new()
+    let send_shutdown_for_thread = send_shutdown.clone();
+    let send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
-        .spawn(move || run_capture_and_send(conn_send, frames, force_idr_for_send, display_dims_tx))?;
+        .spawn(move || {
+            run_capture_and_send(
+                conn_send,
+                frames,
+                force_idr_for_send,
+                display_dims_tx,
+                send_shutdown_for_thread,
+            )
+        })?;
 
-    // Control recv: react to ForceIdr and clock-probe requests on the
-    // reliable control stream. Goodbye triggers a clean shutdown by
-    // closing the connection — the recv loops everywhere else then
-    // return Err and exit. Unknown messages are logged at trace; we
-    // never crash on a control packet.
-    let conn_control = conn.clone();
-    let force_idr_for_ctrl = force_idr.clone();
-    tokio::spawn(async move {
-        loop {
-            match conn_control.recv_control().await {
-                Ok(ControlMessage::ForceIdr) => {
-                    tracing::debug!("client requested IDR");
-                    force_idr_for_ctrl.store(true, Ordering::Relaxed);
-                }
-                Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
-                    let t1 = MonoNanos::now();
-                    let response = ControlMessage::ClockProbeResponse(
-                        tether_protocol::control::ClockProbe {
-                            t0_sender,
-                            t1_receiver_recv: t1,
-                            t2_receiver_send: MonoNanos::now(),
-                        },
-                    );
-                    if let Err(e) = conn_control.send_control(&response).await {
-                        warn!(error = ?e, "clock probe response failed; ending control loop");
-                        return;
-                    }
-                }
-                Ok(ControlMessage::ClockProbeResponse(_)) => {
-                    // Host doesn't currently initiate re-probes, but if
-                    // we ever do, the matching response handler goes here.
-                    tracing::trace!("unsolicited clock probe response; ignoring");
-                }
-                Ok(ControlMessage::Goodbye { reason }) => {
-                    info!(%reason, "client said goodbye");
-                    return;
-                }
-                Err(e) => {
-                    warn!(error = ?e, "control recv failed; ending control loop");
-                    return;
-                }
-            }
-        }
-    });
-
-    // Input recv: drain the client's input stream and feed each event
-    // into the host's injection backend. Backend selection happens
-    // before the recv loops start so the user sees any portal prompt
-    // up front; a backend init failure is non-fatal — we fall back to
-    // a noop injector that just logs.
+    // Per-connection injector. The libei session lives inside the
+    // injector; when the last Arc drops, libei releases. We deliberately
+    // hand the three clones to the three recv tasks and don't keep a
+    // fourth reference in this scope — otherwise the original outlives
+    // the tasks, refcount never hits zero, and the host's mouse stays
+    // grabbed until the process exits (which is the bug that prompted
+    // this whole rewrite). The recv tasks themselves are owned by the
+    // JoinSet below, so tasks.shutdown() is what triggers the final drop.
     //
-    // The injector is shared between the reliable input-stream task
-    // and the unreliable cursor-datagram task; tokio's Mutex is the
-    // right primitive because both call sites are async and the
-    // critical section (a single enigo call) is short. A std Mutex
-    // would risk blocking a tokio worker if libei ever takes longer
-    // than a few microseconds.
-    use std::sync::Arc as StdArc;
-    use tokio::sync::Mutex as TokioMutex;
-    let injector = StdArc::new(TokioMutex::new(
+    // tokio::sync::Mutex is the right primitive: the lock is held only
+    // for the duration of one enigo call (microseconds), but both
+    // holders are async, and a std::sync::Mutex held across an await
+    // would risk blocking a tokio worker.
+    let injector = Arc::new(TokioMutex::new(
         tether_input::inject::default_injector().await,
     ));
 
-    // Display-dimensions follower: any change to the capture's
-    // negotiated resolution pushes new pixel dims into the injector.
-    // Lives in its own task so the recv loops below stay focused.
-    let injector_for_dims = injector.clone();
-    let mut display_dims_watch = display_dims_rx.clone();
-    tokio::spawn(async move {
-        while display_dims_watch.changed().await.is_ok() {
-            // Copy the value out and drop the borrow guard before
-            // awaiting on the injector lock — `watch::Ref` is not Send,
-            // so holding it across an .await fails the Send bound.
-            let dims = *display_dims_watch.borrow();
-            if let Some((w, h)) = dims {
-                injector_for_dims.lock().await.set_display_size(w, h);
-            }
-        }
-    });
+    let mut tasks: JoinSet<()> = JoinSet::new();
 
-    let conn_input = conn.clone();
-    let injector_for_input = injector.clone();
-    tokio::spawn(async move {
-        loop {
-            match conn_input.recv_input().await {
-                Ok(evt) => {
-                    tracing::trace!(
-                        event_id = evt.event_id,
-                        t_client_ns = evt.t_client.0,
-                        kind = ?evt.kind,
-                        "input event"
-                    );
-                    let mut inj = injector_for_input.lock().await;
-                    if let Err(e) = inj.inject(&evt) {
-                        warn!(error = %e, "injector rejected event; dropping");
+    // Control recv: react to ForceIdr and clock-probe requests on the
+    // reliable control stream. Goodbye returns immediately so the
+    // disconnect path runs as soon as the client signals; unknown
+    // messages are logged at trace and the loop continues. We never
+    // crash on a control packet.
+    {
+        let conn = conn.clone();
+        let force_idr = force_idr.clone();
+        tasks.spawn(async move {
+            loop {
+                match conn.recv_control().await {
+                    Ok(ControlMessage::ForceIdr) => {
+                        tracing::debug!("client requested IDR");
+                        force_idr.store(true, Ordering::Relaxed);
+                    }
+                    Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
+                        let t1 = MonoNanos::now();
+                        let response = ControlMessage::ClockProbeResponse(
+                            tether_protocol::control::ClockProbe {
+                                t0_sender,
+                                t1_receiver_recv: t1,
+                                t2_receiver_send: MonoNanos::now(),
+                            },
+                        );
+                        if let Err(e) = conn.send_control(&response).await {
+                            warn!(error = ?e, "clock probe response failed; ending control loop");
+                            return;
+                        }
+                    }
+                    Ok(ControlMessage::ClockProbeResponse(_)) => {
+                        // Host doesn't currently initiate re-probes, but if
+                        // we ever do, the matching response handler goes here.
+                        tracing::trace!("unsolicited clock probe response; ignoring");
+                    }
+                    Ok(ControlMessage::Goodbye { reason }) => {
+                        info!(%reason, "client said goodbye");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "control recv failed; ending control loop");
+                        return;
                     }
                 }
-                Err(e) => {
-                    warn!(error = ?e, "input recv failed; ending input task");
-                    return;
+            }
+        });
+    }
+
+    // Display-dimensions follower: any change to the capture's
+    // negotiated resolution pushes new pixel dims into the injector.
+    // Exits naturally when the send thread drops its display_dims_tx,
+    // or via tasks.shutdown() during disconnect.
+    {
+        let injector = injector.clone();
+        let mut rx = display_dims_rx;
+        tasks.spawn(async move {
+            while rx.changed().await.is_ok() {
+                // Copy the value out and drop the borrow guard before
+                // awaiting on the injector lock — `watch::Ref` is not Send,
+                // so holding it across an .await fails the Send bound.
+                let dims = *rx.borrow();
+                if let Some((w, h)) = dims {
+                    injector.lock().await.set_display_size(w, h);
                 }
             }
-        }
-    });
+        });
+    }
+
+    // Input recv: drain the client's input stream and feed each event
+    // into the host's injection backend.
+    {
+        let conn = conn.clone();
+        let injector = injector.clone();
+        tasks.spawn(async move {
+            loop {
+                match conn.recv_input().await {
+                    Ok(evt) => {
+                        tracing::trace!(
+                            event_id = evt.event_id,
+                            t_client_ns = evt.t_client.0,
+                            kind = ?evt.kind,
+                            "input event"
+                        );
+                        let mut inj = injector.lock().await;
+                        if let Err(e) = inj.inject(&evt) {
+                            warn!(error = %e, "injector rejected event; dropping");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "input recv failed; ending input task");
+                        return;
+                    }
+                }
+            }
+        });
+    }
 
     // Datagram recv: cursor packets ride the unreliable channel for
     // latency. Video and host-cursor datagrams flow the other
     // direction; they should never arrive here, but we match
     // defensively so a misbehaving client can't crash the host.
-    let conn_dgram = conn.clone();
-    let injector_for_dgram = injector.clone();
-    tokio::spawn(async move {
-        loop {
-            match conn_dgram.recv_datagram().await {
-                Ok(Datagram::ClientCursor(c)) => {
-                    let mut inj = injector_for_dgram.lock().await;
-                    if let Err(e) = inj.inject_cursor(&c) {
-                        warn!(error = %e, "cursor inject failed; dropping");
+    //
+    // This consumes the third (and final) injector clone in this
+    // scope; after the spawn, the only references are in the three
+    // task closures, and `injector` is no longer in scope.
+    {
+        let conn = conn.clone();
+        let injector = injector;
+        tasks.spawn(async move {
+            loop {
+                match conn.recv_datagram().await {
+                    Ok(Datagram::ClientCursor(c)) => {
+                        let mut inj = injector.lock().await;
+                        if let Err(e) = inj.inject_cursor(&c) {
+                            warn!(error = %e, "cursor inject failed; dropping");
+                        }
+                    }
+                    Ok(Datagram::Video(_)) | Ok(Datagram::HostCursor(_)) => {
+                        tracing::trace!("unexpected host-direction datagram on host; ignoring");
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "datagram recv failed; ending datagram task");
+                        return;
                     }
                 }
-                Ok(Datagram::Video(_)) | Ok(Datagram::HostCursor(_)) => {
-                    tracing::trace!("unexpected host-direction datagram on host; ignoring");
-                }
-                Err(e) => {
-                    warn!(error = ?e, "datagram recv failed; ending datagram task");
-                    return;
-                }
+            }
+        });
+    }
+
+    // Wait for any signal that the session is over:
+    //   - Ctrl-C: user wants out
+    //   - any per-connection task exited: disconnect, Goodbye, or recv error
+    // Whichever fires first, the cleanup path below runs.
+    tokio::select! {
+        ctrl_c = tokio::signal::ctrl_c() => {
+            if let Err(e) = ctrl_c {
+                warn!(error = %e, "ctrl-c handler failed; tearing down anyway");
+            } else {
+                info!("ctrl-c received, ending session");
             }
         }
-    });
-
-    // Block until Ctrl-C, then shut down gracefully. A ctrl-c registration
-    // error is itself a reason to shut down, not to bail out and skip the
-    // close path — log and proceed either way.
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        warn!(error = %e, "ctrl-c handler failed; shutting down anyway");
-    } else {
-        info!("ctrl-c received, shutting down");
+        res = tasks.join_next() => {
+            match res {
+                Some(Ok(())) => info!("per-connection task ended; tearing down"),
+                Some(Err(e)) => warn!(error = ?e, "per-connection task failed; tearing down"),
+                None => warn!("joined empty task set; tearing down"),
+            }
+        }
     }
-    conn.close(0, b"host shutdown");
-    server.close_and_wait(0, b"host shutdown").await;
+
+    // Close the QUIC connection. This makes send_datagram error in the
+    // send thread, breaking it out of the encode loop, and tells any
+    // still-alive recv tasks that the peer is gone. Cheap and idempotent.
+    conn.close(0, b"session ended");
+
+    // Tell the send thread to stop polling the capture channel. Paired
+    // with the recv_timeout inside the loop so a static desktop (no new
+    // frames) can't keep us blocked in `frames.recv` past disconnect.
+    send_shutdown.store(true, Ordering::Relaxed);
+
+    // Abort and await the remaining recv tasks. Each one holds an Arc
+    // clone of the injector; once shutdown() returns they're all dropped,
+    // leaving the injector at refcount 0 (we deliberately didn't keep
+    // a clone in this scope), so the injector drops here and libei
+    // releases the host's mouse and keyboard.
+    tasks.shutdown().await;
+
+    // Wait for the send thread to actually exit. spawn_blocking lets us
+    // await the std::thread::join without parking a tokio worker. We
+    // swallow the result — a panicked send thread is logged inside the
+    // join, and we're tearing down anyway.
+    let _ = tokio::task::spawn_blocking(move || send_handle.join()).await;
+
     Ok(())
 }
 
@@ -285,6 +364,7 @@ fn run_capture_and_send(
     frames: Receiver<CapturedFrame>,
     force_idr: Arc<AtomicBool>,
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut frame_count: u64 = 0;
@@ -307,7 +387,23 @@ fn run_capture_and_send(
     let mut slot: Option<EncoderSlot> = None;
     let mut pts: i64 = 0;
 
-    while let Ok(frame) = frames.recv() {
+    // Poll the capture channel on a short tick so a quiet desktop
+    // (PipeWire stops delivering frames when nothing changes on screen)
+    // doesn't trap us in a blocking recv past the point where the
+    // disconnect path wants us to exit. The 100 ms wake-up adds zero
+    // latency to actual frame delivery — `recv_timeout` returns as
+    // soon as a frame lands — and ~10 wake-ups/sec of idle CPU is
+    // negligible next to the encoder's own load.
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("send-thread shutdown signalled; exiting");
+            break;
+        }
+        let frame = match frames.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(f) => f,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
         if frame.format != PixelFormat::Bgra8 {
             warn!(
                 ?frame.format,
@@ -465,7 +561,7 @@ fn run_capture_and_send(
             last_log = std::time::Instant::now();
         }
     }
-    info!("capture channel closed, send loop exiting");
+    info!("send loop exiting");
 }
 
 fn parse_args() -> anyhow::Result<(SocketAddr, bool)> {
@@ -546,4 +642,97 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for `handle_client`'s lifecycle invariants. These
+    //! aren't integration tests against the real Connection/libei stack —
+    //! they enforce the *pattern* the production code uses, so a future
+    //! refactor that breaks the pattern (and re-introduces the bug it
+    //! exists to prevent) fails CI instead of failing on a user's desk.
+    //!
+    //! The full subprocess-level integration test is tracked separately;
+    //! see the project task list.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::task::JoinSet;
+
+    /// Increments a shared counter once, when its sole owner drops it.
+    /// Stand-in for the `LibeiInjector` (which we can't construct in a
+    /// unit test — it needs a real portal session) while exercising the
+    /// same Arc-refcount lifecycle the production injector relies on.
+    struct DropCounter(Arc<AtomicUsize>);
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// `handle_client` deliberately hands the *last* injector Arc to
+    /// the dgram task by move rather than clone. The reason is the bug
+    /// this test exists to prevent: if a fourth Arc lives in the
+    /// `handle_client` stack frame, every spawned task can exit and the
+    /// injector's refcount still won't hit zero — the libei session
+    /// stays grabbed, and the host's mouse and keyboard stay frozen
+    /// until the process itself exits. This was a real shipped bug
+    /// (mouse lockup after client disconnect, May 2026).
+    ///
+    /// The assertion: after the analogous three-spawn pattern and a
+    /// `JoinSet::shutdown`, the `DropCounter` standing in for the
+    /// injector must have dropped exactly once. If a future edit
+    /// regresses the pattern (e.g. changes the third spawn from
+    /// `let inj = injector;` to `let inj = injector.clone();`), this
+    /// test fails with `drops == 0`.
+    #[tokio::test]
+    async fn injector_drops_after_recv_tasks_shut_down() {
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let injector = Arc::new(DropCounter(drops.clone()));
+        let mut tasks: JoinSet<()> = JoinSet::new();
+
+        // Mirror the production spawn pattern: two clones, then a
+        // move for the last one so no Arc survives in this scope.
+        {
+            let inj = injector.clone();
+            tasks.spawn(async move {
+                let _hold = inj;
+                std::future::pending::<()>().await
+            });
+        }
+        {
+            let inj = injector.clone();
+            tasks.spawn(async move {
+                let _hold = inj;
+                std::future::pending::<()>().await
+            });
+        }
+        {
+            // The load-bearing move. Replace with `.clone()` to
+            // reproduce the bug this test guards against — the
+            // assertion below will fail with `drops == 0` because
+            // the outer `injector` will still hold the last ref
+            // when we check.
+            let inj = injector;
+            tasks.spawn(async move {
+                let _hold = inj;
+                std::future::pending::<()>().await
+            });
+        }
+
+        tasks.shutdown().await;
+
+        // The check has to happen *before* this function returns —
+        // otherwise even buggy code (extra outer Arc) would pass,
+        // because the stray Arc would drop at function exit and the
+        // counter would still read 1 at that point. We need to catch
+        // "still alive after shutdown" while we're still inside the
+        // scope where the stray ref would have lived.
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "expected injector to drop after tasks.shutdown(); drops={} means a stray Arc clone survived past the spawned tasks (libei lockup bug)",
+            drops.load(Ordering::SeqCst)
+        );
+    }
 }

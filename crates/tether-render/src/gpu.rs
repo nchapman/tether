@@ -2,7 +2,18 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::{RawFrame, RenderError, Result};
+use crate::{Frame, RenderError, Result};
+
+/// Y plus chroma textures and the bind group that points at them.
+/// Bundled together so resize-on-frame can swap them atomically.
+struct YuvTextures {
+    y: wgpu::Texture,
+    u: wgpu::Texture,
+    v: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    /// Y-plane dimensions (chroma is derived).
+    size: (u32, u32),
+}
 
 pub(crate) struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -10,11 +21,9 @@ pub(crate) struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    yuv_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
-    texture_size: (u32, u32),
+    textures: YuvTextures,
     scale_buffer: wgpu::Buffer,
     scale_bind_group: wgpu::BindGroup,
 }
@@ -91,21 +100,18 @@ impl GpuState {
             ..Default::default()
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("tether-render bgl"),
+        // Three single-channel textures (Y, U, V) plus a sampler. We
+        // share one sampler — chroma upsampling uses the same bilinear
+        // filter as luma, and the visual difference vs. a chroma-only
+        // nearest sampler is invisible on 4:2:0 desktop content.
+        let yuv_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tether-render yuv bgl"),
             entries: &[
+                bgl_texture_entry(0),
+                bgl_texture_entry(1),
+                bgl_texture_entry(2),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -132,12 +138,8 @@ impl GpuState {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // Seed the uniform with an identity scale so the very first draw
-        // (which can fire before the recv task has uploaded any frame)
-        // doesn't read undefined memory off the GPU. The 1×1 placeholder
-        // texture renders as solid black either way, but reading
-        // uninitialised buffer contents is UB under wgpu's strict
-        // validation layer.
+        // Seed identity so the first draw before any frame upload
+        // doesn't read undefined memory off the GPU.
         let identity_scale: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
         queue.write_buffer(&scale_buffer, 0, &bytes_of_f32x4(&identity_scale));
         let scale_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -156,7 +158,7 @@ impl GpuState {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tether-render pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout), Some(&scale_bgl)],
+            bind_group_layouts: &[Some(&yuv_bgl), Some(&scale_bgl)],
             immediate_size: 0,
         });
 
@@ -186,8 +188,7 @@ impl GpuState {
             cache: None,
         });
 
-        let (texture, bind_group, texture_size) =
-            make_texture_and_bind_group(&device, &bind_group_layout, &sampler, 1, 1);
+        let textures = make_yuv_textures(&device, &yuv_bgl, &sampler, 1, 1);
 
         Ok(Self {
             surface,
@@ -195,11 +196,9 @@ impl GpuState {
             device,
             queue,
             pipeline,
-            bind_group_layout,
+            yuv_bgl,
             sampler,
-            texture,
-            bind_group,
-            texture_size,
+            textures,
             scale_buffer,
             scale_bind_group,
         })
@@ -209,7 +208,7 @@ impl GpuState {
     /// because the cursor-normalisation math in `lib.rs` needs both.
     pub(crate) fn dimensions(&self) -> ((u32, u32), (u32, u32)) {
         (
-            self.texture_size,
+            self.textures.size,
             (self.surface_config.width, self.surface_config.height),
         )
     }
@@ -223,41 +222,23 @@ impl GpuState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    pub(crate) fn upload(&mut self, frame: &RawFrame) {
+    pub(crate) fn upload(&mut self, frame: &Frame) {
         if frame.width == 0 || frame.height == 0 {
             return;
         }
-        if (frame.width, frame.height) != self.texture_size {
-            let (tex, bg, size) = make_texture_and_bind_group(
+        if (frame.width, frame.height) != self.textures.size {
+            self.textures = make_yuv_textures(
                 &self.device,
-                &self.bind_group_layout,
+                &self.yuv_bgl,
                 &self.sampler,
                 frame.width,
                 frame.height,
             );
-            self.texture = tex;
-            self.bind_group = bg;
-            self.texture_size = size;
         }
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &frame.data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(frame.width * 4),
-                rows_per_image: Some(frame.height),
-            },
-            wgpu::Extent3d {
-                width: frame.width,
-                height: frame.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        let (chroma_w, chroma_h) = frame.chroma_dims();
+        write_plane(&self.queue, &self.textures.y, &frame.y, frame.width, frame.height);
+        write_plane(&self.queue, &self.textures.u, &frame.u, chroma_w, chroma_h);
+        write_plane(&self.queue, &self.textures.v, &frame.v, chroma_w, chroma_h);
     }
 
     pub(crate) fn render(&mut self) -> std::result::Result<(), String> {
@@ -279,17 +260,11 @@ impl GpuState {
                 return Ok(());
             }
             Lost => {
-                // Per wgpu docs, full recovery from Lost may require
-                // recreating the surface via Instance::create_surface,
-                // which needs the window handle we no longer own here.
-                // Best-effort configure; if the surface stays Lost the
-                // user can close and reopen the window.
                 tracing::warn!("wgpu surface lost; attempting best-effort reconfigure");
                 self.surface.configure(&self.device, &self.surface_config);
                 return Ok(());
             }
             Timeout | Occluded => {
-                // Expected transient states — silently skip this frame.
                 return Ok(());
             }
             Validation => {
@@ -299,7 +274,7 @@ impl GpuState {
 
         // Update the aspect-correction uniform before kicking off the
         // render pass. Costs a single 16-byte buffer write per frame.
-        let (sx, sy) = letterbox_scale(self.texture_size, (
+        let (sx, sy) = letterbox_scale(self.textures.size, (
             self.surface_config.width,
             self.surface_config.height,
         ));
@@ -333,7 +308,7 @@ impl GpuState {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(0, &self.textures.bind_group, &[]);
             pass.set_bind_group(1, &self.scale_bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
@@ -361,18 +336,12 @@ fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
     if (src_aspect - dst_aspect).abs() < f32::EPSILON {
         (1.0, 1.0)
     } else if src_aspect > dst_aspect {
-        // Source is wider than the window — fit width, letterbox top/bottom.
         (1.0, dst_aspect / src_aspect)
     } else {
-        // Source is taller than the window — fit height, pillarbox sides.
         (src_aspect / dst_aspect, 1.0)
     }
 }
 
-/// Reinterpret a `[f32; 4]` as its little-endian byte representation for
-/// upload via `queue.write_buffer`. Pulling in `bytemuck` for one site
-/// isn't worth the dep; this is the same `to_le_bytes` dance the per-frame
-/// `render()` path uses, factored into one place.
 fn bytes_of_f32x4(v: &[f32; 4]) -> [u8; 16] {
     let mut out = [0u8; 16];
     for (i, x) in v.iter().enumerate() {
@@ -381,15 +350,68 @@ fn bytes_of_f32x4(v: &[f32; 4]) -> [u8; 16] {
     out
 }
 
-fn make_texture_and_bind_group(
+fn bgl_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn make_yuv_textures(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     width: u32,
     height: u32,
-) -> (wgpu::Texture, wgpu::BindGroup, (u32, u32)) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("tether-render video texture"),
+) -> YuvTextures {
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    let y = make_r8_texture(device, "tether-render y plane", width, height);
+    let u = make_r8_texture(device, "tether-render u plane", chroma_w, chroma_h);
+    let v = make_r8_texture(device, "tether-render v plane", chroma_w, chroma_h);
+    let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
+    let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
+    let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tether-render yuv bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&y_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&u_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&v_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    YuvTextures {
+        y,
+        u,
+        v,
+        bind_group,
+        size: (width, height),
+    }
+}
+
+fn make_r8_texture(device: &wgpu::Device, label: &str, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
         size: wgpu::Extent3d {
             width,
             height,
@@ -398,24 +420,34 @@ fn make_texture_and_bind_group(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        // R8Unorm rather than R8UnormSrgb: YUV values are in a linear
+        // encoding space already (the BT.709 limited-range expansion
+        // in the fragment shader handles gamma); applying sRGB on
+        // sample would double-decode and crush highlights.
+        format: wgpu::TextureFormat::R8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tether-render bind group"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    });
-    (texture, bind_group, (width, height))
+    })
+}
+
+fn write_plane(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }

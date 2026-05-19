@@ -756,6 +756,7 @@ dependencies = [
  "reis",
  "tokio",
  "windows 0.61.3",
+ "x11rb",
  "xkbcommon",
  "xkeysym",
 ]

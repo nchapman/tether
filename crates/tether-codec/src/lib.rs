@@ -40,9 +40,15 @@ pub struct EncodedPacket {
     pub keyframe: bool,
 }
 
-/// A decoded video frame in BGRA8 layout. Dimensions come from the codec
-/// (decoded SPS), not from the wire — this lets the decoder tell us if
-/// the stream silently changed resolution.
+/// A decoded video frame in YUV 4:2:0 planar (I420) layout. Three tight
+/// planes — Y at full resolution, U and V at quarter resolution
+/// (subsampled 2:1 on each axis). The renderer uploads each plane as
+/// its own `R8Unorm` texture and converts to RGB in the fragment
+/// shader, skipping the per-frame CPU YUV→BGRA→RGBA bounce we used
+/// to do.
+///
+/// Dimensions come from the codec (decoded SPS), not from the wire,
+/// so the decoder is authoritative about resolution changes.
 #[derive(Clone, Debug)]
 pub struct DecodedFrame {
     pub width: u32,
@@ -50,7 +56,21 @@ pub struct DecodedFrame {
     /// Decoder-reported PTS in the codec's time_base; `None` if the
     /// upstream packet didn't carry one.
     pub pts: Option<i64>,
-    pub data: Vec<u8>,
+    /// Tight Y plane, `width * height` bytes.
+    pub y: Vec<u8>,
+    /// Tight U plane, `chroma_width * chroma_height` bytes where
+    /// `chroma_width = (width + 1) / 2` (and same for height).
+    pub u: Vec<u8>,
+    /// Tight V plane, same layout as U.
+    pub v: Vec<u8>,
+}
+
+impl DecodedFrame {
+    /// Chroma plane dimensions for the 4:2:0 subsampling we assume.
+    #[must_use]
+    pub fn chroma_dims(&self) -> (u32, u32) {
+        (self.width.div_ceil(2), self.height.div_ceil(2))
+    }
 }
 
 pub trait Encoder: Send {

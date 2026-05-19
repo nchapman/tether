@@ -10,6 +10,22 @@ use ffmpeg_next::{
     util::dictionary::Owned as Dictionary, Packet, Rational,
 };
 
+/// Pack a planar AVFrame plane into a tight `Vec<u8>`, stripping any
+/// stride padding so downstream consumers can upload row-major without
+/// per-row math.
+fn pack_plane(plane: &[u8], stride: usize, row_bytes: usize, height: usize) -> Vec<u8> {
+    let mut packed = Vec::with_capacity(row_bytes * height);
+    if stride == row_bytes {
+        packed.extend_from_slice(&plane[..row_bytes * height]);
+    } else {
+        for row in 0..height {
+            let start = row * stride;
+            packed.extend_from_slice(&plane[start..start + row_bytes]);
+        }
+    }
+    packed
+}
+
 use tether_protocol::control::CodecKind;
 
 use crate::{init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result};
@@ -180,14 +196,6 @@ impl Encoder for H264Encoder {
 
 pub struct H264Decoder {
     decoder: decoder::Video,
-    yuv_to_bgra: Option<scaling::Context>,
-    bgra_frame: frame::Video,
-    /// `(src_pixel_format, width, height)` of the cached `yuv_to_bgra`
-    /// context. The source format must be part of the key — if a peer
-    /// encoder ever switches from YUV420P to NV12 or YUV422 mid-stream,
-    /// the cached swscale would silently keep converting from the stale
-    /// source format and emit garbage pixels.
-    scaler_key: Option<(Pixel, u32, u32)>,
 }
 
 // SAFETY: same rationale as H264Encoder above.
@@ -200,30 +208,7 @@ impl H264Decoder {
             .ok_or(CodecError::Ffmpeg(ffmpeg_next::Error::DecoderNotFound))?;
         let ctx = codec::context::Context::new_with_codec(codec);
         let decoder = ctx.decoder().video()?;
-        Ok(Self {
-            decoder,
-            yuv_to_bgra: None,
-            bgra_frame: frame::Video::empty(),
-            scaler_key: None,
-        })
-    }
-
-    fn ensure_scaler(&mut self, src_format: Pixel, w: u32, h: u32) -> Result<()> {
-        if self.scaler_key == Some((src_format, w, h)) && self.yuv_to_bgra.is_some() {
-            return Ok(());
-        }
-        self.yuv_to_bgra = Some(scaling::Context::get(
-            src_format,
-            w,
-            h,
-            Pixel::BGRA,
-            w,
-            h,
-            scaling::Flags::FAST_BILINEAR,
-        )?);
-        self.bgra_frame = frame::Video::new(Pixel::BGRA, w, h);
-        self.scaler_key = Some((src_format, w, h));
-        Ok(())
+        Ok(Self { decoder })
     }
 }
 
@@ -248,34 +233,28 @@ impl Decoder for H264Decoder {
                 Err(ffmpeg_next::Error::Eof) => break,
                 Err(e) => return Err(CodecError::Ffmpeg(e)),
             }
-            let w = yuv.width();
-            let h = yuv.height();
-            self.ensure_scaler(yuv.format(), w, h)?;
-            let sws = self
-                .yuv_to_bgra
-                .as_mut()
-                .expect("scaler installed by ensure_scaler");
-            sws.run(&yuv, &mut self.bgra_frame)?;
-
-            // Pack rows tightly into the output Vec — sws output stride
-            // may exceed width*4.
-            let stride = self.bgra_frame.stride(0);
-            let row_bytes = (w * 4) as usize;
-            let plane = self.bgra_frame.data(0);
-            let mut packed = Vec::with_capacity(row_bytes * h as usize);
-            if stride == row_bytes {
-                packed.extend_from_slice(&plane[..row_bytes * h as usize]);
-            } else {
-                for row in 0..h as usize {
-                    let start = row * stride;
-                    packed.extend_from_slice(&plane[start..start + row_bytes]);
-                }
+            // H264 in our configuration always emits YUV420P. If a
+            // future capture path negotiates something else (NV12,
+            // YUV422) the renderer's YUV→RGB shader will need
+            // companion shaders / upload paths; for now reject loudly
+            // so the failure is observable instead of a silent garble.
+            if yuv.format() != Pixel::YUV420P {
+                return Err(CodecError::UnsupportedInputFormat);
             }
+            let w = yuv.width() as usize;
+            let h = yuv.height() as usize;
+            let chroma_w = w.div_ceil(2);
+            let chroma_h = h.div_ceil(2);
+            let y_plane = pack_plane(yuv.data(0), yuv.stride(0), w, h);
+            let u_plane = pack_plane(yuv.data(1), yuv.stride(1), chroma_w, chroma_h);
+            let v_plane = pack_plane(yuv.data(2), yuv.stride(2), chroma_w, chroma_h);
             out.push(DecodedFrame {
-                width: w,
-                height: h,
+                width: yuv.width(),
+                height: yuv.height(),
                 pts: yuv.pts(),
-                data: packed,
+                y: y_plane,
+                u: u_plane,
+                v: v_plane,
             });
         }
         Ok(out)
@@ -333,10 +312,10 @@ mod tests {
         let frame = got.expect("decoder produced a frame within four input frames");
         assert_eq!(frame.width, w);
         assert_eq!(frame.height, h);
-        assert_eq!(frame.data.len(), (w * h * 4) as usize);
-        // alpha is always 255 because BGRA conversion fills it in
-        for px in frame.data.chunks_exact(4) {
-            assert_eq!(px[3], 255);
-        }
+        // YUV 4:2:0 plane sizes: Y is full res, U+V quarter res
+        let (cw, ch) = frame.chroma_dims();
+        assert_eq!(frame.y.len(), (w * h) as usize);
+        assert_eq!(frame.u.len(), (cw * ch) as usize);
+        assert_eq!(frame.v.len(), (cw * ch) as usize);
     }
 }

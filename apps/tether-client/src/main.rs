@@ -16,7 +16,7 @@ use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{ClientHello, CodecKind, ControlMessage};
 use tether_protocol::video::FrameReassembler;
 use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
-use tether_render::{RawFrame, RenderEvent};
+use tether_render::{Frame, RenderEvent};
 use tether_transport::{Client, Datagram};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     // Render channel: producer is the recv loop, consumer is the wgpu
     // window. Bounded(2) with drop-newest semantics matches the rest of
     // the project.
-    let (frame_tx, frame_rx) = bounded::<RawFrame>(2);
+    let (frame_tx, frame_rx) = bounded::<Frame>(2);
 
     // First IDR request goes out immediately after the handshake: the
     // host's encoder always emits IDR on its very first frame, but if
@@ -157,11 +157,18 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
                     for dec in decoded {
-                        let rgba = bgra_to_rgba(&dec.data);
-                        let raw = RawFrame {
+                        // YUV planes go straight to the render texture
+                        // upload — no per-frame CPU pixel format
+                        // conversion in our code anymore. The
+                        // BGRA↔RGBA bounce that used to live here
+                        // turned into a free GPU sample in the YUV
+                        // fragment shader.
+                        let raw = Frame {
                             width: dec.width,
                             height: dec.height,
-                            data: rgba,
+                            y: dec.y,
+                            u: dec.u,
+                            v: dec.v,
                         };
                         // Drop on full — render is intentionally one-deep.
                         let _ = frame_tx.try_send(raw);
@@ -242,14 +249,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(bgra.len() % 4, 0, "BGRA buffer must be a multiple of 4 bytes");
-    let mut out = Vec::with_capacity(bgra.len());
-    for px in bgra.chunks_exact(4) {
-        out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-    }
-    out
-}
 
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

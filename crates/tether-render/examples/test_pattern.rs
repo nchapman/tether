@@ -1,15 +1,16 @@
 //! Smoke test for tether-render: opens a window and streams an animated
-//! gradient at ~60 FPS. Run with `cargo run --example test_pattern -p tether-render`.
+//! grayscale Y-plane (no chroma) at ~60 FPS. Run with
+//! `cargo run --example test_pattern -p tether-render`.
 
 use std::time::Duration;
 
 use crossbeam_channel::bounded;
-use tether_render::RawFrame;
+use tether_render::Frame;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let (tx, rx) = bounded::<RawFrame>(2);
+    let (tx, rx) = bounded::<Frame>(2);
 
     std::thread::spawn(move || {
         let (w, h) = (800u32, 600u32);
@@ -28,27 +29,32 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// All `as u8` casts in this fn are intentional truncations in math whose
-// outputs are bounded to [0, 255] by construction. clippy can't prove that.
+// Animated diagonal gradient. Y carries the luminance signal; U+V are
+// pinned to chroma-neutral (128) so the output is greyscale and we
+// don't have to do a full RGB→YUV conversion just to demo the pipeline.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn test_pattern(width: u32, height: u32, t: u32) -> RawFrame {
-    let mut data = Vec::with_capacity((width * height * 4) as usize);
-    let phase_b = (t as f32 * 0.05).sin() * 0.5 + 0.5;
-    for y in 0..height {
-        for x in 0..width {
-            let r = ((x * 255) / width.max(1)) as u8;
-            let g = ((y * 255) / height.max(1)) as u8;
-            let b = (phase_b * 255.0) as u8;
-            data.extend_from_slice(&[r, g, b, 255]);
+fn test_pattern(width: u32, height: u32, t: u32) -> Frame {
+    let mut y = Vec::with_capacity((width * height) as usize);
+    let phase = (t as f32 * 0.05).sin() * 64.0;
+    for j in 0..height {
+        for i in 0..width {
+            let base = ((i + j) * 255 / (width + height).max(1)) as f32;
+            let v = (base + phase).clamp(16.0, 235.0) as u8;
+            y.push(v);
         }
     }
-    RawFrame {
+    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+    let u = vec![128u8; (cw * ch) as usize];
+    let v = vec![128u8; (cw * ch) as usize];
+    Frame {
         width,
         height,
-        data,
+        y,
+        u,
+        v,
     }
 }

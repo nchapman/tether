@@ -1,5 +1,5 @@
 //! Client-side display: a winit window driving a wgpu render pipeline,
-//! fed from a crossbeam channel of [`RawFrame`]s.
+//! fed from a crossbeam channel of [`Frame`]s.
 //!
 //! The v0 path is RGBA passthrough only. A YUV→RGB fragment shader,
 //! adaptive jitter buffer, zero-copy decoded-texture import, and
@@ -26,13 +26,30 @@ use gpu::GpuState;
 pub use winit::event::MouseButton;
 pub use winit::keyboard::{KeyCode, ModifiersState};
 
-/// A single uncompressed RGBA frame. Pixel layout is row-major,
-/// `width * height * 4` bytes total, R first, alpha last.
+/// One frame's worth of pixel data, in YUV 4:2:0 planar (I420) form —
+/// the format the H.264 decoder produces natively. Render uploads each
+/// plane as its own single-channel texture and converts to RGB in the
+/// fragment shader, skipping the per-frame CPU YUV→BGRA→RGBA bounce
+/// the older path needed.
 #[derive(Clone, Debug)]
-pub struct RawFrame {
+pub struct Frame {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>,
+    /// Tight Y plane, `width * height` bytes.
+    pub y: Vec<u8>,
+    /// Tight U plane, `chroma_width * chroma_height` bytes where
+    /// `chroma_width = (width + 1) / 2` (same for height).
+    pub u: Vec<u8>,
+    /// Tight V plane, same layout as U.
+    pub v: Vec<u8>,
+}
+
+impl Frame {
+    /// Chroma plane dimensions for the 4:2:0 subsampling we assume.
+    #[must_use]
+    pub fn chroma_dims(&self) -> (u32, u32) {
+        (self.width.div_ceil(2), self.height.div_ceil(2))
+    }
 }
 
 /// Input-side events surfaced from the window's event loop. The render
@@ -110,7 +127,7 @@ pub type EventSink = Box<dyn Fn(RenderEvent) + Send>;
 pub fn run(
     title: &str,
     initial_size: (u32, u32),
-    frames: Receiver<RawFrame>,
+    frames: Receiver<Frame>,
     on_event: Option<EventSink>,
 ) -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -132,8 +149,8 @@ struct App {
     initial_size: (u32, u32),
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
-    frames: Receiver<RawFrame>,
-    latest: Option<RawFrame>,
+    frames: Receiver<Frame>,
+    latest: Option<Frame>,
     on_event: Option<EventSink>,
 }
 

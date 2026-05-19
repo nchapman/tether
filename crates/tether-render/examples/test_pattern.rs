@@ -56,5 +56,6 @@ fn test_pattern(width: u32, height: u32, t: u32) -> Frame {
         y,
         u,
         v,
+        t_capture_client_clock: None,
     }
 }

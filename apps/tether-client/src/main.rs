@@ -169,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
                             y: dec.y,
                             u: dec.u,
                             v: dec.v,
+                            t_capture_client_clock: Some(host_in_client_clock),
                         };
                         // Drop on full — render is intentionally one-deep.
                         let _ = frame_tx.try_send(raw);

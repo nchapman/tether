@@ -9,7 +9,10 @@ mod gpu;
 
 use std::sync::Arc;
 
+use std::time::{Duration, Instant};
+
 use crossbeam_channel::Receiver;
+use tether_protocol::MonoNanos;
 use tracing::warn;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -42,6 +45,15 @@ pub struct Frame {
     pub u: Vec<u8>,
     /// Tight V plane, same layout as U.
     pub v: Vec<u8>,
+    /// Optional client-clock timestamp of when this frame was
+    /// captured at the host (translated through the handshake's
+    /// `ClockSync::remote_to_local`, so it shares an epoch with
+    /// any `MonoNanos::now()` on this side). When set, the render
+    /// loop uses it to log capture-to-present latency once per
+    /// second — the second segment of the glass-to-glass budget
+    /// that the recv-side latency log can't see. `None` for
+    /// callers that don't care (the test_pattern example).
+    pub t_capture_client_clock: Option<MonoNanos>,
 }
 
 impl Frame {
@@ -139,10 +151,12 @@ pub fn run(
         frames,
         latest: None,
         on_event,
+        present_stats: PresentStats::default(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
+
 
 struct App {
     title: String,
@@ -152,6 +166,44 @@ struct App {
     frames: Receiver<Frame>,
     latest: Option<Frame>,
     on_event: Option<EventSink>,
+    /// Per-frame present-latency stats: sum / count / start.
+    /// Flushed once a second so a long-running session doesn't
+    /// silently accumulate floating-point error. `None` until we've
+    /// presented at least one timestamped frame.
+    present_stats: PresentStats,
+}
+
+#[derive(Default)]
+struct PresentStats {
+    sum_ns: u128,
+    samples: u32,
+    window_start: Option<Instant>,
+}
+
+impl PresentStats {
+    fn record_and_maybe_log(&mut self, latency_ns: u64) {
+        self.sum_ns += u128::from(latency_ns);
+        self.samples += 1;
+        let now = Instant::now();
+        let start = *self.window_start.get_or_insert(now);
+        if now.duration_since(start) >= Duration::from_secs(1) {
+            let avg_ms = if self.samples == 0 {
+                0.0
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let sum_f = self.sum_ns as f64;
+                sum_f / f64::from(self.samples) / 1_000_000.0
+            };
+            tracing::info!(
+                samples = self.samples,
+                avg_present_latency_ms = avg_ms,
+                "present stats"
+            );
+            self.sum_ns = 0;
+            self.samples = 0;
+            self.window_start = Some(now);
+        }
+    }
 }
 
 impl App {
@@ -204,11 +256,21 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
+                let t_capture = self.latest.as_ref().and_then(|f| f.t_capture_client_clock);
                 if let Some(frame) = &self.latest {
                     gpu.upload(frame);
                 }
                 if let Err(e) = gpu.render() {
                     warn!(error = ?e, "render frame failed");
+                }
+                // Sample t_present after the present() call inside
+                // gpu.render() returns. This isn't the true on-screen
+                // time (that's compositor + display latency further
+                // down) but it bounds it from below, which is enough
+                // to decompose recv-to-present vs network+encode.
+                if let Some(t_cap) = t_capture {
+                    let latency = MonoNanos::now().saturating_sub(t_cap);
+                    self.present_stats.record_and_maybe_log(latency);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

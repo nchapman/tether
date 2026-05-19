@@ -3130,6 +3130,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "pollster",
+ "tether-protocol",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",

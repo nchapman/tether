@@ -7,6 +7,8 @@ license.workspace = true
 description = "Client-side display: wgpu + winit, YUV->RGB shader, jitter buffer, present timing."
 
 [dependencies]
+tether-protocol = { workspace = true }
+
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }

@@ -19,8 +19,42 @@ use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Se
 
 use tether_protocol::cursor::ClientCursorPacket;
 use tether_protocol::input::{
-    HidUsage, InputEvent, InputEventKind, MouseButton as ProtoButton, ScrollKind,
+    HidUsage, InputEvent, InputEventKind, Modifiers, MouseButton as ProtoButton, ScrollKind,
 };
+
+// HID Page 0x07 + usage IDs for the eight modifier keys. The trailing
+// 4 are the right-side variants (e.g. RCtrl); held_keys is a flat
+// HashSet so a "shift held" check has to look up both LShift and RShift.
+const HID_LCTRL: HidUsage = HidUsage((0x07 << 16) | 0xE0);
+const HID_LSHIFT: HidUsage = HidUsage((0x07 << 16) | 0xE1);
+const HID_LALT: HidUsage = HidUsage((0x07 << 16) | 0xE2);
+const HID_LMETA: HidUsage = HidUsage((0x07 << 16) | 0xE3);
+const HID_RCTRL: HidUsage = HidUsage((0x07 << 16) | 0xE4);
+const HID_RSHIFT: HidUsage = HidUsage((0x07 << 16) | 0xE5);
+const HID_RALT: HidUsage = HidUsage((0x07 << 16) | 0xE6);
+const HID_RMETA: HidUsage = HidUsage((0x07 << 16) | 0xE7);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ModBit {
+    Shift,
+    Ctrl,
+    Alt,
+    Meta,
+}
+
+/// Identify which modifier bit a HID usage controls (or `None` for
+/// non-modifier keys). Used to skip reconciliation for the very
+/// modifier we're about to press / release, which would otherwise
+/// double-press.
+fn modifier_bit_of(hid: HidUsage) -> Option<ModBit> {
+    match hid {
+        HID_LSHIFT | HID_RSHIFT => Some(ModBit::Shift),
+        HID_LCTRL | HID_RCTRL => Some(ModBit::Ctrl),
+        HID_LALT | HID_RALT => Some(ModBit::Alt),
+        HID_LMETA | HID_RMETA => Some(ModBit::Meta),
+        _ => None,
+    }
+}
 
 use super::{InjectError, Injector, Result};
 
@@ -97,6 +131,81 @@ impl Drop for LibeiInjector {
     }
 }
 
+impl LibeiInjector {
+    /// What we currently believe is held on the host, derived from
+    /// `held_keys`. Cheap (8 lookups in a small HashSet).
+    fn host_modifiers(&self) -> Modifiers {
+        Modifiers {
+            shift: self.held_keys.contains(&HID_LSHIFT) || self.held_keys.contains(&HID_RSHIFT),
+            ctrl: self.held_keys.contains(&HID_LCTRL) || self.held_keys.contains(&HID_RCTRL),
+            alt: self.held_keys.contains(&HID_LALT) || self.held_keys.contains(&HID_RALT),
+            meta: self.held_keys.contains(&HID_LMETA) || self.held_keys.contains(&HID_RMETA),
+        }
+    }
+
+    /// Bring host modifier state in line with what the wire says is
+    /// held, by synthesising press/release pairs for any bit that
+    /// disagrees. `skip` lets the caller exclude the bit they're
+    /// about to press or release themselves (would otherwise
+    /// double-press).
+    ///
+    /// Mirrors Sunshine's `send_key_and_modifiers` and RustDesk's
+    /// pre-mouse-down reconciliation. The "left" variant is always
+    /// synthesised — we don't try to remember which side the user
+    /// originally pressed, since the wire's `Modifiers` bitmask
+    /// doesn't carry that distinction.
+    fn reconcile_modifiers(&mut self, wire: Modifiers, skip: Option<ModBit>) -> Result<()> {
+        let host = self.host_modifiers();
+        for (bit, wire_bit, host_bit, hid) in [
+            (ModBit::Shift, wire.shift, host.shift, HID_LSHIFT),
+            (ModBit::Ctrl, wire.ctrl, host.ctrl, HID_LCTRL),
+            (ModBit::Alt, wire.alt, host.alt, HID_LALT),
+            (ModBit::Meta, wire.meta, host.meta, HID_LMETA),
+        ] {
+            if Some(bit) == skip || wire_bit == host_bit {
+                continue;
+            }
+            let direction = if wire_bit {
+                Direction::Press
+            } else {
+                Direction::Release
+            };
+            if let Some(k) = hid_to_enigo(hid) {
+                self.enigo
+                    .key(k, direction)
+                    .map_err(|e| InjectError::Inject(format!("reconcile modifier: {e:?}")))?;
+                if wire_bit {
+                    self.held_keys.insert(hid);
+                } else {
+                    self.held_keys.remove(&hid);
+                    // Also clear the right-hand variant if it happened
+                    // to be in our set — a single wire bit covers both.
+                    self.held_keys
+                        .remove(&modifier_right_variant(hid).unwrap_or(hid));
+                }
+                tracing::trace!(
+                    ?bit,
+                    ?direction,
+                    "synthesised modifier to match wire state"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Map a left modifier HID to its right-side variant (and vice versa)
+/// so the release path can clear both sides of a single wire bit.
+fn modifier_right_variant(hid: HidUsage) -> Option<HidUsage> {
+    match hid {
+        HID_LSHIFT => Some(HID_RSHIFT),
+        HID_LCTRL => Some(HID_RCTRL),
+        HID_LALT => Some(HID_RALT),
+        HID_LMETA => Some(HID_RMETA),
+        _ => None,
+    }
+}
+
 impl Injector for LibeiInjector {
     // All float->int casts here either clamp (mouse coords) or round and
     // saturate (scroll ticks); none can produce a value outside the
@@ -104,7 +213,8 @@ impl Injector for LibeiInjector {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn inject(&mut self, evt: &InputEvent) -> Result<()> {
         match &evt.kind {
-            InputEventKind::KeyDown { key, .. } => {
+            InputEventKind::KeyDown { key, modifiers } => {
+                self.reconcile_modifiers(*modifiers, modifier_bit_of(*key))?;
                 if let Some(k) = hid_to_enigo(*key) {
                     self.enigo
                         .key(k, Direction::Press)
@@ -113,7 +223,8 @@ impl Injector for LibeiInjector {
                 }
                 Ok(())
             }
-            InputEventKind::KeyUp { key, .. } => {
+            InputEventKind::KeyUp { key, modifiers } => {
+                self.reconcile_modifiers(*modifiers, modifier_bit_of(*key))?;
                 if let Some(k) = hid_to_enigo(*key) {
                     self.enigo
                         .key(k, Direction::Release)
@@ -134,7 +245,12 @@ impl Injector for LibeiInjector {
                     .map_err(|e| InjectError::Inject(format!("text: {e:?}")))?;
                 Ok(())
             }
-            InputEventKind::MouseButton { button, pressed } => {
+            InputEventKind::MouseButton {
+                button,
+                pressed,
+                modifiers,
+            } => {
+                self.reconcile_modifiers(*modifiers, None)?;
                 let b = proto_button_to_enigo(*button);
                 self.enigo
                     .button(
@@ -153,7 +269,13 @@ impl Injector for LibeiInjector {
                 }
                 Ok(())
             }
-            InputEventKind::MouseScroll { dx, dy, kind } => {
+            InputEventKind::MouseScroll {
+                dx,
+                dy,
+                kind,
+                modifiers,
+            } => {
+                self.reconcile_modifiers(*modifiers, None)?;
                 // libei wants discrete ticks. For pixel-mode trackpads
                 // we lose sub-tick precision — acceptable for v0.
                 let scale = match kind {

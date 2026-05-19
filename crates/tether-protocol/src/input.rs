@@ -60,8 +60,23 @@ pub enum InputEventKind {
     // queue of keystrokes can't head-of-line-block the pointer. The
     // input stream stays reliable + ordered for things that *must*
     // arrive (key state, button clicks, scroll deltas).
-    MouseButton { button: MouseButton, pressed: bool },
-    MouseScroll { dx: f32, dy: f32, kind: ScrollKind },
+    //
+    // Mouse events carry a `modifiers` snapshot for the same reason
+    // key events do: lets the host reconcile against whatever it
+    // thinks is held and avoid drift after a dropped event or a
+    // focus-loss-induced state reset. Shift-click selection-extend,
+    // Ctrl-scroll zoom, and Cmd-click on macOS all rely on this.
+    MouseButton {
+        button: MouseButton,
+        pressed: bool,
+        modifiers: Modifiers,
+    },
+    MouseScroll {
+        dx: f32,
+        dy: f32,
+        kind: ScrollKind,
+        modifiers: Modifiers,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

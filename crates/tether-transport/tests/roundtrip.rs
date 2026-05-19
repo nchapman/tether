@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use tether_protocol::{
     control::ControlMessage,
     cursor::{ClientCursorPacket, HostCursorPacket},
-    input::{InputEvent, InputEventKind, MouseButton},
+    input::{InputEvent, InputEventKind, Modifiers, MouseButton},
     video::{HostFrameTiming, InputEchoBatch, VideoFrameMeta, VideoPacket},
     MonoNanos,
 };
@@ -110,6 +110,7 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
         kind: InputEventKind::MouseButton {
             button: MouseButton::Left,
             pressed: true,
+            modifiers: Modifiers::default(),
         },
     };
     conn.send_input(&evt).await?;
@@ -159,6 +160,7 @@ async fn input_stream_wrong_role_errors() -> anyhow::Result<()> {
             kind: InputEventKind::MouseButton {
                 button: MouseButton::Left,
                 pressed: true,
+                modifiers: Modifiers::default(),
             },
         };
         let result = conn.send_input(&evt).await;

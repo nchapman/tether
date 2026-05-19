@@ -163,7 +163,11 @@ impl WinitTranslator {
                         return Vec::new();
                     }
                 };
-                vec![InputEventKind::MouseButton { button, pressed }]
+                vec![InputEventKind::MouseButton {
+                    button,
+                    pressed,
+                    modifiers: self.modifiers,
+                }]
             }
             RenderEvent::Scroll { dx, dy, by_line } => {
                 vec![InputEventKind::MouseScroll {
@@ -174,6 +178,7 @@ impl WinitTranslator {
                     } else {
                         ScrollKind::Pixel
                     },
+                    modifiers: self.modifiers,
                 }]
             }
         };

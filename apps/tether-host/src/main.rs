@@ -164,11 +164,24 @@ async fn main() -> anyhow::Result<()> {
 
     // Input recv: drain the client's input stream and feed each event
     // into the host's injection backend. Backend selection happens
-    // before the recv loop starts so the user sees any portal prompt
+    // before the recv loops start so the user sees any portal prompt
     // up front; a backend init failure is non-fatal — we fall back to
     // a noop injector that just logs.
+    //
+    // The injector is shared between the reliable input-stream task
+    // and the unreliable cursor-datagram task; tokio's Mutex is the
+    // right primitive because both call sites are async and the
+    // critical section (a single enigo call) is short. A std Mutex
+    // would risk blocking a tokio worker if libei ever takes longer
+    // than a few microseconds.
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex as TokioMutex;
+    let injector = StdArc::new(TokioMutex::new(
+        tether_input::inject::default_injector().await,
+    ));
+
     let conn_input = conn.clone();
-    let mut injector = tether_input::inject::default_injector().await;
+    let injector_for_input = injector.clone();
     tokio::spawn(async move {
         loop {
             match conn_input.recv_input().await {
@@ -179,12 +192,39 @@ async fn main() -> anyhow::Result<()> {
                         kind = ?evt.kind,
                         "input event"
                     );
-                    if let Err(e) = injector.inject(&evt) {
+                    let mut inj = injector_for_input.lock().await;
+                    if let Err(e) = inj.inject(&evt) {
                         warn!(error = %e, "injector rejected event; dropping");
                     }
                 }
                 Err(e) => {
                     warn!(error = ?e, "input recv failed; ending input task");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Datagram recv: cursor packets ride the unreliable channel for
+    // latency. Video and host-cursor datagrams flow the other
+    // direction; they should never arrive here, but we match
+    // defensively so a misbehaving client can't crash the host.
+    let conn_dgram = conn.clone();
+    let injector_for_dgram = injector.clone();
+    tokio::spawn(async move {
+        loop {
+            match conn_dgram.recv_datagram().await {
+                Ok(Datagram::ClientCursor(c)) => {
+                    let mut inj = injector_for_dgram.lock().await;
+                    if let Err(e) = inj.inject_cursor(&c) {
+                        warn!(error = %e, "cursor inject failed; dropping");
+                    }
+                }
+                Ok(Datagram::Video(_)) | Ok(Datagram::HostCursor(_)) => {
+                    tracing::trace!("unexpected host-direction datagram on host; ignoring");
+                }
+                Err(e) => {
+                    warn!(error = ?e, "datagram recv failed; ending datagram task");
                     return;
                 }
             }

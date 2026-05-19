@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use tether_protocol::{
     control::ControlMessage,
-    cursor::CursorPacket,
+    cursor::{ClientCursorPacket, HostCursorPacket},
     input::{InputEvent, InputEventKind, MouseButton},
     video::{HostFrameTiming, InputEchoBatch, VideoFrameMeta, VideoPacket},
     MonoNanos,
@@ -31,13 +31,23 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
             other => panic!("expected video First, got {other:?}"),
         }
 
-        // Receive a cursor datagram
+        // Receive a host-cursor datagram (host → client direction).
         match conn.recv_datagram().await? {
-            Datagram::Cursor(CursorPacket::Position { x, y, .. }) => {
+            Datagram::HostCursor(HostCursorPacket::Position { x, y, .. }) => {
                 assert_eq!(x, 100);
                 assert_eq!(y, 200);
             }
-            other => panic!("expected cursor Position, got {other:?}"),
+            other => panic!("expected host cursor Position, got {other:?}"),
+        }
+
+        // Receive a client-cursor datagram (client → host direction).
+        match conn.recv_datagram().await? {
+            Datagram::ClientCursor(c) => {
+                assert_eq!(c.seq, 1);
+                assert!((c.x - 0.5).abs() < 1e-6);
+                assert!(c.visible);
+            }
+            other => panic!("expected client cursor, got {other:?}"),
         }
 
         // Send a ForceIdr back on the control stream
@@ -70,13 +80,23 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
     };
     conn.send_datagram(&Datagram::Video(video))?;
 
-    let cursor = CursorPacket::Position {
+    let host_cursor = HostCursorPacket::Position {
         t_capture: MonoNanos::now(),
         x: 100,
         y: 200,
         visible: true,
     };
-    conn.send_datagram(&Datagram::Cursor(cursor))?;
+    conn.send_datagram(&Datagram::HostCursor(host_cursor))?;
+
+    let client_cursor = ClientCursorPacket {
+        seq: 1,
+        display_idx: 0,
+        x: 0.5,
+        y: 0.5,
+        visible: true,
+        t_client: MonoNanos::now(),
+    };
+    conn.send_datagram(&Datagram::ClientCursor(client_cursor))?;
 
     let ctl = conn.recv_control().await?;
     assert!(

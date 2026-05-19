@@ -11,11 +11,23 @@ pub mod inject;
 
 pub use inject::{InjectError, Injector, NoopInjector};
 
+use tether_protocol::cursor::ClientCursorPacket;
 use tether_protocol::input::{
     HidUsage, InputEvent, InputEventKind, Modifiers, MouseButton, ScrollKind,
 };
 use tether_protocol::MonoNanos;
 use tether_render::{KeyCode, ModifiersState, RenderEvent};
+
+/// One translated event ready to ship over the wire. The two arms map
+/// to the two distinct wire channels they ride: `Input` goes on the
+/// reliable input stream, `Cursor` goes on the unreliable cursor
+/// datagram channel. Callers must respect the split — sending a
+/// `Cursor` over the input stream would defeat its whole purpose.
+#[derive(Clone, Debug)]
+pub enum WireEvent {
+    Input(InputEvent),
+    Cursor(ClientCursorPacket),
+}
 
 /// HID Usage Page 0x07 is "Keyboard / Keypad". Bit-packed with the usage
 /// id into a single `u32` per `HidUsage`'s contract: `(page << 16) | usage`.
@@ -35,6 +47,11 @@ fn hid_keyboard(usage: u32) -> HidUsage {
 pub struct WinitTranslator {
     modifiers: Modifiers,
     next_event_id: u64,
+    /// Per-connection cursor sequence number. Datagrams reorder
+    /// freely; the host uses this to drop late-arriving positions
+    /// (a stale x,y after a fresher one would visibly snap the
+    /// pointer backwards).
+    next_cursor_seq: u32,
     /// Last cursor position inside the video region, normalised to
     /// `[0,1]^2`. We remember it across mouse-button and mouse-wheel
     /// events because winit delivers button/scroll events without
@@ -54,14 +71,17 @@ impl WinitTranslator {
         Self {
             modifiers: Modifiers::default(),
             next_event_id: 0,
+            next_cursor_seq: 0,
             last_cursor: None,
         }
     }
 
-    /// Consume one render event and produce zero or more wire-level input
-    /// events. Most render events translate 1:1, but a couple are
-    /// pure state updates (modifiers, focus) and return an empty Vec.
-    pub fn translate(&mut self, event: RenderEvent) -> Vec<InputEvent> {
+    /// Consume one render event and produce zero or more wire events.
+    /// Most render events translate 1:1; modifier/focus updates are
+    /// pure internal state changes and return an empty Vec. Cursor
+    /// motion produces `WireEvent::Cursor` (datagram path); everything
+    /// else produces `WireEvent::Input` (reliable input stream).
+    pub fn translate(&mut self, event: RenderEvent) -> Vec<WireEvent> {
         let kinds = match event {
             RenderEvent::Modifiers(state) => {
                 self.modifiers = modifiers_from_winit(state);
@@ -72,26 +92,23 @@ impl WinitTranslator {
                     // Forget cursor + modifier state on focus loss so
                     // the host doesn't end up with a sticky modifier
                     // or a click that landed on whatever was focused
-                    // when we re-enter the window.
+                    // when we re-enter the window. Tell the host the
+                    // pointer left the video region too (visible=false)
+                    // so its synthetic cursor disappears.
                     self.modifiers = Modifiers::default();
+                    let pkt = self.next_cursor_packet(0.0, 0.0, false);
                     self.last_cursor = None;
+                    return vec![WireEvent::Cursor(pkt)];
                 }
                 return Vec::new();
             }
             RenderEvent::Cursor { video_normalized } => {
                 self.last_cursor = video_normalized;
-                match video_normalized {
-                    Some((x, y)) => vec![InputEventKind::MousePosition {
-                        // Single-display client for now; multi-monitor
-                        // selection lives in the protocol so the wire
-                        // doesn't have to break when we add it on the
-                        // client side.
-                        display_idx: 0,
-                        x,
-                        y,
-                    }],
-                    None => Vec::new(),
-                }
+                let pkt = match video_normalized {
+                    Some((x, y)) => self.next_cursor_packet(x, y, true),
+                    None => self.next_cursor_packet(0.0, 0.0, false),
+                };
+                return vec![WireEvent::Cursor(pkt)];
             }
             RenderEvent::Key {
                 code,
@@ -163,7 +180,7 @@ impl WinitTranslator {
         self.wrap(kinds)
     }
 
-    fn wrap(&mut self, kinds: Vec<InputEventKind>) -> Vec<InputEvent> {
+    fn wrap(&mut self, kinds: Vec<InputEventKind>) -> Vec<WireEvent> {
         kinds
             .into_iter()
             .map(|kind| {
@@ -173,9 +190,22 @@ impl WinitTranslator {
                     kind,
                 };
                 self.next_event_id = self.next_event_id.wrapping_add(1);
-                evt
+                WireEvent::Input(evt)
             })
             .collect()
+    }
+
+    fn next_cursor_packet(&mut self, x: f32, y: f32, visible: bool) -> ClientCursorPacket {
+        let pkt = ClientCursorPacket {
+            seq: self.next_cursor_seq,
+            display_idx: 0,
+            x,
+            y,
+            visible,
+            t_client: MonoNanos::now(),
+        };
+        self.next_cursor_seq = self.next_cursor_seq.wrapping_add(1);
+        pkt
     }
 }
 
@@ -315,6 +345,13 @@ fn keycode_to_hid(code: KeyCode) -> Option<HidUsage> {
 mod tests {
     use super::*;
 
+    fn expect_input(w: &WireEvent) -> &InputEvent {
+        match w {
+            WireEvent::Input(e) => e,
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
     #[test]
     fn keydown_carries_current_modifiers() {
         let mut t = WinitTranslator::new();
@@ -332,7 +369,7 @@ mod tests {
             text: None,
         });
         assert_eq!(evts.len(), 1);
-        match &evts[0].kind {
+        match &expect_input(&evts[0]).kind {
             InputEventKind::KeyDown { key, modifiers } => {
                 assert_eq!(*key, hid_keyboard(0x04));
                 assert!(modifiers.shift);
@@ -355,12 +392,16 @@ mod tests {
     }
 
     #[test]
-    fn cursor_outside_video_emits_nothing() {
+    fn cursor_outside_video_emits_invisible_packet() {
         let mut t = WinitTranslator::new();
         let evts = t.translate(RenderEvent::Cursor {
             video_normalized: None,
         });
-        assert!(evts.is_empty());
+        assert_eq!(evts.len(), 1);
+        match &evts[0] {
+            WireEvent::Cursor(c) => assert!(!c.visible),
+            other => panic!("expected Cursor, got {other:?}"),
+        }
     }
 
     #[test]
@@ -379,7 +420,7 @@ mod tests {
             repeat: false,
             text: None,
         });
-        match &evts[0].kind {
+        match &expect_input(&evts[0]).kind {
             InputEventKind::KeyDown { modifiers, .. } => {
                 assert!(!modifiers.ctrl);
             }
@@ -390,20 +431,25 @@ mod tests {
     #[test]
     fn event_ids_increment() {
         let mut t = WinitTranslator::new();
-        let a = &t.translate(RenderEvent::Key {
-            code: KeyCode::KeyA,
-            pressed: true,
-            repeat: false,
-            text: None,
-        })[0];
-        let id_a = a.event_id;
-        let b = &t.translate(RenderEvent::Key {
-            code: KeyCode::KeyB,
-            pressed: true,
-            repeat: false,
-            text: None,
-        })[0];
-        assert_eq!(b.event_id, id_a + 1);
+        let a = expect_input(
+            &t.translate(RenderEvent::Key {
+                code: KeyCode::KeyA,
+                pressed: true,
+                repeat: false,
+                text: None,
+            })[0],
+        )
+        .event_id;
+        let b = expect_input(
+            &t.translate(RenderEvent::Key {
+                code: KeyCode::KeyB,
+                pressed: true,
+                repeat: false,
+                text: None,
+            })[0],
+        )
+        .event_id;
+        assert_eq!(b, a + 1);
     }
 
     #[test]
@@ -416,7 +462,7 @@ mod tests {
             text: Some("a".into()),
         });
         assert_eq!(evts.len(), 1);
-        match &evts[0].kind {
+        match &expect_input(&evts[0]).kind {
             InputEventKind::Text { utf8 } => assert_eq!(utf8, "a"),
             other => panic!("expected Text, got {other:?}"),
         }
@@ -430,9 +476,6 @@ mod tests {
             m |= ModifiersState::CONTROL;
             m
         }));
-        // OS sometimes still resolves text for Ctrl+letter (depending
-        // on platform); we should still route via HID so the host
-        // sees Ctrl+C as a shortcut, not the literal character "c".
         let evts = t.translate(RenderEvent::Key {
             code: KeyCode::KeyC,
             pressed: true,
@@ -440,7 +483,7 @@ mod tests {
             text: Some("c".into()),
         });
         assert_eq!(evts.len(), 1);
-        match &evts[0].kind {
+        match &expect_input(&evts[0]).kind {
             InputEventKind::KeyDown { modifiers, .. } => assert!(modifiers.ctrl),
             other => panic!("expected KeyDown, got {other:?}"),
         }
@@ -448,9 +491,6 @@ mod tests {
 
     #[test]
     fn shift_does_not_force_hid_path() {
-        // Shift+A produces text="A"; that's what the user typed. Text
-        // path is correct here — host's `type-text("A")` works
-        // regardless of host keymap.
         let mut t = WinitTranslator::new();
         t.translate(RenderEvent::Modifiers({
             let mut m = ModifiersState::default();
@@ -463,21 +503,25 @@ mod tests {
             repeat: false,
             text: Some("A".into()),
         });
-        match &evts[0].kind {
+        match &expect_input(&evts[0]).kind {
             InputEventKind::Text { utf8 } => assert_eq!(utf8, "A"),
             other => panic!("expected Text, got {other:?}"),
         }
     }
 
     #[test]
-    fn cursor_carries_display_idx() {
+    fn cursor_emits_packet_with_incrementing_seq() {
         let mut t = WinitTranslator::new();
-        let evts = t.translate(RenderEvent::Cursor {
+        let evts1 = t.translate(RenderEvent::Cursor {
             video_normalized: Some((0.5, 0.5)),
         });
-        match &evts[0].kind {
-            InputEventKind::MousePosition { display_idx, .. } => assert_eq!(*display_idx, 0),
-            other => panic!("expected MousePosition, got {other:?}"),
-        }
+        let evts2 = t.translate(RenderEvent::Cursor {
+            video_normalized: Some((0.6, 0.6)),
+        });
+        let (s1, s2) = match (&evts1[0], &evts2[0]) {
+            (WireEvent::Cursor(a), WireEvent::Cursor(b)) => (a.seq, b.seq),
+            _ => panic!("expected Cursor packets"),
+        };
+        assert_eq!(s2, s1 + 1);
     }
 }

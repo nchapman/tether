@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use crossbeam_channel::bounded;
 use tether_codec::{Decoder, H264Decoder};
-use tether_input::WinitTranslator;
+use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{ClientHello, CodecKind, ControlMessage};
 use tether_protocol::video::FrameReassembler;
 use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
@@ -167,7 +167,14 @@ async fn main() -> anyhow::Result<()> {
                         let _ = frame_tx.try_send(raw);
                     }
                 }
-                Ok(Datagram::Cursor(_)) => {}
+                Ok(Datagram::HostCursor(_)) => {
+                    // Host cursor sprite/position rendering isn't wired
+                    // on this side yet; the wire slot is reserved.
+                }
+                Ok(Datagram::ClientCursor(_)) => {
+                    // Client-originated cursor packets should never
+                    // come back to the client; ignore defensively.
+                }
                 Err(e) => {
                     // Promoted from warn → error: this is terminal for the
                     // video stream and the user otherwise sees a frozen
@@ -183,18 +190,36 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Bridge winit window events from the render thread into a tokio
-    // task that owns the connection's input stream. UnboundedSender is
-    // safe to call from the render thread (sync) and the receiver runs
-    // inside the tokio runtime where send_input is async.
+    // task that owns the wire. UnboundedSender is safe to call from
+    // the render thread (sync) and the receiver runs inside the tokio
+    // runtime where the send paths are async. Cursor goes on the
+    // unreliable datagram channel; everything else on the reliable
+    // input stream.
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<RenderEvent>();
     let conn_input = conn.clone();
     tokio::spawn(async move {
         let mut translator = WinitTranslator::new();
         while let Some(render_event) = events_rx.recv().await {
-            for input_event in translator.translate(render_event) {
-                if let Err(e) = conn_input.send_input(&input_event).await {
-                    error!(error = ?e, "send_input failed; ending input loop");
-                    return;
+            for wire in translator.translate(render_event) {
+                match wire {
+                    WireEvent::Input(evt) => {
+                        if let Err(e) = conn_input.send_input(&evt).await {
+                            error!(error = ?e, "send_input failed; ending input loop");
+                            return;
+                        }
+                    }
+                    WireEvent::Cursor(pkt) => {
+                        if let Err(e) =
+                            conn_input.send_datagram(&Datagram::ClientCursor(pkt))
+                        {
+                            // Cursor packets are best-effort by design
+                            // — log at debug and keep going. A burst
+                            // of failures means quinn's send queue is
+                            // saturated, which a moving cursor will
+                            // self-recover from.
+                            tracing::debug!(error = ?e, "cursor datagram drop");
+                        }
+                    }
                 }
             }
         }

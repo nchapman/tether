@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use tether_protocol::{
     control::{ClientHello, ClockSync, ControlMessage, ServerHello},
-    cursor::CursorPacket,
+    cursor::{ClientCursorPacket, HostCursorPacket},
     input::InputEvent,
     video::VideoPacket,
     MAX_DATAGRAM_PAYLOAD,
@@ -22,14 +22,19 @@ use crate::{Result, TransportError, MAX_FRAMED_MESSAGE};
 pub(crate) const STREAM_PREAMBLE_LEN: usize = 4;
 pub(crate) const STREAM_PREAMBLE: &[u8; STREAM_PREAMBLE_LEN] = &[0u8; STREAM_PREAMBLE_LEN];
 
-/// What rides on a QUIC datagram. We multiplex video and cursor packets
-/// onto the same unreliable channel — both prefer drop-on-loss over
+/// What rides on a QUIC datagram. We multiplex three packet types onto
+/// the same unreliable channel — all three prefer drop-on-loss over
 /// retransmit. The enum discriminant adds one byte per datagram; the
 /// receiver demuxes via `match`.
+///
+/// - [`Datagram::Video`] is host → client.
+/// - [`Datagram::HostCursor`] is host → client (cursor sprite + position).
+/// - [`Datagram::ClientCursor`] is client → host (pointer position).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Datagram {
     Video(VideoPacket),
-    Cursor(CursorPacket),
+    HostCursor(HostCursorPacket),
+    ClientCursor(ClientCursorPacket),
 }
 
 /// An established QUIC connection between host and client.

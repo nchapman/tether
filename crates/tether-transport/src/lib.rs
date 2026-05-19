@@ -5,8 +5,9 @@
 //! over one QUIC connection:
 //!
 //! - **Datagrams** (unreliable, unordered) carrying
-//!   [`tether_protocol::video::VideoPacket`] and
-//!   [`tether_protocol::cursor::CursorPacket`], demuxed via the
+//!   [`tether_protocol::video::VideoPacket`],
+//!   [`tether_protocol::cursor::HostCursorPacket`], and
+//!   [`tether_protocol::cursor::ClientCursorPacket`], demuxed via the
 //!   [`Datagram`] enum.
 //! - A **bidirectional control stream** (reliable, ordered) for
 //!   [`tether_protocol::control::ControlMessage`] —

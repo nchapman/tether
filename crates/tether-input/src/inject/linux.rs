@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 
+use tether_protocol::cursor::ClientCursorPacket;
 use tether_protocol::input::{
     HidUsage, InputEvent, InputEventKind, MouseButton as ProtoButton, ScrollKind,
 };
@@ -33,6 +34,11 @@ pub struct LibeiInjector {
     /// Sunshine's `input::reset`.
     held_keys: HashSet<HidUsage>,
     held_buttons: HashSet<ProtoButton>,
+    /// Highest cursor seq we've applied. Cursor datagrams reorder; we
+    /// drop any incoming packet whose seq is older. `None` until the
+    /// first cursor arrives. u32 wraps; a 4-billion-event reset is
+    /// effectively never in v0.
+    last_cursor_seq: Option<u32>,
 }
 
 impl LibeiInjector {
@@ -53,6 +59,7 @@ impl LibeiInjector {
             display,
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
+            last_cursor_seq: None,
         })
     }
 }
@@ -109,29 +116,6 @@ impl Injector for LibeiInjector {
                     .map_err(|e| InjectError::Inject(format!("text: {e:?}")))?;
                 Ok(())
             }
-            InputEventKind::MousePosition {
-                display_idx,
-                x,
-                y,
-            } => {
-                if *display_idx != 0 {
-                    // Multi-monitor host addressing isn't wired up yet;
-                    // pin everything to the primary display and let the
-                    // operator notice via the trace log if they ever
-                    // see this.
-                    tracing::trace!(display_idx, "non-zero display_idx; pinning to primary");
-                }
-                // [0,1] -> absolute pixel within the primary display.
-                // Clamp because the client *should* already have done so
-                // but a misbehaving client could still send 1.5, and
-                // enigo doesn't bound-check.
-                let px = (x.clamp(0.0, 1.0) * self.display.0 as f32) as i32;
-                let py = (y.clamp(0.0, 1.0) * self.display.1 as f32) as i32;
-                self.enigo
-                    .move_mouse(px, py, Coordinate::Abs)
-                    .map_err(|e| InjectError::Inject(format!("move_mouse: {e:?}")))?;
-                Ok(())
-            }
             InputEventKind::MouseButton { button, pressed } => {
                 let b = proto_button_to_enigo(*button);
                 self.enigo
@@ -173,6 +157,43 @@ impl Injector for LibeiInjector {
                 Ok(())
             }
         }
+    }
+
+    // All float->int casts here clamp first and project into pixel
+    // coords within a monitor that fits in i32; safe for any display
+    // that exists in 2026.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn inject_cursor(&mut self, cursor: &ClientCursorPacket) -> Result<()> {
+        // Drop reordered datagrams. The wrapping comparison is the
+        // standard "is `new` strictly newer than `last`?" test for an
+        // unsigned counter that wraps at u32::MAX.
+        if let Some(last) = self.last_cursor_seq {
+            if cursor.seq.wrapping_sub(last) >= (u32::MAX / 2) {
+                tracing::trace!(seq = cursor.seq, last, "out-of-order cursor; dropping");
+                return Ok(());
+            }
+        }
+        self.last_cursor_seq = Some(cursor.seq);
+
+        if !cursor.visible {
+            // No-op for now — there's no separate "hide host cursor"
+            // verb in enigo, and the host's own OS cursor renders
+            // independently. When we ship a host-cursor sprite, this
+            // is where the "stop drawing" signal goes.
+            return Ok(());
+        }
+        if cursor.display_idx != 0 {
+            tracing::trace!(
+                display_idx = cursor.display_idx,
+                "non-zero display_idx; pinning to primary"
+            );
+        }
+        let px = (cursor.x.clamp(0.0, 1.0) * self.display.0 as f32) as i32;
+        let py = (cursor.y.clamp(0.0, 1.0) * self.display.1 as f32) as i32;
+        self.enigo
+            .move_mouse(px, py, Coordinate::Abs)
+            .map_err(|e| InjectError::Inject(format!("move_mouse: {e:?}")))?;
+        Ok(())
     }
 }
 

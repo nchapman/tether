@@ -5,6 +5,7 @@
 //! Targets without a real backend fall through to `NoopInjector`, which
 //! just logs each event and returns success.
 
+use tether_protocol::cursor::ClientCursorPacket;
 use tether_protocol::input::InputEvent;
 
 #[derive(Debug, thiserror::Error)]
@@ -17,12 +18,22 @@ pub enum InjectError {
 
 pub type Result<T> = std::result::Result<T, InjectError>;
 
-/// Apply a wire-level [`InputEvent`] to the host's local input system.
-/// Implementations are `Send` so the host can park them inside a tokio
-/// task; they are NOT `Sync` since most backends keep mutable state
-/// (held keys, last-known mouse position) per connection.
+/// Apply wire-level input to the host's local input system. Split into
+/// two methods because the two paths arrive on independent wire
+/// channels (reliable input stream vs. unreliable cursor datagram) and
+/// often need different rate-limiting / coalescing strategies on the
+/// host. Implementations are `Send` so the host can park them inside a
+/// tokio task; they are NOT `Sync` since backends keep mutable state
+/// (held keys, last cursor seq, last-known mouse position) per connection.
 pub trait Injector: Send {
     fn inject(&mut self, evt: &InputEvent) -> Result<()>;
+
+    /// Apply a cursor position from the client → host datagram channel.
+    /// Backends should track the highest `seq` they've seen and drop
+    /// any packet whose seq is older — datagrams reorder freely and a
+    /// stale position after a fresher one would visibly snap the
+    /// pointer backwards.
+    fn inject_cursor(&mut self, cursor: &ClientCursorPacket) -> Result<()>;
 }
 
 /// Last-resort backend: just log the event at debug level and pretend
@@ -36,6 +47,17 @@ impl Injector for NoopInjector {
             event_id = evt.event_id,
             kind = ?evt.kind,
             "noop injector: event discarded"
+        );
+        Ok(())
+    }
+
+    fn inject_cursor(&mut self, cursor: &ClientCursorPacket) -> Result<()> {
+        tracing::trace!(
+            seq = cursor.seq,
+            x = cursor.x,
+            y = cursor.y,
+            visible = cursor.visible,
+            "noop injector: cursor discarded"
         );
         Ok(())
     }

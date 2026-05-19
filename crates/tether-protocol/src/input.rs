@@ -55,21 +55,11 @@ pub enum InputEventKind {
     /// string from physical keycodes. Hosts apply the current keymap;
     /// shortcuts (Ctrl+C etc.) keep going through `KeyDown`/`KeyUp`.
     Text { utf8: String },
-    /// Absolute mouse position normalised to `[0.0, 1.0]` along each axis of
-    /// the client's rendered video surface (the area showing host pixels,
-    /// excluding any letterbox bars introduced by an aspect-ratio mismatch
-    /// between the client window and the host display). The host scales
-    /// these normalised coordinates to its own display resolution before
-    /// injection. Clients must clamp to `[0.0, 1.0]` and suppress events
-    /// whose pointer falls outside the video region. `display_idx`
-    /// addresses a specific display in a multi-monitor host setup;
-    /// single-display hosts and clients that don't know about the
-    /// distinction send `0` (primary).
-    MousePosition {
-        display_idx: u8,
-        x: f32,
-        y: f32,
-    },
+    // Mouse-position events live on the cursor datagram channel
+    // (`tether_protocol::cursor::ClientCursorPacket`), not here, so a
+    // queue of keystrokes can't head-of-line-block the pointer. The
+    // input stream stays reliable + ordered for things that *must*
+    // arrive (key state, button clicks, scroll deltas).
     MouseButton { button: MouseButton, pressed: bool },
     MouseScroll { dx: f32, dy: f32, kind: ScrollKind },
 }

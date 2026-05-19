@@ -172,16 +172,16 @@ mod tests {
 
     #[test]
     fn round_trip_cursor_position() {
-        let c = CursorPacket::Position {
+        let c = HostCursorPacket::Position {
             t_capture: MonoNanos(999),
             x: 100,
             y: -50,
             visible: true,
         };
         let bytes = encode(&c).unwrap();
-        let c2: CursorPacket = decode(&bytes).unwrap();
+        let c2: HostCursorPacket = decode(&bytes).unwrap();
         match c2 {
-            CursorPacket::Position {
+            HostCursorPacket::Position {
                 t_capture,
                 x,
                 y,

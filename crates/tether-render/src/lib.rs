@@ -152,6 +152,7 @@ pub fn run(
         latest: None,
         on_event,
         present_stats: PresentStats::default(),
+        last_recorded_t_cap: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -171,6 +172,13 @@ struct App {
     /// silently accumulate floating-point error. `None` until we've
     /// presented at least one timestamped frame.
     present_stats: PresentStats,
+    /// Capture timestamp of the most recently *recorded* frame, used
+    /// to dedup present-stats samples when the OS fires
+    /// `RedrawRequested` without a new frame having arrived (focus
+    /// change, expose, etc.). Without this, every OS-initiated
+    /// redraw would record the same age again, inflating the sample
+    /// count and pulling the average up.
+    last_recorded_t_cap: Option<MonoNanos>,
 }
 
 #[derive(Default)]
@@ -268,9 +276,19 @@ impl ApplicationHandler for App {
                 // time (that's compositor + display latency further
                 // down) but it bounds it from below, which is enough
                 // to decompose recv-to-present vs network+encode.
+                //
+                // Dedup: only record on a frame we haven't recorded
+                // yet. OS-initiated redraws (window expose, focus
+                // changes) fire RedrawRequested but don't bring a
+                // new frame, so without this guard each one would
+                // re-record the previous frame's latency and inflate
+                // both the sample count and the rolling average.
                 if let Some(t_cap) = t_capture {
-                    let latency = MonoNanos::now().saturating_sub(t_cap);
-                    self.present_stats.record_and_maybe_log(latency);
+                    if self.last_recorded_t_cap != Some(t_cap) {
+                        let latency = MonoNanos::now().saturating_sub(t_cap);
+                        self.present_stats.record_and_maybe_log(latency);
+                        self.last_recorded_t_cap = Some(t_cap);
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

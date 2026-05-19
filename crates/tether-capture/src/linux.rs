@@ -2,8 +2,8 @@
 //! PipeWire.
 //!
 //! v0: CPU-side BGRA / BGRx readback only. DMA-BUF zero-copy into a VAAPI
-//! surface is the task #9 follow-up that lets the encoder consume the
-//! frame without a memory copy.
+//! surface lands later and will let the encoder consume the frame without
+//! a memory copy.
 //!
 //! Calling [`start`] performs the portal handshake (which triggers a
 //! permission dialog on the user's desktop) and then spawns a dedicated
@@ -82,6 +82,11 @@ async fn open_portal() -> Result<(u32, OwnedFd)> {
 struct UserData {
     format: spa::param::video::VideoInfoRaw,
     sender: Sender<CapturedFrame>,
+    /// Set the first time we observe a buffer with no mapped CPU bytes
+    /// (typically because the compositor negotiated DMA-BUF, which v0
+    /// can't import). Used to log once at warn level and then stay quiet
+    /// instead of spamming at frame rate.
+    unmapped_buffer_warned: bool,
 }
 
 fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Result<()> {
@@ -93,6 +98,7 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
     let user_data = UserData {
         format: spa::param::video::VideoInfoRaw::new(),
         sender,
+        unmapped_buffer_warned: false,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -146,6 +152,11 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            // Sample userspace clock as early as possible — anything later
+            // (memcpy, allocation) would fold into the capture-latency
+            // metric. t_capture_kernel stays equal to this until we read
+            // it out of MetaHeader::pts. TODO(linux-capture): MetaHeader.
+            let t = MonoNanos::now();
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -166,6 +177,14 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
                 return;
             }
 
+            // Drop chunks the compositor flagged as corrupted rather than
+            // forwarding garbage pixels downstream.
+            let chunk_flags = data.chunk().flags();
+            if chunk_flags.contains(pw::spa::buffer::ChunkFlags::CORRUPTED) {
+                tracing::trace!(?chunk_flags, "pipewire chunk CORRUPTED; dropping");
+                return;
+            }
+
             let chunk = data.chunk();
             // stride is an i32 in libspa (negative strides are used for
             // bottom-up textures); we reject those for v0 since the rest
@@ -183,16 +202,50 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
             let offset = chunk.offset() as usize;
             let chunk_size = chunk.size() as usize;
             let row_bytes = (width as usize) * 4;
-            let needed = offset + (height as usize).saturating_sub(1) * stride + row_bytes;
+            let needed = offset
+                .saturating_add((height as usize).saturating_sub(1) * stride)
+                .saturating_add(row_bytes);
 
-            let Some(bytes) = data.data() else { return };
-            if bytes.len() < needed.min(offset + chunk_size) {
+            // `data.data()` returns None whenever the buffer isn't backed
+            // by mapped CPU memory — most commonly DMA-BUF, which we
+            // don't yet import. Without this branch we'd silently drop
+            // every frame forever. Log once at warn, then trace, to avoid
+            // filling the log at frame rate.
+            let Some(bytes) = data.data() else {
+                if !user_data.unmapped_buffer_warned {
+                    user_data.unmapped_buffer_warned = true;
+                    tracing::warn!(
+                        data_type = ?data.type_(),
+                        "pipewire buffer has no mapped CPU memory (likely DMA-BUF). \
+                         v0 doesn't import DMA-BUF; all frames will be dropped \
+                         until the compositor renegotiates. Restart capture or \
+                         try a session that prefers SHM/MemFd."
+                    );
+                } else {
+                    tracing::trace!(data_type = ?data.type_(), "skipping unmapped buffer");
+                }
+                return;
+            };
+            // Two independent constraints: bytes must be big enough for
+            // the full plane, AND the chunk must mark the full plane as
+            // valid data. The previous .min(...) made the check pass when
+            // the chunk was *too small*, which could then panic in the
+            // per-row indexing below.
+            if bytes.len() < needed {
                 tracing::warn!(
                     bytes_len = bytes.len(),
-                    offset,
+                    needed,
                     stride,
                     height,
-                    "pipewire chunk smaller than expected; dropping"
+                    "pipewire buffer smaller than declared frame; dropping"
+                );
+                return;
+            }
+            if chunk_size < needed.saturating_sub(offset) {
+                tracing::warn!(
+                    chunk_size,
+                    needed_data = needed.saturating_sub(offset),
+                    "pipewire chunk smaller than declared frame; dropping"
                 );
                 return;
             }
@@ -209,7 +262,6 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
                 }
             }
 
-            let t = MonoNanos::now();
             let frame = CapturedFrame {
                 width,
                 height,

@@ -2814,7 +2814,6 @@ name = "tether-codec"
 version = "0.0.1"
 dependencies = [
  "ffmpeg-next",
- "tether-capture",
  "tether-protocol",
  "thiserror 2.0.18",
  "tracing",

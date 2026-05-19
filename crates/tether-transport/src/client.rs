@@ -95,7 +95,12 @@ fn transport_config() -> quinn::TransportConfig {
             .try_into()
             .expect("30s fits in IdleTimeout"),
     ));
-    // Match the server's headroom; see server.rs for rationale.
+    // Match the server's headroom; see server.rs for rationale. The send
+    // buffer is currently unused on the client (v0 only sends control
+    // stream traffic; no client→host datagrams yet) but is pre-provisioned
+    // for the input + cursor datagram channels that land with
+    // tether-input. Total budget is ~12 MiB per connection — fine on
+    // desktop targets, would need trimming on embedded.
     t.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     t.datagram_send_buffer_size(4 * 1024 * 1024);
     t

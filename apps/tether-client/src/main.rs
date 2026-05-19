@@ -16,7 +16,7 @@ use tether_protocol::video::FrameReassembler;
 use tether_protocol::MonoNanos;
 use tether_render::RawFrame;
 use tether_transport::{Client, Datagram};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // Initial window size — the actual frame dimensions come from
 // `VideoFrameMeta::dimensions` once frames start arriving and the window
@@ -99,7 +99,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(Datagram::Cursor(_)) => {}
                 Err(e) => {
-                    warn!(error = ?e, "datagram recv failed, ending recv loop");
+                    // Promoted from warn → error: this is terminal for the
+                    // video stream and the user otherwise sees a frozen
+                    // last-frame with no indication anything broke. Also
+                    // close the connection explicitly so the host learns
+                    // about it instead of waiting for the idle timeout.
+                    error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
+                    conn_recv.close(1, b"recv failed");
                     break;
                 }
             }
@@ -115,10 +121,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Swap B and R channels in-place to convert BGRA8 to RGBA8. Allocates a
-/// fresh Vec to keep the hot path obvious; a zero-copy variant lands with
-/// the GPU YUV pipeline in task #9.
 fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(bgra.len() % 4, 0, "BGRA buffer must be a multiple of 4 bytes");
     let mut out = Vec::with_capacity(bgra.len());
     for px in bgra.chunks_exact(4) {
         out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);

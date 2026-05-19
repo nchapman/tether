@@ -19,8 +19,8 @@ pub enum CodecError {
     Ffmpeg(#[from] ffmpeg_next::Error),
     #[error("encoder not configured for input format")]
     UnsupportedInputFormat,
-    #[error("buffer too small: got {got} bytes, expected {expected}")]
-    BufferTooSmall { got: usize, expected: usize },
+    #[error("buffer size mismatch: got {got} bytes, expected {expected}")]
+    BufferSizeMismatch { got: usize, expected: usize },
 }
 
 pub type Result<T> = std::result::Result<T, CodecError>;
@@ -31,6 +31,12 @@ pub type Result<T> = std::result::Result<T, CodecError>;
 #[derive(Clone, Debug)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
+    /// The encoder's output PTS for this packet, in the time_base it was
+    /// configured with. `None` when the encoder didn't set one (rare; mostly
+    /// SPS/PPS-only packets before the first frame is fully buffered).
+    /// Jitter buffer logic on the receive side relies on this — keep it
+    /// plumbed end-to-end.
+    pub pts: Option<i64>,
     pub keyframe: bool,
 }
 
@@ -41,6 +47,9 @@ pub struct EncodedPacket {
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
+    /// Decoder-reported PTS in the codec's time_base; `None` if the
+    /// upstream packet didn't carry one.
+    pub pts: Option<i64>,
     pub data: Vec<u8>,
 }
 

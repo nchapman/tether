@@ -112,7 +112,7 @@ impl Encoder for H264Encoder {
     ) -> Result<Vec<EncodedPacket>> {
         let expected = self.bgra_row_bytes * self.height as usize;
         if bgra.len() != expected {
-            return Err(CodecError::BufferTooSmall {
+            return Err(CodecError::BufferSizeMismatch {
                 got: bgra.len(),
                 expected,
             });
@@ -148,10 +148,24 @@ impl Encoder for H264Encoder {
 
         let mut out = Vec::new();
         let mut packet = Packet::empty();
-        while self.encoder.receive_packet(&mut packet).is_ok() {
+        loop {
+            // Mirror the explicit-match style used in the decoder: only
+            // EAGAIN and EOF are "no more output for now" — every other
+            // error is a real codec failure that the caller needs to see.
+            match self.encoder.receive_packet(&mut packet) {
+                Ok(()) => {}
+                Err(ffmpeg_next::Error::Other { errno })
+                    if errno == ffmpeg_next::error::EAGAIN =>
+                {
+                    break;
+                }
+                Err(ffmpeg_next::Error::Eof) => break,
+                Err(e) => return Err(CodecError::Ffmpeg(e)),
+            }
             if let Some(data) = packet.data() {
                 out.push(EncodedPacket {
                     data: data.to_vec(),
+                    pts: packet.pts(),
                     keyframe: packet.is_key(),
                 });
             }
@@ -168,7 +182,12 @@ pub struct H264Decoder {
     decoder: decoder::Video,
     yuv_to_bgra: Option<scaling::Context>,
     bgra_frame: frame::Video,
-    bgra_dims: (u32, u32),
+    /// `(src_pixel_format, width, height)` of the cached `yuv_to_bgra`
+    /// context. The source format must be part of the key — if a peer
+    /// encoder ever switches from YUV420P to NV12 or YUV422 mid-stream,
+    /// the cached swscale would silently keep converting from the stale
+    /// source format and emit garbage pixels.
+    scaler_key: Option<(Pixel, u32, u32)>,
 }
 
 // SAFETY: same rationale as H264Encoder above.
@@ -185,12 +204,12 @@ impl H264Decoder {
             decoder,
             yuv_to_bgra: None,
             bgra_frame: frame::Video::empty(),
-            bgra_dims: (0, 0),
+            scaler_key: None,
         })
     }
 
     fn ensure_scaler(&mut self, src_format: Pixel, w: u32, h: u32) -> Result<()> {
-        if self.bgra_dims == (w, h) && self.yuv_to_bgra.is_some() {
+        if self.scaler_key == Some((src_format, w, h)) && self.yuv_to_bgra.is_some() {
             return Ok(());
         }
         self.yuv_to_bgra = Some(scaling::Context::get(
@@ -203,7 +222,7 @@ impl H264Decoder {
             scaling::Flags::FAST_BILINEAR,
         )?);
         self.bgra_frame = frame::Video::new(Pixel::BGRA, w, h);
-        self.bgra_dims = (w, h);
+        self.scaler_key = Some((src_format, w, h));
         Ok(())
     }
 }
@@ -255,6 +274,7 @@ impl Decoder for H264Decoder {
             out.push(DecodedFrame {
                 width: w,
                 height: h,
+                pts: yuv.pts(),
                 data: packed,
             });
         }

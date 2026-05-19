@@ -8,7 +8,6 @@ description = "Codec trait + ffmpeg-backed encoders/decoders (H.264 first, HEVC 
 
 [dependencies]
 tether-protocol = { workspace = true }
-tether-capture = { workspace = true }
 
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -17,9 +16,8 @@ tracing = { workspace = true }
 # 0.18 is built against the FFmpeg 8.0 ABI and the installed FFmpeg 8.1
 # moved a few struct fields (`oformat` -> method, `pb` -> `io_context`).
 # ffmpeg-next 8.1.0 auto-detects FFmpeg version. We lose safe hwcontext
-# bindings (HW encoders / DMA-BUF import need raw `ffmpeg-sys-next` FFI),
-# which is the task #9 follow-up. Software libx264 works without them.
-# Migrate back to rsmpeg once it ships FFmpeg 8.1 support.
+# bindings — HW encoders / DMA-BUF import will need raw `ffmpeg-sys-next`
+# FFI here until we can migrate back to rsmpeg with FFmpeg 8.1 support.
 ffmpeg-next = "8.1"
 
 [lints]

@@ -132,6 +132,14 @@ impl GpuState {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Seed the uniform with an identity scale so the very first draw
+        // (which can fire before the recv task has uploaded any frame)
+        // doesn't read undefined memory off the GPU. The 1×1 placeholder
+        // texture renders as solid black either way, but reading
+        // uninitialised buffer contents is UB under wgpu's strict
+        // validation layer.
+        let identity_scale: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
+        queue.write_buffer(&scale_buffer, 0, &bytes_of_f32x4(&identity_scale));
         let scale_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tether-render scale bind group"),
             layout: &scale_bgl,
@@ -286,10 +294,8 @@ impl GpuState {
             self.surface_config.width,
             self.surface_config.height,
         ));
-        let mut scale_bytes = [0u8; 16];
-        scale_bytes[0..4].copy_from_slice(&sx.to_le_bytes());
-        scale_bytes[4..8].copy_from_slice(&sy.to_le_bytes());
-        self.queue.write_buffer(&self.scale_buffer, 0, &scale_bytes);
+        self.queue
+            .write_buffer(&self.scale_buffer, 0, &bytes_of_f32x4(&[sx, sy, 0.0, 0.0]));
 
         let view = output
             .texture
@@ -352,6 +358,18 @@ fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
         // Source is taller than the window — fit height, pillarbox sides.
         (src_aspect / dst_aspect, 1.0)
     }
+}
+
+/// Reinterpret a `[f32; 4]` as its little-endian byte representation for
+/// upload via `queue.write_buffer`. Pulling in `bytemuck` for one site
+/// isn't worth the dep; this is the same `to_le_bytes` dance the per-frame
+/// `render()` path uses, factored into one place.
+fn bytes_of_f32x4(v: &[f32; 4]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, x) in v.iter().enumerate() {
+        out[i * 4..(i + 1) * 4].copy_from_slice(&x.to_le_bytes());
+    }
+    out
 }
 
 fn make_texture_and_bind_group(

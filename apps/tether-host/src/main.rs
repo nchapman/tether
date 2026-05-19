@@ -61,24 +61,41 @@ async fn main() -> anyhow::Result<()> {
 
     // Capture + send runs on a dedicated OS thread per the expert review:
     // the hot path doesn't share the tokio runtime with anything else.
+    // Naming the JoinHandle is informational — dropping it doesn't kill
+    // the thread in Rust, and v0 has no clean way to signal the PipeWire
+    // main loop to stop, so we rely on process exit to tear capture down.
     let conn_send = conn.clone();
-    std::thread::Builder::new()
+    let _send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
         .spawn(move || run_capture_and_send(conn_send, frames))?;
 
-    // Block until Ctrl-C, then shut down gracefully.
-    tokio::signal::ctrl_c().await?;
-    info!("ctrl-c received, shutting down");
+    // Block until Ctrl-C, then shut down gracefully. A ctrl-c registration
+    // error is itself a reason to shut down, not to bail out and skip the
+    // close path — log and proceed either way.
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        warn!(error = %e, "ctrl-c handler failed; shutting down anyway");
+    } else {
+        info!("ctrl-c received, shutting down");
+    }
     conn.close(0, b"host shutdown");
     server.close_and_wait(0, b"host shutdown").await;
     Ok(())
+}
+
+/// Encoder paired with the input dimensions it was configured for, so we
+/// can detect a resolution change in the capture stream and recreate the
+/// encoder (plus bump the wire-side stream epoch) before the next frame.
+struct EncoderSlot {
+    encoder: H264Encoder,
+    width: u32,
+    height: u32,
 }
 
 fn run_capture_and_send(conn: Arc<Connection>, frames: Receiver<CapturedFrame>) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut frame_count: u64 = 0;
     let mut last_log = std::time::Instant::now();
-    let mut encoder: Option<H264Encoder> = None;
+    let mut slot: Option<EncoderSlot> = None;
     let mut pts: i64 = 0;
 
     while let Ok(frame) = frames.recv() {
@@ -90,37 +107,55 @@ fn run_capture_and_send(conn: Arc<Connection>, frames: Receiver<CapturedFrame>) 
             continue;
         }
 
-        // Lazy-init the encoder on the first frame: we need its
-        // dimensions, and capture might be a resolution we didn't know
-        // at startup. A subsequent resolution change would require
-        // recreating the encoder + bumping the stream epoch — deferred
-        // to a later task.
-        let enc = match encoder.as_mut() {
-            Some(e) => e,
-            None => {
-                match H264Encoder::new_bgra(
-                    frame.width,
-                    frame.height,
-                    ENCODER_FPS,
-                    ENCODER_BITRATE_KBPS,
-                ) {
-                    Ok(e) => {
-                        info!(
-                            width = frame.width,
-                            height = frame.height,
-                            fps = ENCODER_FPS,
-                            kbps = ENCODER_BITRATE_KBPS,
-                            "h264 encoder initialised"
-                        );
-                        encoder.insert(e)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "encoder init failed, exiting send loop");
-                        return;
-                    }
-                }
+        // Encoder is lazily created on the first frame (we don't know
+        // capture resolution at startup) and recreated whenever the
+        // capture source changes resolution mid-stream (Linux portal
+        // output switch, future multi-monitor handoff). Bumping the
+        // fragmenter epoch makes the receiver discard any pre-resize
+        // fragments still in flight instead of fusing them with the
+        // first post-resize keyframe — that's exactly what
+        // `VideoPacket::stream_epoch` exists for.
+        let needs_recreate = slot
+            .as_ref()
+            .is_none_or(|s| s.width != frame.width || s.height != frame.height);
+        if needs_recreate {
+            if let Some(old) = slot.as_ref() {
+                info!(
+                    old_width = old.width,
+                    old_height = old.height,
+                    new_width = frame.width,
+                    new_height = frame.height,
+                    "capture dimensions changed; recreating encoder, bumping stream epoch"
+                );
+                fragmenter.bump_epoch();
             }
-        };
+            slot = match H264Encoder::new_bgra(
+                frame.width,
+                frame.height,
+                ENCODER_FPS,
+                ENCODER_BITRATE_KBPS,
+            ) {
+                Ok(e) => {
+                    info!(
+                        width = frame.width,
+                        height = frame.height,
+                        fps = ENCODER_FPS,
+                        kbps = ENCODER_BITRATE_KBPS,
+                        "h264 encoder initialised"
+                    );
+                    Some(EncoderSlot {
+                        encoder: e,
+                        width: frame.width,
+                        height: frame.height,
+                    })
+                }
+                Err(e) => {
+                    warn!(error = %e, "encoder init failed, exiting send loop");
+                    return;
+                }
+            };
+        }
+        let enc = &mut slot.as_mut().expect("slot populated above").encoder;
 
         let t_encode_submit = MonoNanos::now();
         let encoded = match enc.encode_bgra(&frame.data, pts, false) {

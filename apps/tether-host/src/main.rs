@@ -294,6 +294,15 @@ fn run_capture_and_send(
     // confirming a HW encoder swap actually moved the needle without
     // having to instrument every frame.
     let mut encode_latency_sum_ns: u64 = 0;
+    // Bytes of encoded H.264 produced this window (sum of EncodedPacket
+    // payloads). Drives kbps_out so the user can see whether the
+    // encoder is actually hitting the configured bitrate target.
+    let mut encoded_bytes_sum: u64 = 0;
+    // Keyframes emitted this window. Expected value with GOP=fps is
+    // ~1/s; spikes above that mean the client is hammering ForceIdr
+    // (network loss or decoder errors), which is a useful signal
+    // independent of why it's happening.
+    let mut keyframe_count: u32 = 0;
     let mut last_log = std::time::Instant::now();
     let mut slot: Option<EncoderSlot> = None;
     let mut pts: i64 = 0;
@@ -395,6 +404,10 @@ fn run_capture_and_send(
         if combined.is_empty() {
             continue;
         }
+        encoded_bytes_sum = encoded_bytes_sum.saturating_add(combined.len() as u64);
+        if keyframe {
+            keyframe_count = keyframe_count.saturating_add(1);
+        }
 
         let t_send = MonoNanos::now();
         let meta = VideoFrameMeta {
@@ -420,19 +433,35 @@ fn run_capture_and_send(
 
         frame_count += 1;
         if last_log.elapsed() >= std::time::Duration::from_secs(2) {
+            let window_secs = last_log.elapsed().as_secs_f64();
             #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
             let avg_encode_ms = if frame_count > 0 {
                 (encode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
             } else {
                 0.0
             };
+            #[allow(clippy::cast_precision_loss)]
+            let kbps_out = if window_secs > 0.0 {
+                (encoded_bytes_sum as f64 * 8.0 / 1000.0) / window_secs
+            } else {
+                0.0
+            };
+            let kf_per_s = if window_secs > 0.0 {
+                f64::from(keyframe_count) / window_secs
+            } else {
+                0.0
+            };
             info!(
                 frames = frame_count,
                 avg_encode_ms = format!("{avg_encode_ms:.2}"),
+                kbps_out = format!("{kbps_out:.0}"),
+                kf_per_s = format!("{kf_per_s:.2}"),
                 "send stats"
             );
             frame_count = 0;
             encode_latency_sum_ns = 0;
+            encoded_bytes_sum = 0;
+            keyframe_count = 0;
             last_log = std::time::Instant::now();
         }
     }

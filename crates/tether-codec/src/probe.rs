@@ -15,7 +15,7 @@
 //! software and gives hardware backends a clean retry if a previous
 //! attempt failed transiently (e.g. VAAPI session not yet established).
 
-use crate::{Encoder, H264Encoder, Result};
+use crate::{Decoder, Encoder, H264Decoder, H264Encoder, Result};
 
 /// Probe + construct the best available H.264 encoder for the given
 /// dimensions. Hardware backends are tried first; falls through to
@@ -62,4 +62,35 @@ pub fn probe_encoder_bgra(
     // propagate the error rather than silently going dark.
     let enc = H264Encoder::new_bgra(width, height, fps, bitrate_kbps)?;
     Ok(Box::new(enc))
+}
+
+/// Probe + construct the best available H.264 decoder. Same priority
+/// pattern as `probe_encoder_bgra`: hardware backends try first, the
+/// libavcodec software decoder is the last-resort fallback.
+///
+/// Hardware decode is the symmetric optimisation to hardware encode —
+/// removes CPU cycles from the client's hot path so it can keep up
+/// at high resolution without dropping frames or stretching present
+/// latency.
+pub fn probe_decoder() -> Result<Box<dyn Decoder>> {
+    #[cfg(target_os = "linux")]
+    {
+        match crate::vaapi::VaapiDecoder::new() {
+            Ok(dec) => return Ok(Box::new(dec)),
+            Err(e) => {
+                tracing::debug!(
+                    backend = "h264 vaapi",
+                    error = %e,
+                    "hardware decoder unavailable; trying next candidate"
+                );
+            }
+        }
+    }
+
+    // NVDEC / VideoToolbox / D3D11VA candidates slot in here as
+    // additional platform-gated try blocks.
+
+    // Software fallback.
+    let dec = H264Decoder::new()?;
+    Ok(Box::new(dec))
 }

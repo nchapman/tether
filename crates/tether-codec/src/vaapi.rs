@@ -1,20 +1,29 @@
-//! VAAPI hardware H.264 encoder for Linux (Intel Arc / AMD / NVIDIA-
-//! via-translation).
+//! VAAPI hardware H.264 encode + decode for Linux (Intel Arc / AMD /
+//! NVIDIA-via-translation).
 //!
-//! Wraps ffmpeg's `h264_vaapi` encoder through rsmpeg's safe
-//! `AVHWDeviceContext` / `AVHWFramesContext` / `hwframe_transfer_data`
-//! bindings. The capture path still produces BGRA frames in system
-//! memory, so this encoder does:
+//! Wraps ffmpeg's `h264_vaapi` encoder and the `h264` decoder's VAAPI
+//! hwaccel through rsmpeg's safe `AVHWDeviceContext` /
+//! `AVHWFramesContext` / `hwframe_transfer_data` bindings.
+//!
+//! Encoder pipeline (capture-side, still pays CPU swscale + upload):
 //!
 //!   BGRA &[u8] -> bgra AVFrame -> swscale NV12 sw_frame
 //!                              -> av_hwframe_transfer_data -> VAAPI surface
 //!                              -> h264_vaapi encode -> H.264 packet
 //!
-//! The CPU swscale + CPU→GPU transfer are still on the critical path.
-//! The next step is the DMA-BUF capture handoff that hands us a GPU
-//! surface directly from PipeWire, removes both, and lets us encode
-//! straight off the captured surface. That's a separate workstream
-//! and lives in another module when it lands.
+//! Decoder pipeline (client-side, still pays CPU readback + swscale):
+//!
+//!   H.264 bytes -> AVPacket -> h264 (VAAPI hwaccel) -> VAAPI surface
+//!                                                   -> av_hwframe_transfer_data
+//!                                                   -> NV12 sw frame
+//!                                                   -> swscale YUV420P
+//!                                                   -> Y/U/V planes for renderer
+//!
+//! Both pipelines have an obvious-but-deferred next optimisation: zero-
+//! copy GPU handoff. Encoder side wants DMA-BUF from PipeWire capture
+//! straight into a VAAPI surface; decoder side wants the VAAPI surface
+//! to land in a wgpu texture without a CPU detour. Both need real
+//! EGL/Vulkan interop work and live as separate modules when they ship.
 
 use std::slice;
 
@@ -27,8 +36,10 @@ use tracing::warn;
 
 use tether_protocol::control::CodecKind;
 
-use crate::h264::frame_plane_mut;
-use crate::{init_ffmpeg, CodecError, EncodedPacket, Encoder, Result};
+use crate::h264::{frame_plane, frame_plane_mut, pack_plane, packet_from_bytes};
+use crate::{
+    init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result,
+};
 
 /// Number of VAAPI surfaces in the hwframes pool. With `async_depth=1`
 /// the encoder reports a packet synchronously after each `send_frame`,
@@ -329,9 +340,278 @@ impl Encoder for VaapiEncoder {
     }
 }
 
+/// get_format callback the decoder invokes once the bitstream's
+/// SPS/PPS reveal the format options. The decoder's `pix_fmts` arg is
+/// a null-terminated array of `AVPixelFormat` candidates including
+/// `AV_PIX_FMT_VAAPI` (because we set `hw_device_ctx`). We pick
+/// `AV_PIX_FMT_VAAPI` if present, telling ffmpeg "yes, allocate
+/// VAAPI surfaces for output"; otherwise return `AV_PIX_FMT_NONE`
+/// which makes the decoder bail.
+unsafe extern "C" fn get_vaapi_format(
+    _ctx: *mut ffi::AVCodecContext,
+    pix_fmts: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    let fmts =
+        unsafe { rsmpeg::build_array(pix_fmts, ffi::AV_PIX_FMT_NONE) }.unwrap_or_default();
+    for &fmt in fmts {
+        if fmt == ffi::AV_PIX_FMT_VAAPI {
+            return fmt;
+        }
+    }
+    ffi::AV_PIX_FMT_NONE
+}
+
+/// VAAPI-accelerated H.264 decoder. Uses ffmpeg's generic `h264`
+/// decoder with VAAPI hwaccel selected via `get_format`. Output VAAPI
+/// surfaces are downloaded to CPU NV12, then swscaled to YUV420P so
+/// the existing renderer's three-plane upload path keeps working.
+pub struct VaapiDecoder {
+    decoder: AVCodecContext,
+    // Decoder holds a cloned ref to the device internally
+    // (set_hw_device_ctx); keeping our own ref documents the
+    // lifetime relationship and matches what hw_decode.c does.
+    // Drop order: `decoder` drops first (declaration order), so all
+    // surfaces allocated against the device are released before the
+    // device context itself goes.
+    _hw_device: AVHWDeviceContext,
+    // CPU-side NV12 -> YUV420P stage. Built lazily on the first
+    // decoded frame once the bitstream's SPS reveals dimensions, and
+    // rebuilt on a dimension change mid-stream.
+    scaler: Option<Scaler>,
+}
+
+struct Scaler {
+    nv12_to_yuv: SwsContext,
+    yuv_frame: AVFrame,
+    width: i32,
+    height: i32,
+}
+
+// SAFETY: same move-fine / share-bad rationale as VaapiEncoder above.
+unsafe impl Send for VaapiDecoder {}
+
+impl VaapiDecoder {
+    /// Construct an h264 decoder bound to a VAAPI device.
+    /// `Err(CodecError::CodecNotFound)` if either the h264 decoder
+    /// isn't compiled in (effectively impossible — every ffmpeg ships
+    /// it) or this build's h264 decoder doesn't advertise VAAPI
+    /// hwaccel support. Any other failure (device open, get_format
+    /// callback rejected) comes through as `Err(CodecError::Ffmpeg)`.
+    /// The probe treats either as "no HW path" and falls through to
+    /// libavcodec software decode.
+    pub fn new() -> Result<Self> {
+        init_ffmpeg();
+
+        let codec = AVCodec::find_decoder(ffi::AV_CODEC_ID_H264)
+            .ok_or(CodecError::CodecNotFound("h264 (for VAAPI decode)"))?;
+
+        // Walk the decoder's HW config table to confirm VAAPI is
+        // actually supported in this ffmpeg build. Without this probe
+        // an unsupported config would fail at decoder.open() with a
+        // less actionable error.
+        let mut vaapi_supported = false;
+        for i in 0.. {
+            let Some(config) = codec.hw_config(i) else { break };
+            #[allow(clippy::cast_possible_wrap)] // single-bit constant
+            let supports_device_ctx =
+                config.methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0;
+            if supports_device_ctx && config.device_type == ffi::AV_HWDEVICE_TYPE_VAAPI {
+                vaapi_supported = true;
+                break;
+            }
+        }
+        if !vaapi_supported {
+            return Err(CodecError::CodecNotFound("h264 VAAPI hwaccel"));
+        }
+
+        let hw_device =
+            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_VAAPI, None, None, 0)?;
+
+        let mut decoder = AVCodecContext::new(&codec);
+        // Cloning an AVHWDeviceContext is an av_buffer_ref under the
+        // hood (see rsmpeg/src/avutil/buffer.rs); the decoder gets a
+        // fresh ref-counted handle while we keep our own owner.
+        decoder.set_hw_device_ctx(hw_device.clone());
+        decoder.set_get_format(Some(get_vaapi_format));
+        decoder.open(None)?;
+
+        Ok(Self {
+            decoder,
+            _hw_device: hw_device,
+            scaler: None,
+        })
+    }
+
+    /// Lazy/rebuild-on-resize NV12 → YUV420P scaler keyed on dims.
+    fn ensure_scaler(&mut self, width: i32, height: i32) -> Result<&mut Scaler> {
+        let needs_rebuild = self
+            .scaler
+            .as_ref()
+            .is_none_or(|s| s.width != width || s.height != height);
+        if needs_rebuild {
+            let nv12_to_yuv = SwsContext::get_context(
+                width,
+                height,
+                ffi::AV_PIX_FMT_NV12,
+                width,
+                height,
+                ffi::AV_PIX_FMT_YUV420P,
+                ffi::SWS_FAST_BILINEAR,
+                None,
+                None,
+                None,
+            )
+            .ok_or(CodecError::ScalerInit("NV12 -> YUV420P"))?;
+
+            let mut yuv_frame = AVFrame::new();
+            yuv_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
+            yuv_frame.set_width(width);
+            yuv_frame.set_height(height);
+            yuv_frame.alloc_buffer()?;
+
+            self.scaler = Some(Scaler {
+                nv12_to_yuv,
+                yuv_frame,
+                width,
+                height,
+            });
+        }
+        Ok(self.scaler.as_mut().expect("just inserted"))
+    }
+}
+
+impl Decoder for VaapiDecoder {
+    // ffmpeg's i32 ABI fields (width, height, linesize) are
+    // non-negative on allocated decoded frames; cast sites are at
+    // the FFI boundary and follow that invariant.
+    #[allow(clippy::cast_sign_loss)]
+    fn decode(&mut self, encoded: &[u8]) -> Result<Vec<DecodedFrame>> {
+        if encoded.is_empty() {
+            return Ok(Vec::new());
+        }
+        let packet = packet_from_bytes(encoded)?;
+        self.decoder.send_packet(Some(&packet))?;
+
+        let mut out = Vec::new();
+        loop {
+            let frame = match self.decoder.receive_frame() {
+                Ok(f) => f,
+                Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => break,
+                Err(e) => return Err(CodecError::Ffmpeg(e)),
+            };
+
+            // If get_format returned VAAPI, frame is a GPU surface and
+            // needs the transfer dance. If ffmpeg fell back to a
+            // software path (rare in our config; usually a build with
+            // hwaccel disabled silently emits SW frames), the frame is
+            // already in system memory and we use it directly.
+            let sw_frame = if frame.format == ffi::AV_PIX_FMT_VAAPI {
+                let mut sw = AVFrame::new();
+                sw.hwframe_transfer_data(&frame)?;
+                sw
+            } else {
+                frame
+            };
+
+            let width = sw_frame.width;
+            let height = sw_frame.height;
+            let w = width as usize;
+            let h = height as usize;
+            let chroma_w = w.div_ceil(2);
+            let chroma_h = h.div_ceil(2);
+
+            // Two formats we accept from the system-memory side:
+            //  - NV12 (canonical VAAPI sw_format) -> swscale to YUV420P
+            //  - YUV420P (SW fallback emitted this directly) -> pack
+            //    planes directly.
+            // Anything else is an unconfigured path and surfaces as an
+            // error rather than a silent garble.
+            let fmt = sw_frame.format;
+            let (y, u, v) = if fmt == ffi::AV_PIX_FMT_NV12 {
+                let scaler = self.ensure_scaler(width, height)?;
+                scaler.nv12_to_yuv.scale_frame(
+                    &sw_frame,
+                    0,
+                    height,
+                    &mut scaler.yuv_frame,
+                )?;
+                let y = pack_plane(
+                    frame_plane(&scaler.yuv_frame, 0, h),
+                    scaler.yuv_frame.linesize[0] as usize,
+                    w,
+                    h,
+                );
+                let u = pack_plane(
+                    frame_plane(&scaler.yuv_frame, 1, chroma_h),
+                    scaler.yuv_frame.linesize[1] as usize,
+                    chroma_w,
+                    chroma_h,
+                );
+                let v = pack_plane(
+                    frame_plane(&scaler.yuv_frame, 2, chroma_h),
+                    scaler.yuv_frame.linesize[2] as usize,
+                    chroma_w,
+                    chroma_h,
+                );
+                (y, u, v)
+            } else if fmt == ffi::AV_PIX_FMT_YUV420P {
+                let y = pack_plane(
+                    frame_plane(&sw_frame, 0, h),
+                    sw_frame.linesize[0] as usize,
+                    w,
+                    h,
+                );
+                let u = pack_plane(
+                    frame_plane(&sw_frame, 1, chroma_h),
+                    sw_frame.linesize[1] as usize,
+                    chroma_w,
+                    chroma_h,
+                );
+                let v = pack_plane(
+                    frame_plane(&sw_frame, 2, chroma_h),
+                    sw_frame.linesize[2] as usize,
+                    chroma_w,
+                    chroma_h,
+                );
+                (y, u, v)
+            } else {
+                return Err(CodecError::UnsupportedInputFormat);
+            };
+
+            let pts_out = if sw_frame.pts == ffi::AV_NOPTS_VALUE {
+                None
+            } else {
+                Some(sw_frame.pts)
+            };
+            out.push(DecodedFrame {
+                width: width as u32,
+                height: height as u32,
+                pts: pts_out,
+                y,
+                u,
+                v,
+            });
+        }
+        Ok(out)
+    }
+
+    fn codec_kind(&self) -> CodecKind {
+        CodecKind::H264
+    }
+
+    fn is_hardware(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "h264 (VAAPI hw)"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::H264Encoder;
 
     #[test]
     #[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi)"]
@@ -347,5 +627,50 @@ mod tests {
         for p in packets {
             assert!(!p.data.is_empty());
         }
+    }
+
+    fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let r: u8 = if (x / 64 + t / 4) % 2 == 0 { 200 } else { 50 };
+                let g: u8 = if (y / 64) % 2 == 0 { 200 } else { 50 };
+                let b: u8 = 128;
+                data.extend_from_slice(&[b, g, r, 255]);
+            }
+        }
+        data
+    }
+
+    #[test]
+    #[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi)"]
+    fn vaapi_decoder_smoke() {
+        // Encode a few frames with the software encoder so we have a
+        // valid Annex-B bitstream to decode, then verify the VAAPI
+        // decoder produces a frame at the expected dimensions.
+        let w = 320;
+        let h = 240;
+        let mut enc = H264Encoder::new_bgra(w, h, 30, 2_000).expect("sw encoder");
+        let mut dec = VaapiDecoder::new().expect("VAAPI decoder");
+
+        let mut got = None;
+        for t in 0..6i64 {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let bgra = make_test_bgra(w, h, t as u32);
+            let packets = enc.encode_bgra(&bgra, t, t == 0).expect("encode");
+            for p in packets {
+                let frames = dec.decode(&p.data).expect("vaapi decode");
+                if let Some(f) = frames.into_iter().next() {
+                    got = Some(f);
+                }
+            }
+        }
+        let frame = got.expect("decoder produced a frame within six input frames");
+        assert_eq!(frame.width, w);
+        assert_eq!(frame.height, h);
+        let (cw, ch) = frame.chroma_dims();
+        assert_eq!(frame.y.len(), (w * h) as usize);
+        assert_eq!(frame.u.len(), (cw * ch) as usize);
+        assert_eq!(frame.v.len(), (cw * ch) as usize);
     }
 }

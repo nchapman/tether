@@ -25,7 +25,7 @@ use crate::{init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPack
 /// Pack a planar AVFrame plane into a tight `Vec<u8>`, stripping any
 /// stride padding so downstream consumers can upload row-major without
 /// per-row math.
-fn pack_plane(plane: &[u8], stride: usize, row_bytes: usize, height: usize) -> Vec<u8> {
+pub(crate) fn pack_plane(plane: &[u8], stride: usize, row_bytes: usize, height: usize) -> Vec<u8> {
     let mut packed = Vec::with_capacity(row_bytes * height);
     if stride == row_bytes {
         packed.extend_from_slice(&plane[..row_bytes * height]);
@@ -57,7 +57,7 @@ pub(crate) fn frame_plane_mut(frame: &mut AVFrame, idx: usize, height: usize) ->
 
 /// Borrow plane `idx` of an allocated `AVFrame` as a read-only slice.
 #[allow(clippy::cast_sign_loss)] // ffmpeg linesize is i32 but non-negative for allocated frames
-fn frame_plane(frame: &AVFrame, idx: usize, height: usize) -> &[u8] {
+pub(crate) fn frame_plane(frame: &AVFrame, idx: usize, height: usize) -> &[u8] {
     let stride = frame.linesize[idx] as usize;
     let ptr = frame.data[idx];
     // SAFETY: same rationale as `frame_plane_mut`; the &AVFrame borrow
@@ -69,7 +69,7 @@ fn frame_plane(frame: &AVFrame, idx: usize, height: usize) -> &[u8] {
 /// can be fed to a decoder. rsmpeg doesn't expose a safe helper for
 /// this — we allocate via `av_new_packet` (so the packet owns its
 /// buffer and frees it on Drop) and memcpy our bytes in.
-fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
+pub(crate) fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
     let mut packet = AVPacket::new();
     let size = i32::try_from(bytes.len()).map_err(|_| {
         CodecError::Ffmpeg(RsmpegError::AVError(ffi::AVERROR_INVALIDDATA))
@@ -390,6 +390,10 @@ impl Decoder for H264Decoder {
 
     fn codec_kind(&self) -> CodecKind {
         CodecKind::H264
+    }
+
+    fn name(&self) -> &'static str {
+        "libavcodec h264 sw"
     }
 }
 

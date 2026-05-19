@@ -14,7 +14,7 @@ pub mod probe;
 pub mod vaapi;
 
 pub use h264::{H264Decoder, H264Encoder};
-pub use probe::probe_encoder_bgra;
+pub use probe::{probe_decoder, probe_encoder_bgra};
 
 use std::sync::Once;
 
@@ -137,9 +137,33 @@ pub trait Encoder: Send {
     fn name(&self) -> &'static str;
 }
 
+/// Pluggable video-decoder backend. Same probe pattern as `Encoder` —
+/// the client probes available backends at startup, picks the best
+/// one whose `new()` succeeds, and stores the result as
+/// `Box<dyn Decoder>` so the decode loop doesn't care which backend
+/// is underneath.
 pub trait Decoder: Send {
+    /// Decode one encoded buffer. May emit zero frames (decoder
+    /// warming up on SPS/PPS) or multiple (B-frame reorder buffer
+    /// drain). The output `DecodedFrame` always carries tight
+    /// YUV420P planes regardless of the underlying backend's
+    /// preferred sw_format, so the renderer doesn't need backend-
+    /// specific code paths.
     fn decode(&mut self, encoded: &[u8]) -> Result<Vec<DecodedFrame>>;
+
     fn codec_kind(&self) -> tether_protocol::control::CodecKind;
+
+    /// `true` if decoding runs on dedicated silicon (VideoToolbox,
+    /// NVDEC, VAAPI). Used by the probe to prefer HW backends.
+    fn is_hardware(&self) -> bool {
+        false
+    }
+
+    /// Short human-readable identifier for logs — e.g.
+    /// `"libavcodec h264 sw"`, `"h264 (VAAPI hw)"`. Distinct from
+    /// `codec_kind` so the client log can show which backend it
+    /// actually picked.
+    fn name(&self) -> &'static str;
 }
 
 /// First-call hook for any cross-crate ffmpeg setup we want to run

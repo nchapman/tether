@@ -8,8 +8,10 @@
 //! detection) is right from day one.
 
 pub mod h264;
+pub mod probe;
 
 pub use h264::{H264Decoder, H264Encoder};
+pub use probe::probe_encoder_bgra;
 
 use std::sync::Once;
 

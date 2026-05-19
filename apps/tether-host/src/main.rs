@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
-use tether_codec::{Encoder, H264Encoder};
+use tether_codec::{probe_encoder_bgra, Encoder};
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ColorSpace, ControlMessage, ServerHello,
 };
@@ -272,8 +272,10 @@ async fn main() -> anyhow::Result<()> {
 /// Encoder paired with the input dimensions it was configured for, so we
 /// can detect a resolution change in the capture stream and recreate the
 /// encoder (plus bump the wire-side stream epoch) before the next frame.
+/// `Box<dyn Encoder>` lets the probe swap hardware backends in without
+/// the encode loop knowing which one it got.
 struct EncoderSlot {
-    encoder: H264Encoder,
+    encoder: Box<dyn Encoder>,
     width: u32,
     height: u32,
 }
@@ -326,7 +328,7 @@ fn run_capture_and_send(
             // coords into pixels). send() only fails if every receiver
             // is gone, which means the host is shutting down anyway.
             let _ = display_dims_tx.send(Some((frame.width, frame.height)));
-            slot = match H264Encoder::new_bgra(
+            slot = match probe_encoder_bgra(
                 frame.width,
                 frame.height,
                 ENCODER_FPS,
@@ -334,11 +336,13 @@ fn run_capture_and_send(
             ) {
                 Ok(e) => {
                     info!(
+                        backend = e.name(),
+                        hardware = e.is_hardware(),
                         width = frame.width,
                         height = frame.height,
                         fps = ENCODER_FPS,
                         kbps = ENCODER_BITRATE_KBPS,
-                        "h264 encoder initialised"
+                        "encoder initialised"
                     );
                     Some(EncoderSlot {
                         encoder: e,
@@ -352,7 +356,7 @@ fn run_capture_and_send(
                 }
             };
         }
-        let enc = &mut slot.as_mut().expect("slot populated above").encoder;
+        let enc = slot.as_mut().expect("slot populated above").encoder.as_mut();
 
         // Swap-and-zero: at most one forced keyframe per request, even
         // if multiple ForceIdr messages arrive between encode calls.

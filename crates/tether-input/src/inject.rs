@@ -34,6 +34,14 @@ pub trait Injector: Send {
     /// stale position after a fresher one would visibly snap the
     /// pointer backwards.
     fn inject_cursor(&mut self, cursor: &ClientCursorPacket) -> Result<()>;
+
+    /// Tell the injector the host display's pixel dimensions so it can
+    /// convert normalised cursor coords to absolute pixels. The capture
+    /// path is the authoritative source — enigo's `main_display()` is
+    /// `Not implemented yet` on libei/Wayland, so we feed dims from
+    /// PipeWire/ScreenCaptureKit instead. Default impl is a no-op; only
+    /// backends that need it (real pointer movers) override.
+    fn set_display_size(&mut self, _width: u32, _height: u32) {}
 }
 
 /// Last-resort backend: just log the event at debug level and pretend

@@ -106,6 +106,14 @@ async fn main() -> anyhow::Result<()> {
     // primitive that fits the "one-shot until next frame" semantic.
     let force_idr = Arc::new(AtomicBool::new(false));
 
+    // Force-IDR signal already created above. Shared display-dimensions
+    // channel: the capture thread learns the real host display size on
+    // the first frame and posts (w, h) here; the input recv loop reads
+    // it and feeds the injector via set_display_size. We use a single-
+    // slot watch so the injector always reads the latest known dims
+    // even if it polls late.
+    let (display_dims_tx, display_dims_rx) = tokio::sync::watch::channel::<Option<(u32, u32)>>(None);
+
     // Capture + send runs on a dedicated OS thread per the expert review:
     // the hot path doesn't share the tokio runtime with anything else.
     // Naming the JoinHandle is informational — dropping it doesn't kill
@@ -115,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
     let force_idr_for_send = force_idr.clone();
     let _send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
-        .spawn(move || run_capture_and_send(conn_send, frames, force_idr_for_send))?;
+        .spawn(move || run_capture_and_send(conn_send, frames, force_idr_for_send, display_dims_tx))?;
 
     // Control recv: react to ForceIdr and clock-probe requests on the
     // reliable control stream. Goodbye triggers a clean shutdown by
@@ -179,6 +187,23 @@ async fn main() -> anyhow::Result<()> {
     let injector = StdArc::new(TokioMutex::new(
         tether_input::inject::default_injector().await,
     ));
+
+    // Display-dimensions follower: any change to the capture's
+    // negotiated resolution pushes new pixel dims into the injector.
+    // Lives in its own task so the recv loops below stay focused.
+    let injector_for_dims = injector.clone();
+    let mut display_dims_watch = display_dims_rx.clone();
+    tokio::spawn(async move {
+        while display_dims_watch.changed().await.is_ok() {
+            // Copy the value out and drop the borrow guard before
+            // awaiting on the injector lock — `watch::Ref` is not Send,
+            // so holding it across an .await fails the Send bound.
+            let dims = *display_dims_watch.borrow();
+            if let Some((w, h)) = dims {
+                injector_for_dims.lock().await.set_display_size(w, h);
+            }
+        }
+    });
 
     let conn_input = conn.clone();
     let injector_for_input = injector.clone();
@@ -257,6 +282,7 @@ fn run_capture_and_send(
     conn: Arc<Connection>,
     frames: Receiver<CapturedFrame>,
     force_idr: Arc<AtomicBool>,
+    display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut frame_count: u64 = 0;
@@ -295,6 +321,11 @@ fn run_capture_and_send(
                 );
                 fragmenter.bump_epoch();
             }
+            // Push the new display dims to anything that cares (the
+            // input injector uses these to scale normalised cursor
+            // coords into pixels). send() only fails if every receiver
+            // is gone, which means the host is shutting down anyway.
+            let _ = display_dims_tx.send(Some((frame.width, frame.height)));
             slot = match H264Encoder::new_bgra(
                 frame.width,
                 frame.height,

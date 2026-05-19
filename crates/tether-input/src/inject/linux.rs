@@ -24,9 +24,21 @@ use tether_protocol::input::{
 
 use super::{InjectError, Injector, Result};
 
+/// Conservative fallback when neither enigo nor the capture path has
+/// told us a real display size. 1080p is the median desktop today; if
+/// we end up here AND the host display is much larger, the cursor will
+/// be confined to the top-left 1920×1080 region until `set_display_size`
+/// arrives. Loud trace logs at first inject_cursor catch this.
+const FALLBACK_DISPLAY: (i32, i32) = (1920, 1080);
+
 pub struct LibeiInjector {
     enigo: Enigo,
+    /// Host display pixel dimensions used to convert normalised cursor
+    /// coords to absolute pixels. Sourced from the capture path via
+    /// `set_display_size`; falls back to [`FALLBACK_DISPLAY`] until the
+    /// first capture frame arrives.
     display: (i32, i32),
+    display_is_authoritative: bool,
     /// Keys we've sent a press for that haven't been released yet.
     /// Walked on Drop so a sudden client disconnect doesn't leave the
     /// host stuck holding Ctrl, Cmd, or whatever the operator was
@@ -46,17 +58,23 @@ impl LibeiInjector {
     /// blocking thread so it doesn't stall the tokio worker that called
     /// us — enigo's constructor uses its own internal block_on, which
     /// deadlocks if invoked from inside an active tokio context.
+    ///
+    /// Display dimensions are intentionally NOT sourced from enigo:
+    /// `Enigo::main_display()` is unimplemented on libei (the backend
+    /// literally says "I don't know how this is possible under Wayland")
+    /// and failing init there leaves the host with a noop injector even
+    /// though the portal handshake succeeded. We start with a 1080p
+    /// fallback and rely on the capture path to call `set_display_size`
+    /// once it has the real numbers.
     pub async fn connect() -> Result<Self> {
         let enigo = tokio::task::spawn_blocking(|| Enigo::new(&Settings::default()))
             .await
             .map_err(|e| InjectError::Init(format!("spawn_blocking join: {e}")))?
             .map_err(|e| InjectError::Init(format!("enigo new: {e:?}")))?;
-        let display = enigo
-            .main_display()
-            .map_err(|e| InjectError::Init(format!("main_display: {e:?}")))?;
         Ok(Self {
             enigo,
-            display,
+            display: FALLBACK_DISPLAY,
+            display_is_authoritative: false,
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
             last_cursor_seq: None,
@@ -159,6 +177,28 @@ impl Injector for LibeiInjector {
         }
     }
 
+    fn set_display_size(&mut self, width: u32, height: u32) {
+        // i32 cast: any display whose pixel dim exceeds i32::MAX
+        // (2.1 billion) is not real. Clamp defensively anyway.
+        let w = i32::try_from(width).unwrap_or(i32::MAX);
+        let h = i32::try_from(height).unwrap_or(i32::MAX);
+        if w <= 0 || h <= 0 {
+            tracing::warn!(width, height, "ignoring zero/negative display size");
+            return;
+        }
+        let new_dims = (w, h);
+        if new_dims != self.display {
+            tracing::info!(
+                old = ?self.display,
+                new = ?new_dims,
+                authoritative = self.display_is_authoritative,
+                "injector display size updated"
+            );
+            self.display = new_dims;
+        }
+        self.display_is_authoritative = true;
+    }
+
     // All float->int casts here clamp first and project into pixel
     // coords within a monitor that fits in i32; safe for any display
     // that exists in 2026.
@@ -181,6 +221,12 @@ impl Injector for LibeiInjector {
             // independently. When we ship a host-cursor sprite, this
             // is where the "stop drawing" signal goes.
             return Ok(());
+        }
+        if !self.display_is_authoritative {
+            tracing::trace!(
+                fallback = ?self.display,
+                "injecting cursor with fallback display size; capture path hasn't reported real dims yet"
+            );
         }
         if cursor.display_idx != 0 {
             tracing::trace!(

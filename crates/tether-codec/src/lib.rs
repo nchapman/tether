@@ -1,6 +1,6 @@
 //! Codec trait + ffmpeg-backed encoders/decoders.
 //!
-//! v0 ships software H.264 only (libx264 via ffmpeg-next). HW backends
+//! v0 ships software H.264 only (libx264 via rsmpeg). HW backends
 //! (VideoToolbox / VAAPI / NVENC) and additional codecs (HEVC, AV1) will
 //! land as additional [`Encoder`] / [`Decoder`] impls — the trait shape
 //! is cribbed from RustDesk's `EncoderApi` (`libs/scrap/src/common/codec.rs:60`)
@@ -16,11 +16,20 @@ use std::sync::Once;
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     #[error("ffmpeg: {0}")]
-    Ffmpeg(#[from] ffmpeg_next::Error),
+    Ffmpeg(#[from] rsmpeg::error::RsmpegError),
     #[error("encoder not configured for input format")]
     UnsupportedInputFormat,
     #[error("buffer size mismatch: got {got} bytes, expected {expected}")]
     BufferSizeMismatch { got: usize, expected: usize },
+    /// The requested ffmpeg codec wasn't compiled into the linked
+    /// FFmpeg build (e.g. asking for `h264_vaapi` on a system whose
+    /// FFmpeg was built without VAAPI support).
+    #[error("ffmpeg codec '{0}' not available in this build")]
+    CodecNotFound(&'static str),
+    /// SwsContext construction returned NULL — almost always means an
+    /// unsupported source/destination pixel-format pair.
+    #[error("ffmpeg swscale init failed ({0})")]
+    ScalerInit(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, CodecError>;
@@ -100,13 +109,15 @@ pub trait Decoder: Send {
     fn codec_kind(&self) -> tether_protocol::control::CodecKind;
 }
 
-/// Run ffmpeg's one-shot initialiser the first time any encoder/decoder
-/// is constructed. Idempotent.
+/// First-call hook for any cross-crate ffmpeg setup we want to run
+/// exactly once per process. rsmpeg-style bindings don't require a
+/// separate `av_register_all()` (deprecated in FFmpeg 4.x, removed
+/// later) so this is currently a no-op — kept for the call sites and
+/// for future hooks (logging callback, lock manager, etc.).
 pub(crate) fn init_ffmpeg() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // ffmpeg-next 8.x: ffmpeg::init() registers codecs/formats and is
-        // safe to call repeatedly, but we still gate it for clarity.
-        ffmpeg_next::init().expect("ffmpeg init");
+        // Intentionally empty for now. rsmpeg handles codec/format
+        // registration lazily on first use.
     });
 }

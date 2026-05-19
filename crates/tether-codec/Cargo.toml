@@ -12,13 +12,16 @@ tether-protocol = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# NOTE: original plan was rsmpeg (safe hwcontext wrappers), but rsmpeg
-# 0.18 is built against the FFmpeg 8.0 ABI and the installed FFmpeg 8.1
-# moved a few struct fields (`oformat` -> method, `pb` -> `io_context`).
-# ffmpeg-next 8.1.0 auto-detects FFmpeg version. We lose safe hwcontext
-# bindings — HW encoders / DMA-BUF import will need raw `ffmpeg-sys-next`
-# FFI here until we can migrate back to rsmpeg with FFmpeg 8.1 support.
-ffmpeg-next = "8.1"
+# rsmpeg restores the originally-planned stack — safe wrappers around
+# AVHWDeviceContext / AVHWFramesContext / hwframe_transfer_data are the
+# whole reason to prefer it over ffmpeg-next when HW codecs land.
+# Published rsmpeg 0.18 is built against FFmpeg 8.0; we're on FFmpeg 8.1,
+# so we pin to Dryvnt's open PR adding 8.1 support
+# (https://github.com/larksuite/rsmpeg/pull/252) by commit SHA — branch
+# pins would break silently if the PR author force-pushes.
+# Migration trigger: bump to `version = "0.19"` once PR #252 lands and a
+# new rsmpeg version ships to crates.io.
+rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a200256763b31e5528fb0f21876e", features = ["ffmpeg8", "link_system_ffmpeg"] }
 
 [lints]
 workspace = true

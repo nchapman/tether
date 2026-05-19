@@ -4,11 +4,23 @@
 //! to ~5 MB/s (zerolatency H.264). Quality tuning, B-frame strategies,
 //! and adaptive bitrate land later — for now we hardcode the lowest-
 //! latency preset and trust libx264's defaults beyond that.
+//!
+//! Hardware encoders (VAAPI on Linux, VideoToolbox on macOS) will land
+//! as siblings of this module under the same `Encoder` / `Decoder`
+//! traits.
 
-use ffmpeg_next::{
-    codec, decoder, encoder, format::Pixel, frame, picture, software::scaling,
-    util::dictionary::Owned as Dictionary, Packet, Rational,
-};
+use std::ffi::CString;
+use std::slice;
+
+use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
+use rsmpeg::avutil::{ra, AVDictionary, AVFrame};
+use rsmpeg::error::RsmpegError;
+use rsmpeg::ffi;
+use rsmpeg::swscale::SwsContext;
+
+use tether_protocol::control::CodecKind;
+
+use crate::{init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result};
 
 /// Pack a planar AVFrame plane into a tight `Vec<u8>`, stripping any
 /// stride padding so downstream consumers can upload row-major without
@@ -26,15 +38,64 @@ fn pack_plane(plane: &[u8], stride: usize, row_bytes: usize, height: usize) -> V
     packed
 }
 
-use tether_protocol::control::CodecKind;
+/// Borrow plane `idx` of an allocated `AVFrame` as `&mut [u8]` covering
+/// `linesize[idx] * height` bytes. Encapsulates the one unsafe slice
+/// construction we need against rsmpeg's raw-pointer frame layout —
+/// the mutable borrow of `frame` keeps the underlying buffer alive for
+/// the slice's lifetime.
+#[allow(clippy::cast_sign_loss)] // ffmpeg linesize is i32 but non-negative for allocated frames
+fn frame_plane_mut(frame: &mut AVFrame, idx: usize, height: usize) -> &mut [u8] {
+    let stride = frame.linesize[idx] as usize;
+    let ptr = frame.data_mut()[idx];
+    // SAFETY: caller asserts `frame` was constructed with a successful
+    // alloc_buffer() at width/height matching `linesize[idx]` / `height`,
+    // so plane `idx` is backed by at least `stride * height` valid bytes.
+    // The &mut borrow on `frame` is held for the slice's lifetime,
+    // preventing reallocation underneath us.
+    unsafe { slice::from_raw_parts_mut(ptr, stride * height) }
+}
 
-use crate::{init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result};
+/// Borrow plane `idx` of an allocated `AVFrame` as a read-only slice.
+#[allow(clippy::cast_sign_loss)] // ffmpeg linesize is i32 but non-negative for allocated frames
+fn frame_plane(frame: &AVFrame, idx: usize, height: usize) -> &[u8] {
+    let stride = frame.linesize[idx] as usize;
+    let ptr = frame.data[idx];
+    // SAFETY: same rationale as `frame_plane_mut`; the &AVFrame borrow
+    // keeps the buffer alive.
+    unsafe { slice::from_raw_parts(ptr, stride * height) }
+}
+
+/// Wrap a slice of encoded bytes in an `AVPacket` owned by ffmpeg so it
+/// can be fed to a decoder. rsmpeg doesn't expose a safe helper for
+/// this — we allocate via `av_new_packet` (so the packet owns its
+/// buffer and frees it on Drop) and memcpy our bytes in.
+fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
+    let mut packet = AVPacket::new();
+    let size = i32::try_from(bytes.len()).map_err(|_| {
+        CodecError::Ffmpeg(RsmpegError::AVError(ffi::AVERROR_INVALIDDATA))
+    })?;
+    // SAFETY: `packet` was just allocated by AVPacket::new(). av_new_packet
+    // allocates `size + AV_INPUT_BUFFER_PADDING_SIZE` bytes, fills the
+    // padding with zeroes, and sets packet.data + packet.size. Ownership
+    // of the buffer transfers to the packet, freed by AVPacket's Drop
+    // impl via av_packet_free.
+    let ret = unsafe { ffi::av_new_packet(packet.as_mut_ptr(), size) };
+    if ret < 0 {
+        return Err(CodecError::Ffmpeg(RsmpegError::AVError(ret)));
+    }
+    // SAFETY: packet.data now points to an owned buffer of exactly
+    // `size` writable bytes (plus padding we don't touch).
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), packet.data, bytes.len());
+    }
+    Ok(packet)
+}
 
 pub struct H264Encoder {
-    encoder: encoder::Video,
-    bgra_to_yuv: scaling::Context,
-    yuv_frame: frame::Video,
-    bgra_frame: frame::Video,
+    encoder: AVCodecContext,
+    bgra_to_yuv: SwsContext,
+    yuv_frame: AVFrame,
+    bgra_frame: AVFrame,
     height: u32,
     bgra_row_bytes: usize,
 }
@@ -54,59 +115,71 @@ impl H264Encoder {
     /// `tune=zerolatency` doesn't strictly cap.
     pub fn new_bgra(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self> {
         init_ffmpeg();
-        let codec = encoder::find(codec::Id::H264)
-            .ok_or(CodecError::Ffmpeg(ffmpeg_next::Error::EncoderNotFound))?;
-        let mut ctx = codec::context::Context::new_with_codec(codec)
-            .encoder()
-            .video()?;
-        ctx.set_width(width);
-        ctx.set_height(height);
-        ctx.set_format(Pixel::YUV420P);
+        let codec = AVCodec::find_encoder(ffi::AV_CODEC_ID_H264)
+            .ok_or(CodecError::CodecNotFound("h264"))?;
+        let mut encoder = AVCodecContext::new(&codec);
         let fps_i32 = i32::try_from(fps.max(1)).unwrap_or(60);
-        ctx.set_time_base(Rational(1, fps_i32));
-        ctx.set_frame_rate(Some(Rational(fps_i32, 1)));
-        ctx.set_bit_rate(bitrate_kbps as usize * 1000);
+        let width_i32 = i32::try_from(width).expect("width fits in i32");
+        let height_i32 = i32::try_from(height).expect("height fits in i32");
+
+        encoder.set_width(width_i32);
+        encoder.set_height(height_i32);
+        encoder.set_pix_fmt(ffi::AV_PIX_FMT_YUV420P);
+        encoder.set_time_base(ra(1, fps_i32));
+        encoder.set_framerate(ra(fps_i32, 1));
+        encoder.set_bit_rate(i64::from(bitrate_kbps) * 1000);
         // GOP = 1 second of frames. The MVP datagram path has no FEC and
-        // no on-demand IDR signalling yet, so any lost fragment corrupts
-        // the P-frame chain until the next IDR. A 1-second IDR cadence
-        // caps the worst-case "garbled text" window without spending
-        // catastrophic bandwidth on keyframes. Drop this back to a long
-        // GOP once `ControlMessage::ForceIdr` is wired up end-to-end.
-        ctx.set_gop(fps.max(1));
-        ctx.set_max_b_frames(0);
+        // relies on on-demand IDR to recover from packet loss, so any
+        // lost fragment corrupts the P-frame chain until the next IDR.
+        // A 1-second IDR cadence caps the worst-case "garbled" window
+        // without spending catastrophic bandwidth on keyframes. Drop
+        // this back to a long GOP once FEC lands and we trust loss
+        // recovery without a full re-keyframe.
+        encoder.set_gop_size(fps_i32);
+        encoder.set_max_b_frames(0);
 
-        let mut opts = Dictionary::new();
-        opts.set("preset", "ultrafast");
-        opts.set("tune", "zerolatency");
-        // baseline profile = no B-frames, no CABAC entropy coding. ultrafast
-        // preset already drops most of what would slow us down; this is
-        // belt-and-braces for predictability across libx264 versions.
-        opts.set("profile", "baseline");
-        // tune=zerolatency already sets rc-lookahead=0 + sync-lookahead=0,
-        // but pinning min-keyint=keyint forces *exactly* periodic IDRs
-        // (no early IDRs from scene-cut detection) so the GOP cadence
-        // matches what `set_gop` promised.
-        let gop = fps.max(1);
-        opts.set(
-            "x264-params",
-            &format!("keyint={gop}:min-keyint={gop}:scenecut=0"),
-        );
+        // libx264 private options. tune=zerolatency already sets
+        // rc-lookahead=0 + sync-lookahead=0; pinning min-keyint=keyint
+        // forces *exactly* periodic IDRs (no early IDRs from scene-cut
+        // detection) so the GOP cadence matches what `set_gop_size`
+        // promised. baseline profile = no B-frames, no CABAC — belt-
+        // and-braces for predictability across libx264 versions.
+        let x264_params =
+            CString::new(format!("keyint={fps_i32}:min-keyint={fps_i32}:scenecut=0"))
+                .expect("static format yields no nul bytes");
+        let dict = AVDictionary::new(c"preset", c"ultrafast", 0)
+            .set(c"tune", c"zerolatency", 0)
+            .set(c"profile", c"baseline", 0)
+            .set(c"x264-params", &x264_params, 0);
+        encoder.open(Some(dict))?;
 
-        let encoder = ctx.open_with(opts)?;
+        let bgra_to_yuv = SwsContext::get_context(
+            width_i32,
+            height_i32,
+            ffi::AV_PIX_FMT_BGRA,
+            width_i32,
+            height_i32,
+            ffi::AV_PIX_FMT_YUV420P,
+            ffi::SWS_FAST_BILINEAR,
+            None,
+            None,
+            None,
+        )
+        .ok_or(CodecError::ScalerInit("BGRA -> YUV420P"))?;
 
-        let bgra_to_yuv = scaling::Context::get(
-            Pixel::BGRA,
-            width,
-            height,
-            Pixel::YUV420P,
-            width,
-            height,
-            scaling::Flags::FAST_BILINEAR,
-        )?;
+        let mut bgra_frame = AVFrame::new();
+        bgra_frame.set_format(ffi::AV_PIX_FMT_BGRA);
+        bgra_frame.set_width(width_i32);
+        bgra_frame.set_height(height_i32);
+        bgra_frame.alloc_buffer()?;
 
-        let yuv_frame = frame::Video::new(Pixel::YUV420P, width, height);
-        let bgra_frame = frame::Video::new(Pixel::BGRA, width, height);
-        let bgra_row_bytes = (width * 4) as usize;
+        let mut yuv_frame = AVFrame::new();
+        yuv_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
+        yuv_frame.set_width(width_i32);
+        yuv_frame.set_height(height_i32);
+        yuv_frame.alloc_buffer()?;
+
+        let bgra_row_bytes = (width as usize) * 4;
 
         Ok(Self {
             encoder,
@@ -120,13 +193,17 @@ impl H264Encoder {
 }
 
 impl Encoder for H264Encoder {
+    // ffmpeg's i32 ABI fields (linesize, packet.size) are non-negative
+    // in practice; cast sites are documented at the boundary.
+    #[allow(clippy::cast_sign_loss)]
     fn encode_bgra(
         &mut self,
         bgra: &[u8],
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
-        let expected = self.bgra_row_bytes * self.height as usize;
+        let height = self.height as usize;
+        let expected = self.bgra_row_bytes * height;
         if bgra.len() != expected {
             return Err(CodecError::BufferSizeMismatch {
                 got: bgra.len(),
@@ -136,55 +213,65 @@ impl Encoder for H264Encoder {
 
         // Copy BGRA bytes into the encoder's input frame, row-by-row in
         // case stride > width*4 (AVFrame buffers are usually 32-byte
-        // aligned, so 1920*4=7680 bytes/row is already a clean stride —
-        // but smaller widths may have padding).
-        let stride = self.bgra_frame.stride(0);
-        let plane = self.bgra_frame.data_mut(0);
-        if stride == self.bgra_row_bytes {
-            plane[..expected].copy_from_slice(bgra);
-        } else {
-            for row in 0..self.height as usize {
-                let src = row * self.bgra_row_bytes;
-                let dst = row * stride;
-                plane[dst..dst + self.bgra_row_bytes]
-                    .copy_from_slice(&bgra[src..src + self.bgra_row_bytes]);
+        // aligned, so 1920*4 = 7680 bytes/row is already a clean stride
+        // — but smaller widths may have padding).
+        {
+            let stride = self.bgra_frame.linesize[0] as usize;
+            let plane = frame_plane_mut(&mut self.bgra_frame, 0, height);
+            if stride == self.bgra_row_bytes {
+                plane[..expected].copy_from_slice(bgra);
+            } else {
+                for row in 0..height {
+                    let src = row * self.bgra_row_bytes;
+                    let dst = row * stride;
+                    plane[dst..dst + self.bgra_row_bytes]
+                        .copy_from_slice(&bgra[src..src + self.bgra_row_bytes]);
+                }
             }
         }
 
-        self.bgra_to_yuv
-            .run(&self.bgra_frame, &mut self.yuv_frame)?;
-        self.yuv_frame.set_pts(Some(pts));
-        self.yuv_frame.set_kind(if force_keyframe {
-            picture::Type::I
+        self.bgra_to_yuv.scale_frame(
+            &self.bgra_frame,
+            0,
+            i32::try_from(height).expect("height fits in i32"),
+            &mut self.yuv_frame,
+        )?;
+        self.yuv_frame.set_pts(pts);
+        self.yuv_frame.set_pict_type(if force_keyframe {
+            ffi::AV_PICTURE_TYPE_I
         } else {
-            picture::Type::None
+            ffi::AV_PICTURE_TYPE_NONE
         });
 
-        self.encoder.send_frame(&self.yuv_frame)?;
+        self.encoder.send_frame(Some(&self.yuv_frame))?;
 
         let mut out = Vec::new();
-        let mut packet = Packet::empty();
         loop {
             // Mirror the explicit-match style used in the decoder: only
-            // EAGAIN and EOF are "no more output for now" — every other
-            // error is a real codec failure that the caller needs to see.
-            match self.encoder.receive_packet(&mut packet) {
-                Ok(()) => {}
-                Err(ffmpeg_next::Error::Other { errno })
-                    if errno == ffmpeg_next::error::EAGAIN =>
-                {
-                    break;
-                }
-                Err(ffmpeg_next::Error::Eof) => break,
+            // the drain/flushed sentinels mean "no more output for now";
+            // every other error is a real codec failure the caller must
+            // see.
+            let packet = match self.encoder.receive_packet() {
+                Ok(p) => p,
+                Err(RsmpegError::EncoderDrainError | RsmpegError::EncoderFlushedError) => break,
                 Err(e) => return Err(CodecError::Ffmpeg(e)),
-            }
-            if let Some(data) = packet.data() {
-                out.push(EncodedPacket {
-                    data: data.to_vec(),
-                    pts: packet.pts(),
-                    keyframe: packet.is_key(),
-                });
-            }
+            };
+            let size = packet.size as usize;
+            // SAFETY: `packet.data` points to `packet.size` valid bytes
+            // owned by the AVPacket; we copy them out before the packet
+            // is dropped at end-of-iteration.
+            let data = unsafe { slice::from_raw_parts(packet.data, size) }.to_vec();
+            let keyframe = (packet.flags & ffi::AV_PKT_FLAG_KEY as i32) != 0;
+            let pts_out = if packet.pts == ffi::AV_NOPTS_VALUE {
+                None
+            } else {
+                Some(packet.pts)
+            };
+            out.push(EncodedPacket {
+                data,
+                pts: pts_out,
+                keyframe,
+            });
         }
         Ok(out)
     }
@@ -195,7 +282,7 @@ impl Encoder for H264Encoder {
 }
 
 pub struct H264Decoder {
-    decoder: decoder::Video,
+    decoder: AVCodecContext,
 }
 
 // SAFETY: same rationale as H264Encoder above.
@@ -204,54 +291,66 @@ unsafe impl Send for H264Decoder {}
 impl H264Decoder {
     pub fn new() -> Result<Self> {
         init_ffmpeg();
-        let codec = decoder::find(codec::Id::H264)
-            .ok_or(CodecError::Ffmpeg(ffmpeg_next::Error::DecoderNotFound))?;
-        let ctx = codec::context::Context::new_with_codec(codec);
-        let decoder = ctx.decoder().video()?;
+        let codec = AVCodec::find_decoder(ffi::AV_CODEC_ID_H264)
+            .ok_or(CodecError::CodecNotFound("h264"))?;
+        let mut decoder = AVCodecContext::new(&codec);
+        decoder.open(None)?;
         Ok(Self { decoder })
     }
 }
 
 impl Decoder for H264Decoder {
+    // Same rationale as encode_bgra: ffmpeg's i32 width/height/linesize
+    // on an allocated decoder output frame are non-negative.
+    #[allow(clippy::cast_sign_loss)]
     fn decode(&mut self, encoded: &[u8]) -> Result<Vec<DecodedFrame>> {
         if encoded.is_empty() {
             return Ok(Vec::new());
         }
-        let packet = Packet::copy(encoded);
-        self.decoder.send_packet(&packet)?;
+        let packet = packet_from_bytes(encoded)?;
+        self.decoder.send_packet(Some(&packet))?;
 
         let mut out = Vec::new();
-        let mut yuv = frame::Video::empty();
         loop {
-            match self.decoder.receive_frame(&mut yuv) {
-                Ok(()) => {}
-                Err(ffmpeg_next::Error::Other { errno })
-                    if errno == ffmpeg_next::error::EAGAIN =>
-                {
-                    break;
-                }
-                Err(ffmpeg_next::Error::Eof) => break,
+            let yuv = match self.decoder.receive_frame() {
+                Ok(f) => f,
+                Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => break,
                 Err(e) => return Err(CodecError::Ffmpeg(e)),
-            }
+            };
             // H264 in our configuration always emits YUV420P. If a
             // future capture path negotiates something else (NV12,
             // YUV422) the renderer's YUV→RGB shader will need
             // companion shaders / upload paths; for now reject loudly
             // so the failure is observable instead of a silent garble.
-            if yuv.format() != Pixel::YUV420P {
+            if yuv.format != ffi::AV_PIX_FMT_YUV420P {
                 return Err(CodecError::UnsupportedInputFormat);
             }
-            let w = yuv.width() as usize;
-            let h = yuv.height() as usize;
+            let w = yuv.width as usize;
+            let h = yuv.height as usize;
             let chroma_w = w.div_ceil(2);
             let chroma_h = h.div_ceil(2);
-            let y_plane = pack_plane(yuv.data(0), yuv.stride(0), w, h);
-            let u_plane = pack_plane(yuv.data(1), yuv.stride(1), chroma_w, chroma_h);
-            let v_plane = pack_plane(yuv.data(2), yuv.stride(2), chroma_w, chroma_h);
+            let y_plane = pack_plane(frame_plane(&yuv, 0, h), yuv.linesize[0] as usize, w, h);
+            let u_plane = pack_plane(
+                frame_plane(&yuv, 1, chroma_h),
+                yuv.linesize[1] as usize,
+                chroma_w,
+                chroma_h,
+            );
+            let v_plane = pack_plane(
+                frame_plane(&yuv, 2, chroma_h),
+                yuv.linesize[2] as usize,
+                chroma_w,
+                chroma_h,
+            );
+            let pts_out = if yuv.pts == ffi::AV_NOPTS_VALUE {
+                None
+            } else {
+                Some(yuv.pts)
+            };
             out.push(DecodedFrame {
-                width: yuv.width(),
-                height: yuv.height(),
-                pts: yuv.pts(),
+                width: yuv.width as u32,
+                height: yuv.height as u32,
+                pts: pts_out,
                 y: y_plane,
                 u: u_plane,
                 v: v_plane,

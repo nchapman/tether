@@ -76,22 +76,23 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::LibeiInjector;
 
-/// Pick the best available backend for the current target. On Linux we
-/// try `LibeiInjector` first (real injection via the portal); on
-/// failure or on unsupported targets we fall back to `NoopInjector`
+/// Pick the best available backend for the current target. On Linux
+/// the same backend ([`LibeiInjector`]) handles both Wayland (libei
+/// via the Remote Desktop portal) and X11 (XTest via x11rb); the
+/// constructor probes `WAYLAND_DISPLAY` and tells enigo which path
+/// to take. On unsupported targets we fall back to [`NoopInjector`]
 /// with a single warn-level log so the operator notices.
 pub async fn default_injector() -> Box<dyn Injector> {
     #[cfg(target_os = "linux")]
     {
         match LibeiInjector::connect().await {
             Ok(inj) => {
-                tracing::info!("input injector: libei (Wayland portal)");
                 return Box::new(inj);
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "libei injector unavailable; falling back to noop. \
+                    "linux injector unavailable; falling back to noop. \
                      Input events will be logged but not applied."
                 );
             }

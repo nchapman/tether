@@ -88,23 +88,45 @@ pub struct LibeiInjector {
 }
 
 impl LibeiInjector {
-    /// Establish the libei connection. Runs the portal handshake on a
-    /// blocking thread so it doesn't stall the tokio worker that called
-    /// us — enigo's constructor uses its own internal block_on, which
-    /// deadlocks if invoked from inside an active tokio context.
+    /// Establish the connection. enigo is compiled with both
+    /// `libei_tokio` and `x11rb` so we work on Wayland AND X11; the
+    /// runtime probe below picks one explicitly to avoid enigo's
+    /// "fan out to every available backend" behaviour, which would
+    /// double-press keys on XWayland (where both libei and X11
+    /// connect successfully).
+    ///
+    /// Strategy:
+    /// - `WAYLAND_DISPLAY` set → Wayland session. Disable enigo's
+    ///   X11 path by handing it a bogus display name; libei goes
+    ///   through the portal as before.
+    /// - `WAYLAND_DISPLAY` unset → X11 session. Don't disable
+    ///   X11; libei's portal init will fail naturally (no service),
+    ///   leaving X11 as the only backend.
+    ///
+    /// Runs on a blocking thread because enigo's constructor uses
+    /// its own internal block_on (deadlocks inside an active tokio
+    /// context).
     ///
     /// Display dimensions are intentionally NOT sourced from enigo:
-    /// `Enigo::main_display()` is unimplemented on libei (the backend
-    /// literally says "I don't know how this is possible under Wayland")
-    /// and failing init there leaves the host with a noop injector even
-    /// though the portal handshake succeeded. We start with a 1080p
-    /// fallback and rely on the capture path to call `set_display_size`
-    /// once it has the real numbers.
+    /// `Enigo::main_display()` is unimplemented on libei and we
+    /// don't want X11 vs libei to disagree about screen size. The
+    /// capture path calls `set_display_size` with the real numbers.
     pub async fn connect() -> Result<Self> {
-        let enigo = tokio::task::spawn_blocking(|| Enigo::new(&Settings::default()))
+        let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let mut settings = Settings::default();
+        if is_wayland {
+            // Bogus display name -> enigo's x11rb::Con::new() fails;
+            // libei wins by elimination.
+            settings.x11_display = Some("tether-disable-x11:99".to_string());
+        }
+        let enigo = tokio::task::spawn_blocking(move || Enigo::new(&settings))
             .await
             .map_err(|e| InjectError::Init(format!("spawn_blocking join: {e}")))?
             .map_err(|e| InjectError::Init(format!("enigo new: {e:?}")))?;
+        tracing::info!(
+            session = if is_wayland { "wayland (libei)" } else { "x11 (xtest)" },
+            "linux input backend selected"
+        );
         Ok(Self {
             enigo,
             display: FALLBACK_DISPLAY,

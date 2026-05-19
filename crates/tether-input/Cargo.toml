@@ -17,7 +17,7 @@ tracing = { workspace = true }
 # PipeWire screen capture). enigo's libei_tokio feature integrates with
 # the tokio runtime we already use. Other targets get a no-op injector.
 [target.'cfg(target_os = "linux")'.dependencies]
-enigo = { version = "0.6", default-features = false, features = ["libei_tokio"] }
+enigo = { version = "0.6", default-features = false, features = ["libei_tokio", "x11rb"] }
 tokio = { workspace = true }
 
 [lints]

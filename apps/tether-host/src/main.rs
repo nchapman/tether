@@ -10,13 +10,14 @@
 //! (`bind_addr` defaults to `127.0.0.1:7654`).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
 use tether_codec::{Encoder, H264Encoder};
 use tether_protocol::control::{
-    ChromaSubsampling, CodecKind, ColorSpace, ServerHello,
+    ChromaSubsampling, CodecKind, ColorSpace, ControlMessage, ServerHello,
 };
 use tether_protocol::video::{FrameFragmenter, HostFrameTiming, InputEchoBatch, VideoFrameMeta};
 use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
@@ -99,15 +100,67 @@ async fn main() -> anyhow::Result<()> {
     // is identical.
     let frames = pick_capture_source(use_test_pattern).await?;
 
+    // Force-IDR signal: control-stream recv task sets it on
+    // `ControlMessage::ForceIdr`; the capture/encode thread checks it
+    // each frame via swap. AtomicBool is the cheapest cross-thread
+    // primitive that fits the "one-shot until next frame" semantic.
+    let force_idr = Arc::new(AtomicBool::new(false));
+
     // Capture + send runs on a dedicated OS thread per the expert review:
     // the hot path doesn't share the tokio runtime with anything else.
     // Naming the JoinHandle is informational — dropping it doesn't kill
     // the thread in Rust, and v0 has no clean way to signal the PipeWire
     // main loop to stop, so we rely on process exit to tear capture down.
     let conn_send = conn.clone();
+    let force_idr_for_send = force_idr.clone();
     let _send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
-        .spawn(move || run_capture_and_send(conn_send, frames))?;
+        .spawn(move || run_capture_and_send(conn_send, frames, force_idr_for_send))?;
+
+    // Control recv: react to ForceIdr and clock-probe requests on the
+    // reliable control stream. Goodbye triggers a clean shutdown by
+    // closing the connection — the recv loops everywhere else then
+    // return Err and exit. Unknown messages are logged at trace; we
+    // never crash on a control packet.
+    let conn_control = conn.clone();
+    let force_idr_for_ctrl = force_idr.clone();
+    tokio::spawn(async move {
+        loop {
+            match conn_control.recv_control().await {
+                Ok(ControlMessage::ForceIdr) => {
+                    tracing::debug!("client requested IDR");
+                    force_idr_for_ctrl.store(true, Ordering::Relaxed);
+                }
+                Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
+                    let t1 = MonoNanos::now();
+                    let response = ControlMessage::ClockProbeResponse(
+                        tether_protocol::control::ClockProbe {
+                            t0_sender,
+                            t1_receiver_recv: t1,
+                            t2_receiver_send: MonoNanos::now(),
+                        },
+                    );
+                    if let Err(e) = conn_control.send_control(&response).await {
+                        warn!(error = ?e, "clock probe response failed; ending control loop");
+                        return;
+                    }
+                }
+                Ok(ControlMessage::ClockProbeResponse(_)) => {
+                    // Host doesn't currently initiate re-probes, but if
+                    // we ever do, the matching response handler goes here.
+                    tracing::trace!("unsolicited clock probe response; ignoring");
+                }
+                Ok(ControlMessage::Goodbye { reason }) => {
+                    info!(%reason, "client said goodbye");
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = ?e, "control recv failed; ending control loop");
+                    return;
+                }
+            }
+        }
+    });
 
     // Input recv: drain the client's input stream and feed each event
     // into the host's injection backend. Backend selection happens
@@ -160,7 +213,11 @@ struct EncoderSlot {
     height: u32,
 }
 
-fn run_capture_and_send(conn: Arc<Connection>, frames: Receiver<CapturedFrame>) {
+fn run_capture_and_send(
+    conn: Arc<Connection>,
+    frames: Receiver<CapturedFrame>,
+    force_idr: Arc<AtomicBool>,
+) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut frame_count: u64 = 0;
     let mut last_log = std::time::Instant::now();
@@ -226,8 +283,11 @@ fn run_capture_and_send(conn: Arc<Connection>, frames: Receiver<CapturedFrame>) 
         }
         let enc = &mut slot.as_mut().expect("slot populated above").encoder;
 
+        // Swap-and-zero: at most one forced keyframe per request, even
+        // if multiple ForceIdr messages arrive between encode calls.
+        let force_kf = force_idr.swap(false, Ordering::Relaxed);
         let t_encode_submit = MonoNanos::now();
-        let encoded = match enc.encode_bgra(&frame.data, pts, false) {
+        let encoded = match enc.encode_bgra(&frame.data, pts, force_kf) {
             Ok(e) => e,
             Err(e) => {
                 warn!(error = %e, "encode failed; dropping frame");

@@ -13,7 +13,7 @@ use std::time::Instant;
 use crossbeam_channel::bounded;
 use tether_codec::{Decoder, H264Decoder};
 use tether_input::WinitTranslator;
-use tether_protocol::control::{ClientHello, CodecKind};
+use tether_protocol::control::{ClientHello, CodecKind, ControlMessage};
 use tether_protocol::video::FrameReassembler;
 use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
 use tether_render::{RawFrame, RenderEvent};
@@ -78,6 +78,15 @@ async fn main() -> anyhow::Result<()> {
     // the project.
     let (frame_tx, frame_rx) = bounded::<RawFrame>(2);
 
+    // First IDR request goes out immediately after the handshake: the
+    // host's encoder always emits IDR on its very first frame, but if
+    // capture hasn't started yet (portal prompt still up, etc.) we
+    // need to make sure the *next* frame we see is a keyframe instead
+    // of joining the host's P-frame chain mid-GOP.
+    if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
+        warn!(error = ?e, "initial ForceIdr send failed; continuing anyway");
+    }
+
     let conn_recv = conn.clone();
     let recv_clock_sync = clock_sync;
     tokio::spawn(async move {
@@ -91,6 +100,12 @@ async fn main() -> anyhow::Result<()> {
         };
         let mut frame_count: u64 = 0;
         let mut last_log = Instant::now();
+        // Rate-limit ForceIdr requests so a corrupt stream doesn't
+        // turn into a keyframe storm. 500ms matches the human "is this
+        // still broken?" cadence; anything tighter just wastes
+        // bitrate on duplicate IDRs that haven't even been encoded yet.
+        let mut last_idr_request: Option<Instant> = None;
+        const IDR_RATE_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
 
         loop {
             match conn_recv.recv_datagram().await {
@@ -122,6 +137,22 @@ async fn main() -> anyhow::Result<()> {
                         Ok(d) => d,
                         Err(e) => {
                             warn!(error = %e, "h264 decode failed; dropping packet");
+                            // A decode error usually means a P-frame
+                            // arrived without its IDR (or with a dropped
+                            // fragment that corrupted the slice). Asking
+                            // the host for a fresh IDR is the only way
+                            // out — without it we stay garbled until
+                            // the next periodic IDR (up to one GOP).
+                            let now = Instant::now();
+                            if last_idr_request.is_none_or(|t| now.duration_since(t) > IDR_RATE_LIMIT) {
+                                let conn = conn_recv.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
+                                        warn!(error = ?e, "ForceIdr send failed");
+                                    }
+                                });
+                                last_idr_request = Some(now);
+                            }
                             continue;
                         }
                     };

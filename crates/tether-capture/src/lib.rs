@@ -15,6 +15,9 @@
 
 pub mod test_pattern;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 use tether_protocol::MonoNanos;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,3 +66,17 @@ pub enum CaptureError {
 }
 
 pub type Result<T> = std::result::Result<T, CaptureError>;
+
+#[cfg(target_os = "linux")]
+impl From<ashpd::Error> for CaptureError {
+    fn from(e: ashpd::Error) -> Self {
+        Self::Portal(e.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<pipewire::Error> for CaptureError {
+    fn from(e: pipewire::Error) -> Self {
+        Self::PipeWire(e.to_string())
+    }
+}

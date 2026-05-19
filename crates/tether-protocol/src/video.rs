@@ -30,6 +30,11 @@ pub struct VideoFrameMeta {
     pub timing: HostFrameTiming,
     pub keyframe: bool,
     pub input_echo: InputEchoBatch,
+    /// Frame width × height in pixels. Always populated so a raw or
+    /// keyframe-only consumer can size its render target without parsing
+    /// codec-specific SPS / sequence headers. Costs ~10 bytes per frame
+    /// header (varint-encoded u32 pair).
+    pub dimensions: (u32, u32),
 }
 
 /// A single video datagram. Frames larger than the transport's max datagram

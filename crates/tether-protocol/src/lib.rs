@@ -143,6 +143,7 @@ mod tests {
                 input_echo: InputEchoBatch {
                     event_ids: vec![1, 2, 3],
                 },
+                dimensions: (320, 240),
             },
             payload: vec![0xAA; 1100],
         };
@@ -243,8 +244,9 @@ mod tests {
                 input_echo: InputEchoBatch {
                     event_ids: vec![u64::MAX; 4],
                 },
+                dimensions: (u32::MAX, u32::MAX),
             },
-            payload: vec![0; 1100],
+            payload: vec![0; 1080],
         };
         let bytes = encode(&p).unwrap();
         assert!(
@@ -262,6 +264,7 @@ mod tests {
             timing: HostFrameTiming::default(),
             keyframe: true,
             input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
         };
 
         let mut fragmenter = FrameFragmenter::new(0);
@@ -302,6 +305,7 @@ mod tests {
             timing: HostFrameTiming::default(),
             keyframe: false,
             input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
         };
         let mut fragmenter = FrameFragmenter::new(2);
         let mut packets = fragmenter.fragment(meta, &body);
@@ -329,6 +333,7 @@ mod tests {
             timing: HostFrameTiming::default(),
             keyframe: false,
             input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
         };
 
         // Advance latest_seq on the reassembler to 5 by feeding it 6

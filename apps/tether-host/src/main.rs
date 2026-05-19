@@ -1,32 +1,33 @@
 //! Tether host — captures the local display and streams it to a client.
 //!
-//! v0 walking skeleton: synthetic test-pattern capture, no codec, raw
-//! BGRA frames fragmented over QUIC datagrams. Single client per host.
-//! Real capture (ScreenCaptureKit / PipeWire) and a codec come later.
+//! v0: raw BGRA frames fragmented over QUIC datagrams, single client per
+//! host, no codec. Real capture (PipeWire/portal on Linux, ScreenCaptureKit
+//! on macOS) is the default; pass `--test-pattern` to fall back to the
+//! synthetic gradient generator (useful for headless dev or as a fallback
+//! when the portal isn't available).
 //!
-//! Usage: `tether-host [bind_addr]` (defaults to `127.0.0.1:7654`).
+//! Usage: `tether-host [--test-pattern] [bind_addr]`
+//! (`bind_addr` defaults to `127.0.0.1:7654`).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tether_capture::test_pattern;
+use crossbeam_channel::Receiver;
+use tether_capture::CapturedFrame;
 use tether_protocol::video::{FrameFragmenter, HostFrameTiming, InputEchoBatch, VideoFrameMeta};
 use tether_protocol::MonoNanos;
 use tether_transport::{Connection, Datagram, Server};
 use tracing::{info, warn};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
-const FPS: u32 = 30;
+const TEST_PATTERN_WIDTH: u32 = 320;
+const TEST_PATTERN_HEIGHT: u32 = 240;
+const TEST_PATTERN_FPS: u32 = 30;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let bind: SocketAddr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:7654".into())
-        .parse()?;
+    let (bind, use_test_pattern) = parse_args()?;
 
     let server = Server::bind(bind).await?;
     let local = server.local_addr()?;
@@ -47,12 +48,19 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(remote = %conn.remote_address(), "client connected");
 
+    // Acquire a capture stream — either real platform capture or the
+    // synthetic test pattern fallback. Real Linux capture is async (the
+    // portal handshake awaits a user permission dialog); test pattern is
+    // sync. Both end up as a `Receiver<CapturedFrame>` so the send loop
+    // is identical.
+    let frames = pick_capture_source(use_test_pattern).await?;
+
     // Capture + send runs on a dedicated OS thread per the expert review:
     // the hot path doesn't share the tokio runtime with anything else.
     let conn_send = conn.clone();
     std::thread::Builder::new()
         .name("tether-host-send".into())
-        .spawn(move || run_capture_and_send(conn_send))?;
+        .spawn(move || run_capture_and_send(conn_send, frames))?;
 
     // Block until Ctrl-C, then shut down gracefully.
     tokio::signal::ctrl_c().await?;
@@ -62,8 +70,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_capture_and_send(conn: Arc<Connection>) {
-    let frames = test_pattern::start(WIDTH, HEIGHT, FPS);
+fn run_capture_and_send(conn: Arc<Connection>, frames: Receiver<CapturedFrame>) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut frame_count: u64 = 0;
     let mut last_log = std::time::Instant::now();
@@ -84,6 +91,7 @@ fn run_capture_and_send(conn: Arc<Connection>) {
             // any single frame.
             keyframe: true,
             input_echo: InputEchoBatch::default(),
+            dimensions: (frame.width, frame.height),
         };
 
         let packets = fragmenter.fragment(meta, &frame.data);
@@ -106,6 +114,59 @@ fn run_capture_and_send(conn: Arc<Connection>) {
         }
     }
     info!("capture channel closed, send loop exiting");
+}
+
+fn parse_args() -> anyhow::Result<(SocketAddr, bool)> {
+    let mut bind: SocketAddr = "127.0.0.1:7654".parse().expect("static literal");
+    let mut use_test_pattern = false;
+    for arg in std::env::args().skip(1) {
+        if arg == "--test-pattern" {
+            use_test_pattern = true;
+        } else if arg == "--help" || arg == "-h" {
+            eprintln!("usage: tether-host [--test-pattern] [bind_addr]");
+            std::process::exit(0);
+        } else {
+            bind = arg.parse()?;
+        }
+    }
+    Ok((bind, use_test_pattern))
+}
+
+async fn pick_capture_source(
+    force_test_pattern: bool,
+) -> anyhow::Result<Receiver<CapturedFrame>> {
+    if force_test_pattern {
+        info!(
+            width = TEST_PATTERN_WIDTH,
+            height = TEST_PATTERN_HEIGHT,
+            fps = TEST_PATTERN_FPS,
+            "capture source: test-pattern (forced)"
+        );
+        return Ok(tether_capture::test_pattern::start(
+            TEST_PATTERN_WIDTH,
+            TEST_PATTERN_HEIGHT,
+            TEST_PATTERN_FPS,
+        ));
+    }
+    real_capture().await
+}
+
+#[cfg(target_os = "linux")]
+async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
+    info!("capture source: linux (PipeWire + xdg-desktop-portal)");
+    tether_capture::linux::start()
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
+    warn!("no real capture backend on this platform yet; falling back to test-pattern");
+    Ok(tether_capture::test_pattern::start(
+        TEST_PATTERN_WIDTH,
+        TEST_PATTERN_HEIGHT,
+        TEST_PATTERN_FPS,
+    ))
 }
 
 fn init_tracing() {

@@ -17,11 +17,12 @@ use tether_render::RawFrame;
 use tether_transport::{Client, Datagram};
 use tracing::{info, warn};
 
-// Must match the host's hardcoded test-pattern resolution. The protocol
-// doesn't yet carry frame dimensions; that's a follow-up when real
-// capture lands and resolutions are no longer compile-time fixed.
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
+// Initial window size — the actual frame dimensions come from
+// `VideoFrameMeta::dimensions` once frames start arriving and the window
+// will pick them up automatically because tether-render reallocates its
+// texture on dimension change.
+const INITIAL_WIDTH: u32 = 1280;
+const INITIAL_HEIGHT: u32 = 720;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
@@ -71,10 +72,11 @@ async fn main() -> anyhow::Result<()> {
                         last_log = Instant::now();
                     }
 
+                    let (w, h) = frame.meta.dimensions;
                     let rgba = bgra_to_rgba(&frame.body);
                     let raw = RawFrame {
-                        width: WIDTH,
-                        height: HEIGHT,
+                        width: w,
+                        height: h,
                         data: rgba,
                     };
                     // Drop on full — render is intentionally one-deep.
@@ -90,7 +92,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Render loop blocks until the user closes the window.
-    tether_render::run("tether-client", (WIDTH, HEIGHT), frame_rx)?;
+    tether_render::run(
+        "tether-client",
+        (INITIAL_WIDTH, INITIAL_HEIGHT),
+        frame_rx,
+    )?;
     Ok(())
 }
 

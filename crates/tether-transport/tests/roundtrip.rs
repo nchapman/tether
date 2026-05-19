@@ -64,6 +64,7 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
             timing: HostFrameTiming::default(),
             keyframe: true,
             input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
         },
         payload: vec![0u8; 100],
     };
@@ -204,6 +205,7 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
             timing: HostFrameTiming::default(),
             keyframe: false,
             input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
         },
         payload: vec![0u8; 4096],
     };

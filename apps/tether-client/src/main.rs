@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::bounded;
-use tether_codec::{Decoder, H264Decoder};
+use tether_codec::{probe_decoder, Decoder};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{ClientHello, CodecKind, ControlMessage};
 use tether_protocol::video::FrameReassembler;
@@ -91,14 +91,27 @@ async fn main() -> anyhow::Result<()> {
     let recv_clock_sync = clock_sync;
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
-        let mut decoder = match H264Decoder::new() {
-            Ok(d) => d,
+        let mut decoder: Box<dyn Decoder> = match probe_decoder() {
+            Ok(d) => {
+                info!(
+                    backend = d.name(),
+                    hardware = d.is_hardware(),
+                    "decoder initialised"
+                );
+                d
+            }
             Err(e) => {
-                warn!(error = %e, "h264 decoder init failed; aborting recv loop");
+                warn!(error = %e, "decoder init failed; aborting recv loop");
                 return;
             }
         };
         let mut frame_count: u64 = 0;
+        // Sum of decode call wall-clocks across the frames in the
+        // current log window, surfaced as avg_decode_ms on the
+        // frame-stats line. Same shape as the host's avg_encode_ms
+        // metric so the two together show where pipeline time is
+        // going.
+        let mut decode_latency_sum_ns: u64 = 0;
         let mut last_log = Instant::now();
         // Rate-limit ForceIdr requests so a corrupt stream doesn't
         // turn into a keyframe storm. 500ms matches the human "is this
@@ -123,16 +136,8 @@ async fn main() -> anyhow::Result<()> {
                         recv_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
                     let age_ns = now.saturating_sub(host_in_client_clock);
                     frame_count += 1;
-                    if last_log.elapsed() >= std::time::Duration::from_secs(1) {
-                        info!(
-                            frames_per_s = frame_count,
-                            latency_ms = age_ns as f64 / 1_000_000.0,
-                            "frame stats"
-                        );
-                        frame_count = 0;
-                        last_log = Instant::now();
-                    }
 
+                    let t_decode_start = MonoNanos::now();
                     let decoded = match decoder.decode(&frame.body) {
                         Ok(d) => d,
                         Err(e) => {
@@ -156,6 +161,10 @@ async fn main() -> anyhow::Result<()> {
                             continue;
                         }
                     };
+                    let t_decode_done = MonoNanos::now();
+                    decode_latency_sum_ns = decode_latency_sum_ns
+                        .saturating_add(t_decode_done.saturating_sub(t_decode_start));
+
                     for dec in decoded {
                         // YUV planes go straight to the render texture
                         // upload — no per-frame CPU pixel format
@@ -173,6 +182,24 @@ async fn main() -> anyhow::Result<()> {
                         };
                         // Drop on full — render is intentionally one-deep.
                         let _ = frame_tx.try_send(raw);
+                    }
+
+                    if last_log.elapsed() >= std::time::Duration::from_secs(1) {
+                        #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
+                        let avg_decode_ms = if frame_count > 0 {
+                            (decode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        info!(
+                            frames_per_s = frame_count,
+                            latency_ms = age_ns as f64 / 1_000_000.0,
+                            avg_decode_ms = format!("{avg_decode_ms:.2}"),
+                            "frame stats"
+                        );
+                        frame_count = 0;
+                        decode_latency_sum_ns = 0;
+                        last_log = Instant::now();
                     }
                 }
                 Ok(Datagram::HostCursor(_)) => {

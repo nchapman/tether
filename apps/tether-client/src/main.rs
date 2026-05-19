@@ -13,8 +13,9 @@ use std::time::Instant;
 use crossbeam_channel::bounded;
 use tether_codec::{Decoder, H264Decoder};
 use tether_input::WinitTranslator;
+use tether_protocol::control::{ClientHello, CodecKind};
 use tether_protocol::video::FrameReassembler;
-use tether_protocol::MonoNanos;
+use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
 use tether_render::{RawFrame, RenderEvent};
 use tether_transport::{Client, Datagram};
 use tokio::sync::mpsc;
@@ -46,12 +47,39 @@ async fn main() -> anyhow::Result<()> {
     let conn = Arc::new(conn);
     info!(remote = %conn.remote_address(), "connected to host");
 
+    // Application-layer handshake: identify ourselves, request a codec,
+    // and use the embedded probe to compute a host↔client clock offset
+    // so latency logs are wall-clock-accurate from the first frame.
+    let hello = ClientHello {
+        protocol_version: PROTOCOL_VERSION,
+        client_name: "tether-client".to_string(),
+        preferred_codecs: vec![CodecKind::H264],
+        max_resolution: None,
+        clock_probe_t0: MonoNanos::ZERO,
+    };
+    let (server_hello, clock_sync) = conn.client_handshake(hello).await?;
+    if server_hello.protocol_version != PROTOCOL_VERSION {
+        anyhow::bail!(
+            "protocol version mismatch: client={PROTOCOL_VERSION}, server={}",
+            server_hello.protocol_version
+        );
+    }
+    info!(
+        server = %server_hello.server_name,
+        codec = ?server_hello.chosen_codec,
+        resolution = ?server_hello.resolution,
+        rtt_us = clock_sync.rtt_nanos / 1_000,
+        clock_offset_us = clock_sync.offset_nanos / 1_000,
+        "handshake complete"
+    );
+
     // Render channel: producer is the recv loop, consumer is the wgpu
     // window. Bounded(2) with drop-newest semantics matches the rest of
     // the project.
     let (frame_tx, frame_rx) = bounded::<RawFrame>(2);
 
     let conn_recv = conn.clone();
+    let recv_clock_sync = clock_sync;
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
         let mut decoder = match H264Decoder::new() {
@@ -69,7 +97,16 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Datagram::Video(packet)) => {
                     let Some(frame) = reassembler.handle(packet) else { continue };
                     let now = MonoNanos::now();
-                    let age_ns = now.saturating_sub(frame.meta.timing.t_capture_userspace);
+                    // Host timestamp -> client clock via the handshake
+                    // offset, so this is true glass-to-glass-ish (we
+                    // still don't sample present-time on the GPU). On
+                    // first frame this can saturate-to-zero if the
+                    // offset hasn't actually advanced past zero yet —
+                    // log will read 0 ms, which is fine for a single
+                    // frame.
+                    let host_in_client_clock =
+                        recv_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
+                    let age_ns = now.saturating_sub(host_in_client_clock);
                     frame_count += 1;
                     if last_log.elapsed() >= std::time::Duration::from_secs(1) {
                         info!(

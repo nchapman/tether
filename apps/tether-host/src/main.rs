@@ -15,8 +15,11 @@ use std::sync::Arc;
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
 use tether_codec::{Encoder, H264Encoder};
+use tether_protocol::control::{
+    ChromaSubsampling, CodecKind, ColorSpace, ServerHello,
+};
 use tether_protocol::video::{FrameFragmenter, HostFrameTiming, InputEchoBatch, VideoFrameMeta};
-use tether_protocol::MonoNanos;
+use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
 use tether_transport::{Connection, Datagram, Server};
 use tracing::{info, warn};
 
@@ -51,6 +54,43 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     info!(remote = %conn.remote_address(), "client connected");
+
+    // Application-layer handshake. The closure picks the codec from the
+    // client's preference list (H264-only for now), and the transport
+    // layer stamps the clock-probe timestamps right around the send to
+    // keep the offset measurement tight. Hello protocol-version
+    // mismatches are fatal per the v0 policy in control.rs.
+    let client_hello = conn
+        .host_handshake(|hello| ServerHello {
+            protocol_version: PROTOCOL_VERSION,
+            server_name: "tether-host".to_string(),
+            chosen_codec: pick_codec(&hello.preferred_codecs),
+            chosen_chroma: ChromaSubsampling::Yuv420,
+            color_space: ColorSpace::Bt709Limited,
+            // Encoded source dims aren't known yet (lazy encoder init
+            // happens on the first frame); use a placeholder and rely
+            // on per-frame VideoFrameMeta::dimensions for the truth.
+            resolution: (0, 0),
+            clock_probe_t0_echo: MonoNanos::ZERO,
+            t1_server_recv: MonoNanos::ZERO,
+            t2_server_send: MonoNanos::ZERO,
+        })
+        .await?;
+    if client_hello.protocol_version != PROTOCOL_VERSION {
+        warn!(
+            client_version = client_hello.protocol_version,
+            host_version = PROTOCOL_VERSION,
+            "protocol version mismatch; closing"
+        );
+        conn.close(0, b"protocol version mismatch");
+        return Ok(());
+    }
+    info!(
+        client = %client_hello.client_name,
+        codecs = ?client_hello.preferred_codecs,
+        max_resolution = ?client_hello.max_resolution,
+        "handshake complete"
+    );
 
     // Acquire a capture stream — either real platform capture or the
     // synthetic test pattern fallback. Real Linux capture is async (the
@@ -306,6 +346,18 @@ fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// Pick the first codec from the client's preference list that we can
+/// actually encode. H264 is the only one we ship today; HEVC and AV1
+/// will land later.
+fn pick_codec(preferred: &[CodecKind]) -> CodecKind {
+    for k in preferred {
+        if matches!(k, CodecKind::H264) {
+            return *k;
+        }
+    }
+    CodecKind::H264
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

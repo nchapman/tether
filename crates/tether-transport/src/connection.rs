@@ -5,9 +5,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use tether_protocol::{
-    control::ControlMessage, cursor::CursorPacket, input::InputEvent, video::VideoPacket,
+    control::{ClientHello, ClockSync, ControlMessage, ServerHello},
+    cursor::CursorPacket,
+    input::InputEvent,
+    video::VideoPacket,
     MAX_DATAGRAM_PAYLOAD,
 };
+use tether_protocol::MonoNanos;
 
 use crate::{Result, TransportError, MAX_FRAMED_MESSAGE};
 
@@ -111,6 +115,52 @@ impl Connection {
         Ok(tether_protocol::decode(&bytes)?)
     }
 
+    /// Client side of the post-QUIC application handshake. Sends the
+    /// supplied `ClientHello` (overwriting its `clock_probe_t0` with a
+    /// fresh local timestamp right before the write so the round-trip
+    /// math measures *this* send, not whatever the caller built earlier),
+    /// awaits a `ServerHello`, records the receive time, and returns
+    /// both the parsed Hello and a `ClockSync` computed from the four
+    /// probe stamps. Caller is responsible for any application-level
+    /// validation (codec match, resolution sanity, version check).
+    pub async fn client_handshake(
+        &self,
+        mut hello: ClientHello,
+    ) -> Result<(ServerHello, ClockSync)> {
+        hello.clock_probe_t0 = MonoNanos::now();
+        let t0 = hello.clock_probe_t0;
+        self.send_control_raw(&hello).await?;
+        let server: ServerHello = self.recv_control_raw().await?;
+        let t3 = MonoNanos::now();
+        let sync = ClockSync::from_probe(
+            t0,
+            server.t1_server_recv,
+            server.t2_server_send,
+            t3,
+        );
+        Ok((server, sync))
+    }
+
+    /// Host side of the post-QUIC application handshake. Awaits the
+    /// `ClientHello`, captures the receive time, hands the parsed Hello
+    /// to the caller's `build` closure (which picks the codec, chooses a
+    /// resolution, etc.), then stamps `t2_server_send` immediately
+    /// before sending the response. Returns the original `ClientHello`
+    /// so the caller can also inspect what it agreed to.
+    pub async fn host_handshake<F>(&self, build: F) -> Result<ClientHello>
+    where
+        F: FnOnce(&ClientHello) -> ServerHello,
+    {
+        let hello: ClientHello = self.recv_control_raw().await?;
+        let t1 = MonoNanos::now();
+        let mut server = build(&hello);
+        server.clock_probe_t0_echo = hello.clock_probe_t0;
+        server.t1_server_recv = t1;
+        server.t2_server_send = MonoNanos::now();
+        self.send_control_raw(&server).await?;
+        Ok(hello)
+    }
+
     pub async fn send_control(&self, msg: &ControlMessage) -> Result<()> {
         let bytes = tether_protocol::encode(msg)?;
         let mut s = self.control_send.lock().await;
@@ -118,6 +168,20 @@ impl Connection {
     }
 
     pub async fn recv_control(&self) -> Result<ControlMessage> {
+        self.recv_control_raw().await
+    }
+
+    /// Internal helper: same wire shape as `send_control` but generic
+    /// over any serde-encodable type. The handshake messages
+    /// (ClientHello/ServerHello) ride on the same control stream as
+    /// post-handshake `ControlMessage`s but aren't part of that enum.
+    async fn send_control_raw<T: serde::Serialize>(&self, msg: &T) -> Result<()> {
+        let bytes = tether_protocol::encode(msg)?;
+        let mut s = self.control_send.lock().await;
+        write_framed(&mut s, &bytes).await
+    }
+
+    async fn recv_control_raw<T: for<'de> serde::Deserialize<'de>>(&self) -> Result<T> {
         let mut r = self.control_recv.lock().await;
         let bytes = read_framed(&mut r).await?;
         Ok(tether_protocol::decode(&bytes)?)

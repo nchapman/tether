@@ -17,6 +17,7 @@ tether-protocol = { workspace = true }
 tether-transport = { workspace = true }
 tether-capture = { workspace = true }
 tether-codec = { workspace = true }
+tether-input = { workspace = true }
 
 [lints]
 workspace = true

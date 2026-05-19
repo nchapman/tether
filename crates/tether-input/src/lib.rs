@@ -1,7 +1,15 @@
 //! Input plumbing: translate render-layer window events into wire-level
-//! [`InputEvent`]s on the client, and inject those events into the host's
-//! native input system. v0 covers the client side only — injection lands
-//! next, behind a per-platform backend.
+//! [`InputEvent`]s on the client (`WinitTranslator`), and inject those
+//! events into the host's native input system (`inject::Injector`).
+//!
+//! Backends are picked per-target by [`inject::default_injector`]; today
+//! that's libei on Linux (portal-mediated, Wayland-native) and a noop
+//! everywhere else. Adding macOS / Windows means another backend behind
+//! the same trait.
+
+pub mod inject;
+
+pub use inject::{InjectError, Injector, NoopInjector};
 
 use tether_protocol::input::{
     HidUsage, InputEvent, InputEventKind, Modifiers, MouseButton, ScrollKind,

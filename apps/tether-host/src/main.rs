@@ -69,21 +69,26 @@ async fn main() -> anyhow::Result<()> {
         .name("tether-host-send".into())
         .spawn(move || run_capture_and_send(conn_send, frames))?;
 
-    // Input recv: drain the client's input stream and log each event.
-    // Injection lands separately — for now this just proves the input
-    // channel is wired end-to-end and gives the user a visible
-    // confirmation when they type / click in the client window.
+    // Input recv: drain the client's input stream and feed each event
+    // into the host's injection backend. Backend selection happens
+    // before the recv loop starts so the user sees any portal prompt
+    // up front; a backend init failure is non-fatal — we fall back to
+    // a noop injector that just logs.
     let conn_input = conn.clone();
+    let mut injector = tether_input::inject::default_injector().await;
     tokio::spawn(async move {
         loop {
             match conn_input.recv_input().await {
                 Ok(evt) => {
-                    info!(
+                    tracing::trace!(
                         event_id = evt.event_id,
                         t_client_ns = evt.t_client.0,
                         kind = ?evt.kind,
                         "input event"
                     );
+                    if let Err(e) = injector.inject(&evt) {
+                        warn!(error = %e, "injector rejected event; dropping");
+                    }
                 }
                 Err(e) => {
                     warn!(error = ?e, "input recv failed; ending input task");

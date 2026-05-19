@@ -112,6 +112,36 @@ async fn main() -> anyhow::Result<()> {
         // metric so the two together show where pipeline time is
         // going.
         let mut decode_latency_sum_ns: u64 = 0;
+        // Sum of capture-to-recv ages over the window. The previous
+        // implementation logged the last frame's age which is
+        // misleading when the metric is supposed to summarise a
+        // second of behaviour; averaging across frames gives an
+        // actually-meaningful number.
+        let mut latency_sum_ns: u64 = 0;
+        // Sum of t_send (host clock, translated via clock_sync) to
+        // local recv times. Isolates the network leg from compute
+        // — pair with avg_encode_ms / avg_decode_ms to attribute
+        // any latency budget movement to the right component.
+        let mut network_latency_sum_ns: u64 = 0;
+        // Bytes off the wire (encoded H.264 payloads after
+        // reassembly). With matching host kbps_out, a divergence
+        // means packets are being dropped between host and client.
+        let mut bytes_received: u64 = 0;
+        // Decode failures in the window. Steady non-zero values
+        // mean we're losing IDR/SPS/PPS frames or the bitstream is
+        // getting corrupted between encode and decode.
+        let mut decode_errors: u32 = 0;
+        // Frames the recv loop produced but the render channel
+        // couldn't accept (bounded(2), drop-newest). Non-zero
+        // means the render thread isn't keeping up with arrival
+        // rate — typically a wgpu/present pacing issue, not a
+        // codec issue.
+        let mut render_drops: u32 = 0;
+        // ForceIdr control messages we sent in the window. Pairs
+        // with the host's kf_per_s — if these match, the storm of
+        // keyframes on the host is *our* fault, not the encoder
+        // misbehaving.
+        let mut idr_requests: u32 = 0;
         let mut last_log = Instant::now();
         // Rate-limit ForceIdr requests so a corrupt stream doesn't
         // turn into a keyframe storm. 500ms matches the human "is this
@@ -125,23 +155,30 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Datagram::Video(packet)) => {
                     let Some(frame) = reassembler.handle(packet) else { continue };
                     let now = MonoNanos::now();
-                    // Host timestamp -> client clock via the handshake
-                    // offset, so this is true glass-to-glass-ish (we
-                    // still don't sample present-time on the GPU). On
-                    // first frame this can saturate-to-zero if the
-                    // offset hasn't actually advanced past zero yet —
-                    // log will read 0 ms, which is fine for a single
-                    // frame.
+                    // Host timestamps -> client clock via the handshake
+                    // offset. host_in_client_clock is the moment the
+                    // host captured the frame; send_in_client_clock is
+                    // the moment the host handed it to QUIC. The
+                    // difference between them and `now` decomposes
+                    // total latency into capture-to-send (host
+                    // pipeline) and send-to-recv (network + reassembly).
                     let host_in_client_clock =
                         recv_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
+                    let send_in_client_clock =
+                        recv_clock_sync.remote_to_local(frame.meta.timing.t_send);
                     let age_ns = now.saturating_sub(host_in_client_clock);
+                    let network_ns = now.saturating_sub(send_in_client_clock);
                     frame_count += 1;
+                    latency_sum_ns = latency_sum_ns.saturating_add(age_ns);
+                    network_latency_sum_ns = network_latency_sum_ns.saturating_add(network_ns);
+                    bytes_received = bytes_received.saturating_add(frame.body.len() as u64);
 
                     let t_decode_start = MonoNanos::now();
                     let decoded = match decoder.decode(&frame.body) {
                         Ok(d) => d,
                         Err(e) => {
                             warn!(error = %e, "h264 decode failed; dropping packet");
+                            decode_errors = decode_errors.saturating_add(1);
                             // A decode error usually means a P-frame
                             // arrived without its IDR (or with a dropped
                             // fragment that corrupted the slice). Asking
@@ -157,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 });
                                 last_idr_request = Some(now);
+                                idr_requests = idr_requests.saturating_add(1);
                             }
                             continue;
                         }
@@ -181,24 +219,56 @@ async fn main() -> anyhow::Result<()> {
                             t_capture_client_clock: Some(host_in_client_clock),
                         };
                         // Drop on full — render is intentionally one-deep.
-                        let _ = frame_tx.try_send(raw);
+                        if frame_tx.try_send(raw).is_err() {
+                            render_drops = render_drops.saturating_add(1);
+                        }
                     }
 
                     if last_log.elapsed() >= std::time::Duration::from_secs(1) {
+                        let window_secs = last_log.elapsed().as_secs_f64();
                         #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
                         let avg_decode_ms = if frame_count > 0 {
                             (decode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
                         } else {
                             0.0
                         };
+                        #[allow(clippy::cast_precision_loss)]
+                        let avg_latency_ms = if frame_count > 0 {
+                            (latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        #[allow(clippy::cast_precision_loss)]
+                        let avg_network_ms = if frame_count > 0 {
+                            (network_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        #[allow(clippy::cast_precision_loss)]
+                        let kbps_in = if window_secs > 0.0 {
+                            (bytes_received as f64 * 8.0 / 1000.0) / window_secs
+                        } else {
+                            0.0
+                        };
                         info!(
                             frames_per_s = frame_count,
-                            latency_ms = age_ns as f64 / 1_000_000.0,
+                            latency_ms = format!("{avg_latency_ms:.2}"),
+                            network_ms = format!("{avg_network_ms:.2}"),
                             avg_decode_ms = format!("{avg_decode_ms:.2}"),
+                            kbps_in = format!("{kbps_in:.0}"),
+                            decode_errs = decode_errors,
+                            render_drops = render_drops,
+                            idr_reqs = idr_requests,
                             "frame stats"
                         );
                         frame_count = 0;
                         decode_latency_sum_ns = 0;
+                        latency_sum_ns = 0;
+                        network_latency_sum_ns = 0;
+                        bytes_received = 0;
+                        decode_errors = 0;
+                        render_drops = 0;
+                        idr_requests = 0;
                         last_log = Instant::now();
                     }
                 }

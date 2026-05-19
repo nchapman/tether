@@ -44,7 +44,7 @@ fn pack_plane(plane: &[u8], stride: usize, row_bytes: usize, height: usize) -> V
 /// the mutable borrow of `frame` keeps the underlying buffer alive for
 /// the slice's lifetime.
 #[allow(clippy::cast_sign_loss)] // ffmpeg linesize is i32 but non-negative for allocated frames
-fn frame_plane_mut(frame: &mut AVFrame, idx: usize, height: usize) -> &mut [u8] {
+pub(crate) fn frame_plane_mut(frame: &mut AVFrame, idx: usize, height: usize) -> &mut [u8] {
     let stride = frame.linesize[idx] as usize;
     let ptr = frame.data_mut()[idx];
     // SAFETY: caller asserts `frame` was constructed with a successful

@@ -30,12 +30,32 @@ pub fn probe_encoder_bgra(
     fps: u32,
     bitrate_kbps: u32,
 ) -> Result<Box<dyn Encoder>> {
-    // Hardware backends will register here in preference order. The
-    // pattern is the same for each: try the constructor, log a debug
-    // note on failure (so a user investigating perf can see *why* the
-    // HW path was skipped), and fall through to the next candidate.
+    // Hardware backends try-in-order. Each candidate is "try construct,
+    // fall through quietly on failure" — failure usually means "not
+    // available on this system" (no VAAPI device, NVIDIA but no
+    // CUDA, etc.), which is expected and shouldn't propagate.
     //
-    // VAAPI / NVENC / VideoToolbox slot in at this point.
+    // The debug log on failure is intentional: a user investigating
+    // "why is my host using libx264 instead of VAAPI" can flip the
+    // tether-codec log level to debug and see the constructor error
+    // without having to attach a debugger.
+
+    #[cfg(target_os = "linux")]
+    {
+        match crate::vaapi::VaapiEncoder::new_bgra(width, height, fps, bitrate_kbps) {
+            Ok(enc) => return Ok(Box::new(enc)),
+            Err(e) => {
+                tracing::debug!(
+                    backend = "h264_vaapi",
+                    error = %e,
+                    "hardware encoder unavailable; trying next candidate"
+                );
+            }
+        }
+    }
+
+    // NVENC / VideoToolbox / AMF candidates slot in here as additional
+    // platform-gated try blocks.
 
     // Software fallback. libx264 is bundled with every reasonable
     // FFmpeg build — if this fails the host can't encode at all, so

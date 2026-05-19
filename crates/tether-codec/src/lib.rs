@@ -10,6 +10,9 @@
 pub mod h264;
 pub mod probe;
 
+#[cfg(target_os = "linux")]
+pub mod vaapi;
+
 pub use h264::{H264Decoder, H264Encoder};
 pub use probe::probe_encoder_bgra;
 

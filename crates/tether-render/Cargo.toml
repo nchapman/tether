@@ -13,7 +13,16 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
 
-wgpu = "29"
+# wgpu 29 (latest crates.io release) has no DMA-BUF import path; PR #9366
+# adds `texture_from_dmabuf_fd` on the Vulkan hal, which is required to
+# replace `av_hwframe_transfer_data` on the decode side. Pin is by SHA
+# rather than branch for reproducibility — `main` will move, the SHA
+# won't. Workspace-level `[patch.crates-io]` keeps wgpu-{core,hal,types}
+# on the same rev so we don't end up with two incompatible wgpu copies
+# once another crate pulls them in.
+# Migration trigger: drop the patch and bump to `version = "30"` once
+# wgpu 30 ships with the new API.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9" }
 winit = { workspace = true }
 pollster = "0.4"
 

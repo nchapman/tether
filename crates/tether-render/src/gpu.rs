@@ -43,6 +43,10 @@ impl GpuState {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                // Added on wgpu trunk past 29.x; opting out keeps the
+                // pre-trunk per-backend limit behaviour. Revisit when we
+                // bump to wgpu 30.
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|_| RenderError::NoAdapter)?;

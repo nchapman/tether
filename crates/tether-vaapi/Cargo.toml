@@ -1,0 +1,16 @@
+[package]
+name = "tether-vaapi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal libva FFI surface: only the calls Tether needs for DMA-BUF export and error reporting."
+
+[dependencies]
+thiserror = { workspace = true }
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[lints]
+workspace = true

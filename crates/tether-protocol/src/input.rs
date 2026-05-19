@@ -26,7 +26,7 @@ pub struct Modifiers {
     pub meta: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
     Right,
@@ -47,14 +47,29 @@ pub enum ScrollKind {
 pub enum InputEventKind {
     KeyDown { key: HidUsage, modifiers: Modifiers },
     KeyUp { key: HidUsage, modifiers: Modifiers },
+    /// Layout-/IME-resolved character(s) to type as a unit, complementing
+    /// the HID path. The client emits this when it has the actual text
+    /// the user produced — IME composition results, dead-key sequences,
+    /// AltGr letters, and ordinary typing where a layout-aware host
+    /// `type-text` operation is more correct than reconstructing the
+    /// string from physical keycodes. Hosts apply the current keymap;
+    /// shortcuts (Ctrl+C etc.) keep going through `KeyDown`/`KeyUp`.
+    Text { utf8: String },
     /// Absolute mouse position normalised to `[0.0, 1.0]` along each axis of
     /// the client's rendered video surface (the area showing host pixels,
     /// excluding any letterbox bars introduced by an aspect-ratio mismatch
     /// between the client window and the host display). The host scales
     /// these normalised coordinates to its own display resolution before
     /// injection. Clients must clamp to `[0.0, 1.0]` and suppress events
-    /// whose pointer falls outside the video region.
-    MousePosition { x: f32, y: f32 },
+    /// whose pointer falls outside the video region. `display_idx`
+    /// addresses a specific display in a multi-monitor host setup;
+    /// single-display hosts and clients that don't know about the
+    /// distinction send `0` (primary).
+    MousePosition {
+        display_idx: u8,
+        x: f32,
+        y: f32,
+    },
     MouseButton { button: MouseButton, pressed: bool },
     MouseScroll { dx: f32, dy: f32, kind: ScrollKind },
 }

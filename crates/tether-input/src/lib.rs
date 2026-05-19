@@ -81,7 +81,15 @@ impl WinitTranslator {
             RenderEvent::Cursor { video_normalized } => {
                 self.last_cursor = video_normalized;
                 match video_normalized {
-                    Some((x, y)) => vec![InputEventKind::MousePosition { x, y }],
+                    Some((x, y)) => vec![InputEventKind::MousePosition {
+                        // Single-display client for now; multi-monitor
+                        // selection lives in the protocol so the wire
+                        // doesn't have to break when we add it on the
+                        // client side.
+                        display_idx: 0,
+                        x,
+                        y,
+                    }],
                     None => Vec::new(),
                 }
             }
@@ -89,12 +97,28 @@ impl WinitTranslator {
                 code,
                 pressed,
                 repeat,
+                text,
             } => {
                 if repeat {
                     // The host's OS will generate its own auto-repeats
                     // from a single keydown; forwarding both ends up
                     // looking like double-typing.
                     return Vec::new();
+                }
+                // Text path: when the OS resolved this keypress to a
+                // string and no shortcut-style modifier is held, send
+                // the text and skip the HID emit. This is what lets
+                // IME, dead keys, AltGr, and layout-mismatched typing
+                // round-trip correctly. We still emit on key-up via the
+                // HID path so the host can release any held HID keys
+                // that the operator typed before switching to a text-
+                // producing keystroke (rare, but cheap).
+                if pressed {
+                    if let Some(utf8) = text {
+                        if !utf8.is_empty() && !uses_shortcut_modifier(self.modifiers) {
+                            return self.wrap(vec![InputEventKind::Text { utf8 }]);
+                        }
+                    }
                 }
                 match keycode_to_hid(code) {
                     Some(key) => vec![if pressed {
@@ -136,6 +160,10 @@ impl WinitTranslator {
                 }]
             }
         };
+        self.wrap(kinds)
+    }
+
+    fn wrap(&mut self, kinds: Vec<InputEventKind>) -> Vec<InputEvent> {
         kinds
             .into_iter()
             .map(|kind| {
@@ -149,6 +177,14 @@ impl WinitTranslator {
             })
             .collect()
     }
+}
+
+/// True when a "shortcut" modifier is held — Ctrl, Alt (without Shift's
+/// usual layout overlap), or Meta. We deliberately exclude bare Shift
+/// because Shift+letter is just capitalisation, which the text path
+/// handles correctly via the OS-resolved string.
+fn uses_shortcut_modifier(m: Modifiers) -> bool {
+    m.ctrl || m.alt || m.meta
 }
 
 fn modifiers_from_winit(state: ModifiersState) -> Modifiers {
@@ -293,6 +329,7 @@ mod tests {
             code: KeyCode::KeyA,
             pressed: true,
             repeat: false,
+            text: None,
         });
         assert_eq!(evts.len(), 1);
         match &evts[0].kind {
@@ -312,6 +349,7 @@ mod tests {
             code: KeyCode::KeyA,
             pressed: true,
             repeat: true,
+            text: None,
         });
         assert!(evts.is_empty());
     }
@@ -339,6 +377,7 @@ mod tests {
             code: KeyCode::KeyA,
             pressed: true,
             repeat: false,
+            text: None,
         });
         match &evts[0].kind {
             InputEventKind::KeyDown { modifiers, .. } => {
@@ -355,13 +394,90 @@ mod tests {
             code: KeyCode::KeyA,
             pressed: true,
             repeat: false,
+            text: None,
         })[0];
         let id_a = a.event_id;
         let b = &t.translate(RenderEvent::Key {
             code: KeyCode::KeyB,
             pressed: true,
             repeat: false,
+            text: None,
         })[0];
         assert_eq!(b.event_id, id_a + 1);
+    }
+
+    #[test]
+    fn unmodified_text_keypress_takes_the_text_path() {
+        let mut t = WinitTranslator::new();
+        let evts = t.translate(RenderEvent::Key {
+            code: KeyCode::KeyA,
+            pressed: true,
+            repeat: false,
+            text: Some("a".into()),
+        });
+        assert_eq!(evts.len(), 1);
+        match &evts[0].kind {
+            InputEventKind::Text { utf8 } => assert_eq!(utf8, "a"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_held_uses_hid_path_for_shortcut() {
+        let mut t = WinitTranslator::new();
+        t.translate(RenderEvent::Modifiers({
+            let mut m = ModifiersState::default();
+            m |= ModifiersState::CONTROL;
+            m
+        }));
+        // OS sometimes still resolves text for Ctrl+letter (depending
+        // on platform); we should still route via HID so the host
+        // sees Ctrl+C as a shortcut, not the literal character "c".
+        let evts = t.translate(RenderEvent::Key {
+            code: KeyCode::KeyC,
+            pressed: true,
+            repeat: false,
+            text: Some("c".into()),
+        });
+        assert_eq!(evts.len(), 1);
+        match &evts[0].kind {
+            InputEventKind::KeyDown { modifiers, .. } => assert!(modifiers.ctrl),
+            other => panic!("expected KeyDown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_does_not_force_hid_path() {
+        // Shift+A produces text="A"; that's what the user typed. Text
+        // path is correct here — host's `type-text("A")` works
+        // regardless of host keymap.
+        let mut t = WinitTranslator::new();
+        t.translate(RenderEvent::Modifiers({
+            let mut m = ModifiersState::default();
+            m |= ModifiersState::SHIFT;
+            m
+        }));
+        let evts = t.translate(RenderEvent::Key {
+            code: KeyCode::KeyA,
+            pressed: true,
+            repeat: false,
+            text: Some("A".into()),
+        });
+        match &evts[0].kind {
+            InputEventKind::Text { utf8 } => assert_eq!(utf8, "A"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_carries_display_idx() {
+        let mut t = WinitTranslator::new();
+        let evts = t.translate(RenderEvent::Cursor {
+            video_normalized: Some((0.5, 0.5)),
+        });
+        match &evts[0].kind {
+            InputEventKind::MousePosition { display_idx, .. } => assert_eq!(*display_idx, 0),
+            other => panic!("expected MousePosition, got {other:?}"),
+        }
     }
 }

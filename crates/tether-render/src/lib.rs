@@ -46,6 +46,13 @@ pub enum RenderEvent {
         code: KeyCode,
         pressed: bool,
         repeat: bool,
+        /// The text the OS produced for this keypress, as resolved by
+        /// the current keyboard layout and IME. `None` for keys that
+        /// don't generate text (modifiers, function keys, IME mid-
+        /// composition). Lets the translator route unmodified printable
+        /// input to a layout-aware text path while keeping HID for
+        /// shortcuts and named keys.
+        text: Option<String>,
     },
     Modifiers(ModifiersState),
     /// Cursor moved. `video_normalized` is `Some((x, y))` with both
@@ -188,15 +195,15 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // We use PhysicalKey rather than logical_key so the host
-                // sees layout-independent scancodes (the wire protocol
-                // expects HID-style usages, mapped from physical key in
-                // tether-input).
+                // PhysicalKey + the resolved text travel together: HID
+                // for shortcuts, text for layout-aware typing. The
+                // translator decides which path each event takes.
                 if let PhysicalKey::Code(code) = event.physical_key {
                     self.emit(RenderEvent::Key {
                         code,
                         pressed: event.state == ElementState::Pressed,
                         repeat: event.repeat,
+                        text: event.text.as_deref().map(str::to_owned),
                     });
                 }
             }

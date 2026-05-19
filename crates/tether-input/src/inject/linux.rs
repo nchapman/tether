@@ -13,6 +13,8 @@
 //!   - Scroll is forwarded as integer ticks; the precise pixel-delta
 //!     mode used by trackpads is rounded.
 
+use std::collections::HashSet;
+
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 
 use tether_protocol::input::{
@@ -24,6 +26,13 @@ use super::{InjectError, Injector, Result};
 pub struct LibeiInjector {
     enigo: Enigo,
     display: (i32, i32),
+    /// Keys we've sent a press for that haven't been released yet.
+    /// Walked on Drop so a sudden client disconnect doesn't leave the
+    /// host stuck holding Ctrl, Cmd, or whatever the operator was
+    /// chording. Mirrors RustDesk's `release_pressed_modifiers` and
+    /// Sunshine's `input::reset`.
+    held_keys: HashSet<HidUsage>,
+    held_buttons: HashSet<ProtoButton>,
 }
 
 impl LibeiInjector {
@@ -39,7 +48,27 @@ impl LibeiInjector {
         let display = enigo
             .main_display()
             .map_err(|e| InjectError::Init(format!("main_display: {e:?}")))?;
-        Ok(Self { enigo, display })
+        Ok(Self {
+            enigo,
+            display,
+            held_keys: HashSet::new(),
+            held_buttons: HashSet::new(),
+        })
+    }
+}
+
+impl Drop for LibeiInjector {
+    fn drop(&mut self) {
+        for hid in self.held_keys.drain().collect::<Vec<_>>() {
+            if let Some(k) = hid_to_enigo(hid) {
+                let _ = self.enigo.key(k, Direction::Release);
+            }
+        }
+        for btn in self.held_buttons.drain().collect::<Vec<_>>() {
+            let _ = self
+                .enigo
+                .button(proto_button_to_enigo(btn), Direction::Release);
+        }
     }
 }
 
@@ -55,6 +84,7 @@ impl Injector for LibeiInjector {
                     self.enigo
                         .key(k, Direction::Press)
                         .map_err(|e| InjectError::Inject(format!("key down: {e:?}")))?;
+                    self.held_keys.insert(*key);
                 }
                 Ok(())
             }
@@ -63,10 +93,34 @@ impl Injector for LibeiInjector {
                     self.enigo
                         .key(k, Direction::Release)
                         .map_err(|e| InjectError::Inject(format!("key up: {e:?}")))?;
+                    self.held_keys.remove(key);
                 }
                 Ok(())
             }
-            InputEventKind::MousePosition { x, y } => {
+            InputEventKind::Text { utf8 } => {
+                // enigo's text() picks the fastest available path
+                // (xdotool CHARS, Wayland virtual_keyboard text, etc.)
+                // and falls back to per-codepoint Key::Unicode entry.
+                // This is the path that handles IME / dead keys / AltGr
+                // / non-ASCII typing correctly without depending on the
+                // host's keymap matching the client's.
+                self.enigo
+                    .text(utf8)
+                    .map_err(|e| InjectError::Inject(format!("text: {e:?}")))?;
+                Ok(())
+            }
+            InputEventKind::MousePosition {
+                display_idx,
+                x,
+                y,
+            } => {
+                if *display_idx != 0 {
+                    // Multi-monitor host addressing isn't wired up yet;
+                    // pin everything to the primary display and let the
+                    // operator notice via the trace log if they ever
+                    // see this.
+                    tracing::trace!(display_idx, "non-zero display_idx; pinning to primary");
+                }
                 // [0,1] -> absolute pixel within the primary display.
                 // Clamp because the client *should* already have done so
                 // but a misbehaving client could still send 1.5, and
@@ -90,6 +144,11 @@ impl Injector for LibeiInjector {
                         },
                     )
                     .map_err(|e| InjectError::Inject(format!("button: {e:?}")))?;
+                if *pressed {
+                    self.held_buttons.insert(*button);
+                } else {
+                    self.held_buttons.remove(button);
+                }
                 Ok(())
             }
             InputEventKind::MouseScroll { dx, dy, kind } => {

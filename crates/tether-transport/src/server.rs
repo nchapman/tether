@@ -106,6 +106,13 @@ fn transport_config() -> quinn::TransportConfig {
             .try_into()
             .expect("30s fits in IdleTimeout"),
     ));
+    // Headroom for video: a 1080p H.264 keyframe at 4 Mbps is ~50 KB, and
+    // we'd like the receive queue to absorb several frames of bursting
+    // without dropping fragments mid-frame (a single lost fragment
+    // corrupts every P-frame until the next IDR). 8 MiB is generous on
+    // LAN; tune down once we have telemetry.
+    t.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    t.datagram_send_buffer_size(4 * 1024 * 1024);
     // TODO(latency): switch to a no-pacer / BBR controller for LAN once we
     // have measurements showing Cubic adds visible jitter. Per the expert
     // review, the right place is

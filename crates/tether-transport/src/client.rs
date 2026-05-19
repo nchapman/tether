@@ -95,5 +95,8 @@ fn transport_config() -> quinn::TransportConfig {
             .try_into()
             .expect("30s fits in IdleTimeout"),
     ));
+    // Match the server's headroom; see server.rs for rationale.
+    t.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    t.datagram_send_buffer_size(4 * 1024 * 1024);
     t
 }

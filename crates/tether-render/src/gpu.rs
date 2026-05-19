@@ -15,6 +15,8 @@ pub(crate) struct GpuState {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     texture_size: (u32, u32),
+    scale_buffer: wgpu::Buffer,
+    scale_bind_group: wgpu::BindGroup,
 }
 
 impl GpuState {
@@ -111,6 +113,34 @@ impl GpuState {
             ],
         });
 
+        let scale_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tether-render scale bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let scale_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tether-render scale uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let scale_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tether-render scale bind group"),
+            layout: &scale_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: scale_buffer.as_entire_binding(),
+            }],
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tether-render shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -118,7 +148,7 @@ impl GpuState {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tether-render pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&scale_bgl)],
             immediate_size: 0,
         });
 
@@ -162,6 +192,8 @@ impl GpuState {
             texture,
             bind_group,
             texture_size,
+            scale_buffer,
+            scale_bind_group,
         })
     }
 
@@ -248,6 +280,17 @@ impl GpuState {
             }
         };
 
+        // Update the aspect-correction uniform before kicking off the
+        // render pass. Costs a single 16-byte buffer write per frame.
+        let (sx, sy) = letterbox_scale(self.texture_size, (
+            self.surface_config.width,
+            self.surface_config.height,
+        ));
+        let mut scale_bytes = [0u8; 16];
+        scale_bytes[0..4].copy_from_slice(&sx.to_le_bytes());
+        scale_bytes[4..8].copy_from_slice(&sy.to_le_bytes());
+        self.queue.write_buffer(&self.scale_buffer, 0, &scale_bytes);
+
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -276,6 +319,7 @@ impl GpuState {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &self.scale_bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -285,6 +329,28 @@ impl GpuState {
             self.surface.configure(&self.device, &self.surface_config);
         }
         Ok(())
+    }
+}
+
+/// Compute the (x, y) NDC scale factors that letterbox / pillarbox the
+/// source texture inside the surface while preserving its aspect ratio.
+/// Returns (1.0, 1.0) for matching aspect ratios. The unused axis gets
+/// the proportional shrink; the dominant axis stays at 1.0.
+#[allow(clippy::cast_precision_loss)]
+fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
+    if src.0 == 0 || src.1 == 0 || dst.0 == 0 || dst.1 == 0 {
+        return (1.0, 1.0);
+    }
+    let src_aspect = src.0 as f32 / src.1 as f32;
+    let dst_aspect = dst.0 as f32 / dst.1 as f32;
+    if (src_aspect - dst_aspect).abs() < f32::EPSILON {
+        (1.0, 1.0)
+    } else if src_aspect > dst_aspect {
+        // Source is wider than the window — fit width, letterbox top/bottom.
+        (1.0, dst_aspect / src_aspect)
+    } else {
+        // Source is taller than the window — fit height, pillarbox sides.
+        (src_aspect / dst_aspect, 1.0)
     }
 }
 

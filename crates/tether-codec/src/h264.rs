@@ -50,9 +50,13 @@ impl H264Encoder {
         ctx.set_time_base(Rational(1, fps_i32));
         ctx.set_frame_rate(Some(Rational(fps_i32, 1)));
         ctx.set_bit_rate(bitrate_kbps as usize * 1000);
-        // Long GOP — clients request on-demand IDRs via ControlMessage::ForceIdr
-        // when they detect loss. Don't waste bandwidth on periodic IDRs.
-        ctx.set_gop(120);
+        // GOP = 1 second of frames. The MVP datagram path has no FEC and
+        // no on-demand IDR signalling yet, so any lost fragment corrupts
+        // the P-frame chain until the next IDR. A 1-second IDR cadence
+        // caps the worst-case "garbled text" window without spending
+        // catastrophic bandwidth on keyframes. Drop this back to a long
+        // GOP once `ControlMessage::ForceIdr` is wired up end-to-end.
+        ctx.set_gop(fps.max(1));
         ctx.set_max_b_frames(0);
 
         let mut opts = Dictionary::new();
@@ -62,6 +66,15 @@ impl H264Encoder {
         // preset already drops most of what would slow us down; this is
         // belt-and-braces for predictability across libx264 versions.
         opts.set("profile", "baseline");
+        // tune=zerolatency already sets rc-lookahead=0 + sync-lookahead=0,
+        // but pinning min-keyint=keyint forces *exactly* periodic IDRs
+        // (no early IDRs from scene-cut detection) so the GOP cadence
+        // matches what `set_gop` promised.
+        let gop = fps.max(1);
+        opts.set(
+            "x264-params",
+            &format!("keyint={gop}:min-keyint={gop}:scenecut=0"),
+        );
 
         let encoder = ctx.open_with(opts)?;
 

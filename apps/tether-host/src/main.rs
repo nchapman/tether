@@ -13,11 +13,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
-use tether_capture::CapturedFrame;
+use tether_capture::{CapturedFrame, PixelFormat};
+use tether_codec::{Encoder, H264Encoder};
 use tether_protocol::video::{FrameFragmenter, HostFrameTiming, InputEchoBatch, VideoFrameMeta};
 use tether_protocol::MonoNanos;
 use tether_transport::{Connection, Datagram, Server};
 use tracing::{info, warn};
+
+const ENCODER_BITRATE_KBPS: u32 = 4_000;
+const ENCODER_FPS: u32 = 30;
 
 const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
@@ -74,27 +78,92 @@ fn run_capture_and_send(conn: Arc<Connection>, frames: Receiver<CapturedFrame>) 
     let mut fragmenter = FrameFragmenter::new(0);
     let mut frame_count: u64 = 0;
     let mut last_log = std::time::Instant::now();
+    let mut encoder: Option<H264Encoder> = None;
+    let mut pts: i64 = 0;
 
     while let Ok(frame) = frames.recv() {
+        if frame.format != PixelFormat::Bgra8 {
+            warn!(
+                ?frame.format,
+                "h264 encoder only accepts BGRA in v0; skipping frame"
+            );
+            continue;
+        }
+
+        // Lazy-init the encoder on the first frame: we need its
+        // dimensions, and capture might be a resolution we didn't know
+        // at startup. A subsequent resolution change would require
+        // recreating the encoder + bumping the stream epoch — deferred
+        // to a later task.
+        let enc = match encoder.as_mut() {
+            Some(e) => e,
+            None => {
+                match H264Encoder::new_bgra(
+                    frame.width,
+                    frame.height,
+                    ENCODER_FPS,
+                    ENCODER_BITRATE_KBPS,
+                ) {
+                    Ok(e) => {
+                        info!(
+                            width = frame.width,
+                            height = frame.height,
+                            fps = ENCODER_FPS,
+                            kbps = ENCODER_BITRATE_KBPS,
+                            "h264 encoder initialised"
+                        );
+                        encoder.insert(e)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "encoder init failed, exiting send loop");
+                        return;
+                    }
+                }
+            }
+        };
+
+        let t_encode_submit = MonoNanos::now();
+        let encoded = match enc.encode_bgra(&frame.data, pts, false) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "encode failed; dropping frame");
+                continue;
+            }
+        };
+        let t_encode_done = MonoNanos::now();
+        pts += 1;
+
+        // Concatenate all packets the encoder spat out for this input
+        // frame into one wire payload. With tune=zerolatency this is
+        // usually 1:1; the first few frames may produce 0 (encoder
+        // setup latency) which we silently skip.
+        let mut keyframe = false;
+        let mut combined = Vec::new();
+        for pkt in encoded {
+            if pkt.keyframe {
+                keyframe = true;
+            }
+            combined.extend_from_slice(&pkt.data);
+        }
+        if combined.is_empty() {
+            continue;
+        }
+
         let t_send = MonoNanos::now();
         let meta = VideoFrameMeta {
             timing: HostFrameTiming {
                 t_capture_kernel: frame.t_capture_kernel,
                 t_capture_userspace: frame.t_capture_userspace,
-                // No real encoder yet — submit and done both land at "send".
-                t_encode_submit: t_send,
-                t_encode_done: t_send,
+                t_encode_submit,
+                t_encode_done,
                 t_send,
             },
-            // Without a codec every frame is independent; mark all as
-            // keyframes so the receiver can decode (i.e. trivially copy)
-            // any single frame.
-            keyframe: true,
+            keyframe,
             input_echo: InputEchoBatch::default(),
             dimensions: (frame.width, frame.height),
         };
 
-        let packets = fragmenter.fragment(meta, &frame.data);
+        let packets = fragmenter.fragment(meta, &combined);
         for packet in packets {
             if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
                 warn!(error = ?e, "send_datagram failed, terminating send loop");
@@ -106,7 +175,7 @@ fn run_capture_and_send(conn: Arc<Connection>, frames: Receiver<CapturedFrame>) 
         if last_log.elapsed() >= std::time::Duration::from_secs(2) {
             info!(
                 frames = frame_count,
-                "sent {} frames in last 2s",
+                "sent {} encoded frames in last 2s",
                 frame_count
             );
             frame_count = 0;

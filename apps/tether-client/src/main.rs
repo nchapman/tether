@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::bounded;
+use tether_codec::{Decoder, H264Decoder};
 use tether_protocol::video::FrameReassembler;
 use tether_protocol::MonoNanos;
 use tether_render::RawFrame;
@@ -51,6 +52,13 @@ async fn main() -> anyhow::Result<()> {
     let conn_recv = conn.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
+        let mut decoder = match H264Decoder::new() {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = %e, "h264 decoder init failed; aborting recv loop");
+                return;
+            }
+        };
         let mut frame_count: u64 = 0;
         let mut last_log = Instant::now();
 
@@ -59,8 +67,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Datagram::Video(packet)) => {
                     let Some(frame) = reassembler.handle(packet) else { continue };
                     let now = MonoNanos::now();
-                    let age_ns =
-                        now.saturating_sub(frame.meta.timing.t_capture_userspace);
+                    let age_ns = now.saturating_sub(frame.meta.timing.t_capture_userspace);
                     frame_count += 1;
                     if last_log.elapsed() >= std::time::Duration::from_secs(1) {
                         info!(
@@ -72,15 +79,23 @@ async fn main() -> anyhow::Result<()> {
                         last_log = Instant::now();
                     }
 
-                    let (w, h) = frame.meta.dimensions;
-                    let rgba = bgra_to_rgba(&frame.body);
-                    let raw = RawFrame {
-                        width: w,
-                        height: h,
-                        data: rgba,
+                    let decoded = match decoder.decode(&frame.body) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(error = %e, "h264 decode failed; dropping packet");
+                            continue;
+                        }
                     };
-                    // Drop on full — render is intentionally one-deep.
-                    let _ = frame_tx.try_send(raw);
+                    for dec in decoded {
+                        let rgba = bgra_to_rgba(&dec.data);
+                        let raw = RawFrame {
+                            width: dec.width,
+                            height: dec.height,
+                            data: rgba,
+                        };
+                        // Drop on full — render is intentionally one-deep.
+                        let _ = frame_tx.try_send(raw);
+                    }
                 }
                 Ok(Datagram::Cursor(_)) => {}
                 Err(e) => {

@@ -138,18 +138,43 @@ impl H264Encoder {
         encoder.set_gop_size(fps_i32);
         encoder.set_max_b_frames(0);
 
-        // libx264 private options. tune=zerolatency already sets
-        // rc-lookahead=0 + sync-lookahead=0; pinning min-keyint=keyint
-        // forces *exactly* periodic IDRs (no early IDRs from scene-cut
-        // detection) so the GOP cadence matches what `set_gop_size`
-        // promised. baseline profile = no B-frames, no CABAC — belt-
-        // and-braces for predictability across libx264 versions.
+        // Latency flag at the codec-context level. AV_CODEC_FLAG_LOW_DELAY
+        // tells ffmpeg "emit a packet per input frame, do not buffer for
+        // throughput." Most ffmpeg encoders respect this; libx264 with
+        // tune=zerolatency already implies it, but setting it
+        // unconditionally is cheap belt-and-braces and matches what
+        // Sunshine does (src/video.cpp:1727).
+        #[allow(clippy::cast_possible_wrap)] // AV_CODEC_FLAG_LOW_DELAY is a single-bit constant
+        let low_delay_flag = ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+        encoder.set_flags(encoder.flags | low_delay_flag);
+
+        // libx264 private options.
+        //
+        // tune=zerolatency already sets rc-lookahead=0 +
+        // sync-lookahead=0; pinning min-keyint=keyint forces *exactly*
+        // periodic IDRs (no early IDRs from scene-cut detection) so
+        // the GOP cadence matches what `set_gop_size` promised.
+        // baseline profile = no B-frames, no CABAC — belt-and-braces
+        // for predictability across libx264 versions.
+        //
+        // threads + thread_type=slice is the load-bearing latency knob
+        // for libx264. ffmpeg's default thread_type=frame buffers
+        // `threads` frames before emitting any output, costing N-1
+        // frames of pipeline latency at fps. thread_type=slice
+        // partitions the *current* frame across threads instead, so
+        // each frame still emerges in its own encode step. Sunshine
+        // sets FF_THREAD_SLICE the same way (src/video.cpp:1808-1809).
+        // 4 slices is a reasonable balance — more slices means more
+        // parallelism but worse compression efficiency (each slice has
+        // its own header + can't predict across slice boundaries).
         let x264_params =
             CString::new(format!("keyint={fps_i32}:min-keyint={fps_i32}:scenecut=0"))
                 .expect("static format yields no nul bytes");
         let dict = AVDictionary::new(c"preset", c"ultrafast", 0)
             .set(c"tune", c"zerolatency", 0)
             .set(c"profile", c"baseline", 0)
+            .set(c"threads", c"4", 0)
+            .set(c"thread_type", c"slice", 0)
             .set(c"x264-params", &x264_params, 0);
         encoder.open(Some(dict))?;
 

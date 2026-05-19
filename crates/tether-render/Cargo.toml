@@ -12,7 +12,7 @@ tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
 
 wgpu = "29"
-winit = "0.30"
+winit = { workspace = true }
 pollster = "0.4"
 
 [dev-dependencies]

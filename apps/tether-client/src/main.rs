@@ -12,10 +12,12 @@ use std::time::Instant;
 
 use crossbeam_channel::bounded;
 use tether_codec::{Decoder, H264Decoder};
+use tether_input::WinitTranslator;
 use tether_protocol::video::FrameReassembler;
 use tether_protocol::MonoNanos;
-use tether_render::RawFrame;
+use tether_render::{RawFrame, RenderEvent};
 use tether_transport::{Client, Datagram};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 // Initial window size — the actual frame dimensions come from
@@ -112,11 +114,37 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Bridge winit window events from the render thread into a tokio
+    // task that owns the connection's input stream. UnboundedSender is
+    // safe to call from the render thread (sync) and the receiver runs
+    // inside the tokio runtime where send_input is async.
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<RenderEvent>();
+    let conn_input = conn.clone();
+    tokio::spawn(async move {
+        let mut translator = WinitTranslator::new();
+        while let Some(render_event) = events_rx.recv().await {
+            for input_event in translator.translate(render_event) {
+                if let Err(e) = conn_input.send_input(&input_event).await {
+                    error!(error = ?e, "send_input failed; ending input loop");
+                    return;
+                }
+            }
+        }
+    });
+
+    let on_event: tether_render::EventSink = Box::new(move |evt| {
+        // Render must not block on a slow consumer. UnboundedSender drops
+        // its message on send-after-close, which is exactly what we want
+        // when the input task has exited.
+        let _ = events_tx.send(evt);
+    });
+
     // Render loop blocks until the user closes the window.
     tether_render::run(
         "tether-client",
         (INITIAL_WIDTH, INITIAL_HEIGHT),
         frame_rx,
+        Some(on_event),
     )?;
     Ok(())
 }

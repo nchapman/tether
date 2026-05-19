@@ -69,6 +69,30 @@ async fn main() -> anyhow::Result<()> {
         .name("tether-host-send".into())
         .spawn(move || run_capture_and_send(conn_send, frames))?;
 
+    // Input recv: drain the client's input stream and log each event.
+    // Injection lands separately — for now this just proves the input
+    // channel is wired end-to-end and gives the user a visible
+    // confirmation when they type / click in the client window.
+    let conn_input = conn.clone();
+    tokio::spawn(async move {
+        loop {
+            match conn_input.recv_input().await {
+                Ok(evt) => {
+                    info!(
+                        event_id = evt.event_id,
+                        t_client_ns = evt.t_client.0,
+                        kind = ?evt.kind,
+                        "input event"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = ?e, "input recv failed; ending input task");
+                    return;
+                }
+            }
+        }
+    });
+
     // Block until Ctrl-C, then shut down gracefully. A ctrl-c registration
     // error is itself a reason to shut down, not to bail out and skip the
     // close path — log and proceed either way.

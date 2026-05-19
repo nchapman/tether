@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    tether_render::run("tether-render test pattern", (800, 600), rx)?;
+    tether_render::run("tether-render test pattern", (800, 600), rx, None)?;
     Ok(())
 }
 

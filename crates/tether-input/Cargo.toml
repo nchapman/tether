@@ -6,5 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Input event capture (client) and injection (host) for keyboard, mouse, and cursor."
 
+[dependencies]
+tether-protocol = { workspace = true }
+tether-render = { workspace = true }
+
+tracing = { workspace = true }
+
 [lints]
 workspace = true

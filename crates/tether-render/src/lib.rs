@@ -1,11 +1,9 @@
 //! Client-side display: a winit window driving a wgpu render pipeline,
 //! fed from a crossbeam channel of [`RawFrame`]s.
 //!
-//! Task #4 (minimal): RGBA passthrough only. Task #9 will add a YUV→RGB
-//! fragment shader, an adaptive jitter buffer, zero-copy decoded-texture
-//! import, present-time telemetry hooks, and aspect-ratio aware
-//! letterboxing so the rendered frame matches the normalised mouse
-//! coordinate space promised by `tether_protocol::input`.
+//! The v0 path is RGBA passthrough only. A YUV→RGB fragment shader,
+//! adaptive jitter buffer, zero-copy decoded-texture import, and
+//! present-time telemetry will land alongside the GPU video pipeline.
 
 mod gpu;
 
@@ -14,12 +12,19 @@ use std::sync::Arc;
 use crossbeam_channel::Receiver;
 use tracing::warn;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use gpu::GpuState;
+
+// Re-exported so tether-input / tether-client can match on render events
+// without having to add their own winit dep at a possibly-different
+// version. tether-render's version of winit is the workspace version.
+pub use winit::event::MouseButton;
+pub use winit::keyboard::{KeyCode, ModifiersState};
 
 /// A single uncompressed RGBA frame. Pixel layout is row-major,
 /// `width * height * 4` bytes total, R first, alpha last.
@@ -28,6 +33,41 @@ pub struct RawFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+}
+
+/// Input-side events surfaced from the window's event loop. The render
+/// crate already owns the window and its letterbox transform, so it does
+/// the cursor-normalisation math once and hands callers either video-
+/// region coordinates or `None` (cursor outside the video region — events
+/// downstream of this should be suppressed by the consumer).
+#[derive(Clone, Debug)]
+pub enum RenderEvent {
+    Key {
+        code: KeyCode,
+        pressed: bool,
+        repeat: bool,
+    },
+    Modifiers(ModifiersState),
+    /// Cursor moved. `video_normalized` is `Some((x, y))` with both
+    /// components in `[0.0, 1.0]` when the pointer is inside the video
+    /// region, `None` when it sits in a letterbox bar or outside the
+    /// window entirely.
+    Cursor {
+        video_normalized: Option<(f32, f32)>,
+    },
+    MouseButton {
+        button: MouseButton,
+        pressed: bool,
+    },
+    /// Horizontal + vertical scroll deltas. `by_line` is `true` for
+    /// notched-wheel input (winit `LineDelta`), `false` for high-resolution
+    /// trackpad / Magic Mouse input (winit `PixelDelta`).
+    Scroll {
+        dx: f32,
+        dy: f32,
+        by_line: bool,
+    },
+    Focused(bool),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,13 +86,25 @@ pub enum RenderError {
 
 pub type Result<T> = std::result::Result<T, RenderError>;
 
-/// Run the render loop on the current thread. Blocks until the user closes
-/// the window. The frame channel may disconnect; the window stays open
-/// showing the last received frame until the user closes it.
+/// Callback invoked on each input-relevant window event. The render loop
+/// fires this synchronously inside `window_event`, so the closure must
+/// be cheap — push into a channel and process elsewhere rather than
+/// blocking on network IO here. Returning is the only contract; errors
+/// inside the callback are the caller's to handle.
+pub type EventSink = Box<dyn Fn(RenderEvent) + Send>;
+
+/// Run the render loop on the current thread. Blocks until the user
+/// closes the window. The frame channel may disconnect; the window stays
+/// open showing the last received frame until the user closes it.
+///
+/// `on_event` is optional: pass `None` to skip input-event emission.
+/// Using a callback rather than a channel lets the caller bridge into
+/// whatever sync/async plumbing they already have.
 pub fn run(
     title: &str,
     initial_size: (u32, u32),
     frames: Receiver<RawFrame>,
+    on_event: Option<EventSink>,
 ) -> Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = App {
@@ -62,6 +114,7 @@ pub fn run(
         gpu: None,
         frames,
         latest: None,
+        on_event,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -74,6 +127,15 @@ struct App {
     gpu: Option<GpuState>,
     frames: Receiver<RawFrame>,
     latest: Option<RawFrame>,
+    on_event: Option<EventSink>,
+}
+
+impl App {
+    fn emit(&self, event: RenderEvent) {
+        if let Some(cb) = &self.on_event {
+            cb(event);
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -125,6 +187,50 @@ impl ApplicationHandler for App {
                     warn!(error = ?e, "render frame failed");
                 }
             }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // We use PhysicalKey rather than logical_key so the host
+                // sees layout-independent scancodes (the wire protocol
+                // expects HID-style usages, mapped from physical key in
+                // tether-input).
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.emit(RenderEvent::Key {
+                        code,
+                        pressed: event.state == ElementState::Pressed,
+                        repeat: event.repeat,
+                    });
+                }
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                self.emit(RenderEvent::Modifiers(m.state()));
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let (texture, surface) = gpu.dimensions();
+                self.emit(RenderEvent::Cursor {
+                    video_normalized: cursor_to_video_normalized(position, surface, texture),
+                });
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                self.emit(RenderEvent::MouseButton {
+                    button,
+                    pressed: state == ElementState::Pressed,
+                });
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy, by_line) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x, y, true),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let x = p.x as f32;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let y = p.y as f32;
+                        (x, y, false)
+                    }
+                };
+                self.emit(RenderEvent::Scroll { dx, dy, by_line });
+            }
+            WindowEvent::Focused(b) => {
+                self.emit(RenderEvent::Focused(b));
+            }
             _ => {}
         }
     }
@@ -150,5 +256,115 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
         }
+    }
+}
+
+/// Map a window-pixel cursor position onto the video region in `[0,1]^2`,
+/// accounting for the same letterbox / pillarbox transform the GPU shader
+/// applies. Returns `None` when the cursor sits in a letterbox bar
+/// (outside the video region) or when either size is degenerate.
+///
+/// Mirrors `gpu::letterbox_scale`: when source and surface aspect ratios
+/// match, the whole window is the video region; otherwise the video is
+/// centered and one axis is shrunk by `min_aspect / max_aspect`.
+#[allow(clippy::cast_precision_loss)]
+fn cursor_to_video_normalized(
+    pos: PhysicalPosition<f64>,
+    surface: (u32, u32),
+    texture: (u32, u32),
+) -> Option<(f32, f32)> {
+    if surface.0 == 0 || surface.1 == 0 || texture.0 == 0 || texture.1 == 0 {
+        return None;
+    }
+    let (sx, sy) = letterbox_scale_for_cursor(texture, surface);
+    let sw = f64::from(surface.0);
+    let sh = f64::from(surface.1);
+    let (sx, sy) = (f64::from(sx), f64::from(sy));
+    let video_w = sw * sx;
+    let video_h = sh * sy;
+    let offset_x = (sw - video_w) * 0.5;
+    let offset_y = (sh - video_h) * 0.5;
+    let nx = (pos.x - offset_x) / video_w;
+    let ny = (pos.y - offset_y) / video_h;
+    if !(0.0..=1.0).contains(&nx) || !(0.0..=1.0).contains(&ny) {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Some((nx as f32, ny as f32))
+}
+
+/// Local copy of `gpu::letterbox_scale` — the GPU module's version is
+/// private and we don't want to widen its visibility just for the cursor
+/// math. If these ever drift, the cursor will land in the wrong place.
+#[allow(clippy::cast_precision_loss)]
+fn letterbox_scale_for_cursor(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
+    let src_aspect = src.0 as f32 / src.1 as f32;
+    let dst_aspect = dst.0 as f32 / dst.1 as f32;
+    if (src_aspect - dst_aspect).abs() < f32::EPSILON {
+        (1.0, 1.0)
+    } else if src_aspect > dst_aspect {
+        (1.0, dst_aspect / src_aspect)
+    } else {
+        (src_aspect / dst_aspect, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_centre_maps_to_centre() {
+        let n = cursor_to_video_normalized(
+            PhysicalPosition::new(640.0, 360.0),
+            (1280, 720),
+            (1920, 1080),
+        )
+        .expect("centre is inside the video region");
+        assert!((n.0 - 0.5).abs() < 1e-4);
+        assert!((n.1 - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cursor_in_letterbox_bar_returns_none() {
+        // 1000x1000 window, 1920x1080 source -> top/bottom letterbox
+        // (source is wider than the window's square aspect). y=10 lands
+        // in the top bar.
+        assert!(cursor_to_video_normalized(
+            PhysicalPosition::new(500.0, 10.0),
+            (1000, 1000),
+            (1920, 1080),
+        )
+        .is_none());
+        // 1000x1000 window, 1080x1920 source -> left/right pillarbox.
+        // x=10 lands in the left bar.
+        assert!(cursor_to_video_normalized(
+            PhysicalPosition::new(10.0, 500.0),
+            (1000, 1000),
+            (1080, 1920),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cursor_outside_window_returns_none() {
+        assert!(cursor_to_video_normalized(
+            PhysicalPosition::new(-5.0, 100.0),
+            (1280, 720),
+            (1280, 720),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn matching_aspect_uses_full_window() {
+        let n = cursor_to_video_normalized(
+            PhysicalPosition::new(128.0, 72.0),
+            (1280, 720),
+            (1920, 1080),
+        )
+        .expect("inside");
+        assert!((n.0 - 0.1).abs() < 1e-4);
+        assert!((n.1 - 0.1).abs() < 1e-4);
     }
 }

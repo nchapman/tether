@@ -2801,6 +2801,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "tether-codec",
+ "tether-input",
  "tether-protocol",
  "tether-render",
  "tether-transport",
@@ -2837,6 +2838,11 @@ dependencies = [
 [[package]]
 name = "tether-input"
 version = "0.0.1"
+dependencies = [
+ "tether-protocol",
+ "tether-render",
+ "tracing",
+]
 
 [[package]]
 name = "tether-protocol"

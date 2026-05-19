@@ -205,6 +205,15 @@ impl GpuState {
         })
     }
 
+    /// Current video texture size and surface size. Returned together
+    /// because the cursor-normalisation math in `lib.rs` needs both.
+    pub(crate) fn dimensions(&self) -> ((u32, u32), (u32, u32)) {
+        (
+            self.texture_size,
+            (self.surface_config.width, self.surface_config.height),
+        )
+    }
+
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;

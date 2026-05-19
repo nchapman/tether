@@ -37,7 +37,8 @@ use tether_protocol::control::CodecKind;
 
 use crate::h264::{frame_plane, frame_plane_mut, interleave_uv, pack_plane, packet_from_bytes};
 use crate::{
-    init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result, GOP_SECONDS,
+    init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Frame, Result,
+    GOP_SECONDS,
 };
 
 /// Number of VAAPI surfaces in the hwframes pool. With `async_depth=1`
@@ -435,110 +436,113 @@ impl VaapiDecoder {
 }
 
 impl Decoder for VaapiDecoder {
+    fn submit(&mut self, encoded: &[u8]) -> Result<()> {
+        if encoded.is_empty() {
+            return Ok(());
+        }
+        let packet = packet_from_bytes(encoded)?;
+        self.decoder.send_packet(Some(&packet))?;
+        Ok(())
+    }
+
     // ffmpeg's i32 ABI fields (width, height, linesize) are
     // non-negative on allocated decoded frames; cast sites are at
     // the FFI boundary and follow that invariant.
     #[allow(clippy::cast_sign_loss)]
-    fn decode(&mut self, encoded: &[u8]) -> Result<Vec<DecodedFrame>> {
-        if encoded.is_empty() {
-            return Ok(Vec::new());
-        }
-        let packet = packet_from_bytes(encoded)?;
-        self.decoder.send_packet(Some(&packet))?;
+    fn next_frame(&mut self) -> Result<Option<Frame>> {
+        let frame = match self.decoder.receive_frame() {
+            Ok(f) => f,
+            Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => {
+                return Ok(None)
+            }
+            Err(e) => return Err(CodecError::Ffmpeg(e)),
+        };
 
-        let mut out = Vec::new();
-        loop {
-            let frame = match self.decoder.receive_frame() {
-                Ok(f) => f,
-                Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => break,
-                Err(e) => return Err(CodecError::Ffmpeg(e)),
-            };
+        // If get_format returned VAAPI, frame is a GPU surface and
+        // needs the transfer dance. If ffmpeg fell back to a
+        // software path (rare in our config; usually a build with
+        // hwaccel disabled silently emits SW frames), the frame is
+        // already in system memory and we use it directly. The
+        // transfer here will be replaced by a DMA-BUF export +
+        // `Frame::Gpu` once the renderer can import VAAPI surfaces.
+        let sw_frame = if frame.format == ffi::AV_PIX_FMT_VAAPI {
+            let mut sw = AVFrame::new();
+            sw.hwframe_transfer_data(&frame)?;
+            sw
+        } else {
+            frame
+        };
 
-            // If get_format returned VAAPI, frame is a GPU surface and
-            // needs the transfer dance. If ffmpeg fell back to a
-            // software path (rare in our config; usually a build with
-            // hwaccel disabled silently emits SW frames), the frame is
-            // already in system memory and we use it directly.
-            let sw_frame = if frame.format == ffi::AV_PIX_FMT_VAAPI {
-                let mut sw = AVFrame::new();
-                sw.hwframe_transfer_data(&frame)?;
-                sw
-            } else {
-                frame
-            };
+        let width = sw_frame.width;
+        let height = sw_frame.height;
+        let w = width as usize;
+        let h = height as usize;
+        let chroma_w = w.div_ceil(2);
+        let chroma_h = h.div_ceil(2);
 
-            let width = sw_frame.width;
-            let height = sw_frame.height;
-            let w = width as usize;
-            let h = height as usize;
-            let chroma_w = w.div_ceil(2);
-            let chroma_h = h.div_ceil(2);
+        // Two formats we accept from the system-memory side:
+        //  - NV12 (canonical VAAPI sw_format) — already the
+        //    renderer's preferred layout, just pack the Y and UV
+        //    planes tight (strip any compositor stride padding).
+        //  - YUV420P (SW fallback emitted this directly) — interleave
+        //    U and V into NV12 layout before handing off. Pure byte
+        //    permutation; no resampling.
+        // Anything else (notably NV21, which is V-first instead of
+        // U-first) lands in the error arm rather than silently
+        // shipping inverted colors. If a future hwaccel surfaces
+        // NV21 we'd need either a dedicated arm or a U/V swap in
+        // the packing step.
+        let fmt = sw_frame.format;
+        let (y, uv) = if fmt == ffi::AV_PIX_FMT_NV12 {
+            let y = pack_plane(
+                frame_plane(&sw_frame, 0, h),
+                sw_frame.linesize[0] as usize,
+                w,
+                h,
+            );
+            // NV12 plane 1: interleaved UV at half resolution. Each
+            // "chroma sample" is two bytes (U, V) so a row carries
+            // `chroma_w * 2` bytes; `pack_plane` strips any extra
+            // padding the driver may have added.
+            let uv = pack_plane(
+                frame_plane(&sw_frame, 1, chroma_h),
+                sw_frame.linesize[1] as usize,
+                chroma_w * 2,
+                chroma_h,
+            );
+            (y, uv)
+        } else if fmt == ffi::AV_PIX_FMT_YUV420P {
+            let y = pack_plane(
+                frame_plane(&sw_frame, 0, h),
+                sw_frame.linesize[0] as usize,
+                w,
+                h,
+            );
+            let uv = interleave_uv(
+                frame_plane(&sw_frame, 1, chroma_h),
+                sw_frame.linesize[1] as usize,
+                frame_plane(&sw_frame, 2, chroma_h),
+                sw_frame.linesize[2] as usize,
+                chroma_w,
+                chroma_h,
+            );
+            (y, uv)
+        } else {
+            return Err(CodecError::UnsupportedInputFormat);
+        };
 
-            // Two formats we accept from the system-memory side:
-            //  - NV12 (canonical VAAPI sw_format) — already the
-            //    renderer's preferred layout, just pack the Y and UV
-            //    planes tight (strip any compositor stride padding).
-            //  - YUV420P (SW fallback emitted this directly) — interleave
-            //    U and V into NV12 layout before handing off. Pure byte
-            //    permutation; no resampling.
-            // Anything else (notably NV21, which is V-first instead of
-            // U-first) lands in the error arm rather than silently
-            // shipping inverted colors. If a future hwaccel surfaces
-            // NV21 we'd need either a dedicated arm or a U/V swap in
-            // the packing step.
-            let fmt = sw_frame.format;
-            let (y, uv) = if fmt == ffi::AV_PIX_FMT_NV12 {
-                let y = pack_plane(
-                    frame_plane(&sw_frame, 0, h),
-                    sw_frame.linesize[0] as usize,
-                    w,
-                    h,
-                );
-                // NV12 plane 1: interleaved UV at half resolution. Each
-                // "chroma sample" is two bytes (U, V) so a row carries
-                // `chroma_w * 2` bytes; `pack_plane` strips any extra
-                // padding the driver may have added.
-                let uv = pack_plane(
-                    frame_plane(&sw_frame, 1, chroma_h),
-                    sw_frame.linesize[1] as usize,
-                    chroma_w * 2,
-                    chroma_h,
-                );
-                (y, uv)
-            } else if fmt == ffi::AV_PIX_FMT_YUV420P {
-                let y = pack_plane(
-                    frame_plane(&sw_frame, 0, h),
-                    sw_frame.linesize[0] as usize,
-                    w,
-                    h,
-                );
-                let uv = interleave_uv(
-                    frame_plane(&sw_frame, 1, chroma_h),
-                    sw_frame.linesize[1] as usize,
-                    frame_plane(&sw_frame, 2, chroma_h),
-                    sw_frame.linesize[2] as usize,
-                    chroma_w,
-                    chroma_h,
-                );
-                (y, uv)
-            } else {
-                return Err(CodecError::UnsupportedInputFormat);
-            };
-
-            let pts_out = if sw_frame.pts == ffi::AV_NOPTS_VALUE {
-                None
-            } else {
-                Some(sw_frame.pts)
-            };
-            out.push(DecodedFrame {
-                width: width as u32,
-                height: height as u32,
-                pts: pts_out,
-                y,
-                uv,
-            });
-        }
-        Ok(out)
+        let pts_out = if sw_frame.pts == ffi::AV_NOPTS_VALUE {
+            None
+        } else {
+            Some(sw_frame.pts)
+        };
+        Ok(Some(Frame::Cpu(DecodedFrame {
+            width: width as u32,
+            height: height as u32,
+            pts: pts_out,
+            y,
+            uv,
+        })))
     }
 
     fn codec_kind(&self) -> CodecKind {
@@ -605,8 +609,12 @@ mod tests {
             let bgra = make_test_bgra(w, h, t as u32);
             let packets = enc.encode_bgra(&bgra, t, t == 0).expect("encode");
             for p in packets {
-                let frames = dec.decode(&p.data).expect("vaapi decode");
-                if let Some(f) = frames.into_iter().next() {
+                dec.submit(&p.data).expect("vaapi submit");
+                while let Some(f) = dec.next_frame().expect("vaapi next_frame") {
+                    let Frame::Cpu(f) = f else {
+                        panic!("VaapiDecoder is in CPU-readback mode; \
+                                update this test when DMA-BUF export ships");
+                    };
                     got = Some(f);
                 }
             }

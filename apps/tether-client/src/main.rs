@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::bounded;
-use tether_codec::{probe_decoder, Decoder};
+use tether_codec::{probe_decoder, Decoder, Frame as CodecFrame};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{ClientHello, CodecKind, ControlMessage};
 use tether_protocol::video::FrameReassembler;
@@ -174,53 +174,86 @@ async fn main() -> anyhow::Result<()> {
                     bytes_received = bytes_received.saturating_add(frame.body.len() as u64);
 
                     let t_decode_start = MonoNanos::now();
-                    let decoded = match decoder.decode(&frame.body) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!(error = %e, "h264 decode failed; dropping packet");
-                            decode_errors = decode_errors.saturating_add(1);
-                            // A decode error usually means a P-frame
-                            // arrived without its IDR (or with a dropped
-                            // fragment that corrupted the slice). Asking
-                            // the host for a fresh IDR is the only way
-                            // out — without it we stay garbled until
-                            // the next periodic IDR (up to one GOP).
-                            let now = Instant::now();
-                            if last_idr_request.is_none_or(|t| now.duration_since(t) > IDR_RATE_LIMIT) {
-                                let conn = conn_recv.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
-                                        warn!(error = ?e, "ForceIdr send failed");
-                                    }
-                                });
-                                last_idr_request = Some(now);
-                                idr_requests = idr_requests.saturating_add(1);
+                    // submit + drain. The trait swallows ffmpeg's
+                    // drain/flushed sentinels and returns them as
+                    // `Ok(None)`, so any `Err` we see here is a real
+                    // decode failure — never a benign "need more input".
+                    let mut decoded: Vec<CodecFrame> = Vec::new();
+                    let mut decode_err: Option<tether_codec::CodecError> =
+                        decoder.submit(&frame.body).err();
+                    if decode_err.is_none() {
+                        loop {
+                            match decoder.next_frame() {
+                                Ok(Some(f)) => decoded.push(f),
+                                Ok(None) => break,
+                                Err(e) => {
+                                    decode_err = Some(e);
+                                    break;
+                                }
                             }
-                            continue;
                         }
-                    };
+                    }
                     let t_decode_done = MonoNanos::now();
                     decode_latency_sum_ns = decode_latency_sum_ns
                         .saturating_add(t_decode_done.saturating_sub(t_decode_start));
 
+                    // Render any frames we *did* successfully decode
+                    // before reporting the error. With async_depth=0
+                    // and no B-frames this is almost always 0 or 1
+                    // frames; the loop is here so a mid-drain failure
+                    // doesn't silently throw away good output.
                     for dec in decoded {
-                        // YUV planes go straight to the render texture
-                        // upload — no per-frame CPU pixel format
-                        // conversion in our code anymore. The
-                        // BGRA↔RGBA bounce that used to live here
-                        // turned into a free GPU sample in the YUV
-                        // fragment shader.
+                        let cpu = match dec {
+                            CodecFrame::Cpu(c) => c,
+                            CodecFrame::Gpu(_) => {
+                                // The renderer doesn't import GPU
+                                // surfaces yet. Backends must not emit
+                                // Gpu until it does; loudly assert in
+                                // debug so a misconfigured backend
+                                // produces a test failure rather than
+                                // a silently-black stream in CI.
+                                debug_assert!(
+                                    false,
+                                    "decoder emitted Gpu frame but renderer cannot import"
+                                );
+                                warn!("decoder emitted Gpu frame; renderer cannot import yet");
+                                continue;
+                            }
+                        };
                         let raw = Frame {
-                            width: dec.width,
-                            height: dec.height,
-                            y: dec.y,
-                            uv: dec.uv,
+                            width: cpu.width,
+                            height: cpu.height,
+                            y: cpu.y,
+                            uv: cpu.uv,
                             t_capture_client_clock: Some(host_in_client_clock),
                         };
                         // Drop on full — render is intentionally one-deep.
                         if frame_tx.try_send(raw).is_err() {
                             render_drops = render_drops.saturating_add(1);
                         }
+                    }
+
+                    if let Some(e) = decode_err {
+                        warn!(error = %e, "h264 decode failed; dropping packet");
+                        decode_errors = decode_errors.saturating_add(1);
+                        // A decode error usually means a P-frame
+                        // arrived without its IDR (or with a dropped
+                        // fragment that corrupted the slice). Asking
+                        // the host for a fresh IDR is the only way
+                        // out — without it we stay garbled until
+                        // the next periodic IDR (up to one GOP).
+                        let now = Instant::now();
+                        if last_idr_request.is_none_or(|t| now.duration_since(t) > IDR_RATE_LIMIT) {
+                            let conn = conn_recv.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
+                                    warn!(error = ?e, "ForceIdr send failed");
+                                }
+                            });
+                            last_idr_request = Some(now);
+                            idr_requests = idr_requests.saturating_add(1);
+                        }
+                        continue;
                     }
 
                     if last_log.elapsed() >= std::time::Duration::from_secs(1) {

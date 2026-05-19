@@ -20,7 +20,10 @@ use rsmpeg::swscale::SwsContext;
 
 use tether_protocol::control::CodecKind;
 
-use crate::{init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result, GOP_SECONDS};
+use crate::{
+    init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Frame, Result,
+    GOP_SECONDS,
+};
 
 /// Pack a planar AVFrame plane into a tight `Vec<u8>`, stripping any
 /// stride padding so downstream consumers can upload row-major without
@@ -351,64 +354,65 @@ impl H264Decoder {
 }
 
 impl Decoder for H264Decoder {
-    // Same rationale as encode_bgra: ffmpeg's i32 width/height/linesize
-    // on an allocated decoder output frame are non-negative.
-    #[allow(clippy::cast_sign_loss)]
-    fn decode(&mut self, encoded: &[u8]) -> Result<Vec<DecodedFrame>> {
+    fn submit(&mut self, encoded: &[u8]) -> Result<()> {
         if encoded.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let packet = packet_from_bytes(encoded)?;
         self.decoder.send_packet(Some(&packet))?;
+        Ok(())
+    }
 
-        let mut out = Vec::new();
-        loop {
-            let yuv = match self.decoder.receive_frame() {
-                Ok(f) => f,
-                Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => break,
-                Err(e) => return Err(CodecError::Ffmpeg(e)),
-            };
-            // H264 in our configuration always emits YUV420P. If a
-            // future capture path negotiates something else (NV12,
-            // YUV422) the renderer's YUV→RGB shader will need
-            // companion shaders / upload paths; for now reject loudly
-            // so the failure is observable instead of a silent garble.
-            if yuv.format != ffi::AV_PIX_FMT_YUV420P {
-                return Err(CodecError::UnsupportedInputFormat);
+    // Same rationale as encode_bgra: ffmpeg's i32 width/height/linesize
+    // on an allocated decoder output frame are non-negative.
+    #[allow(clippy::cast_sign_loss)]
+    fn next_frame(&mut self) -> Result<Option<Frame>> {
+        let yuv = match self.decoder.receive_frame() {
+            Ok(f) => f,
+            Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => {
+                return Ok(None)
             }
-            let w = yuv.width as usize;
-            let h = yuv.height as usize;
-            let chroma_w = w.div_ceil(2);
-            let chroma_h = h.div_ceil(2);
-            let y_plane = pack_plane(frame_plane(&yuv, 0, h), yuv.linesize[0] as usize, w, h);
-            // Interleave U + V into NV12-layout UV plane so the rest of
-            // the pipeline (including the renderer) sees the same shape
-            // VAAPI hardware decode produces natively. The interleave is
-            // a byte permutation — no resampling, ~chroma_w*chroma_h
-            // memory writes — and replaces the older path that uploaded
-            // U and V as separate textures.
-            let uv_plane = interleave_uv(
-                frame_plane(&yuv, 1, chroma_h),
-                yuv.linesize[1] as usize,
-                frame_plane(&yuv, 2, chroma_h),
-                yuv.linesize[2] as usize,
-                chroma_w,
-                chroma_h,
-            );
-            let pts_out = if yuv.pts == ffi::AV_NOPTS_VALUE {
-                None
-            } else {
-                Some(yuv.pts)
-            };
-            out.push(DecodedFrame {
-                width: yuv.width as u32,
-                height: yuv.height as u32,
-                pts: pts_out,
-                y: y_plane,
-                uv: uv_plane,
-            });
+            Err(e) => return Err(CodecError::Ffmpeg(e)),
+        };
+        // H264 in our configuration always emits YUV420P. If a
+        // future capture path negotiates something else (NV12,
+        // YUV422) the renderer's YUV→RGB shader will need
+        // companion shaders / upload paths; for now reject loudly
+        // so the failure is observable instead of a silent garble.
+        if yuv.format != ffi::AV_PIX_FMT_YUV420P {
+            return Err(CodecError::UnsupportedInputFormat);
         }
-        Ok(out)
+        let w = yuv.width as usize;
+        let h = yuv.height as usize;
+        let chroma_w = w.div_ceil(2);
+        let chroma_h = h.div_ceil(2);
+        let y_plane = pack_plane(frame_plane(&yuv, 0, h), yuv.linesize[0] as usize, w, h);
+        // Interleave U + V into NV12-layout UV plane so the rest of
+        // the pipeline (including the renderer) sees the same shape
+        // VAAPI hardware decode produces natively. The interleave is
+        // a byte permutation — no resampling, ~chroma_w*chroma_h
+        // memory writes — and replaces the older path that uploaded
+        // U and V as separate textures.
+        let uv_plane = interleave_uv(
+            frame_plane(&yuv, 1, chroma_h),
+            yuv.linesize[1] as usize,
+            frame_plane(&yuv, 2, chroma_h),
+            yuv.linesize[2] as usize,
+            chroma_w,
+            chroma_h,
+        );
+        let pts_out = if yuv.pts == ffi::AV_NOPTS_VALUE {
+            None
+        } else {
+            Some(yuv.pts)
+        };
+        Ok(Some(Frame::Cpu(DecodedFrame {
+            width: yuv.width as u32,
+            height: yuv.height as u32,
+            pts: pts_out,
+            y: y_plane,
+            uv: uv_plane,
+        })))
     }
 
     fn codec_kind(&self) -> CodecKind {
@@ -501,8 +505,11 @@ mod tests {
             let bgra = make_test_bgra(w, h, t as u32);
             let packets = enc.encode_bgra(&bgra, t, t == 0).expect("encode");
             for p in packets {
-                let frames = dec.decode(&p.data).expect("decode");
-                if let Some(f) = frames.into_iter().next() {
+                dec.submit(&p.data).expect("submit");
+                while let Some(f) = dec.next_frame().expect("next_frame") {
+                    let Frame::Cpu(f) = f else {
+                        panic!("H264Decoder is SW-only and must never emit Gpu");
+                    };
                     got = Some(f);
                 }
             }

@@ -157,19 +157,178 @@ pub trait Encoder: Send {
     fn name(&self) -> &'static str;
 }
 
+/// Output of one decoded frame, either CPU-resident NV12 planes or a
+/// GPU-resident surface handle. SW backends always emit `Cpu`. HW
+/// backends emit `Gpu` when their renderer-side import path is ready
+/// and `Cpu` (via `av_hwframe_transfer_data`) otherwise. The renderer
+/// matches on the variant and either uploads (Cpu) or imports (Gpu).
+#[derive(Debug)]
+pub enum Frame {
+    Cpu(DecodedFrame),
+    Gpu(GpuFrame),
+}
+
+impl Frame {
+    pub fn width(&self) -> u32 {
+        match self {
+            Frame::Cpu(f) => f.width,
+            Frame::Gpu(f) => f.width,
+        }
+    }
+    pub fn height(&self) -> u32 {
+        match self {
+            Frame::Cpu(f) => f.height,
+            Frame::Gpu(f) => f.height,
+        }
+    }
+    pub fn pts(&self) -> Option<i64> {
+        match self {
+            Frame::Cpu(f) => f.pts,
+            Frame::Gpu(f) => f.pts,
+        }
+    }
+}
+
+/// GPU-resident decoded frame. Storage shape is in `source`; the
+/// platform-tagged variant tells the renderer how to import. The
+/// `_guard` field holds whatever ref-counted handles the decoder needs
+/// alive while the renderer is reading the surface — for VAAPI that's
+/// the `AVFrame` whose `Drop` calls `av_frame_unref` and returns the
+/// surface to the pool. The renderer never inspects the guard; it
+/// just drops the `GpuFrame` when done.
+#[derive(Debug)]
+pub struct GpuFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pts: Option<i64>,
+    pub source: GpuFrameSource,
+    _guard: GpuFrameGuard,
+}
+
+impl GpuFrame {
+    /// Build a `GpuFrame`. `guard` is anything `Send + 'static` whose
+    /// `Drop` releases the decoder-side resources backing `source` —
+    /// most commonly an owned `AVFrame`.
+    pub fn new<G: Send + 'static>(
+        width: u32,
+        height: u32,
+        pts: Option<i64>,
+        source: GpuFrameSource,
+        guard: G,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pts,
+            source,
+            _guard: GpuFrameGuard { inner: Box::new(guard) },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum GpuFrameSource {
+    /// Linux DMA-BUF export of a VAAPI surface. Per-platform variants
+    /// (VideoToolbox `CVPixelBuffer`, D3D11 texture) will land alongside
+    /// their backends. The variant is gated on `target_os` so the
+    /// renderer's match is exhaustive on each platform without a
+    /// catch-all that silently swallows future variants.
+    #[cfg(target_os = "linux")]
+    DmaBuf(DmaBufFrame),
+}
+
+/// DMA-BUF descriptor as returned by `vaExportSurfaceHandle`. Mirrors
+/// `tether_vaapi::DrmPrimeSurface` but is owned by `tether-codec` so
+/// downstream crates that don't otherwise want a libva dep (notably
+/// `tether-render`'s wgpu import path) can stay decoupled from
+/// `tether-vaapi`. The fds are `OwnedFd` so close-exactly-once is
+/// type-enforced.
+///
+/// Synchronisation model: implicit. VAAPI's `vaExportSurfaceHandle`
+/// returns surfaces whose dma-buf reservation object carries the
+/// decoder's writes, so an importer that respects implicit sync (the
+/// Vulkan ext that backs wgpu's external-memory path does) sees a
+/// fully-decoded surface without a separate fence import. If a future
+/// backend needs explicit sync (e.g. NVDEC, which prefers timeline
+/// semaphores), this struct will need a sync_file fd alongside.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct DmaBufFrame {
+    pub fourcc: u32,
+    pub objects: Vec<DmaBufObject>,
+    pub layers: Vec<DmaBufLayer>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct DmaBufObject {
+    pub fd: std::os::fd::OwnedFd,
+    /// Object size in bytes. `vaExportSurfaceHandle` returns this as
+    /// `uint32_t`, but Vulkan's `VkMemoryAllocateInfo::allocationSize`
+    /// is `VkDeviceSize` (u64). We widen here so swapping to a backend
+    /// or surface format that exceeds 4 GiB doesn't break the type.
+    pub size: u64,
+    pub drm_format_modifier: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Copy, Clone)]
+pub struct DmaBufLayer {
+    pub drm_format: u32,
+    pub num_planes: u32,
+    pub object_index: [u32; 4],
+    pub offset: [u32; 4],
+    pub pitch: [u32; 4],
+}
+
+/// Opaque "hold these refs alive while the renderer reads the surface"
+/// container. The inner box is a sealed trait object so different
+/// decoders can stash backend-specific lifetimes (e.g. an `AVFrame`)
+/// without leaking their crate's types through `Decoder`'s public API
+/// — and without advertising `Any`'s downcasting capability, which
+/// would invite consumers to depend on the concrete type by convention.
+pub struct GpuFrameGuard {
+    // Held purely for its Drop.
+    #[allow(dead_code)]
+    inner: Box<dyn GuardPayload>,
+}
+
+/// Sealed marker for anything a backend wants to keep alive for the
+/// lifetime of a `GpuFrame`. Blanket-impl'd for every `Send + 'static`
+/// type; the trait itself is private so no one outside this crate can
+/// implement it or downcast through it.
+trait GuardPayload: Send + 'static {}
+impl<T: Send + 'static> GuardPayload for T {}
+
+impl std::fmt::Debug for GpuFrameGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuFrameGuard").finish_non_exhaustive()
+    }
+}
+
 /// Pluggable video-decoder backend. Same probe pattern as `Encoder` —
 /// the client probes available backends at startup, picks the best
 /// one whose `new()` succeeds, and stores the result as
 /// `Box<dyn Decoder>` so the decode loop doesn't care which backend
 /// is underneath.
+///
+/// The split between `submit` and `next_frame` mirrors ffmpeg's
+/// `send_packet` / `receive_frame` and lets the renderer drain the
+/// B-frame reorder buffer at its own cadence — and, more importantly,
+/// lets a future zero-copy backend hand out GPU surfaces one at a time
+/// without forcing the decoder to hold the whole batch in a `Vec`.
 pub trait Decoder: Send {
-    /// Decode one encoded buffer. May emit zero frames (decoder
-    /// warming up on SPS/PPS) or multiple (B-frame reorder buffer
-    /// drain). The output `DecodedFrame` always carries tight
-    /// YUV420P planes regardless of the underlying backend's
-    /// preferred sw_format, so the renderer doesn't need backend-
-    /// specific code paths.
-    fn decode(&mut self, encoded: &[u8]) -> Result<Vec<DecodedFrame>>;
+    /// Submit one encoded buffer. Does not produce frames directly —
+    /// call `next_frame` until it returns `None` to drain anything the
+    /// decoder produced.
+    fn submit(&mut self, encoded: &[u8]) -> Result<()>;
+
+    /// Pull the next decoded frame, or `Ok(None)` if the decoder needs
+    /// more input. Backends may emit zero frames per submit (warming
+    /// up on SPS/PPS) or several (B-frame reorder drain on a
+    /// configuration that has B-frames — we don't, but the API stays
+    /// honest about it).
+    fn next_frame(&mut self) -> Result<Option<Frame>>;
 
     fn codec_kind(&self) -> tether_protocol::control::CodecKind;
 

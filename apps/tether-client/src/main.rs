@@ -337,6 +337,29 @@ async fn main() -> anyhow::Result<()> {
         let _ = events_tx.send(evt);
     });
 
+    // Ctrl-C handler: winit's event loop owns the main thread once
+    // `tether_render::run` starts, so an interrupt can't naturally fall
+    // through to the `say_goodbye` block below. Catch it here, send
+    // Goodbye on the host's behalf, then `std::process::exit`. The exit
+    // skips destructors (wgpu device drop, winit window cleanup, tokio
+    // runtime shutdown). That's safe today because this process owns
+    // no state that needs cleanup before exit: no on-disk caches to
+    // flush, no in-flight telemetry to drain, no other peers depending
+    // on a graceful close beyond the Goodbye we already sent. Revisit
+    // before adding anything in those categories.
+    {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                warn!(error = %e, "ctrl-c handler failed; exiting anyway");
+                std::process::exit(1);
+            }
+            info!("ctrl-c received, sending Goodbye and exiting");
+            say_goodbye(&conn, "client interrupted").await;
+            std::process::exit(0);
+        });
+    }
+
     // Render loop blocks until the user closes the window.
     tether_render::run(
         "tether-client",
@@ -344,7 +367,41 @@ async fn main() -> anyhow::Result<()> {
         frame_rx,
         Some(on_event),
     )?;
+
+    // Normal window-close path. Notify the host so it can tear down its
+    // capture, encoder, and libei session immediately instead of waiting
+    // for QUIC's idle timeout.
+    say_goodbye(&conn, "client closing").await;
     Ok(())
+}
+
+/// Send a `ControlMessage::Goodbye` and close the connection. The
+/// sleep between send and close is a known-imperfect interim: the
+/// correct primitive is "wait for the peer to ack the Goodbye bytes,"
+/// which Quinn exposes only via `SendStream::finish` + `stopped()` on
+/// a stream we're willing to terminate. Our control stream lives for
+/// the whole connection, so a clean implementation needs a dedicated
+/// uni stream for shutdown — tracked as a separate task and required
+/// before real-network testing.
+///
+/// Until then: wait `2 * rtt`, floored at 20 ms and capped at 200 ms.
+/// `send_control` returns when bytes are in Quinn's send buffer (not
+/// when ack'd); two round trips covers send + propagation + ack on
+/// any sane link. The floor handles loopback (RTT in the microseconds)
+/// and the cap bounds shutdown latency on a high-RTT link where the
+/// peer may already be unreachable anyway.
+async fn say_goodbye(conn: &tether_transport::Connection, reason: &str) {
+    use std::time::Duration;
+    let msg = ControlMessage::Goodbye {
+        reason: reason.to_string(),
+    };
+    if let Err(e) = conn.send_control(&msg).await {
+        warn!(error = ?e, "send Goodbye failed; host will fall back to timeout");
+    } else {
+        let wait = (2 * conn.rtt()).clamp(Duration::from_millis(20), Duration::from_millis(200));
+        tokio::time::sleep(wait).await;
+    }
+    conn.close(0, reason.as_bytes());
 }
 
 

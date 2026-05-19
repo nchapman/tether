@@ -82,7 +82,22 @@ impl DecodedFrame {
     }
 }
 
+/// Pluggable video-encoder backend. One impl per (codec, backend) pair
+/// — `libx264` software, `h264_vaapi`, `h264_videotoolbox`, etc. The
+/// host probes available backends at startup, picks the best one that
+/// constructs successfully, and stores the result as `Box<dyn Encoder>`
+/// so the encode loop is backend-agnostic.
+///
+/// Shape is patterned after RustDesk's `EncoderApi` in
+/// `libs/scrap/src/common/codec.rs:60-83`. The introspection methods
+/// — `is_hardware`, `supports_changing_bitrate`, `name` — feed the
+/// probe and adaptive-bitrate controller without forcing the caller
+/// to know the concrete type.
 pub trait Encoder: Send {
+    /// Encode one BGRA frame at the negotiated width/height. May emit
+    /// zero or more packets — zero on the very first frame while
+    /// libx264 buffers SPS/PPS, multiple on an IDR that emits SPS/PPS
+    /// + the IDR slice as separate packets.
     fn encode_bgra(
         &mut self,
         bgra: &[u8],
@@ -90,18 +105,31 @@ pub trait Encoder: Send {
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>>;
 
-    /// Whether this encoder can change bitrate at runtime.
+    /// Whether this encoder can change bitrate at runtime via
+    /// `set_bitrate_kbps`. Defaults to `false` — most ffmpeg encoders
+    /// need a full restart to retune.
     fn supports_changing_bitrate(&self) -> bool {
         false
     }
+
     fn set_bitrate_kbps(&mut self, _kbps: u32) -> Result<()> {
         Ok(())
     }
-    /// True if encoding runs on dedicated HW (VideoToolbox, NVENC, VAAPI).
+
+    /// `true` if encoding runs on dedicated silicon (VideoToolbox,
+    /// NVENC, VAAPI, AMF). Used by the probe to prefer HW backends.
     fn is_hardware(&self) -> bool {
         false
     }
+
     fn codec_kind(&self) -> tether_protocol::control::CodecKind;
+
+    /// Short human-readable identifier suitable for logs and the
+    /// `ServerHello` descriptor field — e.g. `"libx264 sw"`,
+    /// `"h264_vaapi (Intel)"`, `"h264_videotoolbox"`. Distinct from
+    /// `codec_kind` (which only carries the on-wire codec id) so the
+    /// client can show which backend the host actually chose.
+    fn name(&self) -> &'static str;
 }
 
 pub trait Decoder: Send {

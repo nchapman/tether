@@ -279,6 +279,10 @@ impl Encoder for H264Encoder {
     fn codec_kind(&self) -> CodecKind {
         CodecKind::H264
     }
+
+    fn name(&self) -> &'static str {
+        "libx264 sw"
+    }
 }
 
 pub struct H264Decoder {

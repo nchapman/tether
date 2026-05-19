@@ -214,8 +214,7 @@ async fn main() -> anyhow::Result<()> {
                             width: dec.width,
                             height: dec.height,
                             y: dec.y,
-                            u: dec.u,
-                            v: dec.v,
+                            uv: dec.uv,
                             t_capture_client_clock: Some(host_in_client_clock),
                         };
                         // Drop on full — render is intentionally one-deep.

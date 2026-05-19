@@ -29,22 +29,26 @@ use gpu::GpuState;
 pub use winit::event::MouseButton;
 pub use winit::keyboard::{KeyCode, ModifiersState};
 
-/// One frame's worth of pixel data, in YUV 4:2:0 planar (I420) form —
-/// the format the H.264 decoder produces natively. Render uploads each
-/// plane as its own single-channel texture and converts to RGB in the
-/// fragment shader, skipping the per-frame CPU YUV→BGRA→RGBA bounce
-/// the older path needed.
+/// One frame's worth of pixel data, in NV12 (Y plus interleaved UV)
+/// form — the canonical output of every hardware H.264 decoder we
+/// target. Render uploads `y` as a full-resolution `R8Unorm` texture
+/// and `uv` as a half-resolution `Rg8Unorm` texture, then does the
+/// limited-range BT.709 matrix in the fragment shader. Two texture
+/// binds replace the three-plane YUV420P upload the older path used,
+/// and the decoder no longer has to swscale NV12→YUV420P just to feed
+/// the GPU.
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
     /// Tight Y plane, `width * height` bytes.
     pub y: Vec<u8>,
-    /// Tight U plane, `chroma_width * chroma_height` bytes where
-    /// `chroma_width = (width + 1) / 2` (same for height).
-    pub u: Vec<u8>,
-    /// Tight V plane, same layout as U.
-    pub v: Vec<u8>,
+    /// Tight UV plane in NV12 layout, `chroma_width * chroma_height * 2`
+    /// bytes where `chroma_width = (width + 1) / 2` (and same for
+    /// height). Each chroma sample is two bytes — U first, V second —
+    /// so a single `Rg8` texture sample on the GPU yields both
+    /// channels in one read.
+    pub uv: Vec<u8>,
     /// Optional client-clock timestamp of when this frame was
     /// captured at the host (translated through the handshake's
     /// `ClockSync::remote_to_local`, so it shares an epoch with
@@ -57,7 +61,9 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Chroma plane dimensions for the 4:2:0 subsampling we assume.
+    /// Chroma plane dimensions (in chroma samples) for the 4:2:0
+    /// subsampling we assume. The `uv` buffer is twice this wide in
+    /// bytes because each sample carries U and V interleaved.
     #[must_use]
     pub fn chroma_dims(&self) -> (u32, u32) {
         (self.width.div_ceil(2), self.height.div_ceil(2))

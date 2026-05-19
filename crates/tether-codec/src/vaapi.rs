@@ -11,13 +11,12 @@
 //!                              -> av_hwframe_transfer_data -> VAAPI surface
 //!                              -> h264_vaapi encode -> H.264 packet
 //!
-//! Decoder pipeline (client-side, still pays CPU readback + swscale):
+//! Decoder pipeline (client-side, still pays CPU readback):
 //!
 //!   H.264 bytes -> AVPacket -> h264 (VAAPI hwaccel) -> VAAPI surface
 //!                                                   -> av_hwframe_transfer_data
 //!                                                   -> NV12 sw frame
-//!                                                   -> swscale YUV420P
-//!                                                   -> Y/U/V planes for renderer
+//!                                                   -> Y + UV planes (NV12 layout) for renderer
 //!
 //! Both pipelines have an obvious-but-deferred next optimisation: zero-
 //! copy GPU handoff. Encoder side wants DMA-BUF from PipeWire capture
@@ -36,9 +35,9 @@ use tracing::warn;
 
 use tether_protocol::control::CodecKind;
 
-use crate::h264::{frame_plane, frame_plane_mut, pack_plane, packet_from_bytes};
+use crate::h264::{frame_plane, frame_plane_mut, interleave_uv, pack_plane, packet_from_bytes};
 use crate::{
-    init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result,
+    init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result, GOP_SECONDS,
 };
 
 /// Number of VAAPI surfaces in the hwframes pool. With `async_depth=1`
@@ -126,7 +125,9 @@ impl VaapiEncoder {
         // GOP cadence matches the libx264 fallback so the on-wire
         // worst-case "garbled until next IDR" window is the same
         // regardless of which encoder the probe picked.
-        encoder.set_gop_size(fps_i32);
+        let gop_frames = fps_i32
+            .saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
+        encoder.set_gop_size(gop_frames);
         encoder.set_max_b_frames(0);
 
         // Build + attach the hwframes context. NV12 is the canonical
@@ -363,8 +364,10 @@ unsafe extern "C" fn get_vaapi_format(
 
 /// VAAPI-accelerated H.264 decoder. Uses ffmpeg's generic `h264`
 /// decoder with VAAPI hwaccel selected via `get_format`. Output VAAPI
-/// surfaces are downloaded to CPU NV12, then swscaled to YUV420P so
-/// the existing renderer's three-plane upload path keeps working.
+/// surfaces are downloaded to CPU NV12 via `hwframe_transfer_data`
+/// and handed straight to the renderer in that shape — no NV12→YUV420P
+/// swscale on the decode hot path. The renderer was migrated to a
+/// two-texture NV12 layout to match.
 pub struct VaapiDecoder {
     decoder: AVCodecContext,
     // Decoder holds a cloned ref to the device internally
@@ -374,17 +377,6 @@ pub struct VaapiDecoder {
     // surfaces allocated against the device are released before the
     // device context itself goes.
     _hw_device: AVHWDeviceContext,
-    // CPU-side NV12 -> YUV420P stage. Built lazily on the first
-    // decoded frame once the bitstream's SPS reveals dimensions, and
-    // rebuilt on a dimension change mid-stream.
-    scaler: Option<Scaler>,
-}
-
-struct Scaler {
-    nv12_to_yuv: SwsContext,
-    yuv_frame: AVFrame,
-    width: i32,
-    height: i32,
 }
 
 // SAFETY: same move-fine / share-bad rationale as VaapiEncoder above.
@@ -438,45 +430,7 @@ impl VaapiDecoder {
         Ok(Self {
             decoder,
             _hw_device: hw_device,
-            scaler: None,
         })
-    }
-
-    /// Lazy/rebuild-on-resize NV12 → YUV420P scaler keyed on dims.
-    fn ensure_scaler(&mut self, width: i32, height: i32) -> Result<&mut Scaler> {
-        let needs_rebuild = self
-            .scaler
-            .as_ref()
-            .is_none_or(|s| s.width != width || s.height != height);
-        if needs_rebuild {
-            let nv12_to_yuv = SwsContext::get_context(
-                width,
-                height,
-                ffi::AV_PIX_FMT_NV12,
-                width,
-                height,
-                ffi::AV_PIX_FMT_YUV420P,
-                ffi::SWS_FAST_BILINEAR,
-                None,
-                None,
-                None,
-            )
-            .ok_or(CodecError::ScalerInit("NV12 -> YUV420P"))?;
-
-            let mut yuv_frame = AVFrame::new();
-            yuv_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
-            yuv_frame.set_width(width);
-            yuv_frame.set_height(height);
-            yuv_frame.alloc_buffer()?;
-
-            self.scaler = Some(Scaler {
-                nv12_to_yuv,
-                yuv_frame,
-                width,
-                height,
-            });
-        }
-        Ok(self.scaler.as_mut().expect("just inserted"))
     }
 }
 
@@ -521,39 +475,36 @@ impl Decoder for VaapiDecoder {
             let chroma_h = h.div_ceil(2);
 
             // Two formats we accept from the system-memory side:
-            //  - NV12 (canonical VAAPI sw_format) -> swscale to YUV420P
-            //  - YUV420P (SW fallback emitted this directly) -> pack
-            //    planes directly.
-            // Anything else is an unconfigured path and surfaces as an
-            // error rather than a silent garble.
+            //  - NV12 (canonical VAAPI sw_format) — already the
+            //    renderer's preferred layout, just pack the Y and UV
+            //    planes tight (strip any compositor stride padding).
+            //  - YUV420P (SW fallback emitted this directly) — interleave
+            //    U and V into NV12 layout before handing off. Pure byte
+            //    permutation; no resampling.
+            // Anything else (notably NV21, which is V-first instead of
+            // U-first) lands in the error arm rather than silently
+            // shipping inverted colors. If a future hwaccel surfaces
+            // NV21 we'd need either a dedicated arm or a U/V swap in
+            // the packing step.
             let fmt = sw_frame.format;
-            let (y, u, v) = if fmt == ffi::AV_PIX_FMT_NV12 {
-                let scaler = self.ensure_scaler(width, height)?;
-                scaler.nv12_to_yuv.scale_frame(
-                    &sw_frame,
-                    0,
-                    height,
-                    &mut scaler.yuv_frame,
-                )?;
+            let (y, uv) = if fmt == ffi::AV_PIX_FMT_NV12 {
                 let y = pack_plane(
-                    frame_plane(&scaler.yuv_frame, 0, h),
-                    scaler.yuv_frame.linesize[0] as usize,
+                    frame_plane(&sw_frame, 0, h),
+                    sw_frame.linesize[0] as usize,
                     w,
                     h,
                 );
-                let u = pack_plane(
-                    frame_plane(&scaler.yuv_frame, 1, chroma_h),
-                    scaler.yuv_frame.linesize[1] as usize,
-                    chroma_w,
+                // NV12 plane 1: interleaved UV at half resolution. Each
+                // "chroma sample" is two bytes (U, V) so a row carries
+                // `chroma_w * 2` bytes; `pack_plane` strips any extra
+                // padding the driver may have added.
+                let uv = pack_plane(
+                    frame_plane(&sw_frame, 1, chroma_h),
+                    sw_frame.linesize[1] as usize,
+                    chroma_w * 2,
                     chroma_h,
                 );
-                let v = pack_plane(
-                    frame_plane(&scaler.yuv_frame, 2, chroma_h),
-                    scaler.yuv_frame.linesize[2] as usize,
-                    chroma_w,
-                    chroma_h,
-                );
-                (y, u, v)
+                (y, uv)
             } else if fmt == ffi::AV_PIX_FMT_YUV420P {
                 let y = pack_plane(
                     frame_plane(&sw_frame, 0, h),
@@ -561,19 +512,15 @@ impl Decoder for VaapiDecoder {
                     w,
                     h,
                 );
-                let u = pack_plane(
+                let uv = interleave_uv(
                     frame_plane(&sw_frame, 1, chroma_h),
                     sw_frame.linesize[1] as usize,
-                    chroma_w,
-                    chroma_h,
-                );
-                let v = pack_plane(
                     frame_plane(&sw_frame, 2, chroma_h),
                     sw_frame.linesize[2] as usize,
                     chroma_w,
                     chroma_h,
                 );
-                (y, u, v)
+                (y, uv)
             } else {
                 return Err(CodecError::UnsupportedInputFormat);
             };
@@ -588,8 +535,7 @@ impl Decoder for VaapiDecoder {
                 height: height as u32,
                 pts: pts_out,
                 y,
-                u,
-                v,
+                uv,
             });
         }
         Ok(out)
@@ -670,7 +616,7 @@ mod tests {
         assert_eq!(frame.height, h);
         let (cw, ch) = frame.chroma_dims();
         assert_eq!(frame.y.len(), (w * h) as usize);
-        assert_eq!(frame.u.len(), (cw * ch) as usize);
-        assert_eq!(frame.v.len(), (cw * ch) as usize);
+        // NV12 layout: each chroma sample carries 2 bytes (U then V).
+        assert_eq!(frame.uv.len(), (cw * ch * 2) as usize);
     }
 }

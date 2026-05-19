@@ -18,6 +18,15 @@ pub use probe::{probe_decoder, probe_encoder_bgra};
 
 use std::sync::Once;
 
+/// GOP length used by every H.264 encoder we ship. Long enough that
+/// keyframes don't dominate the bitrate envelope (1 IDR every ~240
+/// frames at 30 fps), short enough that a client joining mid-stream
+/// after our handshake's eager-IDR request never has to wait more
+/// than this for a periodic recovery point. Loss recovery between
+/// IDRs is handled by the client's on-demand `ForceIdr` plumbing,
+/// not by GOP cadence.
+pub(crate) const GOP_SECONDS: u32 = 8;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     #[error("ffmpeg: {0}")]
@@ -54,12 +63,20 @@ pub struct EncodedPacket {
     pub keyframe: bool,
 }
 
-/// A decoded video frame in YUV 4:2:0 planar (I420) layout. Three tight
-/// planes — Y at full resolution, U and V at quarter resolution
-/// (subsampled 2:1 on each axis). The renderer uploads each plane as
-/// its own `R8Unorm` texture and converts to RGB in the fragment
-/// shader, skipping the per-frame CPU YUV→BGRA→RGBA bounce we used
-/// to do.
+/// A decoded video frame in NV12 (Y plus interleaved UV) layout. Two
+/// tight planes — Y at full resolution, UV at half resolution in both
+/// dimensions with U and V byte-interleaved (U₀ V₀ U₁ V₁ ...). NV12 is
+/// the native output of every hardware H.264 decoder we care about, so
+/// the VAAPI path lands its surface straight into this shape with zero
+/// CPU pixel-format conversion. The software path does a cheap
+/// YUV420P→NV12 interleave (byte permutation, no resampling) so the
+/// renderer only has to know about one format.
+///
+/// The renderer uploads `y` as an `R8Unorm` texture and `uv` as a
+/// half-res `Rg8Unorm` texture, then does the limited-range BT.709
+/// matrix in the fragment shader. Two texture binds replace the old
+/// three; bandwidth-equivalent but one fewer sampler binding and no
+/// CPU NV12→YUV420P swscale on the decode hot path.
 ///
 /// Dimensions come from the codec (decoded SPS), not from the wire,
 /// so the decoder is authoritative about resolution changes.
@@ -72,15 +89,18 @@ pub struct DecodedFrame {
     pub pts: Option<i64>,
     /// Tight Y plane, `width * height` bytes.
     pub y: Vec<u8>,
-    /// Tight U plane, `chroma_width * chroma_height` bytes where
-    /// `chroma_width = (width + 1) / 2` (and same for height).
-    pub u: Vec<u8>,
-    /// Tight V plane, same layout as U.
-    pub v: Vec<u8>,
+    /// Tight UV plane in NV12 layout, `chroma_width * chroma_height * 2`
+    /// bytes where `chroma_width = (width + 1) / 2` (and same for
+    /// height). Each chroma sample is two bytes — U byte first, V byte
+    /// second — so a single `Rg8` texture sample on the GPU yields
+    /// both channels in one read.
+    pub uv: Vec<u8>,
 }
 
 impl DecodedFrame {
-    /// Chroma plane dimensions for the 4:2:0 subsampling we assume.
+    /// Chroma plane dimensions (in chroma samples) for the 4:2:0
+    /// subsampling we assume. The `uv` buffer is twice this wide in
+    /// bytes because each sample carries U and V interleaved.
     #[must_use]
     pub fn chroma_dims(&self) -> (u32, u32) {
         (self.width.div_ceil(2), self.height.div_ceil(2))

@@ -48,14 +48,13 @@ fn test_pattern(width: u32, height: u32, t: u32) -> Frame {
         }
     }
     let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-    let u = vec![128u8; (cw * ch) as usize];
-    let v = vec![128u8; (cw * ch) as usize];
+    // Neutral grey chroma in NV12 layout: U=128, V=128 interleaved.
+    let uv = vec![128u8; (cw * ch * 2) as usize];
     Frame {
         width,
         height,
         y,
-        u,
-        v,
+        uv,
         t_capture_client_clock: None,
     }
 }

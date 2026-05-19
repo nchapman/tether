@@ -88,43 +88,34 @@ pub struct LibeiInjector {
 }
 
 impl LibeiInjector {
-    /// Establish the connection. enigo is compiled with both
-    /// `libei_tokio` and `x11rb` so we work on Wayland AND X11; the
-    /// runtime probe below picks one explicitly to avoid enigo's
-    /// "fan out to every available backend" behaviour, which would
-    /// double-press keys on XWayland (where both libei and X11
-    /// connect successfully).
+    /// Establish the libei session via the Remote Desktop portal.
+    /// enigo is built without its x11rb feature (see the crate Cargo.toml
+    /// for rationale), so libei is the only backend on the table — no
+    /// runtime probe needed and no X11 connection attempt to surface as
+    /// an error in the host's log.
     ///
-    /// Strategy:
-    /// - `WAYLAND_DISPLAY` set → Wayland session. Disable enigo's
-    ///   X11 path by handing it a bogus display name; libei goes
-    ///   through the portal as before.
-    /// - `WAYLAND_DISPLAY` unset → X11 session. Don't disable
-    ///   X11; libei's portal init will fail naturally (no service),
-    ///   leaving X11 as the only backend.
-    ///
-    /// Runs on a blocking thread because enigo's constructor uses
-    /// its own internal block_on (deadlocks inside an active tokio
-    /// context).
+    /// Runs on a blocking thread because enigo's constructor uses its
+    /// own internal block_on (deadlocks inside an active tokio context).
     ///
     /// Display dimensions are intentionally NOT sourced from enigo:
-    /// `Enigo::main_display()` is unimplemented on libei and we
-    /// don't want X11 vs libei to disagree about screen size. The
-    /// capture path calls `set_display_size` with the real numbers.
+    /// `Enigo::main_display()` is unimplemented on libei. The capture
+    /// path calls `set_display_size` with the real numbers from the
+    /// PipeWire-negotiated stream format.
+    ///
+    /// Three lines of `Start emulating` on stdout during this call are
+    /// from a raw `println!` in enigo 0.6.1's libei backend — one per
+    /// virtual device the portal exposes (keyboard, pointer, scroll). It
+    /// isn't gated by a logger, so we can't filter it from our side
+    /// without dup2'ing fd 1 across the call. Live with it until enigo
+    /// upstream demotes that line.
     pub async fn connect() -> Result<Self> {
-        let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-        let mut settings = Settings::default();
-        if is_wayland {
-            // Bogus display name -> enigo's x11rb::Con::new() fails;
-            // libei wins by elimination.
-            settings.x11_display = Some("tether-disable-x11:99".to_string());
-        }
+        let settings = Settings::default();
         let enigo = tokio::task::spawn_blocking(move || Enigo::new(&settings))
             .await
             .map_err(|e| InjectError::Init(format!("spawn_blocking join: {e}")))?
             .map_err(|e| InjectError::Init(format!("enigo new: {e:?}")))?;
         tracing::info!(
-            session = if is_wayland { "wayland (libei)" } else { "x11 (xtest)" },
+            session = "wayland (libei)",
             "linux input backend selected"
         );
         Ok(Self {

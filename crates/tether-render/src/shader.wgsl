@@ -24,14 +24,14 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
-// YUV 4:2:0 planar: three single-channel textures, full-res Y plus
-// half-res U + V. The sampler bilerps the chroma planes for us — at
-// 4:2:0 quality the visual difference vs. nearest is negligible and
-// the bilinear taps are free on every GPU we care about.
+// NV12: full-res single-channel Y plus half-res two-channel UV with U
+// in .r and V in .g. One sample of the UV texture yields both chroma
+// components, replacing the older path's pair of single-channel taps.
+// Bilinear filter on the chroma sampler is free on every GPU we care
+// about and the visual difference vs. nearest is invisible at 4:2:0.
 @group(0) @binding(0) var y_tex: texture_2d<f32>;
-@group(0) @binding(1) var u_tex: texture_2d<f32>;
-@group(0) @binding(2) var v_tex: texture_2d<f32>;
-@group(0) @binding(3) var s: sampler;
+@group(0) @binding(1) var uv_tex: texture_2d<f32>;
+@group(0) @binding(2) var s: sampler;
 
 // BT.709 limited-range YUV -> linear sRGB. Constants match the
 // conventional broadcast matrix. The encoder is currently configured
@@ -41,12 +41,11 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let y = textureSample(y_tex, s, in.uv).r;
-    let u = textureSample(u_tex, s, in.uv).r;
-    let v = textureSample(v_tex, s, in.uv).r;
+    let chroma = textureSample(uv_tex, s, in.uv).rg;
     // Limited-range expansion: Y[16..235] -> [0..1], C[16..240] -> [-0.5..0.5].
     let yc = (y - 16.0 / 255.0) * (255.0 / 219.0);
-    let uc = (u - 128.0 / 255.0) * (255.0 / 224.0);
-    let vc = (v - 128.0 / 255.0) * (255.0 / 224.0);
+    let uc = (chroma.r - 128.0 / 255.0) * (255.0 / 224.0);
+    let vc = (chroma.g - 128.0 / 255.0) * (255.0 / 224.0);
     let r = yc + 1.5748 * vc;
     let g = yc - 0.1873 * uc - 0.4681 * vc;
     let b = yc + 1.8556 * uc;

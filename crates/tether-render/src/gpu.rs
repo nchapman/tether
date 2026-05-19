@@ -4,12 +4,14 @@ use winit::window::Window;
 
 use crate::{Frame, RenderError, Result};
 
-/// Y plus chroma textures and the bind group that points at them.
-/// Bundled together so resize-on-frame can swap them atomically.
+/// Y plus interleaved-UV textures and the bind group that points at
+/// them. Bundled together so resize-on-frame can swap them atomically.
+/// Y is R8Unorm at full resolution; UV is Rg8Unorm at half resolution
+/// (each texel holds one U byte in .r and one V byte in .g, matching
+/// the NV12 layout the decoder emits).
 struct YuvTextures {
     y: wgpu::Texture,
-    u: wgpu::Texture,
-    v: wgpu::Texture,
+    uv: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     /// Y-plane dimensions (chroma is derived).
     size: (u32, u32),
@@ -100,8 +102,8 @@ impl GpuState {
             ..Default::default()
         });
 
-        // Three single-channel textures (Y, U, V) plus a sampler. We
-        // share one sampler — chroma upsampling uses the same bilinear
+        // Two textures (Y + UV-interleaved) plus a sampler. We share
+        // one sampler — chroma upsampling uses the same bilinear
         // filter as luma, and the visual difference vs. a chroma-only
         // nearest sampler is invisible on 4:2:0 desktop content.
         let yuv_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -109,9 +111,8 @@ impl GpuState {
             entries: &[
                 bgl_texture_entry(0),
                 bgl_texture_entry(1),
-                bgl_texture_entry(2),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3,
+                    binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -236,9 +237,10 @@ impl GpuState {
             );
         }
         let (chroma_w, chroma_h) = frame.chroma_dims();
-        write_plane(&self.queue, &self.textures.y, &frame.y, frame.width, frame.height);
-        write_plane(&self.queue, &self.textures.u, &frame.u, chroma_w, chroma_h);
-        write_plane(&self.queue, &self.textures.v, &frame.v, chroma_w, chroma_h);
+        // Y is R8 — one byte per texel, so bytes_per_row == width.
+        // UV is Rg8 — two bytes per texel, so bytes_per_row == chroma_w * 2.
+        write_plane_r8(&self.queue, &self.textures.y, &frame.y, frame.width, frame.height);
+        write_plane_rg8(&self.queue, &self.textures.uv, &frame.uv, chroma_w, chroma_h);
     }
 
     pub(crate) fn render(&mut self) -> std::result::Result<(), String> {
@@ -372,12 +374,22 @@ fn make_yuv_textures(
 ) -> YuvTextures {
     let chroma_w = width.div_ceil(2);
     let chroma_h = height.div_ceil(2);
-    let y = make_r8_texture(device, "tether-render y plane", width, height);
-    let u = make_r8_texture(device, "tether-render u plane", chroma_w, chroma_h);
-    let v = make_r8_texture(device, "tether-render v plane", chroma_w, chroma_h);
+    let y = make_plane_texture(
+        device,
+        "tether-render y plane",
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    );
+    let uv = make_plane_texture(
+        device,
+        "tether-render uv plane",
+        chroma_w,
+        chroma_h,
+        wgpu::TextureFormat::Rg8Unorm,
+    );
     let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
-    let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
-    let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
+    let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tether-render yuv bind group"),
         layout,
@@ -388,28 +400,29 @@ fn make_yuv_textures(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&u_view),
+                resource: wgpu::BindingResource::TextureView(&uv_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::TextureView(&v_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
         ],
     });
     YuvTextures {
         y,
-        u,
-        v,
+        uv,
         bind_group,
         size: (width, height),
     }
 }
 
-fn make_r8_texture(device: &wgpu::Device, label: &str, width: u32, height: u32) -> wgpu::Texture {
+fn make_plane_texture(
+    device: &wgpu::Device,
+    label: &str,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -420,17 +433,32 @@ fn make_r8_texture(device: &wgpu::Device, label: &str, width: u32, height: u32) 
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        // R8Unorm rather than R8UnormSrgb: YUV values are in a linear
+        // Non-sRGB variants on purpose: YUV values are in a linear
         // encoding space already (the BT.709 limited-range expansion
         // in the fragment shader handles gamma); applying sRGB on
         // sample would double-decode and crush highlights.
-        format: wgpu::TextureFormat::R8Unorm,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
 }
 
-fn write_plane(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
+fn write_plane_r8(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
+    write_plane(queue, texture, bytes, width, height, 1);
+}
+
+fn write_plane_rg8(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
+    write_plane(queue, texture, bytes, width, height, 2);
+}
+
+fn write_plane(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    bytes_per_texel: u32,
+) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -441,7 +469,7 @@ fn write_plane(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8], width
         bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width),
+            bytes_per_row: Some(width * bytes_per_texel),
             rows_per_image: Some(height),
         },
         wgpu::Extent3d {

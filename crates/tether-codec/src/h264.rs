@@ -20,7 +20,7 @@ use rsmpeg::swscale::SwsContext;
 
 use tether_protocol::control::CodecKind;
 
-use crate::{init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result};
+use crate::{init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Result, GOP_SECONDS};
 
 /// Pack a planar AVFrame plane into a tight `Vec<u8>`, stripping any
 /// stride padding so downstream consumers can upload row-major without
@@ -36,6 +36,33 @@ pub(crate) fn pack_plane(plane: &[u8], stride: usize, row_bytes: usize, height: 
         }
     }
     packed
+}
+
+/// Interleave two single-channel chroma planes (YUV420P layout) into
+/// an NV12-shaped UV buffer (U₀ V₀ U₁ V₁ ...). Output is tight (no
+/// stride padding) and sized `chroma_w * chroma_h * 2` bytes — twice
+/// the input plane size, since each chroma sample contributes one byte
+/// of U and one of V. Replaces the per-plane swscale we used to do
+/// after the VAAPI decoder; for the software path this is a fast
+/// memory-bound shuffle (no resampling).
+pub(crate) fn interleave_uv(
+    u: &[u8],
+    u_stride: usize,
+    v: &[u8],
+    v_stride: usize,
+    chroma_w: usize,
+    chroma_h: usize,
+) -> Vec<u8> {
+    let mut uv = Vec::with_capacity(chroma_w * chroma_h * 2);
+    for row in 0..chroma_h {
+        let u_row = &u[row * u_stride..row * u_stride + chroma_w];
+        let v_row = &v[row * v_stride..row * v_stride + chroma_w];
+        for col in 0..chroma_w {
+            uv.push(u_row[col]);
+            uv.push(v_row[col]);
+        }
+    }
+    uv
 }
 
 /// Borrow plane `idx` of an allocated `AVFrame` as `&mut [u8]` covering
@@ -128,14 +155,9 @@ impl H264Encoder {
         encoder.set_time_base(ra(1, fps_i32));
         encoder.set_framerate(ra(fps_i32, 1));
         encoder.set_bit_rate(i64::from(bitrate_kbps) * 1000);
-        // GOP = 1 second of frames. The MVP datagram path has no FEC and
-        // relies on on-demand IDR to recover from packet loss, so any
-        // lost fragment corrupts the P-frame chain until the next IDR.
-        // A 1-second IDR cadence caps the worst-case "garbled" window
-        // without spending catastrophic bandwidth on keyframes. Drop
-        // this back to a long GOP once FEC lands and we trust loss
-        // recovery without a full re-keyframe.
-        encoder.set_gop_size(fps_i32);
+        let gop_frames = fps_i32
+            .saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
+        encoder.set_gop_size(gop_frames);
         encoder.set_max_b_frames(0);
 
         // Latency flag at the codec-context level. AV_CODEC_FLAG_LOW_DELAY
@@ -168,7 +190,7 @@ impl H264Encoder {
         // parallelism but worse compression efficiency (each slice has
         // its own header + can't predict across slice boundaries).
         let x264_params =
-            CString::new(format!("keyint={fps_i32}:min-keyint={fps_i32}:scenecut=0"))
+            CString::new(format!("keyint={gop_frames}:min-keyint={gop_frames}:scenecut=0"))
                 .expect("static format yields no nul bytes");
         let dict = AVDictionary::new(c"preset", c"ultrafast", 0)
             .set(c"tune", c"zerolatency", 0)
@@ -359,13 +381,15 @@ impl Decoder for H264Decoder {
             let chroma_w = w.div_ceil(2);
             let chroma_h = h.div_ceil(2);
             let y_plane = pack_plane(frame_plane(&yuv, 0, h), yuv.linesize[0] as usize, w, h);
-            let u_plane = pack_plane(
+            // Interleave U + V into NV12-layout UV plane so the rest of
+            // the pipeline (including the renderer) sees the same shape
+            // VAAPI hardware decode produces natively. The interleave is
+            // a byte permutation — no resampling, ~chroma_w*chroma_h
+            // memory writes — and replaces the older path that uploaded
+            // U and V as separate textures.
+            let uv_plane = interleave_uv(
                 frame_plane(&yuv, 1, chroma_h),
                 yuv.linesize[1] as usize,
-                chroma_w,
-                chroma_h,
-            );
-            let v_plane = pack_plane(
                 frame_plane(&yuv, 2, chroma_h),
                 yuv.linesize[2] as usize,
                 chroma_w,
@@ -381,8 +405,7 @@ impl Decoder for H264Decoder {
                 height: yuv.height as u32,
                 pts: pts_out,
                 y: y_plane,
-                u: u_plane,
-                v: v_plane,
+                uv: uv_plane,
             });
         }
         Ok(out)
@@ -405,6 +428,49 @@ impl Decoder for H264Decoder {
 )]
 mod tests {
     use super::*;
+
+    /// Verifies `interleave_uv` produces the correct NV12 byte order
+    /// (U₀ V₀ U₁ V₁ ...) and correctly strips stride padding. The
+    /// stride case matters because ffmpeg-allocated YUV420P frames
+    /// typically have linesize > chroma_w, and a regression here
+    /// would silently shift chroma samples (visible as wrong colors
+    /// per row) instead of erroring.
+    #[test]
+    fn interleave_uv_packs_nv12_and_strips_stride() {
+        // 4x2 chroma plane with stride 6 (2 bytes of trailing padding
+        // per row). U byte values encode (row << 4) | col so any
+        // mis-indexing is obvious.
+        let chroma_w = 4;
+        let chroma_h = 2;
+        let stride = 6;
+        let mut u_plane = vec![0u8; stride * chroma_h];
+        let mut v_plane = vec![0u8; stride * chroma_h];
+        for row in 0..chroma_h {
+            for col in 0..chroma_w {
+                u_plane[row * stride + col] = ((row << 4) | col) as u8;
+                v_plane[row * stride + col] = 0xF0 | (((row << 4) | col) & 0x0F) as u8;
+            }
+            // Sentinel bytes in the stride padding region — should
+            // never appear in the output.
+            u_plane[row * stride + 4] = 0xAA;
+            u_plane[row * stride + 5] = 0xAA;
+            v_plane[row * stride + 4] = 0xAA;
+            v_plane[row * stride + 5] = 0xAA;
+        }
+
+        let uv = interleave_uv(&u_plane, stride, &v_plane, stride, chroma_w, chroma_h);
+
+        assert_eq!(uv.len(), chroma_w * chroma_h * 2);
+        // Row 0: U(0,0) V(0,0) U(0,1) V(0,1) U(0,2) V(0,2) U(0,3) V(0,3)
+        // Row 1: U(1,0) V(1,0) U(1,1) V(1,1) ...
+        let expected: Vec<u8> = vec![
+            0x00, 0xF0, 0x01, 0xF1, 0x02, 0xF2, 0x03, 0xF3,
+            0x10, 0xF0, 0x11, 0xF1, 0x12, 0xF2, 0x13, 0xF3,
+        ];
+        assert_eq!(uv, expected);
+        // No stride-padding sentinels leaked into the output.
+        assert!(!uv.contains(&0xAA), "stride padding leaked into UV plane");
+    }
 
     fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
         let mut data = Vec::with_capacity((width * height * 4) as usize);
@@ -444,10 +510,11 @@ mod tests {
         let frame = got.expect("decoder produced a frame within four input frames");
         assert_eq!(frame.width, w);
         assert_eq!(frame.height, h);
-        // YUV 4:2:0 plane sizes: Y is full res, U+V quarter res
+        // NV12 plane sizes: Y is full res; UV is quarter-resolution
+        // chroma but with two bytes per sample (interleaved U + V), so
+        // the byte total matches the old U+V combined.
         let (cw, ch) = frame.chroma_dims();
         assert_eq!(frame.y.len(), (w * h) as usize);
-        assert_eq!(frame.u.len(), (cw * ch) as usize);
-        assert_eq!(frame.v.len(), (cw * ch) as usize);
+        assert_eq!(frame.uv.len(), (cw * ch * 2) as usize);
     }
 }

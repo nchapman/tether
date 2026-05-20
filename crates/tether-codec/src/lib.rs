@@ -8,6 +8,7 @@
 //! (latency hints, bitrate control, HW vs SW detection) is right from
 //! day one.
 
+pub mod av_log;
 pub mod h264;
 pub mod probe;
 
@@ -26,7 +27,6 @@ pub use probe::{probe_decoder, probe_encoder, probe_encoder_kind};
 /// downcast or inspect.
 pub use tether_protocol::GpuResourceGuard as GpuFrameGuard;
 
-use std::sync::Once;
 
 /// GOP length used by every H.264 encoder we ship. Long enough that
 /// keyframes don't dominate the bitrate envelope (1 IDR every ~240
@@ -452,14 +452,15 @@ pub trait Decoder: Send {
 }
 
 /// First-call hook for any cross-crate ffmpeg setup we want to run
-/// exactly once per process. rsmpeg-style bindings don't require a
-/// separate `av_register_all()` (deprecated in FFmpeg 4.x, removed
-/// later) so this is currently a no-op — kept for the call sites and
-/// for future hooks (logging callback, lock manager, etc.).
+/// exactly once per process. rsmpeg handles codec registration lazily
+/// on first use; what we install here is the `av_log` -> tracing
+/// bridge so libavcodec messages don't slip through to raw stderr and
+/// so the client can observe `av_log::warning_or_above_count` to
+/// detect "decoder is stuck" states (e.g. HEVC RPS reconstruction
+/// failures) that don't surface as `Err` from the codec API. The
+/// `install()` callee is itself `Once`-guarded, so calling
+/// `init_ffmpeg` from every codec constructor is cheap on the steady
+/// path.
 pub(crate) fn init_ffmpeg() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        // Intentionally empty for now. rsmpeg handles codec/format
-        // registration lazily on first use.
-    });
+    av_log::install();
 }

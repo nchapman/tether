@@ -320,6 +320,18 @@ async fn main() -> anyhow::Result<()> {
                     // drain/flushed sentinels and returns them as
                     // `Ok(None)`, so any `Err` we see here is a real
                     // decode failure — never a benign "need more input".
+                    //
+                    // Some failure modes (HEVC RPS reconstruction —
+                    // "Could not find ref with POC N") don't surface
+                    // through the API at all: libavcodec internally
+                    // logs the error and skips the undecodable NALU,
+                    // returning Ok. We bracket the call with a
+                    // snapshot of the process-wide `av_log` warning
+                    // counter so we can treat "libavcodec was unhappy
+                    // during this packet" as a soft decode failure
+                    // worth a ForceIdr, even when `decoder.submit` /
+                    // `next_frame` reported Ok.
+                    let avlog_before = tether_codec::av_log::warning_or_above_count();
                     let mut decoded: Vec<CodecFrame> = Vec::new();
                     let mut decode_err: Option<tether_codec::CodecError> =
                         decoder.submit(&frame.body).err();
@@ -335,6 +347,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    let avlog_warnings = tether_codec::av_log::warning_or_above_count()
+                        .saturating_sub(avlog_before);
                     let t_decode_done = MonoNanos::now();
                     decode_latency_sum_ns = decode_latency_sum_ns
                         .saturating_add(t_decode_done.saturating_sub(t_decode_start));
@@ -370,14 +384,36 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    if let Some(e) = decode_err {
-                        warn!(error = %e, "h264 decode failed; dropping packet");
+                    // Two distinct failure shapes ride the same recovery
+                    // path. (1) Hard failure: `decoder.submit` or
+                    // `next_frame` returned an Err (rare; almost always
+                    // a truly corrupt slice). (2) Soft failure:
+                    // libavcodec internally logged at warning or above
+                    // during this packet — the common case for
+                    // "P-frame references a fragment we dropped on the
+                    // wire," which the HEVC decoder skips silently
+                    // until the next IDR. Either way, the only recovery
+                    // is a fresh IDR. We count the soft path under the
+                    // same `decode_errs` metric (it was previously
+                    // lying as zero) and reuse the rate-limited
+                    // ForceIdr request below.
+                    let soft_failure = decode_err.is_none() && avlog_warnings > 0;
+                    if let Some(e) = decode_err.as_ref() {
+                        warn!(error = %e, "decode failed; dropping packet");
+                    } else if soft_failure {
+                        // Don't emit per-packet — the av_log bridge
+                        // already routed the underlying libavcodec
+                        // message into tracing. A trace-level here keeps
+                        // the metric attributable without doubling up.
+                        tracing::trace!(
+                            avlog_warnings,
+                            "libavcodec warned during decode; treating as soft failure"
+                        );
+                    }
+                    if decode_err.is_some() || soft_failure {
                         decode_errors = decode_errors.saturating_add(1);
-                        // A decode error usually means a P-frame
-                        // arrived without its IDR (or with a dropped
-                        // fragment that corrupted the slice). Asking
-                        // the host for a fresh IDR is the only way
-                        // out — without it we stay garbled until
+                        // Asking the host for a fresh IDR is the only
+                        // way out — without it we stay garbled until
                         // the next periodic IDR (up to one GOP).
                         let now = Instant::now();
                         if last_idr_request.is_none_or(|t| now.duration_since(t) > IDR_RATE_LIMIT) {
@@ -390,7 +426,15 @@ async fn main() -> anyhow::Result<()> {
                             last_idr_request = Some(now);
                             idr_requests = idr_requests.saturating_add(1);
                         }
-                        continue;
+                        if decode_err.is_some() {
+                            // Decoded frames (if any landed before the
+                            // mid-drain Err) were already rendered
+                            // above; `continue` here just skips the
+                            // per-window stats block for this iteration
+                            // so a packet that errored isn't counted
+                            // toward the network-latency average.
+                            continue;
+                        }
                     }
 
                     if last_log.elapsed() >= std::time::Duration::from_secs(1) {

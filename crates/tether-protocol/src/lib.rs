@@ -51,6 +51,10 @@ impl MonoNanos {
         static PROCESS_START: OnceLock<Instant> = OnceLock::new();
         let start = PROCESS_START.get_or_init(Instant::now);
         let nanos = Instant::now().duration_since(*start).as_nanos();
+        // `Duration::as_nanos` returns u128 to accommodate ~584-year
+        // intervals; we saturate to u64 (still ~584 years from process
+        // start) rather than panic. Not an `unwrap` site — clamping is
+        // the intended behavior, just not the form `try_from` ships in.
         Self(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 

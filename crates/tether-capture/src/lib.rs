@@ -19,6 +19,9 @@ pub mod test_pattern;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 use tether_protocol::MonoNanos;
 
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. Producers (the
@@ -192,6 +195,12 @@ pub enum CaptureError {
     Portal(String),
     #[error("pipewire: {0}")]
     PipeWire(String),
+    /// ScreenCaptureKit (macOS) error — typically a permission denial
+    /// (`NSScreenCaptureUsageDescription` missing or TCC denied),
+    /// `SCShareableContent::get` failure, or `start_capture` rejection.
+    /// Carries the framework error's display form.
+    #[error("ScreenCaptureKit: {0}")]
+    Sck(String),
 }
 
 pub type Result<T> = std::result::Result<T, CaptureError>;
@@ -207,5 +216,12 @@ impl From<ashpd::Error> for CaptureError {
 impl From<pipewire::Error> for CaptureError {
     fn from(e: pipewire::Error) -> Self {
         Self::PipeWire(e.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<screencapturekit::error::SCError> for CaptureError {
+    fn from(e: screencapturekit::error::SCError) -> Self {
+        Self::Sck(e.to_string())
     }
 }

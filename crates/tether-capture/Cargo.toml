@@ -13,6 +13,16 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Safe SCK bindings — wraps Apple's framework via the doom-fish Swift
+# FFI shim. `macos_13_0` is the minimum feature level Tether targets;
+# bump alongside Apple's SDK floor.
+screencapturekit = { version = "6", features = ["macos_13_0"] }
+# Need tokio's `task::spawn_blocking` to run SCK's synchronous
+# `SCShareableContent::get` off the async runtime. The Linux target
+# pulls tokio via ashpd; macOS pulls it explicitly.
+tokio = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
 pipewire = "0.10"

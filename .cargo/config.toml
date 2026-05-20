@@ -1,0 +1,15 @@
+# macOS: apple-cf / screencapturekit / apple-metal ship Swift shims that
+# link `libswift_Concurrency.dylib` via `@rpath`. Their build scripts emit
+# `cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift`, but cargo only
+# propagates those to the *artifact built by the same script*, not to
+# downstream binary/test/example targets that consume the rlib. The
+# result is `dyld: Library not loaded: @rpath/libswift_Concurrency.dylib`
+# at test/binary runtime.
+#
+# Bake the OS Swift runtime location into every final link product as a
+# workspace-wide rpath. Cheap, idempotent, only applied on macOS targets.
+# Drop this once the upstream crates emit `rustc-link-arg-bins-tests-examples`
+# instead of plain `rustc-link-arg`.
+
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-args=-Wl,-rpath,/usr/lib/swift"]

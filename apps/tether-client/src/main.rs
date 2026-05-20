@@ -81,6 +81,28 @@ async fn main() -> anyhow::Result<()> {
         "handshake complete"
     );
 
+    // Sanity-check the advertised pixel format. NV12 is the only one
+    // the client decode → render path handles today; anything else
+    // (P010 for HDR, etc.) means the host is running ahead of this
+    // build. We log but don't refuse — the user might still get a
+    // partial render if we're lucky.
+    if let Some(pf_bytes) = server_body
+        .extensions
+        .get(tether_protocol::control::PIXEL_FORMAT_EXTENSION_KEY)
+    {
+        match tether_protocol::decode::<tether_protocol::control::PixelFormat>(pf_bytes) {
+            Ok(tether_protocol::control::PixelFormat::Nv12) => {
+                tracing::debug!("host advertised pixel format: Nv12");
+            }
+            Ok(other) => {
+                warn!(?other, "host advertised an unsupported pixel format; expect rendering issues");
+            }
+            Err(e) => {
+                warn!(error = %e, "host advertised an unparseable pixel format extension");
+            }
+        }
+    }
+
     // Render channel: producer is the recv loop, consumer is the wgpu
     // window. Bounded(2) with drop-newest semantics matches the rest of
     // the project.

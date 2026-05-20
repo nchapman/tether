@@ -365,6 +365,26 @@ mod tests {
     }
 
     #[test]
+    fn pixel_format_extension_round_trips() {
+        use crate::control::{PixelFormat, PIXEL_FORMAT_EXTENSION_KEY};
+        let pf = PixelFormat::Nv12;
+        let bytes = encode(&pf).unwrap();
+        let pf2: PixelFormat = decode(&bytes).unwrap();
+        assert_eq!(pf, pf2);
+
+        // Round-trip via a hello extension map to confirm the integration
+        // shape: server encodes into BTreeMap value, client decodes back.
+        let mut ext = std::collections::BTreeMap::<String, Vec<u8>>::new();
+        ext.insert(PIXEL_FORMAT_EXTENSION_KEY.to_string(), bytes);
+        let read = ext
+            .get(PIXEL_FORMAT_EXTENSION_KEY)
+            .expect("present");
+        let decoded: PixelFormat = decode(read).unwrap();
+        assert_eq!(decoded, PixelFormat::Nv12);
+        assert_eq!(PIXEL_FORMAT_EXTENSION_KEY, "tether.pixel-format");
+    }
+
+    #[test]
     fn round_trip_audio_packet_opus() {
         use crate::audio::{AudioConfig, AudioPacket, AUDIO_CONFIG_EXTENSION_KEY};
         let p = AudioPacket::Opus {

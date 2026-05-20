@@ -136,7 +136,22 @@ async fn handle_client(
                 clock_probe_t0_echo: MonoNanos::ZERO,
                 t1_server_recv: MonoNanos::ZERO,
                 t2_server_send: MonoNanos::ZERO,
-                extensions: Default::default(),
+                extensions: {
+                    let mut e = std::collections::BTreeMap::new();
+                    // Advertise pixel format up front so the client's
+                    // decoder import path (VAAPI / VT / MF) doesn't
+                    // have to wait on the first SPS to decide between
+                    // 8-bit and 10-bit. We're NV12 everywhere today;
+                    // P010 lands with HDR.
+                    e.insert(
+                        tether_protocol::control::PIXEL_FORMAT_EXTENSION_KEY.to_string(),
+                        tether_protocol::encode(
+                            &tether_protocol::control::PixelFormat::Nv12,
+                        )
+                        .expect("PixelFormat::Nv12 encodes; types under our control"),
+                    );
+                    e
+                },
                 resume_token: None,
             })
         })

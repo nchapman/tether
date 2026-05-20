@@ -266,6 +266,21 @@ pub enum ControlMessage {
     /// client's user-driven display switch; host stops emitting video
     /// for displays not in the set.
     SetActiveDisplays { displays: Vec<u8> },
+    /// Client → host. Sent once after the client has finished building
+    /// its decoders, so the host doesn't start blasting video before
+    /// the receive side is ready. Booleans indicate which streams the
+    /// client is prepared to consume; `audio` is reserved for the
+    /// future Opus pipeline (always `false` from clients today).
+    StreamReady { video: bool, audio: bool },
+    /// Client → host. Pause emission for the given display (e.g.
+    /// window minimised). Host is free to stop encoding entirely for
+    /// that display to save power.
+    StreamPause { display: u8 },
+    /// Client → host. Resume emission for the given display. Pairs
+    /// with [`Self::StreamPause`]; host emits a fresh IDR before any
+    /// subsequent P-frames so the client doesn't render a half-decoded
+    /// stream.
+    StreamResume { display: u8 },
 }
 
 // --- ClockSync ----------------------------------------------------------

@@ -171,6 +171,12 @@ async fn main() -> anyhow::Result<()> {
                         // Client-originated; misrouted if seen on the client side.
                         tracing::debug!("unexpected client→host SetActiveDisplays arrived on client; ignoring");
                     }
+                    Ok(ControlMessage::StreamReady { .. }
+                       | ControlMessage::StreamPause { .. }
+                       | ControlMessage::StreamResume { .. }) => {
+                        // Client-originated; misrouted if seen on the client side.
+                        tracing::debug!("unexpected client→host stream-lifecycle message arrived on client; ignoring");
+                    }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");
                         return;
@@ -183,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
     let conn_recv = conn.clone();
     let recv_clock_sync = clock_sync;
     let chosen_codec = server_body.chosen_codec;
+    let conn_ready = conn.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
         let mut decoder: Box<dyn Decoder> = match probe_decoder(chosen_codec) {
@@ -200,6 +207,18 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
         };
+        // Decoder is up; tell the host to start streaming. `audio: false`
+        // because the Opus pipeline isn't wired yet (the wire-shape lands
+        // in tether-protocol/audio.rs).
+        if let Err(e) = conn_ready
+            .send_control(&ControlMessage::StreamReady {
+                video: true,
+                audio: false,
+            })
+            .await
+        {
+            warn!(error = ?e, "StreamReady send failed; host will not emit video");
+        }
         let mut frame_count: u64 = 0;
         // Sum of decode call wall-clocks across the frames in the
         // current log window, surfaced as avg_decode_ms on the

@@ -258,9 +258,17 @@ async fn handle_client(
     // flag breaks the send loop out of its idle wait on a quiet desktop,
     // where `frames.recv` would otherwise block past disconnect detection.
     let send_shutdown = Arc::new(AtomicBool::new(false));
+    // Stream-readiness gate. The client signals it has built its
+    // decoders by sending `ControlMessage::StreamReady`; until then
+    // we drop captured frames at the head of the send loop. Without
+    // this, the first ~100-500 ms of frames race the client's
+    // decoder construction and render as garbage or get dropped on
+    // the floor (depending on which side wins).
+    let stream_ready = Arc::new(AtomicBool::new(false));
     let conn_send = conn.clone();
     let force_idr_for_send = force_idr.clone();
     let send_shutdown_for_thread = send_shutdown.clone();
+    let stream_ready_for_thread = stream_ready.clone();
     let send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
         .spawn(move || {
@@ -271,6 +279,7 @@ async fn handle_client(
                 display_dims_tx,
                 send_shutdown_for_thread,
                 chosen_codec,
+                stream_ready_for_thread,
             )
         })?;
 
@@ -301,11 +310,27 @@ async fn handle_client(
     {
         let conn = conn.clone();
         let force_idr = force_idr.clone();
+        let stream_ready_ctl = stream_ready.clone();
         tasks.spawn(async move {
             loop {
                 match conn.recv_control().await {
                     Ok(ControlMessage::ForceIdr) => {
                         tracing::debug!("client requested IDR");
+                        force_idr.raise();
+                    }
+                    Ok(ControlMessage::StreamReady { video, audio }) => {
+                        info!(video, audio, "client signalled StreamReady; opening the gate");
+                        stream_ready_ctl.store(true, Ordering::Release);
+                    }
+                    Ok(ControlMessage::StreamPause { display }) => {
+                        let display_id = display;
+                        info!(display_id, "client paused stream (no-op today)");
+                    }
+                    Ok(ControlMessage::StreamResume { display }) => {
+                        let display_id = display;
+                        info!(display_id, "client resumed stream (no-op today)");
+                        // Force a fresh IDR so the client can latch
+                        // onto the resumed stream without a partial GOP.
                         force_idr.raise();
                     }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
@@ -675,6 +700,7 @@ fn run_capture_and_send(
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
     shutdown: Arc<AtomicBool>,
     chosen_codec: CodecKind,
+    stream_ready: Arc<AtomicBool>,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
@@ -698,6 +724,15 @@ fn run_capture_and_send(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        // Drop frames captured before the client said it was ready to
+        // decode. This is the StreamReady gate — without it, frames
+        // from the first ~100-500 ms race the client's decoder
+        // construction. We drop rather than buffer because (a)
+        // captured frames go stale fast, and (b) the encoder isn't
+        // built yet on this thread either, so there's nothing to feed.
+        if !stream_ready.load(Ordering::Acquire) {
+            continue;
+        }
         let frame_width = frame.width();
         let frame_height = frame.height();
         let mut timing = {

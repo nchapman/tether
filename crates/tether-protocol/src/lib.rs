@@ -358,6 +358,24 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_stream_lifecycle() {
+        // The three lifecycle variants gate host frame emission. All
+        // three need to survive the wire identically.
+        for msg in [
+            ControlMessage::StreamReady {
+                video: true,
+                audio: false,
+            },
+            ControlMessage::StreamPause { display: 3 },
+            ControlMessage::StreamResume { display: 3 },
+        ] {
+            let bytes = encode(&msg).unwrap();
+            let msg2: ControlMessage = decode(&bytes).unwrap();
+            assert_eq!(msg, msg2);
+        }
+    }
+
+    #[test]
     fn round_trip_control_extension() {
         // The Extension escape unblocks future control features
         // without forcing a ClientHelloV2. Confirm it survives the

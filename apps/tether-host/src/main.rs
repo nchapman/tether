@@ -19,7 +19,9 @@ use tether_codec::{probe_encoder, probe_encoder_kind, Encoder};
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
 #[cfg(target_os = "linux")]
-use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject, GpuEncoderFrame};
+use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use tether_codec::GpuEncoderFrame;
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame};
 use tether_protocol::control::{
@@ -671,6 +673,43 @@ fn encode_gpu_frame(
     }
 }
 
+/// Encode one ScreenCaptureKit-supplied IOSurface through the
+/// VideoToolbox zero-copy path. Simpler than the Linux equivalent —
+/// no gpuconvert bridge, no NV12 conversion, no `BridgeState`: SCK
+/// hands us NV12 IOSurfaces directly and the encoder consumes them
+/// as-is via `CVPixelBufferCreateWithIOSurface`.
+///
+/// The capture-side `release_guard` keeps the underlying IOSurface
+/// alive for the duration of this call; the encoder's
+/// `submit_iosurface` performs a fresh CFRetain on the wrapping
+/// CVPixelBuffer so the surface stays valid for the encoder's
+/// async work after we return.
+#[cfg(target_os = "macos")]
+fn encode_iosurface_frame(
+    slot: &mut EncoderSlot,
+    gpu: tether_capture::GpuCapturedFrame,
+    pts: i64,
+    force_keyframe: bool,
+) -> anyhow::Result<Vec<tether_codec::EncodedPacket>> {
+    let tether_capture::GpuCapturedSource::IOSurface(iosurface) = gpu.source;
+    let codec_frame = tether_codec::IOSurfaceFrame {
+        surface: iosurface.surface,
+        pixel_format: iosurface.pixel_format,
+        width: iosurface.width,
+        height: iosurface.height,
+    };
+    let packets = slot
+        .encoder
+        .encode_gpu(GpuEncoderFrame::IOSurface(&codec_frame), pts, force_keyframe)?;
+    // `gpu` (and its `release_guard`) falls out of scope at function
+    // end, releasing the capture-side CMSampleBuffer + IOSurface
+    // retains. By that point `submit_iosurface` has already taken its
+    // own CFRetain on the wrapping CVPixelBuffer, so the surface
+    // outlives this scope as needed by the encoder. Ordering here is
+    // not load-bearing — no explicit `drop` needed.
+    Ok(packets)
+}
+
 /// Build a `DmaBufFrame` (NV12, one object, two layers — Y as R8 and
 /// UV as GR88, both pointing at `object_index=0` with their offsets
 /// within the shared allocation) from the bridge's per-call descriptor.
@@ -872,9 +911,17 @@ fn run_capture_and_send(
                     return;
                 }
             },
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            CapturedFrame::Gpu(gpu) => match encode_iosurface_frame(slot_mut, gpu, pts, force_kf) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "IOSurface encode failed; dropping frame");
+                    continue;
+                }
+            },
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             CapturedFrame::Gpu(_) => {
-                warn!("Gpu CapturedFrame on a non-Linux build; dropping");
+                warn!("Gpu CapturedFrame on an unsupported build; dropping");
                 continue;
             }
         };
@@ -1006,7 +1053,19 @@ async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
         .map_err(anyhow::Error::from)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
+    // No gpuconvert preflight — VideoToolbox accepts the NV12
+    // IOSurface ScreenCaptureKit hands us directly. SCK's
+    // `start_capture` triggers the macOS ScreenRecording TCC prompt
+    // on first run; subsequent runs reuse the granted permission.
+    info!("capture source: macOS (ScreenCaptureKit, primary display)");
+    tether_capture::macos::start()
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
     warn!("no real capture backend on this platform yet; falling back to test-pattern");
     Ok(tether_capture::test_pattern::start(

@@ -5,8 +5,12 @@ Low-latency, open-source remote desktop in Rust. Inspired by
 and [Sunshine](https://github.com/LizardByte/Sunshine).
 
 **Status:** pre-MVP. Linux host → Linux client works end-to-end over QUIC
-with VAAPI hardware encode, DMA-BUF capture, and wgpu present. macOS host
-and the audio pipeline are next.
+with VAAPI hardware encode, PipeWire DMA-BUF capture, and wgpu present.
+macOS host (ScreenCaptureKit capture + VideoToolbox encode + CGEvent
+input injection) compiles and the encoder round-trips on Apple Silicon;
+end-to-end LAN streaming to a Linux client is the next demo milestone.
+macOS client (VideoToolbox decode + Metal render) and the audio pipeline
+follow after that.
 
 ## Layout
 

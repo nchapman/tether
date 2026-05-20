@@ -28,21 +28,21 @@
 //! - This crate's surface is one wgpu device + one compute pipeline.
 //!   Small, focused, easy to test in isolation.
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod dmabuf_export;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod modifier_query;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod nv12_dmabuf;
 mod pipeline;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use dmabuf_export::{
     export_texture_as_dmabuf, DmaBufExport, ExportError, DRM_FORMAT_MOD_LINEAR,
 };
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use modifier_query::{importable_dmabuf_modifiers, ModifierQueryError};
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use nv12_dmabuf::{Nv12DmaBuf, Nv12DmaBufError, Nv12DmaBufFrame};
 
 #[derive(Debug, thiserror::Error)]

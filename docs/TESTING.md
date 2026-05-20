@@ -10,7 +10,7 @@ each layer covers, and how to extend it.
 | --- | --- | --- |
 | `tether-protocol` | 32 | Wire round-trips for every control variant (handshake, codec negotiation, video packets + `stream_epoch>u16` widening, `VideoFrameMetaEnvelope`, cursor position + control-stream cursor shapes, multi-monitor `DisplayList`, stream lifecycle, `ClientStats`, `ControlMessage::Extension`, audio `Opus`, `PixelFormat` hello extension, `InputEvent::device_id`), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant fails decode; trailing bytes fail decode). |
 | `tether-transport` | 4 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning. |
-| `tether-codec` | 2 unit + 8 `#[ignore]` | SW H264 round-trip (test-only); VAAPI encoder/decoder/dma-buf-import on hardware; HEVC + H.264 probe smoke check; per-codec × per-resolution benchmarks (`vaapi::bench`, 4 cells × 3 paths). |
+| `tether-codec` | 3 unit + 8 `#[ignore]` Linux + 2 `#[ignore]` macOS | SW H264 round-trip (test-only); codec_name map sanity; VAAPI encoder/decoder/dma-buf-import on Linux hardware; HEVC + H.264 probe smoke check; per-codec × per-resolution benchmarks (`vaapi::bench`, 4 cells × 3 paths); VideoToolbox encoder construct + H.264 BGRA round-trip on macOS hardware. |
 | `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |
 | `tether-session` | 5 | `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate. |
 | `tether-render` | 4 + 1 `#[ignore]` | Cursor letterbox clipping, aspect ratio; dma-buf zero-copy on hardware. |
@@ -24,17 +24,19 @@ with an explanatory string:
 - **Default-on** — run on every `cargo test`. No hardware assumptions
   beyond what the workstation already has (file I/O, in-process QUIC
   loopback via tokio).
-- **`#[ignore = "requires …"]`** — needs real GPU or VAAPI. Run via
-  `cargo test -- --ignored` on a host with the right capabilities.
-  The ignore message names the requirement (`vainfo`, the Vulkan
-  extension, etc.) so the next person can see at a glance whether
-  their box should run them.
+- **`#[ignore = "requires …"]`** — needs real GPU, VAAPI, or
+  VideoToolbox. Run via `cargo test -- --ignored` on a host with the
+  right capabilities. The ignore message names the requirement
+  (`vainfo`, the Vulkan extension, `requires macOS + VideoToolbox`,
+  etc.) so the next person can see at a glance whether their box
+  should run them.
 
-Today there are **20 ignored tests** across `tether-codec/vaapi`
-(8 — 5 correctness, plus 4 cells of the `bench` matrix that each
-exercise encode_bgra + encode_dmabuf + decode), `tether-gpuconvert`
-(11), and `tether-render` (1). They are real and load-bearing on
-hardware; they are not abandoned.
+Today there are **22 ignored tests**: `tether-codec/vaapi` (8 — 5
+correctness, plus 4 cells of the `bench` matrix that each exercise
+encode_bgra + encode_dmabuf + decode), `tether-codec/videotoolbox` (2 —
+encoder smoke + HEVC constructs), `tether-gpuconvert` (11), and
+`tether-render` (1). They are real and load-bearing on hardware; they
+are not abandoned.
 
 The benchmark cells (one per codec × resolution) live in
 `crates/tether-codec/src/vaapi/bench.rs`. Run with:

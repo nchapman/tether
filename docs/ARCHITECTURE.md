@@ -3,10 +3,14 @@
 Tether is a low-latency open-source remote desktop in Rust. The first
 working end-to-end target is **Linux ↔ Linux on a LAN over QUIC**, with
 hardware H.264 or HEVC (negotiated per session) at 60 fps default and
-a zero-copy capture→encode→decode→render path. The crate boundaries are
-shaped so adding macOS (ScreenCaptureKit / VideoToolbox / IOSurface)
-and Windows (DXGI / Media Foundation / D3D11) backends is a new module
-per platform, not a rewrite of the core path.
+a zero-copy capture→encode→decode→render path. **macOS host (capture +
+encode + input injection) compiles and the encoder round-trips on
+Apple Silicon** via ScreenCaptureKit, VideoToolbox, and CGEvent;
+end-to-end LAN streaming from a Mac to a Linux client is the next
+demo milestone. The macOS client (VideoToolbox decode + Metal render
++ winit input capture) and the Windows backends (DXGI / Media
+Foundation / D3D11) are additional modules per platform, not a
+rewrite of the core path.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -169,7 +173,7 @@ pub enum CapturedFrame { Cpu(CpuFrame), Gpu(GpuCapturedFrame) }
 
 pub enum GpuCapturedSource {
     #[cfg(target_os = "linux")] DmaBuf(CapturedDmaBuf),
-    // future: #[cfg(target_os = "macos")] IOSurface(...),
+    #[cfg(target_os = "macos")] IOSurface(CapturedIOSurface),
     // future: #[cfg(target_os = "windows")] D3D11Texture(...),
 }
 ```
@@ -197,15 +201,15 @@ pub trait Encoder: Send {
 
 pub enum GpuEncoderFrame<'a> {
     #[cfg(target_os = "linux")] DmaBuf(&'a DmaBufFrame),
+    #[cfg(target_os = "macos")] IOSurface(&'a IOSurfaceFrame),
     #[doc(hidden)] _Phantom(PhantomData<&'a ()>),
 }
 ```
 
 The trait method is cross-platform; variants inside `GpuEncoderFrame`
 are cfg-gated internally. The host's dispatch doesn't need a per-
-platform `#[cfg]`. When IOSurface/D3D11 backends arrive, they add a
-variant to the enum and an `encode_gpu` impl on their `Encoder` — no
-change to the trait shape or the call site.
+platform `#[cfg]`. The Windows D3D11 variant slots in the same way
+when that backend arrives.
 
 **Decoder side** uses the same shape, mirrored: `Decoder::next_frame ->
 Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
@@ -213,11 +217,20 @@ Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
 renderer a `GpuFrameGuard` (the shared `GpuResourceGuard` re-export) that
 holds the source `AVFrame` ref alive until the renderer drops it.
 
-The macOS migration path is roughly: add `tether-capture/src/macos.rs`
-emitting `CapturedFrame::Gpu(GpuCapturedSource::IOSurface(...))`, add a
-`VideoToolboxEncoder` impl in `tether-codec` whose `encode_gpu`
-unwraps `GpuEncoderFrame::IOSurface`, and the host's run loop is
-unchanged. Same for the decoder/renderer pair on the client.
+**macOS host (shipping today).** ScreenCaptureKit emits NV12
+`CMSampleBuffer`s; `tether-capture::macos` unwraps each to its
+`IOSurface` and forwards as `CapturedFrame::Gpu(GpuCapturedSource::IOSurface(...))`.
+`tether-codec::videotoolbox::VideoToolboxEncoder` wraps the IOSurface
+in a fresh `CVPixelBuffer` (`CVPixelBufferCreateWithIOSurface`) and
+feeds it to `h264_videotoolbox` / `hevc_videotoolbox` via the AVFrame
+`data[3]` slot — no NV12 conversion step is needed (SCK delivers
+NV12 video range natively), so the macOS host has no analogue of
+`tether-gpuconvert`. Input injection is via `enigo`'s CGEvent
+backend, sharing the modifier-reconciliation and HID→Key code with
+the Linux libei path through `inject::enigo_backend`. macOS client
+(VideoToolbox decode + Metal IOSurface→wgpu render + winit input
+capture) is a separate plan; for now a macOS host streams to a
+Linux VAAPI client.
 
 ---
 
@@ -306,8 +319,11 @@ to a transport-agnostic HID-style `InputEvent`, sends to host.
 
 Listed to set expectations; each is a real follow-up, not a "never":
 
-- **macOS and Windows backends.** Crate boundaries are ready
-  (see "Cross-platform additivity"); the modules don't exist yet.
+- **macOS client and Windows backends.** macOS host ships today
+  (see "Cross-platform additivity"); the macOS client (VideoToolbox
+  decode + Metal IOSurface→wgpu render + winit input capture) and
+  the Windows host/client (DXGI / Media Foundation / D3D11) are
+  follow-up modules per platform.
 - **AV1.** H.264 and HEVC are supported; AV1 needs a different VAAPI
   decoder probe (no `vaapi_av1` encode entrypoint on most current
   Intel iGPUs) and a separate codec_id path. The probe stub returns
@@ -368,7 +384,27 @@ reasons:
 - **Hard requirement on hardware codecs.** SW H264 is gated behind
   `cfg(test)`. The probe returns `NoHardwareCodec` with actionable
   diagnostics ("run vainfo", "check kernel module") rather than
-  silently falling back to a SW path that would tank latency.
+  silently falling back to a SW path that would tank latency. On
+  macOS the VideoToolbox encoder additionally sets `allow_sw=0` and
+  errors out if FFmpeg leaves that option unconsumed (older builds
+  with stale option tables), so the GPU-only invariant doesn't decay
+  silently across FFmpeg versions.
+- **FFmpeg build requirements.** Linux host needs FFmpeg built with
+  `--enable-vaapi` (Ubuntu's default is fine; check `ffmpeg -encoders | grep vaapi`).
+  macOS host needs `--enable-videotoolbox` (Homebrew's `ffmpeg`
+  formula enables it by default — verify with
+  `ffmpeg -encoders | grep videotoolbox`). Custom or trimmed builds
+  may omit either; the probe surfaces a `CodecNotFound` with the
+  exact encoder name to look for.
+- **macOS Swift runtime rpath.** The screencapturekit / apple-cf
+  crates ship Swift shims that link `libswift_Concurrency.dylib` via
+  `@rpath`. Their build scripts emit
+  `cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift`, but cargo only
+  propagates that to the artifact built by the same script. The
+  workspace `.cargo/config.toml` bakes the OS Swift runtime location
+  into every macOS link product as a workspace-wide rpath. Drop the
+  override once the upstream crates emit
+  `rustc-link-arg-bins-tests-examples` instead.
 - **wgpu pinned to a trunk SHA, not a release.** `texture_from_dmabuf_fd`
   isn't in a published wgpu release yet. Workspace-level
   `[patch.crates-io]` keeps every wgpu sub-crate on the same SHA so a

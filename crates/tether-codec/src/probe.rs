@@ -75,7 +75,34 @@ pub fn probe_encoder(
         return Err(no_hw_encoder(kind, src));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut last_err: Option<(CodecKind, CodecError)> = None;
+        for kind in preferred {
+            match crate::videotoolbox::VideoToolboxEncoder::new(
+                *kind,
+                width,
+                height,
+                fps,
+                bitrate_kbps,
+            ) {
+                Ok(enc) => return Ok((*kind, Box::new(enc))),
+                Err(e) => {
+                    tracing::warn!(
+                        backend = "videotoolbox",
+                        codec = ?kind,
+                        error = %e,
+                        "VideoToolbox encoder construction failed for codec; trying next"
+                    );
+                    last_err = Some((*kind, e));
+                }
+            }
+        }
+        let (kind, src) = last_err.expect("loop entered with non-empty preferred");
+        return Err(no_hw_encoder_vt(kind, src));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (preferred, width, height, fps, bitrate_kbps);
         Err(no_hw_encoder_for_platform())
@@ -109,7 +136,19 @@ pub fn probe_encoder_kind(kind: CodecKind) -> bool {
     {
         crate::vaapi::VaapiEncoder::new(kind, 128, 128, 30, 1_000).is_ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Apple Silicon h264/hevc_videotoolbox accept down to 128×128,
+        // matching the VAAPI floor. Intel Macs (pre-M1) have been
+        // observed to reject HEVC below ~144×144 — bumping to 256×144
+        // gives headroom across both arches and still costs the probe
+        // only a single one-shot encode. If the probe ever passes here
+        // and `new()` then fails at a real resolution on an Intel mac,
+        // raise the floor further; we don't have an Intel mac in CI to
+        // validate against today.
+        crate::videotoolbox::VideoToolboxEncoder::new(kind, 256, 144, 30, 1_000).is_ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = kind;
         false
@@ -136,7 +175,22 @@ pub fn probe_decoder(kind: CodecKind) -> Result<Box<dyn Decoder>> {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // VideoToolbox decoder is a follow-up plan. This is a
+        // missing-feature, not a misconfiguration — make that
+        // unambiguous in the error so operators don't chase a
+        // permissions / driver problem that doesn't exist.
+        let _ = kind;
+        return Err(CodecError::NoHardwareCodec(
+            "VideoToolbox decoder is not yet implemented in this build — \
+             macOS client support is planned but not available. \
+             Run tether-client on Linux (VAAPI) to receive from a macOS host."
+                .to_string(),
+        ));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = kind;
         Err(no_hw_decoder_for_platform())
@@ -158,6 +212,17 @@ fn no_hw_encoder(kind: CodecKind, source: CodecError) -> CodecError {
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn no_hw_encoder_vt(kind: CodecKind, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "VideoToolbox encoder unavailable for {kind:?} ({source}). \
+         Check that `ffmpeg -hide_banner -encoders | grep videotoolbox` lists \
+         h264_videotoolbox / hevc_videotoolbox — Homebrew's `ffmpeg` formula \
+         enables `--enable-videotoolbox` by default; a custom build may not. \
+         Tether requires GPU encode — there is no software fallback."
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn no_hw_decoder(kind: CodecKind, source: CodecError) -> CodecError {
     CodecError::NoHardwareCodec(format!(
@@ -168,22 +233,22 @@ fn no_hw_decoder(kind: CodecKind, source: CodecError) -> CodecError {
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn no_hw_encoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
-        "Tether currently supports hardware encode only on Linux (VAAPI). \
-         macOS/VideoToolbox, Windows/NVENC, and Windows/AMF backends are not \
-         yet implemented."
+        "Tether currently supports hardware encode on Linux (VAAPI) and \
+         macOS (VideoToolbox). Windows/NVENC and Windows/AMF backends are \
+         not yet implemented."
             .to_string(),
     )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn no_hw_decoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
-        "Tether currently supports hardware decode only on Linux (VAAPI). \
-         macOS/VideoToolbox, Windows/NVDEC, and Windows/D3D11VA backends are \
-         not yet implemented."
+        "Tether currently supports hardware decode on Linux (VAAPI). \
+         macOS/VideoToolbox (client), Windows/NVDEC, and Windows/D3D11VA \
+         backends are not yet implemented."
             .to_string(),
     )
 }

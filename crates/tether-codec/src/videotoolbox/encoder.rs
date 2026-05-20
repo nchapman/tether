@@ -1,0 +1,458 @@
+//! VideoToolbox hardware video encoder. Codec-parameterized via
+//! [`CodecKind`]: H.264 selects `h264_videotoolbox`, HEVC selects
+//! `hevc_videotoolbox`. Shares the same `Encoder` trait shape as the
+//! VAAPI sibling so the host's send loop is backend-agnostic.
+
+use std::ptr;
+use std::slice;
+
+use rsmpeg::avcodec::{AVCodec, AVCodecContext};
+use rsmpeg::avutil::{ra, AVFrame, AVHWDeviceContext};
+use rsmpeg::error::RsmpegError;
+use rsmpeg::ffi;
+use rsmpeg::swscale::SwsContext;
+use rsmpeg::UnsafeDerefMut;
+
+use tether_protocol::control::CodecKind;
+
+use crate::h264::frame_plane_mut;
+use crate::{
+    init_ffmpeg, CodecError, Encoder, EncodedPacket, IOSurfaceFrame, Result, GOP_SECONDS,
+};
+
+use super::ffi::{
+    CFRelease, CVPixelBufferCreateWithIOSurface, CVPixelBufferRef, K_CV_RETURN_SUCCESS,
+};
+
+/// Pool size for the VideoToolbox surface pool. With `async_depth=1`
+/// (synchronous send/receive) we never have more than one VT frame in
+/// flight at a time; a few extra surfaces absorb the brief windows
+/// where the encoder transiently holds an extra reference. Matches the
+/// VAAPI sibling's headroom.
+const VT_POOL_SIZE: i32 = 8;
+
+pub struct VideoToolboxEncoder {
+    kind: CodecKind,
+    encoder: AVCodecContext,
+    bgra_to_nv12: SwsContext,
+    sw_frame: AVFrame,
+    bgra_frame: AVFrame,
+    // Keep the device context alive for the encoder's lifetime. Drop
+    // order: `encoder` (and its `hw_frames_ctx`) tear down before
+    // `_hw_device`, which is the correct order — surfaces must be freed
+    // before the device that allocated them.
+    _hw_device: AVHWDeviceContext,
+    width: u32,
+    height: u32,
+    bgra_row_bytes: usize,
+}
+
+// SAFETY: same contract as `VaapiEncoder` — the AVCodecContext is fine
+// to *move* between threads but unsafe to share. `&mut self` methods
+// serialise access within a thread; the `unsafe impl Send` matches the
+// move-fine / share-bad shape of every encoder we ship.
+unsafe impl Send for VideoToolboxEncoder {}
+
+impl VideoToolboxEncoder {
+    /// Construct a VideoToolbox encoder for the given codec at the
+    /// given dimensions.
+    ///
+    /// Returns `Err(CodecError::CodecNotFound)` if the linked FFmpeg
+    /// wasn't built with VideoToolbox support for the requested codec
+    /// (Homebrew's `ffmpeg` formula enables `--enable-videotoolbox`
+    /// by default); any `RsmpegError` if the VT device fails to open.
+    pub fn new(
+        kind: CodecKind,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self> {
+        init_ffmpeg();
+
+        let codec_cname = vt_codec_cname(kind)?;
+        let codec = AVCodec::find_encoder_by_name(codec_cname)
+            .ok_or(CodecError::CodecNotFound(vt_codec_name(kind)))?;
+
+        let hw_device =
+            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_VIDEOTOOLBOX, None, None, 0)?;
+
+        let width_i32 = i32::try_from(width).expect("width fits in i32");
+        let height_i32 = i32::try_from(height).expect("height fits in i32");
+        let fps_i32 = i32::try_from(fps.max(1)).unwrap_or(60);
+
+        let mut encoder = AVCodecContext::new(&codec);
+        encoder.set_width(width_i32);
+        encoder.set_height(height_i32);
+        // pix_fmt is VIDEOTOOLBOX: pixels live in a CVPixelBuffer; the
+        // sw_format on the hwframes context says NV12 (matching what
+        // ScreenCaptureKit hands us as the IOSurface backing format
+        // and what the BGRA-upload path swscales into).
+        encoder.set_pix_fmt(ffi::AV_PIX_FMT_VIDEOTOOLBOX);
+        encoder.set_time_base(ra(1, fps_i32));
+        encoder.set_framerate(ra(fps_i32, 1));
+        encoder.set_bit_rate(i64::from(bitrate_kbps) * 1000);
+        let gop_frames = fps_i32
+            .saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
+        encoder.set_gop_size(gop_frames);
+        encoder.set_max_b_frames(0);
+
+        // Build + attach the hwframes context. NV12 video-range is the
+        // canonical VT input — Apple's hardware encoder natively
+        // consumes it and SCK is configured (in tether-capture::macos)
+        // to deliver IOSurfaces in the same format.
+        let mut hw_frames_ref = hw_device.hwframe_ctx_alloc();
+        hw_frames_ref.data().format = ffi::AV_PIX_FMT_VIDEOTOOLBOX;
+        hw_frames_ref.data().sw_format = ffi::AV_PIX_FMT_NV12;
+        hw_frames_ref.data().width = width_i32;
+        hw_frames_ref.data().height = height_i32;
+        hw_frames_ref.data().initial_pool_size = VT_POOL_SIZE;
+        hw_frames_ref.init()?;
+        encoder.set_hw_frames_ctx(hw_frames_ref);
+
+        // VideoToolbox-specific private options. The defaults are
+        // tuned for file-based transcoding; we override for realtime:
+        //   realtime=1 — bias the encoder toward low-latency mode.
+        //     Sunshine and OBS both set this; the cost is a slight
+        //     hit to compression efficiency that's a clear win at
+        //     60 fps interactive workloads.
+        //   allow_sw=0 — refuse to fall back to a software encoder
+        //     if the hardware path can't be opened. We hard-require
+        //     hardware encode across the project; the probe layer
+        //     surfaces a clean `NoHardwareCodec` error instead.
+        //
+        // Note: VideoToolbox doesn't expose an `idr_interval`-style
+        // knob the way VAAPI does. We bound the IDR cadence via
+        // `gop_size` above and drive on-demand IDRs through the
+        // `AVPicture::AV_PICTURE_TYPE_I` pict_type on individual
+        // input frames (same channel as the VAAPI path).
+        let dict = rsmpeg::avutil::AVDictionary::new(c"realtime", c"1", 0)
+            .set(c"allow_sw", c"0", 0);
+        let leftover = encoder.open(Some(dict))?;
+        // The "GPU or nothing" invariant rides on `allow_sw=0` actually
+        // being consumed by the encoder. If a build of FFmpeg silently
+        // ignores it (older versions, or a custom build with a stale
+        // option table), the encoder may fall back to SW without us
+        // noticing. Treat any unconsumed `allow_sw` as a hard error —
+        // the diagnostic is more actionable than discovering it via a
+        // CPU-bound encode loop in production. We log other unused
+        // options as warnings (defensive parity with the VAAPI path).
+        if let Some(unused) = leftover {
+            let mut allow_sw_ignored = false;
+            let mut other_unused: Vec<String> = Vec::new();
+            for entry in unused.iter() {
+                let key = entry.key().to_string_lossy().into_owned();
+                let val = entry.value().to_string_lossy().into_owned();
+                if key == "allow_sw" {
+                    allow_sw_ignored = true;
+                } else {
+                    other_unused.push(format!("{key}={val}"));
+                }
+            }
+            if !other_unused.is_empty() {
+                tracing::warn!(
+                    codec = vt_codec_name(kind),
+                    unused = ?other_unused,
+                    "VideoToolbox encoder ignored some private options"
+                );
+            }
+            if allow_sw_ignored {
+                return Err(CodecError::NoHardwareCodec(format!(
+                    "VideoToolbox encoder for {kind:?} ignored `allow_sw=0` — \
+                     this build of FFmpeg may not enforce the GPU-only contract. \
+                     Verify with `ffmpeg -h encoder={}` that `allow_sw` is listed \
+                     under private options.",
+                    vt_codec_name(kind)
+                )));
+            }
+        }
+
+        let bgra_to_nv12 = SwsContext::get_context(
+            width_i32,
+            height_i32,
+            ffi::AV_PIX_FMT_BGRA,
+            width_i32,
+            height_i32,
+            ffi::AV_PIX_FMT_NV12,
+            ffi::SWS_FAST_BILINEAR,
+            None,
+            None,
+            None,
+        )
+        .ok_or(CodecError::ScalerInit("BGRA -> NV12"))?;
+
+        let mut bgra_frame = AVFrame::new();
+        bgra_frame.set_format(ffi::AV_PIX_FMT_BGRA);
+        bgra_frame.set_width(width_i32);
+        bgra_frame.set_height(height_i32);
+        bgra_frame.alloc_buffer()?;
+
+        let mut sw_frame = AVFrame::new();
+        sw_frame.set_format(ffi::AV_PIX_FMT_NV12);
+        sw_frame.set_width(width_i32);
+        sw_frame.set_height(height_i32);
+        sw_frame.alloc_buffer()?;
+
+        let bgra_row_bytes = (width as usize) * 4;
+
+        Ok(Self {
+            kind,
+            encoder,
+            bgra_to_nv12,
+            sw_frame,
+            bgra_frame,
+            _hw_device: hw_device,
+            width,
+            height,
+            bgra_row_bytes,
+        })
+    }
+
+    /// Encode one IOSurface-backed frame without a CPU upload. We wrap
+    /// the IOSurface in a fresh `CVPixelBufferRef` and feed it to
+    /// `h264_videotoolbox` via the AVFrame `data[3]` slot. The
+    /// `AVBufferRef` we attach owns the +1 retain of the CVPixelBuffer
+    /// — FFmpeg's `av_frame_unref` releases it when the frame's last
+    /// reference drops.
+    ///
+    /// The caller's `IOSurfaceFrame` is borrowed: the apple-cf side
+    /// keeps the IOSurface alive via the `GpuCapturedGuard` on the
+    /// originating `CapturedFrame`. `CVPixelBufferCreateWithIOSurface`
+    /// internally retains the IOSurface, so we don't need to extend
+    /// the guard's lifetime past this call.
+    pub fn submit_iosurface(
+        &mut self,
+        frame: &IOSurfaceFrame,
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>> {
+        if frame.width != self.width || frame.height != self.height {
+            return Err(CodecError::UnsupportedInputFormat);
+        }
+        if frame.surface.is_null() {
+            return Err(CodecError::UnsupportedInputFormat);
+        }
+
+        // 1. Wrap the IOSurface in a fresh CVPixelBuffer. Apple's
+        // allocator default + null attributes is the standard call
+        // shape for the zero-copy path.
+        let mut pixbuf: CVPixelBufferRef = ptr::null_mut();
+        // SAFETY: surface is non-null (checked above), pixbuf is a
+        // valid out-pointer, the allocator/attributes are documented
+        // as nullable for "use the default".
+        let rc = unsafe {
+            CVPixelBufferCreateWithIOSurface(
+                ptr::null(),
+                frame.surface,
+                ptr::null(),
+                &mut pixbuf,
+            )
+        };
+        if rc != K_CV_RETURN_SUCCESS || pixbuf.is_null() {
+            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR_EXTERNAL)));
+        }
+
+        // 2. Wrap the +1 retained CVPixelBufferRef in an AVBufferRef
+        // so the AVFrame owns its lifetime. Free callback CFReleases
+        // exactly once when the last ref drops. This mirrors the
+        // DRM_PRIME descriptor pattern in the VAAPI encoder.
+        unsafe extern "C" fn pixbuf_free(_opaque: *mut std::ffi::c_void, data: *mut u8) {
+            // SAFETY: `data` was passed in as the +1 retained
+            // CVPixelBufferRef; this is the only path that releases it.
+            unsafe { CFRelease(data.cast::<std::ffi::c_void>().cast_const()) };
+        }
+        // SAFETY: pixbuf is non-null (checked above). Pass it to
+        // av_buffer_create as a u8* — FFmpeg treats it as opaque.
+        // av_buffer_create returns null only on OOM; we CFRelease
+        // and surface a clean error if that happens.
+        let pixbuf_buf = unsafe {
+            ffi::av_buffer_create(
+                pixbuf.cast::<u8>(),
+                0,
+                Some(pixbuf_free),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if pixbuf_buf.is_null() {
+            // SAFETY: av_buffer_create didn't take ownership of the
+            // CVPixelBufferRef on failure, so we still own the +1
+            // retain and must release it.
+            unsafe { CFRelease(pixbuf.cast_const()) };
+            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(ffi::ENOMEM))));
+        }
+
+        // 3. Build the AVFrame. Format = VIDEOTOOLBOX, data[3] points
+        // at the CVPixelBufferRef, buf[0] owns the AVBufferRef
+        // wrapping it. hw_frames_ctx points at the encoder's pool so
+        // the encoder accepts the frame on send_frame.
+        let mut src = AVFrame::new();
+        src.set_format(ffi::AV_PIX_FMT_VIDEOTOOLBOX);
+        src.set_width(i32::try_from(self.width).expect("width fits in i32"));
+        src.set_height(i32::try_from(self.height).expect("height fits in i32"));
+        // SAFETY: deref_mut exposes the raw ffi::AVFrame so we can
+        // poke buf[0]/data[3]/hw_frames_ctx (rsmpeg doesn't wrap those
+        // slots). The AVFrame's Drop releases buf[0] via
+        // av_frame_unref, which calls `pixbuf_free` once the last ref
+        // drops. hw_frames_ctx is reffed below.
+        unsafe {
+            let raw = src.deref_mut();
+            raw.buf[0] = pixbuf_buf;
+            raw.data[3] = pixbuf.cast::<u8>();
+            let enc_frames_ref = self
+                .encoder
+                .hw_frames_ctx_mut()
+                .expect("hw_frames_ctx set in new")
+                .as_ptr();
+            raw.hw_frames_ctx = ffi::av_buffer_ref(enc_frames_ref as *mut _);
+        }
+
+        src.set_pts(pts);
+        src.set_pict_type(if force_keyframe {
+            ffi::AV_PICTURE_TYPE_I
+        } else {
+            ffi::AV_PICTURE_TYPE_NONE
+        });
+
+        self.encoder.send_frame(Some(&src))?;
+        drop(src);
+
+        drain_encoder(&mut self.encoder)
+    }
+}
+
+impl Encoder for VideoToolboxEncoder {
+    #[allow(clippy::cast_sign_loss)]
+    fn encode_bgra(
+        &mut self,
+        bgra: &[u8],
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>> {
+        let height = self.height as usize;
+        let expected = self.bgra_row_bytes * height;
+        if bgra.len() != expected {
+            return Err(CodecError::BufferSizeMismatch {
+                got: bgra.len(),
+                expected,
+            });
+        }
+
+        // 1. Copy BGRA into the encoder-side BGRA AVFrame, stride-aware.
+        {
+            let stride = self.bgra_frame.linesize[0] as usize;
+            let plane = frame_plane_mut(&mut self.bgra_frame, 0, height);
+            if stride == self.bgra_row_bytes {
+                plane[..expected].copy_from_slice(bgra);
+            } else {
+                for row in 0..height {
+                    let src = row * self.bgra_row_bytes;
+                    let dst = row * stride;
+                    plane[dst..dst + self.bgra_row_bytes]
+                        .copy_from_slice(&bgra[src..src + self.bgra_row_bytes]);
+                }
+            }
+        }
+
+        // 2. swscale BGRA -> NV12.
+        self.bgra_to_nv12.scale_frame(
+            &self.bgra_frame,
+            0,
+            i32::try_from(height).expect("height fits in i32"),
+            &mut self.sw_frame,
+        )?;
+
+        // 3. Allocate a VideoToolbox frame from the encoder's pool and
+        // upload the NV12 bytes via av_hwframe_transfer_data.
+        let mut hw_frame = AVFrame::new();
+        self.encoder
+            .hw_frames_ctx_mut()
+            .expect("hw_frames_ctx set in new")
+            .get_buffer(&mut hw_frame)?;
+        hw_frame.hwframe_transfer_data(&self.sw_frame)?;
+        hw_frame.set_pts(pts);
+        hw_frame.set_pict_type(if force_keyframe {
+            ffi::AV_PICTURE_TYPE_I
+        } else {
+            ffi::AV_PICTURE_TYPE_NONE
+        });
+
+        self.encoder.send_frame(Some(&hw_frame))?;
+        drain_encoder(&mut self.encoder)
+    }
+
+    fn is_hardware(&self) -> bool {
+        true
+    }
+
+    fn codec_kind(&self) -> CodecKind {
+        self.kind
+    }
+
+    fn name(&self) -> &'static str {
+        vt_codec_name(self.kind)
+    }
+
+    fn encode_gpu(
+        &mut self,
+        frame: crate::GpuEncoderFrame<'_>,
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>> {
+        match frame {
+            crate::GpuEncoderFrame::IOSurface(f) => {
+                VideoToolboxEncoder::submit_iosurface(self, f, pts, force_keyframe)
+            }
+            crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
+        }
+    }
+}
+
+/// FFmpeg codec name for `find_encoder_by_name`. Errors for codecs we
+/// don't ship a VideoToolbox path for yet.
+fn vt_codec_cname(kind: CodecKind) -> Result<&'static std::ffi::CStr> {
+    match kind {
+        CodecKind::H264 => Ok(c"h264_videotoolbox"),
+        CodecKind::Hevc => Ok(c"hevc_videotoolbox"),
+        CodecKind::Av1 => Err(CodecError::CodecNotFound(
+            "av1_videotoolbox (not yet supported)",
+        )),
+    }
+}
+
+/// Human-readable backend name for logs and `Encoder::name`.
+fn vt_codec_name(kind: CodecKind) -> &'static str {
+    match kind {
+        CodecKind::H264 => "h264_videotoolbox",
+        CodecKind::Hevc => "hevc_videotoolbox",
+        CodecKind::Av1 => "av1_videotoolbox",
+    }
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn drain_encoder(encoder: &mut AVCodecContext) -> Result<Vec<EncodedPacket>> {
+    let mut out = Vec::new();
+    loop {
+        let packet = match encoder.receive_packet() {
+            Ok(p) => p,
+            Err(RsmpegError::EncoderDrainError | RsmpegError::EncoderFlushedError) => break,
+            Err(e) => return Err(CodecError::Ffmpeg(e)),
+        };
+        let size = packet.size as usize;
+        // SAFETY: packet.data points to packet.size valid bytes owned
+        // by the AVPacket; we copy them before drop.
+        let data = unsafe { slice::from_raw_parts(packet.data, size) }.to_vec();
+        let keyframe = (packet.flags & ffi::AV_PKT_FLAG_KEY as i32) != 0;
+        let pts_out = if packet.pts == ffi::AV_NOPTS_VALUE {
+            None
+        } else {
+            Some(packet.pts)
+        };
+        out.push(EncodedPacket {
+            data,
+            pts: pts_out,
+            keyframe,
+        });
+    }
+    Ok(out)
+}

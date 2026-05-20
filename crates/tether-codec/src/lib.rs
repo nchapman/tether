@@ -14,6 +14,9 @@ pub mod probe;
 #[cfg(target_os = "linux")]
 pub mod vaapi;
 
+#[cfg(target_os = "macos")]
+pub mod videotoolbox;
+
 pub use probe::{probe_decoder, probe_encoder, probe_encoder_kind};
 
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. The decoder

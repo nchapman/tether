@@ -203,6 +203,23 @@ pub enum ControlMessage {
         key: String,
         payload: Vec<u8>,
     },
+    /// Host → client. Cursor sprite (RGBA pixels). Routed on the
+    /// reliable control stream rather than the cursor datagram channel
+    /// because a 64×64 RGBA sprite exceeds the 1200-byte datagram
+    /// budget and reassembly would be more complex than the win.
+    /// Clients cache shapes by `id` and switch via [`Self::CursorUseShape`].
+    CursorShape {
+        id: u64,
+        hotspot: (u16, u16),
+        width: u16,
+        height: u16,
+        format: crate::cursor::CursorPixelFormat,
+        pixels: Vec<u8>,
+    },
+    /// Host → client. Activate a previously-sent [`Self::CursorShape`]
+    /// by id. Separate from `CursorShape` so the host can switch
+    /// between cached cursors without re-sending the pixels.
+    CursorUseShape { id: u64 },
 }
 
 // --- ClockSync ----------------------------------------------------------

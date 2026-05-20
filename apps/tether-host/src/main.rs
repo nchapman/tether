@@ -168,6 +168,39 @@ async fn handle_client(
         "handshake complete"
     );
 
+    // Send a single placeholder cursor shape so the client's receive
+    // path is exercised end-to-end. Real cursor-shape capture (querying
+    // the compositor's current cursor sprite, sending Shape on change,
+    // UseShape on switch) is its own future workstream. A 16×16 opaque
+    // checkerboard is enough to prove the wire shape and the client's
+    // log line — replace with the real pointer texture later.
+    {
+        let pixels: Vec<u8> = (0..16 * 16)
+            .flat_map(|i| {
+                let on = ((i / 16) + (i % 16)) % 2 == 0;
+                let v = if on { 0xFFu8 } else { 0x00 };
+                [v, v, v, 0xFF]
+            })
+            .collect();
+        let shape = ControlMessage::CursorShape {
+            id: 0,
+            hotspot: (0, 0),
+            width: 16,
+            height: 16,
+            format: tether_protocol::cursor::CursorPixelFormat::Rgba8,
+            pixels,
+        };
+        if let Err(e) = conn.send_control(&shape).await {
+            warn!(error = ?e, "initial CursorShape send failed; continuing anyway");
+        }
+        if let Err(e) = conn
+            .send_control(&ControlMessage::CursorUseShape { id: 0 })
+            .await
+        {
+            warn!(error = ?e, "CursorUseShape send failed; continuing anyway");
+        }
+    }
+
     // Acquire a capture stream — either real platform capture or the
     // synthetic test pattern fallback. Real Linux capture is async (the
     // portal handshake awaits a user permission dialog); test pattern is
@@ -276,6 +309,11 @@ async fn handle_client(
                             payload_len = payload.len(),
                             "unknown control extension; ignoring"
                         );
+                    }
+                    Ok(ControlMessage::CursorShape { .. } | ControlMessage::CursorUseShape { .. }) => {
+                        // Host-originated; receiving one here means the
+                        // client misrouted. Log and drop.
+                        tracing::debug!("unexpected host→client cursor message arrived on host; ignoring");
                     }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");

@@ -2,10 +2,14 @@
 //! traffic on its own unreliable, latest-wins path.
 //!
 //! Two directions, two packet types:
-//! - [`HostCursorPacket`]: host → client. The host's pointer sprite as
-//!   rendered on its own display, so the client can paint a cursor that
-//!   tracks the OS pointer at full host frame rate without waiting for
-//!   the encoded video to catch up.
+//! - [`HostCursorPacket`]: host → client. The host's pointer position
+//!   as rendered on its own display, so the client can paint a cursor
+//!   that tracks the OS pointer at full host frame rate without waiting
+//!   for the encoded video to catch up. Position only — cursor shapes
+//!   live on the reliable control stream (`ControlMessage::CursorShape`,
+//!   `ControlMessage::CursorUseShape`) because a 64×64 RGBA sprite
+//!   (16 KB) does not fit in a 1200-byte datagram and a corrupted /
+//!   partially-delivered shape is worse than no shape at all.
 //! - [`ClientCursorPacket`]: client → host. The client window's pointer
 //!   position, in `[0,1]` video-region coordinates. Routed through the
 //!   datagram channel rather than the reliable input stream so a queue
@@ -19,29 +23,16 @@ pub enum CursorPixelFormat {
     Rgba8,
 }
 
-/// Host → client. The host sends `Position` updates at a high rate
-/// (250-500 Hz) and emits `Shape` only when the cursor shape changes.
-/// Clients keep a small cache of shapes keyed by `id`. Not implemented
-/// in v0; the wire shape is reserved.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Host → client. Sent at a high rate (250-500 Hz) while the pointer is
+/// over the host's display. Cursor *shapes* are not on this channel —
+/// see the module-level doc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostCursorPacket {
     Position {
         t_capture: MonoNanos,
         x: i32,
         y: i32,
         visible: bool,
-    },
-    Shape {
-        id: u64,
-        hotspot_x: u16,
-        hotspot_y: u16,
-        width: u16,
-        height: u16,
-        format: CursorPixelFormat,
-        pixels: Vec<u8>,
-    },
-    UseShape {
-        id: u64,
     },
 }
 

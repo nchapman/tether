@@ -135,6 +135,22 @@ async fn main() -> anyhow::Result<()> {
                             "unknown control extension; ignoring"
                         );
                     }
+                    Ok(ControlMessage::CursorShape {
+                        id, hotspot, width, height, format, pixels,
+                    }) => {
+                        info!(
+                            id,
+                            ?hotspot,
+                            width,
+                            height,
+                            ?format,
+                            pixel_bytes = pixels.len(),
+                            "received cursor shape (overlay rendering not yet implemented)"
+                        );
+                    }
+                    Ok(ControlMessage::CursorUseShape { id }) => {
+                        tracing::debug!(id, "host activated cursor shape");
+                    }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");
                         return;

@@ -263,6 +263,46 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_cursor_shape_control() {
+        // CursorShape rides the reliable control stream (sprite payloads
+        // are too large for the 1200-byte cursor datagram budget).
+        let msg = ControlMessage::CursorShape {
+            id: 42,
+            hotspot: (4, 7),
+            width: 16,
+            height: 16,
+            format: CursorPixelFormat::Rgba8,
+            pixels: vec![0xABu8; 16 * 16 * 4],
+        };
+        let bytes = encode(&msg).unwrap();
+        let msg2: ControlMessage = decode(&bytes).unwrap();
+        match msg2 {
+            ControlMessage::CursorShape {
+                id, hotspot, width, height, format, pixels,
+            } => {
+                assert_eq!(id, 42);
+                assert_eq!(hotspot, (4, 7));
+                assert_eq!(width, 16);
+                assert_eq!(height, 16);
+                assert_eq!(format, CursorPixelFormat::Rgba8);
+                assert_eq!(pixels.len(), 16 * 16 * 4);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_cursor_use_shape_control() {
+        let msg = ControlMessage::CursorUseShape { id: 7 };
+        let bytes = encode(&msg).unwrap();
+        let msg2: ControlMessage = decode(&bytes).unwrap();
+        match msg2 {
+            ControlMessage::CursorUseShape { id } => assert_eq!(id, 7),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn round_trip_control_extension() {
         // The Extension escape unblocks future control features
         // without forcing a ClientHelloV2. Confirm it survives the
@@ -402,20 +442,16 @@ mod tests {
         };
         let bytes = encode(&c).unwrap();
         let c2: HostCursorPacket = decode(&bytes).unwrap();
-        match c2 {
-            HostCursorPacket::Position {
-                t_capture,
-                x,
-                y,
-                visible,
-            } => {
-                assert_eq!(t_capture, MonoNanos(999));
-                assert_eq!(x, 100);
-                assert_eq!(y, -50);
-                assert!(visible);
-            }
-            _ => panic!("wrong variant"),
-        }
+        let HostCursorPacket::Position {
+            t_capture,
+            x,
+            y,
+            visible,
+        } = c2;
+        assert_eq!(t_capture, MonoNanos(999));
+        assert_eq!(x, 100);
+        assert_eq!(y, -50);
+        assert!(visible);
     }
 
     #[test]

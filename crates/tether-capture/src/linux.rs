@@ -24,7 +24,7 @@ use pw::properties::properties;
 use pw::spa;
 use tether_protocol::MonoNanos;
 
-use crate::{CaptureError, CapturedFrame, PixelFormat, Result};
+use crate::{CaptureError, CapturedFrame, CpuFrame, PixelFormat, Result};
 
 const CAPTURE_CHANNEL_DEPTH: usize = 2;
 
@@ -262,14 +262,14 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
                 }
             }
 
-            let frame = CapturedFrame {
+            let frame = CapturedFrame::Cpu(CpuFrame {
                 width,
                 height,
                 format: pixel_format,
                 data: packed,
                 t_capture_kernel: t,
                 t_capture_userspace: t,
-            };
+            });
 
             match user_data.sender.try_send(frame) {
                 Ok(()) => {}

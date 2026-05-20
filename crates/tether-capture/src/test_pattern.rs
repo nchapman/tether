@@ -7,7 +7,7 @@ use std::time::Duration;
 use crossbeam_channel::{bounded, Receiver, TrySendError};
 use tether_protocol::MonoNanos;
 
-use crate::{CapturedFrame, PixelFormat};
+use crate::{CapturedFrame, CpuFrame, PixelFormat};
 
 /// Start a test-pattern producer. Returns a receiver bounded to 2 frames.
 ///
@@ -66,14 +66,14 @@ fn generate(width: u32, height: u32, t: u32) -> CapturedFrame {
             data.extend_from_slice(&[b_byte, g, r, 255]);
         }
     }
-    CapturedFrame {
+    CapturedFrame::Cpu(CpuFrame {
         width,
         height,
         format: PixelFormat::Bgra8,
         data,
         t_capture_kernel: t_capture,
         t_capture_userspace: t_capture,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -87,12 +87,15 @@ mod tests {
         let frame = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("frame from test_pattern");
-        assert_eq!(frame.width, 64);
-        assert_eq!(frame.height, 48);
-        assert_eq!(frame.format, PixelFormat::Bgra8);
-        assert_eq!(frame.data.len(), 64 * 48 * 4);
+        let CapturedFrame::Cpu(cpu) = frame else {
+            panic!("test_pattern must emit Cpu frames");
+        };
+        assert_eq!(cpu.width, 64);
+        assert_eq!(cpu.height, 48);
+        assert_eq!(cpu.format, PixelFormat::Bgra8);
+        assert_eq!(cpu.data.len(), 64 * 48 * 4);
         // alpha channel is always 255
-        for px in frame.data.chunks_exact(4) {
+        for px in cpu.data.chunks_exact(4) {
             assert_eq!(px[3], 255);
         }
     }

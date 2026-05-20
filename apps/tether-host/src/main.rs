@@ -404,6 +404,21 @@ fn run_capture_and_send(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        // GPU-backed capture frames (PipeWire DMA-BUF) ride the
+        // zero-copy gpuconvert → VAAPI submit_dmabuf path, wired in a
+        // follow-up commit. Until that lands, drop them with a
+        // one-time warn so a DMA-BUF negotiation doesn't silently
+        // black out the stream — the SHM fallback path stays intact.
+        let frame = match frame {
+            CapturedFrame::Cpu(f) => f,
+            CapturedFrame::Gpu(_) => {
+                warn!(
+                    "received GPU CapturedFrame but the zero-copy encode path \
+                     isn't wired yet; dropping frame"
+                );
+                continue;
+            }
+        };
         if frame.format != PixelFormat::Bgra8 {
             warn!(
                 ?frame.format,

@@ -27,35 +27,35 @@
 use std::os::fd::OwnedFd;
 
 use crate::{
-    dmabuf_export::{export_texture_as_dmabuf, DmaBufExport, ExportError},
+    dmabuf_export::{export_nv12_shared_dmabuf, ExportError, SharedNv12Export},
     pipeline::build_pipeline,
 };
 
-/// One frame's worth of NV12 planes, each backed by its own DMA-BUF.
+/// One frame's worth of NV12 — a single DMA-BUF fd carrying both planes
+/// at distinct offsets within one shared `VkDeviceMemory` allocation.
 ///
-/// The fds are *dup'd copies* of the bridge's persistent exports — drop
-/// this struct (or hand it off and let the consumer drop it) once the
-/// downstream importer has refcounted the buffers it cares about. The
-/// underlying GPU memory stays alive via the bridge's own
-/// [`DmaBufExport`] for as long as the bridge exists.
+/// `fd` is a *dup'd copy* of the bridge's persistent export — drop this
+/// struct (or hand it off and let the consumer drop it) once the
+/// downstream importer has refcounted what it cares about. The
+/// underlying GPU memory stays alive via the bridge's own export for as
+/// long as the bridge exists.
 ///
-/// Field shape matches what `tether_codec::DmaBufFrame` needs for the
-/// SEPARATE_LAYERS variant of NV12: two objects (one per plane), two
-/// layers (one per plane, each with one sub-plane), surface fourcc NV12,
-/// per-layer DRM fourccs R8 and GR88.
+/// Field shape matches what `tether_codec::DmaBufFrame` needs for
+/// ffmpeg's `av_hwframe_map(DRM_PRIME → VAAPI)`: one object with two
+/// layers (Y as R8, UV as GR88) both pointing at `object_index=0` with
+/// per-plane offsets/strides. This is the only shape ffmpeg's VAAPI
+/// hwframe_map accepts ("VAAPI can only map frames made from a single
+/// DRM object").
 pub struct Nv12DmaBufFrame {
     pub width: u32,
     pub height: u32,
-    pub y_fd: OwnedFd,
-    pub y_stride: u64,
+    pub fd: OwnedFd,
+    pub size: u64,
+    pub modifier: u64,
     pub y_offset: u64,
-    pub y_size: u64,
-    pub y_modifier: u64,
-    pub uv_fd: OwnedFd,
-    pub uv_stride: u64,
+    pub y_stride: u64,
     pub uv_offset: u64,
-    pub uv_size: u64,
-    pub uv_modifier: u64,
+    pub uv_stride: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -104,12 +104,11 @@ pub struct Nv12DmaBuf {
     bgl: wgpu::BindGroupLayout,
     width: u32,
     height: u32,
-    /// Y plane (R8Unorm) backing storage + DMA-BUF fd. Held for
-    /// re-use across frames — dropping this drops the underlying
-    /// VkImage + VkDeviceMemory.
-    y_export: DmaBufExport,
-    /// UV plane (Rg8Unorm) backing storage + DMA-BUF fd.
-    uv_export: DmaBufExport,
+    /// Shared NV12 surface — one VkDeviceMemory backing both plane
+    /// textures, exported as a single dma-buf fd. Held for re-use
+    /// across frames; dropping it drops both plane textures (which in
+    /// turn destroy the VkImages) and frees the memory.
+    nv12: SharedNv12Export,
     /// Cached views into the export textures so we don't rebuild them
     /// per frame; bind groups themselves still rebuild because the
     /// source texture is per-frame.
@@ -151,28 +150,15 @@ impl Nv12DmaBuf {
 
         let (pipeline, bgl) = build_pipeline(&device);
 
-        let chroma_w = width.div_ceil(2);
-        let chroma_h = height.div_ceil(2);
-
-        let y_export = export_texture_as_dmabuf(
+        let nv12 = export_nv12_shared_dmabuf(
             &device,
             width,
             height,
-            wgpu::TextureFormat::R8Unorm,
             wgpu::TextureUsages::STORAGE_BINDING,
-            "nv12 y dmabuf",
-        )?;
-        let uv_export = export_texture_as_dmabuf(
-            &device,
-            chroma_w,
-            chroma_h,
-            wgpu::TextureFormat::Rg8Unorm,
-            wgpu::TextureUsages::STORAGE_BINDING,
-            "nv12 uv dmabuf",
         )?;
 
-        let y_view = y_export.texture.create_view(&Default::default());
-        let uv_view = uv_export.texture.create_view(&Default::default());
+        let y_view = nv12.y_texture.create_view(&Default::default());
+        let uv_view = nv12.uv_texture.create_view(&Default::default());
 
         Ok(Self {
             device,
@@ -181,8 +167,7 @@ impl Nv12DmaBuf {
             bgl,
             width,
             height,
-            y_export,
-            uv_export,
+            nv12,
             y_view,
             uv_view,
         })
@@ -361,24 +346,13 @@ impl Nv12DmaBuf {
         Ok(Nv12DmaBufFrame {
             width: self.width,
             height: self.height,
-            y_fd: self
-                .y_export
-                .fd
-                .try_clone()
-                .map_err(Nv12DmaBufError::DupFd)?,
-            y_stride: self.y_export.stride,
-            y_offset: self.y_export.offset,
-            y_size: self.y_export.size,
-            y_modifier: self.y_export.drm_format_modifier,
-            uv_fd: self
-                .uv_export
-                .fd
-                .try_clone()
-                .map_err(Nv12DmaBufError::DupFd)?,
-            uv_stride: self.uv_export.stride,
-            uv_offset: self.uv_export.offset,
-            uv_size: self.uv_export.size,
-            uv_modifier: self.uv_export.drm_format_modifier,
+            fd: self.nv12.fd.try_clone().map_err(Nv12DmaBufError::DupFd)?,
+            size: self.nv12.size,
+            modifier: self.nv12.modifier,
+            y_offset: self.nv12.y_offset,
+            y_stride: self.nv12.y_pitch,
+            uv_offset: self.nv12.uv_offset,
+            uv_stride: self.nv12.uv_pitch,
         })
     }
 }
@@ -485,9 +459,9 @@ mod tests {
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .expect("vulkan backend")
                 .texture_from_dmabuf_fd(
-                    out.y_fd,
+                    out.fd.try_clone().expect("dup shared NV12 fd for Y reimport"),
                     &import_desc,
-                    out.y_modifier,
+                    out.modifier,
                     out.y_stride,
                     out.y_offset,
                 )
@@ -685,9 +659,9 @@ mod tests {
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .expect("vulkan backend")
                 .texture_from_dmabuf_fd(
-                    out.y_fd,
+                    out.fd.try_clone().expect("dup shared NV12 fd for Y reimport"),
                     &import_desc,
-                    out.y_modifier,
+                    out.modifier,
                     out.y_stride,
                     out.y_offset,
                 )

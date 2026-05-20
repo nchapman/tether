@@ -476,26 +476,23 @@ fn encode_gpu_frame(
     }
 }
 
-/// Build a `DmaBufFrame` (NV12, two objects, two layers — Y as R8 and
-/// UV as GR88) from the bridge's per-call descriptor. The codec layer
-/// dups the fds again inside `vaCreateSurfaces`, so this `DmaBufFrame`
-/// (and its owned fds) drops cleanly after `encode_gpu` returns.
+/// Build a `DmaBufFrame` (NV12, one object, two layers — Y as R8 and
+/// UV as GR88, both pointing at `object_index=0` with their offsets
+/// within the shared allocation) from the bridge's per-call descriptor.
+/// FFmpeg's `av_hwframe_map(DRM_PRIME → VAAPI)` only accepts NV12 as a
+/// single DRM object with planes at distinct offsets — separate-fd
+/// NV12 fails with `"VAAPI can only map frames made from a single DRM
+/// object"`. The bridge allocates one shared `VkDeviceMemory` for both
+/// planes precisely to produce this shape.
 #[cfg(target_os = "linux")]
 fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
     DmaBufFrame {
         fourcc: u32::from_le_bytes(*b"NV12"),
-        objects: vec![
-            DmaBufObject {
-                fd: out.y_fd,
-                size: out.y_size,
-                drm_format_modifier: out.y_modifier,
-            },
-            DmaBufObject {
-                fd: out.uv_fd,
-                size: out.uv_size,
-                drm_format_modifier: out.uv_modifier,
-            },
-        ],
+        objects: vec![DmaBufObject {
+            fd: out.fd,
+            size: out.size,
+            drm_format_modifier: out.modifier,
+        }],
         layers: vec![
             DmaBufLayer {
                 drm_format: u32::from_le_bytes(*b"R8  "),
@@ -517,7 +514,7 @@ fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
             DmaBufLayer {
                 drm_format: u32::from_le_bytes(*b"GR88"),
                 num_planes: 1,
-                object_index: [1, 0, 0, 0],
+                object_index: [0, 0, 0, 0],
                 offset: [
                     u32::try_from(out.uv_offset).expect("UV plane offset fits in u32"),
                     0,

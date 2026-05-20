@@ -8,7 +8,7 @@ each layer covers, and how to extend it.
 
 | Crate | Tests | Covers |
 | --- | --- | --- |
-| `tether-protocol` | 21 | Wire round-trips (ClientHello envelope, ServerHello HEVC negotiation, video packets, cursor, input), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant fails decode; trailing bytes fail decode). |
+| `tether-protocol` | 32 | Wire round-trips for every control variant (handshake, codec negotiation, video packets + `stream_epoch>u16` widening, `VideoFrameMetaEnvelope`, cursor position + control-stream cursor shapes, multi-monitor `DisplayList`, stream lifecycle, `ClientStats`, `ControlMessage::Extension`, audio `Opus`, `PixelFormat` hello extension, `InputEvent::device_id`), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant fails decode; trailing bytes fail decode). |
 | `tether-transport` | 4 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning. |
 | `tether-codec` | 2 unit + 8 `#[ignore]` | SW H264 round-trip (test-only); VAAPI encoder/decoder/dma-buf-import on hardware; HEVC + H.264 probe smoke check; per-codec × per-resolution benchmarks (`vaapi::bench`, 4 cells × 3 paths). |
 | `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |

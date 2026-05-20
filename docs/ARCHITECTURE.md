@@ -223,27 +223,49 @@ unchanged. Same for the decoder/renderer pair on the client.
 
 ## Protocol shape
 
-`tether-protocol` defines three kinds of messages, each on its own
-QUIC primitive:
+`tether-protocol` defines five logical channels, each carried by
+its own QUIC primitive:
 
-- **Control** — a bidirectional QUIC stream, length-prefixed
-  bincode-encoded `ControlMessage` enum. Carries the handshake
-  (`ClientHello` / `ServerHello`, both tagged-enum envelopes for
-  forward compatibility), `Goodbye` (with a machine-readable
-  `GoodbyeCode`), `ForceIdr` requests, cursor updates, input
-  batches, and display-dim notifications. Never used for video.
-- **Video** — QUIC datagrams. Each datagram carries one
-  `VideoPacket::First { display, stream_epoch, frame_seq,
-  fragment_count, meta, payload }` or
-  `VideoPacket::Continuation { display, stream_epoch, frame_seq,
-  fragment_index, payload }`, where `meta` is `VideoFrameMeta {
-  timing: HostFrameTiming, keyframe, input_echo, dimensions }`. The
-  receiver defragments, drops any fragments whose epoch doesn't
-  match the current one (resolution change → epoch bump), and
-  forwards complete frames to the decoder.
-- **Input/cursor** — separate from control because input events are
-  high-rate and don't need re-transmission; sent as small unreliable
-  datagrams keyed by a monotonic sequence number.
+- **Control** (reliable, bidirectional) — length-prefixed bincode
+  `ControlMessage`. Handshake (`ClientHello` / `ServerHello`, both
+  tagged-enum envelopes), `Goodbye` (with machine-readable
+  `GoodbyeCode`), `ForceIdr`, `ClockProbe*`, cursor shapes
+  (`CursorShape` / `CursorUseShape`), display topology
+  (`DisplayList` / `SetActiveDisplays`), stream lifecycle
+  (`StreamReady` / `StreamPause` / `StreamResume`), receiver
+  telemetry (`ClientStats`), and the open-ended `Extension { key,
+  payload }` escape for future features that aren't worth a typed
+  variant yet (clipboard, file transfer, gamepad rumble, auth, …).
+- **Video** (unreliable datagrams) — `VideoPacket::First { display,
+  stream_epoch, frame_seq, fragment_count, meta:
+  VideoFrameMetaEnvelope, payload }` or `::Continuation { …,
+  fragment_index, payload }`. `stream_epoch` is `u32` so encoder
+  restarts can't wrap. `VideoFrameMetaEnvelope` is a versioned wrap
+  around `VideoFrameMeta` so future per-frame metadata (HDR ROI QP)
+  lands as additive variants instead of struct-field appends.
+- **Audio** (unreliable datagrams, host → client) — `AudioPacket::Opus
+  { stream_epoch, frame_seq, t_capture, payload }`. The wire shape
+  ships in V1; the Opus capture/encode/decode pipeline is its own
+  future workstream (no protocol bump needed when it lands).
+- **Cursor** (unreliable datagrams, high priority) — pointer position
+  only (`HostCursorPacket::Position`, `ClientCursorPacket`). Sprite
+  payloads ride the reliable control stream (too large for a
+  1200-byte datagram).
+- **Input** (reliable stream, client → host) — `InputEvent { event_id,
+  t_client, device_id, kind }`. `device_id` is hardcoded `0` (primary
+  keyboard/mouse) today; reserved for future gamepad / pen /
+  multi-touch devices.
+
+Forward-compat hooks every feature added later relies on:
+
+- **Hello extension map** with reverse-DNS-style keys (`tether.audio`,
+  `tether.pixel-format`, `tether.cap.*`). Receivers ignore unknown
+  keys; capability keys (`tether.cap.*`) follow an echo-to-accept
+  convention.
+- **`ControlMessage::Extension { key, payload }`** as the escape for
+  any new control message that doesn't fit the typed variants.
+- **`VideoFrameMetaEnvelope`** so per-frame metadata grows by enum
+  variant rather than struct field.
 
 Three non-negotiable invariants tracked end-to-end:
 

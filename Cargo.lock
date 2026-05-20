@@ -3198,6 +3198,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tether-gpuconvert"
+version = "0.0.1"
+dependencies = [
+ "pollster",
+ "thiserror 2.0.18",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
 name = "tether-host"
 version = "0.0.1"
 dependencies = [

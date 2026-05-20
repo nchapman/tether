@@ -1,0 +1,22 @@
+[package]
+name = "tether-gpuconvert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Host-side GPU colour-space conversions (BGRA → NV12) for the zero-copy capture → encode path."
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Same wgpu trunk pin as tether-render. We need
+# VULKAN_EXTERNAL_MEMORY_DMA_BUF for both the eventual import (PipeWire
+# capture as Bgra8Unorm) and export (NV12 storage textures handed to
+# VAAPI). Workspace-level [patch.crates-io] keeps the wgpu sub-crates
+# consistent across both consumers.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["vulkan"] }
+pollster = "0.4"
+
+[lints]
+workspace = true

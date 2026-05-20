@@ -215,7 +215,16 @@ pub trait Encoder: Send {
 pub enum GpuEncoderFrame<'a> {
     #[cfg(target_os = "linux")]
     DmaBuf(&'a DmaBufFrame),
-    // IOSurface / D3D11Texture land here when those backends arrive.
+    /// macOS IOSurface from a ScreenCaptureKit-captured `CMSampleBuffer`,
+    /// consumed zero-copy by VideoToolbox via FFmpeg's `videotoolbox_enc`
+    /// (`AVFrame::data[3]` holds the `CVPixelBufferRef` wrapping the
+    /// IOSurface).
+    #[cfg(target_os = "macos")]
+    IOSurface(&'a IOSurfaceFrame),
+    // Keeps the enum inhabited on platforms where no cfg branch above
+    // fires (e.g. Windows until D3D11 lands). On platforms that have
+    // a real variant (`linux`, `macos`) this is unreachable by safe
+    // code; the encoder's `encode_gpu` default body never matches it.
     #[doc(hidden)]
     _Phantom(std::marker::PhantomData<&'a ()>),
 }
@@ -307,6 +316,14 @@ pub enum GpuFrameSource {
     /// catch-all that silently swallows future variants.
     #[cfg(target_os = "linux")]
     DmaBuf(DmaBufFrame),
+    /// macOS VideoToolbox-decoded `CVPixelBuffer` (typically with an
+    /// IOSurface backing). The renderer imports the IOSurface as a
+    /// Metal texture via wgpu's Metal HAL `texture_from_raw` path.
+    /// Carried here so the protocol/codec contract is symmetric with
+    /// the encoder side; the client-side decoder implementation is a
+    /// follow-up plan.
+    #[cfg(target_os = "macos")]
+    IOSurface(IOSurfaceFrame),
 }
 
 /// DMA-BUF descriptor as returned by `vaExportSurfaceHandle`. Mirrors
@@ -354,6 +371,43 @@ pub struct DmaBufLayer {
     pub offset: [u32; 4],
     pub pitch: [u32; 4],
 }
+
+/// macOS IOSurface descriptor for a captured (encoder input) or
+/// decoded (renderer input) frame. Mirrors what
+/// `tether_capture::CapturedIOSurface` carries on the capture side;
+/// owned by `tether-codec` so downstream crates that don't otherwise
+/// want a `tether-capture` dep (notably `tether-render`'s wgpu Metal
+/// import path) can stay decoupled — same rationale as
+/// [`DmaBufFrame`] vs `CapturedDmaBuf`.
+///
+/// Lifetime: the encoder borrows this through
+/// [`GpuEncoderFrame::IOSurface`] for the duration of one
+/// `encode_gpu` call; the capture-side `release_guard` keeps the
+/// IOSurface alive across that call. The decoder side owns its
+/// `IOSurfaceFrame` and pairs it with a [`GpuFrameGuard`] that
+/// retains the `CVPixelBuffer` until the renderer is done.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct IOSurfaceFrame {
+    /// `IOSurfaceRef` — opaque Apple type. Non-owning: lifetime is the
+    /// retaining guard alongside this frame (capture's
+    /// `release_guard`, decoder's `GpuFrameGuard`).
+    pub surface: *mut std::ffi::c_void,
+    /// `kCVPixelFormatType_*` fourcc, e.g. `'420v'` for NV12 video
+    /// range. The encoder's `AVHWFramesContext` is configured to
+    /// match.
+    pub pixel_format: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+// No `&mut` access is possible to the IOSurface through this raw
+// pointer from Rust; all mutation goes through Apple's IOSurface C
+// API, which is itself thread-safe (CF-style refcounted, kernel
+// surface thread-shareable). The struct carries no Rust state that
+// would conflict with crossing a thread boundary.
+#[cfg(target_os = "macos")]
+unsafe impl Send for IOSurfaceFrame {}
 
 /// Pluggable video-decoder backend. Same probe pattern as `Encoder` —
 /// the client probes available backends at startup, picks the best

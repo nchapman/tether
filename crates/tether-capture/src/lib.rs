@@ -7,7 +7,8 @@
 //!
 //! Backends planned but not yet implemented:
 //! - `linux` — PipeWire + xdg-desktop-portal (DMA-BUF zero-copy aim)
-//! - `macos` — ScreenCaptureKit (NV12 zero-copy via CVPixelBuffer)
+//! - `macos` — type seam in place ([`CapturedIOSurface`]);
+//!   ScreenCaptureKit backend lands in the next phase.
 //!
 //! [`test_pattern`] is always available and produces synthetic frames
 //! at a fixed cadence. It exists so the walking skeleton and headless
@@ -100,6 +101,13 @@ pub enum GpuCapturedSource {
     /// compositor known to produce multi-plane capture buffers.
     #[cfg(target_os = "linux")]
     DmaBuf(CapturedDmaBuf),
+    /// macOS IOSurface from ScreenCaptureKit's `CMSampleBuffer`. The
+    /// real CFRetain on the underlying `IOSurfaceRef` (and the
+    /// `CMSampleBuffer` keeping it alive) lives in the parent
+    /// [`GpuCapturedFrame::release_guard`] — the pointer here is a
+    /// non-owning view, valid until the guard is dropped.
+    #[cfg(target_os = "macos")]
+    IOSurface(CapturedIOSurface),
 }
 
 /// Linux DMA-BUF descriptor for a captured frame. Mirrors what
@@ -116,6 +124,36 @@ pub struct CapturedDmaBuf {
     pub offset: u64,
     pub modifier: u64,
 }
+
+/// macOS IOSurface descriptor for a captured frame. Mirrors the shape
+/// `tether_codec::IOSurfaceFrame` carries for the encoder side; kept
+/// separate so `tether-capture` doesn't depend on `tether-codec` (same
+/// rationale as [`CapturedDmaBuf`] vs `DmaBufFrame`).
+///
+/// The pointer is a non-owning view; lifetime is the parent
+/// [`GpuCapturedFrame::release_guard`], which retains the
+/// `CMSampleBuffer` (and transitively the IOSurface). Dropping the
+/// guard releases both.
+#[cfg(target_os = "macos")]
+pub struct CapturedIOSurface {
+    /// `IOSurfaceRef` — opaque Apple type, valid until the parent
+    /// `release_guard` is dropped.
+    pub surface: *mut std::ffi::c_void,
+    /// `kCVPixelFormatType_*` fourcc as returned by
+    /// `IOSurfaceGetPixelFormat`. Typically NV12
+    /// (`420YpCbCr8BiPlanarVideoRange` = `'420v'`).
+    pub pixel_format: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+// No `&mut` access is possible to the IOSurface through this raw
+// pointer from Rust; all mutation goes through Apple's IOSurface C
+// API, which is itself thread-safe (CF-style refcounted, kernel
+// surface thread-shareable). The struct carries no Rust state that
+// would conflict with crossing a thread boundary.
+#[cfg(target_os = "macos")]
+unsafe impl Send for CapturedIOSurface {}
 
 impl CapturedFrame {
     #[must_use]

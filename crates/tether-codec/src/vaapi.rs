@@ -685,6 +685,17 @@ impl Encoder for VaapiEncoder {
         // is_hardware=true alongside the name.
         "h264_vaapi"
     }
+
+    fn submit_dmabuf(
+        &mut self,
+        frame: &DmaBufFrame,
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>> {
+        // Inherent method already does the work; the trait override
+        // just makes it dispatchable through `dyn Encoder`.
+        VaapiEncoder::submit_dmabuf(self, frame, pts, force_keyframe)
+    }
 }
 
 /// get_format callback the decoder invokes once the bitstream's

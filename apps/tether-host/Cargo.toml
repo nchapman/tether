@@ -18,6 +18,14 @@ tether-transport = { workspace = true }
 tether-capture = { workspace = true }
 tether-codec = { workspace = true }
 tether-input = { workspace = true }
+# Linux-only: BGRA→NV12 + DMA-BUF bridge for the zero-copy
+# capture→encode path. The non-Linux build does CPU-side encode only.
+[target.'cfg(target_os = "linux")'.dependencies]
+tether-gpuconvert = { workspace = true }
+# pollster::block_on lets us drive Nv12DmaBuf::new (async) from the
+# synchronous send-thread context. Already a transitive dep through
+# tether-gpuconvert; declared directly here to make the use explicit.
+pollster = "0.4"
 
 [lints]
 workspace = true

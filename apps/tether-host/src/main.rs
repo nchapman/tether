@@ -16,6 +16,12 @@ use std::sync::Arc;
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
 use tether_codec::{probe_encoder_bgra, Encoder};
+#[cfg(target_os = "linux")]
+use tether_capture::GpuCapturedSource;
+#[cfg(target_os = "linux")]
+use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
+#[cfg(target_os = "linux")]
+use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame};
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ColorSpace, ControlMessage, ServerHello,
 };
@@ -357,6 +363,137 @@ struct EncoderSlot {
     encoder: Box<dyn Encoder>,
     width: u32,
     height: u32,
+    /// Lazily-built BGRA→NV12 + DMA-BUF bridge for the zero-copy
+    /// capture→encode path. `Some` after the first `CapturedFrame::Gpu`
+    /// arrives and the wgpu device opens; `None` while the stream is
+    /// SHM-only or before any Gpu frame has been seen.
+    ///
+    /// `Err` once we've tried and failed (no Vulkan adapter, etc.) so
+    /// subsequent Gpu frames just drop with a one-line warn instead of
+    /// retrying the device-open at frame rate.
+    #[cfg(target_os = "linux")]
+    bridge: BridgeState,
+}
+
+#[cfg(target_os = "linux")]
+enum BridgeState {
+    NotYetBuilt,
+    Ready(Nv12DmaBuf),
+    Failed,
+}
+
+/// Encode one PipeWire-supplied DMA-BUF frame through the zero-copy
+/// pipeline: import BGRA into wgpu, compute BGRA→NV12 onto exported
+/// DMA-BUF Y/UV planes, hand both to the encoder's `submit_dmabuf`.
+///
+/// On first call, lazily opens the wgpu device and allocates the
+/// bridge; the result is cached on the `EncoderSlot`. On any error in
+/// device-open or feature-probe, the bridge moves to `Failed` and
+/// subsequent Gpu frames return Err — the caller drops them with a
+/// warn, and the SHM-fallback path is unaffected (if PipeWire ever
+/// emits a Cpu frame, the existing `encode_bgra` arm handles it).
+#[cfg(target_os = "linux")]
+fn encode_gpu_frame(
+    slot: &mut EncoderSlot,
+    gpu: tether_capture::GpuCapturedFrame,
+    pts: i64,
+    force_keyframe: bool,
+) -> anyhow::Result<Vec<tether_codec::EncodedPacket>> {
+    let bridge = match &mut slot.bridge {
+        BridgeState::Ready(b) => b,
+        BridgeState::Failed => {
+            anyhow::bail!("GPU encode bridge is in failed state; dropping frame")
+        }
+        BridgeState::NotYetBuilt => {
+            match pollster::block_on(Nv12DmaBuf::new(slot.width, slot.height)) {
+                Ok(b) => {
+                    info!(
+                        width = slot.width,
+                        height = slot.height,
+                        "gpuconvert bridge initialised for zero-copy DMA-BUF encode"
+                    );
+                    slot.bridge = BridgeState::Ready(b);
+                    let BridgeState::Ready(b) = &mut slot.bridge else {
+                        unreachable!()
+                    };
+                    b
+                }
+                Err(e) => {
+                    warn!(error = %e, "gpuconvert bridge init failed; \
+                           future Gpu frames will be dropped");
+                    slot.bridge = BridgeState::Failed;
+                    anyhow::bail!("bridge init failed: {e}");
+                }
+            }
+        }
+    };
+
+    let GpuCapturedSource::DmaBuf(dmabuf) = gpu.source;
+    let tether_capture::CapturedDmaBuf {
+        fourcc,
+        fd,
+        stride,
+        offset,
+        modifier,
+    } = dmabuf;
+
+    let imported = bridge
+        .import_bgra_dmabuf(fd, modifier, stride, offset)
+        .map_err(|e| anyhow::anyhow!("import_bgra_dmabuf: {e}"))?;
+    let nv12 = bridge
+        .convert(&imported)
+        .map_err(|e| anyhow::anyhow!("Nv12DmaBuf::convert: {e}"))?;
+    // gpu.release_guard drops here implicitly along with `imported`
+    // and `dmabuf` once `nv12` has the dup'd Y/UV fds owned. The
+    // bridge's poll-on-completion guarantees the compute write retired
+    // before we hand the fds to VAAPI.
+    drop(imported);
+    let _ = fourcc; // PipeWire-side fourcc is informational; the
+                     // shader treats input as BGRA regardless.
+
+    let codec_frame = nv12_dmabuf_to_codec_frame(nv12);
+    slot.encoder
+        .submit_dmabuf(&codec_frame, pts, force_keyframe)
+        .map_err(|e| anyhow::anyhow!("submit_dmabuf: {e}"))
+}
+
+/// Build a `DmaBufFrame` (NV12, two objects, two layers — Y as R8 and
+/// UV as GR88) from the bridge's per-call descriptor. The codec layer
+/// dups the fds again inside `vaCreateSurfaces`, so this `DmaBufFrame`
+/// (and its owned fds) drops cleanly after `submit_dmabuf` returns.
+#[cfg(target_os = "linux")]
+fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"NV12"),
+        objects: vec![
+            DmaBufObject {
+                fd: out.y_fd,
+                size: out.y_size,
+                drm_format_modifier: out.y_modifier,
+            },
+            DmaBufObject {
+                fd: out.uv_fd,
+                size: out.uv_size,
+                drm_format_modifier: out.uv_modifier,
+            },
+        ],
+        layers: vec![
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"R8  "),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [u32::try_from(out.y_offset).unwrap_or(0), 0, 0, 0],
+                pitch: [u32::try_from(out.y_stride).unwrap_or(0), 0, 0, 0],
+            },
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"GR88"),
+                num_planes: 1,
+                object_index: [1, 0, 0, 0],
+                offset: [u32::try_from(out.uv_offset).unwrap_or(0), 0, 0, 0],
+                pitch: [u32::try_from(out.uv_stride).unwrap_or(0), 0, 0, 0],
+            },
+        ],
+    }
 }
 
 fn run_capture_and_send(
@@ -404,27 +541,19 @@ fn run_capture_and_send(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
-        // GPU-backed capture frames (PipeWire DMA-BUF) ride the
-        // zero-copy gpuconvert → VAAPI submit_dmabuf path, wired in a
-        // follow-up commit. Until that lands, drop them with a
-        // one-time warn so a DMA-BUF negotiation doesn't silently
-        // black out the stream — the SHM fallback path stays intact.
-        let frame = match frame {
-            CapturedFrame::Cpu(f) => f,
-            CapturedFrame::Gpu(_) => {
-                warn!(
-                    "received GPU CapturedFrame but the zero-copy encode path \
-                     isn't wired yet; dropping frame"
-                );
+        let frame_width = frame.width();
+        let frame_height = frame.height();
+        let (t_capture_kernel, t_capture_userspace) = frame.timestamps();
+
+        // Reject CPU frames in non-BGRA formats up front (no encoder
+        // path consumes them today). GPU frames already passed format
+        // gating at PipeWire negotiation time — see
+        // spa_format_to_drm_fourcc in tether-capture.
+        if let CapturedFrame::Cpu(ref cpu) = frame {
+            if cpu.format != PixelFormat::Bgra8 {
+                warn!(?cpu.format, "h264 encoder only accepts BGRA; skipping frame");
                 continue;
             }
-        };
-        if frame.format != PixelFormat::Bgra8 {
-            warn!(
-                ?frame.format,
-                "h264 encoder only accepts BGRA in v0; skipping frame"
-            );
-            continue;
         }
 
         // Encoder is lazily created on the first frame (we don't know
@@ -437,26 +566,22 @@ fn run_capture_and_send(
         // `VideoPacket::stream_epoch` exists for.
         let needs_recreate = slot
             .as_ref()
-            .is_none_or(|s| s.width != frame.width || s.height != frame.height);
+            .is_none_or(|s| s.width != frame_width || s.height != frame_height);
         if needs_recreate {
             if let Some(old) = slot.as_ref() {
                 info!(
                     old_width = old.width,
                     old_height = old.height,
-                    new_width = frame.width,
-                    new_height = frame.height,
+                    new_width = frame_width,
+                    new_height = frame_height,
                     "capture dimensions changed; recreating encoder, bumping stream epoch"
                 );
                 fragmenter.bump_epoch();
             }
-            // Push the new display dims to anything that cares (the
-            // input injector uses these to scale normalised cursor
-            // coords into pixels). send() only fails if every receiver
-            // is gone, which means the host is shutting down anyway.
-            let _ = display_dims_tx.send(Some((frame.width, frame.height)));
+            let _ = display_dims_tx.send(Some((frame_width, frame_height)));
             slot = match probe_encoder_bgra(
-                frame.width,
-                frame.height,
+                frame_width,
+                frame_height,
                 ENCODER_FPS,
                 ENCODER_BITRATE_KBPS,
             ) {
@@ -464,16 +589,18 @@ fn run_capture_and_send(
                     info!(
                         backend = e.name(),
                         hardware = e.is_hardware(),
-                        width = frame.width,
-                        height = frame.height,
+                        width = frame_width,
+                        height = frame_height,
                         fps = ENCODER_FPS,
                         kbps = ENCODER_BITRATE_KBPS,
                         "encoder initialised"
                     );
                     Some(EncoderSlot {
                         encoder: e,
-                        width: frame.width,
-                        height: frame.height,
+                        width: frame_width,
+                        height: frame_height,
+                        #[cfg(target_os = "linux")]
+                        bridge: BridgeState::NotYetBuilt,
                     })
                 }
                 Err(e) => {
@@ -482,16 +609,35 @@ fn run_capture_and_send(
                 }
             };
         }
-        let enc = slot.as_mut().expect("slot populated above").encoder.as_mut();
+        let slot_mut = slot.as_mut().expect("slot populated above");
 
         // Swap-and-zero: at most one forced keyframe per request, even
         // if multiple ForceIdr messages arrive between encode calls.
         let force_kf = force_idr.swap(false, Ordering::Relaxed);
         let t_encode_submit = MonoNanos::now();
-        let encoded = match enc.encode_bgra(&frame.data, pts, force_kf) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(error = %e, "encode failed; dropping frame");
+        let encoded = match frame {
+            CapturedFrame::Cpu(ref cpu) => {
+                match slot_mut.encoder.encode_bgra(&cpu.data, pts, force_kf) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(error = %e, "encode failed; dropping frame");
+                        continue;
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            CapturedFrame::Gpu(gpu) => {
+                match encode_gpu_frame(slot_mut, gpu, pts, force_kf) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(error = %e, "GPU encode failed; dropping frame");
+                        continue;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            CapturedFrame::Gpu(_) => {
+                warn!("Gpu CapturedFrame on a non-Linux build; dropping");
                 continue;
             }
         };
@@ -523,15 +669,15 @@ fn run_capture_and_send(
         let t_send = MonoNanos::now();
         let meta = VideoFrameMeta {
             timing: HostFrameTiming {
-                t_capture_kernel: frame.t_capture_kernel,
-                t_capture_userspace: frame.t_capture_userspace,
+                t_capture_kernel,
+                t_capture_userspace,
                 t_encode_submit,
                 t_encode_done,
                 t_send,
             },
             keyframe,
             input_echo: InputEchoBatch::default(),
-            dimensions: (frame.width, frame.height),
+            dimensions: (frame_width, frame_height),
         };
 
         let packets = fragmenter.fragment(meta, &combined);

@@ -172,6 +172,25 @@ pub trait Encoder: Send {
     /// `codec_kind` (which only carries the on-wire codec id) so the
     /// client can show which backend the host actually chose.
     fn name(&self) -> &'static str;
+
+    /// Encode one DMA-BUF-backed NV12 frame zero-copy. Only HW backends
+    /// that can import an external GPU buffer implement this; the
+    /// default returns [`CodecError::UnsupportedInputFormat`] so SW
+    /// encoders and HW backends without a DMA-BUF import path stay
+    /// honest about not handling GPU frames.
+    ///
+    /// The host's send loop calls this for `CapturedFrame::Gpu`
+    /// variants and falls back to `encode_bgra` (with a CPU readback)
+    /// when this returns unsupported.
+    #[cfg(target_os = "linux")]
+    fn submit_dmabuf(
+        &mut self,
+        _frame: &DmaBufFrame,
+        _pts: i64,
+        _force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>> {
+        Err(CodecError::UnsupportedInputFormat)
+    }
 }
 
 /// Output of one decoded frame, either CPU-resident NV12 planes or a

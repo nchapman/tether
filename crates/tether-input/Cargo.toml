@@ -24,6 +24,10 @@ tracing = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 enigo = { version = "0.6", default-features = false, features = ["libei_tokio"] }
 tokio = { workspace = true }
+# dup2 + open(/dev/null) to muzzle enigo 0.6.1's raw `println!("Start
+# emulating")` on libei session init. Drop this dep once enigo demotes
+# those lines to log!().
+libc = "0.2"
 
 [lints]
 workspace = true

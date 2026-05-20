@@ -14,6 +14,8 @@
 //!     mode used by trackpads is rounded.
 
 use std::collections::HashSet;
+use std::ffi::CString;
+use std::os::fd::RawFd;
 
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 
@@ -102,18 +104,22 @@ impl LibeiInjector {
     /// path calls `set_display_size` with the real numbers from the
     /// PipeWire-negotiated stream format.
     ///
-    /// Three lines of `Start emulating` on stdout during this call are
-    /// from a raw `println!` in enigo 0.6.1's libei backend — one per
-    /// virtual device the portal exposes (keyboard, pointer, scroll). It
-    /// isn't gated by a logger, so we can't filter it from our side
-    /// without dup2'ing fd 1 across the call. Live with it until enigo
-    /// upstream demotes that line.
+    /// `enigo` 0.6.1's libei backend emits three raw `println!("Start
+    /// emulating")` lines during construction — one per virtual device
+    /// the portal exposes (keyboard, pointer, scroll). They're not
+    /// gated by a logger, so we silence them by redirecting fd 1 to
+    /// `/dev/null` for the duration of the call. Tracing output goes
+    /// to fd 2 and is unaffected. Remove this wrapper once enigo
+    /// upstream demotes those lines.
     pub async fn connect() -> Result<Self> {
         let settings = Settings::default();
-        let enigo = tokio::task::spawn_blocking(move || Enigo::new(&settings))
-            .await
-            .map_err(|e| InjectError::Init(format!("spawn_blocking join: {e}")))?
-            .map_err(|e| InjectError::Init(format!("enigo new: {e:?}")))?;
+        let enigo = tokio::task::spawn_blocking(move || {
+            let _silence = SilenceStdout::new();
+            Enigo::new(&settings)
+        })
+        .await
+        .map_err(|e| InjectError::Init(format!("spawn_blocking join: {e}")))?
+        .map_err(|e| InjectError::Init(format!("enigo new: {e:?}")))?;
         tracing::info!(
             session = "wayland (libei)",
             "linux input backend selected"
@@ -204,6 +210,68 @@ impl LibeiInjector {
             }
         }
         Ok(())
+    }
+}
+
+/// RAII guard that redirects process stdout to `/dev/null` for the
+/// duration of its lifetime. Used exclusively to muzzle enigo 0.6.1's
+/// raw `println!("Start emulating")` lines on libei session init —
+/// see [`LibeiInjector::connect`].
+///
+/// fd 1 is process-global, so anything else trying to write to stdout
+/// during this guard's lifetime also goes to `/dev/null`. tracing
+/// writes to fd 2 by default, so logs are unaffected. The guard is
+/// constructed on the `spawn_blocking` thread enigo runs on, which
+/// keeps the window short and predictable.
+///
+/// If any `libc` call fails, the guard quietly becomes a no-op rather
+/// than panicking — losing the muzzle is harmless; aborting startup
+/// over a cosmetic log line would not be.
+struct SilenceStdout {
+    saved_fd: Option<RawFd>,
+}
+
+impl SilenceStdout {
+    fn new() -> Self {
+        // SAFETY: dup/open/dup2 on fd 1 are sound; we own the saved fd
+        // and the devnull fd. On any error we leave fd 1 untouched and
+        // return a no-op guard.
+        unsafe {
+            let saved = libc::dup(1);
+            if saved < 0 {
+                return Self { saved_fd: None };
+            }
+            let Ok(path) = CString::new("/dev/null") else {
+                libc::close(saved);
+                return Self { saved_fd: None };
+            };
+            let devnull = libc::open(path.as_ptr(), libc::O_WRONLY);
+            if devnull < 0 {
+                libc::close(saved);
+                return Self { saved_fd: None };
+            }
+            if libc::dup2(devnull, 1) < 0 {
+                libc::close(devnull);
+                libc::close(saved);
+                return Self { saved_fd: None };
+            }
+            libc::close(devnull);
+            Self { saved_fd: Some(saved) }
+        }
+    }
+}
+
+impl Drop for SilenceStdout {
+    fn drop(&mut self) {
+        // SAFETY: saved_fd was produced by libc::dup on fd 1; restoring
+        // it via dup2 is sound. Errors here are unrecoverable (we'd
+        // leak the saved fd at worst) so we ignore them.
+        if let Some(saved) = self.saved_fd.take() {
+            unsafe {
+                libc::dup2(saved, 1);
+                libc::close(saved);
+            }
+        }
     }
 }
 

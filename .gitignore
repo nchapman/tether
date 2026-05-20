@@ -1,1 +1,4 @@
 /target
+
+# Ad-hoc log captures from manual `cargo run` testing.
+*.log

@@ -3233,6 +3233,7 @@ name = "tether-input"
 version = "0.0.1"
 dependencies = [
  "enigo",
+ "libc",
  "tether-protocol",
  "tether-render",
  "thiserror 2.0.18",

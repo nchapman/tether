@@ -214,6 +214,88 @@ impl Nv12DmaBuf {
         self.height
     }
 
+    /// Import a PipeWire-supplied BGRA DMA-BUF as a wgpu texture on
+    /// this bridge's device. Format is fixed to `Bgra8Unorm` (matches
+    /// what compositors emit for BGRx/BGRA video formats); usage is
+    /// `TEXTURE_BINDING` because the shader reads via `textureLoad`.
+    ///
+    /// The bridge takes ownership of `fd`; on import success the
+    /// returned `wgpu::Texture` holds the corresponding `VkImage` and
+    /// `VkDeviceMemory`, and dropping the texture closes the fd
+    /// indirectly via that allocation. The caller's PipeWire buffer
+    /// release guard should be held alongside the texture for as long
+    /// as the GPU is reading.
+    ///
+    /// `modifier`, `stride`, and `offset` come from PipeWire's
+    /// `SPA_DATA_DmaBuf` chunk metadata (queried via the buffer's
+    /// chunk + the negotiated format's modifier param).
+    ///
+    /// # Errors
+    /// Returns [`Nv12DmaBufError::Poll`] if wgpu-hal rejects the
+    /// import — typically a stride/modifier mismatch with what the
+    /// driver expects, or an unsupported DMA-BUF source.
+    pub fn import_bgra_dmabuf(
+        &self,
+        fd: OwnedFd,
+        modifier: u64,
+        stride: u64,
+        offset: u64,
+    ) -> Result<wgpu::Texture> {
+        let hal_desc = wgpu::hal::TextureDescriptor {
+            label: Some("imported bgra"),
+            size: wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUses::RESOURCE,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+        // SAFETY: caller asserts fd is a valid DMA-BUF fd owned by us
+        // (we took the `OwnedFd`), and that modifier/stride/offset
+        // describe the same image. wgpu-hal does the Vulkan-side
+        // validation; failure returns Err rather than UB.
+        let hal_tex = unsafe {
+            self.device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or_else(|| {
+                    Nv12DmaBufError::Poll(
+                        "device is not Vulkan-backed; DMA-BUF import unavailable".into(),
+                    )
+                })?
+                .texture_from_dmabuf_fd(fd, &hal_desc, modifier, stride, offset)
+                .map_err(|e| {
+                    Nv12DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}"))
+                })?
+        };
+        let wgpu_desc = wgpu::TextureDescriptor {
+            label: Some("imported bgra"),
+            size: wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        // SAFETY: hal_tex was just built from this device on the same
+        // Vulkan backend; descs match in shape.
+        let tex = unsafe {
+            self.device
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_tex, &wgpu_desc)
+        };
+        Ok(tex)
+    }
+
     /// Convert one imported BGRA frame into the bridge's NV12 DMA-BUF
     /// targets and return dup'd fds the caller can wrap in a codec
     /// `DmaBufFrame` for `VaapiEncoder::submit_dmabuf`.
@@ -304,6 +386,7 @@ impl Nv12DmaBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dmabuf_export::export_texture_as_dmabuf;
 
     /// End-to-end without VAAPI: load a solid-colour BGRA texture, run
     /// the bridge, re-import the returned Y plane via wgpu's existing
@@ -494,6 +577,194 @@ mod tests {
             assert!(
                 diff.abs() <= 2,
                 "Y[{x},{y}] = {got}, expected ~{expected_y} (diff {diff})",
+            );
+        }
+    }
+
+    /// Same conversion math as the test above, but the BGRA source
+    /// arrives via [`Nv12DmaBuf::import_bgra_dmabuf`] rather than as a
+    /// native wgpu texture — the production shape. Uses
+    /// `export_texture_as_dmabuf` to stand in for PipeWire as the
+    /// producer.
+    #[test]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    fn convert_via_imported_bgra() {
+        let width = 32u32;
+        let height = 32u32;
+
+        let bridge = match pollster::block_on(Nv12DmaBuf::new(width, height)) {
+            Ok(b) => b,
+            Err(Nv12DmaBufError::NoAdapter | Nv12DmaBufError::FeatureUnsupported) => {
+                eprintln!("SKIP: no wgpu adapter with DMA-BUF export feature");
+                return;
+            }
+            Err(e) => panic!("Nv12DmaBuf::new: {e}"),
+        };
+
+        // Stand in for PipeWire: export a BGRA DMA-BUF on the same
+        // device, fill it with solid blue (B=255, G=0, R=0), then
+        // hand the fd to the bridge's import helper. In production the
+        // BGRA DMA-BUF comes from the compositor through PipeWire.
+        let src_export = export_texture_as_dmabuf(
+            bridge.device(),
+            width,
+            height,
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            "bgra source",
+        )
+        .expect("export bgra source");
+        let n = (width * height) as usize;
+        let mut bgra = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            bgra.extend_from_slice(&[255, 0, 0, 255]); // blue
+        }
+        bridge.queue().write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src_export.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bgra,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        bridge.queue().submit(std::iter::empty());
+        bridge
+            .device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll write");
+
+        let dup_fd = src_export.fd.try_clone().expect("dup src fd");
+        let imported = bridge
+            .import_bgra_dmabuf(
+                dup_fd,
+                src_export.drm_format_modifier,
+                src_export.stride,
+                src_export.offset,
+            )
+            .expect("import_bgra_dmabuf");
+
+        let out = bridge.convert(&imported).expect("convert");
+
+        // BT.709 Y for pure blue: Y' = 0.0722; limited byte ≈
+        // (0.0722*219/255 + 16/255) * 255 ≈ 32.
+        let expected_y: u8 = ((0.0722_f32 * 219.0 / 255.0 + 16.0 / 255.0) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+
+        // Read back Y plane via the export's own re-import path.
+        let import_desc = wgpu::hal::TextureDescriptor {
+            label: Some("y reimport"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUses::COPY_SRC,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+        // SAFETY: out.y_fd was produced by the bridge's export path.
+        let hal_tex = unsafe {
+            bridge
+                .device()
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("vulkan backend")
+                .texture_from_dmabuf_fd(
+                    out.y_fd,
+                    &import_desc,
+                    out.y_modifier,
+                    out.y_stride,
+                    out.y_offset,
+                )
+                .expect("texture_from_dmabuf_fd y")
+        };
+        let y_tex = unsafe {
+            bridge.device().create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_tex,
+                &wgpu::TextureDescriptor {
+                    label: Some("y reimport"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                },
+            )
+        };
+        let padded_row = u64::from(width).div_ceil(256) * 256;
+        let readback = bridge.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("y readback"),
+            size: padded_row * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = bridge
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("y readback enc"),
+            });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &y_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(u32::try_from(padded_row).unwrap()),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        bridge.queue().submit(Some(enc.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        bridge
+            .device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll readback");
+        rx.recv().expect("cb").expect("map");
+        let mapped = slice.get_mapped_range().expect("range");
+
+        for &(x, y) in &[(0u32, 0u32), (width / 2, height / 2)] {
+            let got = mapped[(u64::from(y) * padded_row + u64::from(x)) as usize];
+            let diff = i32::from(got) - i32::from(expected_y);
+            assert!(
+                diff.abs() <= 2,
+                "Y[{x},{y}] (blue via import) = {got}, expected ~{expected_y} (diff {diff})",
             );
         }
     }

@@ -50,6 +50,13 @@
 //!   [`crate::audio::AudioConfig`]. Advertised on `ServerHelloV1`.
 //! - `tether.pixel-format` — host video pixel format; payload is
 //!   bincode-encoded [`PixelFormat`]. Advertised on `ServerHelloV1`.
+//! - `tether.color-spec` — host video color spec (matrix / range /
+//!   transfer / primaries); payload is bincode-encoded
+//!   [`VideoColorSpec`]. Advertised on `ServerHelloV1`. Absence
+//!   implies [`VideoColorSpec::sdr_legacy`]. The richer four-axis
+//!   shape is the negotiation prerequisite for the transfer-correct
+//!   shader path; the legacy [`ServerHelloV1::color_space`] field is
+//!   preserved alongside for clients that haven't been updated yet.
 //! - `tether.gamepad-rumble` — host → client rumble command; rides
 //!   [`ControlMessage::Extension`] until it earns a typed variant
 //!   in a future hello revision. Payload shape: TBD pending the
@@ -124,6 +131,149 @@ pub enum ColorSpace {
     /// BT.709 limited range. The only color space supported in v0.
     Bt709Limited,
 }
+
+// =============================================================
+// Four-axis color spec — the principled replacement for
+// `ColorSpace`. Negotiated via the `tether.color-spec` hello
+// extension; absence implies [`VideoColorSpec::sdr_legacy`] (what
+// every Tether build through this commit hard-pins).
+// =============================================================
+//
+// A video stream's color identity is four orthogonal things, each
+// of which can change independently per codec / source / display.
+// H.264 and HEVC carry these in the SPS VUI parameters; we expose
+// them on the wire so the decoder + renderer can negotiate the
+// right shader path without having to re-parse the bitstream.
+//
+// Range × Matrix × Transfer × Primaries combinations describe every
+// common SDR and HDR pipeline; the variants here are the subset
+// Tether commits to supporting in the foreseeable roadmap. New
+// variants land as additive enum additions per the bincode
+// versioning policy.
+
+/// Pixel-value range of the encoded Y / Cb / Cr planes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorRange {
+    /// "TV" / "video" range. Y in 16..235, Cb/Cr in 16..240. The
+    /// default for broadcast and what every Tether encoder produces
+    /// today (`PixelFormat::YCbCr_420v` on SCK; explicit
+    /// limited-range quantize in `tether-gpuconvert`).
+    Limited,
+    /// "PC" / "full" range. Y/Cb/Cr each span the full 0..255. Some
+    /// desktop captures hand us bytes in this range; the decoder
+    /// needs to know so it skips the limited-range expand step.
+    Full,
+}
+
+/// Y'CbCr ↔ R'G'B' conversion matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorMatrix {
+    /// BT.709 (Rec. ITU-R BT.709-6). The standard for HD video and
+    /// what every encoder we ship configures today.
+    Bt709,
+    /// BT.2020 non-constant luminance. Required for HDR pipelines
+    /// (PQ / HLG). Not yet wired on either end.
+    Bt2020Ncl,
+    /// Identity matrix — R'G'B' rides the Y/Cb/Cr channels directly.
+    /// Useful for lossless screen capture; reserved.
+    Identity,
+}
+
+/// Transfer function (a.k.a. EOTF / OETF pair) that maps between
+/// gamma-encoded R'G'B' and linear light.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorTransfer {
+    /// BT.709 OETF (Rec. ITU-R BT.709-6, eq. 1.2). What broadcast
+    /// content uses. Tether currently treats source bytes as
+    /// BT.709-encoded — the assumption that produces a ≤~5% mismatch
+    /// on actually-sRGB sources like a desktop framebuffer.
+    Bt709,
+    /// sRGB OETF (IEC 61966-2-1). The right answer for desktop
+    /// screen capture; matches what every Mac/Windows/Linux
+    /// compositor framebuffer is encoded as.
+    Srgb,
+    /// Perceptual Quantizer (SMPTE ST 2084 / Rec. ITU-R BT.2100).
+    /// HDR; reserved.
+    Pq,
+    /// Hybrid Log-Gamma (Rec. ITU-R BT.2100). HDR; reserved.
+    Hlg,
+    /// Linear light. Useful for offline / lossless pipelines;
+    /// reserved.
+    Linear,
+}
+
+/// Color primaries (the chromaticity coordinates of R, G, B).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorPrimaries {
+    /// BT.709 / sRGB primaries. Identical chromaticities; the two
+    /// differ only in transfer function. Default for SDR.
+    Bt709,
+    /// BT.2020 / Rec. ITU-R BT.2100 primaries. Wider gamut; required
+    /// for HDR.
+    Bt2020,
+    /// Apple Display P3 primaries. Common on recent Mac displays.
+    DisplayP3,
+}
+
+/// The four-axis tuple. Carried as the `tether.color-spec` hello
+/// extension payload (bincode-encoded), advertised on
+/// [`ServerHelloV1::extensions`].
+///
+/// The legacy [`color_space`](ServerHelloV1::color_space) field is
+/// preserved for backwards compatibility — old clients see
+/// `Bt709Limited` and the negotiated extension is opt-in. New
+/// clients that recognise the extension should prefer it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoColorSpec {
+    pub matrix: ColorMatrix,
+    pub range: ColorRange,
+    pub transfer: ColorTransfer,
+    pub primaries: ColorPrimaries,
+}
+
+impl VideoColorSpec {
+    /// What every Tether build through this commit hard-pins: BT.709
+    /// matrix + primaries, limited range, BT.709 transfer assumed
+    /// (even when the source is actually sRGB). Implementations that
+    /// haven't yet wired the negotiated path should advertise this.
+    #[must_use]
+    pub const fn sdr_legacy() -> Self {
+        Self {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            transfer: ColorTransfer::Bt709,
+            primaries: ColorPrimaries::Bt709,
+        }
+    }
+
+    /// The principled spec for a desktop screen capture on macOS,
+    /// Linux Wayland, or Windows: sRGB transfer (compositor
+    /// framebuffer reality) with BT.709 matrix/primaries/range. A
+    /// decoder that respects this can apply the sRGB EOTF instead of
+    /// BT.709's, eliminating the ≤~5% mid-tone lift the legacy
+    /// chain introduces.
+    #[must_use]
+    pub const fn sdr_desktop() -> Self {
+        Self {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            transfer: ColorTransfer::Srgb,
+            primaries: ColorPrimaries::Bt709,
+        }
+    }
+}
+
+impl Default for VideoColorSpec {
+    /// `sdr_legacy()` — preserves today's behaviour for any caller
+    /// that constructs a spec without thinking about it.
+    fn default() -> Self {
+        Self::sdr_legacy()
+    }
+}
+
+/// Hello-extension key for [`VideoColorSpec`] advertisement.
+/// Reverse-DNS per the [`ClientHelloV1::extensions`] convention.
+pub const COLOR_SPEC_EXTENSION_KEY: &str = "tether.color-spec";
 
 /// Pixel/bit-depth format the host's video stream uses. The hardware
 /// decoder pipeline (VAAPI, VideoToolbox, Media Foundation) needs this

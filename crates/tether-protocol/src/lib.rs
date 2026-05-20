@@ -385,6 +385,61 @@ mod tests {
     }
 
     #[test]
+    fn color_spec_extension_round_trips() {
+        use crate::control::{
+            ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, VideoColorSpec,
+            COLOR_SPEC_EXTENSION_KEY,
+        };
+        // Hand-build a non-default spec so every field is exercised
+        // (the legacy default would round-trip even if we accidentally
+        // dropped one of the four axes from the struct on either end).
+        let spec = VideoColorSpec {
+            matrix: ColorMatrix::Bt2020Ncl,
+            range: ColorRange::Full,
+            transfer: ColorTransfer::Pq,
+            primaries: ColorPrimaries::Bt2020,
+        };
+        let bytes = encode(&spec).unwrap();
+        let decoded: VideoColorSpec = decode(&bytes).unwrap();
+        assert_eq!(decoded, spec);
+
+        // Hello-extension integration shape: server stashes the
+        // bincode payload in the BTreeMap, client pulls it back out.
+        let mut ext = std::collections::BTreeMap::<String, Vec<u8>>::new();
+        ext.insert(COLOR_SPEC_EXTENSION_KEY.to_string(), bytes);
+        let read = ext.get(COLOR_SPEC_EXTENSION_KEY).expect("present");
+        let from_ext: VideoColorSpec = decode(read).unwrap();
+        assert_eq!(from_ext, spec);
+        assert_eq!(COLOR_SPEC_EXTENSION_KEY, "tether.color-spec");
+    }
+
+    #[test]
+    fn color_spec_named_constructors_match_intent() {
+        use crate::control::{
+            ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, VideoColorSpec,
+        };
+        // `sdr_legacy` is the today-hard-pinned spec — what an
+        // absent `tether.color-spec` extension is taken to mean.
+        // Pin the four axes here so a future refactor that swaps
+        // a default fails loudly.
+        let legacy = VideoColorSpec::sdr_legacy();
+        assert_eq!(legacy.matrix, ColorMatrix::Bt709);
+        assert_eq!(legacy.range, ColorRange::Limited);
+        assert_eq!(legacy.transfer, ColorTransfer::Bt709);
+        assert_eq!(legacy.primaries, ColorPrimaries::Bt709);
+        assert_eq!(VideoColorSpec::default(), legacy);
+
+        // `sdr_desktop` is the principled SDR-screen-capture spec:
+        // sRGB transfer instead of BT.709. Everything else matches.
+        let desktop = VideoColorSpec::sdr_desktop();
+        assert_eq!(desktop.matrix, ColorMatrix::Bt709);
+        assert_eq!(desktop.range, ColorRange::Limited);
+        assert_eq!(desktop.transfer, ColorTransfer::Srgb);
+        assert_eq!(desktop.primaries, ColorPrimaries::Bt709);
+        assert_ne!(desktop, legacy);
+    }
+
+    #[test]
     fn round_trip_audio_packet_opus() {
         use crate::audio::{AudioConfig, AudioPacket, AUDIO_CONFIG_EXTENSION_KEY};
         let p = AudioPacket::Opus {

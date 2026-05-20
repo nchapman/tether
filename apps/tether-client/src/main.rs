@@ -151,6 +151,26 @@ async fn main() -> anyhow::Result<()> {
                     Ok(ControlMessage::CursorUseShape { id }) => {
                         tracing::debug!(id, "host activated cursor shape");
                     }
+                    Ok(ControlMessage::DisplayList { displays }) => {
+                        info!(count = displays.len(), "host display topology");
+                        for d in &displays {
+                            info!(
+                                id = d.id,
+                                name = %d.name,
+                                width = d.width,
+                                height = d.height,
+                                refresh_mhz = d.refresh_mhz,
+                                scale = format!("{}/{}", d.scale_num, d.scale_den),
+                                primary = d.primary,
+                                position = ?d.position,
+                                "  display"
+                            );
+                        }
+                    }
+                    Ok(ControlMessage::SetActiveDisplays { .. }) => {
+                        // Client-originated; misrouted if seen on the client side.
+                        tracing::debug!("unexpected client→host SetActiveDisplays arrived on client; ignoring");
+                    }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");
                         return;

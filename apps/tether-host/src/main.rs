@@ -201,6 +201,34 @@ async fn handle_client(
         }
     }
 
+    // DisplayList: one entry, single-monitor placeholder. Real values
+    // (refresh rate from the PipeWire stream, scale + position from
+    // the compositor) get filled in when the capture backend grows a
+    // display-enumeration API. The send is here so the client gets
+    // the topology *before* any video arrives.
+    {
+        let display = tether_protocol::control::DisplayDescriptor {
+            id: 0,
+            name: String::new(),
+            // Resolution is not known until the first frame arrives;
+            // use 0 as "to be replaced." Future: defer DisplayList
+            // until the capture backend has reported its real dims.
+            width: 0,
+            height: 0,
+            refresh_mhz: 60_000,
+            scale_num: 1,
+            scale_den: 1,
+            primary: true,
+            position: (0, 0),
+        };
+        let msg = ControlMessage::DisplayList {
+            displays: vec![display],
+        };
+        if let Err(e) = conn.send_control(&msg).await {
+            warn!(error = ?e, "initial DisplayList send failed; continuing anyway");
+        }
+    }
+
     // Acquire a capture stream — either real platform capture or the
     // synthetic test pattern fallback. Real Linux capture is async (the
     // portal handshake awaits a user permission dialog); test pattern is
@@ -314,6 +342,16 @@ async fn handle_client(
                         // Host-originated; receiving one here means the
                         // client misrouted. Log and drop.
                         tracing::debug!("unexpected host→client cursor message arrived on host; ignoring");
+                    }
+                    Ok(ControlMessage::DisplayList { .. }) => {
+                        // Host-originated; misrouted if seen here.
+                        tracing::debug!("unexpected host→client DisplayList arrived on host; ignoring");
+                    }
+                    Ok(ControlMessage::SetActiveDisplays { displays }) => {
+                        // Single-display host today — log the request
+                        // and ignore. The selection mechanic plugs in
+                        // when multi-display capture lands.
+                        info!(?displays, "client requested display subset; ignoring (single-display host)");
                     }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");

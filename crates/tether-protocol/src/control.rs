@@ -82,6 +82,41 @@ pub enum ColorSpace {
     Bt709Limited,
 }
 
+/// Describes one host display, carried in
+/// [`ControlMessage::DisplayList`]. Today the host always sends a
+/// one-element list (single-monitor); the field shape is here so adding
+/// multi-monitor support later is purely additive — no new
+/// `ControlMessage` variant, no V2 hello bump. `refresh_mhz` and the
+/// `scale_*` pair also cover what would otherwise need their own
+/// extension keys (display geometry / HiDPI hints).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayDescriptor {
+    /// Host-assigned display id. Stable for the lifetime of a session;
+    /// matches the `display: u8` on `VideoPacket` / cursor packets.
+    pub id: u8,
+    /// Human-readable name as the host's compositor reports it
+    /// (`HDMI-A-1`, `DP-3`, `Built-in Retina Display`, etc.). May be
+    /// empty if the host's capture backend doesn't expose names.
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    /// Refresh rate in millihertz so 60 Hz = 60_000 and 59.94 Hz =
+    /// 59_940 round-trip without floating point.
+    pub refresh_mhz: u32,
+    /// Logical-to-physical scale as a rational `num / den`. `(1, 1)`
+    /// for a 1× display, `(2, 1)` for a Retina-style 2×, `(3, 2)` for
+    /// 150% Windows scaling. Rational so common factors round-trip
+    /// without `f32` precision loss; the client computes the final
+    /// scale factor as needed.
+    pub scale_num: u16,
+    pub scale_den: u16,
+    pub primary: bool,
+    /// Origin of this display in the virtual desktop, in physical
+    /// pixels. Lets the client place multi-display windows correctly
+    /// without re-deriving the topology.
+    pub position: (i32, i32),
+}
+
 /// NTP-style three-way clock probe. The receiver records `t3` locally on
 /// arrival; the offset between the two monotonic clocks is then
 /// `((t1 - t0) + (t2 - t3)) / 2`.
@@ -220,6 +255,17 @@ pub enum ControlMessage {
     /// by id. Separate from `CursorShape` so the host can switch
     /// between cached cursors without re-sending the pixels.
     CursorUseShape { id: u64 },
+    /// Host → client. Full display topology. Sent post-handshake and
+    /// again on hotplug (display added/removed) — the client treats
+    /// each message as the authoritative replacement. Single-monitor
+    /// hosts send a one-element list; the field shape supports
+    /// multi-monitor without a V2.
+    DisplayList { displays: Vec<DisplayDescriptor> },
+    /// Client → host. Subscribe to a subset of host displays. Empty
+    /// vec means "the primary" (today, the only one). Sent on the
+    /// client's user-driven display switch; host stops emitting video
+    /// for displays not in the set.
+    SetActiveDisplays { displays: Vec<u8> },
 }
 
 // --- ClockSync ----------------------------------------------------------

@@ -303,6 +303,61 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_display_list_multi() {
+        // Multi-entry exercises the Vec<DisplayDescriptor> serde shape
+        // even though the host today always emits a one-element list.
+        use crate::control::DisplayDescriptor;
+        let displays = vec![
+            DisplayDescriptor {
+                id: 0,
+                name: "DP-1".into(),
+                width: 3840,
+                height: 2160,
+                refresh_mhz: 60_000,
+                scale_num: 2,
+                scale_den: 1,
+                primary: true,
+                position: (0, 0),
+            },
+            DisplayDescriptor {
+                id: 1,
+                name: "HDMI-A-2".into(),
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 59_940,
+                scale_num: 1,
+                scale_den: 1,
+                primary: false,
+                position: (3840, 0),
+            },
+        ];
+        let msg = ControlMessage::DisplayList {
+            displays: displays.clone(),
+        };
+        let bytes = encode(&msg).unwrap();
+        let msg2: ControlMessage = decode(&bytes).unwrap();
+        match msg2 {
+            ControlMessage::DisplayList { displays: d2 } => assert_eq!(d2, displays),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_set_active_displays() {
+        let msg = ControlMessage::SetActiveDisplays {
+            displays: vec![0, 2, 5],
+        };
+        let bytes = encode(&msg).unwrap();
+        let msg2: ControlMessage = decode(&bytes).unwrap();
+        match msg2 {
+            ControlMessage::SetActiveDisplays { displays } => {
+                assert_eq!(displays, vec![0, 2, 5]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn round_trip_control_extension() {
         // The Extension escape unblocks future control features
         // without forcing a ClientHelloV2. Confirm it survives the

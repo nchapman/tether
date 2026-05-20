@@ -56,6 +56,32 @@
 //!   gamepad pipeline.
 //! - `tether.cap.*` — capability advertisement. See the next section.
 //!
+//! # Capability advertisement (`tether.cap.*`)
+//!
+//! Any hello-extension key beginning with `tether.cap.` is a capability
+//! advertisement. The sender is offering the feature; the receiver, if
+//! it accepts the offer, MUST echo the key (with the negotiated payload
+//! it agrees to use) back in its own hello `extensions`. Receivers that
+//! recognise a `tether.cap.*` key but do not accept it MUST omit it
+//! from the echo; receivers that do not recognise it MUST omit it from
+//! the echo (the standard "unknown key, ignore" rule). Receivers MUST
+//! NOT silently *consume* a capability key without acknowledging —
+//! either echo or drop.
+//!
+//! That gives every future negotiated feature (FEC tuning, relay path,
+//! adaptive-bitrate handshake, bandwidth probe parameters,
+//! multi-stream session) a single shared idiom for "did the peer
+//! accept this?" — no per-feature ack message, no per-feature timeout
+//! dance. The presence of the key in the *other* side's hello
+//! `extensions` is the ack; absence is rejection.
+//!
+//! Example flow for a hypothetical FEC negotiation:
+//! - Client → `tether.cap.fec = encode(FecCapability { reed_solomon: true, .. })`.
+//! - Host accepts: echoes `tether.cap.fec = encode(FecCapability { reed_solomon: true, .. })`
+//!   with the parameters it agrees to (likely a subset / tightened
+//!   variant of what the client offered).
+//! - Host declines: omits the key. Client sees no echo and falls back.
+//!
 //! # The `Extension` escape
 //!
 //! [`ControlMessage::Extension`] exists so that future features which

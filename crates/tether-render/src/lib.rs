@@ -1,6 +1,7 @@
 //! Client-side display: a winit window driving a wgpu render pipeline,
 //! fed from a crossbeam channel of [`Frame`]s.
 
+pub mod color;
 mod gpu;
 
 #[cfg(test)]

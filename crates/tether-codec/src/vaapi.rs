@@ -24,6 +24,7 @@
 //! to land in a wgpu texture without a CPU detour. Both need real
 //! EGL/Vulkan interop work and live as separate modules when they ship.
 
+use std::os::fd::AsRawFd;
 use std::slice;
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
@@ -53,6 +54,84 @@ struct AVVAAPIDeviceContext {
     display: tether_vaapi::VADisplay,
     driver_quirks: std::os::raw::c_uint,
 }
+
+/// DRM PRIME frame descriptors from `<libavutil/hwcontext_drm.h>`. Same
+/// reason we hand-declare these as `AVVAAPIDeviceContext`: rusty-ffmpeg
+/// doesn't bind the header. Field layout is stable since libavutil 56.x.
+///
+/// `ptrdiff_t` / `size_t` map to `isize` / `usize` — one machine word
+/// regardless of arch, matching what the C header expands to. (The
+/// signed type for offsets/pitches reflects the kernel API's signature;
+/// VAAPI's PRIME_2 import path rejects negative pitches, so we don't
+/// actually accept flipped buffers either way.)
+const AV_DRM_MAX_PLANES: usize = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AVDRMPlaneDescriptor {
+    object_index: std::os::raw::c_int,
+    offset: isize,
+    pitch: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AVDRMLayerDescriptor {
+    format: u32,
+    nb_planes: std::os::raw::c_int,
+    planes: [AVDRMPlaneDescriptor; AV_DRM_MAX_PLANES],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AVDRMObjectDescriptor {
+    fd: std::os::raw::c_int,
+    size: usize,
+    format_modifier: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AVDRMFrameDescriptor {
+    nb_objects: std::os::raw::c_int,
+    objects: [AVDRMObjectDescriptor; AV_DRM_MAX_PLANES],
+    nb_layers: std::os::raw::c_int,
+    layers: [AVDRMLayerDescriptor; AV_DRM_MAX_PLANES],
+}
+
+// Pin sizes and offsets of the hand-rolled DRM hwcontext structs the
+// same way `tether-vaapi` pins its libva descriptors. Catches both
+// ffmpeg ABI drift and the LP64-vs-ILP32-vs-LLP64 trap (`ptrdiff_t` /
+// `size_t` change width). Numbers are for LP64 (x86_64 + aarch64 Linux);
+// if we ever cross-compile to 32-bit ARM the const eval will fail and
+// force a per-arch fix rather than silently corrupting layout.
+const _: () = {
+    // AVDRMPlaneDescriptor: int + 4 pad + isize + isize = 24.
+    assert!(std::mem::size_of::<AVDRMPlaneDescriptor>() == 24);
+    assert!(std::mem::offset_of!(AVDRMPlaneDescriptor, object_index) == 0);
+    assert!(std::mem::offset_of!(AVDRMPlaneDescriptor, offset) == 8);
+    assert!(std::mem::offset_of!(AVDRMPlaneDescriptor, pitch) == 16);
+
+    // AVDRMLayerDescriptor: u32 + int + 4 planes * 24 = 104.
+    assert!(std::mem::size_of::<AVDRMLayerDescriptor>() == 104);
+    assert!(std::mem::offset_of!(AVDRMLayerDescriptor, format) == 0);
+    assert!(std::mem::offset_of!(AVDRMLayerDescriptor, nb_planes) == 4);
+    assert!(std::mem::offset_of!(AVDRMLayerDescriptor, planes) == 8);
+
+    // AVDRMObjectDescriptor: int + 4 pad + usize + u64 = 24.
+    assert!(std::mem::size_of::<AVDRMObjectDescriptor>() == 24);
+    assert!(std::mem::offset_of!(AVDRMObjectDescriptor, fd) == 0);
+    assert!(std::mem::offset_of!(AVDRMObjectDescriptor, size) == 8);
+    assert!(std::mem::offset_of!(AVDRMObjectDescriptor, format_modifier) == 16);
+
+    // AVDRMFrameDescriptor: int + 4 pad + 4 objects * 24 + int + 4 pad
+    // + 4 layers * 104 = 528.
+    assert!(std::mem::size_of::<AVDRMFrameDescriptor>() == 528);
+    assert!(std::mem::offset_of!(AVDRMFrameDescriptor, nb_objects) == 0);
+    assert!(std::mem::offset_of!(AVDRMFrameDescriptor, objects) == 8);
+    assert!(std::mem::offset_of!(AVDRMFrameDescriptor, nb_layers) == 104);
+    assert!(std::mem::offset_of!(AVDRMFrameDescriptor, layers) == 112);
+};
 
 /// Surfaces beyond what the decoder needs for its own reference picture
 /// list. We hand each decoded surface to the renderer and only release
@@ -91,6 +170,7 @@ pub struct VaapiEncoder {
     // which is the correct order — surfaces must be freed before the
     // device that allocated them.
     _hw_device: AVHWDeviceContext,
+    width: u32,
     height: u32,
     bgra_row_bytes: usize,
 }
@@ -244,9 +324,250 @@ impl VaapiEncoder {
             sw_frame,
             bgra_frame,
             _hw_device: hw_device,
+            width,
             height,
             bgra_row_bytes,
         })
+    }
+
+    /// Encode one DMA-BUF-backed frame without a CPU upload. The fds
+    /// inside `frame` are *borrowed* — ffmpeg's VAAPI import dups them
+    /// via `vaCreateSurfaces` with PRIME_2 mem-type, so the caller can
+    /// drop the source `DmaBufFrame` (and its `GpuFrameGuard`)
+    /// immediately after this returns. `force_keyframe` mirrors
+    /// `encode_bgra`.
+    ///
+    /// Constraints: `frame.fourcc` must be NV12 (the encoder's
+    /// `sw_format`); width/height are pinned to the encoder's
+    /// construction values. Resolution changes go through a full
+    /// encoder rebuild — same as the BGRA path.
+    ///
+    /// Approach: reuse the encoder's existing VAAPI hwframes pool and
+    /// let `vaapi_map_from_drm` add each imported surface into it
+    /// on-demand. An earlier attempt to use
+    /// `av_hwframe_ctx_create_derived(VAAPI ← DRM)` for a pool that
+    /// "started" with DRM as its source returned ENOSYS — that helper
+    /// is only set up for the export direction (VAAPI → DRM). Per-frame
+    /// map into a regular pool is what works.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn submit_dmabuf(
+        &mut self,
+        frame: &DmaBufFrame,
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>> {
+        const NV12_FOURCC: u32 = u32::from_le_bytes(*b"NV12");
+        if frame.fourcc != NV12_FOURCC {
+            // Only NV12 is in the encoder's hw_frames_ctx sw_format;
+            // mapping any other fourcc would fail mid-pipeline with a
+            // less actionable error.
+            return Err(CodecError::UnsupportedInputFormat);
+        }
+        if frame.objects.len() > AV_DRM_MAX_PLANES
+            || frame.layers.len() > AV_DRM_MAX_PLANES
+        {
+            return Err(CodecError::UnsupportedInputFormat);
+        }
+        // Same upper bound on per-layer planes — otherwise the
+        // `min(AV_DRM_MAX_PLANES)` clamp in the layer loop would
+        // silently drop planes the source actually has, which is a
+        // recipe for "looks fine, decodes garbage" downstream.
+        for layer in &frame.layers {
+            if (layer.num_planes as usize) > AV_DRM_MAX_PLANES {
+                return Err(CodecError::UnsupportedInputFormat);
+            }
+        }
+
+        // Build the AVDRMFrameDescriptor. We need it owned by an
+        // AVBufferRef stored in src->buf[0] — not just dangling off
+        // src->data[0] — because ff_hwframe_map_create internally
+        // calls av_frame_ref(hwmap->source, src), and av_frame_ref
+        // deep-copies when src->buf[0] is null. Deep-copy invokes
+        // av_frame_get_buffer which DRM_PRIME can't satisfy (the
+        // hwcontext_drm.h contract is "user-allocated only"), so it
+        // returns EINVAL and the whole map fails. With buf[0] set,
+        // av_frame_ref takes the simple ref-bump path.
+        let mut desc: Box<AVDRMFrameDescriptor> =
+            Box::new(unsafe { std::mem::zeroed() });
+        desc.nb_objects = i32::try_from(frame.objects.len()).expect("<= 4");
+        for (i, obj) in frame.objects.iter().enumerate() {
+            desc.objects[i] = AVDRMObjectDescriptor {
+                fd: obj.fd.as_raw_fd(),
+                size: usize::try_from(obj.size).expect("size fits in usize"),
+                format_modifier: obj.drm_format_modifier,
+            };
+        }
+        desc.nb_layers = i32::try_from(frame.layers.len()).expect("<= 4");
+        for (i, layer) in frame.layers.iter().enumerate() {
+            let mut planes = [AVDRMPlaneDescriptor {
+                object_index: 0,
+                offset: 0,
+                pitch: 0,
+            }; AV_DRM_MAX_PLANES];
+            for p in 0..(layer.num_planes as usize).min(AV_DRM_MAX_PLANES) {
+                planes[p] = AVDRMPlaneDescriptor {
+                    object_index: i32::try_from(layer.object_index[p])
+                        .expect("object_index fits in i32"),
+                    offset: isize::try_from(layer.offset[p])
+                        .expect("offset fits in isize"),
+                    pitch: isize::try_from(layer.pitch[p])
+                        .expect("pitch fits in isize"),
+                };
+            }
+            desc.layers[i] = AVDRMLayerDescriptor {
+                format: layer.drm_format,
+                nb_planes: i32::try_from(layer.num_planes).expect("<= 4"),
+                planes,
+            };
+        }
+
+        // Wrap the descriptor in an AVBufferRef so src->buf[0] is set
+        // (see comment above). The free callback drops the Box that
+        // owns the descriptor's heap allocation. av_buffer_create takes
+        // ownership of `desc`; we Box::into_raw to surrender the Box.
+        let desc_ptr = Box::into_raw(desc);
+        unsafe extern "C" fn drm_desc_free(
+            _opaque: *mut std::ffi::c_void,
+            data: *mut u8,
+        ) {
+            // SAFETY: data was produced by Box::into_raw on a
+            // Box<AVDRMFrameDescriptor>; this is the only path that
+            // reclaims it.
+            drop(unsafe { Box::from_raw(data as *mut AVDRMFrameDescriptor) });
+        }
+        // SAFETY: desc_ptr is a valid heap allocation of size
+        // size_of::<AVDRMFrameDescriptor>(); the free callback matches
+        // its allocation strategy. av_buffer_create returns null only
+        // on OOM, which we convert to a clean error rather than
+        // unwinding through the raw pointer.
+        let desc_buf = unsafe {
+            ffi::av_buffer_create(
+                desc_ptr as *mut u8,
+                std::mem::size_of::<AVDRMFrameDescriptor>(),
+                Some(drm_desc_free),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if desc_buf.is_null() {
+            // SAFETY: av_buffer_create didn't take ownership, so we
+            // still own desc_ptr and must reclaim it.
+            unsafe { drop(Box::from_raw(desc_ptr)) };
+            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(ffi::ENOMEM))));
+        }
+
+        // Build the source DRM_PRIME AVFrame. Pointing data[0] +
+        // buf[0] at the descriptor is the ffmpeg convention;
+        // hw_frames_ctx stays NULL per the hwcontext_drm.h contract.
+        let mut src = AVFrame::new();
+        src.set_format(ffi::AV_PIX_FMT_DRM_PRIME);
+        src.set_width(i32::try_from(self.width).expect("width fits in i32"));
+        src.set_height(i32::try_from(self.height).expect("height fits in i32"));
+        // SAFETY: deref_mut() exposes the raw ffi::AVFrame so we can
+        // poke buf[0]/data[0] (rsmpeg doesn't wrap them). buf[0] takes
+        // ownership of the ref we got from av_buffer_create; the
+        // AVFrame's Drop releases it via av_frame_unref, which calls
+        // the free callback when the last ref drops.
+        unsafe {
+            let raw = src.deref_mut();
+            raw.buf[0] = desc_buf;
+            raw.data[0] = desc_ptr as *mut u8;
+        }
+
+        // Destination VAAPI frame. Pre-set format + hw_frames_ctx so
+        // av_hwframe_map sees the target context and creates a VA
+        // surface inside the encoder's pool that wraps the imported
+        // DMA-BUF (AV_HWFRAME_MAP_DIRECT semantics).
+        let mut dst = AVFrame::new();
+        dst.set_format(ffi::AV_PIX_FMT_VAAPI);
+        dst.set_width(i32::try_from(self.width).expect("width fits in i32"));
+        dst.set_height(i32::try_from(self.height).expect("height fits in i32"));
+        // SAFETY: pointing dst.hw_frames_ctx at the encoder's pool via
+        // av_buffer_ref bumps the ref count; Drop releases it. Without
+        // this, av_hwframe_map allocates a fresh internal pool that
+        // the encoder wouldn't accept on send_frame.
+        unsafe {
+            let enc_frames_ref = self
+                .encoder
+                .hw_frames_ctx_mut()
+                .expect("hw_frames_ctx set in new_bgra")
+                .as_ptr();
+            dst.deref_mut().hw_frames_ctx = ffi::av_buffer_ref(enc_frames_ref as *mut _);
+        }
+
+        // SAFETY: src is a fully-populated DRM_PRIME frame whose
+        // descriptor lives in src->buf[0]; dst is a freshly-allocated
+        // empty frame whose hw_frames_ctx points at the encoder's
+        // pool. AV_HWFRAME_MAP_DIRECT requests a zero-copy mapping.
+        // No AV_HWFRAME_MAP_READ/WRITE: those flags describe the
+        // user's intended access pattern to the *mapped* output, and
+        // the encoder reads via VAAPI ops rather than direct CPU/EGL
+        // access — setting MAP_READ here would tell the driver to
+        // wire up CPU readback fencing, which radeonsi has been
+        // observed to reject on tiled modifiers.
+        let rc = unsafe {
+            ffi::av_hwframe_map(
+                dst.as_mut_ptr(),
+                src.as_ptr(),
+                ffi::AV_HWFRAME_MAP_DIRECT as i32,
+            )
+        };
+        if rc < 0 {
+            // Map failures here are usually a modifier mismatch
+            // between the source DMA-BUF and what the encoder's pool
+            // accepts. Log the descriptor shape so field bugs are
+            // tractable without re-running with AV_LOG_DEBUG.
+            warn!(
+                rc,
+                fourcc = format_args!("{:08x}", frame.fourcc),
+                num_objects = frame.objects.len(),
+                num_layers = frame.layers.len(),
+                modifier = frame.objects.first().map(|o| o.drm_format_modifier),
+                "av_hwframe_map(DRM_PRIME -> VAAPI) failed"
+            );
+            return Err(CodecError::Ffmpeg(RsmpegError::from(rc)));
+        }
+
+        dst.set_pts(pts);
+        dst.set_pict_type(if force_keyframe {
+            ffi::AV_PICTURE_TYPE_I
+        } else {
+            ffi::AV_PICTURE_TYPE_NONE
+        });
+
+        self.encoder.send_frame(Some(&dst))?;
+
+        // src + dst are no longer needed past this point — the
+        // dst frame holds a fresh VA surface that internally references
+        // the dup'd DMA-BUF fds. Explicit drop documents the lifetime;
+        // src's buf[0] release triggers the descriptor's free callback.
+        drop(dst);
+        drop(src);
+
+        let mut out = Vec::new();
+        loop {
+            let packet = match self.encoder.receive_packet() {
+                Ok(p) => p,
+                Err(RsmpegError::EncoderDrainError | RsmpegError::EncoderFlushedError) => break,
+                Err(e) => return Err(CodecError::Ffmpeg(e)),
+            };
+            let size = packet.size as usize;
+            // SAFETY: packet.data points to packet.size valid bytes
+            // owned by the AVPacket; we copy them before drop.
+            let data = unsafe { slice::from_raw_parts(packet.data, size) }.to_vec();
+            let keyframe = (packet.flags & ffi::AV_PKT_FLAG_KEY as i32) != 0;
+            let pts_out = if packet.pts == ffi::AV_NOPTS_VALUE {
+                None
+            } else {
+                Some(packet.pts)
+            };
+            out.push(EncodedPacket {
+                data,
+                pts: pts_out,
+                keyframe,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -824,6 +1145,91 @@ mod tests {
             dmabuf.layers[1].drm_format,
             u32::from_le_bytes(*b"GR88"),
             "UV plane should be DRM_FORMAT_GR88"
+        );
+    }
+
+    /// Round-trip a frame through SW encode → VAAPI decode (which
+    /// exports a DMA-BUF) → VAAPI encode via the new DMA-BUF import
+    /// path. Validates the riskiest unknown for task #40: that ffmpeg
+    /// accepts a DRM_PRIME AVFrame mapped into the encoder's hwframes
+    /// pool and emits a valid H.264 packet without a CPU upload.
+    ///
+    /// We piggyback on the decoder to produce the DMA-BUF (which is
+    /// itself covered by `vaapi_decoder_smoke`) rather than synthesising
+    /// one via vaCreateSurfaces — both sources hit the same import code
+    /// path inside ffmpeg's hwcontext_vaapi.
+    ///
+    /// PipeWire integration lands separately; this test only exercises
+    /// the encoder/ffmpeg side.
+    #[test]
+    #[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_encoder_dmabuf_import)"]
+    fn vaapi_encoder_dmabuf_import() {
+        // Same dimensions on the SW encoder, the VAAPI decoder (implicit
+        // — picks them up from the SPS), and the VAAPI encoder built
+        // below. They must match because the encoder's hw_frames_ctx
+        // pins width/height, and av_hwframe_map needs the dst pool to
+        // accept the src dimensions.
+        let w = 320;
+        let h = 240;
+
+        let mut sw_enc = H264Encoder::new_bgra(w, h, 30, 2_000).expect("sw encoder");
+        let mut dec = VaapiDecoder::new().expect("VAAPI decoder");
+        let mut hw_enc = VaapiEncoder::new_bgra(w, h, 30, 4_000).expect("VAAPI encoder");
+
+        // Pump frames through SW encode → VAAPI decode until we get a
+        // GpuFrame holding a DMA-BUF. Six frames is the same budget
+        // vaapi_decoder_smoke uses (decoder usually emits on frame 0
+        // for the I-frame, but allow latency for swscale warmup).
+        let mut gpu_frame: Option<GpuFrame> = None;
+        for t in 0..6i64 {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let bgra = make_test_bgra(w, h, t as u32);
+            let packets = sw_enc.encode_bgra(&bgra, t, t == 0).expect("sw encode");
+            for p in packets {
+                dec.submit(&p.data).expect("vaapi submit");
+                while let Some(f) = dec.next_frame().expect("vaapi next_frame") {
+                    let Frame::Gpu(g) = f else {
+                        panic!("VaapiDecoder must emit Gpu frames");
+                    };
+                    gpu_frame = Some(g);
+                }
+            }
+            if gpu_frame.is_some() {
+                break;
+            }
+        }
+        let gpu = gpu_frame.expect("decoder produced a GpuFrame");
+        let GpuFrameSource::DmaBuf(ref dmabuf) = gpu.source;
+
+        // Hand the DMA-BUF straight to the VAAPI encoder. `gpu`
+        // (whose guard owns the source VA surface) stays alive through
+        // the end of the test via the `dmabuf` borrow into `gpu.source`.
+        // In production, the guard drops as soon as submit_dmabuf
+        // returns — ffmpeg dups the DMA-BUF fds internally during
+        // av_hwframe_map, so the source surface is no longer needed.
+        let packets = hw_enc
+            .submit_dmabuf(dmabuf, 0, true)
+            .expect("submit_dmabuf");
+
+        // First imported frame can emit 0 packets (encoder warm-up
+        // buffers SPS/PPS until the next frame) or 1+ packets carrying
+        // the headers plus IDR slice. Either way, no error and any
+        // returned packet is non-empty.
+        for p in &packets {
+            assert!(!p.data.is_empty(), "encoded packet must not be empty");
+        }
+
+        // To prove the encoder really produced output (not just
+        // accepted the input), push one more imported frame and drain.
+        // Re-using the same dmabuf is fine — ffmpeg's VAAPI import
+        // re-dups the fds each call, and the source surface is
+        // unchanged because nothing has reffed it since the decoder.
+        let more = hw_enc
+            .submit_dmabuf(dmabuf, 1, false)
+            .expect("submit_dmabuf #2");
+        assert!(
+            !packets.is_empty() || !more.is_empty(),
+            "encoder must emit at least one packet across two submitted frames"
         );
     }
 }

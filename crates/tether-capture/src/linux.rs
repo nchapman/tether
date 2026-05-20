@@ -339,7 +339,14 @@ fn run_pipewire(
 /// DRM modifier the GPU importer can consume); empty produces the SHM
 /// variant (all four 4-byte SPA formats, no modifier prop).
 ///
-/// Size range 1x1 to 7680x4320 (8K), framerate 0..=240 fps. Built with
+/// Size range 1x1 to 7680x4320 (8K). Framerate: SPA Range with
+/// default=60, min=0, max=240 — the compositor typically mirrors the
+/// display refresh (60 Hz → 60 fps, 144 Hz → 144 fps clamped at our
+/// max). 60 fps is the host's encoder target so that's the default
+/// hint; compositors that can drive higher get to. The encoder
+/// time_base is decoupled from the actual delivered rate (VBR
+/// bitrate, GOP measured in frames) so frame-rate variation does not
+/// stall the pipeline. Built with
 /// pipewire-rs's object!/property! macros; the modifier property needs a
 /// manual `Property` because the macro doesn't expose property flags,
 /// and the prop is required to carry both MANDATORY and DONT_FIXATE —

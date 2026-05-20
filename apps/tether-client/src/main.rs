@@ -173,9 +173,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(ControlMessage::StreamReady { .. }
                        | ControlMessage::StreamPause { .. }
-                       | ControlMessage::StreamResume { .. }) => {
+                       | ControlMessage::StreamResume { .. }
+                       | ControlMessage::ClientStats { .. }) => {
                         // Client-originated; misrouted if seen on the client side.
-                        tracing::debug!("unexpected client→host stream-lifecycle message arrived on client; ignoring");
+                        tracing::debug!("unexpected client→host control message arrived on client; ignoring");
                     }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");
@@ -220,6 +221,11 @@ async fn main() -> anyhow::Result<()> {
             warn!(error = ?e, "StreamReady send failed; host will not emit video");
         }
         let mut frame_count: u64 = 0;
+        // Reassembler cumulative counters at the start of the current
+        // stats window. Diff against the live counters to compute the
+        // per-interval drop and fragment-loss rates for ClientStats.
+        let mut last_frames_dropped: u64 = 0;
+        let mut last_fragments_lost: u64 = 0;
         // Sum of decode call wall-clocks across the frames in the
         // current log window, surfaced as avg_decode_ms on the
         // frame-stats line. Same shape as the host's avg_encode_ms
@@ -367,6 +373,46 @@ async fn main() -> anyhow::Result<()> {
 
                     if last_log.elapsed() >= std::time::Duration::from_secs(1) {
                         let window_secs = last_log.elapsed().as_secs_f64();
+                        // ClientStats — host uses this to drive future
+                        // adaptive bitrate / FEC strength / codec
+                        // downshift decisions. Counters are diffed
+                        // against last window so the wire field is a
+                        // per-interval rate; rtt_ewma_us is whole-
+                        // session EWMA on the QUIC RTT.
+                        let (frames_dropped_now, fragments_lost_now) =
+                            reassembler.loss_counters();
+                        let frames_dropped_delta = u32::try_from(
+                            frames_dropped_now.saturating_sub(last_frames_dropped),
+                        )
+                        .unwrap_or(u32::MAX);
+                        let fragments_lost_delta = u32::try_from(
+                            fragments_lost_now.saturating_sub(last_fragments_lost),
+                        )
+                        .unwrap_or(u32::MAX);
+                        last_frames_dropped = frames_dropped_now;
+                        last_fragments_lost = fragments_lost_now;
+                        let interval_ms = u32::try_from(
+                            (window_secs * 1000.0).round() as i64,
+                        )
+                        .unwrap_or(u32::MAX);
+                        let rtt_ewma_us = u32::try_from(
+                            conn_recv.rtt().as_micros().min(u128::from(u32::MAX)),
+                        )
+                        .unwrap_or(u32::MAX);
+                        let stats = ControlMessage::ClientStats {
+                            interval_ms,
+                            frames_received: u32::try_from(frame_count).unwrap_or(u32::MAX),
+                            frames_dropped: frames_dropped_delta,
+                            fragments_lost: fragments_lost_delta,
+                            rtt_ewma_us,
+                        };
+                        let conn_stats = conn_recv.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = conn_stats.send_control(&stats).await {
+                                tracing::trace!(error = ?e, "ClientStats send failed");
+                            }
+                        });
+
                         #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
                         let avg_decode_ms = if frame_count > 0 {
                             (decode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0

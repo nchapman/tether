@@ -333,6 +333,25 @@ async fn handle_client(
                         // onto the resumed stream without a partial GOP.
                         force_idr.raise();
                     }
+                    Ok(ControlMessage::ClientStats {
+                        interval_ms,
+                        frames_received,
+                        frames_dropped,
+                        fragments_lost,
+                        rtt_ewma_us,
+                    }) => {
+                        // No adaptive policy yet — log only. When the
+                        // host learns to act on these, it consumes the
+                        // counters here and feeds the rate controller.
+                        info!(
+                            interval_ms,
+                            frames_received,
+                            frames_dropped,
+                            fragments_lost,
+                            rtt_ewma_us,
+                            "client stats"
+                        );
+                    }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
                         let t1 = MonoNanos::now();
                         let response = ControlMessage::ClockProbeResponse(

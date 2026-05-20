@@ -358,6 +358,20 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_client_stats() {
+        let msg = ControlMessage::ClientStats {
+            interval_ms: 1000,
+            frames_received: 60,
+            frames_dropped: 2,
+            fragments_lost: 4,
+            rtt_ewma_us: 9_500,
+        };
+        let bytes = encode(&msg).unwrap();
+        let msg2: ControlMessage = decode(&bytes).unwrap();
+        assert_eq!(msg, msg2);
+    }
+
+    #[test]
     fn round_trip_stream_lifecycle() {
         // The three lifecycle variants gate host frame emission. All
         // three need to survive the wire identically.

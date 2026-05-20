@@ -287,6 +287,16 @@ pub struct FrameReassembler {
     pending: HashMap<FrameKey, Pending>,
     latest_seq: HashMap<StreamKey, u32>,
     max_age: u32,
+    /// Cumulative count of frames the reassembler started but pruned
+    /// (timed out past `max_age`) before completing — i.e. frames the
+    /// client never got to render.
+    frames_dropped: u64,
+    /// Cumulative count of fragments rejected as stale (older than
+    /// `max_age` behind the latest seq seen on their stream). This is
+    /// a lower bound on lost-then-arrived-late fragments; truly lost
+    /// fragments never show up at all and are inferred from
+    /// `frames_dropped` instead.
+    fragments_lost: u64,
 }
 
 type FrameKey = (u8, u32, u32);
@@ -311,6 +321,8 @@ impl FrameReassembler {
             pending: HashMap::new(),
             latest_seq: HashMap::new(),
             max_age: 4,
+            frames_dropped: 0,
+            fragments_lost: 0,
         }
     }
 
@@ -319,6 +331,15 @@ impl FrameReassembler {
     pub fn with_max_age(mut self, max_age: u32) -> Self {
         self.max_age = max_age;
         self
+    }
+
+    /// Returns `(frames_dropped, fragments_lost)`. Counters are
+    /// cumulative over the reassembler's lifetime; callers diff
+    /// successive reads to compute per-interval rates for
+    /// `ControlMessage::ClientStats`.
+    #[must_use]
+    pub fn loss_counters(&self) -> (u64, u64) {
+        (self.frames_dropped, self.fragments_lost)
     }
 
     pub fn handle(&mut self, packet: VideoPacket) -> Option<ReassembledFrame> {
@@ -355,6 +376,7 @@ impl FrameReassembler {
                 frame_seq,
                 latest
             );
+            self.fragments_lost = self.fragments_lost.saturating_add(1);
             return None;
         }
 
@@ -432,11 +454,18 @@ impl FrameReassembler {
     fn prune_old(&mut self) {
         let max_age = self.max_age;
         let latest = self.latest_seq.clone();
+        let before = self.pending.len();
         self.pending.retain(|(d, e, seq), _| {
             latest
                 .get(&(*d, *e))
                 .is_none_or(|l| l.saturating_sub(*seq) <= max_age)
         });
+        let pruned = before.saturating_sub(self.pending.len());
+        // Each pending entry that got evicted is a frame the receiver
+        // started reassembling but never finished — i.e. a frame the
+        // renderer never sees. Count it as a drop so ClientStats can
+        // report the loss.
+        self.frames_dropped = self.frames_dropped.saturating_add(pruned as u64);
     }
 }
 

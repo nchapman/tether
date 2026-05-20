@@ -281,6 +281,17 @@ pub enum ControlMessage {
     /// subsequent P-frames so the client doesn't render a half-decoded
     /// stream.
     StreamResume { display: u8 },
+    /// Client → host. Periodic receive-side telemetry (1 Hz typical).
+    /// Feeds future adaptive-bitrate / FEC / codec-downshift policy on
+    /// the host. Counters are per the elapsed `interval_ms` window;
+    /// `rtt_ewma_us` is the EWMA over the connection's lifetime so far.
+    ClientStats {
+        interval_ms: u32,
+        frames_received: u32,
+        frames_dropped: u32,
+        fragments_lost: u32,
+        rtt_ewma_us: u32,
+    },
 }
 
 // --- ClockSync ----------------------------------------------------------

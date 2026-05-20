@@ -112,8 +112,8 @@ mod tests {
     use crate::input::*;
     use crate::video::{
         FrameFragmenter, FrameReassembler, HostFrameTiming, HostFrameTimingBuilder,
-        InputEchoBatch, VideoFrameMeta, VideoPacket, CONTINUATION_PAYLOAD_BUDGET,
-        FIRST_PAYLOAD_BUDGET,
+        InputEchoBatch, VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket,
+        CONTINUATION_PAYLOAD_BUDGET, FIRST_PAYLOAD_BUDGET,
     };
 
     #[test]
@@ -306,7 +306,7 @@ mod tests {
             stream_epoch: 0,
             frame_seq: 42,
             fragment_count: 3,
-            meta: VideoFrameMeta {
+            meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
                 timing: HostFrameTiming {
                     t_capture_kernel: MonoNanos(1_000),
                     t_capture_userspace: MonoNanos(1_100),
@@ -319,7 +319,7 @@ mod tests {
                     event_ids: vec![1, 2, 3],
                 },
                 dimensions: (320, 240),
-            },
+            }),
             payload: vec![0xAA; 1100],
         };
         let bytes = encode(&p).unwrap();
@@ -337,12 +337,32 @@ mod tests {
                 assert_eq!(stream_epoch, 0);
                 assert_eq!(frame_seq, 42);
                 assert_eq!(fragment_count, 3);
+                let meta = meta.into_meta();
                 assert!(meta.keyframe);
                 assert_eq!(meta.input_echo.event_ids, vec![1, 2, 3]);
                 assert_eq!(payload.len(), 1100);
             }
             VideoPacket::Continuation { .. } => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn videoframe_meta_envelope_round_trip() {
+        // The envelope discriminator is the load-bearing addition:
+        // future per-frame metadata (HDR, ROI, QP) lands as new
+        // variants without breaking the wire. Confirm V1 unwraps
+        // back to the original meta.
+        let original = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: true,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (1280, 720),
+        };
+        let env = VideoFrameMetaEnvelope::V1(original.clone());
+        let bytes = encode(&env).unwrap();
+        let env2: VideoFrameMetaEnvelope = decode(&bytes).unwrap();
+        let unwrapped = env2.into_meta();
+        assert_eq!(unwrapped, original);
     }
 
     #[test]
@@ -356,12 +376,12 @@ mod tests {
             stream_epoch: epoch,
             frame_seq: 0,
             fragment_count: 1,
-            meta: VideoFrameMeta {
+            meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
                 timing: HostFrameTiming::default(),
                 keyframe: true,
                 input_echo: InputEchoBatch::default(),
                 dimensions: (1, 1),
-            },
+            }),
             payload: vec![],
         };
         let bytes = encode(&p).unwrap();
@@ -434,7 +454,7 @@ mod tests {
             stream_epoch: u32::MAX,
             frame_seq: u32::MAX,
             fragment_count: u16::MAX,
-            meta: VideoFrameMeta {
+            meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
                 timing: HostFrameTiming {
                     t_capture_kernel: MonoNanos(u64::MAX / 2),
                     t_capture_userspace: MonoNanos(u64::MAX / 2),
@@ -447,7 +467,7 @@ mod tests {
                     event_ids: vec![u64::MAX; 4],
                 },
                 dimensions: (u32::MAX, u32::MAX),
-            },
+            }),
             payload: vec![0; 1080],
         };
         let bytes = encode(&p).unwrap();

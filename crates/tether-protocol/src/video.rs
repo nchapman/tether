@@ -106,6 +106,14 @@ pub struct InputEchoBatch {
 
 /// Per-frame metadata. Sent in fragment 0 of a video frame, not repeated
 /// across continuation packets.
+///
+/// **Wire-additive policy:** `VideoFrameMeta` is a closed struct — adding a
+/// field would be a wire break. New per-frame metadata (HDR mastering
+/// display info, ROI hints, encoder QP feedback, etc.) must land as a new
+/// variant of [`VideoFrameMetaEnvelope`], which is the type that actually
+/// rides on the wire in [`VideoPacket::First`]. The receive side unwraps
+/// to a `VideoFrameMeta` for downstream consumers; new variants update
+/// that conversion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoFrameMeta {
     pub timing: HostFrameTiming,
@@ -116,6 +124,29 @@ pub struct VideoFrameMeta {
     /// codec-specific SPS / sequence headers. Costs ~10 bytes per frame
     /// header (varint-encoded u32 pair).
     pub dimensions: (u32, u32),
+}
+
+/// Versioned envelope around [`VideoFrameMeta`]. Costs one discriminator
+/// byte per keyframe-bearing packet; in return, future per-frame metadata
+/// (HDR, ROI, QP) is purely additive — a new envelope variant rather than
+/// a struct-field append (forbidden by the bincode positional-encoding
+/// forward-compat rules).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoFrameMetaEnvelope {
+    V1(VideoFrameMeta),
+}
+
+impl VideoFrameMetaEnvelope {
+    /// Convenience for receivers: collapse any current envelope variant
+    /// into the legacy `VideoFrameMeta` shape. Future variants update
+    /// this method to project their richer payload back onto the
+    /// `VideoFrameMeta` fields downstream code already reads.
+    #[must_use]
+    pub fn into_meta(self) -> VideoFrameMeta {
+        match self {
+            Self::V1(m) => m,
+        }
+    }
 }
 
 /// A single video datagram. Frames larger than the transport's max datagram
@@ -142,7 +173,7 @@ pub enum VideoPacket {
         stream_epoch: u32,
         frame_seq: u32,
         fragment_count: u16,
-        meta: VideoFrameMeta,
+        meta: VideoFrameMetaEnvelope,
         payload: Vec<u8>,
     },
     Continuation {
@@ -195,7 +226,8 @@ impl FrameFragmenter {
     }
 
     /// Fragment a frame body into one or more packets. `meta` rides in
-    /// fragment 0 only. An empty body still produces a single
+    /// fragment 0 only, wrapped in the current `VideoFrameMetaEnvelope`
+    /// variant. An empty body still produces a single
     /// [`VideoPacket::First`] with `fragment_count = 1`.
     pub fn fragment(&mut self, meta: VideoFrameMeta, body: &[u8]) -> Vec<VideoPacket> {
         let frame_seq = self.next_frame_seq;
@@ -213,7 +245,7 @@ impl FrameFragmenter {
             stream_epoch: self.stream_epoch,
             frame_seq,
             fragment_count,
-            meta,
+            meta: VideoFrameMetaEnvelope::V1(meta),
             payload: body[..first_len].to_vec(),
         });
 
@@ -353,7 +385,7 @@ impl FrameReassembler {
                     entry.fragments[0] = Some(payload);
                     entry.received_count += 1;
                 }
-                entry.meta = Some(meta);
+                entry.meta = Some(meta.into_meta());
             }
             VideoPacket::Continuation {
                 fragment_index,

@@ -4,7 +4,7 @@ use tether_protocol::{
     control::ControlMessage,
     cursor::{ClientCursorPacket, HostCursorPacket},
     input::{InputEvent, InputEventKind, Modifiers, MouseButton},
-    video::{HostFrameTiming, InputEchoBatch, VideoFrameMeta, VideoPacket},
+    video::{HostFrameTiming, InputEchoBatch, VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket},
     MonoNanos,
 };
 use tether_transport::{Client, Datagram, Server};
@@ -70,12 +70,12 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
         stream_epoch: 0,
         frame_seq: 7,
         fragment_count: 1,
-        meta: VideoFrameMeta {
+        meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: true,
             input_echo: InputEchoBatch::default(),
             dimensions: (320, 240),
-        },
+        }),
         payload: vec![0u8; 100],
     };
     conn.send_datagram(&Datagram::Video(video))?;
@@ -223,12 +223,12 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
         stream_epoch: 0,
         frame_seq: 0,
         fragment_count: 1,
-        meta: VideoFrameMeta {
+        meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: false,
             input_echo: InputEchoBatch::default(),
             dimensions: (320, 240),
-        },
+        }),
         payload: vec![0u8; 4096],
     };
     let err = conn.send_datagram(&Datagram::Video(oversized));

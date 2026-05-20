@@ -364,13 +364,14 @@ struct EncoderSlot {
     width: u32,
     height: u32,
     /// Lazily-built BGRA→NV12 + DMA-BUF bridge for the zero-copy
-    /// capture→encode path. `Some` after the first `CapturedFrame::Gpu`
-    /// arrives and the wgpu device opens; `None` while the stream is
-    /// SHM-only or before any Gpu frame has been seen.
-    ///
-    /// `Err` once we've tried and failed (no Vulkan adapter, etc.) so
-    /// subsequent Gpu frames just drop with a one-line warn instead of
-    /// retrying the device-open at frame rate.
+    /// capture→encode path. `NotYetBuilt` while the stream is SHM-only
+    /// or before any Gpu frame has been seen; `Ready` after the first
+    /// successful build for this resolution. No `Failed` state — the
+    /// startup probe (`importable_dmabuf_modifiers`) gates whether the
+    /// compositor ever offers DMA-BUF in the first place, so failure at
+    /// this layer would be an anomalous device-loss / OOM and is
+    /// surfaced as a fatal error that exits the send loop rather than a
+    /// silent per-frame drop.
     #[cfg(target_os = "linux")]
     bridge: BridgeState,
 }
@@ -379,7 +380,20 @@ struct EncoderSlot {
 enum BridgeState {
     NotYetBuilt,
     Ready(Nv12DmaBuf),
-    Failed,
+}
+
+/// Outcome of one Gpu-frame encode attempt. Distinguishes per-frame
+/// failures (drop this frame, keep going) from bridge construction
+/// failure (no recovery; exit the send loop). Per-frame errors are
+/// usually transient (a single bad PipeWire buffer); bridge-init failure
+/// after the startup probe succeeded indicates device loss or OOM and
+/// the client would just freeze if we silently dropped every subsequent
+/// frame.
+#[cfg(target_os = "linux")]
+enum GpuEncodeOutcome {
+    Packets(Vec<tether_codec::EncodedPacket>),
+    DropFrame(anyhow::Error),
+    Fatal(anyhow::Error),
 }
 
 /// Encode one PipeWire-supplied DMA-BUF frame through the zero-copy
@@ -387,42 +401,37 @@ enum BridgeState {
 /// DMA-BUF Y/UV planes, hand both to the encoder's `encode_gpu`.
 ///
 /// On first call, lazily opens the wgpu device and allocates the
-/// bridge; the result is cached on the `EncoderSlot`. On any error in
-/// device-open or feature-probe, the bridge moves to `Failed` and
-/// subsequent Gpu frames return Err — the caller drops them with a
-/// warn, and the SHM-fallback path is unaffected (if PipeWire ever
-/// emits a Cpu frame, the existing `encode_bgra` arm handles it).
+/// bridge; the result is cached on the `EncoderSlot`.
 #[cfg(target_os = "linux")]
 fn encode_gpu_frame(
     slot: &mut EncoderSlot,
     gpu: tether_capture::GpuCapturedFrame,
     pts: i64,
     force_keyframe: bool,
-) -> anyhow::Result<Vec<tether_codec::EncodedPacket>> {
+) -> GpuEncodeOutcome {
     let bridge = match &mut slot.bridge {
         BridgeState::Ready(b) => b,
-        BridgeState::Failed => {
-            anyhow::bail!("GPU encode bridge is in failed state; dropping frame")
-        }
         BridgeState::NotYetBuilt => {
             match pollster::block_on(Nv12DmaBuf::new(slot.width, slot.height)) {
-                Ok(b) => {
+                Ok(built) => {
                     info!(
                         width = slot.width,
                         height = slot.height,
                         "gpuconvert bridge initialised for zero-copy DMA-BUF encode"
                     );
-                    slot.bridge = BridgeState::Ready(b);
+                    slot.bridge = BridgeState::Ready(built);
                     let BridgeState::Ready(b) = &mut slot.bridge else {
                         unreachable!()
                     };
                     b
                 }
                 Err(e) => {
-                    warn!(error = %e, "gpuconvert bridge init failed; \
-                           future Gpu frames will be dropped");
-                    slot.bridge = BridgeState::Failed;
-                    anyhow::bail!("bridge init failed: {e}");
+                    return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                        "gpuconvert bridge init failed for {}x{} after startup \
+                         probe succeeded — device loss or OOM: {e}",
+                        slot.width,
+                        slot.height,
+                    ));
                 }
             }
         }
@@ -437,12 +446,18 @@ fn encode_gpu_frame(
         modifier,
     } = dmabuf;
 
-    let imported = bridge
-        .import_bgra_dmabuf(fd, modifier, stride, offset)
-        .map_err(|e| anyhow::anyhow!("import_bgra_dmabuf: {e}"))?;
-    let nv12 = bridge
-        .convert(&imported)
-        .map_err(|e| anyhow::anyhow!("Nv12DmaBuf::convert: {e}"))?;
+    let imported = match bridge.import_bgra_dmabuf(fd, modifier, stride, offset) {
+        Ok(t) => t,
+        Err(e) => {
+            return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("import_bgra_dmabuf: {e}"));
+        }
+    };
+    let nv12 = match bridge.convert(&imported) {
+        Ok(f) => f,
+        Err(e) => {
+            return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("Nv12DmaBuf::convert: {e}"));
+        }
+    };
     // gpu.release_guard drops here implicitly along with `imported`
     // and `dmabuf` once `nv12` has the dup'd Y/UV fds owned. The
     // bridge's poll-on-completion guarantees the compute write retired
@@ -452,9 +467,13 @@ fn encode_gpu_frame(
                      // shader treats input as BGRA regardless.
 
     let codec_frame = nv12_dmabuf_to_codec_frame(nv12);
-    slot.encoder
+    match slot
+        .encoder
         .encode_gpu(GpuEncoderFrame::DmaBuf(&codec_frame), pts, force_keyframe)
-        .map_err(|e| anyhow::anyhow!("encode_gpu: {e}"))
+    {
+        Ok(packets) => GpuEncodeOutcome::Packets(packets),
+        Err(e) => GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}")),
+    }
 }
 
 /// Build a `DmaBufFrame` (NV12, two objects, two layers — Y as R8 and
@@ -646,15 +665,17 @@ fn run_capture_and_send(
                 }
             }
             #[cfg(target_os = "linux")]
-            CapturedFrame::Gpu(gpu) => {
-                match encode_gpu_frame(slot_mut, gpu, pts, force_kf) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        warn!(error = %e, "GPU encode failed; dropping frame");
-                        continue;
-                    }
+            CapturedFrame::Gpu(gpu) => match encode_gpu_frame(slot_mut, gpu, pts, force_kf) {
+                GpuEncodeOutcome::Packets(p) => p,
+                GpuEncodeOutcome::DropFrame(e) => {
+                    warn!(error = %e, "GPU encode failed; dropping frame");
+                    continue;
                 }
-            }
+                GpuEncodeOutcome::Fatal(e) => {
+                    tracing::error!(error = %e, "GPU encode bridge collapsed; exiting send loop");
+                    return;
+                }
+            },
             #[cfg(not(target_os = "linux"))]
             CapturedFrame::Gpu(_) => {
                 warn!("Gpu CapturedFrame on a non-Linux build; dropping");

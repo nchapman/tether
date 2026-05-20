@@ -8,8 +8,11 @@
 
 pub mod control;
 pub mod cursor;
+pub mod guard;
 pub mod input;
 pub mod video;
+
+pub use guard::GpuResourceGuard;
 
 use serde::{Deserialize, Serialize};
 

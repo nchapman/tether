@@ -16,6 +16,13 @@ pub mod vaapi;
 
 pub use probe::{probe_decoder, probe_encoder_bgra};
 
+/// Re-export of [`tether_protocol::GpuResourceGuard`]. The decoder
+/// stashes whatever ref-counted handles it needs alive while the
+/// renderer reads the surface (typically an `AVFrame` whose `Drop`
+/// returns the VAAPI surface to the pool); the renderer can't
+/// downcast or inspect.
+pub use tether_protocol::GpuResourceGuard as GpuFrameGuard;
+
 use std::sync::Once;
 
 /// GOP length used by every H.264 encoder we ship. Long enough that
@@ -277,7 +284,7 @@ impl GpuFrame {
             height,
             pts,
             source,
-            _guard: GpuFrameGuard { inner: Box::new(guard) },
+            _guard: GpuFrameGuard::new(guard),
         }
     }
 
@@ -346,31 +353,6 @@ pub struct DmaBufLayer {
     pub object_index: [u32; 4],
     pub offset: [u32; 4],
     pub pitch: [u32; 4],
-}
-
-/// Opaque "hold these refs alive while the renderer reads the surface"
-/// container. The inner box is a sealed trait object so different
-/// decoders can stash backend-specific lifetimes (e.g. an `AVFrame`)
-/// without leaking their crate's types through `Decoder`'s public API
-/// — and without advertising `Any`'s downcasting capability, which
-/// would invite consumers to depend on the concrete type by convention.
-pub struct GpuFrameGuard {
-    // Held purely for its Drop.
-    #[allow(dead_code)]
-    inner: Box<dyn GuardPayload>,
-}
-
-/// Sealed marker for anything a backend wants to keep alive for the
-/// lifetime of a `GpuFrame`. Blanket-impl'd for every `Send + 'static`
-/// type; the trait itself is private so no one outside this crate can
-/// implement it or downcast through it.
-trait GuardPayload: Send + 'static {}
-impl<T: Send + 'static> GuardPayload for T {}
-
-impl std::fmt::Debug for GpuFrameGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuFrameGuard").finish_non_exhaustive()
-    }
 }
 
 /// Pluggable video-decoder backend. Same probe pattern as `Encoder` —

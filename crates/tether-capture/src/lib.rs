@@ -20,6 +20,11 @@ pub mod linux;
 
 use tether_protocol::MonoNanos;
 
+/// Re-export of [`tether_protocol::GpuResourceGuard`]. Producers (the
+/// capture backend) stash whatever they need to keep alive while the
+/// consumer reads the buffer; consumers can't downcast or inspect.
+pub use tether_protocol::GpuResourceGuard as GpuCapturedGuard;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     /// 8-bit-per-channel BGRA, little-endian per pixel (B, G, R, A).
@@ -111,32 +116,6 @@ pub struct CapturedDmaBuf {
     pub offset: u64,
     pub modifier: u64,
 }
-
-/// Sealed Drop carrier — same shape as `tether_codec::GpuFrameGuard`.
-/// Producers (the capture backend) stash whatever they need to keep
-/// alive; consumers can't downcast or inspect.
-pub struct GpuCapturedGuard {
-    #[allow(dead_code)]
-    inner: Box<dyn GuardPayload>,
-}
-
-impl GpuCapturedGuard {
-    /// Wrap any `Send + 'static` value so it's dropped when the
-    /// `GpuCapturedFrame` is. Used by backends to attach their
-    /// release/queue-back logic.
-    pub fn new<T: Send + 'static>(payload: T) -> Self {
-        Self { inner: Box::new(payload) }
-    }
-}
-
-impl std::fmt::Debug for GpuCapturedGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuCapturedGuard").finish_non_exhaustive()
-    }
-}
-
-trait GuardPayload: Send + 'static {}
-impl<T: Send + 'static> GuardPayload for T {}
 
 impl CapturedFrame {
     #[must_use]

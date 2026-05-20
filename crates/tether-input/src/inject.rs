@@ -71,17 +71,25 @@ impl Injector for NoopInjector {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod enigo_backend;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::LibeiInjector;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::MacOsInjector;
+
 /// Pick the best available backend for the current target. On Linux
-/// the same backend ([`LibeiInjector`]) handles both Wayland (libei
-/// via the Remote Desktop portal) and X11 (XTest via x11rb); the
-/// constructor probes `WAYLAND_DISPLAY` and tells enigo which path
-/// to take. On unsupported targets we fall back to [`NoopInjector`]
-/// with a single warn-level log so the operator notices.
+/// [`LibeiInjector`] drives libei via the Remote Desktop portal; on
+/// macOS [`MacOsInjector`] drives CGEvent (no portal — the
+/// Accessibility TCC grant is the equivalent gate). On unsupported
+/// targets we fall back to [`NoopInjector`] with a single warn-level
+/// log so the operator notices.
 pub async fn default_injector() -> Box<dyn Injector> {
     #[cfg(target_os = "linux")]
     {
@@ -98,7 +106,24 @@ pub async fn default_injector() -> Box<dyn Injector> {
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        match MacOsInjector::connect().await {
+            Ok(inj) => {
+                return Box::new(inj);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "macOS injector unavailable; falling back to noop. \
+                     Input events will be logged but not applied. \
+                     Most likely missing Accessibility TCC grant — \
+                     System Settings → Privacy & Security → Accessibility."
+                );
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     tracing::warn!(
         "no input injection backend compiled for this target; using noop"
     );

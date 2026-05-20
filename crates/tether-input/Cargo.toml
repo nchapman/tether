@@ -29,5 +29,15 @@ tokio = { workspace = true }
 # those lines to log!().
 libc = "0.2"
 
+# macOS uses enigo's CGEvent backend (always present, no feature flag
+# needed). default-features = false drops the x11rb default feature;
+# its sys-crate would not compile here anyway because enigo gates
+# x11rb itself behind `cfg(all(unix, not(target_os = "macos")))`, but
+# dropping the feature keeps the dep graph honest and avoids a stray
+# x11rb resolution step on `cargo update`.
+[target.'cfg(target_os = "macos")'.dependencies]
+enigo = { version = "0.6", default-features = false }
+tokio = { workspace = true }
+
 [lints]
 workspace = true

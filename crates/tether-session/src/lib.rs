@@ -9,8 +9,7 @@
 //! is obvious independent of a second platform actually existing live
 //! here. As macOS and Windows host binaries land, the platform-shared
 //! orchestration (handshake, fragmenter ownership, the recv-task
-//! JoinSet) will move in here too — see the workstream-3 entry in the
-//! foundation review for the full target shape.
+//! JoinSet) will move in here too.
 
 mod idr;
 mod stats;

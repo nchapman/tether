@@ -8,13 +8,13 @@ each layer covers, and how to extend it.
 
 | Crate | Tests | Covers |
 | --- | --- | --- |
-| `tether-protocol` | 19 | Wire round-trips (ClientHello envelope, video packets, cursor, input), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant must fail decode). |
-| `tether-transport` | 7 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning. |
-| `tether-codec` | 2 unit | SW H264 round-trip (test-only). |
+| `tether-protocol` | 20 | Wire round-trips (ClientHello envelope, video packets, cursor, input), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant fails decode; trailing bytes fail decode). |
+| `tether-transport` | 4 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning. |
+| `tether-codec` | 2 unit + 3 `#[ignore]` | SW H264 round-trip (test-only); VAAPI encoder/decoder/dma-buf-import on hardware. |
 | `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |
 | `tether-session` | 5 | `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate. |
-| `tether-render` | 4 | Cursor letterbox clipping, aspect ratio. |
-| `tether-gpuconvert` | 6 (all `#[ignore]`) | BGRA→NV12 + DMA-BUF round-trip with real Vulkan adapter. |
+| `tether-render` | 4 + 1 `#[ignore]` | Cursor letterbox clipping, aspect ratio; dma-buf zero-copy on hardware. |
+| `tether-gpuconvert` | 11 `#[ignore]` | BGRA→NV12 + DMA-BUF round-trip with real Vulkan adapter. |
 
 ## Test categories
 
@@ -30,9 +30,9 @@ with an explanatory string:
   extension, etc.) so the next person can see at a glance whether
   their box should run them.
 
-Today there are **16 ignored tests** across `tether-codec/vaapi`,
-`tether-gpuconvert`, and `tether-render`. They are real and load-bearing
-on hardware; they are not abandoned.
+Today there are **15 ignored tests** across `tether-codec/vaapi`
+(3), `tether-gpuconvert` (11), and `tether-render` (1). They are
+real and load-bearing on hardware; they are not abandoned.
 
 ## Conventions for new tests
 
@@ -67,8 +67,7 @@ on hardware; they are not abandoned.
   Linux↔Linux LAN; no automation. A `tether-session` loopback
   integration test that runs `HostSession` and `ClientSession`
   over a `tokio::io::duplex` shim is the natural next addition
-  once those session-level scaffolds exist (the workstream-3
-  follow-up).
+  once those session-level scaffolds exist.
 - **The actual rendered pixels.** `tether-render`'s shader output
   is validated by eye, not by image-diff. A headless `wgpu::Surface`
   + image diff against a checked-in fixture is a worthwhile

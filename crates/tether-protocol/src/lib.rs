@@ -87,7 +87,20 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
 // should also refuse oversize payloads. Wire bincode's Limit config or wrap
 // here once the transport is in place and we can measure realistic sizes.
 pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> {
-    let (value, _) = bincode::serde::decode_from_slice(bytes, bincode_config())?;
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode_config())?;
+    // Strict-decode: every framed message must be fully consumed by its
+    // declared type. The forward-compat policy (see control.rs) says
+    // appending fields to a body is forbidden — only new enum variants
+    // are wire-additive. Catching trailing bytes here is what enforces
+    // that promise: a buggy future encoder that ignored the rule would
+    // trip this error in old receivers rather than having its extra
+    // bytes silently misattributed.
+    if consumed != bytes.len() {
+        return Err(CodecError::Decode(bincode::error::DecodeError::Other(
+            "decoded message had trailing bytes; sender may be using a \
+             schema-incompatible protocol revision",
+        )));
+    }
     Ok(value)
 }
 
@@ -180,6 +193,32 @@ mod tests {
         let ClientHello::V1(body2) = decode::<ClientHello>(&bytes).unwrap();
         assert_eq!(body2.extensions, extensions);
         assert_eq!(body2.resume_token, Some(vec![0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    #[test]
+    fn trailing_bytes_fail_decode() {
+        // Strict-decode is the forcing function for the "no appended
+        // fields" forward-compat policy: a future encoder that appends
+        // a field to ClientHelloV1 (forbidden — see control.rs module
+        // doc) would produce a wire payload that decodes one extra
+        // byte past where this build's schema thinks the message ends.
+        // We surface that as a decode error rather than silently
+        // truncating.
+        let body = ClientHelloV1 {
+            client_name: "x".into(),
+            preferred_codecs: vec![CodecKind::H264],
+            max_resolution: None,
+            clock_probe_t0: MonoNanos(0),
+            extensions: Default::default(),
+            resume_token: None,
+        };
+        let mut bytes = encode(&ClientHello::V1(body)).unwrap();
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let result = decode::<ClientHello>(&bytes);
+        assert!(
+            result.is_err(),
+            "trailing bytes after a valid message must fail decode"
+        );
     }
 
     #[test]

@@ -30,10 +30,11 @@ tether/
     ├── tether-gpuconvert    # host-side BGRA→NV12 compute + DMA-BUF export
     ├── tether-render        # client-side wgpu renderer (NV12 → window)
     ├── tether-input         # keyboard/mouse capture (client) + injection (host)
+    ├── tether-session       # cross-platform session helpers (IDR coalescing, stats)
     └── tether-vaapi         # hand-rolled libva FFI (vaExportSurfaceHandle etc.)
 ```
 
-Two binaries, eight library crates. `tether-protocol` has no I/O at
+Two binaries, nine library crates. `tether-protocol` has no I/O at
 all — it's the contract both sides speak. Every other crate is
 single-purpose so a future platform backend lands as a sibling file in
 the relevant crate (e.g. `tether-capture/src/macos.rs`).
@@ -76,7 +77,7 @@ any Linux machine:
 │         ▼                                                           │
 │   tether-protocol::video::FrameFragmenter                           │
 │     • split into MTU-sized fragments, attach HostFrameTiming +      │
-│       stream_epoch + per-fragment index                             │
+│       stream_epoch + frame_seq + fragment_index                     │
 │         │                                                           │
 │         ▼                                                           │
 │   tether-transport::Server (QUIC datagrams)                         │
@@ -134,10 +135,13 @@ pub enum GpuCapturedSource {
 
 Each variant is cfg-gated *per platform* so the consumer's `match` is
 exhaustive without a catch-all that would silently swallow future
-variants. A `GpuCapturedGuard` (sealed-trait box) lets the capture
-backend stash whatever per-frame refcounted handles it needs to keep
-alive while the importer reads — without leaking the backend's concrete
-types through the public API.
+variants. A `GpuCapturedGuard` (a sealed-trait box; type alias for
+`tether_protocol::GpuResourceGuard`) lets the capture backend stash
+whatever per-frame refcounted handles it needs to keep alive while
+the importer reads — without leaking the backend's concrete types
+through the public API. The same sealed type is re-exported as
+`GpuFrameGuard` in `tether-codec` for the decode side; one
+implementation, two named uses.
 
 **Encoder side — `Encoder::encode_gpu(GpuEncoderFrame<'_>)`**
 (`tether-codec/src/lib.rs`):
@@ -165,8 +169,8 @@ change to the trait shape or the call site.
 **Decoder side** uses the same shape, mirrored: `Decoder::next_frame ->
 Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
 `GpuFrameSource` enum with the same cfg gating. The decoder hands the
-renderer a `GpuFrameGuard` (sealed-trait box) that holds the source
-`AVFrame` ref alive until the renderer drops it.
+renderer a `GpuFrameGuard` (the shared `GpuResourceGuard` re-export) that
+holds the source `AVFrame` ref alive until the renderer drops it.
 
 The macOS migration path is roughly: add `tether-capture/src/macos.rs`
 emitting `CapturedFrame::Gpu(GpuCapturedSource::IOSurface(...))`, add a
@@ -182,16 +186,20 @@ unchanged. Same for the decoder/renderer pair on the client.
 QUIC primitive:
 
 - **Control** — a bidirectional QUIC stream, length-prefixed
-  CBOR-encoded `ControlMessage` enum. Carries the handshake
-  (`ClientHello` / `ServerHello`), `Goodbye`, `ForceIdr` requests,
-  cursor updates, input batches, and display-dim notifications. Never
-  used for video.
+  bincode-encoded `ControlMessage` enum. Carries the handshake
+  (`ClientHello` / `ServerHello`, both tagged-enum envelopes for
+  forward compatibility), `Goodbye` (with a machine-readable
+  `GoodbyeCode`), `ForceIdr` requests, cursor updates, input
+  batches, and display-dim notifications. Never used for video.
 - **Video** — QUIC datagrams. Each datagram carries one
-  `VideoFragment { stream_epoch, frame_index, fragment_index,
-  fragment_count, timing: HostFrameTiming, payload }`. The receiver
-  defragments, drops any fragments whose epoch doesn't match the
-  current one (resolution change → epoch bump), and forwards complete
-  frames to the decoder.
+  `VideoPacket::First { display, stream_epoch, frame_seq,
+  fragment_count, meta, payload }` or
+  `VideoPacket::Continuation { display, stream_epoch, frame_seq,
+  fragment_index, payload }`, where `meta` is `VideoFrameMeta {
+  timing: HostFrameTiming, keyframe, input_echo, dimensions }`. The
+  receiver defragments, drops any fragments whose epoch doesn't
+  match the current one (resolution change → epoch bump), and
+  forwards complete frames to the decoder.
 - **Input/cursor** — separate from control because input events are
   high-rate and don't need re-transmission; sent as small unreliable
   datagrams keyed by a monotonic sequence number.

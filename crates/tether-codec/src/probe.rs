@@ -1,96 +1,124 @@
-//! Encoder selection policy.
+//! Encoder / decoder selection policy. Tether hard-requires GPU
+//! acceleration on both ends — no software fallback path.
 //!
-//! `probe_encoder_bgra` is the single construction site for the host's
-//! video encoder. It walks a hardcoded preference list — hardware
-//! backends first, software libx264 as the last-resort fallback — and
-//! returns the first one whose constructor succeeds wrapped in a
-//! `Box<dyn Encoder>`. Each backend's `new_bgra(...)` failure is
-//! interpreted as "not available on this system" and falls through
-//! quietly; only a SW-fallback failure is propagated, since that means
-//! the FFmpeg build is broken and the host can't function.
+//! The motivation: software H.264 at 4K30 burns ~2-3 cores on the
+//! capture side and the same on decode; that budget needs to be free
+//! for capture, encode-side rate control, and (on the client) a
+//! responsive UI thread + sample-accurate input forwarding. The
+//! zero-copy DMA-BUF decode path (decoder surface -> wgpu Vulkan
+//! import, no CPU readback) is also only reachable through the VAAPI
+//! decoder — the SW path would feed CPU planes back through the
+//! upload road we deliberately walked off of. Committing to "GPU or
+//! nothing" makes the rest of the pipeline simpler (one render path,
+//! one stat surface) and surfaces driver problems immediately
+//! instead of hiding them behind a slower-and-different fallback.
 //!
 //! Resolution changes recreate the encoder via this same function, so
-//! probe cost is paid per resize, not per frame. We don't cache the
-//! chosen-backend identity — re-probing on resize is fast for
-//! software and gives hardware backends a clean retry if a previous
-//! attempt failed transiently (e.g. VAAPI session not yet established).
+//! probe cost is paid per resize, not per frame.
 
-use crate::{Decoder, Encoder, H264Decoder, H264Encoder, Result};
+use crate::{CodecError, Decoder, Encoder, Result};
 
-/// Probe + construct the best available H.264 encoder for the given
-/// dimensions. Hardware backends are tried first; falls through to
-/// libx264 software encode if no hardware path constructs successfully.
+/// Probe + construct the H.264 encoder for the given dimensions.
+/// Errors with a diagnostics-friendly message if no GPU encoder is
+/// available on this system.
 ///
-/// `fps` is the *target* rate (sets the encoder's time_base). `bitrate_kbps`
-/// is a soft target — libx264 with `tune=zerolatency` doesn't strictly
-/// cap, and VAAPI's rate-control mode will treat it as a VBR target.
+/// `fps` sets the encoder's time_base. `bitrate_kbps` is a soft VBR
+/// target.
 pub fn probe_encoder_bgra(
     width: u32,
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
 ) -> Result<Box<dyn Encoder>> {
-    // Hardware backends try-in-order. Each candidate is "try construct,
-    // fall through quietly on failure" — failure usually means "not
-    // available on this system" (no VAAPI device, NVIDIA but no
-    // CUDA, etc.), which is expected and shouldn't propagate.
-    //
-    // The debug log on failure is intentional: a user investigating
-    // "why is my host using libx264 instead of VAAPI" can flip the
-    // tether-codec log level to debug and see the constructor error
-    // without having to attach a debugger.
-
     #[cfg(target_os = "linux")]
     {
         match crate::vaapi::VaapiEncoder::new_bgra(width, height, fps, bitrate_kbps) {
             Ok(enc) => return Ok(Box::new(enc)),
             Err(e) => {
-                tracing::debug!(
+                tracing::error!(
                     backend = "h264_vaapi",
                     error = %e,
-                    "hardware encoder unavailable; trying next candidate"
+                    "VAAPI encoder construction failed"
                 );
+                return Err(no_hw_encoder(e));
             }
         }
     }
 
-    // NVENC / VideoToolbox / AMF candidates slot in here as additional
-    // platform-gated try blocks.
-
-    // Software fallback. libx264 is bundled with every reasonable
-    // FFmpeg build — if this fails the host can't encode at all, so
-    // propagate the error rather than silently going dark.
-    let enc = H264Encoder::new_bgra(width, height, fps, bitrate_kbps)?;
-    Ok(Box::new(enc))
+    // NVENC / VideoToolbox / AMF slot in here when their backends
+    // land. Until then, non-Linux hosts can't run.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (width, height, fps, bitrate_kbps);
+        Err(no_hw_encoder_for_platform())
+    }
 }
 
-/// Probe + construct the best available H.264 decoder. Same priority
-/// pattern as `probe_encoder_bgra`: hardware backends try first, the
-/// libavcodec software decoder is the last-resort fallback.
+/// Probe + construct the H.264 decoder. Errors if no GPU decoder is
+/// available.
 ///
-/// Hardware decode is the symmetric optimisation to hardware encode —
-/// removes CPU cycles from the client's hot path so it can keep up
-/// at high resolution without dropping frames or stretching present
-/// latency.
+/// Hard-required because the zero-copy decode-to-render pipeline
+/// (VAAPI surface -> DMA-BUF -> wgpu Vulkan import) only exists on
+/// the GPU path; the SW decoder would produce CPU NV12 that the
+/// renderer then has to upload, defeating the work.
 pub fn probe_decoder() -> Result<Box<dyn Decoder>> {
     #[cfg(target_os = "linux")]
     {
         match crate::vaapi::VaapiDecoder::new() {
             Ok(dec) => return Ok(Box::new(dec)),
             Err(e) => {
-                tracing::debug!(
+                tracing::error!(
                     backend = "h264 vaapi",
                     error = %e,
-                    "hardware decoder unavailable; trying next candidate"
+                    "VAAPI decoder construction failed"
                 );
+                return Err(no_hw_decoder(e));
             }
         }
     }
 
-    // NVDEC / VideoToolbox / D3D11VA candidates slot in here as
-    // additional platform-gated try blocks.
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(no_hw_decoder_for_platform())
+    }
+}
 
-    // Software fallback.
-    let dec = H264Decoder::new()?;
-    Ok(Box::new(dec))
+#[cfg(target_os = "linux")]
+fn no_hw_encoder(source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "VAAPI H.264 encoder unavailable ({source}). \
+         Check that /dev/dri/renderD128 is present and readable, and that `vainfo` \
+         lists VAProfileH264{{ConstrainedBaseline,Main,High}} with VAEntrypointEnc*. \
+         Tether requires GPU encode — there is no software fallback."
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn no_hw_decoder(source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "VAAPI H.264 decoder unavailable ({source}). \
+         Check `vainfo` lists VAEntrypointVLD for H.264, and that the kernel + \
+         libva versions match (Mesa 24+ on a 6.x kernel is the verified path). \
+         Tether requires GPU decode — there is no software fallback."
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn no_hw_encoder_for_platform() -> CodecError {
+    CodecError::NoHardwareCodec(
+        "Tether currently supports hardware encode only on Linux (VAAPI). \
+         macOS/VideoToolpath, Windows/NVENC, and Windows/AMF backends are not \
+         yet implemented."
+            .to_string(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn no_hw_decoder_for_platform() -> CodecError {
+    CodecError::NoHardwareCodec(
+        "Tether currently supports hardware decode only on Linux (VAAPI). \
+         macOS/VideoToolbox, Windows/NVDEC, and Windows/D3D11VA backends are \
+         not yet implemented."
+            .to_string(),
+    )
 }

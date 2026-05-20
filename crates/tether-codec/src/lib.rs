@@ -14,7 +14,6 @@ pub mod probe;
 #[cfg(target_os = "linux")]
 pub mod vaapi;
 
-pub use h264::{H264Decoder, H264Encoder};
 pub use probe::{probe_decoder, probe_encoder_bgra};
 
 use std::sync::Once;
@@ -45,6 +44,14 @@ pub enum CodecError {
     /// unsupported source/destination pixel-format pair.
     #[error("ffmpeg swscale init failed ({0})")]
     ScalerInit(&'static str),
+    /// No GPU codec available — Tether hard-requires hardware
+    /// encode/decode. Returned from [`probe_encoder_bgra`] /
+    /// [`probe_decoder`] when no hardware backend constructs
+    /// successfully. The string carries the user-actionable
+    /// diagnostics (which call to `vainfo` to run, which kernel
+    /// module to check, etc.).
+    #[error("no hardware codec: {0}")]
+    NoHardwareCodec(String),
     /// `vaExportSurfaceHandle` failed. Most commonly: the driver doesn't
     /// support PRIME_2 export for the surface's tiling modifier (rare on
     /// Intel iGPU since Skylake, more common on edge-case AMD configs).

@@ -734,7 +734,7 @@ impl Decoder for VaapiDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::H264Encoder;
+    use crate::h264::H264Encoder;
 
     #[test]
     #[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi)"]

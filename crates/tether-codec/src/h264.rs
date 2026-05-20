@@ -1,29 +1,33 @@
-//! Software H.264 encoder + decoder via libx264 / ffmpeg's `h264` decoder.
+//! Shared NV12 plane helpers + (test-only) software H.264 encoder and
+//! decoder via libx264 / ffmpeg's `h264` decoder.
 //!
-//! v0 goals: get bytes-on-the-wire down from ~240 MB/s (raw 1080p BGRA)
-//! to ~5 MB/s (zerolatency H.264). Quality tuning, B-frame strategies,
-//! and adaptive bitrate land later — for now we hardcode the lowest-
-//! latency preset and trust libx264's defaults beyond that.
-//!
-//! Hardware encoders (VAAPI on Linux, VideoToolbox on macOS) will land
-//! as siblings of this module under the same `Encoder` / `Decoder`
-//! traits.
+//! Production builds hard-require the VAAPI hardware path — see
+//! `crate::probe`. The SW encoder/decoder live here behind
+//! `#[cfg(test)]` to keep the codec test fixtures self-contained
+//! (round-trip pixel correctness checks) without shipping a fallback
+//! that would dilute the "GPU or nothing" contract.
 
-use std::ffi::CString;
 use std::slice;
 
-use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
-use rsmpeg::avutil::{ra, AVDictionary, AVFrame};
+use rsmpeg::avcodec::AVPacket;
+use rsmpeg::avutil::AVFrame;
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
+
+use crate::{CodecError, Result};
+
+#[cfg(test)]
+use std::ffi::CString;
+#[cfg(test)]
+use rsmpeg::avcodec::{AVCodec, AVCodecContext};
+#[cfg(test)]
+use rsmpeg::avutil::{ra, AVDictionary};
+#[cfg(test)]
 use rsmpeg::swscale::SwsContext;
-
+#[cfg(test)]
 use tether_protocol::control::CodecKind;
-
-use crate::{
-    init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Frame, Result,
-    GOP_SECONDS,
-};
+#[cfg(test)]
+use crate::{init_ffmpeg, DecodedFrame, Decoder, Encoder, EncodedPacket, Frame, GOP_SECONDS};
 
 /// Pack a planar AVFrame plane into a tight `Vec<u8>`, stripping any
 /// stride padding so downstream consumers can upload row-major without
@@ -121,7 +125,14 @@ pub(crate) fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
     Ok(packet)
 }
 
-pub struct H264Encoder {
+// Software H.264 encoder. Tether requires GPU acceleration in
+// production — see `crate::probe::probe_encoder_bgra` for the
+// rationale — so this is gated to tests only. It's the round-trip
+// fixture for the SW decoder (also test-only) and for VAAPI's
+// decoder smoke test, which needs a valid Annex-B bitstream to
+// feed the hardware path.
+#[cfg(test)]
+pub(crate) struct H264Encoder {
     encoder: AVCodecContext,
     bgra_to_yuv: SwsContext,
     yuv_frame: AVFrame,
@@ -136,8 +147,10 @@ pub struct H264Encoder {
 // which the borrow checker already serialises within a single thread, and
 // we never hand out aliasing references to the inner pointers. The Send
 // marker matches the "move is fine, share is not" contract.
+#[cfg(test)]
 unsafe impl Send for H264Encoder {}
 
+#[cfg(test)]
 impl H264Encoder {
     /// Construct a libx264 encoder configured for low-latency BGRA input.
     /// `fps` is the *target* rate (sets time_base); we don't enforce it on
@@ -242,6 +255,7 @@ impl H264Encoder {
     }
 }
 
+#[cfg(test)]
 impl Encoder for H264Encoder {
     // ffmpeg's i32 ABI fields (linesize, packet.size) are non-negative
     // in practice; cast sites are documented at the boundary.
@@ -335,13 +349,20 @@ impl Encoder for H264Encoder {
     }
 }
 
-pub struct H264Decoder {
+// Software H.264 decoder. Same test-only gating as `H264Encoder`:
+// production builds hard-require the VAAPI hardware path via
+// `crate::probe::probe_decoder`, so this struct exists only to keep
+// the round-trip fixture in this file working.
+#[cfg(test)]
+pub(crate) struct H264Decoder {
     decoder: AVCodecContext,
 }
 
 // SAFETY: same rationale as H264Encoder above.
+#[cfg(test)]
 unsafe impl Send for H264Decoder {}
 
+#[cfg(test)]
 impl H264Decoder {
     pub fn new() -> Result<Self> {
         init_ffmpeg();
@@ -353,6 +374,7 @@ impl H264Decoder {
     }
 }
 
+#[cfg(test)]
 impl Decoder for H264Decoder {
     fn submit(&mut self, encoded: &[u8]) -> Result<()> {
         if encoded.is_empty() {

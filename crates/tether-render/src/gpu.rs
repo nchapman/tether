@@ -80,15 +80,27 @@ impl GpuState {
             .await
             .map_err(|_| RenderError::NoAdapter)?;
 
-        // Ask for DMA-BUF import as an *optional* feature: probe the
-        // adapter first, request it only if available. On Mesa/Intel
-        // (the realistic deployment for our Linux VAAPI path) it lights
-        // up; on Vulkan-portability stacks (lavapipe, MoltenVK) it
-        // doesn't, and we fall back to the CPU-upload path. The render
-        // crate doesn't refuse to start without it — the CPU path is
-        // a valid degradation mode and the hard-require lives one layer
-        // up in the decoder probe.
+        // Hard-require DMA-BUF import on Linux. The decoder side
+        // (tether-codec's probe) hard-requires VAAPI and the decoded
+        // frames arrive as `Frame::Gpu` carrying dma-buf fds; the
+        // renderer needs the matching Vulkan extension to consume them.
+        // If the adapter doesn't advertise it (lavapipe, very old
+        // Mesa, missing VK_EXT_image_drm_format_modifier), fail loudly
+        // here rather than silently dropping every frame later.
+        let info = adapter.get_info();
         let adapter_features = adapter.features();
+        #[cfg(target_os = "linux")]
+        if !adapter_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF) {
+            return Err(RenderError::DmaBufImport(format!(
+                "wgpu adapter '{}' (driver: '{}', backend: {:?}) does not advertise \
+                 VULKAN_EXTERNAL_MEMORY_DMA_BUF. Check that the system Vulkan ICD \
+                 is a real GPU driver (Mesa 24+ for Intel/AMD) and exposes \
+                 VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier; \
+                 lavapipe and similar software stacks do not. Tether requires \
+                 zero-copy decode — there is no CPU-upload fallback.",
+                info.name, info.driver, info.backend
+            )));
+        }
         let mut required = wgpu::Features::empty();
         if adapter_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF) {
             required |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
@@ -105,7 +117,6 @@ impl GpuState {
             .await?;
         let dmabuf_import_supported =
             device.features().contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
-        let info = adapter.get_info();
         tracing::info!(
             adapter = info.name,
             driver = info.driver,
@@ -326,13 +337,14 @@ impl GpuState {
 
     #[cfg(target_os = "linux")]
     fn apply_gpu(&mut self, frame: GpuFrame) -> Result<()> {
-        if !self.dmabuf_import_supported {
-            tracing::warn!(
-                "received GpuFrame but adapter lacks VULKAN_EXTERNAL_MEMORY_DMA_BUF; \
-                 dropping frame (decoder probe should have picked a SW backend)"
-            );
-            return Ok(());
-        }
+        // `GpuState::new` hard-errors when the dma-buf feature isn't
+        // available on Linux, so reaching this branch with the flag
+        // false would mean the constructor's check is broken — not
+        // a runtime condition the caller can recover from.
+        debug_assert!(
+            self.dmabuf_import_supported,
+            "apply_gpu reached without dma-buf feature; GpuState::new should have failed"
+        );
         // Use an explicit match (not `let else`) so adding a future
         // GpuFrameSource variant (NVDEC over CUDA-Vulkan interop, a
         // VideoToolbox CVPixelBuffer, etc.) is a compile error here

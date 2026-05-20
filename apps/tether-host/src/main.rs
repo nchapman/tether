@@ -19,7 +19,7 @@ use tether_codec::{probe_encoder_bgra, Encoder};
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
 #[cfg(target_os = "linux")]
-use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
+use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject, GpuEncoderFrame};
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame};
 use tether_protocol::control::{
@@ -384,7 +384,7 @@ enum BridgeState {
 
 /// Encode one PipeWire-supplied DMA-BUF frame through the zero-copy
 /// pipeline: import BGRA into wgpu, compute BGRA→NV12 onto exported
-/// DMA-BUF Y/UV planes, hand both to the encoder's `submit_dmabuf`.
+/// DMA-BUF Y/UV planes, hand both to the encoder's `encode_gpu`.
 ///
 /// On first call, lazily opens the wgpu device and allocates the
 /// bridge; the result is cached on the `EncoderSlot`. On any error in
@@ -453,14 +453,14 @@ fn encode_gpu_frame(
 
     let codec_frame = nv12_dmabuf_to_codec_frame(nv12);
     slot.encoder
-        .submit_dmabuf(&codec_frame, pts, force_keyframe)
-        .map_err(|e| anyhow::anyhow!("submit_dmabuf: {e}"))
+        .encode_gpu(GpuEncoderFrame::DmaBuf(&codec_frame), pts, force_keyframe)
+        .map_err(|e| anyhow::anyhow!("encode_gpu: {e}"))
 }
 
 /// Build a `DmaBufFrame` (NV12, two objects, two layers — Y as R8 and
 /// UV as GR88) from the bridge's per-call descriptor. The codec layer
 /// dups the fds again inside `vaCreateSurfaces`, so this `DmaBufFrame`
-/// (and its owned fds) drops cleanly after `submit_dmabuf` returns.
+/// (and its owned fds) drops cleanly after `encode_gpu` returns.
 #[cfg(target_os = "linux")]
 fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
     DmaBufFrame {
@@ -482,15 +482,35 @@ fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
                 drm_format: u32::from_le_bytes(*b"R8  "),
                 num_planes: 1,
                 object_index: [0, 0, 0, 0],
-                offset: [u32::try_from(out.y_offset).unwrap_or(0), 0, 0, 0],
-                pitch: [u32::try_from(out.y_stride).unwrap_or(0), 0, 0, 0],
+                offset: [
+                    u32::try_from(out.y_offset).expect("Y plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(out.y_stride).expect("Y plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
             },
             DmaBufLayer {
                 drm_format: u32::from_le_bytes(*b"GR88"),
                 num_planes: 1,
                 object_index: [1, 0, 0, 0],
-                offset: [u32::try_from(out.uv_offset).unwrap_or(0), 0, 0, 0],
-                pitch: [u32::try_from(out.uv_stride).unwrap_or(0), 0, 0, 0],
+                offset: [
+                    u32::try_from(out.uv_offset).expect("UV plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(out.uv_stride).expect("UV plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
             },
         ],
     }

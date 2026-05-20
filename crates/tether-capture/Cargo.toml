@@ -16,7 +16,10 @@ crossbeam-channel = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
 pipewire = "0.10"
-libspa = "0.10"
+# v0_3_33 gates PropertyFlags::DONT_FIXATE, which we need on the
+# VideoModifier prop so Mutter/KWin recognise our offer as a
+# multi-modifier DMA-BUF intent instead of falling through to SHM.
+libspa = { version = "0.10", features = ["v0_3_33"] }
 # Raw SPA constants (SPA_DATA_DmaBuf, SPA_PARAM_BUFFERS_dataType) that
 # pipewire-rs 0.10's safe wrappers don't re-export. Pinned to the same
 # version as libspa to avoid two sys-crate copies in the dep graph.

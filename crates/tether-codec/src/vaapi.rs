@@ -686,15 +686,18 @@ impl Encoder for VaapiEncoder {
         "h264_vaapi"
     }
 
-    fn submit_dmabuf(
+    fn encode_gpu(
         &mut self,
-        frame: &DmaBufFrame,
+        frame: crate::GpuEncoderFrame<'_>,
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
-        // Inherent method already does the work; the trait override
-        // just makes it dispatchable through `dyn Encoder`.
-        VaapiEncoder::submit_dmabuf(self, frame, pts, force_keyframe)
+        match frame {
+            crate::GpuEncoderFrame::DmaBuf(f) => {
+                VaapiEncoder::submit_dmabuf(self, f, pts, force_keyframe)
+            }
+            crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
+        }
     }
 }
 

@@ -329,11 +329,10 @@ fn build_format_pod(want_dmabuf: bool) -> Result<Vec<u8>> {
     //
     // Size range 1x1 to 7680x4320 (8K), framerate 0..=240 fps. Built
     // with pipewire-rs's object!/property! macros; modifier needs a
-    // manual Property because the macro doesn't expose property flags
-    // (the SPA DONT_FIXATE flag would help compositors that want to
-    // tell us "I support these other modifiers" — for our LINEAR-only
-    // offer it doesn't matter, and a future modifier-list expansion
-    // can drop down to manual property building too).
+    // manual Property because the macro doesn't expose property flags,
+    // and the modifier prop is required to carry both MANDATORY and
+    // DONT_FIXATE — Mutter and KWin treat absence of DONT_FIXATE as
+    // the legacy single-modifier path and silently fall through to SHM.
     let mut properties = vec![
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::MediaType,
@@ -395,7 +394,8 @@ fn build_format_pod(want_dmabuf: bool) -> Result<Vec<u8>> {
         let modifier_default = i64::try_from(DRM_FORMAT_MOD_LINEAR).unwrap();
         properties.push(pw::spa::pod::Property {
             key: pw::spa::param::format::FormatProperties::VideoModifier.as_raw(),
-            flags: pw::spa::pod::PropertyFlags::empty(),
+            flags: pw::spa::pod::PropertyFlags::MANDATORY
+                | pw::spa::pod::PropertyFlags::DONT_FIXATE,
             value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Long(
                 pw::spa::utils::Choice::<i64>(
                     pw::spa::utils::ChoiceFlags::empty(),

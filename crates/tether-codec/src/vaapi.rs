@@ -31,15 +31,39 @@ use rsmpeg::avutil::{ra, AVDictionary, AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
+use rsmpeg::UnsafeDerefMut;
 use tracing::warn;
 
 use tether_protocol::control::CodecKind;
 
 use crate::h264::{frame_plane, frame_plane_mut, interleave_uv, pack_plane, packet_from_bytes};
 use crate::{
-    init_ffmpeg, CodecError, DecodedFrame, Decoder, Encoder, EncodedPacket, Frame, Result,
-    GOP_SECONDS,
+    init_ffmpeg, CodecError, DecodedFrame, Decoder, DmaBufFrame, DmaBufLayer, DmaBufObject,
+    Encoder, EncodedPacket, Frame, GpuFrame, GpuFrameSource, Result, GOP_SECONDS,
 };
+
+/// `AVVAAPIDeviceContext` from `<libavutil/hwcontext_vaapi.h>`. rusty-ffmpeg
+/// doesn't bind it (the header requires libva at bindgen time, which the
+/// FFI crate doesn't pull in), so we declare it locally. Two fields,
+/// stable since libavutil 56.x — if FFmpeg ever extends it, the new
+/// fields land *after* `driver_quirks` so our access of `display`
+/// stays correct.
+#[repr(C)]
+struct AVVAAPIDeviceContext {
+    display: tether_vaapi::VADisplay,
+    driver_quirks: std::os::raw::c_uint,
+}
+
+/// Surfaces beyond what the decoder needs for its own reference picture
+/// list. We hand each decoded surface to the renderer and only release
+/// the AVFrame ref when the renderer drops the `GpuFrame`. With a
+/// 1-deep render channel that's at most 2 surfaces held outside the
+/// decoder (one rendering, one in flight in the channel); 4 gives
+/// headroom for the brief window where the renderer is sampling the
+/// previous surface while the next one lands. Surfaces are cheap to
+/// allocate but not free — a 2880×1920 NV12 surface is ~8 MiB of GPU
+/// memory, so don't over-provision.
+const DECODE_EXTRA_HW_FRAMES: i32 = 4;
 
 /// Number of VAAPI surfaces in the hwframes pool. With `async_depth=1`
 /// the encoder reports a packet synchronously after each `send_frame`,
@@ -426,12 +450,140 @@ impl VaapiDecoder {
         // fresh ref-counted handle while we keep our own owner.
         decoder.set_hw_device_ctx(hw_device.clone());
         decoder.set_get_format(Some(get_vaapi_format));
+        // Tell ffmpeg to size its internal hwframes pool with room for
+        // surfaces we hand to the renderer. rsmpeg doesn't wrap this
+        // field; AVCodecContext derefs to ffi::AVCodecContext so we
+        // poke it directly.
+        // SAFETY: extra_hw_frames must be written before avcodec_open2
+        // — that's the libavcodec ordering invariant the unsafe here
+        // attests to.
+        unsafe {
+            decoder.deref_mut().extra_hw_frames = DECODE_EXTRA_HW_FRAMES;
+        }
         decoder.open(None)?;
 
         Ok(Self {
             decoder,
             _hw_device: hw_device,
         })
+    }
+
+    /// Export the VAAPI surface backing `frame` as a DMA-BUF and wrap
+    /// it in a `Frame::Gpu`. The AVFrame is moved into the
+    /// `GpuFrameGuard`: when the renderer drops the `GpuFrame`, the
+    /// AVFrame's ref-count hits zero and the surface returns to the
+    /// hwframes pool. `frame.data[3]` carries the `VASurfaceID`
+    /// (libavutil convention); `frame.hw_frames_ctx -> data ->
+    /// device_ctx -> hwctx` is the `AVVAAPIDeviceContext` whose
+    /// `display` field is the `VADisplay` we need to pass to libva.
+    #[allow(clippy::cast_sign_loss)] // i32 width/height from ffmpeg are non-negative
+    fn export_vaapi_frame(&self, frame: AVFrame) -> Result<Frame> {
+        let width = frame.width;
+        let height = frame.height;
+        let pts_out = if frame.pts == ffi::AV_NOPTS_VALUE {
+            None
+        } else {
+            Some(frame.pts)
+        };
+
+        // SAFETY: frame is a freshly received decoded frame; for any
+        // VAAPI surface ffmpeg sets hw_frames_ctx to the pool's
+        // buffer ref, and data[3] holds the VASurfaceID as an integer
+        // sentinel (cast through usize). Both invariants are part of
+        // libavutil's hwaccel contract. Null fields would mean ffmpeg
+        // violated that contract — treat as unreachable rather than a
+        // user-facing format mismatch.
+        let (display, surface_id) = unsafe {
+            let hwf_ref = frame.hw_frames_ctx;
+            assert!(!hwf_ref.is_null(), "VAAPI frame missing hw_frames_ctx");
+            let hwf = (*hwf_ref).data as *const ffi::AVHWFramesContext;
+            // `device_ctx` on AVHWFramesContext is the unwrapped
+            // pointer (sibling `device_ref` is the AVBufferRef*),
+            // so we deref it directly without another `.data` step.
+            let dev = (*hwf).device_ctx;
+            assert!(!dev.is_null(), "VAAPI frame's hwframes ctx missing device_ctx");
+            let vactx = (*dev).hwctx as *const AVVAAPIDeviceContext;
+            let display = (*vactx).display;
+            // VASurfaceID is unsigned int; libavutil stores it in
+            // data[3] by casting through uintptr_t.
+            let surface_id = frame.data[3] as usize as tether_vaapi::VASurfaceID;
+            (display, surface_id)
+        };
+
+        // READ_ONLY because we're a *consumer* of the decoded surface;
+        // the encoder side (Sunshine's reference) uses WRITE_ONLY for
+        // the opposite reason. SEPARATE_LAYERS gives one DRM layer per
+        // plane (Y, UV) which is what wgpu's external-memory import
+        // wants for multi-planar formats.
+        // SAFETY: display and surface_id are derived from the
+        // currently-live AVFrame above; both stay valid until that
+        // frame's buffer ref is dropped, which happens after this fn
+        // returns and after the GpuFrameGuard releases.
+        let prime = unsafe {
+            tether_vaapi::export_surface_handle(
+                display,
+                surface_id,
+                tether_vaapi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                tether_vaapi::VA_EXPORT_SURFACE_READ_ONLY
+                    | tether_vaapi::VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+            )
+        }
+        .map_err(|e| {
+            // The AVFrame Drops on the `?` below, releasing the
+            // surface back to the pool — so we lose this frame but
+            // the decoder stays healthy.
+            warn!(error = %e, "vaExportSurfaceHandle failed; dropping this frame");
+            CodecError::SurfaceExportFailed(e)
+        })?;
+
+        let objects = prime
+            .objects
+            .into_iter()
+            .map(|o| DmaBufObject {
+                fd: o.fd,
+                size: u64::from(o.size),
+                drm_format_modifier: o.drm_format_modifier,
+            })
+            .collect();
+        let layers = prime
+            .layers
+            .into_iter()
+            .map(|l| DmaBufLayer {
+                drm_format: l.drm_format,
+                num_planes: l.num_planes,
+                object_index: l.object_index,
+                offset: l.offset,
+                pitch: l.pitch,
+            })
+            .collect();
+        let dmabuf = DmaBufFrame {
+            fourcc: prime.fourcc,
+            objects,
+            layers,
+        };
+
+        // rsmpeg doesn't mark AVFrame Send (it has raw ptr fields).
+        // The renderer thread takes ownership of this guard via the
+        // channel and the only thing it ever does is drop it — never
+        // shares a reference, never accesses fields. Same move-fine /
+        // share-bad rationale as the existing `unsafe impl Send for
+        // VaapiDecoder`. The `dead_code` allow is correct: this
+        // struct exists for its Drop side-effect (av_frame_unref
+        // releasing the surface).
+        #[allow(dead_code)]
+        struct SendFrame(AVFrame);
+        // SAFETY: ownership is moved across the channel boundary, not
+        // shared. av_frame_unref's reentrancy means it's safe to call
+        // from whichever thread ends up dropping the box.
+        unsafe impl Send for SendFrame {}
+
+        Ok(Frame::Gpu(GpuFrame::new(
+            width as u32,
+            height as u32,
+            pts_out,
+            GpuFrameSource::DmaBuf(dmabuf),
+            SendFrame(frame),
+        )))
     }
 }
 
@@ -458,20 +610,28 @@ impl Decoder for VaapiDecoder {
             Err(e) => return Err(CodecError::Ffmpeg(e)),
         };
 
-        // If get_format returned VAAPI, frame is a GPU surface and
-        // needs the transfer dance. If ffmpeg fell back to a
-        // software path (rare in our config; usually a build with
-        // hwaccel disabled silently emits SW frames), the frame is
-        // already in system memory and we use it directly. The
-        // transfer here will be replaced by a DMA-BUF export +
-        // `Frame::Gpu` once the renderer can import VAAPI surfaces.
-        let sw_frame = if frame.format == ffi::AV_PIX_FMT_VAAPI {
-            let mut sw = AVFrame::new();
-            sw.hwframe_transfer_data(&frame)?;
-            sw
-        } else {
-            frame
-        };
+        // VAAPI surface: export as DMA-BUF and hand the renderer a
+        // GPU-resident frame. The exported fds borrow from the
+        // surface; the AVFrame keeps the surface alive in the pool,
+        // so we move it into the GpuFrame as a release guard.
+        if frame.format == ffi::AV_PIX_FMT_VAAPI {
+            return self.export_vaapi_frame(frame).map(Some);
+        }
+
+        // Reaching here means ffmpeg decoded into system memory
+        // despite our get_format callback insisting on VAAPI. The
+        // probe in `new()` already verified the build advertises
+        // VAAPI hwaccel for h264, so this only happens if the driver
+        // bailed mid-stream — silently doing CPU decode at 4K would
+        // make CPU usage spike with no obvious cause. Refuse loudly
+        // so the failure mode is observable. The remaining
+        // CPU-packing logic stays below in case a future SW backend
+        // wants to reuse it via a different decoder type.
+        warn!(
+            format = frame.format,
+            "VaapiDecoder fell back to software decode unexpectedly"
+        );
+        let sw_frame = frame;
 
         let width = sw_frame.width;
         let height = sw_frame.height;
@@ -603,7 +763,7 @@ mod tests {
         let mut enc = H264Encoder::new_bgra(w, h, 30, 2_000).expect("sw encoder");
         let mut dec = VaapiDecoder::new().expect("VAAPI decoder");
 
-        let mut got = None;
+        let mut got: Option<GpuFrame> = None;
         for t in 0..6i64 {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             let bgra = make_test_bgra(w, h, t as u32);
@@ -611,20 +771,46 @@ mod tests {
             for p in packets {
                 dec.submit(&p.data).expect("vaapi submit");
                 while let Some(f) = dec.next_frame().expect("vaapi next_frame") {
-                    let Frame::Cpu(f) = f else {
-                        panic!("VaapiDecoder is in CPU-readback mode; \
-                                update this test when DMA-BUF export ships");
+                    let Frame::Gpu(g) = f else {
+                        panic!("VaapiDecoder must emit DMA-BUF Gpu frames");
                     };
-                    got = Some(f);
+                    got = Some(g);
                 }
             }
         }
         let frame = got.expect("decoder produced a frame within six input frames");
         assert_eq!(frame.width, w);
         assert_eq!(frame.height, h);
-        let (cw, ch) = frame.chroma_dims();
-        assert_eq!(frame.y.len(), (w * h) as usize);
-        // NV12 layout: each chroma sample carries 2 bytes (U then V).
-        assert_eq!(frame.uv.len(), (cw * ch * 2) as usize);
+        let GpuFrameSource::DmaBuf(dmabuf) = frame.source else {
+            panic!("expected DmaBuf source on Linux VAAPI");
+        };
+        // SEPARATE_LAYERS gives NV12 two planes (Y, UV). Each layer
+        // points at one object (might be the same fd with different
+        // offsets, or two distinct fds) so we expect 2 layers and at
+        // least 1 object.
+        assert_eq!(dmabuf.layers.len(), 2, "NV12 export should yield 2 layers");
+        assert!(!dmabuf.objects.is_empty(), "at least one DMA-BUF object");
+        // Surface-level fourcc is NV12.
+        assert_eq!(
+            dmabuf.fourcc,
+            u32::from_le_bytes(*b"NV12"),
+            "expected NV12 fourcc"
+        );
+        // Per-layer DRM fourccs: R8 for the Y plane, GR88 for the
+        // interleaved UV plane. Asserting these catches a driver
+        // silently falling back to COMPOSED_LAYERS (which would emit
+        // a single NV12-fourcc layer) — under that mode our wgpu
+        // import would do the wrong thing and we'd rather fail in
+        // the test than in production.
+        assert_eq!(
+            dmabuf.layers[0].drm_format,
+            u32::from_le_bytes(*b"R8  "),
+            "Y plane should be DRM_FORMAT_R8"
+        );
+        assert_eq!(
+            dmabuf.layers[1].drm_format,
+            u32::from_le_bytes(*b"GR88"),
+            "UV plane should be DRM_FORMAT_GR88"
+        );
     }
 }

@@ -3192,6 +3192,7 @@ version = "0.0.1"
 dependencies = [
  "rsmpeg",
  "tether-protocol",
+ "tether-vaapi",
  "thiserror 2.0.18",
  "tracing",
 ]

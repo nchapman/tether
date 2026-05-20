@@ -1,11 +1,12 @@
 //! Codec trait + ffmpeg-backed encoders/decoders.
 //!
-//! v0 ships software H.264 only (libx264 via rsmpeg). HW backends
-//! (VideoToolbox / VAAPI / NVENC) and additional codecs (HEVC, AV1) will
-//! land as additional [`Encoder`] / [`Decoder`] impls — the trait shape
-//! is cribbed from RustDesk's `EncoderApi` (`libs/scrap/src/common/codec.rs:60`)
-//! so the introspection surface (latency hints, bitrate control, HW vs SW
-//! detection) is right from day one.
+//! Current backends: software H.264 (libx264 via rsmpeg) and hardware
+//! H.264 via VAAPI on Linux. VideoToolbox / NVENC and additional codecs
+//! (HEVC, AV1) land as additional [`Encoder`] / [`Decoder`] impls.
+//! Trait shape is cribbed from RustDesk's `EncoderApi`
+//! (`libs/scrap/src/common/codec.rs:60`) so the introspection surface
+//! (latency hints, bitrate control, HW vs SW detection) is right from
+//! day one.
 
 pub mod h264;
 pub mod probe;
@@ -44,6 +45,15 @@ pub enum CodecError {
     /// unsupported source/destination pixel-format pair.
     #[error("ffmpeg swscale init failed ({0})")]
     ScalerInit(&'static str),
+    /// `vaExportSurfaceHandle` failed. Most commonly: the driver doesn't
+    /// support PRIME_2 export for the surface's tiling modifier (rare on
+    /// Intel iGPU since Skylake, more common on edge-case AMD configs).
+    /// Distinct from `UnsupportedInputFormat` so the host log can
+    /// distinguish "decoder produced a frame in a shape we can't read"
+    /// from "the kernel/driver refused to share this specific surface."
+    #[cfg(target_os = "linux")]
+    #[error("vaExportSurfaceHandle failed: {0}")]
+    SurfaceExportFailed(#[from] tether_vaapi::VaError),
 }
 
 pub type Result<T> = std::result::Result<T, CodecError>;

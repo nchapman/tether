@@ -23,5 +23,10 @@ tracing = { workspace = true }
 # new rsmpeg version ships to crates.io.
 rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a200256763b31e5528fb0f21876e", features = ["ffmpeg8", "link_system_ffmpeg"] }
 
+# libva FFI for vaExportSurfaceHandle on the decode-side zero-copy
+# path. Linux-only because VAAPI itself is.
+[target.'cfg(target_os = "linux")'.dependencies]
+tether-vaapi = { workspace = true }
+
 [lints]
 workspace = true

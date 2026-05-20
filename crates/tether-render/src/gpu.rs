@@ -10,7 +10,7 @@ use crate::{CpuFrame, Frame, GpuFrame, RenderError, Result};
 /// Y is R8Unorm at full resolution; UV is Rg8Unorm at half resolution
 /// (each texel holds one U byte in .r and one V byte in .g, matching
 /// the NV12 layout the decoder emits).
-struct YuvTextures {
+pub(crate) struct YuvTextures {
     // Both textures own GPU memory and are kept alive solely for the
     // bind group's views; we never reference them by name after the
     // bind group is built. The allow keeps clippy quiet about the
@@ -19,7 +19,7 @@ struct YuvTextures {
     y: wgpu::Texture,
     #[allow(dead_code)]
     uv: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+    pub(crate) bind_group: wgpu::BindGroup,
     /// Y-plane dimensions (chroma is derived).
     size: (u32, u32),
     /// Backend-side lifetime extender from the decoder (DMA-BUF path)
@@ -564,7 +564,7 @@ fn make_yuv_textures(
 /// different offsets).
 #[cfg(target_os = "linux")]
 #[allow(clippy::cast_lossless)] // u32 pitch into u64 stride is intentional
-fn import_dmabuf_textures(
+pub(crate) fn import_dmabuf_textures(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,

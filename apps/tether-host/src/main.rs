@@ -25,7 +25,9 @@ use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame};
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ColorSpace, ControlMessage, ServerHello,
 };
-use tether_protocol::video::{FrameFragmenter, HostFrameTiming, InputEchoBatch, VideoFrameMeta};
+use tether_protocol::video::{
+    FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
+};
 use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
 use tether_transport::{Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
@@ -579,7 +581,10 @@ fn run_capture_and_send(
         };
         let frame_width = frame.width();
         let frame_height = frame.height();
-        let (t_capture_kernel, t_capture_userspace) = frame.timestamps();
+        let mut timing = {
+            let (k, u) = frame.timestamps();
+            HostFrameTimingBuilder::captured(k, u)
+        };
 
         // Reject CPU frames in non-BGRA formats up front (no encoder
         // path consumes them today). GPU frames already passed format
@@ -650,7 +655,7 @@ fn run_capture_and_send(
         // Swap-and-zero: at most one forced keyframe per request, even
         // if multiple ForceIdr messages arrive between encode calls.
         let force_kf = force_idr.swap(false, Ordering::Relaxed);
-        let t_encode_submit = MonoNanos::now();
+        timing.encode_submit();
         let encoded = match frame {
             CapturedFrame::Cpu(ref cpu) => {
                 match slot_mut.encoder.encode_bgra(&cpu.data, pts, force_kf) {
@@ -679,9 +684,8 @@ fn run_capture_and_send(
                 continue;
             }
         };
-        let t_encode_done = MonoNanos::now();
-        encode_latency_sum_ns =
-            encode_latency_sum_ns.saturating_add(t_encode_done.saturating_sub(t_encode_submit));
+        timing.encode_done();
+        encode_latency_sum_ns = encode_latency_sum_ns.saturating_add(timing.encode_delta_ns());
         pts += 1;
 
         // Concatenate all packets the encoder spat out for this input
@@ -704,15 +708,8 @@ fn run_capture_and_send(
             keyframe_count = keyframe_count.saturating_add(1);
         }
 
-        let t_send = MonoNanos::now();
         let meta = VideoFrameMeta {
-            timing: HostFrameTiming {
-                t_capture_kernel,
-                t_capture_userspace,
-                t_encode_submit,
-                t_encode_done,
-                t_send,
-            },
+            timing: timing.finish(),
             keyframe,
             input_echo: InputEchoBatch::default(),
             dimensions: (frame_width, frame_height),

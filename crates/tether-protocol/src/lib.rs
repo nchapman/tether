@@ -102,9 +102,39 @@ mod tests {
     use crate::cursor::*;
     use crate::input::*;
     use crate::video::{
-        FrameFragmenter, FrameReassembler, HostFrameTiming, InputEchoBatch, VideoFrameMeta,
-        VideoPacket, CONTINUATION_PAYLOAD_BUDGET, FIRST_PAYLOAD_BUDGET,
+        FrameFragmenter, FrameReassembler, HostFrameTiming, HostFrameTimingBuilder,
+        InputEchoBatch, VideoFrameMeta, VideoPacket, CONTINUATION_PAYLOAD_BUDGET,
+        FIRST_PAYLOAD_BUDGET,
     };
+
+    #[test]
+    fn host_frame_timing_builder_finishes() {
+        let mut b = HostFrameTimingBuilder::captured(MonoNanos(100), MonoNanos(200));
+        b.encode_submit();
+        b.encode_done();
+        assert!(b.encode_delta_ns() < 1_000_000); // sub-ms for two consecutive now()
+        let t = b.finish();
+        assert_eq!(t.t_capture_kernel, MonoNanos(100));
+        assert_eq!(t.t_capture_userspace, MonoNanos(200));
+        assert!(t.t_encode_submit <= t.t_encode_done);
+        assert!(t.t_encode_done <= t.t_send);
+    }
+
+    #[test]
+    #[should_panic(expected = "encode_submit not called")]
+    fn host_frame_timing_builder_panics_if_submit_skipped() {
+        let mut b = HostFrameTimingBuilder::captured(MonoNanos(0), MonoNanos(0));
+        b.encode_done();
+        let _ = b.finish();
+    }
+
+    #[test]
+    #[should_panic(expected = "encode_done not called")]
+    fn host_frame_timing_builder_panics_if_done_skipped() {
+        let mut b = HostFrameTimingBuilder::captured(MonoNanos(0), MonoNanos(0));
+        b.encode_submit();
+        let _ = b.finish();
+    }
 
     #[test]
     fn mono_nanos_monotonic() {

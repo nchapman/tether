@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 
 /// Timing fields populated by the host as a frame moves through its pipeline.
 /// All times in **host-local** [`MonoNanos`].
+///
+/// Construct via [`HostFrameTimingBuilder`] rather than this struct's
+/// public fields — the builder enforces that every stamp is set before
+/// the wire `HostFrameTiming` is materialized, so a future instrumentation
+/// site that forgets to stamp will panic in dev instead of silently
+/// shipping zeroes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFrameTiming {
     pub t_capture_kernel: MonoNanos,
@@ -14,6 +20,81 @@ pub struct HostFrameTiming {
     pub t_encode_submit: MonoNanos,
     pub t_encode_done: MonoNanos,
     pub t_send: MonoNanos,
+}
+
+/// Assembles a [`HostFrameTiming`] one stamp at a time as a frame moves
+/// through the host pipeline. The capture backend constructs it with the
+/// two capture stamps; the host's encode loop calls [`Self::encode_submit`]
+/// / [`Self::encode_done`] around the encoder invocation; the send loop
+/// calls [`Self::finish`] right before handing the body to the
+/// [`FrameFragmenter`].
+///
+/// `finish` panics if any stamp is missing — the intent is that a future
+/// site that adds a new stage (e.g. a CPU-side scale pass) and forgets
+/// to call the new setter trips a debug-time panic rather than ships
+/// zero timestamps to the wire. (Forgetting `.finish()` itself is
+/// already caught by the type system: [`VideoFrameMeta::timing`] is
+/// `HostFrameTiming`, not `HostFrameTimingBuilder`, so the call site
+/// can't compile without finalizing.)
+pub struct HostFrameTimingBuilder {
+    t_capture_kernel: MonoNanos,
+    t_capture_userspace: MonoNanos,
+    t_encode_submit: Option<MonoNanos>,
+    t_encode_done: Option<MonoNanos>,
+}
+
+impl HostFrameTimingBuilder {
+    /// Start a builder with both capture stamps populated. These come
+    /// from the capture backend (`CapturedFrame::timestamps()`).
+    pub fn captured(t_capture_kernel: MonoNanos, t_capture_userspace: MonoNanos) -> Self {
+        Self {
+            t_capture_kernel,
+            t_capture_userspace,
+            t_encode_submit: None,
+            t_encode_done: None,
+        }
+    }
+
+    /// Stamp `t_encode_submit = MonoNanos::now()`. Call immediately
+    /// before invoking the encoder.
+    pub fn encode_submit(&mut self) {
+        self.t_encode_submit = Some(MonoNanos::now());
+    }
+
+    /// Stamp `t_encode_done = MonoNanos::now()`. Call immediately after
+    /// the encoder returns.
+    pub fn encode_done(&mut self) {
+        self.t_encode_done = Some(MonoNanos::now());
+    }
+
+    /// Useful for the host's encode-latency rolling-average log line.
+    /// Returns the delta in nanoseconds; 0 if either stamp is unset —
+    /// in practice this means the encoder errored or returned no
+    /// packets between [`Self::encode_submit`] and a `continue` that
+    /// skipped [`Self::encode_done`].
+    #[must_use]
+    pub fn encode_delta_ns(&self) -> u64 {
+        match (self.t_encode_submit, self.t_encode_done) {
+            (Some(s), Some(d)) => d.saturating_sub(s),
+            _ => 0,
+        }
+    }
+
+    /// Stamp `t_send = MonoNanos::now()` and finalize. Panics if the
+    /// encode stamps were not set — see the struct doc for rationale.
+    pub fn finish(self) -> HostFrameTiming {
+        HostFrameTiming {
+            t_capture_kernel: self.t_capture_kernel,
+            t_capture_userspace: self.t_capture_userspace,
+            t_encode_submit: self
+                .t_encode_submit
+                .expect("HostFrameTimingBuilder::encode_submit not called"),
+            t_encode_done: self
+                .t_encode_done
+                .expect("HostFrameTimingBuilder::encode_done not called"),
+            t_send: MonoNanos::now(),
+        }
+    }
 }
 
 /// Echo of input events the host injected since the previous frame. Lets the

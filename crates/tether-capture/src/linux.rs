@@ -29,30 +29,34 @@ use crate::{
     GpuCapturedSource, PixelFormat, Result,
 };
 
-/// `DRM_FORMAT_MOD_LINEAR` from `<drm/drm_fourcc.h>`. Universally
-/// importable across compositors / GPU drivers; the only modifier we
-/// advertise to the compositor in v1. Tiled-modifier negotiation is a
-/// later expansion (requires per-format Vulkan modifier-property
-/// queries on our side so we only advertise what wgpu can import).
-const DRM_FORMAT_MOD_LINEAR: u64 = 0;
-
 const CAPTURE_CHANNEL_DEPTH: usize = 2;
 
 /// Run the portal handshake and spawn the PipeWire stream thread.
 /// Returns a receiver that emits one [`CapturedFrame`] per produced frame.
 ///
+/// `dmabuf_modifiers` is the list of DRM format modifiers the downstream
+/// GPU importer can consume — typically obtained from
+/// `tether_gpuconvert::importable_dmabuf_modifiers(AR24)`. The set is
+/// passed to PipeWire as a multi-modifier DMA-BUF format offer alongside
+/// the SHM fallback pod. Empty list ⇒ disable DMA-BUF entirely, advertise
+/// only SHM.
+///
 /// **Side effect:** triggers an xdg-desktop-portal permission dialog on
 /// the user's desktop session. The call blocks (asynchronously) until the
 /// user grants or denies access.
-pub async fn start() -> Result<Receiver<CapturedFrame>> {
+pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<Receiver<CapturedFrame>> {
     let (node_id, fd) = open_portal().await?;
-    tracing::info!(node_id, "portal handshake complete; spawning pipewire thread");
+    tracing::info!(
+        node_id,
+        dmabuf_modifiers = dmabuf_modifiers.len(),
+        "portal handshake complete; spawning pipewire thread"
+    );
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
     std::thread::Builder::new()
         .name("tether-capture-pipewire".into())
         .spawn(move || {
-            if let Err(e) = run_pipewire(node_id, fd, tx) {
+            if let Err(e) = run_pipewire(node_id, fd, tx, dmabuf_modifiers) {
                 tracing::error!(error = %e, "pipewire capture thread failed");
             }
         })?;
@@ -100,7 +104,12 @@ struct UserData {
     negotiated_modifier: Option<u64>,
 }
 
-fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Result<()> {
+fn run_pipewire(
+    node_id: u32,
+    fd: OwnedFd,
+    sender: Sender<CapturedFrame>,
+    dmabuf_modifiers: Vec<u64>,
+) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -297,21 +306,27 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
     // first so a capable compositor takes the zero-copy path, and SHM
     // is the runtime fallback. param_changed observes which got fixated
     // and updates ParamBuffers accordingly.
-    let dmabuf_pod_bytes = build_format_pod(/* dmabuf */ true)?;
-    let shm_pod_bytes = build_format_pod(/* dmabuf */ false)?;
-    let mut params_slice = [
-        spa::pod::Pod::from_bytes(&dmabuf_pod_bytes).ok_or_else(|| {
+    let shm_pod_bytes = build_format_pod(&[])?;
+    let shm_pod = spa::pod::Pod::from_bytes(&shm_pod_bytes)
+        .ok_or_else(|| CaptureError::PipeWire("shm pod from_bytes returned None".into()))?;
+    let dmabuf_pod_bytes = if dmabuf_modifiers.is_empty() {
+        None
+    } else {
+        Some(build_format_pod(&dmabuf_modifiers)?)
+    };
+    let mut params_storage: Vec<&spa::pod::Pod> = Vec::with_capacity(2);
+    if let Some(ref bytes) = dmabuf_pod_bytes {
+        params_storage.push(spa::pod::Pod::from_bytes(bytes).ok_or_else(|| {
             CaptureError::PipeWire("dmabuf pod from_bytes returned None".into())
-        })?,
-        spa::pod::Pod::from_bytes(&shm_pod_bytes)
-            .ok_or_else(|| CaptureError::PipeWire("shm pod from_bytes returned None".into()))?,
-    ];
+        })?);
+    }
+    params_storage.push(shm_pod);
 
     stream.connect(
         spa::utils::Direction::Input,
         Some(node_id),
         pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-        &mut params_slice,
+        &mut params_storage[..],
     )?;
 
     tracing::info!("pipewire stream connected; entering main loop");
@@ -319,20 +334,19 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
     Ok(())
 }
 
-fn build_format_pod(want_dmabuf: bool) -> Result<Vec<u8>> {
-    // Two variants of the same pod. The DMA-BUF variant restricts to
-    // BGRx/BGRA (the formats our zero-copy importer handles) and adds
-    // a VideoModifier property pinning DRM_FORMAT_MOD_LINEAR — this is
-    // what flags the offer to the compositor as a DMA-BUF intent. The
-    // SHM variant accepts all four 4-byte SPA formats and omits the
-    // modifier; PipeWire negotiates it as plain MemPtr/MemFd.
-    //
-    // Size range 1x1 to 7680x4320 (8K), framerate 0..=240 fps. Built
-    // with pipewire-rs's object!/property! macros; modifier needs a
-    // manual Property because the macro doesn't expose property flags,
-    // and the modifier prop is required to carry both MANDATORY and
-    // DONT_FIXATE — Mutter and KWin treat absence of DONT_FIXATE as
-    // the legacy single-modifier path and silently fall through to SHM.
+/// Build one Format pod. Non-empty `modifiers` produces the DMA-BUF
+/// variant (BGRx/BGRA only, VideoModifier prop carrying every supported
+/// DRM modifier the GPU importer can consume); empty produces the SHM
+/// variant (all four 4-byte SPA formats, no modifier prop).
+///
+/// Size range 1x1 to 7680x4320 (8K), framerate 0..=240 fps. Built with
+/// pipewire-rs's object!/property! macros; the modifier property needs a
+/// manual `Property` because the macro doesn't expose property flags,
+/// and the prop is required to carry both MANDATORY and DONT_FIXATE —
+/// Mutter and KWin treat absence of DONT_FIXATE as the legacy single-
+/// modifier path and silently fall through to SHM.
+fn build_format_pod(modifiers: &[u64]) -> Result<Vec<u8>> {
+    let want_dmabuf = !modifiers.is_empty();
     let mut properties = vec![
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::MediaType,
@@ -387,11 +401,22 @@ fn build_format_pod(want_dmabuf: bool) -> Result<Vec<u8>> {
         pw::spa::utils::Fraction { num: 240, denom: 1 }
     ));
     if want_dmabuf {
-        // VideoModifier as a single-element Long choice = "fixate to
-        // LINEAR". The property! macro doesn't support Long (no
-        // libspa::utils::Long wrapper exists — i64 is used directly),
-        // so we hand-build the Property.
-        let modifier_default = i64::try_from(DRM_FORMAT_MOD_LINEAR).unwrap();
+        // VideoModifier as a multi-element Long enum lets the compositor
+        // pick whichever of our advertised modifiers it can satisfy.
+        // SPA's Property type doesn't have a Long wrapper in
+        // libspa::utils (i64 is the value type directly), so the macro
+        // can't build this — hand-built `Property` it is.
+        //
+        // The `default` slot is what fixated negotiation falls back to
+        // when neither side states a preference; we use the first
+        // entry. Caller is expected to pass LINEAR first if it's in the
+        // set so plain compositors don't gravitate to a tiled modifier
+        // unnecessarily.
+        let alternatives: Vec<i64> = modifiers
+            .iter()
+            .map(|m| i64::from_ne_bytes(m.to_ne_bytes()))
+            .collect();
+        let default = alternatives[0];
         properties.push(pw::spa::pod::Property {
             key: pw::spa::param::format::FormatProperties::VideoModifier.as_raw(),
             flags: pw::spa::pod::PropertyFlags::MANDATORY
@@ -400,8 +425,8 @@ fn build_format_pod(want_dmabuf: bool) -> Result<Vec<u8>> {
                 pw::spa::utils::Choice::<i64>(
                     pw::spa::utils::ChoiceFlags::empty(),
                     pw::spa::utils::ChoiceEnum::<i64>::Enum {
-                        default: modifier_default,
-                        alternatives: vec![modifier_default],
+                        default,
+                        alternatives,
                     },
                 ),
             )),

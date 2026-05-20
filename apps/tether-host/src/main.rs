@@ -783,7 +783,36 @@ async fn pick_capture_source(
 #[cfg(target_os = "linux")]
 async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
     info!("capture source: linux (PipeWire + xdg-desktop-portal)");
-    tether_capture::linux::start()
+    // Query which DRM modifiers our wgpu/Vulkan importer can consume for
+    // the BGRA-family capture formats PipeWire emits. PipeWire then
+    // negotiates a DMA-BUF format with the compositor restricted to the
+    // intersection of (compositor-supported, this list). Empty result —
+    // or any query failure — drops us to SHM-only, which is the
+    // intended fallback path; the goal is "never advertise a modifier we
+    // can't actually import."
+    //
+    // AR24 (DRM_FORMAT_ARGB8888) and XR24 (DRM_FORMAT_XRGB8888) both map
+    // to vk::Format::B8G8R8A8_UNORM on the importer side, so the
+    // modifier sets are identical; querying once suffices.
+    let modifiers = match tether_gpuconvert::importable_dmabuf_modifiers(
+        u32::from_le_bytes(*b"AR24"),
+    )
+    .await
+    {
+        Ok(m) if !m.is_empty() => {
+            info!(count = m.len(), "advertised DMA-BUF modifiers to compositor");
+            m
+        }
+        Ok(_) => {
+            warn!("GPU importer reports zero DRM modifiers; DMA-BUF disabled, SHM only");
+            Vec::new()
+        }
+        Err(e) => {
+            warn!(error = %e, "modifier query failed; DMA-BUF disabled, SHM only");
+            Vec::new()
+        }
+    };
+    tether_capture::linux::start(modifiers)
         .await
         .map_err(anyhow::Error::from)
 }

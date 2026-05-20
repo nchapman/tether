@@ -31,6 +31,8 @@
 #[cfg(unix)]
 pub mod dmabuf_export;
 #[cfg(unix)]
+pub mod modifier_query;
+#[cfg(unix)]
 pub mod nv12_dmabuf;
 mod pipeline;
 
@@ -38,6 +40,8 @@ mod pipeline;
 pub use dmabuf_export::{
     export_texture_as_dmabuf, DmaBufExport, ExportError, DRM_FORMAT_MOD_LINEAR,
 };
+#[cfg(unix)]
+pub use modifier_query::{importable_dmabuf_modifiers, ModifierQueryError};
 #[cfg(unix)]
 pub use nv12_dmabuf::{Nv12DmaBuf, Nv12DmaBufError, Nv12DmaBufFrame};
 

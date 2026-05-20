@@ -3222,6 +3222,7 @@ dependencies = [
  "tether-gpuconvert",
  "tether-input",
  "tether-protocol",
+ "tether-session",
  "tether-transport",
  "tokio",
  "tracing",
@@ -3265,6 +3266,13 @@ dependencies = [
  "tracing-subscriber",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "tether-session"
+version = "0.0.1"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]

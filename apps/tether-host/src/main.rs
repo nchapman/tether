@@ -125,11 +125,11 @@ async fn handle_client(
     // is identical.
     let frames = pick_capture_source(use_test_pattern).await?;
 
-    // Force-IDR signal: control-stream recv task sets it on
-    // `ControlMessage::ForceIdr`; the capture/encode thread checks it
-    // each frame via swap. AtomicBool is the cheapest cross-thread
-    // primitive that fits the "one-shot until next frame" semantic.
-    let force_idr = Arc::new(AtomicBool::new(false));
+    // Force-IDR signal: control-stream recv task `raise`s it on
+    // `ControlMessage::ForceIdr`; the capture/encode thread `take`s it
+    // each frame. Coalescing comes for free — N raises between two
+    // takes produce one keyframe. See `tether_session::IdrSignal`.
+    let force_idr = tether_session::IdrSignal::new();
 
     // Shared display-dimensions channel: the capture thread learns the
     // real host display size on the first frame and posts (w, h) here;
@@ -194,7 +194,7 @@ async fn handle_client(
                 match conn.recv_control().await {
                     Ok(ControlMessage::ForceIdr) => {
                         tracing::debug!("client requested IDR");
-                        force_idr.store(true, Ordering::Relaxed);
+                        force_idr.raise();
                     }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
                         let t1 = MonoNanos::now();
@@ -537,28 +537,12 @@ fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
 fn run_capture_and_send(
     conn: Arc<Connection>,
     frames: Receiver<CapturedFrame>,
-    force_idr: Arc<AtomicBool>,
+    force_idr: tether_session::IdrSignal,
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
-    let mut frame_count: u64 = 0;
-    // Sum of (t_encode_done - t_encode_submit) across frames in the
-    // current log window. Pairs with frame_count to produce an average
-    // encode latency per stats log — the headline number for
-    // confirming a HW encoder swap actually moved the needle without
-    // having to instrument every frame.
-    let mut encode_latency_sum_ns: u64 = 0;
-    // Bytes of encoded H.264 produced this window (sum of EncodedPacket
-    // payloads). Drives kbps_out so the user can see whether the
-    // encoder is actually hitting the configured bitrate target.
-    let mut encoded_bytes_sum: u64 = 0;
-    // Keyframes emitted this window. Expected value with GOP=fps is
-    // ~1/s; spikes above that mean the client is hammering ForceIdr
-    // (network loss or decoder errors), which is a useful signal
-    // independent of why it's happening.
-    let mut keyframe_count: u32 = 0;
-    let mut last_log = std::time::Instant::now();
+    let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
     let mut slot: Option<EncoderSlot> = None;
     let mut pts: i64 = 0;
 
@@ -654,7 +638,7 @@ fn run_capture_and_send(
 
         // Swap-and-zero: at most one forced keyframe per request, even
         // if multiple ForceIdr messages arrive between encode calls.
-        let force_kf = force_idr.swap(false, Ordering::Relaxed);
+        let force_kf = force_idr.take();
         timing.encode_submit();
         let encoded = match frame {
             CapturedFrame::Cpu(ref cpu) => {
@@ -685,7 +669,7 @@ fn run_capture_and_send(
             }
         };
         timing.encode_done();
-        encode_latency_sum_ns = encode_latency_sum_ns.saturating_add(timing.encode_delta_ns());
+        let encode_delta_ns = timing.encode_delta_ns();
         pts += 1;
 
         // Concatenate all packets the encoder spat out for this input
@@ -703,10 +687,7 @@ fn run_capture_and_send(
         if combined.is_empty() {
             continue;
         }
-        encoded_bytes_sum = encoded_bytes_sum.saturating_add(combined.len() as u64);
-        if keyframe {
-            keyframe_count = keyframe_count.saturating_add(1);
-        }
+        stats.record_frame(encode_delta_ns, combined.len() as u64, keyframe);
 
         let meta = VideoFrameMeta {
             timing: timing.finish(),
@@ -723,38 +704,21 @@ fn run_capture_and_send(
             }
         }
 
-        frame_count += 1;
-        if last_log.elapsed() >= std::time::Duration::from_secs(2) {
-            let window_secs = last_log.elapsed().as_secs_f64();
-            #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
-            let avg_encode_ms = if frame_count > 0 {
-                (encode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
-            } else {
-                0.0
-            };
-            #[allow(clippy::cast_precision_loss)]
-            let kbps_out = if window_secs > 0.0 {
-                (encoded_bytes_sum as f64 * 8.0 / 1000.0) / window_secs
-            } else {
-                0.0
-            };
-            let kf_per_s = if window_secs > 0.0 {
-                f64::from(keyframe_count) / window_secs
-            } else {
-                0.0
-            };
-            info!(
-                frames = frame_count,
-                avg_encode_ms = format!("{avg_encode_ms:.2}"),
-                kbps_out = format!("{kbps_out:.0}"),
-                kf_per_s = format!("{kf_per_s:.2}"),
-                "send stats"
-            );
-            frame_count = 0;
-            encode_latency_sum_ns = 0;
-            encoded_bytes_sum = 0;
-            keyframe_count = 0;
-            last_log = std::time::Instant::now();
+        if stats.should_emit() {
+            if let Some(snap) = stats.snapshot_and_reset() {
+                let kf_per_s = if snap.window_secs > 0.0 {
+                    f64::from(snap.keyframe_count) / snap.window_secs
+                } else {
+                    0.0
+                };
+                info!(
+                    frames = snap.frame_count,
+                    avg_encode_ms = format!("{:.2}", snap.avg_encode_ms),
+                    kbps_out = format!("{:.0}", snap.kbps_out),
+                    kf_per_s = format!("{kf_per_s:.2}"),
+                    "send stats"
+                );
+            }
         }
     }
     info!("send loop exiting");

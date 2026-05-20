@@ -132,26 +132,30 @@ impl Connection {
         &self,
         mut hello: ClientHello,
     ) -> Result<(ServerHello, ClockSync)> {
-        hello.clock_probe_t0 = MonoNanos::now();
-        let t0 = hello.clock_probe_t0;
+        let t0 = MonoNanos::now();
+        // Stamp t0 into the version-specific body so the host's echo
+        // pairs with this send. Match exhaustively — adding a V2 forces
+        // an update here.
+        match &mut hello {
+            ClientHello::V1(body) => body.clock_probe_t0 = t0,
+        }
         self.send_control_raw(&hello).await?;
         let server: ServerHello = self.recv_control_raw().await?;
         let t3 = MonoNanos::now();
-        let sync = ClockSync::from_probe(
-            t0,
-            server.t1_server_recv,
-            server.t2_server_send,
-            t3,
-        );
+        let (t1_recv, t2_send) = match &server {
+            ServerHello::V1(body) => (body.t1_server_recv, body.t2_server_send),
+        };
+        let sync = ClockSync::from_probe(t0, t1_recv, t2_send, t3);
         Ok((server, sync))
     }
 
     /// Host side of the post-QUIC application handshake. Awaits the
     /// `ClientHello`, captures the receive time, hands the parsed Hello
     /// to the caller's `build` closure (which picks the codec, chooses a
-    /// resolution, etc.), then stamps `t2_server_send` immediately
-    /// before sending the response. Returns the original `ClientHello`
-    /// so the caller can also inspect what it agreed to.
+    /// resolution, etc.), then stamps the probe timestamps inside the
+    /// returned ServerHello body immediately before sending the response.
+    /// Returns the parsed `ClientHello` so the caller can also inspect
+    /// what it agreed to.
     pub async fn host_handshake<F>(&self, build: F) -> Result<ClientHello>
     where
         F: FnOnce(&ClientHello) -> ServerHello,
@@ -159,9 +163,18 @@ impl Connection {
         let hello: ClientHello = self.recv_control_raw().await?;
         let t1 = MonoNanos::now();
         let mut server = build(&hello);
-        server.clock_probe_t0_echo = hello.clock_probe_t0;
-        server.t1_server_recv = t1;
-        server.t2_server_send = MonoNanos::now();
+        let client_t0 = match &hello {
+            ClientHello::V1(body) => body.clock_probe_t0,
+        };
+        // Patch the probe stamps into the body the caller built. Match
+        // exhaustively so a future V2 forces a code update here.
+        match &mut server {
+            ServerHello::V1(body) => {
+                body.clock_probe_t0_echo = client_t0;
+                body.t1_server_recv = t1;
+                body.t2_server_send = MonoNanos::now();
+            }
+        }
         self.send_control_raw(&server).await?;
         Ok(hello)
     }

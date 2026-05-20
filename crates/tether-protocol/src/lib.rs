@@ -16,10 +16,6 @@ pub use guard::GpuResourceGuard;
 
 use serde::{Deserialize, Serialize};
 
-/// Wire-format version. Bumped on any breaking change to the on-wire
-/// representation of any message defined in this crate.
-pub const PROTOCOL_VERSION: u32 = 1;
-
 /// Conservative QUIC datagram budget — the upper bound on encoded
 /// [`video::VideoPacket`] size we target. The actual `max_datagram_size`
 /// reported by quinn at runtime may be larger; we slice frames to this size
@@ -145,20 +141,76 @@ mod tests {
 
     #[test]
     fn round_trip_client_hello() {
-        let h = ClientHello {
-            protocol_version: PROTOCOL_VERSION,
+        let body = ClientHelloV1 {
             client_name: "tether-client/0.0.1".into(),
             preferred_codecs: vec![CodecKind::H264, CodecKind::Hevc],
             max_resolution: Some((3840, 2160)),
             clock_probe_t0: MonoNanos(123_456_789),
+            extensions: Default::default(),
+            resume_token: None,
         };
+        let h = ClientHello::V1(body.clone());
         let bytes = encode(&h).unwrap();
         let h2: ClientHello = decode(&bytes).unwrap();
-        assert_eq!(h.protocol_version, h2.protocol_version);
-        assert_eq!(h.client_name, h2.client_name);
-        assert_eq!(h.preferred_codecs, h2.preferred_codecs);
-        assert_eq!(h.max_resolution, h2.max_resolution);
-        assert_eq!(h.clock_probe_t0, h2.clock_probe_t0);
+        let ClientHello::V1(body2) = h2;
+        assert_eq!(body.client_name, body2.client_name);
+        assert_eq!(body.preferred_codecs, body2.preferred_codecs);
+        assert_eq!(body.max_resolution, body2.max_resolution);
+        assert_eq!(body.clock_probe_t0, body2.clock_probe_t0);
+        assert!(body2.extensions.is_empty());
+        assert!(body2.resume_token.is_none());
+    }
+
+    #[test]
+    fn client_hello_extensions_round_trip() {
+        // Extensions populated round-trip identically. This is the
+        // forward-compat probe: a future feature opt-in lands here.
+        let mut extensions = std::collections::BTreeMap::new();
+        extensions.insert("av1-preferred".to_string(), vec![1u8]);
+        extensions.insert("adaptive-bitrate-hint".to_string(), vec![0u8, 0, 64, 0]);
+        let body = ClientHelloV1 {
+            client_name: "x".into(),
+            preferred_codecs: vec![CodecKind::H264],
+            max_resolution: None,
+            clock_probe_t0: MonoNanos(1),
+            extensions: extensions.clone(),
+            resume_token: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+        };
+        let bytes = encode(&ClientHello::V1(body)).unwrap();
+        let ClientHello::V1(body2) = decode::<ClientHello>(&bytes).unwrap();
+        assert_eq!(body2.extensions, extensions);
+        assert_eq!(body2.resume_token, Some(vec![0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    #[test]
+    fn unknown_client_hello_variant_fails_decode() {
+        // Hand-craft bytes for a hypothetical V2: discriminator byte
+        // claiming variant 1 (V1 is 0). This pins the forward-compat
+        // story: an older receiver decoding a newer variant must error
+        // cleanly, not silently misinterpret the body bytes.
+        let bytes = [1u8, 0, 0, 0, 0];
+        let result = decode::<ClientHello>(&bytes);
+        assert!(
+            result.is_err(),
+            "unknown ClientHello variant must fail decode, not silently succeed"
+        );
+    }
+
+    #[test]
+    fn goodbye_carries_machine_readable_code() {
+        let g = ControlMessage::Goodbye {
+            reason: "user quit".into(),
+            code: GoodbyeCode::Clean,
+        };
+        let bytes = encode(&g).unwrap();
+        let g2: ControlMessage = decode(&bytes).unwrap();
+        match g2 {
+            ControlMessage::Goodbye { reason, code } => {
+                assert_eq!(reason, "user quit");
+                assert_eq!(code, GoodbyeCode::Clean);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

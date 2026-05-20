@@ -1,4 +1,45 @@
 //! Control stream: handshake, clock sync, IDR requests, shutdown.
+//!
+//! # Versioning policy
+//!
+//! Both handshake messages ([`ClientHello`], [`ServerHello`]) are
+//! `enum`-shaped wire envelopes whose variants tag a body struct
+//! ([`ClientHelloV1`], [`ServerHelloV1`]). New protocol revisions land
+//! as additional variants (`V2(ClientHelloV2)` etc.). Bincode encodes
+//! enum variants with a varint discriminator, so a future V2 sent to
+//! a V1-only receiver fails decode cleanly (`DecodeError::UnexpectedVariant`)
+//! rather than silently misinterpreting the bytes. The transport
+//! surfaces that as a `Result::Err` to the caller, which then closes
+//! the connection — there's no in-band Goodbye round-trip on a
+//! decode failure (we'd have to know what the peer can parse, which
+//! is exactly what failed).
+//!
+//! Inside a body struct, **only new variants are wire-additive — never
+//! appended fields**. Bincode is strictly positional within a struct
+//! with no length prefix, so a V1 encoder that grew a new field at the
+//! end would either leave trailing bytes attributed to the *next*
+//! framed message or hit EOF in an older decoder. Adding anything to
+//! `ClientHelloV1` after this point requires a `ClientHelloV2`.
+//! The `#[serde(default)]` attributes on `extensions` and `resume_token`
+//! are no-ops under bincode (positional, never sees a missing field) but
+//! stay correct under serde formats with field-name tagging, in case
+//! we ever export to JSON for telemetry.
+//!
+//! Forward-compatible *opt-in features* go through [`ClientHelloV1::extensions`]
+//! / [`ServerHelloV1::extensions`] instead. The map shape lets either
+//! side advertise a feature key (and its value payload) without a wire
+//! revision; unknown keys are ignored. **Key naming convention:**
+//! reverse-DNS-style `vendor.feature` (`tether.adaptive-bitrate`,
+//! `tether.av1-preferred`) so first-party and future third-party
+//! extensions don't collide.
+//!
+//! [`ControlMessage`] is closed: new variants on it are NOT
+//! wire-additive (the discriminator collides with future codepoints
+//! the peer might already understand differently). Adding a new
+//! `ControlMessage` variant requires landing a `ClientHelloV2`
+//! alongside it.
+
+use std::collections::BTreeMap;
 
 use crate::MonoNanos;
 use serde::{Deserialize, Serialize};
@@ -32,17 +73,19 @@ pub struct ClockProbe {
     pub t2_receiver_send: MonoNanos,
 }
 
-/// First message a client sends after the QUIC handshake completes.
+// --- Versioned handshake envelopes --------------------------------------
+
+/// Wire envelope for the client's opening message.
 ///
-/// **Version policy (v0):** the receiver compares
-/// [`Self::protocol_version`] against the local [`crate::PROTOCOL_VERSION`]
-/// and treats any mismatch as fatal — no negotiation, no minimum-version
-/// fallback. The connection is closed with `Goodbye { reason: "protocol
-/// version mismatch" }`. We can revisit once we have multiple shipped
-/// versions in the wild.
+/// New protocol revisions add additional variants alongside `V1`. See
+/// the module-level docs for the full versioning policy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientHello {
-    pub protocol_version: u32,
+pub enum ClientHello {
+    V1(ClientHelloV1),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHelloV1 {
     pub client_name: String,
     /// Codecs the client can decode, ordered by preference.
     pub preferred_codecs: Vec<CodecKind>,
@@ -51,11 +94,30 @@ pub struct ClientHello {
     /// First leg of the handshake clock probe — client's monotonic time at
     /// the moment of send.
     pub clock_probe_t0: MonoNanos,
+    /// Opt-in extension envelope for forward-compatible feature flags
+    /// (AV1 advertise, adaptive bitrate hint, future channels). Both
+    /// sides ignore keys they don't recognise — adding a feature here
+    /// does not require a protocol revision.
+    #[serde(default)]
+    pub extensions: BTreeMap<String, Vec<u8>>,
+    /// If the client is attempting to resume a previous session, the
+    /// token the host issued in that session's [`ServerHelloV1::resume_token`].
+    /// `None` on a fresh session. The host may accept (preserving
+    /// `stream_epoch` so the renderer can continue without a black
+    /// frame) or reject (issue a fresh epoch); semantics are TBD. The
+    /// protocol shape is here now so adding the implementation later
+    /// doesn't require a wire bump.
+    #[serde(default)]
+    pub resume_token: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerHello {
-    pub protocol_version: u32,
+pub enum ServerHello {
+    V1(ServerHelloV1),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerHelloV1 {
     pub server_name: String,
     pub chosen_codec: CodecKind,
     pub chosen_chroma: ChromaSubsampling,
@@ -68,6 +130,37 @@ pub struct ServerHello {
     pub t1_server_recv: MonoNanos,
     /// Server-monotonic time when this message is sent.
     pub t2_server_send: MonoNanos,
+    /// Opt-in extension envelope — same purpose as
+    /// [`ClientHelloV1::extensions`].
+    #[serde(default)]
+    pub extensions: BTreeMap<String, Vec<u8>>,
+    /// Opaque token the client can stash and present in a future
+    /// [`ClientHelloV1::resume_token`] to attempt session resume.
+    /// `None` if the host doesn't (yet) implement resume.
+    #[serde(default)]
+    pub resume_token: Option<Vec<u8>>,
+}
+
+// --- Goodbye ------------------------------------------------------------
+
+/// Machine-readable reason for a [`ControlMessage::Goodbye`]. Lets the
+/// peer distinguish "host shutting down cleanly" from "protocol
+/// violation" without parsing the human-readable `reason` string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GoodbyeCode {
+    /// Local side initiated a clean shutdown (user quit, system
+    /// suspend, etc.). The peer should not retry.
+    Clean,
+    /// Local side observed a protocol violation in the peer's
+    /// messages. Retrying with the same binary is unlikely to help.
+    ProtocolError,
+    /// Handshake's variant tag didn't decode, i.e. the peer is
+    /// speaking a newer protocol revision than this build knows.
+    UnsupportedVersion,
+    /// Catch-all for internal errors not otherwise classified. The
+    /// peer may retry; a transient failure here doesn't preclude
+    /// reconnect.
+    InternalError,
 }
 
 /// Messages exchanged on the reliable control stream after handshake.
@@ -78,8 +171,13 @@ pub enum ControlMessage {
     /// Periodic clock-sync re-probe (either side may initiate).
     ClockProbeRequest { t0_sender: MonoNanos },
     ClockProbeResponse(ClockProbe),
-    Goodbye { reason: String },
+    Goodbye {
+        reason: String,
+        code: GoodbyeCode,
+    },
 }
+
+// --- ClockSync ----------------------------------------------------------
 
 /// Result of a successful three-way handshake probe. Computed from
 /// `t0_client_send`, `t1_server_recv`, `t2_server_send`, `t3_client_recv`

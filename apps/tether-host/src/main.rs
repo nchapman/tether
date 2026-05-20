@@ -23,12 +23,13 @@ use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject, GpuEncoderFrame};
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame};
 use tether_protocol::control::{
-    ChromaSubsampling, CodecKind, ColorSpace, ControlMessage, ServerHello,
+    ChromaSubsampling, ClientHello, CodecKind, ColorSpace, ControlMessage, ServerHello,
+    ServerHelloV1,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
-use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
+use tether_protocol::MonoNanos;
 use tether_transport::{Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
@@ -86,35 +87,34 @@ async fn handle_client(
     // layer stamps the clock-probe timestamps right around the send to
     // keep the offset measurement tight. Hello protocol-version
     // mismatches are fatal per the v0 policy in control.rs.
+    // Newer clients sending an unknown ClientHello variant fail decode
+    // upstream of this closure; the transport surfaces that as an error
+    // we return below. Reaching the closure means the variant decoded.
     let client_hello = conn
-        .host_handshake(|hello| ServerHello {
-            protocol_version: PROTOCOL_VERSION,
-            server_name: "tether-host".to_string(),
-            chosen_codec: pick_codec(&hello.preferred_codecs),
-            chosen_chroma: ChromaSubsampling::Yuv420,
-            color_space: ColorSpace::Bt709Limited,
-            // Encoded source dims aren't known yet (lazy encoder init
-            // happens on the first frame); use a placeholder and rely
-            // on per-frame VideoFrameMeta::dimensions for the truth.
-            resolution: (0, 0),
-            clock_probe_t0_echo: MonoNanos::ZERO,
-            t1_server_recv: MonoNanos::ZERO,
-            t2_server_send: MonoNanos::ZERO,
+        .host_handshake(|hello| {
+            let ClientHello::V1(body) = hello;
+            ServerHello::V1(ServerHelloV1 {
+                server_name: "tether-host".to_string(),
+                chosen_codec: pick_codec(&body.preferred_codecs),
+                chosen_chroma: ChromaSubsampling::Yuv420,
+                color_space: ColorSpace::Bt709Limited,
+                // Encoded source dims aren't known yet (lazy encoder init
+                // happens on the first frame); use a placeholder and rely
+                // on per-frame VideoFrameMeta::dimensions for the truth.
+                resolution: (0, 0),
+                clock_probe_t0_echo: MonoNanos::ZERO,
+                t1_server_recv: MonoNanos::ZERO,
+                t2_server_send: MonoNanos::ZERO,
+                extensions: Default::default(),
+                resume_token: None,
+            })
         })
         .await?;
-    if client_hello.protocol_version != PROTOCOL_VERSION {
-        warn!(
-            client_version = client_hello.protocol_version,
-            host_version = PROTOCOL_VERSION,
-            "protocol version mismatch; closing"
-        );
-        conn.close(0, b"protocol version mismatch");
-        return Ok(());
-    }
+    let ClientHello::V1(client_body) = client_hello;
     info!(
-        client = %client_hello.client_name,
-        codecs = ?client_hello.preferred_codecs,
-        max_resolution = ?client_hello.max_resolution,
+        client = %client_body.client_name,
+        codecs = ?client_body.preferred_codecs,
+        max_resolution = ?client_body.max_resolution,
         "handshake complete"
     );
 
@@ -215,8 +215,8 @@ async fn handle_client(
                         // we ever do, the matching response handler goes here.
                         tracing::trace!("unsolicited clock probe response; ignoring");
                     }
-                    Ok(ControlMessage::Goodbye { reason }) => {
-                        info!(%reason, "client said goodbye");
+                    Ok(ControlMessage::Goodbye { reason, code }) => {
+                        info!(%reason, ?code, "client said goodbye");
                         return;
                     }
                     Err(e) => {

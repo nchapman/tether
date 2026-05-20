@@ -14,9 +14,11 @@ use crossbeam_channel::bounded;
 use tether_codec::{probe_decoder, Decoder, Frame as CodecFrame};
 use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame};
 use tether_input::{WinitTranslator, WireEvent};
-use tether_protocol::control::{ClientHello, CodecKind, ControlMessage};
+use tether_protocol::control::{
+    ClientHello, ClientHelloV1, CodecKind, ControlMessage, GoodbyeCode, ServerHello,
+};
 use tether_protocol::video::FrameReassembler;
-use tether_protocol::{MonoNanos, PROTOCOL_VERSION};
+use tether_protocol::MonoNanos;
 use tether_render::{Frame, RenderEvent};
 use tether_transport::{Client, Datagram};
 use tokio::sync::mpsc;
@@ -51,24 +53,25 @@ async fn main() -> anyhow::Result<()> {
     // Application-layer handshake: identify ourselves, request a codec,
     // and use the embedded probe to compute a host↔client clock offset
     // so latency logs are wall-clock-accurate from the first frame.
-    let hello = ClientHello {
-        protocol_version: PROTOCOL_VERSION,
+    let hello = ClientHello::V1(ClientHelloV1 {
         client_name: "tether-client".to_string(),
         preferred_codecs: vec![CodecKind::H264],
         max_resolution: None,
         clock_probe_t0: MonoNanos::ZERO,
-    };
+        extensions: Default::default(),
+        resume_token: None,
+    });
     let (server_hello, clock_sync) = conn.client_handshake(hello).await?;
-    if server_hello.protocol_version != PROTOCOL_VERSION {
-        anyhow::bail!(
-            "protocol version mismatch: client={PROTOCOL_VERSION}, server={}",
-            server_hello.protocol_version
-        );
-    }
+    // Newer hosts may send a future ServerHello variant we don't know;
+    // bincode's enum-variant decode catches that as an error before we
+    // get here. Reaching this point means the variant decoded; we
+    // match exhaustively so a future V2 forces a compile-time update
+    // rather than a silent fallthrough.
+    let ServerHello::V1(server_body) = server_hello;
     info!(
-        server = %server_hello.server_name,
-        codec = ?server_hello.chosen_codec,
-        resolution = ?server_hello.resolution,
+        server = %server_body.server_name,
+        codec = ?server_body.chosen_codec,
+        resolution = ?server_body.resolution,
         rtt_us = clock_sync.rtt_nanos / 1_000,
         clock_offset_us = clock_sync.offset_nanos / 1_000,
         "handshake complete"
@@ -422,6 +425,7 @@ async fn say_goodbye(conn: &tether_transport::Connection, reason: &str) {
     use std::time::Duration;
     let msg = ControlMessage::Goodbye {
         reason: reason.to_string(),
+        code: GoodbyeCode::Clean,
     };
     if let Err(e) = conn.send_control(&msg).await {
         warn!(error = ?e, "send Goodbye failed; host will fall back to timeout");

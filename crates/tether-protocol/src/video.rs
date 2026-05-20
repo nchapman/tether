@@ -129,16 +129,17 @@ pub struct VideoFrameMeta {
 /// `stream_epoch` + `frame_seq` counters (cribbed from RustDesk's
 /// `video_threads: HashMap<usize, _>` pattern).
 ///
-/// `stream_epoch` is `u16` (varint-encoded as 1 byte for typical values) so
-/// a long-lived session that restarts the encoder thousands of times can't
-/// collide with prior epochs. The host bumps `stream_epoch` whenever the
-/// encoder is restarted (resize, codec switch, HW context loss). Clients
-/// drop all packets from prior epochs.
+/// `stream_epoch` is `u32` (varint-encoded as 1 byte for typical values) so
+/// a long-lived session that restarts the encoder cannot wrap and reuse a
+/// prior epoch (which would let the client misattribute fragments at the
+/// wrong resolution / codec / hw context). The host bumps `stream_epoch`
+/// whenever the encoder is restarted (resize, codec switch, HW context
+/// loss). Clients drop all packets from prior epochs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoPacket {
     First {
         display: u8,
-        stream_epoch: u16,
+        stream_epoch: u32,
         frame_seq: u32,
         fragment_count: u16,
         meta: VideoFrameMeta,
@@ -146,7 +147,7 @@ pub enum VideoPacket {
     },
     Continuation {
         display: u8,
-        stream_epoch: u16,
+        stream_epoch: u32,
         frame_seq: u32,
         fragment_index: u16,
         payload: Vec<u8>,
@@ -167,7 +168,7 @@ pub const CONTINUATION_PAYLOAD_BUDGET: usize = 1180;
 /// underlying encoder is restarted.
 pub struct FrameFragmenter {
     display: u8,
-    stream_epoch: u16,
+    stream_epoch: u32,
     next_frame_seq: u32,
 }
 
@@ -184,7 +185,7 @@ impl FrameFragmenter {
         self.display
     }
 
-    pub fn stream_epoch(&self) -> u16 {
+    pub fn stream_epoch(&self) -> u32 {
         self.stream_epoch
     }
 
@@ -239,7 +240,7 @@ impl FrameFragmenter {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReassembledFrame {
     pub display: u8,
-    pub stream_epoch: u16,
+    pub stream_epoch: u32,
     pub frame_seq: u32,
     pub meta: VideoFrameMeta,
     pub body: Vec<u8>,
@@ -256,8 +257,8 @@ pub struct FrameReassembler {
     max_age: u32,
 }
 
-type FrameKey = (u8, u16, u32);
-type StreamKey = (u8, u16);
+type FrameKey = (u8, u32, u32);
+type StreamKey = (u8, u32);
 
 struct Pending {
     fragment_count: u16,

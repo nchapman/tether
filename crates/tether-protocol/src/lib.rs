@@ -326,6 +326,33 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_video_packet_stream_epoch_above_u16() {
+        // stream_epoch is u32: a long-lived host that restarts the
+        // encoder past u16::MAX (65_535) must round-trip cleanly.
+        // 70_000 is just past that ceiling.
+        let epoch = 70_000u32;
+        let p = VideoPacket::First {
+            display: 0,
+            stream_epoch: epoch,
+            frame_seq: 0,
+            fragment_count: 1,
+            meta: VideoFrameMeta {
+                timing: HostFrameTiming::default(),
+                keyframe: true,
+                input_echo: InputEchoBatch::default(),
+                dimensions: (1, 1),
+            },
+            payload: vec![],
+        };
+        let bytes = encode(&p).unwrap();
+        let p2: VideoPacket = decode(&bytes).unwrap();
+        match p2 {
+            VideoPacket::First { stream_epoch, .. } => assert_eq!(stream_epoch, epoch),
+            VideoPacket::Continuation { .. } => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn round_trip_cursor_position() {
         let c = HostCursorPacket::Position {
             t_capture: MonoNanos(999),
@@ -384,7 +411,7 @@ mod tests {
         // payload sized so the whole packet stays under the datagram budget.
         let p = VideoPacket::First {
             display: u8::MAX,
-            stream_epoch: u16::MAX,
+            stream_epoch: u32::MAX,
             frame_seq: u32::MAX,
             fragment_count: u16::MAX,
             meta: VideoFrameMeta {
@@ -519,7 +546,7 @@ mod tests {
         // ~15 bytes of header overhead in the worst case for this variant.
         let p = VideoPacket::Continuation {
             display: u8::MAX,
-            stream_epoch: u16::MAX,
+            stream_epoch: u32::MAX,
             frame_seq: u32::MAX,
             fragment_index: u16::MAX,
             payload: vec![0; 1180],

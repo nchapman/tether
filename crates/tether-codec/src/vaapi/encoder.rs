@@ -138,23 +138,41 @@ impl VaapiEncoder {
         // transcoding throughput, not realtime; we override the knobs
         // that cost us the most:
         //   profile=main — Main is the safest broadly-supported profile
-        //     across Intel/AMD/NVIDIA VAAPI drivers. The encoder defaults
-        //     to High, which fails to open on hardware that exposes only
-        //     Main for the chosen entrypoint. Both H.264 Main and HEVC
-        //     Main use the same `profile=main` option string. Every
-        //     realistic decoder we'll talk to handles Main. W3 will
-        //     replace this hard-code with a probe.
-        //   async_depth=1 — synchronous mode. Default is 4, which
-        //     buys throughput at the cost of three extra frames of
-        //     latency before the first packet emerges. We need the
-        //     opposite trade.
+        //     across Intel/AMD/NVIDIA VAAPI drivers (H.264 Main, HEVC
+        //     Main — same option string for both codecs). The encoder
+        //     defaults to High for H.264, which fails to open on hardware
+        //     that exposes only Main for the chosen entrypoint. Every
+        //     realistic decoder we'll talk to handles Main. Per-codec
+        //     profile probing via vaQueryConfigProfiles +
+        //     vaGetConfigAttributes is the principled replacement; it
+        //     needs a small libva FFI extension (vaQueryConfigProfiles,
+        //     vaGetConfigAttributes) and an AMD test machine to validate.
+        //     Deferred until we have both.
+        //   async_depth=1 — synchronous mode. Default is 4, which buys
+        //     throughput at the cost of three extra frames of latency
+        //     before the first packet emerges. We need the opposite trade.
         //   rc_mode=VBR — VBR matches Intel's recommended low-latency
         //     mode (CBR-style buffering also works but introduces a
-        //     visible bitrate floor on static content). W3 will probe
-        //     the supported rate-control modes per backend.
+        //     visible bitrate floor on static content). Apollo carries
+        //     an explicit CBR/VBR probe for AMD VAAPI (commit 2aa5a396)
+        //     because the default of CQP produces bad bitrate behavior
+        //     on Radeon. We'll add the same probe alongside the profile
+        //     probe above when we have AMD hardware to validate against;
+        //     today the VBR hard-code works on Intel and NVIDIA via
+        //     nvidia-vaapi-driver, which is what tether users run.
+        //   idr_interval=INT_MAX — disable the encoder's internal periodic
+        //     IDR. We drive IDRs on demand via IdrSignal at the host
+        //     orchestration layer; the GOP_SECONDS-based gop_size above
+        //     bounds the recovery window for clients that miss a forced
+        //     IDR. Setting this to INT_MAX matches Sunshine.
+        //   sei=0 — suppress SEI prefix NAL units (timing info, recovery
+        //     point, etc.). Saves a few bytes per IDR and no decoder we
+        //     ship to needs them.
         let dict = AVDictionary::new(c"profile", c"main", 0)
             .set(c"async_depth", c"1", 0)
-            .set(c"rc_mode", c"VBR", 0);
+            .set(c"rc_mode", c"VBR", 0)
+            .set(c"idr_interval", c"2147483647", 0)
+            .set(c"sei", c"0", 0);
         let leftover = encoder.open(Some(dict))?;
         if let Some(unused) = leftover {
             // Driver/encoder didn't recognise one or more opts. Not

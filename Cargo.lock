@@ -3201,6 +3201,7 @@ dependencies = [
 name = "tether-gpuconvert"
 version = "0.0.1"
 dependencies = [
+ "ash",
  "pollster",
  "thiserror 2.0.18",
  "tracing",

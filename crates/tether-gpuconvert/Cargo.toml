@@ -16,6 +16,11 @@ tracing = { workspace = true }
 # VAAPI). Workspace-level [patch.crates-io] keeps the wgpu sub-crates
 # consistent across both consumers.
 wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["vulkan"] }
+# Raw Vulkan calls for the DMA-BUF export path. wgpu-hal pins ash
+# 0.38; matching here keeps a single resolved version across the
+# workspace so types (vk::Image, vk::DeviceMemory, etc.) are
+# pointer-compatible with wgpu's internals.
+ash = "0.38"
 pollster = "0.4"
 
 [lints]

@@ -28,6 +28,13 @@
 //! - This crate's surface is one wgpu device + one compute pipeline.
 //!   Small, focused, easy to test in isolation.
 
+#[cfg(unix)]
+pub mod dmabuf_export;
+#[cfg(unix)]
+pub use dmabuf_export::{
+    export_texture_as_dmabuf, DmaBufExport, ExportError, DRM_FORMAT_MOD_LINEAR,
+};
+
 const SHADER_SRC: &str = include_str!("bgra_to_nv12.wgsl");
 
 #[derive(Debug, thiserror::Error)]

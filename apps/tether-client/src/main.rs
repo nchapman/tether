@@ -55,7 +55,11 @@ async fn main() -> anyhow::Result<()> {
     // so latency logs are wall-clock-accurate from the first frame.
     let hello = ClientHello::V1(ClientHelloV1 {
         client_name: "tether-client".to_string(),
-        preferred_codecs: vec![CodecKind::H264],
+        // Order matters: host picks the first that it can build, so
+        // HEVC takes precedence on hosts that have it (better
+        // compression at the same visual quality). H.264 is the
+        // universal fallback.
+        preferred_codecs: vec![CodecKind::Hevc, CodecKind::H264],
         max_resolution: None,
         clock_probe_t0: MonoNanos::ZERO,
         extensions: Default::default(),
@@ -93,19 +97,21 @@ async fn main() -> anyhow::Result<()> {
 
     let conn_recv = conn.clone();
     let recv_clock_sync = clock_sync;
+    let chosen_codec = server_body.chosen_codec;
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
-        let mut decoder: Box<dyn Decoder> = match probe_decoder() {
+        let mut decoder: Box<dyn Decoder> = match probe_decoder(chosen_codec) {
             Ok(d) => {
                 info!(
                     backend = d.name(),
                     hardware = d.is_hardware(),
+                    codec = ?chosen_codec,
                     "decoder initialised"
                 );
                 d
             }
             Err(e) => {
-                warn!(error = %e, "decoder init failed; aborting recv loop");
+                warn!(error = %e, codec = ?chosen_codec, "decoder init failed; aborting recv loop");
                 return;
             }
         };

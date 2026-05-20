@@ -14,7 +14,7 @@ pub mod probe;
 #[cfg(target_os = "linux")]
 pub mod vaapi;
 
-pub use probe::{probe_decoder, probe_encoder_bgra};
+pub use probe::{probe_decoder, probe_encoder, probe_encoder_kind};
 
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. The decoder
 /// stashes whatever ref-counted handles it needs alive while the

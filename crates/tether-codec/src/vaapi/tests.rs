@@ -175,3 +175,13 @@ fn vaapi_encoder_dmabuf_import() {
         "encoder must emit at least one packet across two submitted frames"
     );
 }
+
+#[test]
+#[ignore = "requires VAAPI; one-shot probe check"]
+fn probe_encoder_kind_smoke() {
+    use crate::probe_encoder_kind;
+    use tether_protocol::control::CodecKind;
+    println!("H264 buildable: {}", probe_encoder_kind(CodecKind::H264));
+    println!("HEVC buildable: {}", probe_encoder_kind(CodecKind::Hevc));
+    println!("AV1  buildable: {}", probe_encoder_kind(CodecKind::Av1));
+}

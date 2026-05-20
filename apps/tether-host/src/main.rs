@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
-use tether_codec::{probe_encoder_bgra, Encoder};
+use tether_codec::{probe_encoder, probe_encoder_kind, Encoder};
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
 #[cfg(target_os = "linux")]
@@ -35,12 +35,26 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-const ENCODER_BITRATE_KBPS: u32 = 4_000;
-const ENCODER_FPS: u32 = 30;
+/// Default target frame rate. Sunshine and Apollo run desktop / game
+/// streaming at 60 fps by default; tether matches. The host's encoder
+/// time_base, the test-pattern source, and (in the future) the
+/// PipeWire format negotiation all use this. Per-frame budget at 60 fps
+/// is 16.6 ms; current Intel iGPU encode times sit around 7–8 ms, so
+/// there's headroom.
+const ENCODER_FPS: u32 = 60;
+
+/// VBR target bitrate. The encoder is allowed to overshoot for
+/// motion-heavy frames and undershoot on static content. Calibrated
+/// for 1080p60 H.264 ≈ 8 Mbps and roughly scales linearly with
+/// resolution × fps. HEVC sessions get a 0.7× multiplier inside the
+/// derivation step (~30% more efficient at the same visual quality;
+/// conservative estimate, refined when we benchmark). For now the
+/// constant is the H.264 1080p60 floor; multi-resolution scaling is W8.
+const ENCODER_BITRATE_KBPS: u32 = 8_000;
 
 const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
-const TEST_PATTERN_FPS: u32 = 30;
+const TEST_PATTERN_FPS: u32 = 60;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -82,20 +96,25 @@ async fn handle_client(
     conn: Arc<Connection>,
     use_test_pattern: bool,
 ) -> anyhow::Result<()> {
-    // Application-layer handshake. The closure picks the codec from the
-    // client's preference list (H264-only for now), and the transport
-    // layer stamps the clock-probe timestamps right around the send to
-    // keep the offset measurement tight. Hello protocol-version
-    // mismatches are fatal per the v0 policy in control.rs.
+    // Application-layer handshake. The closure walks the client's
+    // codec preference list and picks the first one this host can
+    // actually build (cheap construction probe at 64×64), so the
+    // ServerHello we return carries an authoritative `chosen_codec`
+    // rather than a guess. The transport layer stamps the clock-probe
+    // timestamps right around the send.
+    //
     // Newer clients sending an unknown ClientHello variant fail decode
     // upstream of this closure; the transport surfaces that as an error
     // we return below. Reaching the closure means the variant decoded.
+    let mut chosen_codec_outer: Option<CodecKind> = None;
     let client_hello = conn
         .host_handshake(|hello| {
             let ClientHello::V1(body) = hello;
+            let chosen = pick_supported_codec(&body.preferred_codecs);
+            chosen_codec_outer = Some(chosen);
             ServerHello::V1(ServerHelloV1 {
                 server_name: "tether-host".to_string(),
-                chosen_codec: pick_codec(&body.preferred_codecs),
+                chosen_codec: chosen,
                 chosen_chroma: ChromaSubsampling::Yuv420,
                 color_space: ColorSpace::Bt709Limited,
                 // Encoded source dims aren't known yet (lazy encoder init
@@ -111,9 +130,12 @@ async fn handle_client(
         })
         .await?;
     let ClientHello::V1(client_body) = client_hello;
+    let chosen_codec = chosen_codec_outer
+        .expect("host_handshake invoked the closure exactly once");
     info!(
         client = %client_body.client_name,
-        codecs = ?client_body.preferred_codecs,
+        preferred_codecs = ?client_body.preferred_codecs,
+        chosen_codec = ?chosen_codec,
         max_resolution = ?client_body.max_resolution,
         "handshake complete"
     );
@@ -159,6 +181,7 @@ async fn handle_client(
                 force_idr_for_send,
                 display_dims_tx,
                 send_shutdown_for_thread,
+                chosen_codec,
             )
         })?;
 
@@ -540,6 +563,7 @@ fn run_capture_and_send(
     force_idr: tether_session::IdrSignal,
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
     shutdown: Arc<AtomicBool>,
+    chosen_codec: CodecKind,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
@@ -604,20 +628,26 @@ fn run_capture_and_send(
                 fragmenter.bump_epoch();
             }
             let _ = display_dims_tx.send(Some((frame_width, frame_height)));
-            slot = match probe_encoder_bgra(
+            // Single-element preference list: the handshake already
+            // picked one codec, and a mid-session codec switch would
+            // require coordinated client decoder rebuild. We pass the
+            // list-form for API symmetry with the initial handshake
+            // probe; per-resize cost is one construction attempt.
+            slot = match probe_encoder(
+                &[chosen_codec],
                 frame_width,
                 frame_height,
                 ENCODER_FPS,
-                ENCODER_BITRATE_KBPS,
+                derive_bitrate_kbps(chosen_codec, frame_width, frame_height, ENCODER_FPS),
             ) {
-                Ok(e) => {
+                Ok((_kind, e)) => {
                     info!(
                         backend = e.name(),
                         hardware = e.is_hardware(),
+                        codec = ?chosen_codec,
                         width = frame_width,
                         height = frame_height,
                         fps = ENCODER_FPS,
-                        kbps = ENCODER_BITRATE_KBPS,
                         "encoder initialised"
                     );
                     Some(EncoderSlot {
@@ -812,16 +842,58 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// Pick the first codec from the client's preference list that we can
-/// actually encode. H264 is the only one we ship today; HEVC and AV1
-/// will land later.
-fn pick_codec(preferred: &[CodecKind]) -> CodecKind {
+/// Pick the first codec from the client's preference list that this
+/// host can actually construct an encoder for. Each candidate gets a
+/// real construction probe (`probe_encoder_kind`) so that an
+/// FFmpeg-built-but-driver-unsupported codec doesn't slip past the
+/// handshake and crash the send loop mid-session.
+///
+/// Falls back to H.264 if the client offered nothing we can build —
+/// the send loop's first-frame encoder construction will then fail
+/// loudly with a diagnostic. We don't synthesize an arbitrary codec
+/// because doing so would lie to the client about what we'll send.
+fn pick_supported_codec(preferred: &[CodecKind]) -> CodecKind {
     for k in preferred {
-        if matches!(k, CodecKind::H264) {
+        if probe_encoder_kind(*k) {
             return *k;
         }
     }
+    tracing::warn!(
+        ?preferred,
+        "no codec in client preference list is buildable on this host; \
+         echoing H264 — first-frame encoder init will surface the error"
+    );
     CodecKind::H264
+}
+
+/// Default VBR target bitrate as a function of resolution, fps, and
+/// codec. Anchored at 1080p60 H.264 = 8 Mbps (the [`ENCODER_BITRATE_KBPS`]
+/// floor); scales linearly with `pixels × fps`; HEVC gets a 0.7×
+/// multiplier (conservative ~30% efficiency gain over H.264 at the
+/// same visual quality). Clamped to a sane band so a tiny test pattern
+/// doesn't get a starvation-tier bitrate and a huge display doesn't
+/// blow the LAN.
+fn derive_bitrate_kbps(codec: CodecKind, width: u32, height: u32, fps: u32) -> u32 {
+    const REFERENCE_PIXELS: u64 = 1920 * 1080;
+    const REFERENCE_FPS: u64 = 60;
+    const REFERENCE_KBPS_H264: u64 = ENCODER_BITRATE_KBPS as u64;
+
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    let scaled = REFERENCE_KBPS_H264
+        .saturating_mul(pixels)
+        .saturating_mul(u64::from(fps))
+        / (REFERENCE_PIXELS * REFERENCE_FPS).max(1);
+
+    let codec_scaled = match codec {
+        CodecKind::H264 => scaled,
+        // HEVC: 70% of H.264 for similar visual quality.
+        CodecKind::Hevc => scaled * 7 / 10,
+        // AV1: not yet supported; if it gets here the encoder build
+        // will fail anyway. 60% is the standard reference number.
+        CodecKind::Av1 => scaled * 6 / 10,
+    };
+
+    codec_scaled.clamp(500, 30_000) as u32
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

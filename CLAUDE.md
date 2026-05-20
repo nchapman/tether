@@ -1,0 +1,47 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+Tether is a low-latency open-source remote desktop in Rust. Two binaries (`tether-host`, `tether-client`) and nine library crates in a Cargo workspace. Status is pre-MVP — Linux↔Linux over QUIC with VAAPI hardware encode, PipeWire DMA-BUF capture, and wgpu present works end-to-end. macOS/Windows backends and audio are deferred.
+
+Toolchain is pinned via `mise.toml` (rust 1.95). MSRV in `Cargo.toml` is 1.85.
+
+## Common commands
+
+All wrapped by `make` — `make help` lists every target. Underlying cargo invocations:
+
+- `make build` — `cargo build --workspace`
+- `make test` — `cargo test --workspace --lib` (no hardware required)
+- `make test-hw` — `test-correctness` + `bench`; needs a working VAAPI + Vulkan box
+- `make test-correctness` — runs the `#[ignore]` hardware tests in `tether-codec`, `tether-render`, `tether-gpuconvert`
+- `make bench` — `cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1` (the `--test-threads=1` is required: parallel cells contend for the same VAAPI device and make timings meaningless)
+- `make probe` — prints which VAAPI codecs build on this host
+- `make clippy` — advisory (pre-existing warnings exist, mostly in `tether-gpuconvert`)
+- `make release` — release build of host + client only
+
+Single test: `cargo test -p <crate> <test_name>`. Hardware-gated tests are `#[ignore = "requires …"]` — add `-- --ignored` and the test name to run one.
+
+## Architecture orientation
+
+`docs/ARCHITECTURE.md` is the source of truth; read it before non-trivial changes. The big picture:
+
+- **`tether-protocol`** has zero I/O. It's the wire contract both sides speak — control messages (bincode, reliable), video/audio/cursor (datagrams), input (reliable stream). Forward-compat hooks: hello extension map with reverse-DNS keys (`tether.cap.*` follows echo-to-accept), `ControlMessage::Extension { key, payload }` escape hatch, `VideoFrameMetaEnvelope` versions per-frame metadata.
+- **The hot path is zero-copy on both sides.** Host: PipeWire DMA-BUF → `tether-gpuconvert` (BGRA→NV12 compute pass into a single shared dma-buf with R8 Y + Rg8 UV planes at offsets) → `tether-codec::vaapi` (`av_hwframe_map` DRM_PRIME→VAAPI) → `FrameFragmenter` → QUIC datagrams. Client: defragment → VAAPI decode → `vaExportSurfaceHandle` per frame → `tether-render` imports both planes as wgpu textures, NV12→RGB matrix in the fragment shader.
+- **Cross-platform additivity** is done via two type seams. `CapturedFrame::Gpu(GpuCapturedSource)` and `GpuEncoderFrame` are cfg-gated **per variant** (`#[cfg(target_os = "linux")] DmaBuf(...)`), so matches stay exhaustive without a catch-all and adding macOS/Windows means a new variant + a new backend module — not a refactor of the call sites. The opaque `GpuResourceGuard` (re-exported as `GpuCapturedGuard` / `GpuFrameGuard`) keeps backend lifetime-extension types from leaking through the public API.
+- **Three end-to-end invariants:** (1) clock sync via handshake-measured `MonoNanos` offset + per-fragment `HostFrameTiming` stamps; (2) `stream_epoch: u32` bumped on any resolution/encoder restart, defragmenter drops cross-epoch fragments; (3) on-demand IDR via `ControlMessage::ForceIdr`, coalesced through an `AtomicBool` swap. GOP is long (~240); IDRs are request-driven, not cadence-driven.
+
+## Conventions that aren't obvious from grep
+
+- **`HostFrameTimingBuilder` is typestate.** Skipping a stage panics — that's the contract. New host-pipeline stages add a `should_panic` test for the skip case.
+- **Wire round-trip first.** Any new protocol message gets a unit test in `tether-protocol/src/lib.rs#mod tests` that asserts every field round-trips. Tagged-enum additions also get a forward-compat probe (hand-craft a "future" byte sequence, assert old code errors cleanly — see `unknown_client_hello_variant_fails_decode`).
+- **Hardware tests are `#[ignore]`, not deleted or runtime-skipped.** Ignore message names the requirement (`vainfo`, the Vulkan extension, etc.) so it's obvious whether a given box should run them.
+- **Hard requirement on hardware codecs.** SW H264 is gated behind `cfg(test)`. The probe returns `NoHardwareCodec` with actionable diagnostics rather than falling back silently.
+- **NV12 export is pinned to `DRM_FORMAT_MOD_LINEAR`.** Tiled modifiers don't have a portable shared-allocation contract that VAAPI's DRM_PRIME importer honours. Capture side advertises whatever modifiers the GPU importer can consume; export side is LINEAR-only. Don't try to "optimize" this without reading the comment in `tether-gpuconvert`.
+- **Bridge init failures mid-session are fatal.** A startup probe (`tether_gpuconvert::importable_dmabuf_modifiers`) verifies the wgpu+Vulkan+features chain before PipeWire advertises DMA-BUF. Runtime failures after that are device-loss/OOM — exit loudly rather than silently dropping every Gpu frame.
+- **wgpu is pinned to a trunk SHA via workspace `[patch.crates-io]`** because `texture_from_dmabuf_fd` isn't released yet. All wgpu sub-crates (`wgpu-core`, `wgpu-hal`, `wgpu-types`, `naga`) must move together — if you add a workspace member pulling wgpu, it goes through the same patch. Drop the pin when wgpu cuts a release with the API.
+
+## Testing matrix
+
+`docs/TESTING.md` has the per-crate breakdown. Headline: ~67 default-on tests + 20 `#[ignore]` hardware tests. Default CI is `cargo build --workspace && cargo test --workspace`; hardware runner (when it exists) adds `-- --ignored`. `cargo clippy --workspace --all-targets` is advisory today.

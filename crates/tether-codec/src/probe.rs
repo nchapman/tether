@@ -85,14 +85,25 @@ pub fn probe_encoder(
 /// Lightweight handshake-time capability check: is `kind` a codec we
 /// can *currently* build on this host? Implemented as a tiny
 /// construction probe at 128×128 — captures real driver state (not
-/// just FFmpeg build-time support), at the cost of a one-time
-/// ~10–50 ms VAAPI device open. Caller is expected to invoke this
-/// once per session during handshake, not per frame.
+/// just FFmpeg build-time support), at the cost of a one-time VAAPI
+/// device open. Caller is expected to invoke this once per session
+/// during handshake, not per frame.
 ///
 /// The 128×128 floor satisfies HEVC's minimum-block constraint on
 /// Intel hardware (which rejects anything under 128×128 with EINVAL).
 /// H.264 accepts smaller, but using the same dims keeps the probe a
 /// single config across codecs.
+///
+/// Driver-portability caveat: rsmpeg's `AVCodecContext` exposes a
+/// known failure mode where `encoder.open()` returning an error
+/// leaves the context partially-initialized, and the subsequent Drop
+/// segfaults (see the comment in `vaapi/encoder.rs` about the LP
+/// entrypoint). We've validated this probe at 128×128 against H.264
+/// and HEVC on Intel Arc (Meteor Lake). AMD and NVIDIA-via-VAAPI may
+/// have different minimum block sizes for HEVC; if the probe ever
+/// SIGSEGVs on a new driver, the principled fix is to add the
+/// `vaQueryConfigProfiles` libva probe before construction. Today
+/// we accept the risk because we don't have the test hardware.
 pub fn probe_encoder_kind(kind: CodecKind) -> bool {
     #[cfg(target_os = "linux")]
     {

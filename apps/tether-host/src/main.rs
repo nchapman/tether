@@ -106,15 +106,27 @@ async fn handle_client(
     // Newer clients sending an unknown ClientHello variant fail decode
     // upstream of this closure; the transport surfaces that as an error
     // we return below. Reaching the closure means the variant decoded.
+    // Two-stage codec selection: the closure picks (and may fail to
+    // pick), but the handshake must still produce a syntactically valid
+    // ServerHello to send. If the pick failed, the closure writes a
+    // placeholder codec into the response and surfaces None via the
+    // outer Option; post-handshake we send a clean Goodbye(InternalError)
+    // and exit rather than leaving the client waiting on frames that
+    // will never arrive.
     let mut chosen_codec_outer: Option<CodecKind> = None;
     let client_hello = conn
         .host_handshake(|hello| {
             let ClientHello::V1(body) = hello;
             let chosen = pick_supported_codec(&body.preferred_codecs);
-            chosen_codec_outer = Some(chosen);
+            chosen_codec_outer = chosen;
             ServerHello::V1(ServerHelloV1 {
                 server_name: "tether-host".to_string(),
-                chosen_codec: chosen,
+                // On no-match the response carries H264 as a placeholder
+                // — the immediately-following Goodbye is what the client
+                // actually acts on. We use H264 (not e.g. Av1) because
+                // it's the universal floor; if the client respects the
+                // Goodbye it never tries to use it.
+                chosen_codec: chosen.unwrap_or(CodecKind::H264),
                 chosen_chroma: ChromaSubsampling::Yuv420,
                 color_space: ColorSpace::Bt709Limited,
                 // Encoded source dims aren't known yet (lazy encoder init
@@ -130,8 +142,24 @@ async fn handle_client(
         })
         .await?;
     let ClientHello::V1(client_body) = client_hello;
-    let chosen_codec = chosen_codec_outer
-        .expect("host_handshake invoked the closure exactly once");
+    let chosen_codec = match chosen_codec_outer {
+        Some(k) => k,
+        None => {
+            warn!(
+                preferred = ?client_body.preferred_codecs,
+                "no codec in client preference list is buildable on this host; \
+                 sending Goodbye(InternalError) and ending session"
+            );
+            let _ = conn
+                .send_control(&ControlMessage::Goodbye {
+                    reason: "host cannot build any of the client's preferred codecs"
+                        .to_string(),
+                    code: tether_protocol::control::GoodbyeCode::InternalError,
+                })
+                .await;
+            return Ok(());
+        }
+    };
     info!(
         client = %client_body.client_name,
         preferred_codecs = ?client_body.preferred_codecs,
@@ -848,22 +876,12 @@ fn init_tracing() {
 /// FFmpeg-built-but-driver-unsupported codec doesn't slip past the
 /// handshake and crash the send loop mid-session.
 ///
-/// Falls back to H.264 if the client offered nothing we can build —
-/// the send loop's first-frame encoder construction will then fail
-/// loudly with a diagnostic. We don't synthesize an arbitrary codec
-/// because doing so would lie to the client about what we'll send.
-fn pick_supported_codec(preferred: &[CodecKind]) -> CodecKind {
-    for k in preferred {
-        if probe_encoder_kind(*k) {
-            return *k;
-        }
-    }
-    tracing::warn!(
-        ?preferred,
-        "no codec in client preference list is buildable on this host; \
-         echoing H264 — first-frame encoder init will surface the error"
-    );
-    CodecKind::H264
+/// Returns `None` when nothing in `preferred` is buildable — the caller
+/// uses that signal to send a Goodbye and refuse the session. Returning
+/// a fallback codec here would lie to the client about what we can
+/// send and turn a clear "no codec match" into a session hang.
+fn pick_supported_codec(preferred: &[CodecKind]) -> Option<CodecKind> {
+    preferred.iter().copied().find(|k| probe_encoder_kind(*k))
 }
 
 /// Default VBR target bitrate as a function of resolution, fps, and

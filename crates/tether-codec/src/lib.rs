@@ -52,7 +52,7 @@ pub enum CodecError {
     #[error("ffmpeg swscale init failed ({0})")]
     ScalerInit(&'static str),
     /// No GPU codec available — Tether hard-requires hardware
-    /// encode/decode. Returned from [`probe_encoder_bgra`] /
+    /// encode/decode. Returned from [`probe_encoder`] /
     /// [`probe_decoder`] when no hardware backend constructs
     /// successfully. The string carries the user-actionable
     /// diagnostics (which call to `vainfo` to run, which kernel

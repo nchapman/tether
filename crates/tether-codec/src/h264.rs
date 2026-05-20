@@ -126,7 +126,7 @@ pub(crate) fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
 }
 
 // Software H.264 encoder. Tether requires GPU acceleration in
-// production — see `crate::probe::probe_encoder_bgra` for the
+// production — see `crate::probe::probe_encoder` for the
 // rationale — so this is gated to tests only. It's the round-trip
 // fixture for the SW decoder (also test-only) and for VAAPI's
 // decoder smoke test, which needs a valid Annex-B bitstream to

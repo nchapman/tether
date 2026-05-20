@@ -38,6 +38,25 @@
 //! the peer might already understand differently). Adding a new
 //! `ControlMessage` variant requires landing a `ClientHelloV2`
 //! alongside it.
+//!
+//! # The `Extension` escape
+//!
+//! [`ControlMessage::Extension`] exists so that future features which
+//! need a new control message *do not* force a `ClientHelloV2`. A
+//! sender publishes a reverse-DNS-keyed payload; receivers that
+//! don't recognise the key log and drop it without erroring. Typical
+//! lifecycle of a new control feature:
+//!
+//! 1. Ship the feature as `ControlMessage::Extension { key:
+//!    "tether.feature-x", payload: <bincode-encoded body> }`.
+//! 2. Soak it until the shape stabilises across deployments.
+//! 3. When promoting to a typed variant becomes worthwhile (compile-
+//!    time field checking, no String overhead per message), land it
+//!    as part of the next `ClientHelloV{N+1}` bump.
+//!
+//! Receivers MUST log unknown extension keys at `debug` so an
+//! operator can see "peer is speaking a feature this build doesn't
+//! support yet."
 
 use std::collections::BTreeMap;
 
@@ -174,6 +193,15 @@ pub enum ControlMessage {
     Goodbye {
         reason: String,
         code: GoodbyeCode,
+    },
+    /// Escape hatch for features that don't yet warrant a typed
+    /// variant. Payload is opaque to the protocol — the convention
+    /// is reverse-DNS-style keys (`tether.clipboard`,
+    /// `tether.gamepad-rumble`) with a bincode-encoded body. Unknown
+    /// keys are logged + dropped. See the module-level doc.
+    Extension {
+        key: String,
+        payload: Vec<u8>,
     },
 }
 

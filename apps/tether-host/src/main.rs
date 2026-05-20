@@ -270,6 +270,13 @@ async fn handle_client(
                         info!(%reason, ?code, "client said goodbye");
                         return;
                     }
+                    Ok(ControlMessage::Extension { key, payload }) => {
+                        tracing::debug!(
+                            key = %key,
+                            payload_len = payload.len(),
+                            "unknown control extension; ignoring"
+                        );
+                    }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");
                         return;

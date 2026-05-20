@@ -263,6 +263,26 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_control_extension() {
+        // The Extension escape unblocks future control features
+        // without forcing a ClientHelloV2. Confirm it survives the
+        // wire identically.
+        let msg = ControlMessage::Extension {
+            key: "tether.cap.test".into(),
+            payload: vec![1, 2, 3, 0xFF],
+        };
+        let bytes = encode(&msg).unwrap();
+        let msg2: ControlMessage = decode(&bytes).unwrap();
+        match msg2 {
+            ControlMessage::Extension { key, payload } => {
+                assert_eq!(key, "tether.cap.test");
+                assert_eq!(payload, vec![1, 2, 3, 0xFF]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn goodbye_carries_machine_readable_code() {
         let g = ControlMessage::Goodbye {
             reason: "user quit".into(),

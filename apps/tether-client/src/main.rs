@@ -95,6 +95,55 @@ async fn main() -> anyhow::Result<()> {
         warn!(error = ?e, "initial ForceIdr send failed; continuing anyway");
     }
 
+    // Receive-side control loop. Today the host doesn't initiate any
+    // typed messages we need to act on, but the Extension escape and
+    // future variants (CursorShape, DisplayList, StreamPause/Resume)
+    // arrive here, so the loop exists from V1 onward.
+    {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            loop {
+                match conn.recv_control().await {
+                    Ok(ControlMessage::ForceIdr) => {
+                        tracing::trace!("host sent ForceIdr (no-op on client)");
+                    }
+                    Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
+                        let t1 = MonoNanos::now();
+                        let response = ControlMessage::ClockProbeResponse(
+                            tether_protocol::control::ClockProbe {
+                                t0_sender,
+                                t1_receiver_recv: t1,
+                                t2_receiver_send: MonoNanos::now(),
+                            },
+                        );
+                        if let Err(e) = conn.send_control(&response).await {
+                            warn!(error = ?e, "clock probe response failed; ending control loop");
+                            return;
+                        }
+                    }
+                    Ok(ControlMessage::ClockProbeResponse(_)) => {
+                        tracing::trace!("unsolicited clock probe response; ignoring");
+                    }
+                    Ok(ControlMessage::Goodbye { reason, code }) => {
+                        info!(%reason, ?code, "host said goodbye");
+                        return;
+                    }
+                    Ok(ControlMessage::Extension { key, payload }) => {
+                        tracing::debug!(
+                            key = %key,
+                            payload_len = payload.len(),
+                            "unknown control extension; ignoring"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "control recv failed; ending control loop");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     let conn_recv = conn.clone();
     let recv_clock_sync = clock_sync;
     let chosen_codec = server_body.chosen_codec;

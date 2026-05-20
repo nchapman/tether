@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use crossbeam_channel::bounded;
-use tether_render::Frame;
+use tether_render::{CpuFrame, Frame};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -50,11 +50,11 @@ fn test_pattern(width: u32, height: u32, t: u32) -> Frame {
     let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
     // Neutral grey chroma in NV12 layout: U=128, V=128 interleaved.
     let uv = vec![128u8; (cw * ch * 2) as usize];
-    Frame {
+    Frame::Cpu(CpuFrame {
         width,
         height,
         y,
         uv,
         t_capture_client_clock: None,
-    }
+    })
 }

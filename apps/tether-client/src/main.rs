@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use crossbeam_channel::bounded;
 use tether_codec::{probe_decoder, Decoder, Frame as CodecFrame};
+use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{ClientHello, CodecKind, ControlMessage};
 use tether_protocol::video::FrameReassembler;
@@ -203,29 +204,24 @@ async fn main() -> anyhow::Result<()> {
                     // frames; the loop is here so a mid-drain failure
                     // doesn't silently throw away good output.
                     for dec in decoded {
-                        let cpu = match dec {
-                            CodecFrame::Cpu(c) => c,
-                            CodecFrame::Gpu(_) => {
-                                // The renderer doesn't import GPU
-                                // surfaces yet. Backends must not emit
-                                // Gpu until it does; loudly assert in
-                                // debug so a misconfigured backend
-                                // produces a test failure rather than
-                                // a silently-black stream in CI.
-                                debug_assert!(
-                                    false,
-                                    "decoder emitted Gpu frame but renderer cannot import"
-                                );
-                                warn!("decoder emitted Gpu frame; renderer cannot import yet");
-                                continue;
+                        let raw = match dec {
+                            CodecFrame::Cpu(c) => Frame::Cpu(CpuFrame {
+                                width: c.width,
+                                height: c.height,
+                                y: c.y,
+                                uv: c.uv,
+                                t_capture_client_clock: Some(host_in_client_clock),
+                            }),
+                            CodecFrame::Gpu(g) => {
+                                let (w, h, _pts, source, guard) = g.into_parts();
+                                Frame::Gpu(RenderGpuFrame {
+                                    width: w,
+                                    height: h,
+                                    t_capture_client_clock: Some(host_in_client_clock),
+                                    source,
+                                    guard,
+                                })
                             }
-                        };
-                        let raw = Frame {
-                            width: cpu.width,
-                            height: cpu.height,
-                            y: cpu.y,
-                            uv: cpu.uv,
-                            t_capture_client_clock: Some(host_in_client_clock),
                         };
                         // Drop on full — render is intentionally one-deep.
                         if frame_tx.try_send(raw).is_err() {

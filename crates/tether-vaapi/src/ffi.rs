@@ -63,6 +63,13 @@ extern "C" {
     ) -> VAStatus;
 
     pub fn vaErrorStr(status: VAStatus) -> *const c_char;
+
+    /// Block until all pending operations on `surface_id` complete.
+    /// Used before `vaExportSurfaceHandle` so the consumer sees a
+    /// fully-decoded surface even on driver/kernel combinations
+    /// that don't reliably attach the decoder's write fence to the
+    /// dma-buf reservation object.
+    pub fn vaSyncSurface(dpy: VADisplay, surface_id: VASurfaceID) -> VAStatus;
 }
 
 // Layout assertions: pin both sizes AND field offsets so a libva struct

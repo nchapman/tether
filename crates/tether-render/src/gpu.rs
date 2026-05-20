@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
+use tether_codec::{GpuFrameGuard, GpuFrameSource};
 use winit::window::Window;
 
-use crate::{Frame, RenderError, Result};
+use crate::{CpuFrame, Frame, GpuFrame, RenderError, Result};
 
 /// Y plus interleaved-UV textures and the bind group that points at
 /// them. Bundled together so resize-on-frame can swap them atomically.
@@ -10,11 +11,23 @@ use crate::{Frame, RenderError, Result};
 /// (each texel holds one U byte in .r and one V byte in .g, matching
 /// the NV12 layout the decoder emits).
 struct YuvTextures {
+    // Both textures own GPU memory and are kept alive solely for the
+    // bind group's views; we never reference them by name after the
+    // bind group is built. The allow keeps clippy quiet about the
+    // unused field reads.
+    #[allow(dead_code)]
     y: wgpu::Texture,
+    #[allow(dead_code)]
     uv: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     /// Y-plane dimensions (chroma is derived).
     size: (u32, u32),
+    /// Backend-side lifetime extender from the decoder (DMA-BUF path)
+    /// — typically an `AVFrame` whose Drop releases the VAAPI surface
+    /// back to the hwframes pool. `None` for CPU-uploaded textures.
+    /// Held in the same struct as the textures so dropping `textures`
+    /// (on resize / new frame) releases the surface in the same step.
+    _guard: Option<GpuFrameGuard>,
 }
 
 pub(crate) struct GpuState {
@@ -26,8 +39,24 @@ pub(crate) struct GpuState {
     yuv_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: YuvTextures,
+    /// Previous frame's textures + guard, retired for one extra render
+    /// cycle so any in-flight GPU sampling completes before the dma-buf
+    /// memory is freed. Without this, the AVFrame guard would drop the
+    /// VAAPI surface back to the pool the instant `textures` is
+    /// replaced; the decoder could then reuse it for the next frame
+    /// while the GPU is still mid-sample, producing torn output on
+    /// drivers that don't attach Vulkan read fences to the dma-buf
+    /// reservation object. Mesa+Intel does attach them; this slot is
+    /// cheap insurance against drivers that don't.
+    retired: Option<YuvTextures>,
     scale_buffer: wgpu::Buffer,
     scale_bind_group: wgpu::BindGroup,
+    /// True if `VULKAN_EXTERNAL_MEMORY_DMA_BUF` was negotiated on the
+    /// adapter. Gates the DMA-BUF import path; without it, a `GpuFrame`
+    /// from the decoder gets dropped with a warn — the decoder probe
+    /// shouldn't have picked the HW backend in that case, so reaching
+    /// this branch indicates a misconfiguration.
+    dmabuf_import_supported: bool,
 }
 
 impl GpuState {
@@ -51,16 +80,39 @@ impl GpuState {
             .await
             .map_err(|_| RenderError::NoAdapter)?;
 
+        // Ask for DMA-BUF import as an *optional* feature: probe the
+        // adapter first, request it only if available. On Mesa/Intel
+        // (the realistic deployment for our Linux VAAPI path) it lights
+        // up; on Vulkan-portability stacks (lavapipe, MoltenVK) it
+        // doesn't, and we fall back to the CPU-upload path. The render
+        // crate doesn't refuse to start without it — the CPU path is
+        // a valid degradation mode and the hard-require lives one layer
+        // up in the decoder probe.
+        let adapter_features = adapter.features();
+        let mut required = wgpu::Features::empty();
+        if adapter_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF) {
+            required |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tether-render device"),
-                required_features: wgpu::Features::empty(),
+                required_features: required,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
             .await?;
+        let dmabuf_import_supported =
+            device.features().contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
+        let info = adapter.get_info();
+        tracing::info!(
+            adapter = info.name,
+            driver = info.driver,
+            backend = ?info.backend,
+            dmabuf_import_supported,
+            "wgpu device initialised"
+        );
 
         let surface_caps = surface.get_capabilities(&adapter);
         let format = surface_caps
@@ -204,8 +256,10 @@ impl GpuState {
             yuv_bgl,
             sampler,
             textures,
+            retired: None,
             scale_buffer,
             scale_bind_group,
+            dmabuf_import_supported,
         })
     }
 
@@ -225,26 +279,97 @@ impl GpuState {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
+        // The video textures are at decoded resolution and don't change
+        // on window resize. `render()` recomputes the letterbox scale
+        // uniform every frame from `surface_config`, so the next redraw
+        // automatically fits the new window without re-uploading or
+        // re-importing.
     }
 
-    pub(crate) fn upload(&mut self, frame: &Frame) {
-        if frame.width == 0 || frame.height == 0 {
-            return;
+    /// Take ownership of a new frame and either upload it (Cpu) or
+    /// import it via DMA-BUF (Gpu). The previous frame's textures
+    /// (and, for Gpu, its decoder-side guard) drop here, releasing
+    /// any VAAPI surface they kept alive.
+    pub(crate) fn apply_frame(&mut self, frame: Frame) -> Result<()> {
+        match frame {
+            Frame::Cpu(cpu) => self.apply_cpu(cpu),
+            Frame::Gpu(gpu) => self.apply_gpu(gpu),
         }
-        if (frame.width, frame.height) != self.textures.size {
-            self.textures = make_yuv_textures(
+    }
+
+    fn apply_cpu(&mut self, frame: CpuFrame) -> Result<()> {
+        if frame.width == 0 || frame.height == 0 {
+            return Ok(());
+        }
+        // Two reasons to rebuild: the previous frame was DMA-BUF-imported
+        // (those textures aren't COPY_DST so write_texture would fail
+        // — checking `_guard.is_some()` is load-bearing; the size match
+        // would silently skip the rebuild otherwise), or the resolution
+        // changed.
+        if self.textures._guard.is_some() || (frame.width, frame.height) != self.textures.size {
+            let fresh = make_yuv_textures(
                 &self.device,
                 &self.yuv_bgl,
                 &self.sampler,
                 frame.width,
                 frame.height,
             );
+            self.retire_textures(fresh);
         }
         let (chroma_w, chroma_h) = frame.chroma_dims();
         // Y is R8 — one byte per texel, so bytes_per_row == width.
         // UV is Rg8 — two bytes per texel, so bytes_per_row == chroma_w * 2.
         write_plane_r8(&self.queue, &self.textures.y, &frame.y, frame.width, frame.height);
         write_plane_rg8(&self.queue, &self.textures.uv, &frame.uv, chroma_w, chroma_h);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn apply_gpu(&mut self, frame: GpuFrame) -> Result<()> {
+        if !self.dmabuf_import_supported {
+            tracing::warn!(
+                "received GpuFrame but adapter lacks VULKAN_EXTERNAL_MEMORY_DMA_BUF; \
+                 dropping frame (decoder probe should have picked a SW backend)"
+            );
+            return Ok(());
+        }
+        // Use an explicit match (not `let else`) so adding a future
+        // GpuFrameSource variant (NVDEC over CUDA-Vulkan interop, a
+        // VideoToolbox CVPixelBuffer, etc.) is a compile error here
+        // rather than a silent fallthrough.
+        let dmabuf = match frame.source {
+            GpuFrameSource::DmaBuf(d) => d,
+        };
+        let fresh = import_dmabuf_textures(
+            &self.device,
+            &self.yuv_bgl,
+            &self.sampler,
+            &dmabuf,
+            frame.width,
+            frame.height,
+            frame.guard,
+        )?;
+        self.retire_textures(fresh);
+        Ok(())
+    }
+
+    /// Swap in `fresh` as the active textures and move the previous
+    /// set into the retired slot. Anything already in the retired
+    /// slot is dropped — that frame's GPU submission has had at least
+    /// one `render()` cycle's worth of opportunity to complete on the
+    /// GPU, so its dma-buf is safe to unmap and its VAAPI surface is
+    /// safe to return to the pool.
+    fn retire_textures(&mut self, fresh: YuvTextures) {
+        let previous = std::mem::replace(&mut self.textures, fresh);
+        self.retired = Some(previous);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn apply_gpu(&mut self, _frame: GpuFrame) -> Result<()> {
+        // GpuFrameSource has no variants off-Linux, so a GpuFrame is
+        // type-level uninhabitable here; this stub exists to keep the
+        // match in `apply_frame` exhaustive across cfgs.
+        unreachable!("GpuFrame cannot be constructed on this platform")
     }
 
     pub(crate) fn render(&mut self) -> std::result::Result<(), String> {
@@ -320,6 +445,15 @@ impl GpuState {
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // Drop the previously-retired textures after the *next* submit
+        // completes the previous frame's read. Conservative: this drops
+        // one cycle after the texture stopped being bound, not one
+        // cycle after the GPU finished reading from it. Tightening to
+        // a real signal (queue submission index, fence) is the kind of
+        // optimisation worth doing only if profiling shows the extra
+        // dma-buf memory held across one frame matters.
+        self.retired = None;
 
         if reconfigure_after {
             self.surface.configure(&self.device, &self.surface_config);
@@ -417,7 +551,179 @@ fn make_yuv_textures(
         uv,
         bind_group,
         size: (width, height),
+        _guard: None,
     }
+}
+
+/// Import a NV12 VAAPI surface (exported with SEPARATE_LAYERS) as two
+/// wgpu textures: Y as `R8Unorm`, UV as `Rg8Unorm`. Each layer of the
+/// DMA-BUF descriptor points at an object via `object_index[0]`; we
+/// dup the underlying fd for each call because wgpu's hal API takes
+/// ownership and the same object can be referenced by both layers
+/// (Intel/Mesa typically packs Y and UV into one allocation with
+/// different offsets).
+#[cfg(target_os = "linux")]
+#[allow(clippy::cast_lossless)] // u32 pitch into u64 stride is intentional
+fn import_dmabuf_textures(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    dmabuf: &tether_codec::DmaBufFrame,
+    width: u32,
+    height: u32,
+    guard: GpuFrameGuard,
+) -> Result<YuvTextures> {
+    if dmabuf.layers.len() != 2 {
+        return Err(RenderError::DmaBufImport(format!(
+            "expected 2 layers (NV12 SEPARATE_LAYERS), got {}",
+            dmabuf.layers.len()
+        )));
+    }
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    let y = import_one_layer(
+        device,
+        "tether-render y plane (dmabuf)",
+        dmabuf,
+        0,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )?;
+    let uv = import_one_layer(
+        device,
+        "tether-render uv plane (dmabuf)",
+        dmabuf,
+        1,
+        chroma_w,
+        chroma_h,
+        wgpu::TextureFormat::Rg8Unorm,
+    )?;
+    let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
+    let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tether-render yuv bind group (dmabuf)"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&y_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&uv_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    Ok(YuvTextures {
+        y,
+        uv,
+        bind_group,
+        size: (width, height),
+        _guard: Some(guard),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn import_one_layer(
+    device: &wgpu::Device,
+    label: &str,
+    dmabuf: &tether_codec::DmaBufFrame,
+    layer_idx: usize,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> Result<wgpu::Texture> {
+    let layer = &dmabuf.layers[layer_idx];
+    // SEPARATE_LAYERS gives one plane per layer; multi-plane within a
+    // layer would mean we're looking at a COMPOSED export, which we
+    // explicitly didn't ask for and don't import.
+    if layer.num_planes != 1 {
+        return Err(RenderError::DmaBufImport(format!(
+            "layer {layer_idx} has {} planes; expected 1 (SEPARATE_LAYERS)",
+            layer.num_planes
+        )));
+    }
+    let obj_idx = layer.object_index[0] as usize;
+    let obj = dmabuf.objects.get(obj_idx).ok_or_else(|| {
+        RenderError::DmaBufImport(format!(
+            "layer {layer_idx} references object {obj_idx} but only {} present",
+            dmabuf.objects.len()
+        ))
+    })?;
+    // dup the fd because wgpu takes ownership and the same object may
+    // also back another layer. `try_clone` is dup(2) with CLOEXEC.
+    let fd = obj
+        .fd
+        .try_clone()
+        .map_err(|e| RenderError::DmaBufImport(format!("dup dma-buf fd: {e}")))?;
+
+    let hal_desc = wgpu::hal::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUses::RESOURCE,
+        memory_flags: wgpu::hal::MemoryFlags::empty(),
+        view_formats: vec![],
+    };
+
+    // SAFETY: the device was created from this hal::Api (Vulkan is
+    // wgpu's default backend on Linux); `as_hal` returns Some for the
+    // matching API. `texture_from_dmabuf_fd` consumes the fd on
+    // success and closes it on failure, so we hand over our duped one.
+    // `texture_from_raw` (called inside) requires the hal_texture be
+    // created from this device, which is exactly what we did.
+    let hal_texture = unsafe {
+        let hal_dev = device
+            .as_hal::<wgpu::hal::api::Vulkan>()
+            .ok_or_else(|| RenderError::DmaBufImport("device is not Vulkan-backed".into()))?;
+        hal_dev
+            .texture_from_dmabuf_fd(
+                fd,
+                &hal_desc,
+                obj.drm_format_modifier,
+                u64::from(layer.pitch[0]),
+                u64::from(layer.offset[0]),
+            )
+            .map_err(|e| {
+                RenderError::DmaBufImport(format!("texture_from_dmabuf_fd: {e:?}"))
+            })?
+    };
+
+    let wgpu_desc = wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    };
+    // SAFETY: hal_texture was just built from this device on the same
+    // Vulkan backend. The wgpu_desc must describe the same image as
+    // the hal_desc — width/height/format/dimension are identical
+    // above; `usage` deliberately differs (`TextureUses::RESOURCE` on
+    // the hal side, `TextureUsages::TEXTURE_BINDING` on the wgpu side
+    // — they're the equivalent representations in each API's vocabulary
+    // and that's the correct pairing).
+    let texture = unsafe { device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc) };
+    Ok(texture)
 }
 
 fn make_plane_texture(

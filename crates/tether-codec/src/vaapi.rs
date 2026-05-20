@@ -510,6 +510,19 @@ impl VaapiDecoder {
             (display, surface_id)
         };
 
+        // Wait for the decode to actually finish before handing the
+        // surface out. dma-buf implicit sync via the reservation object
+        // only works when the producer attaches a write fence, and
+        // not every libva backend does. Cost is microseconds when the
+        // surface is already done (the common case at 30 fps where
+        // decode lags submit by 0).
+        // SAFETY: display + surface_id come from the same AVFrame
+        // whose buffer ref keeps both alive.
+        if let Err(e) = unsafe { tether_vaapi::sync_surface(display, surface_id) } {
+            warn!(error = %e, "vaSyncSurface failed; surface export may race decode");
+            return Err(CodecError::SurfaceExportFailed(e));
+        }
+
         // READ_ONLY because we're a *consumer* of the decoded surface;
         // the encoder side (Sunshine's reference) uses WRITE_ONLY for
         // the opposite reason. SEPARATE_LAYERS gives one DRM layer per

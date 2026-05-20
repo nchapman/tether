@@ -106,6 +106,31 @@ impl DrmPrimeSurface {
     }
 }
 
+/// Block until all in-flight operations on `surface` complete. Cheap
+/// when the surface is already done (microseconds); guarantees the
+/// next consumer (a wgpu/Vulkan import) sees decode-complete pixels.
+///
+/// We always call this before [`export_surface_handle`] because dma-buf
+/// implicit sync via the reservation object only works when the
+/// producer attaches a write fence — Mesa+Intel does, but proprietary
+/// stacks (e.g. NVIDIA's libva backends) historically do not, and a
+/// race window has been observed on the Intel `iHD` driver around
+/// export. The cost of always syncing is negligible compared to the
+/// cost of a silently torn frame with no log signal.
+///
+/// # Safety
+/// Same contract as [`export_surface_handle`]: `display` must be live
+/// and `surface` must be owned by it.
+pub unsafe fn sync_surface(display: VADisplay, surface: VASurfaceID) -> Result<(), VaError> {
+    // SAFETY: forwarding caller's invariants on display+surface.
+    let status = unsafe { ffi::vaSyncSurface(display, surface) };
+    if status == VA_STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(VaError::from_status(status))
+    }
+}
+
 /// Export the given VA surface as a DRM PRIME descriptor.
 ///
 /// `mem_type` is typically [`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`].

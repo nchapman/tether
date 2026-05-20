@@ -8,6 +8,11 @@ description = "Client-side display: wgpu + winit, YUV->RGB shader, jitter buffer
 
 [dependencies]
 tether-protocol = { workspace = true }
+# Renderer takes ownership of decoder-emitted GPU frames (DMA-BUF
+# descriptor + opaque drop guard whose Drop releases the VAAPI
+# surface back to the hwframes pool). It only reads tether-codec's
+# data shapes, never invokes the decoder.
+tether-codec = { workspace = true }
 
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -22,7 +27,7 @@ crossbeam-channel = { workspace = true }
 # once another crate pulls them in.
 # Migration trigger: drop the patch and bump to `version = "30"` once
 # wgpu 30 ships with the new API.
-wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9" }
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["vulkan"] }
 winit = { workspace = true }
 pollster = "0.4"
 

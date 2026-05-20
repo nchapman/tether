@@ -234,6 +234,15 @@ impl GpuFrame {
             _guard: GpuFrameGuard { inner: Box::new(guard) },
         }
     }
+
+    /// Decompose into its fields so a renderer can take the source and
+    /// the guard separately. The guard must outlive any GPU work that
+    /// reads the surface; the renderer typically parks it next to the
+    /// imported wgpu textures and drops both together when the next
+    /// frame arrives.
+    pub fn into_parts(self) -> (u32, u32, Option<i64>, GpuFrameSource, GpuFrameGuard) {
+        (self.width, self.height, self.pts, self.source, self._guard)
+    }
 }
 
 #[derive(Debug)]
@@ -254,13 +263,15 @@ pub enum GpuFrameSource {
 /// `tether-vaapi`. The fds are `OwnedFd` so close-exactly-once is
 /// type-enforced.
 ///
-/// Synchronisation model: implicit. VAAPI's `vaExportSurfaceHandle`
-/// returns surfaces whose dma-buf reservation object carries the
-/// decoder's writes, so an importer that respects implicit sync (the
-/// Vulkan ext that backs wgpu's external-memory path does) sees a
-/// fully-decoded surface without a separate fence import. If a future
-/// backend needs explicit sync (e.g. NVDEC, which prefers timeline
-/// semaphores), this struct will need a sync_file fd alongside.
+/// Synchronisation model: the decoder calls `vaSyncSurface` before
+/// exporting, so the consumer is guaranteed to see a fully-decoded
+/// surface. We don't rely on dma-buf implicit sync via the reservation
+/// object — not every libva backend attaches the producer write fence
+/// reliably, and the cost of an unconditional `vaSyncSurface` is
+/// microseconds when the surface is already done. The Vulkan import on
+/// the other side likewise doesn't need an explicit fence; a future
+/// backend that wants pipelined GPU-to-GPU sync (e.g. NVDEC over
+/// CUDA/Vulkan interop) can add a sync_file fd alongside.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct DmaBufFrame {

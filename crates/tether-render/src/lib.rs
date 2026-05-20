@@ -1,9 +1,5 @@
 //! Client-side display: a winit window driving a wgpu render pipeline,
 //! fed from a crossbeam channel of [`Frame`]s.
-//!
-//! The v0 path is RGBA passthrough only. A YUV→RGB fragment shader,
-//! adaptive jitter buffer, zero-copy decoded-texture import, and
-//! present-time telemetry will land alongside the GPU video pipeline.
 
 mod gpu;
 
@@ -12,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use tether_codec::{GpuFrameGuard, GpuFrameSource};
 use tether_protocol::MonoNanos;
 use tracing::warn;
 use winit::application::ApplicationHandler;
@@ -29,16 +26,46 @@ use gpu::GpuState;
 pub use winit::event::MouseButton;
 pub use winit::keyboard::{KeyCode, ModifiersState};
 
-/// One frame's worth of pixel data, in NV12 (Y plus interleaved UV)
-/// form — the canonical output of every hardware H.264 decoder we
-/// target. Render uploads `y` as a full-resolution `R8Unorm` texture
-/// and `uv` as a half-resolution `Rg8Unorm` texture, then does the
-/// limited-range BT.709 matrix in the fragment shader. Two texture
-/// binds replace the three-plane YUV420P upload the older path used,
-/// and the decoder no longer has to swscale NV12→YUV420P just to feed
-/// the GPU.
+/// One frame ready for display. Either the pixels live in CPU memory
+/// and need an `R8` + `Rg8` upload (the SW decoder path), or they live
+/// on the GPU as a DMA-BUF exported from a HW decoder surface and the
+/// renderer imports them directly.
+#[derive(Debug)]
+pub enum Frame {
+    Cpu(CpuFrame),
+    Gpu(GpuFrame),
+}
+
+impl Frame {
+    pub fn width(&self) -> u32 {
+        match self {
+            Frame::Cpu(f) => f.width,
+            Frame::Gpu(f) => f.width,
+        }
+    }
+    pub fn height(&self) -> u32 {
+        match self {
+            Frame::Cpu(f) => f.height,
+            Frame::Gpu(f) => f.height,
+        }
+    }
+    pub fn t_capture_client_clock(&self) -> Option<MonoNanos> {
+        match self {
+            Frame::Cpu(f) => f.t_capture_client_clock,
+            Frame::Gpu(f) => f.t_capture_client_clock,
+        }
+    }
+}
+
+/// Frame whose pixels live in CPU memory (SW decoder path), in NV12
+/// (Y plus interleaved UV) layout — the canonical output of every
+/// hardware H.264 decoder, mirrored on the SW side by a cheap byte
+/// interleave so the renderer only knows one format. The renderer
+/// uploads `y` as an `R8Unorm` texture and `uv` as a half-resolution
+/// `Rg8Unorm` texture, then does the limited-range BT.709 matrix in
+/// the fragment shader.
 #[derive(Clone, Debug)]
-pub struct Frame {
+pub struct CpuFrame {
     pub width: u32,
     pub height: u32,
     /// Tight Y plane, `width * height` bytes.
@@ -60,7 +87,7 @@ pub struct Frame {
     pub t_capture_client_clock: Option<MonoNanos>,
 }
 
-impl Frame {
+impl CpuFrame {
     /// Chroma plane dimensions (in chroma samples) for the 4:2:0
     /// subsampling we assume. The `uv` buffer is twice this wide in
     /// bytes because each sample carries U and V interleaved.
@@ -68,6 +95,23 @@ impl Frame {
     pub fn chroma_dims(&self) -> (u32, u32) {
         (self.width.div_ceil(2), self.height.div_ceil(2))
     }
+}
+
+/// Frame whose pixels live on the GPU. Carries the DMA-BUF descriptor
+/// the renderer needs to import the surface, plus the decoder-side
+/// release guard that returns the underlying VAAPI surface to the
+/// hwframes pool when the renderer is done with it. The `source` is
+/// borrowed by `Drop` of the imported wgpu textures; pair them.
+#[derive(Debug)]
+pub struct GpuFrame {
+    pub width: u32,
+    pub height: u32,
+    pub t_capture_client_clock: Option<MonoNanos>,
+    pub source: GpuFrameSource,
+    /// Backend-side lifetime extender (typically an `AVFrame`). The
+    /// renderer parks this alongside the imported textures and drops
+    /// both when the next frame replaces them.
+    pub guard: GpuFrameGuard,
 }
 
 /// Input-side events surfaced from the window's event loop. The render
@@ -124,6 +168,11 @@ pub enum RenderError {
     RequestDevice(#[from] wgpu::RequestDeviceError),
     #[error("wgpu surface create: {0}")]
     SurfaceCreate(#[from] wgpu::CreateSurfaceError),
+    /// DMA-BUF import failed at the hal layer (driver refused the
+    /// modifier, fd dup failed, layout mismatch, etc.). The frame is
+    /// dropped; the next decoded frame will try again.
+    #[error("dma-buf import: {0}")]
+    DmaBufImport(String),
 }
 
 pub type Result<T> = std::result::Result<T, RenderError>;
@@ -270,10 +319,20 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
-                let t_capture = self.latest.as_ref().and_then(|f| f.t_capture_client_clock);
-                if let Some(frame) = &self.latest {
-                    gpu.upload(frame);
-                }
+                // Apply a new frame at most once per redraw. GpuState
+                // holds the imported/uploaded textures across redraws,
+                // so OS-initiated redraws (expose, focus) re-render the
+                // most recently applied frame without re-uploading or
+                // re-importing.
+                let applied_t_capture = if let Some(frame) = self.latest.take() {
+                    let t_capture = frame.t_capture_client_clock();
+                    if let Err(e) = gpu.apply_frame(frame) {
+                        warn!(error = ?e, "applying frame failed");
+                    }
+                    t_capture
+                } else {
+                    None
+                };
                 if let Err(e) = gpu.render() {
                     warn!(error = ?e, "render frame failed");
                 }
@@ -283,13 +342,9 @@ impl ApplicationHandler for App {
                 // down) but it bounds it from below, which is enough
                 // to decompose recv-to-present vs network+encode.
                 //
-                // Dedup: only record on a frame we haven't recorded
-                // yet. OS-initiated redraws (window expose, focus
-                // changes) fire RedrawRequested but don't bring a
-                // new frame, so without this guard each one would
-                // re-record the previous frame's latency and inflate
-                // both the sample count and the rolling average.
-                if let Some(t_cap) = t_capture {
+                // Only record on a frame we just applied; OS-initiated
+                // redraws without a new frame produce no sample.
+                if let Some(t_cap) = applied_t_capture {
                     if self.last_recorded_t_cap != Some(t_cap) {
                         let latency = MonoNanos::now().saturating_sub(t_cap);
                         self.present_stats.record_and_maybe_log(latency);

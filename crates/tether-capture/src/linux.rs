@@ -11,7 +11,7 @@
 //! crossbeam channel. The thread currently has no clean shutdown path
 //! when the receiver is dropped; this is a documented v0 limitation.
 
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
@@ -24,7 +24,17 @@ use pw::properties::properties;
 use pw::spa;
 use tether_protocol::MonoNanos;
 
-use crate::{CaptureError, CapturedFrame, CpuFrame, PixelFormat, Result};
+use crate::{
+    CaptureError, CapturedDmaBuf, CapturedFrame, CpuFrame, GpuCapturedFrame, GpuCapturedGuard,
+    GpuCapturedSource, PixelFormat, Result,
+};
+
+/// `DRM_FORMAT_MOD_LINEAR` from `<drm/drm_fourcc.h>`. Universally
+/// importable across compositors / GPU drivers; the only modifier we
+/// advertise to the compositor in v1. Tiled-modifier negotiation is a
+/// later expansion (requires per-format Vulkan modifier-property
+/// queries on our side so we only advertise what wgpu can import).
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 const CAPTURE_CHANNEL_DEPTH: usize = 2;
 
@@ -82,11 +92,12 @@ async fn open_portal() -> Result<(u32, OwnedFd)> {
 struct UserData {
     format: spa::param::video::VideoInfoRaw,
     sender: Sender<CapturedFrame>,
-    /// Set the first time we observe a buffer with no mapped CPU bytes
-    /// (typically because the compositor negotiated DMA-BUF, which v0
-    /// can't import). Used to log once at warn level and then stay quiet
-    /// instead of spamming at frame rate.
-    unmapped_buffer_warned: bool,
+    /// `Some(modifier)` once `param_changed` has seen a fixated
+    /// modifier — i.e. the compositor accepted our DMA-BUF offer.
+    /// `None` means SHM was negotiated (or negotiation hasn't
+    /// completed yet); the process callback uses this to know which
+    /// CapturedFrame variant to emit.
+    negotiated_modifier: Option<u64>,
 }
 
 fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Result<()> {
@@ -98,7 +109,7 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
     let user_data = UserData {
         format: spa::param::video::VideoInfoRaw::new(),
         sender,
-        unmapped_buffer_warned: false,
+        negotiated_modifier: None,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -116,7 +127,7 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
         .state_changed(|_, _, old, new| {
             tracing::info!(?old, ?new, "pipewire stream state");
         })
-        .param_changed(|_, user_data, id, param| {
+        .param_changed(|stream, user_data, id, param| {
             let Some(param) = param else { return };
             if id != pw::spa::param::ParamType::Format.as_raw() {
                 return;
@@ -138,6 +149,35 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
                 tracing::warn!(error = ?e, "failed to parse video format");
                 return;
             }
+            // Detect whether the compositor accepted our DMA-BUF offer.
+            // Per the SPA convention, a fixated `Format` pod carrying a
+            // `VideoModifier` property means DMA-BUF was negotiated;
+            // absence of the property means SHM. We can't rely on
+            // `VideoInfoRaw::modifier()` alone (it's zero-initialised),
+            // so we look at the pod itself.
+            //
+            // Raw spa-sys constant: pipewire-rs 0.10 exposes
+            // `FormatProperties::VideoModifier`, whose `.as_raw()` is
+            // the right Id key.
+            let modifier_key = pw::spa::utils::Id(
+                pw::spa::param::format::FormatProperties::VideoModifier.as_raw(),
+            );
+            let has_modifier = unsafe {
+                // SAFETY: the negotiated Format pod is always an
+                // Object pod per the libspa contract for SPA_PARAM_Format.
+                // pipewire-rs doesn't have a safe accessor that goes
+                // pod → object for this case in 0.10; we use the raw
+                // helper.
+                let ptr = param.as_raw_ptr() as *const libspa_sys::spa_pod;
+                let prop = libspa_sys::spa_pod_find_prop(
+                    ptr.cast(),
+                    std::ptr::null(),
+                    modifier_key.0,
+                );
+                !prop.is_null()
+            };
+            user_data.negotiated_modifier =
+                has_modifier.then_some(user_data.format.modifier());
             let f = &user_data.format;
             tracing::info!(
                 spa_format = ?f.format(),
@@ -145,8 +185,41 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
                 height = f.size().height,
                 fps_num = f.framerate().num,
                 fps_denom = f.framerate().denom,
+                dmabuf = has_modifier,
+                modifier = user_data.negotiated_modifier,
                 "pipewire negotiated format"
             );
+
+            // Tell PipeWire which buffer types we can sink. The bitmask
+            // semantics come from spa/buffer/buffer.h:
+            //   bit (1 << SPA_DATA_MemPtr) → CPU-mapped pointer (SHM)
+            //   bit (1 << SPA_DATA_MemFd)  → CPU-mapped via memfd
+            //   bit (1 << SPA_DATA_DmaBuf) → GPU DMA-BUF fd
+            // We advertise MemPtr+MemFd always (SHM fallback path); add
+            // DmaBuf only when modifier negotiation succeeded — sending
+            // the DmaBuf bit without a fixated modifier would let the
+            // compositor hand us an opaque-tiled buffer we can't import.
+            let mut data_type_mask = (1u32
+                << libspa_sys::SPA_DATA_MemPtr)
+                | (1u32 << libspa_sys::SPA_DATA_MemFd);
+            if has_modifier {
+                data_type_mask |= 1u32 << libspa_sys::SPA_DATA_DmaBuf;
+            }
+            let buffers_param = match build_buffers_param(data_type_mask) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to build ParamBuffers");
+                    return;
+                }
+            };
+            let Some(pod) = spa::pod::Pod::from_bytes(&buffers_param) else {
+                tracing::warn!("ParamBuffers pod from_bytes returned None");
+                return;
+            };
+            let mut params = [pod];
+            if let Err(e) = stream.update_params(&mut params) {
+                tracing::warn!(error = %e, "pw_stream_update_params (Buffers) failed");
+            }
         })
         .process(|stream, user_data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -155,21 +228,13 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
             // Sample userspace clock as early as possible — anything later
             // (memcpy, allocation) would fold into the capture-latency
             // metric. t_capture_kernel stays equal to this until we read
-            // it out of MetaHeader::pts. TODO(linux-capture): MetaHeader.
+            // it out of MetaHeader::pts.
             let t = MonoNanos::now();
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
             }
             let data = &mut datas[0];
-
-            let Some(pixel_format) = spa_format_to_ours(user_data.format.format()) else {
-                tracing::warn!(
-                    spa_format = ?user_data.format.format(),
-                    "unsupported pixel format; dropping frame"
-                );
-                return;
-            };
 
             let width = user_data.format.size().width;
             let height = user_data.format.size().height;
@@ -185,91 +250,31 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
                 return;
             }
 
-            let chunk = data.chunk();
-            // stride is an i32 in libspa (negative strides are used for
-            // bottom-up textures); we reject those for v0 since the rest
-            // of the pipeline assumes top-down BGRA.
-            let stride = match usize::try_from(chunk.stride()) {
-                Ok(s) => s,
-                Err(_) => {
-                    tracing::warn!(
-                        stride = chunk.stride(),
-                        "negative stride from pipewire; v0 doesn't handle flipped frames"
-                    );
+            let frame = match data.type_() {
+                pw::spa::buffer::DataType::DmaBuf => {
+                    match build_dmabuf_frame(data, user_data, width, height, t) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "DMA-BUF frame build failed");
+                            return;
+                        }
+                    }
+                }
+                pw::spa::buffer::DataType::MemPtr
+                | pw::spa::buffer::DataType::MemFd => {
+                    match build_cpu_frame(data, user_data, width, height, t) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "CPU frame build failed");
+                            return;
+                        }
+                    }
+                }
+                other => {
+                    tracing::warn!(data_type = ?other, "unsupported buffer type");
                     return;
                 }
             };
-            let offset = chunk.offset() as usize;
-            let chunk_size = chunk.size() as usize;
-            let row_bytes = (width as usize) * 4;
-            let needed = offset
-                .saturating_add((height as usize).saturating_sub(1) * stride)
-                .saturating_add(row_bytes);
-
-            // `data.data()` returns None whenever the buffer isn't backed
-            // by mapped CPU memory — most commonly DMA-BUF, which we
-            // don't yet import. Without this branch we'd silently drop
-            // every frame forever. Log once at warn, then trace, to avoid
-            // filling the log at frame rate.
-            let Some(bytes) = data.data() else {
-                if !user_data.unmapped_buffer_warned {
-                    user_data.unmapped_buffer_warned = true;
-                    tracing::warn!(
-                        data_type = ?data.type_(),
-                        "pipewire buffer has no mapped CPU memory (likely DMA-BUF). \
-                         v0 doesn't import DMA-BUF; all frames will be dropped \
-                         until the compositor renegotiates. Restart capture or \
-                         try a session that prefers SHM/MemFd."
-                    );
-                } else {
-                    tracing::trace!(data_type = ?data.type_(), "skipping unmapped buffer");
-                }
-                return;
-            };
-            // Two independent constraints: bytes must be big enough for
-            // the full plane, AND the chunk must mark the full plane as
-            // valid data. The previous .min(...) made the check pass when
-            // the chunk was *too small*, which could then panic in the
-            // per-row indexing below.
-            if bytes.len() < needed {
-                tracing::warn!(
-                    bytes_len = bytes.len(),
-                    needed,
-                    stride,
-                    height,
-                    "pipewire buffer smaller than declared frame; dropping"
-                );
-                return;
-            }
-            if chunk_size < needed.saturating_sub(offset) {
-                tracing::warn!(
-                    chunk_size,
-                    needed_data = needed.saturating_sub(offset),
-                    "pipewire chunk smaller than declared frame; dropping"
-                );
-                return;
-            }
-
-            // Pack rows tightly in case stride > width*4 (compositor padding).
-            let mut packed = Vec::with_capacity(row_bytes * height as usize);
-            if stride == row_bytes {
-                let end = offset + row_bytes * height as usize;
-                packed.extend_from_slice(&bytes[offset..end]);
-            } else {
-                for row in 0..height as usize {
-                    let start = offset + row * stride;
-                    packed.extend_from_slice(&bytes[start..start + row_bytes]);
-                }
-            }
-
-            let frame = CapturedFrame::Cpu(CpuFrame {
-                width,
-                height,
-                format: pixel_format,
-                data: packed,
-                t_capture_kernel: t,
-                t_capture_userspace: t,
-            });
 
             match user_data.sender.try_send(frame) {
                 Ok(()) => {}
@@ -287,9 +292,20 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
         })
         .register()?;
 
-    let params = build_format_pod()?;
-    let mut params_slice = [spa::pod::Pod::from_bytes(&params)
-        .ok_or_else(|| CaptureError::PipeWire("pod from_bytes returned None".into()))?];
+    // Offer DMA-BUF and SHM as separate EnumFormat alternatives. The
+    // compositor picks the first one it can satisfy; DMA-BUF comes
+    // first so a capable compositor takes the zero-copy path, and SHM
+    // is the runtime fallback. param_changed observes which got fixated
+    // and updates ParamBuffers accordingly.
+    let dmabuf_pod_bytes = build_format_pod(/* dmabuf */ true)?;
+    let shm_pod_bytes = build_format_pod(/* dmabuf */ false)?;
+    let mut params_slice = [
+        spa::pod::Pod::from_bytes(&dmabuf_pod_bytes).ok_or_else(|| {
+            CaptureError::PipeWire("dmabuf pod from_bytes returned None".into())
+        })?,
+        spa::pod::Pod::from_bytes(&shm_pod_bytes)
+            .ok_or_else(|| CaptureError::PipeWire("shm pod from_bytes returned None".into()))?,
+    ];
 
     stream.connect(
         spa::utils::Direction::Input,
@@ -303,15 +319,22 @@ fn run_pipewire(node_id: u32, fd: OwnedFd, sender: Sender<CapturedFrame>) -> Res
     Ok(())
 }
 
-fn build_format_pod() -> Result<Vec<u8>> {
-    // Offer BGRx / BGRA / RGBx / RGBA only — all 4-byte pixel formats so
-    // the downstream code (raw send + future BGRA->NV12 conversion) has
-    // a uniform shape. Size range is 1x1 to 7680x4320 (8K), framerate
-    // range 0..=240 fps. PipeWire picks one matching what the compositor
-    // can serve.
-    let obj = pw::spa::pod::object!(
-        pw::spa::utils::SpaTypes::ObjectParamFormat,
-        pw::spa::param::ParamType::EnumFormat,
+fn build_format_pod(want_dmabuf: bool) -> Result<Vec<u8>> {
+    // Two variants of the same pod. The DMA-BUF variant restricts to
+    // BGRx/BGRA (the formats our zero-copy importer handles) and adds
+    // a VideoModifier property pinning DRM_FORMAT_MOD_LINEAR — this is
+    // what flags the offer to the compositor as a DMA-BUF intent. The
+    // SHM variant accepts all four 4-byte SPA formats and omits the
+    // modifier; PipeWire negotiates it as plain MemPtr/MemFd.
+    //
+    // Size range 1x1 to 7680x4320 (8K), framerate 0..=240 fps. Built
+    // with pipewire-rs's object!/property! macros; modifier needs a
+    // manual Property because the macro doesn't expose property flags
+    // (the SPA DONT_FIXATE flag would help compositors that want to
+    // tell us "I support these other modifiers" — for our LINEAR-only
+    // offer it doesn't matter, and a future modifier-list expansion
+    // can drop down to manual property building too).
+    let mut properties = vec![
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::MediaType,
             Id,
@@ -322,7 +345,19 @@ fn build_format_pod() -> Result<Vec<u8>> {
             Id,
             pw::spa::param::format::MediaSubtype::Raw
         ),
-        pw::spa::pod::property!(
+    ];
+    if want_dmabuf {
+        properties.push(pw::spa::pod::property!(
+            pw::spa::param::format::FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::BGRA,
+        ));
+    } else {
+        properties.push(pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoFormat,
             Choice,
             Enum,
@@ -332,38 +367,51 @@ fn build_format_pod() -> Result<Vec<u8>> {
             pw::spa::param::video::VideoFormat::BGRA,
             pw::spa::param::video::VideoFormat::RGBx,
             pw::spa::param::video::VideoFormat::RGBA,
-        ),
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            pw::spa::utils::Rectangle {
-                width: 1920,
-                height: 1080
-            },
-            pw::spa::utils::Rectangle {
-                width: 1,
-                height: 1
-            },
-            pw::spa::utils::Rectangle {
-                width: 7680,
-                height: 4320
-            }
-        ),
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            pw::spa::utils::Fraction { num: 60, denom: 1 },
-            pw::spa::utils::Fraction { num: 0, denom: 1 },
-            pw::spa::utils::Fraction {
-                num: 240,
-                denom: 1
-            }
-        ),
-    );
+        ));
+    }
+    properties.push(pw::spa::pod::property!(
+        pw::spa::param::format::FormatProperties::VideoSize,
+        Choice,
+        Range,
+        Rectangle,
+        pw::spa::utils::Rectangle { width: 1920, height: 1080 },
+        pw::spa::utils::Rectangle { width: 1, height: 1 },
+        pw::spa::utils::Rectangle { width: 7680, height: 4320 }
+    ));
+    properties.push(pw::spa::pod::property!(
+        pw::spa::param::format::FormatProperties::VideoFramerate,
+        Choice,
+        Range,
+        Fraction,
+        pw::spa::utils::Fraction { num: 60, denom: 1 },
+        pw::spa::utils::Fraction { num: 0, denom: 1 },
+        pw::spa::utils::Fraction { num: 240, denom: 1 }
+    ));
+    if want_dmabuf {
+        // VideoModifier as a single-element Long choice = "fixate to
+        // LINEAR". The property! macro doesn't support Long (no
+        // libspa::utils::Long wrapper exists — i64 is used directly),
+        // so we hand-build the Property.
+        let modifier_default = i64::try_from(DRM_FORMAT_MOD_LINEAR).unwrap();
+        properties.push(pw::spa::pod::Property {
+            key: pw::spa::param::format::FormatProperties::VideoModifier.as_raw(),
+            flags: pw::spa::pod::PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Long(
+                pw::spa::utils::Choice::<i64>(
+                    pw::spa::utils::ChoiceFlags::empty(),
+                    pw::spa::utils::ChoiceEnum::<i64>::Enum {
+                        default: modifier_default,
+                        alternatives: vec![modifier_default],
+                    },
+                ),
+            )),
+        });
+    }
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: pw::spa::param::ParamType::EnumFormat.as_raw(),
+        properties,
+    };
     let bytes: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &pw::spa::pod::Value::Object(obj),
@@ -381,4 +429,193 @@ fn spa_format_to_ours(spa: pw::spa::param::video::VideoFormat) -> Option<PixelFo
         V::RGBA | V::RGBx => PixelFormat::Rgba8,
         _ => return None,
     })
+}
+
+/// SPA-format → DRM fourcc mapping for DMA-BUF capture. The downstream
+/// importer (wgpu's `texture_from_dmabuf_fd` + tether-gpuconvert) only
+/// supports `Bgra8Unorm`, so we map the BGR-family SPA formats to the
+/// matching DRM fourcc. RGB-family formats are rejected at the DMA-BUF
+/// path; if a compositor only emits those, capture falls back to SHM
+/// via the existing CPU path.
+///
+/// Fourcc values are little-endian 4-char codes from `<drm/drm_fourcc.h>`:
+///   AR24 = DRM_FORMAT_ARGB8888  (32-bit ARGB, alpha in high byte) — BGRA in memory
+///   XR24 = DRM_FORMAT_XRGB8888  (32-bit RGB, X in high byte)       — BGRx in memory
+fn spa_format_to_drm_fourcc(spa: pw::spa::param::video::VideoFormat) -> Option<u32> {
+    use pw::spa::param::video::VideoFormat as V;
+    Some(match spa {
+        V::BGRA => u32::from_le_bytes(*b"AR24"),
+        V::BGRx => u32::from_le_bytes(*b"XR24"),
+        _ => return None,
+    })
+}
+
+fn build_cpu_frame(
+    data: &mut pw::spa::buffer::Data,
+    user_data: &UserData,
+    width: u32,
+    height: u32,
+    t: MonoNanos,
+) -> std::result::Result<CapturedFrame, String> {
+    let Some(pixel_format) = spa_format_to_ours(user_data.format.format()) else {
+        return Err(format!(
+            "unsupported SPA pixel format on SHM path: {:?}",
+            user_data.format.format()
+        ));
+    };
+
+    let chunk = data.chunk();
+    // stride is i32; reject negative (bottom-up) since the rest of the
+    // pipeline assumes top-down.
+    let stride = usize::try_from(chunk.stride())
+        .map_err(|_| format!("negative stride {} (flipped frame)", chunk.stride()))?;
+    let offset = chunk.offset() as usize;
+    let chunk_size = chunk.size() as usize;
+    let row_bytes = (width as usize) * 4;
+    let needed = offset
+        .saturating_add((height as usize).saturating_sub(1) * stride)
+        .saturating_add(row_bytes);
+
+    let Some(bytes) = data.data() else {
+        // SHM path expects mapped CPU memory. If MAP_BUFFERS is set on
+        // the stream connect (it is), the only way data() returns None
+        // is a libpipewire-internal mapping failure — extremely rare.
+        return Err("SHM buffer has no mapped memory".into());
+    };
+    if bytes.len() < needed {
+        return Err(format!(
+            "buffer too small: {} bytes, need {}",
+            bytes.len(),
+            needed
+        ));
+    }
+    if chunk_size < needed.saturating_sub(offset) {
+        return Err(format!(
+            "chunk too small: {} bytes, need {}",
+            chunk_size,
+            needed.saturating_sub(offset)
+        ));
+    }
+
+    // Pack rows tightly (compositor may pad stride > width*4).
+    let mut packed = Vec::with_capacity(row_bytes * height as usize);
+    if stride == row_bytes {
+        let end = offset + row_bytes * height as usize;
+        packed.extend_from_slice(&bytes[offset..end]);
+    } else {
+        for row in 0..height as usize {
+            let start = offset + row * stride;
+            packed.extend_from_slice(&bytes[start..start + row_bytes]);
+        }
+    }
+
+    Ok(CapturedFrame::Cpu(CpuFrame {
+        width,
+        height,
+        format: pixel_format,
+        data: packed,
+        t_capture_kernel: t,
+        t_capture_userspace: t,
+    }))
+}
+
+fn build_dmabuf_frame(
+    data: &mut pw::spa::buffer::Data,
+    user_data: &UserData,
+    width: u32,
+    height: u32,
+    t: MonoNanos,
+) -> std::result::Result<CapturedFrame, String> {
+    let Some(modifier) = user_data.negotiated_modifier else {
+        return Err("DMA-BUF buffer arrived but no modifier was negotiated".into());
+    };
+    let Some(fourcc) = spa_format_to_drm_fourcc(user_data.format.format()) else {
+        return Err(format!(
+            "unsupported SPA pixel format on DMA-BUF path: {:?}",
+            user_data.format.format()
+        ));
+    };
+
+    let chunk = data.chunk();
+    let stride = u64::try_from(chunk.stride())
+        .map_err(|_| format!("negative DMA-BUF stride {}", chunk.stride()))?;
+    let offset = u64::from(chunk.offset());
+
+    let raw_fd = data.fd();
+    if raw_fd < 0 {
+        return Err(format!("invalid DMA-BUF fd {raw_fd}"));
+    }
+    // Dup the fd so we own a reference independent of PipeWire's
+    // buffer slot. The Buffer drops at the end of the callback,
+    // queuing the slot back to PipeWire — at which point the
+    // compositor may reuse the slot's *memory* for the next frame.
+    // Dup'ing keeps the dma-buf object refcounted alive for the
+    // downstream importer (libva, wgpu).
+    //
+    // Trade-off: the *memory contents* can still be overwritten if
+    // PipeWire cycles back to the same slot before our consumer
+    // reads. With the default 4-buffer pool, that's ~60 ms of
+    // headroom at 60 fps — comfortably wider than encode latency.
+    // The tight fix (delay queue-back until consumer drops) needs
+    // raw pw_stream_queue_buffer calls; deferred until we measure
+    // tearing in practice.
+    // SAFETY: raw_fd was just returned by libspa for a DMA-BUF
+    // SPA_DATA_DmaBuf data block; libc::dup is sound on any open fd.
+    let dup_fd = unsafe {
+        let f = libc::dup(raw_fd.as_raw_fd());
+        if f < 0 {
+            return Err(format!(
+                "dup(DMA-BUF fd) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        OwnedFd::from_raw_fd(f)
+    };
+
+    Ok(CapturedFrame::Gpu(GpuCapturedFrame {
+        width,
+        height,
+        source: GpuCapturedSource::DmaBuf(CapturedDmaBuf {
+            fourcc,
+            fd: dup_fd,
+            stride,
+            offset,
+            modifier,
+        }),
+        t_capture_kernel: t,
+        t_capture_userspace: t,
+        // No live PipeWire ref in the guard — see the dup() comment
+        // above. A future refactor that holds the Buffer past callback
+        // exit can stash it here.
+        release_guard: GpuCapturedGuard::new(()),
+    }))
+}
+
+/// Build a `SPA_TYPE_OBJECT_ParamBuffers` pod announcing which buffer
+/// types we can consume. Called from `param_changed` once we know
+/// whether DMA-BUF was negotiated.
+fn build_buffers_param(data_type_mask: u32) -> Result<Vec<u8>> {
+    // spa_sys::SPA_PARAM_BUFFERS_dataType is the property key. Wrapped
+    // in libspa::utils::Id for the property! macro.
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: pw::spa::param::ParamType::Buffers.as_raw(),
+        properties: vec![pw::spa::pod::Property {
+            key: libspa_sys::SPA_PARAM_BUFFERS_dataType,
+            flags: pw::spa::pod::PropertyFlags::empty(),
+            // SPA represents the buffer-type bitmask as an Int (i32)
+            // per the historical struct layout in spa/param/buffers.h.
+            value: pw::spa::pod::Value::Int(
+                i32::try_from(data_type_mask).expect("buffer-type bits fit in i32"),
+            ),
+        }],
+    };
+    let bytes: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(obj),
+    )
+    .map_err(|e| CaptureError::PipeWire(format!("buffers pod serialize: {e:?}")))?
+    .0
+    .into_inner();
+    Ok(bytes)
 }

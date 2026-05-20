@@ -17,6 +17,14 @@ crossbeam-channel = { workspace = true }
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
 pipewire = "0.10"
 libspa = "0.10"
+# Raw SPA constants (SPA_DATA_DmaBuf, SPA_PARAM_BUFFERS_dataType) that
+# pipewire-rs 0.10's safe wrappers don't re-export. Pinned to the same
+# version as libspa to avoid two sys-crate copies in the dep graph.
+libspa-sys = "0.10"
+# Raw libc::dup for cloning the DMA-BUF fd we receive from PipeWire so
+# it outlives the per-callback Buffer borrow. OwnedFd::try_clone goes
+# the same path with an extra Result wrap.
+libc = "0.2"
 tokio = { workspace = true }
 # Used by ashpd's BitFlags types — adding directly lets us write
 # `BitFlags::from(SourceType::Monitor)` without the bitor-with-self hack.

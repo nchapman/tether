@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,7 +7,10 @@ use tracing::{info, trace};
 
 use crate::{
     connection::{Connection, STREAM_PREAMBLE_LEN},
-    tls::{ensure_crypto_provider, generate_self_signed, CertFingerprint, SelfSignedCert},
+    tls::{
+        ensure_crypto_provider, generate_self_signed, load_or_generate_persistent,
+        CertFingerprint, SelfSignedCert,
+    },
     Result, TransportError,
 };
 
@@ -16,17 +20,34 @@ pub struct Server {
 }
 
 impl Server {
-    /// Bind a server to the given UDP address. The server generates a
-    /// fresh self-signed certificate on startup; its fingerprint must be
-    /// shared with the client out of band.
+    /// Bind a server to the given UDP address with a freshly-generated
+    /// ephemeral certificate. The fingerprint changes on every call;
+    /// suitable for tests and one-shot processes that don't need
+    /// stable identity. Long-running host processes should prefer
+    /// [`Self::bind_persistent`] so the operator only copies the
+    /// fingerprint to the client once.
     pub async fn bind(addr: SocketAddr) -> Result<Self> {
+        let cert = generate_self_signed(default_subject_alt_names())?;
+        Self::bind_with_cert(addr, cert).await
+    }
+
+    /// Bind with a self-signed cert loaded from `cert_dir`, generating
+    /// and persisting a new one if no cert is present. Stable
+    /// fingerprint across restarts — `rm` the files in `cert_dir` to
+    /// rotate. Same on-wire behaviour as [`Self::bind`].
+    pub async fn bind_persistent(addr: SocketAddr, cert_dir: &Path) -> Result<Self> {
+        let cert = load_or_generate_persistent(cert_dir, default_subject_alt_names())?;
+        Self::bind_with_cert(addr, cert).await
+    }
+
+    async fn bind_with_cert(addr: SocketAddr, cert: SelfSignedCert) -> Result<Self> {
         ensure_crypto_provider();
 
         let SelfSignedCert {
             chain,
             key,
             fingerprint,
-        } = generate_self_signed(vec!["tether-host".into(), "localhost".into()])?;
+        } = cert;
 
         let mut server_config = quinn::ServerConfig::with_single_cert(chain, key.into())
             .map_err(|e| TransportError::Rustls(rustls::Error::General(format!("{e}"))))?;
@@ -96,6 +117,10 @@ async fn handle_incoming(incoming: quinn::Incoming) -> Result<Connection> {
         control_recv,
         input_recv,
     ))
+}
+
+fn default_subject_alt_names() -> Vec<String> {
+    vec!["tether-host".into(), "localhost".into()]
 }
 
 fn transport_config() -> quinn::TransportConfig {

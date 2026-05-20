@@ -12,6 +12,7 @@
 //! the same way standard rustls does it — we only override the *trust*
 //! decision (fingerprint match instead of PKI chain).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use rustls::client::danger::{
@@ -49,6 +50,61 @@ pub(crate) fn sha256(bytes: &[u8]) -> CertFingerprint {
     let mut h = Sha256::new();
     h.update(bytes);
     h.finalize().into()
+}
+
+/// Load a previously-generated self-signed cert from `dir`, or generate
+/// a fresh one and write it there if no cert exists. Stable fingerprint
+/// across runs — the user only has to copy it to the client once.
+///
+/// Files written: `host_cert.der` (PKIX DER) and `host_key.der` (PKCS8
+/// DER). On unix, the key is created with mode `0o600`. A future
+/// `--regenerate-cert` flag would delete both files and call this
+/// again; today the operator can just `rm` them.
+///
+/// Returns the same shape `generate_self_signed` does, so callers
+/// can't tell whether the cert was loaded or freshly generated — that
+/// distinction lives in the (optional) log line at the call site.
+pub fn load_or_generate_persistent(
+    dir: &Path,
+    subject_alt_names: Vec<String>,
+) -> Result<SelfSignedCert> {
+    let cert_path = dir.join("host_cert.der");
+    let key_path = dir.join("host_key.der");
+
+    if cert_path.exists() && key_path.exists() {
+        let der_bytes = std::fs::read(&cert_path)?;
+        let key_bytes = std::fs::read(&key_path)?;
+        let fingerprint = sha256(&der_bytes);
+        return Ok(SelfSignedCert {
+            chain: vec![CertificateDer::from(der_bytes)],
+            key: PrivatePkcs8KeyDer::from(key_bytes),
+            fingerprint,
+        });
+    }
+
+    let fresh = generate_self_signed(subject_alt_names)?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&cert_path, fresh.chain[0].as_ref())?;
+    write_key_file(&key_path, fresh.key.secret_pkcs8_der())?;
+    Ok(fresh)
+}
+
+#[cfg(unix)]
+fn write_key_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_key_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 #[derive(Debug)]

@@ -10,6 +10,7 @@
 //! (`bind_addr` defaults to `127.0.0.1:7654`).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -64,13 +65,15 @@ async fn main() -> anyhow::Result<()> {
 
     let (bind, use_test_pattern) = parse_args()?;
 
-    let server = Server::bind(bind).await?;
+    let cert_dir = persistent_cert_dir()?;
+    let server = Server::bind_persistent(bind, &cert_dir).await?;
     let local = server.local_addr()?;
     let fingerprint = server.fingerprint();
     let fp_hex = hex_encode(&fingerprint);
 
     println!("tether-host listening on {local}");
     println!("cert fingerprint: {fp_hex}");
+    println!("cert dir:        {} (rm to rotate)", cert_dir.display());
     println!("client cmd:      tether-client {local} {fp_hex}");
 
     let conn = match server.accept().await {
@@ -979,6 +982,24 @@ fn run_capture_and_send(
         }
     }
     info!("send loop exiting");
+}
+
+/// Directory the host caches its self-signed cert + key in. Default
+/// is `$HOME/.tether/`; override with `$TETHER_CERT_DIR` for testing
+/// or sharing between host instances. We deliberately don't follow
+/// XDG paths — the file pair is small and operationally important,
+/// and a single well-known location ("look under ~/.tether") is
+/// easier to talk about in docs than "wherever XDG_DATA_HOME points".
+fn persistent_cert_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        anyhow::anyhow!(
+            "neither $TETHER_CERT_DIR nor $HOME is set; can't choose a cert directory"
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".tether"))
 }
 
 fn parse_args() -> anyhow::Result<(SocketAddr, bool)> {

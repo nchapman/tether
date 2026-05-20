@@ -1,0 +1,500 @@
+//! BGRA wgpu texture → NV12 DMA-BUF planes, via compute shader + export.
+//!
+//! Ties the BGRA→NV12 compute pipeline (shared with [`crate::Bgra2Nv12`])
+//! to a pair of DMA-BUF-exported storage textures. The exported textures
+//! are allocated once at construction and reused every frame; the caller
+//! gets back dup'd fds per call so the consumer (VAAPI here, IOSurface
+//! later on macOS, D3D11 shared handle on Windows — same shape via
+//! different export modules) can own its own lifetime.
+//!
+//! Synchronisation: we block on GPU completion (`device.poll`) before
+//! returning the descriptor. Without an explicit Vulkan→VAAPI fence the
+//! consumer has no way to know the compute write has retired, and not
+//! every libva backend honours the dma-buf reservation-object fence.
+//! Cost is one synchronous poll per frame; the eventual answer is to
+//! plumb a `sync_file` fd alongside the descriptor — see the comment
+//! near [`tether_codec::DmaBufFrame`].
+//!
+//! Cross-platform shape:
+//! - this module is Linux-only because DMA-BUF is the Linux GPU-IPC
+//!   primitive. The macOS sibling will be `nv12_iosurface.rs` (compute
+//!   pipeline identical, export goes through `IOSurface_create` +
+//!   `MTLDevice.newTextureWithDescriptor`). The Windows sibling is
+//!   D3D11 shared handle. The bridge struct's *shape* (own a device,
+//!   own pre-allocated Y/UV targets, take an imported BGRA texture,
+//!   return per-frame descriptors) is what's shared.
+
+use std::os::fd::OwnedFd;
+
+use crate::{
+    dmabuf_export::{export_texture_as_dmabuf, DmaBufExport, ExportError},
+    pipeline::build_pipeline,
+};
+
+/// One frame's worth of NV12 planes, each backed by its own DMA-BUF.
+///
+/// The fds are *dup'd copies* of the bridge's persistent exports — drop
+/// this struct (or hand it off and let the consumer drop it) once the
+/// downstream importer has refcounted the buffers it cares about. The
+/// underlying GPU memory stays alive via the bridge's own
+/// [`DmaBufExport`] for as long as the bridge exists.
+///
+/// Field shape matches what `tether_codec::DmaBufFrame` needs for the
+/// SEPARATE_LAYERS variant of NV12: two objects (one per plane), two
+/// layers (one per plane, each with one sub-plane), surface fourcc NV12,
+/// per-layer DRM fourccs R8 and GR88.
+pub struct Nv12DmaBufFrame {
+    pub width: u32,
+    pub height: u32,
+    pub y_fd: OwnedFd,
+    pub y_stride: u64,
+    pub y_offset: u64,
+    pub y_size: u64,
+    pub y_modifier: u64,
+    pub uv_fd: OwnedFd,
+    pub uv_stride: u64,
+    pub uv_offset: u64,
+    pub uv_size: u64,
+    pub uv_modifier: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Nv12DmaBufError {
+    #[error("no wgpu adapter")]
+    NoAdapter,
+    #[error("wgpu request_device: {0}")]
+    Device(#[from] wgpu::RequestDeviceError),
+    #[error(
+        "adapter doesn't advertise the features required for zero-copy NV12 \
+         (VULKAN_EXTERNAL_MEMORY_DMA_BUF + TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES). \
+         The Vulkan ICD must support VK_EXT_external_memory_dma_buf, \
+         VK_EXT_image_drm_format_modifier, and VK_KHR_external_memory_fd."
+    )]
+    FeatureUnsupported,
+    #[error("dma-buf export: {0}")]
+    Export(#[from] ExportError),
+    #[error("input texture format must be Bgra8Unorm, got {0:?}")]
+    InputFormat(wgpu::TextureFormat),
+    #[error(
+        "input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}"
+    )]
+    DimMismatch {
+        input_w: u32,
+        input_h: u32,
+        w: u32,
+        h: u32,
+    },
+    #[error("wgpu poll: {0}")]
+    Poll(String),
+    #[error("dup fd: {0}")]
+    DupFd(std::io::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Nv12DmaBufError>;
+
+/// Persistent BGRA→NV12 converter that writes its output into
+/// DMA-BUF-exported Y/UV textures. Built once per resolution; the
+/// per-frame call takes an imported BGRA wgpu texture (typically from
+/// PipeWire's DMA-BUF buffer-type) and returns dup'd fds to the same
+/// underlying GPU memory the consumer wants to read.
+pub struct Nv12DmaBuf {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+    /// Y plane (R8Unorm) backing storage + DMA-BUF fd. Held for
+    /// re-use across frames — dropping this drops the underlying
+    /// VkImage + VkDeviceMemory.
+    y_export: DmaBufExport,
+    /// UV plane (Rg8Unorm) backing storage + DMA-BUF fd.
+    uv_export: DmaBufExport,
+    /// Cached views into the export textures so we don't rebuild them
+    /// per frame; bind groups themselves still rebuild because the
+    /// source texture is per-frame.
+    y_view: wgpu::TextureView,
+    uv_view: wgpu::TextureView,
+}
+
+impl Nv12DmaBuf {
+    /// Build the bridge: open a wgpu device with the required features,
+    /// allocate the shared compute pipeline, and allocate the Y + UV
+    /// DMA-BUF exports sized for `width`×`height`.
+    pub async fn new(width: u32, height: u32) -> Result<Self> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+            .map_err(|_| Nv12DmaBufError::NoAdapter)?;
+
+        let required_features = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        if !adapter.features().contains(required_features) {
+            return Err(Nv12DmaBufError::FeatureUnsupported);
+        }
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("tether-gpuconvert nv12-dmabuf device"),
+                required_features,
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            })
+            .await?;
+
+        let (pipeline, bgl) = build_pipeline(&device);
+
+        let chroma_w = width.div_ceil(2);
+        let chroma_h = height.div_ceil(2);
+
+        let y_export = export_texture_as_dmabuf(
+            &device,
+            width,
+            height,
+            wgpu::TextureFormat::R8Unorm,
+            wgpu::TextureUsages::STORAGE_BINDING,
+            "nv12 y dmabuf",
+        )?;
+        let uv_export = export_texture_as_dmabuf(
+            &device,
+            chroma_w,
+            chroma_h,
+            wgpu::TextureFormat::Rg8Unorm,
+            wgpu::TextureUsages::STORAGE_BINDING,
+            "nv12 uv dmabuf",
+        )?;
+
+        let y_view = y_export.texture.create_view(&Default::default());
+        let uv_view = uv_export.texture.create_view(&Default::default());
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            bgl,
+            width,
+            height,
+            y_export,
+            uv_export,
+            y_view,
+            uv_view,
+        })
+    }
+
+    /// The wgpu device the bridge owns. Callers importing PipeWire
+    /// DMA-BUFs as wgpu textures must use this device so the imported
+    /// texture lives on the same Vulkan instance as the compute
+    /// pipeline that reads it.
+    #[must_use]
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The wgpu queue paired with [`Self::device`]. Exposed so capture
+    /// imports can be submitted alongside the bridge's own work.
+    #[must_use]
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Convert one imported BGRA frame into the bridge's NV12 DMA-BUF
+    /// targets and return dup'd fds the caller can wrap in a codec
+    /// `DmaBufFrame` for `VaapiEncoder::submit_dmabuf`.
+    ///
+    /// Blocks on GPU completion so VAAPI's subsequent read sees the
+    /// finished compute write. See module-level comment for the
+    /// rationale and the path to an explicit-fence-based version.
+    pub fn convert(&self, src_bgra: &wgpu::Texture) -> Result<Nv12DmaBufFrame> {
+        if src_bgra.format() != wgpu::TextureFormat::Bgra8Unorm {
+            return Err(Nv12DmaBufError::InputFormat(src_bgra.format()));
+        }
+        if src_bgra.width() != self.width || src_bgra.height() != self.height {
+            return Err(Nv12DmaBufError::DimMismatch {
+                input_w: src_bgra.width(),
+                input_h: src_bgra.height(),
+                w: self.width,
+                h: self.height,
+            });
+        }
+
+        let src_view = src_bgra.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nv12-dmabuf bg"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.y_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.uv_view),
+                },
+            ],
+        });
+
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nv12-dmabuf enc"),
+            });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("nv12-dmabuf pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            let chroma_w = self.width.div_ceil(2);
+            let chroma_h = self.height.div_ceil(2);
+            pass.dispatch_workgroups(chroma_w.div_ceil(8), chroma_h.div_ceil(8), 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| Nv12DmaBufError::Poll(format!("{e:?}")))?;
+
+        Ok(Nv12DmaBufFrame {
+            width: self.width,
+            height: self.height,
+            y_fd: self
+                .y_export
+                .fd
+                .try_clone()
+                .map_err(Nv12DmaBufError::DupFd)?,
+            y_stride: self.y_export.stride,
+            y_offset: self.y_export.offset,
+            y_size: self.y_export.size,
+            y_modifier: self.y_export.drm_format_modifier,
+            uv_fd: self
+                .uv_export
+                .fd
+                .try_clone()
+                .map_err(Nv12DmaBufError::DupFd)?,
+            uv_stride: self.uv_export.stride,
+            uv_offset: self.uv_export.offset,
+            uv_size: self.uv_export.size,
+            uv_modifier: self.uv_export.drm_format_modifier,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end without VAAPI: load a solid-colour BGRA texture, run
+    /// the bridge, re-import the returned Y plane via wgpu's existing
+    /// `texture_from_dmabuf_fd`, read it back, assert the bytes match
+    /// what BT.709 limited-range gives for that colour.
+    ///
+    /// This is the smallest test that proves: shader runs against
+    /// exported storage textures (not just normal ones), exported
+    /// memory is the same memory the importer sees, the dispatcher
+    /// covers the full frame. Catches binding-order regressions in
+    /// [`crate::pipeline::build_pipeline`] too.
+    #[test]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    fn convert_solid_red_roundtrip() {
+        let width = 64u32;
+        let height = 32u32;
+
+        let bridge = match pollster::block_on(Nv12DmaBuf::new(width, height)) {
+            Ok(b) => b,
+            Err(Nv12DmaBufError::NoAdapter | Nv12DmaBufError::FeatureUnsupported) => {
+                eprintln!("SKIP: no wgpu adapter with DMA-BUF export feature");
+                return;
+            }
+            Err(e) => panic!("Nv12DmaBuf::new: {e}"),
+        };
+
+        // Build a non-exported source texture filled with solid red
+        // (BGRA: B=0, G=0, R=255, A=255). Uses the bridge's own device
+        // so the texture is on the same Vulkan instance the compute
+        // pipeline will read from.
+        let src = bridge
+            .device()
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("test bgra red"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+        let n = (width * height) as usize;
+        let mut bgra = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            bgra.extend_from_slice(&[0, 0, 255, 255]);
+        }
+        bridge.queue().write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bgra,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let out = bridge.convert(&src).expect("bridge convert");
+
+        // Re-import the Y plane via the existing DMA-BUF import path,
+        // copy to a readback buffer, and verify a handful of pixels.
+        let import_desc = wgpu::hal::TextureDescriptor {
+            label: Some("y reimport"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUses::COPY_SRC,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+        // SAFETY: out.y_fd was just produced by the bridge's export
+        // path so the modifier/stride/offset values are authoritative.
+        let hal_tex = unsafe {
+            bridge
+                .device()
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("vulkan backend")
+                .texture_from_dmabuf_fd(
+                    out.y_fd,
+                    &import_desc,
+                    out.y_modifier,
+                    out.y_stride,
+                    out.y_offset,
+                )
+                .expect("y texture_from_dmabuf_fd")
+        };
+        let import_tex = unsafe {
+            bridge.device().create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_tex,
+                &wgpu::TextureDescriptor {
+                    label: Some("y reimport"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                },
+            )
+        };
+
+        let padded_row = u64::from(width).div_ceil(256) * 256;
+        let readback = bridge.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("y readback"),
+            size: padded_row * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = bridge
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("y readback enc"),
+            });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &import_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(u32::try_from(padded_row).unwrap()),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        bridge.queue().submit(Some(enc.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        bridge
+            .device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll readback");
+        rx.recv().expect("cb").expect("map");
+        let mapped = slice.get_mapped_range().expect("range");
+
+        // BT.709 limited-range Y for pure red (R=1, G=0, B=0):
+        //   Y' = 0.2126; scaled to limited = 0.2126*219/255 + 16/255
+        //      ≈ 0.2455 → byte ≈ 63.
+        let expected_y: u8 = ((0.2126_f32 * 219.0 / 255.0 + 16.0 / 255.0) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+
+        for &(x, y) in &[
+            (0u32, 0u32),
+            (width / 2, height / 2),
+            (width - 1, height - 1),
+        ] {
+            let got = mapped[(u64::from(y) * padded_row + u64::from(x)) as usize];
+            let diff = i32::from(got) - i32::from(expected_y);
+            assert!(
+                diff.abs() <= 2,
+                "Y[{x},{y}] = {got}, expected ~{expected_y} (diff {diff})",
+            );
+        }
+    }
+}

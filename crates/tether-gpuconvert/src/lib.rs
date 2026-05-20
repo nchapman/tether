@@ -31,11 +31,15 @@
 #[cfg(unix)]
 pub mod dmabuf_export;
 #[cfg(unix)]
+pub mod nv12_dmabuf;
+mod pipeline;
+
+#[cfg(unix)]
 pub use dmabuf_export::{
     export_texture_as_dmabuf, DmaBufExport, ExportError, DRM_FORMAT_MOD_LINEAR,
 };
-
-const SHADER_SRC: &str = include_str!("bgra_to_nv12.wgsl");
+#[cfg(unix)]
+pub use nv12_dmabuf::{Nv12DmaBuf, Nv12DmaBufError, Nv12DmaBufFrame};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
@@ -164,63 +168,7 @@ impl Bgra2Nv12 {
             })
             .await?;
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bgra_to_nv12"),
-            source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
-        });
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bgra_to_nv12 bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rg8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bgra_to_nv12 pl"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            // wgpu trunk renamed/replaced push_constant_ranges with
-            // immediate_size; we use neither.
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("bgra_to_nv12"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let (pipeline, bind_group_layout) = pipeline::build_pipeline(&device);
 
         let (src_tex, y_tex, uv_tex, y_readback, uv_readback, y_padded_row, uv_padded_row) =
             allocate_textures(&device, width, height);

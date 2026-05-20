@@ -8,7 +8,7 @@ use super::{VaapiDecoder, VaapiEncoder};
 fn vaapi_encoder_smoke() {
     let w = 640;
     let h = 480;
-    let mut enc = VaapiEncoder::new_bgra(w, h, 30, 4_000).expect("VAAPI encoder");
+    let mut enc = VaapiEncoder::new(tether_protocol::control::CodecKind::H264, w, h, 30, 4_000).expect("VAAPI encoder");
     let bgra = vec![0x80u8; (w * h * 4) as usize];
     let packets = enc.encode_bgra(&bgra, 0, true).expect("encode");
     // First frame may produce 0 packets (encoder warm-up) or 1+
@@ -41,7 +41,7 @@ fn vaapi_decoder_smoke() {
     let w = 320;
     let h = 240;
     let mut enc = H264Encoder::new_bgra(w, h, 30, 2_000).expect("sw encoder");
-    let mut dec = VaapiDecoder::new().expect("VAAPI decoder");
+    let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
 
     let mut got: Option<GpuFrame> = None;
     for t in 0..6i64 {
@@ -116,8 +116,8 @@ fn vaapi_encoder_dmabuf_import() {
     let h = 240;
 
     let mut sw_enc = H264Encoder::new_bgra(w, h, 30, 2_000).expect("sw encoder");
-    let mut dec = VaapiDecoder::new().expect("VAAPI decoder");
-    let mut hw_enc = VaapiEncoder::new_bgra(w, h, 30, 4_000).expect("VAAPI encoder");
+    let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
+    let mut hw_enc = VaapiEncoder::new(tether_protocol::control::CodecKind::H264, w, h, 30, 4_000).expect("VAAPI encoder");
 
     // Pump frames through SW encode → VAAPI decode until we get a
     // GpuFrame holding a DMA-BUF. Six frames is the same budget

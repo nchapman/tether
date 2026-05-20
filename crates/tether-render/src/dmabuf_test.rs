@@ -24,6 +24,7 @@ use std::sync::mpsc;
 
 use tether_codec::vaapi::{VaapiDecoder, VaapiEncoder};
 use tether_codec::{Decoder, Encoder, Frame as CodecFrame, GpuFrameSource};
+use tether_protocol::control::CodecKind;
 
 use crate::gpu;
 
@@ -272,7 +273,7 @@ fn dmabuf_zero_copy_roundtrip_yields_recognisable_pixels() {
 
     // Encode the test pattern. First frame is forced IDR; we feed a
     // few frames so the decoder has enough to actually emit one.
-    let mut enc = VaapiEncoder::new_bgra(w, h, 30, 4_000).expect("VAAPI encoder");
+    let mut enc = VaapiEncoder::new(CodecKind::H264, w, h, 30, 4_000).expect("VAAPI encoder");
     let mut packets = Vec::new();
     for t in 0..6i64 {
         packets.extend(
@@ -281,7 +282,7 @@ fn dmabuf_zero_copy_roundtrip_yields_recognisable_pixels() {
     }
 
     // Decode and grab the first GPU-resident frame.
-    let mut dec = VaapiDecoder::new().expect("VAAPI decoder");
+    let mut dec = VaapiDecoder::new(CodecKind::H264).expect("VAAPI decoder");
     let mut codec_gpu: Option<tether_codec::GpuFrame> = None;
     for pkt in &packets {
         dec.submit(&pkt.data).expect("submit");

@@ -1,4 +1,8 @@
-//! `h264_vaapi` hardware encoder.
+//! VAAPI hardware video encoder. Codec-parameterized via
+//! [`CodecKind`]: H.264 selects `h264_vaapi`, HEVC selects
+//! `hevc_vaapi`. Both encoders share the NV12 surface pool, swscale
+//! upload path, and DMA-BUF import path — only the FFmpeg codec name
+//! and profile differ per codec.
 
 use std::os::fd::AsRawFd;
 use std::slice;
@@ -25,6 +29,7 @@ use super::ffi::{
 use super::VAAPI_POOL_SIZE;
 
 pub struct VaapiEncoder {
+    kind: CodecKind,
     encoder: AVCodecContext,
     bgra_to_nv12: SwsContext,
     sw_frame: AVFrame,
@@ -53,13 +58,16 @@ pub struct VaapiEncoder {
 unsafe impl Send for VaapiEncoder {}
 
 impl VaapiEncoder {
-    /// Construct an `h264_vaapi` encoder for BGRA input at the given
-    /// dimensions. Returns `Err(CodecError::CodecNotFound)` if the
-    /// installed FFmpeg wasn't built with VAAPI support, and any
-    /// `RsmpegError` if the VAAPI device can't be opened (no
-    /// `/dev/dri/renderD*` accessible, driver mismatch, etc.) — the
-    /// caller (the probe in `crate::probe`) treats either as "no
-    /// hardware path available" and falls through to libx264.
+    /// Construct a VAAPI encoder for the given codec at the given
+    /// dimensions. `kind` selects between `h264_vaapi` and
+    /// `hevc_vaapi`; AV1 is not yet supported.
+    ///
+    /// Returns `Err(CodecError::CodecNotFound)` if the installed
+    /// FFmpeg wasn't built with VAAPI support for the requested codec,
+    /// and any `RsmpegError` if the VAAPI device can't be opened (no
+    /// `/dev/dri/renderD*` accessible, driver mismatch, etc.). The
+    /// probe in `crate::probe` walks the client's preferred-codec
+    /// list, calling this for each kind until one succeeds.
     ///
     /// The low-power VAAPI encode entrypoint
     /// (`VAEntrypointEncSliceLP`) would shave more latency on Intel
@@ -71,11 +79,18 @@ impl VaapiEncoder {
     /// devices (no LP for H.264). A safe LP path needs an explicit
     /// libva capability query before encoder.open(); deferring until
     /// the win is worth the FFI surface.
-    pub fn new_bgra(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self> {
+    pub fn new(
+        kind: CodecKind,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self> {
         init_ffmpeg();
 
-        let codec = AVCodec::find_encoder_by_name(c"h264_vaapi")
-            .ok_or(CodecError::CodecNotFound("h264_vaapi"))?;
+        let codec_cname = vaapi_codec_cname(kind)?;
+        let codec = AVCodec::find_encoder_by_name(codec_cname)
+            .ok_or(CodecError::CodecNotFound(vaapi_codec_name(kind)))?;
 
         // Default VAAPI device (typically /dev/dri/renderD128). None
         // lets FFmpeg pick — explicit device strings only matter on
@@ -119,22 +134,24 @@ impl VaapiEncoder {
         hw_frames_ref.init()?;
         encoder.set_hw_frames_ctx(hw_frames_ref);
 
-        // h264_vaapi private options. The defaults are tuned for
-        // file-based transcoding throughput, not realtime; we
-        // override the knobs that cost us the most:
-        //   profile=main — Main is the safest broadly-supported
-        //     profile across Intel/AMD/NVIDIA VAAPI drivers. The
-        //     encoder defaults to High, which fails to open on
-        //     hardware that exposes only Main for the chosen
-        //     entrypoint. Every realistic H.264 decoder we'll talk
-        //     to handles Main.
+        // VAAPI private options. The defaults are tuned for file-based
+        // transcoding throughput, not realtime; we override the knobs
+        // that cost us the most:
+        //   profile=main — Main is the safest broadly-supported profile
+        //     across Intel/AMD/NVIDIA VAAPI drivers. The encoder defaults
+        //     to High, which fails to open on hardware that exposes only
+        //     Main for the chosen entrypoint. Both H.264 Main and HEVC
+        //     Main use the same `profile=main` option string. Every
+        //     realistic decoder we'll talk to handles Main. W3 will
+        //     replace this hard-code with a probe.
         //   async_depth=1 — synchronous mode. Default is 4, which
         //     buys throughput at the cost of three extra frames of
         //     latency before the first packet emerges. We need the
         //     opposite trade.
         //   rc_mode=VBR — VBR matches Intel's recommended low-latency
         //     mode (CBR-style buffering also works but introduces a
-        //     visible bitrate floor on static content).
+        //     visible bitrate floor on static content). W3 will probe
+        //     the supported rate-control modes per backend.
         let dict = AVDictionary::new(c"profile", c"main", 0)
             .set(c"async_depth", c"1", 0)
             .set(c"rc_mode", c"VBR", 0);
@@ -154,8 +171,9 @@ impl VaapiEncoder {
             }
             if !unused_keys.is_empty() {
                 warn!(
+                    codec = vaapi_codec_name(kind),
                     unused = ?unused_keys,
-                    "h264_vaapi ignored some private options; latency knobs may not be applied"
+                    "VAAPI encoder ignored some private options; latency knobs may not be applied"
                 );
             }
         }
@@ -189,6 +207,7 @@ impl VaapiEncoder {
         let bgra_row_bytes = (width as usize) * 4;
 
         Ok(Self {
+            kind,
             encoder,
             bgra_to_nv12,
             sw_frame,
@@ -497,7 +516,7 @@ impl Encoder for VaapiEncoder {
     }
 
     fn codec_kind(&self) -> CodecKind {
-        CodecKind::H264
+        self.kind
     }
 
     fn name(&self) -> &'static str {
@@ -505,7 +524,7 @@ impl Encoder for VaapiEncoder {
         // by querying the VA driver string from the hw_device. Not
         // worth the extra FFI on first pass — the log already shows
         // is_hardware=true alongside the name.
-        "h264_vaapi"
+        vaapi_codec_name(self.kind)
     }
 
     fn encode_gpu(
@@ -520,6 +539,27 @@ impl Encoder for VaapiEncoder {
             }
             crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
         }
+    }
+}
+
+/// FFmpeg codec name (as a `CStr` for `find_encoder_by_name`) for
+/// the given codec kind. Errors for codecs we don't have a VAAPI
+/// build path for yet.
+fn vaapi_codec_cname(kind: CodecKind) -> Result<&'static std::ffi::CStr> {
+    match kind {
+        CodecKind::H264 => Ok(c"h264_vaapi"),
+        CodecKind::Hevc => Ok(c"hevc_vaapi"),
+        CodecKind::Av1 => Err(CodecError::CodecNotFound("av1_vaapi (not yet supported)")),
+    }
+}
+
+/// Human-readable VAAPI encoder name for logs and the `Encoder::name`
+/// trait method. Returns a stable `&'static str` per codec.
+fn vaapi_codec_name(kind: CodecKind) -> &'static str {
+    match kind {
+        CodecKind::H264 => "h264_vaapi",
+        CodecKind::Hevc => "hevc_vaapi",
+        CodecKind::Av1 => "av1_vaapi",
     }
 }
 

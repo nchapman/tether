@@ -17,6 +17,8 @@
 //! probe cost is paid per resize, not per frame.
 
 use crate::{CodecError, Decoder, Encoder, Result};
+#[cfg(target_os = "linux")]
+use tether_protocol::control::CodecKind;
 
 /// Probe + construct the H.264 encoder for the given dimensions.
 /// Errors with a diagnostics-friendly message if no GPU encoder is
@@ -32,7 +34,7 @@ pub fn probe_encoder_bgra(
 ) -> Result<Box<dyn Encoder>> {
     #[cfg(target_os = "linux")]
     {
-        match crate::vaapi::VaapiEncoder::new_bgra(width, height, fps, bitrate_kbps) {
+        match crate::vaapi::VaapiEncoder::new(CodecKind::H264, width, height, fps, bitrate_kbps) {
             Ok(enc) => return Ok(Box::new(enc)),
             Err(e) => {
                 tracing::error!(
@@ -64,7 +66,7 @@ pub fn probe_encoder_bgra(
 pub fn probe_decoder() -> Result<Box<dyn Decoder>> {
     #[cfg(target_os = "linux")]
     {
-        match crate::vaapi::VaapiDecoder::new() {
+        match crate::vaapi::VaapiDecoder::new(CodecKind::H264) {
             Ok(dec) => return Ok(Box::new(dec)),
             Err(e) => {
                 tracing::error!(

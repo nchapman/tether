@@ -1,4 +1,8 @@
-//! H.264 VAAPI hardware decoder.
+//! VAAPI hardware video decoder. Codec-parameterized via
+//! [`CodecKind`]: H.264 selects the `h264` decoder with VAAPI
+//! hwaccel, HEVC selects the `hevc` decoder. Both paths share the
+//! VAAPI surface export → DMA-BUF → renderer pipeline; only the
+//! AVCodecID differs.
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
@@ -18,13 +22,13 @@ use crate::{
 use super::ffi::AVVAAPIDeviceContext;
 use super::DECODE_EXTRA_HW_FRAMES;
 
-/// VAAPI-accelerated H.264 decoder. Uses ffmpeg's generic `h264`
-/// decoder with VAAPI hwaccel selected via `get_format`. Output VAAPI
-/// surfaces are downloaded to CPU NV12 via `hwframe_transfer_data`
-/// and handed straight to the renderer in that shape — no NV12→YUV420P
-/// swscale on the decode hot path. The renderer was migrated to a
-/// two-texture NV12 layout to match.
+/// VAAPI-accelerated video decoder. Uses ffmpeg's generic `h264` or
+/// `hevc` decoder with VAAPI hwaccel selected via `get_format`.
+/// Output VAAPI surfaces are exported as DMA-BUFs (zero copy) and
+/// handed straight to the renderer; the CPU NV12 path is a safety
+/// net for unexpected SW fallback.
 pub struct VaapiDecoder {
+    kind: CodecKind,
     decoder: AVCodecContext,
     // Decoder holds a cloned ref to the device internally
     // (set_hw_device_ctx); keeping our own ref documents the
@@ -39,19 +43,18 @@ pub struct VaapiDecoder {
 unsafe impl Send for VaapiDecoder {}
 
 impl VaapiDecoder {
-    /// Construct an h264 decoder bound to a VAAPI device.
-    /// `Err(CodecError::CodecNotFound)` if either the h264 decoder
-    /// isn't compiled in (effectively impossible — every ffmpeg ships
-    /// it) or this build's h264 decoder doesn't advertise VAAPI
-    /// hwaccel support. Any other failure (device open, get_format
-    /// callback rejected) comes through as `Err(CodecError::Ffmpeg)`.
-    /// The probe treats either as "no HW path" and falls through to
-    /// libavcodec software decode.
-    pub fn new() -> Result<Self> {
+    /// Construct a VAAPI decoder for the given codec.
+    /// `Err(CodecError::CodecNotFound)` if the decoder isn't compiled
+    /// in or this build's decoder doesn't advertise VAAPI hwaccel
+    /// support for that codec. Any other failure (device open,
+    /// get_format callback rejected) comes through as
+    /// `Err(CodecError::Ffmpeg)`.
+    pub fn new(kind: CodecKind) -> Result<Self> {
         init_ffmpeg();
 
-        let codec = AVCodec::find_decoder(ffi::AV_CODEC_ID_H264)
-            .ok_or(CodecError::CodecNotFound("h264 (for VAAPI decode)"))?;
+        let codec_id = vaapi_av_codec_id(kind)?;
+        let codec = AVCodec::find_decoder(codec_id)
+            .ok_or(CodecError::CodecNotFound(vaapi_decoder_name(kind)))?;
 
         // Walk the decoder's HW config table to confirm VAAPI is
         // actually supported in this ffmpeg build. Without this probe
@@ -69,7 +72,7 @@ impl VaapiDecoder {
             }
         }
         if !vaapi_supported {
-            return Err(CodecError::CodecNotFound("h264 VAAPI hwaccel"));
+            return Err(CodecError::CodecNotFound(vaapi_decoder_name(kind)));
         }
 
         let hw_device =
@@ -94,6 +97,7 @@ impl VaapiDecoder {
         decoder.open(None)?;
 
         Ok(Self {
+            kind,
             decoder,
             _hw_device: hw_device,
         })
@@ -350,7 +354,7 @@ impl Decoder for VaapiDecoder {
     }
 
     fn codec_kind(&self) -> CodecKind {
-        CodecKind::H264
+        self.kind
     }
 
     fn is_hardware(&self) -> bool {
@@ -358,7 +362,26 @@ impl Decoder for VaapiDecoder {
     }
 
     fn name(&self) -> &'static str {
-        "h264 (VAAPI hw)"
+        vaapi_decoder_name(self.kind)
+    }
+}
+
+/// FFmpeg `AVCodecID` for the given codec kind. Errors for codecs we
+/// don't have a VAAPI decode path for yet.
+fn vaapi_av_codec_id(kind: CodecKind) -> Result<ffi::AVCodecID> {
+    match kind {
+        CodecKind::H264 => Ok(ffi::AV_CODEC_ID_H264),
+        CodecKind::Hevc => Ok(ffi::AV_CODEC_ID_HEVC),
+        CodecKind::Av1 => Err(CodecError::CodecNotFound("av1 VAAPI (not yet supported)")),
+    }
+}
+
+/// Human-readable decoder name for logs / `Decoder::name`.
+fn vaapi_decoder_name(kind: CodecKind) -> &'static str {
+    match kind {
+        CodecKind::H264 => "h264 (VAAPI hw)",
+        CodecKind::Hevc => "hevc (VAAPI hw)",
+        CodecKind::Av1 => "av1 (VAAPI hw)",
     }
 }
 

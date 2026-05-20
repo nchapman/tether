@@ -114,24 +114,46 @@ an Intel Arc iGPU (Meteor Lake), the host's average encode time is
 ~7-8 ms per 2880×1920 frame; client glass-to-glass latency on loopback
 is ~20-25 ms including the ~10 ms present scheduler wait.
 
-**60 fps budget audit (Intel Arc iGPU, Meteor Lake, 1080p, CPU-upload
-path via `encode_bgra` synthetic constant-color input — DMA-BUF
-zero-copy path is faster in production):**
+**60 fps budget audit (Intel Arc iGPU, Meteor Lake; 60 fps budget =
+16.67 ms/frame; p99 over 60 sampled frames):**
 
-| Codec | p50    | p99    | max    | Budget @ 60 fps |
-| ----- | ------ | ------ | ------ | --------------- |
-| H.264 | 7.4 ms | 14.4 ms | 14.4 ms | 16.6 ms        |
-| HEVC  | 8.0 ms | 15.3 ms | 15.3 ms | 16.6 ms        |
+| Codec | Resolution | encode_bgra p99 | encode_dmabuf p99 | decode p99 |
+| ----- | ---------- | --------------- | ----------------- | ---------- |
+| H.264 | 1920×1080  | 13.20 ms        | 5.00 ms           | 1.55 ms    |
+| HEVC  | 1920×1080  | 16.15 ms        | 5.08 ms           | 1.45 ms    |
+| H.264 | 3840×2160  | 50.40 ms ⚠      | 12.26 ms          | 4.15 ms    |
+| HEVC  | 3840×2160  | 53.63 ms ⚠      | 14.55 ms          | 3.62 ms    |
 
-Both codecs fit, with the headroom tightest on HEVC's p99 (~1.3 ms).
-Real workloads exercise the DMA-BUF path and skip the swscale +
-hwframe_transfer_data steps that dominate this synthetic measurement,
-so production p99 is lower. If a future workload sees consistent
-p99 > 15 ms, `async_depth=2` is the principled lever — at the cost of
-one additional frame of pipeline latency, the encoder gains parallel
-slot for the next surface while the current one is being drained.
-Benchmark lives in `tether-codec`'s `vaapi_encode_budget_60fps`
-ignored test.
+`encode_bgra` is the CPU-upload path the synthetic test-pattern source
+uses (BGRA→NV12 swscale + `av_hwframe_transfer_data` upload, then
+encode). `encode_dmabuf` is the production zero-copy path (PipeWire
+DMA-BUF → tether-gpuconvert NV12 DMA-BUF → encoder). `decode` is
+VAAPI `submit` + drain.
+
+Headlines:
+- **Production path fits at both resolutions**. encode_dmabuf has
+  ~4 ms headroom at 4K60 H.264, ~2 ms at 4K60 HEVC. Tight but real.
+- **The BGRA-upload path is the bottleneck at 4K60**, not the
+  encoder. The test pattern won't drive a 4K60 stream; real users
+  on PipeWire DMA-BUF will. If we ever want a CPU-friendly capture
+  fallback, the upload step needs to move off the host CPU (e.g.,
+  a Vulkan compute shader doing the swizzle).
+- **Decode is cheap everywhere** — under 5 ms p99 even at 4K60.
+- **H.264 vs HEVC are within noise** on this hardware. Codec choice
+  is about wire bitrate, not encoder cost.
+
+If a workload starts pressing the encode_dmabuf budget at 4K60 (e.g.
+a high-motion scene that pushes the rate-control into more expensive
+coding modes), `async_depth=2` is the principled lever — one
+additional frame of pipeline latency in exchange for parallel encode
+slots. Don't reach for it until the measurement says we need it.
+
+Benchmarks live in `crates/tether-codec/src/vaapi/bench.rs`. Run
+locally with:
+
+```text
+cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1
+```
 
 ---
 

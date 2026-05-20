@@ -10,7 +10,7 @@ each layer covers, and how to extend it.
 | --- | --- | --- |
 | `tether-protocol` | 21 | Wire round-trips (ClientHello envelope, ServerHello HEVC negotiation, video packets, cursor, input), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant fails decode; trailing bytes fail decode). |
 | `tether-transport` | 4 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning. |
-| `tether-codec` | 2 unit + 5 `#[ignore]` | SW H264 round-trip (test-only); VAAPI encoder/decoder/dma-buf-import on hardware; HEVC + H.264 probe smoke check; 1080p60 encode-budget benchmark. |
+| `tether-codec` | 2 unit + 8 `#[ignore]` | SW H264 round-trip (test-only); VAAPI encoder/decoder/dma-buf-import on hardware; HEVC + H.264 probe smoke check; per-codec × per-resolution benchmarks (`vaapi::bench`, 4 cells × 3 paths). |
 | `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |
 | `tether-session` | 5 | `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate. |
 | `tether-render` | 4 + 1 `#[ignore]` | Cursor letterbox clipping, aspect ratio; dma-buf zero-copy on hardware. |
@@ -30,9 +30,24 @@ with an explanatory string:
   extension, etc.) so the next person can see at a glance whether
   their box should run them.
 
-Today there are **17 ignored tests** across `tether-codec/vaapi`
-(5), `tether-gpuconvert` (11), and `tether-render` (1). They are
-real and load-bearing on hardware; they are not abandoned.
+Today there are **20 ignored tests** across `tether-codec/vaapi`
+(8 — 5 correctness, plus 4 cells of the `bench` matrix that each
+exercise encode_bgra + encode_dmabuf + decode), `tether-gpuconvert`
+(11), and `tether-render` (1). They are real and load-bearing on
+hardware; they are not abandoned.
+
+The benchmark cells (one per codec × resolution) live in
+`crates/tether-codec/src/vaapi/bench.rs`. Run with:
+
+```text
+cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1
+```
+
+`--test-threads=1` is required: parallel cells interleave output and
+contend for the same VAAPI device, which makes the per-iteration
+timing meaningless. Results print as `p50 / p99 / max ms` with a
+budget headroom annotation for the 60 fps frame budget (16.67 ms).
+See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
 
 ## Conventions for new tests
 

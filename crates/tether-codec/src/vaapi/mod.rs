@@ -47,6 +47,8 @@ mod encoder;
 mod ffi;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod tests;
 
 pub use decoder::VaapiDecoder;

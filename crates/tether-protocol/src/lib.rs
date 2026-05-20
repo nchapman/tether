@@ -1,11 +1,18 @@
 //! Wire protocol for Tether.
 //!
-//! Four logical channels, carried by `tether-transport`:
-//! - **Control** (reliable, bidirectional) — handshake, clock sync, IDR requests.
+//! Five logical channels, carried by `tether-transport`:
+//! - **Control** (reliable, bidirectional) — handshake, clock sync,
+//!   IDR requests, stream lifecycle, cursor shape, display topology,
+//!   extension escape hatch.
 //! - **Video datagrams** (unreliable) — fragmented encoded frames.
-//! - **Cursor datagrams** (unreliable, high priority) — position + shape.
+//! - **Audio datagrams** (unreliable) — Opus packets, host→client.
+//!   Wire shape defined; pipeline (capture/encode/decode/output) is
+//!   future work — see [`audio`].
+//! - **Cursor datagrams** (unreliable, high priority) — pointer
+//!   position. Sprite payloads ride the reliable control stream.
 //! - **Input stream** (reliable, client→host) — keyboard + mouse events.
 
+pub mod audio;
 pub mod control;
 pub mod cursor;
 pub mod guard;
@@ -355,6 +362,33 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn round_trip_audio_packet_opus() {
+        use crate::audio::{AudioConfig, AudioPacket, AUDIO_CONFIG_EXTENSION_KEY};
+        let p = AudioPacket::Opus {
+            stream_epoch: 1,
+            frame_seq: 1234,
+            t_capture: MonoNanos(98765),
+            payload: vec![0xAB; 64],
+        };
+        let bytes = encode(&p).unwrap();
+        let p2: AudioPacket = decode(&bytes).unwrap();
+        assert_eq!(p, p2);
+
+        // Hello-extension config round-trips identically too.
+        let cfg = AudioConfig {
+            sample_rate_hz: 48_000,
+            channels: 2,
+            streams: 1,
+            coupled_streams: 1,
+            channel_mapping: vec![0, 1],
+        };
+        let cfg_bytes = encode(&cfg).unwrap();
+        let cfg2: AudioConfig = decode(&cfg_bytes).unwrap();
+        assert_eq!(cfg, cfg2);
+        assert_eq!(AUDIO_CONFIG_EXTENSION_KEY, "tether.audio");
     }
 
     #[test]

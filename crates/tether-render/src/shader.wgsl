@@ -33,21 +33,113 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 @group(0) @binding(1) var uv_tex: texture_2d<f32>;
 @group(0) @binding(2) var s: sampler;
 
-// BT.709 limited-range YUV -> linear sRGB. Constants match the
-// conventional broadcast matrix. The encoder is currently configured
-// for Bt709Limited so this is right; full-range or BT.601 sources
-// would need a different matrix (deferred until we negotiate
-// per-stream color metadata).
+// =============================================================
+// YUV -> display: three independent transforms, each swappable.
+// =============================================================
+//
+// The pipeline has to track three things that vary independently
+// across codecs / displays. Splitting the shader into one function
+// per concern means a future HDR or BT.2020 path swaps exactly the
+// function that changes — no copy-paste of the whole fragment body.
+//
+//   1. RANGE
+//      How the integer pixel values map to normalized luma/chroma.
+//      Limited (16..235 / 16..240) for broadcast and what every
+//      Tether encoder produces today; full (0..255) for capture
+//      sources that hand us PC-range data.
+//
+//   2. MATRIX (a.k.a. color-conversion matrix)
+//      The 3x3 that turns normalized Y'CbCr into *gamma-encoded*
+//      R'G'B'. BT.709 today (sRGB-gamut content); BT.601 for
+//      legacy SD; BT.2020 for HDR. The R'G'B' output of this step
+//      is in the SAME GAMMA SPACE as the source content — it is
+//      NOT linear light. (The apostrophe in R'G'B' is load-
+//      bearing; missing this is the single most common cause of
+//      "the video looks washed out" bugs.)
+//
+//   3. TRANSFER FUNCTION (EOTF)
+//      The 1D curve that lifts gamma-encoded R'G'B' to linear
+//      light. BT.709 EOTF for SDR broadcast (what we emit today);
+//      sRGB EOTF for desktop-captured content; PQ (BT.2100) and
+//      HLG for HDR. Linear light is the universal interchange —
+//      blending, gamut conversion, and tone mapping all want it.
+//
+// We output **linear** light to the fragment surface. wgpu applies
+// the surface format's OETF on write (sRGB encoding for an
+// `Bgra8UnormSrgb` surface) so the bytes that hit the display are
+// in the display's expected encoding. The HDR path will swap the
+// surface format (e.g. `Rgba16Float` with PQ/HLG signaling) and
+// the linear-light output stays the same.
+//
+// Stream-side color metadata (range / matrix / transfer triplet)
+// isn't carried on the wire yet; until it is, this shader is
+// hard-pinned to BT.709 limited-range — what every encoder we
+// configure today produces.
+
+fn limited_y_to_normalized(y_lim: f32) -> f32 {
+    // Y[16..235] -> [0..1]. Out-of-range values stay out-of-range;
+    // we don't clamp because the matrix and EOTF below tolerate it
+    // (and clamping here would crush legitimate overshoots from
+    // chroma siting / encoder rate-control).
+    return (y_lim - 16.0 / 255.0) * (255.0 / 219.0);
+}
+
+fn limited_c_to_normalized(c_lim: f32) -> f32 {
+    // Cb/Cr[16..240] -> [-0.5..0.5].
+    return (c_lim - 128.0 / 255.0) * (255.0 / 224.0);
+}
+
+fn bt709_ycbcr_to_rgb_gamma(y: f32, u: f32, v: f32) -> vec3<f32> {
+    // BT.709 inverse matrix. Output is gamma-encoded R'G'B' in the
+    // [0,1] nominal range (possibly with small out-of-range
+    // excursions from limited-range overshoots).
+    let r = y + 1.5748 * v;
+    let g = y - 0.1873 * u - 0.4681 * v;
+    let b = y + 1.8556 * u;
+    return vec3<f32>(r, g, b);
+}
+
+fn bt709_eotf_component(v: f32) -> f32 {
+    // BT.709 EOTF (Rec. ITU-R BT.709-6, eq. 1.2 inverted). Piecewise
+    // linear-then-power with the same break point and gamma as the
+    // BT.709 OETF used by capture/encode hardware. Clamp negatives
+    // to zero before `pow` to handle the tiny excursions limited-
+    // range chroma can produce after the matrix; without this, the
+    // pow on a negative value is undefined behaviour in WGSL.
+    let vc = max(v, 0.0);
+    if (vc < 0.081) {
+        return vc / 4.5;
+    }
+    return pow((vc + 0.099) / 1.099, 1.0 / 0.45);
+}
+
+fn bt709_eotf(rgb_gamma: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        bt709_eotf_component(rgb_gamma.x),
+        bt709_eotf_component(rgb_gamma.y),
+        bt709_eotf_component(rgb_gamma.z),
+    );
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let y = textureSample(y_tex, s, in.uv).r;
-    let chroma = textureSample(uv_tex, s, in.uv).rg;
-    // Limited-range expansion: Y[16..235] -> [0..1], C[16..240] -> [-0.5..0.5].
-    let yc = (y - 16.0 / 255.0) * (255.0 / 219.0);
-    let uc = (chroma.r - 128.0 / 255.0) * (255.0 / 224.0);
-    let vc = (chroma.g - 128.0 / 255.0) * (255.0 / 224.0);
-    let r = yc + 1.5748 * vc;
-    let g = yc - 0.1873 * uc - 0.4681 * vc;
-    let b = yc + 1.8556 * uc;
-    return vec4(r, g, b, 1.0);
+    // 1. SAMPLE
+    let y_lim = textureSample(y_tex, s, in.uv).r;
+    let chroma_lim = textureSample(uv_tex, s, in.uv).rg;
+
+    // 2. RANGE: limited -> normalized.
+    let y = limited_y_to_normalized(y_lim);
+    let u = limited_c_to_normalized(chroma_lim.r);
+    let v = limited_c_to_normalized(chroma_lim.g);
+
+    // 3. MATRIX: BT.709 Y'CbCr -> gamma-encoded R'G'B'.
+    let rgb_gamma = bt709_ycbcr_to_rgb_gamma(y, u, v);
+
+    // 4. TRANSFER: BT.709 EOTF -> linear light.
+    let rgb_linear = bt709_eotf(rgb_gamma);
+
+    // wgpu applies the surface format's OETF on write. Output is
+    // therefore linear; the display receives correctly-encoded
+    // pixels regardless of the surface format we picked.
+    return vec4<f32>(rgb_linear, 1.0);
 }

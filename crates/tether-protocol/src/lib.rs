@@ -600,6 +600,7 @@ mod tests {
         let e = InputEvent {
             event_id: 12345,
             t_client: MonoNanos(54321),
+            device_id: 1, // non-zero to confirm varint shape is fine
             kind: InputEventKind::KeyDown {
                 key: HidUsage(0x0007_0004), // HID page 7 (kbd), usage 4 ('a')
                 modifiers: Modifiers {
@@ -612,6 +613,7 @@ mod tests {
         let e2: InputEvent = decode(&bytes).unwrap();
         assert_eq!(e.event_id, e2.event_id);
         assert_eq!(e.t_client, e2.t_client);
+        assert_eq!(e2.device_id, 1);
         match e2.kind {
             InputEventKind::KeyDown { key, modifiers } => {
                 assert_eq!(key, HidUsage(0x0007_0004));

@@ -192,6 +192,7 @@ impl WinitTranslator {
                 let evt = InputEvent {
                     event_id: self.next_event_id,
                     t_client: MonoNanos::now(),
+                    device_id: 0,
                     kind,
                 };
                 self.next_event_id = self.next_event_id.wrapping_add(1);

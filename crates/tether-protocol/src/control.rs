@@ -39,6 +39,23 @@
 //! `ControlMessage` variant requires landing a `ClientHelloV2`
 //! alongside it.
 //!
+//! # Reserved extension keys
+//!
+//! These keys have meanings the protocol has committed to but the
+//! payload formats aren't yet stabilised. First-party features should
+//! not collide; third-party builds that want to use them should pick
+//! a different reverse-DNS prefix.
+//!
+//! - `tether.audio` — host audio config; payload is bincode-encoded
+//!   [`crate::audio::AudioConfig`]. Advertised on `ServerHelloV1`.
+//! - `tether.pixel-format` — host video pixel format; payload is
+//!   bincode-encoded [`PixelFormat`]. Advertised on `ServerHelloV1`.
+//! - `tether.gamepad-rumble` — host → client rumble command; rides
+//!   [`ControlMessage::Extension`] until it earns a typed variant
+//!   in a future hello revision. Payload shape: TBD pending the
+//!   gamepad pipeline.
+//! - `tether.cap.*` — capability advertisement. See the next section.
+//!
 //! # The `Extension` escape
 //!
 //! [`ControlMessage::Extension`] exists so that future features which

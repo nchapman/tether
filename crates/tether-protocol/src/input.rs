@@ -87,5 +87,13 @@ pub struct InputEvent {
     pub event_id: u64,
     /// Client-monotonic time at which the OS delivered the event.
     pub t_client: MonoNanos,
+    /// Identifies which input device the event came from. `0` is the
+    /// implicit "primary" keyboard/mouse pair, which is what every
+    /// `KeyDown`/`MouseScroll`/etc. event uses today. Reserved here so
+    /// future device kinds (a second gamepad, pen, touchpoint) can ride
+    /// the same wire shape — gamepad rumble going back to the client
+    /// also keys off this id (see `tether.gamepad-rumble` extension in
+    /// `control.rs`).
+    pub device_id: u8,
     pub kind: InputEventKind,
 }

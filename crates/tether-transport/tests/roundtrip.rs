@@ -107,6 +107,7 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
     let evt = InputEvent {
         event_id: 42,
         t_client: MonoNanos::now(),
+        device_id: 0,
         kind: InputEventKind::MouseButton {
             button: MouseButton::Left,
             pressed: true,
@@ -157,6 +158,7 @@ async fn input_stream_wrong_role_errors() -> anyhow::Result<()> {
         let evt = InputEvent {
             event_id: 1,
             t_client: MonoNanos::now(),
+            device_id: 0,
             kind: InputEventKind::MouseButton {
                 button: MouseButton::Left,
                 pressed: true,

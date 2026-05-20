@@ -176,6 +176,44 @@ fn vaapi_encoder_dmabuf_import() {
     );
 }
 
+/// Measures wall-clock encode time at 1080p60 for both H.264 and HEVC
+/// to document the per-frame budget headroom against the 16.6 ms 60 fps
+/// budget. Output isn't asserted on (variance is real and hardware-
+/// dependent); print only.
+#[test]
+#[ignore = "requires VAAPI; benchmark, prints encode times"]
+fn vaapi_encode_budget_60fps() {
+    use std::time::Instant;
+    use tether_protocol::control::CodecKind;
+    let w = 1920u32;
+    let h = 1080u32;
+    let bgra = vec![0x80u8; (w * h * 4) as usize];
+    for kind in [CodecKind::H264, CodecKind::Hevc] {
+        let mut enc = match VaapiEncoder::new(kind, w, h, 60, 8_000) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("skip {kind:?}: {e}");
+                continue;
+            }
+        };
+        // Warm up — first frame includes hwframes pool prealloc.
+        let _ = enc.encode_bgra(&bgra, 0, true);
+        let mut times_ms = Vec::with_capacity(60);
+        for t in 1..=60i64 {
+            let start = Instant::now();
+            let _ = enc.encode_bgra(&bgra, t, false);
+            times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = times_ms[times_ms.len() / 2];
+        let p99 = times_ms[(times_ms.len() * 99) / 100];
+        let max = *times_ms.last().unwrap();
+        println!(
+            "{kind:?} @ 1080p60: p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms (60fps budget=16.6ms)"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires VAAPI; one-shot probe check"]
 fn probe_encoder_kind_smoke() {

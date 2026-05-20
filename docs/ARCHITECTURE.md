@@ -2,11 +2,11 @@
 
 Tether is a low-latency open-source remote desktop in Rust. The first
 working end-to-end target is **Linux ↔ Linux on a LAN over QUIC**, with
-H.264 hardware encode/decode and a zero-copy capture→encode→decode→
-render path. The crate boundaries are shaped so adding macOS
-(ScreenCaptureKit / VideoToolbox / IOSurface) and Windows (DXGI /
-Media Foundation / D3D11) backends is a new module per platform, not a
-rewrite of the core path.
+hardware H.264 or HEVC (negotiated per session) at 60 fps default and
+a zero-copy capture→encode→decode→render path. The crate boundaries are
+shaped so adding macOS (ScreenCaptureKit / VideoToolbox / IOSurface)
+and Windows (DXGI / Media Foundation / D3D11) backends is a new module
+per platform, not a rewrite of the core path.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -72,7 +72,7 @@ any Linux machine:
 │         ▼                                                           │
 │   tether-codec::vaapi::VaapiEncoder                                 │
 │     • av_hwframe_map(DRM_PRIME → VAAPI) on the single fd            │
-│     • h264_vaapi encode → Annex-B NAL units                         │
+│     • h264_vaapi or hevc_vaapi encode → Annex-B NAL units           │
 │         │                                                           │
 │         ▼                                                           │
 │   tether-protocol::video::FrameFragmenter                           │
@@ -113,6 +113,25 @@ memcpy on the client between the decoder and the renderer. Measured on
 an Intel Arc iGPU (Meteor Lake), the host's average encode time is
 ~7-8 ms per 2880×1920 frame; client glass-to-glass latency on loopback
 is ~20-25 ms including the ~10 ms present scheduler wait.
+
+**60 fps budget audit (Intel Arc iGPU, Meteor Lake, 1080p, CPU-upload
+path via `encode_bgra` synthetic constant-color input — DMA-BUF
+zero-copy path is faster in production):**
+
+| Codec | p50    | p99    | max    | Budget @ 60 fps |
+| ----- | ------ | ------ | ------ | --------------- |
+| H.264 | 7.4 ms | 14.4 ms | 14.4 ms | 16.6 ms        |
+| HEVC  | 8.0 ms | 15.3 ms | 15.3 ms | 16.6 ms        |
+
+Both codecs fit, with the headroom tightest on HEVC's p99 (~1.3 ms).
+Real workloads exercise the DMA-BUF path and skip the swscale +
+hwframe_transfer_data steps that dominate this synthetic measurement,
+so production p99 is lower. If a future workload sees consistent
+p99 > 15 ms, `async_depth=2` is the principled lever — at the cost of
+one additional frame of pipeline latency, the encoder gains parallel
+slot for the next surface while the current one is being drained.
+Benchmark lives in `tether-codec`'s `vaapi_encode_budget_60fps`
+ignored test.
 
 ---
 
@@ -245,14 +264,28 @@ Listed to set expectations; each is a real follow-up, not a "never":
 
 - **macOS and Windows backends.** Crate boundaries are ready
   (see "Cross-platform additivity"); the modules don't exist yet.
-- **AV1 / HEVC.** H.264 only. `tether-codec` is set up to accept new
-  `Encoder`/`Decoder` impls without touching the trait.
+- **AV1.** H.264 and HEVC are supported; AV1 needs a different VAAPI
+  decoder probe (no `vaapi_av1` encode entrypoint on most current
+  Intel iGPUs) and a separate codec_id path. The probe stub returns
+  `CodecNotFound` for AV1 today.
+- **HEVC Main10 / HDR.** HEVC Main 8-bit only. Main10 requires a
+  10-bit capture path on the host (PipeWire format negotiation) and
+  an HDR-aware renderer on the client (BT.2020 + PQ/HLG in the
+  fragment shader). Both are real, neither exists yet.
 - **NAT traversal.** LAN direct only. QUIC's pluggable transport makes
   adding ICE later straightforward; today the user runs the client
   binary with a host IP.
-- **Adaptive bitrate.** Fixed 4 Mbps. The trait exposes
-  `supports_changing_bitrate` / `set_bitrate_kbps` so a control loop
-  can drive this when QoS data arrives — not wired up.
+- **Adaptive bitrate.** Default scales with resolution + fps + codec
+  via `derive_bitrate_kbps` in the host (1080p60 H.264 = 8 Mbps;
+  HEVC × 0.7). The trait exposes `supports_changing_bitrate` /
+  `set_bitrate_kbps` so a closed-loop QoS controller can drive this
+  per-window — not yet wired up.
+- **Profile + rate-control probe (VAAPI).** Today we hard-code
+  `profile=main` and `rc_mode=VBR`. Apollo carries an AMD-specific
+  CBR/VBR probe and Sunshine probes the profile table via
+  `vaQueryConfigProfiles`. Both are the principled extensions, both
+  need a small libva FFI add (vaQueryConfigProfiles,
+  vaGetConfigAttributes) and an AMD test box to validate against.
 - **Multi-monitor.** Single primary monitor capture.
 - **Audio.** Video + input only.
 - **Explicit GPU sync (`sync_file` fd).** The host blocks on

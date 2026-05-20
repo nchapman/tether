@@ -8,9 +8,9 @@ each layer covers, and how to extend it.
 
 | Crate | Tests | Covers |
 | --- | --- | --- |
-| `tether-protocol` | 20 | Wire round-trips (ClientHello envelope, video packets, cursor, input), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant fails decode; trailing bytes fail decode). |
+| `tether-protocol` | 21 | Wire round-trips (ClientHello envelope, ServerHello HEVC negotiation, video packets, cursor, input), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant fails decode; trailing bytes fail decode). |
 | `tether-transport` | 4 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning. |
-| `tether-codec` | 2 unit + 3 `#[ignore]` | SW H264 round-trip (test-only); VAAPI encoder/decoder/dma-buf-import on hardware. |
+| `tether-codec` | 2 unit + 5 `#[ignore]` | SW H264 round-trip (test-only); VAAPI encoder/decoder/dma-buf-import on hardware; HEVC + H.264 probe smoke check; 1080p60 encode-budget benchmark. |
 | `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |
 | `tether-session` | 5 | `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate. |
 | `tether-render` | 4 + 1 `#[ignore]` | Cursor letterbox clipping, aspect ratio; dma-buf zero-copy on hardware. |
@@ -30,8 +30,8 @@ with an explanatory string:
   extension, etc.) so the next person can see at a glance whether
   their box should run them.
 
-Today there are **15 ignored tests** across `tether-codec/vaapi`
-(3), `tether-gpuconvert` (11), and `tether-render` (1). They are
+Today there are **17 ignored tests** across `tether-codec/vaapi`
+(5), `tether-gpuconvert` (11), and `tether-render` (1). They are
 real and load-bearing on hardware; they are not abandoned.
 
 ## Conventions for new tests

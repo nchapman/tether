@@ -196,6 +196,33 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_server_hello_hevc() {
+        // Codec negotiation lands HEVC: client advertised [Hevc, H264],
+        // host probed and picked Hevc, echoes back in chosen_codec.
+        // Round-tripping confirms the host's selection survives the wire.
+        use crate::control::{ChromaSubsampling, ColorSpace, ServerHello, ServerHelloV1};
+        let body = ServerHelloV1 {
+            server_name: "tether-host".into(),
+            chosen_codec: CodecKind::Hevc,
+            chosen_chroma: ChromaSubsampling::Yuv420,
+            color_space: ColorSpace::Bt709Limited,
+            resolution: (1920, 1080),
+            clock_probe_t0_echo: MonoNanos(42),
+            t1_server_recv: MonoNanos(43),
+            t2_server_send: MonoNanos(44),
+            extensions: Default::default(),
+            resume_token: None,
+        };
+        let h = ServerHello::V1(body.clone());
+        let bytes = encode(&h).unwrap();
+        let h2: ServerHello = decode(&bytes).unwrap();
+        let ServerHello::V1(body2) = h2;
+        assert_eq!(body2.chosen_codec, CodecKind::Hevc);
+        assert_eq!(body2.server_name, body.server_name);
+        assert_eq!(body2.resolution, body.resolution);
+    }
+
+    #[test]
     fn trailing_bytes_fail_decode() {
         // Strict-decode is the forcing function for the "no appended
         // fields" forward-compat policy: a future encoder that appends

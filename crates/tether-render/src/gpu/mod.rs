@@ -282,6 +282,26 @@ impl GpuState {
         if adapter_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF) {
             required |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
         }
+        // 10-bit biplanar (`Biplanar16`) layouts allocate `R16Unorm` Y +
+        // `Rg16Unorm` UV textures (see `make_yuv_textures`). Both are
+        // gated behind the `TEXTURE_FORMAT_16BIT_NORM` feature in wgpu,
+        // which is widely supported on real hardware (every Apple GPU
+        // since A11, every desktop Vulkan ICD on Mesa 24+ / NVIDIA /
+        // AMD) but is *not* enabled by default — creating these
+        // textures without the opt-in raises a Validation Error and
+        // the wgpu default error handler then panics. Opting in is
+        // safe on any adapter that advertises it; on adapters that
+        // don't (lavapipe / SwiftShader / very old mobile), the
+        // negotiator would still pick a 10-bit profile and we'd
+        // panic at `make_yuv_textures` on first frame allocation.
+        // FIXME: the symmetric gate — `tether-render` exposing a
+        // `supports_10_bit_render()` probe that the client calls
+        // before assembling `supported_decode_profiles()` — would
+        // close that residual gap. The codec layer's profile probe
+        // doesn't see renderer features today.
+        if adapter_features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            required |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tether-render device"),

@@ -43,7 +43,9 @@ pub use dmabuf_export::{
     export_texture_as_dmabuf, DmaBufExport, ExportError, DRM_FORMAT_MOD_LINEAR,
 };
 #[cfg(target_os = "linux")]
-pub use modifier_query::{importable_dmabuf_modifiers, ModifierQueryError};
+pub use modifier_query::{
+    importable_dmabuf_modifiers, storable_dmabuf_modifiers, ModifierQueryError,
+};
 #[cfg(target_os = "linux")]
 pub use nv12_dmabuf::{Nv12DmaBuf, Nv12DmaBufError, Nv12DmaBufFrame};
 #[cfg(target_os = "linux")]

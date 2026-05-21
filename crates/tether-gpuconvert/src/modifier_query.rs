@@ -8,9 +8,12 @@
 //!
 //! Implementation reaches through wgpu's Vulkan hal escape hatch to call
 //! `vkGetPhysicalDeviceFormatProperties2` with
-//! `VkDrmFormatModifierPropertiesListEXT` in the pNext chain. Filters by
-//! `SAMPLED_IMAGE` (the BGRA→NV12 shader's `textureLoad` access) so we
-//! only return modifiers usable by the downstream compute pass.
+//! `VkDrmFormatModifierPropertiesListEXT` in the pNext chain. The
+//! [`importable_dmabuf_modifiers`] entry point filters by `SAMPLED_IMAGE`
+//! (the BGRA→NV12 shader's `textureLoad` access). [`storable_dmabuf_modifiers`]
+//! filters by `STORAGE_IMAGE` instead, gating the 10-bit compute
+//! pipelines (P010/P410/XV30) whose outputs are storage textures rather
+//! than sampled reads.
 //!
 //! Currently called once at host startup. Selects the same adapter the
 //! [`crate::Nv12DmaBuf`] bridge will later pick (Vulkan, high-perf, no
@@ -48,6 +51,36 @@ pub type Result<T> = std::result::Result<T, ModifierQueryError>;
 /// is absent the GPU can't import this format at all and the caller
 /// should skip the DMA-BUF path entirely for it.
 pub async fn importable_dmabuf_modifiers(drm_fourcc: u32) -> Result<Vec<u64>> {
+    query_dmabuf_modifiers(drm_fourcc, vk::FormatFeatureFlags::SAMPLED_IMAGE).await
+}
+
+/// Sibling of [`importable_dmabuf_modifiers`] that filters on
+/// `STORAGE_IMAGE` instead of `SAMPLED_IMAGE`.
+///
+/// Required gate for the 10-bit gpuconvert compute pipelines: a BGRA→P010
+/// or BGRA→XV30 shader writes into an R16/Rg16/Rgba16 storage texture,
+/// which the importer must support as `VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT`,
+/// not just sampled-image. Some drivers expose 16-bit unorm as sampleable
+/// (so [`importable_dmabuf_modifiers`] returns a non-empty list) but not
+/// storage-writable — in that case `create_compute_pipeline` would fail
+/// at runtime with a validation error. Probing storage support up front
+/// lets the host filter the 10-bit profiles out of the encode-capability
+/// set before negotiation.
+///
+/// Same return semantics as [`importable_dmabuf_modifiers`]: empty list
+/// means no modifier supports storage writes on this device, including
+/// LINEAR.
+pub async fn storable_dmabuf_modifiers(drm_fourcc: u32) -> Result<Vec<u64>> {
+    query_dmabuf_modifiers(drm_fourcc, vk::FormatFeatureFlags::STORAGE_IMAGE).await
+}
+
+/// Shared Vulkan path behind [`importable_dmabuf_modifiers`] and
+/// [`storable_dmabuf_modifiers`]. The only difference between the two
+/// is which `VkFormatFeatureFlagBits` the modifier must advertise.
+async fn query_dmabuf_modifiers(
+    drm_fourcc: u32,
+    required_feature: vk::FormatFeatureFlags,
+) -> Result<Vec<u64>> {
     let vk_format = drm_fourcc_to_vk_format(drm_fourcc)?;
 
     let instance = wgpu::Instance::default();
@@ -117,7 +150,7 @@ pub async fn importable_dmabuf_modifiers(drm_fourcc: u32) -> Result<Vec<u64>> {
             .into_iter()
             .filter(|p| {
                 p.drm_format_modifier_tiling_features
-                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+                    .contains(required_feature)
             })
             .map(|p| p.drm_format_modifier)
             .collect::<Vec<_>>()
@@ -128,21 +161,24 @@ pub async fn importable_dmabuf_modifiers(drm_fourcc: u32) -> Result<Vec<u64>> {
 
 /// Map DRM fourcc codes to the Vulkan format the importer would use.
 ///
-/// **What this answers, precisely**: "If we asked Vulkan to import a
-/// DMA-BUF carrying `drm_fourcc` as a sampled image, which `VkFormat`
-/// would we use?" — and consequently, when paired with
-/// [`importable_dmabuf_modifiers`], "can the renderer / gpuconvert
-/// sample-read this format at all on this device?" The `SAMPLED_IMAGE`
-/// filter in the caller is the gate.
+/// **What this answers, precisely**: "If we asked Vulkan to bind a
+/// DMA-BUF carrying `drm_fourcc` to an image, which `VkFormat` would we
+/// use?" — and consequently, when paired with either
+/// [`importable_dmabuf_modifiers`] or [`storable_dmabuf_modifiers`],
+/// "can the renderer / gpuconvert sample-read or storage-write this
+/// format at all on this device?" The `SAMPLED_IMAGE` /
+/// `STORAGE_IMAGE` filter in the caller is the gate.
 ///
 /// **What this does *not* answer**: whether the VAAPI encoder accepts
 /// the format as input via `av_hwframe_map(DRM_PRIME → VAAPI)`. That
 /// path goes through `vaapi_drm_format_map` in libavcodec, not through
 /// Vulkan modifier tables — it has its own probe (see
 /// `tether-codec::vaapi::probe`). A 10-bit encode profile may only be
-/// advertised when *both* probes return supported: renderer importable
-/// (this function via `importable_dmabuf_modifiers`) AND encoder
-/// accepts the input format (the VAAPI probe).
+/// advertised when *all three* probes return supported: gpuconvert can
+/// storage-write the producer format (this function via
+/// [`storable_dmabuf_modifiers`]), the renderer can sample-read the
+/// decoded format (this function via [`importable_dmabuf_modifiers`]),
+/// AND the VAAPI encoder accepts the input format.
 ///
 /// Fourcc families covered:
 /// - Capture input (BGRA family): `AR24`, `XR24` → `B8G8R8A8_UNORM`.
@@ -248,5 +284,38 @@ mod tests {
             drm_fourcc_to_vk_format(unknown),
             Err(ModifierQueryError::UnsupportedFourcc(0xDEADBEEF))
         ));
+    }
+
+    /// Storage-image probe sanity check on a real Vulkan device.
+    ///
+    /// On any Mesa or recent Intel/AMD driver, R16/Rg16 must support
+    /// `STORAGE_IMAGE` for `DRM_FORMAT_MOD_LINEAR` — that's the path the
+    /// 10-bit BGRA→P010 compute shader requires. A failure here means
+    /// the box can't host 10-bit encode regardless of what the VAAPI
+    /// encoder probe says; the bridge constructor in
+    /// [`crate::Bgra2P010DmaBuf`] uses the same query to refuse
+    /// construction loudly rather than crash at
+    /// `create_compute_pipeline`.
+    #[test]
+    #[ignore = "requires a working Vulkan adapter advertising VK_EXT_image_drm_format_modifier"]
+    fn storable_probe_returns_linear_for_r16_and_gr32() {
+        let r16 = u32::from_le_bytes(*b"R16 ");
+        let gr32 = u32::from_le_bytes(*b"GR32");
+        let r16_mods = pollster::block_on(storable_dmabuf_modifiers(r16))
+            .expect("storage probe for R16");
+        let gr32_mods = pollster::block_on(storable_dmabuf_modifiers(gr32))
+            .expect("storage probe for GR32");
+        // LINEAR is the only modifier the encoder DMA-BUF export uses;
+        // anything else returned is bonus. If LINEAR is missing the
+        // driver can't host storage writes to 16-bit unorm at all.
+        let linear = crate::dmabuf_export::DRM_FORMAT_MOD_LINEAR;
+        assert!(
+            r16_mods.contains(&linear),
+            "expected DRM_FORMAT_MOD_LINEAR in R16 storage modifiers, got {r16_mods:?}",
+        );
+        assert!(
+            gr32_mods.contains(&linear),
+            "expected DRM_FORMAT_MOD_LINEAR in GR32 storage modifiers, got {gr32_mods:?}",
+        );
     }
 }

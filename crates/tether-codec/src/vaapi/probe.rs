@@ -73,14 +73,14 @@ impl ProfileProbe for VaapiProbe {
             // need a transient gpuconvert P010 bridge in this crate,
             // pulling tether-gpuconvert into the codec layer's
             // dependency surface — too much coupling for the marginal
-            // probe completeness gain. When the Linux
-            // `capture_filtered_encode_profiles` grows a
-            // bridge-deliverability filter (Step 4 of the 10-bit
-            // port), that provides an independent backstop; until
-            // then, profile filtering relies on the host's existing
-            // `Bgra2P010DmaBuf::new` failing loudly mid-session if
-            // the bridge can't be built (per the bridge-fatal-init
-            // contract in CLAUDE.md).
+            // probe completeness gain. The host's
+            // `probe_p010_submit_round_trip` (in tether-host, gating
+            // `capture_filtered_encode_profiles`) is the independent
+            // backstop: it runs a real Bgra2P010DmaBuf → submit_dmabuf
+            // round trip at startup, and the result feeds
+            // `LINUX_P010_DELIVERABLE_CACHE`, so any driver that
+            // accepts open2 but rejects submit gets filtered out
+            // before negotiation.
             let _ = enc;
         }
         Ok(())

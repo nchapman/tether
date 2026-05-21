@@ -406,47 +406,8 @@ impl VaapiEncoder {
         // us a frame matching the negotiated profile — otherwise
         // av_hwframe_map would fail mid-pipeline with a much less
         // actionable error.
-        const NV12_FOURCC: u32 = u32::from_le_bytes(*b"NV12");
-        // 4:4:4 8-bit path: DRM_FORMAT_XYUV8888 (`XYUV` in fourcc form;
-        // bytes V, U, Y, X in memory little-endian). The only 4:4:4
-        // 8-bit format ffmpeg's `vaapi_drm_format_map` recognises for
-        // DRM_PRIME import — planar YUV444P / YU24 / three-R8-layer
-        // shapes fail with "DRM format not supported by VAAPI".
-        const XYUV_FOURCC: u32 = u32::from_le_bytes(*b"XYUV");
-        // 4:2:0 10-bit path: DRM_FORMAT_P010. Two-plane biplanar
-        // (R16 Y + GR32 UV in DRM fourcc terms), 10 bits MSB-aligned
-        // in 16-bit cells. Maps to AV_PIX_FMT_P010LE on the VAAPI side
-        // — the only 10-bit 4:2:0 entry in `vaapi_drm_format_map`.
-        // Produced by [`tether_gpuconvert::Bgra2P010DmaBuf`].
-        const P010_FOURCC: u32 = u32::from_le_bytes(*b"P010");
-        // 4:4:4 10-bit path: DRM_FORMAT_XV30 — packed 10:10:10:2
-        // (V:U:Y:X) in a single 32-bit cell. The only 10-bit 4:4:4
-        // entry in `vaapi_drm_format_map`, mapped to AV_PIX_FMT_XV30LE.
-        // Currently no gpuconvert bridge produces this; the entry
-        // exists so that when an XV30 bridge ships, the encoder side
-        // is already wired (no need to revisit the fourcc table). A
-        // submission landing here with this fourcc today means the
-        // upstream bridge negotiation got ahead of itself; surfaces as
-        // a clean UnsupportedInputFormat below.
-        const XV30_FOURCC: u32 = u32::from_le_bytes(*b"XV30");
-        // Nested match keeps the outer `match self.chroma` exhaustive on
-        // the enum so a future `Yuv422` variant forces a code change
-        // here rather than silently falling through to
-        // UnsupportedInputFormat at submit time (which is exactly the
-        // failure mode the old `bit_depth != 8` guard protected
-        // against). Inner arms hand-cover the bit-depths we accept.
-        let expected_fourcc = match self.chroma {
-            ChromaSubsampling::Yuv420 => match self.bit_depth {
-                8 => NV12_FOURCC,
-                10 => P010_FOURCC,
-                _ => return Err(CodecError::UnsupportedInputFormat),
-            },
-            ChromaSubsampling::Yuv444 => match self.bit_depth {
-                8 => XYUV_FOURCC,
-                10 => XV30_FOURCC,
-                _ => return Err(CodecError::UnsupportedInputFormat),
-            },
-        };
+        let expected_fourcc = expected_dmabuf_fourcc(self.chroma, self.bit_depth)
+            .ok_or(CodecError::UnsupportedInputFormat)?;
         if frame.fourcc != expected_fourcc {
             // Mismatch usually means a stale dma-buf bridge initialised
             // for one chroma was fed a frame from the other (or
@@ -812,6 +773,34 @@ fn vaapi_codec_name(kind: CodecKind) -> &'static str {
 /// `vaapi_drm_format_map` table covers them, but no driver we've
 /// found exposes the matching encode profile, so the probe is the
 /// only honest signal.
+/// The DRM fourcc the VAAPI dma-buf importer (`av_hwframe_map`)
+/// expects for a given negotiated (chroma, bit_depth). Single source of
+/// truth shared by [`VaapiEncoder::submit_dmabuf`] and the cross-crate
+/// consistency tests in `tether-render::dmabuf_test`. Returning `None`
+/// for unsupported tuples (Yuv422, Yuv444 12-bit, …) lets the caller
+/// surface a clean `UnsupportedInputFormat`.
+///
+/// Field reference:
+/// - `NV12` — 4:2:0 8-bit biplanar; AV_PIX_FMT_NV12.
+/// - `P010` — 4:2:0 10-bit biplanar (R16 + GR32 layers; 10 bits
+///   MSB-aligned in 16-bit cells); AV_PIX_FMT_P010LE.
+/// - `XYUV` — 4:4:4 8-bit packed 32 bpp (V,U,Y,X bytes LE);
+///   AV_PIX_FMT_VUYX. The only 4:4:4 8-bit format in
+///   `vaapi_drm_format_map`.
+/// - `XV30` — 4:4:4 10-bit packed 10:10:10:2 (V:U:Y:X);
+///   AV_PIX_FMT_XV30LE. No gpuconvert bridge produces this today; the
+///   entry is preserved so adding an XV30 bridge later doesn't need
+///   to touch this table.
+pub fn expected_dmabuf_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {
+    Some(match (chroma, bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => u32::from_le_bytes(*b"NV12"),
+        (ChromaSubsampling::Yuv420, 10) => u32::from_le_bytes(*b"P010"),
+        (ChromaSubsampling::Yuv444, 8) => u32::from_le_bytes(*b"XYUV"),
+        (ChromaSubsampling::Yuv444, 10) => u32::from_le_bytes(*b"XV30"),
+        _ => return None,
+    })
+}
+
 fn vaapi_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
     Ok(match (chroma, bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => ffi::AV_PIX_FMT_NV12,

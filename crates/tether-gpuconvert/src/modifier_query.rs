@@ -54,34 +54,6 @@ pub async fn importable_dmabuf_modifiers(drm_fourcc: u32) -> Result<Vec<u64>> {
     query_dmabuf_modifiers(drm_fourcc, vk::FormatFeatureFlags::SAMPLED_IMAGE).await
 }
 
-/// Whether the live driver hosts the 10-bit gpuconvert path for HEVC
-/// Main10 (4:2:0 10-bit). Convenience wrapper around two
-/// [`storable_dmabuf_modifiers`] calls — checks R16 (Y plane) and GR32
-/// (UV plane) both advertise `STORAGE_IMAGE` for
-/// `DRM_FORMAT_MOD_LINEAR`. False is the right cautious default if
-/// either probe call errors out (no Vulkan ICD, no device, etc.).
-///
-/// Cache the result for the process lifetime — both Vulkan calls open
-/// a transient device on each invocation (TODO: share one device for
-/// both probes once the storable/importable family grows past two
-/// callers; not worth the lifetime complexity for v1), which is
-/// non-trivial cost for what's a static driver capability. The host's
-/// per-process warm path runs this once at startup.
-pub async fn linux_can_deliver_p010() -> bool {
-    let r16 = u32::from_le_bytes(*b"R16 ");
-    let gr32 = u32::from_le_bytes(*b"GR32");
-    let linear = crate::dmabuf_export::DRM_FORMAT_MOD_LINEAR;
-    let y_ok = storable_dmabuf_modifiers(r16)
-        .await
-        .map(|m| m.contains(&linear))
-        .unwrap_or(false);
-    let uv_ok = storable_dmabuf_modifiers(gr32)
-        .await
-        .map(|m| m.contains(&linear))
-        .unwrap_or(false);
-    y_ok && uv_ok
-}
-
 /// Sibling of [`importable_dmabuf_modifiers`] that filters on
 /// `STORAGE_IMAGE` instead of `SAMPLED_IMAGE`.
 ///

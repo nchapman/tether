@@ -158,13 +158,13 @@ pub(crate) struct GpuState {
 /// the right variant from [`render_layout_for`] and (if it's a third
 /// shape) wiring a new fragment shader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenderLayout {
+pub(crate) enum RenderLayout {
     Biplanar8,
     Biplanar16,
     PackedXYUV,
 }
 
-fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> RenderLayout {
+pub(crate) fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> RenderLayout {
     match (chroma, bit_depth) {
         // 8-bit: existing macOS-IOSurface / Linux-dma-buf split. macOS
         // gives biplanar NV12/NV24; Linux gives packed XYUV for 4:4:4

@@ -53,7 +53,7 @@ mod bench;
 mod tests;
 
 pub use decoder::VaapiDecoder;
-pub use encoder::VaapiEncoder;
+pub use encoder::{expected_dmabuf_fourcc, VaapiEncoder};
 
 /// Surfaces beyond what the decoder needs for its own reference picture
 /// list. We hand each decoded surface to the renderer and only release

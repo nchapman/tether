@@ -26,7 +26,9 @@ use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tether_codec::GpuEncoderFrame;
 #[cfg(target_os = "linux")]
-use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame};
+use tether_gpuconvert::{
+    Bgra2P010DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
+};
 use tether_protocol::control::{
     ChromaSubsampling, ClientHello, CodecKind, ControlMessage, ServerHello, ServerHelloV1,
     VideoColorSpec, VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY,
@@ -777,6 +779,7 @@ enum BridgeState {
 enum GpuConvertBridge {
     Nv12(Nv12DmaBuf),
     Yuv444(Yuv444DmaBuf),
+    P010(Bgra2P010DmaBuf),
 }
 
 /// Outcome of one Gpu-frame encode attempt. Distinguishes per-frame
@@ -805,6 +808,7 @@ enum GpuEncodeOutcome {
 fn encode_gpu_frame(
     slot: &mut EncoderSlot,
     chroma: tether_protocol::control::ChromaSubsampling,
+    bit_depth: u8,
     gpu: tether_capture::GpuCapturedFrame,
     pts: i64,
     force_keyframe: bool,
@@ -814,8 +818,8 @@ fn encode_gpu_frame(
     let bridge = match &mut slot.bridge {
         BridgeState::Ready(b) => b,
         BridgeState::NotYetBuilt => {
-            let built = match chroma {
-                ChromaSubsampling::Yuv420 => {
+            let built = match (chroma, bit_depth) {
+                (ChromaSubsampling::Yuv420, 8) => {
                     match pollster::block_on(Nv12DmaBuf::new(slot.width, slot.height)) {
                         Ok(b) => GpuConvertBridge::Nv12(b),
                         Err(e) => {
@@ -828,7 +832,20 @@ fn encode_gpu_frame(
                         }
                     }
                 }
-                ChromaSubsampling::Yuv444 => {
+                (ChromaSubsampling::Yuv420, 10) => {
+                    match pollster::block_on(Bgra2P010DmaBuf::new(slot.width, slot.height)) {
+                        Ok(b) => GpuConvertBridge::P010(b),
+                        Err(e) => {
+                            return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                                "P010 gpuconvert bridge init failed for {}x{} after \
+                                 startup probe succeeded — device loss or OOM: {e}",
+                                slot.width,
+                                slot.height,
+                            ));
+                        }
+                    }
+                }
+                (ChromaSubsampling::Yuv444, 8) => {
                     match pollster::block_on(Yuv444DmaBuf::new(slot.width, slot.height)) {
                         Ok(b) => GpuConvertBridge::Yuv444(b),
                         Err(e) => {
@@ -840,6 +857,19 @@ fn encode_gpu_frame(
                             ));
                         }
                     }
+                }
+                // Yuv444 10-bit (XV30) has no bridge; capture_filtered_encode_profiles
+                // is supposed to keep it out of the negotiated set. Reaching this arm
+                // is a contract violation — fail loud rather than silently dropping
+                // every frame.
+                (chroma, bit_depth) => {
+                    return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                        "no gpuconvert bridge for negotiated profile chroma={:?} \
+                         bit_depth={} — capture_filtered_encode_profiles failed to \
+                         filter this profile out before negotiation",
+                        chroma,
+                        bit_depth,
+                    ));
                 }
             };
             info!(
@@ -907,6 +937,26 @@ fn encode_gpu_frame(
             };
             drop(imported);
             yuv444_dmabuf_to_codec_frame(yuv)
+        }
+        GpuConvertBridge::P010(b) => {
+            let imported = match b.import_bgra_dmabuf(fd, modifier, stride, offset) {
+                Ok(t) => t,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "import_bgra_dmabuf (p010 bridge): {e}"
+                    ));
+                }
+            };
+            let p010 = match b.convert(&imported) {
+                Ok(f) => f,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "Bgra2P010DmaBuf::convert: {e}"
+                    ));
+                }
+            };
+            drop(imported);
+            p010_dmabuf_to_codec_frame(p010)
         }
     };
 
@@ -993,6 +1043,64 @@ fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
             },
             DmaBufLayer {
                 drm_format: u32::from_le_bytes(*b"GR88"),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(out.uv_offset).expect("UV plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(out.uv_stride).expect("UV plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+            },
+        ],
+    }
+}
+
+/// Build a `DmaBufFrame` for the P010 (HEVC Main10 / 4:2:0 10-bit) path:
+/// one DRM object, two layers — Y as R16 and UV as GR32 (R16G16), both
+/// pointing at `object_index=0` with their offsets within the shared
+/// allocation. Mirror of [`nv12_dmabuf_to_codec_frame`]; the encoder
+/// validates the outer P010 fourcc against `(Yuv420, 10)` and FFmpeg
+/// then reads the per-layer fourccs directly out of the descriptor.
+///
+/// Shape must stay in lockstep with [`probe_p010_submit_round_trip`]
+/// (the startup-time backstop) — the cross-table consistency test
+/// asserts both produce the same descriptor.
+#[cfg(target_os = "linux")]
+fn p010_dmabuf_to_codec_frame(out: P010DmaBufFrame) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"P010"),
+        objects: vec![DmaBufObject {
+            fd: out.fd,
+            size: out.size,
+            drm_format_modifier: out.modifier,
+        }],
+        layers: vec![
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"R16 "),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(out.y_offset).expect("Y plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(out.y_stride).expect("Y plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+            },
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"GR32"),
                 num_planes: 1,
                 object_index: [0, 0, 0, 0],
                 offset: [
@@ -1218,6 +1326,7 @@ fn run_capture_and_send(
             CapturedFrame::Gpu(gpu) => match encode_gpu_frame(
                 slot_mut,
                 chosen_profile.chroma,
+                chosen_profile.bit_depth,
                 gpu,
                 pts,
                 force_kf,
@@ -1616,32 +1725,27 @@ async fn warm_gpuconvert_capability_cache() {
     if LINUX_P010_DELIVERABLE_CACHE.get().is_some() {
         return;
     }
-    // Two-stage probe. The storage-modifier check passes if the
-    // Vulkan ICD says R16/GR32 are storage-writable; this is
-    // necessary but not sufficient — FFmpeg's
-    // `av_hwframe_map(DRM_PRIME → VAAPI)` may reject the P010
-    // descriptor at the driver-table level even when the storage
-    // probe is happy (empirically Intel iHD + Mesa + FFmpeg 8.1 hits
-    // this — see docs/CODEC_CAPABILITIES.md "Linux 10-bit encode —
-    // empirical state"). The actual `submit_dmabuf` round-trip is
-    // the authoritative answer; if it fails we degrade silently to
-    // 8-bit-only rather than advertise Main10 to clients we can't
-    // serve.
-    let storage_ok = tether_gpuconvert::linux_can_deliver_p010().await;
-    let p010 = if storage_ok {
-        match probe_p010_submit_round_trip().await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::info!(
-                    error = %e,
-                    "Main10 storage probe passed but submit_dmabuf round-trip \
-                     failed; falling back to 8-bit-only advertisement"
-                );
-                false
-            }
+    // Single-shot probe. `probe_p010_submit_round_trip` builds the
+    // real `Bgra2P010DmaBuf` bridge (which internally runs the
+    // R16+GR32 storage-modifier check via its `new()`) and then
+    // round-trips a real `submit_dmabuf` against a Main10 VaapiEncoder.
+    // Any failure — missing storage support, missing Vulkan features,
+    // or driver-layer rejection of the P010 dma-buf descriptor by
+    // `av_hwframe_map` — surfaces as an Err here and we degrade to
+    // 8-bit-only advertisement. Splitting this into a storage
+    // precheck + submit probe used to mean two extra transient wgpu
+    // device opens for the same answer the bridge constructor would
+    // give us anyway.
+    let p010 = match probe_p010_submit_round_trip().await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::info!(
+                error = %e,
+                "Main10 gpuconvert round-trip probe failed; falling back to \
+                 8-bit-only advertisement"
+            );
+            false
         }
-    } else {
-        false
     };
     tracing::info!(p010, "Linux gpuconvert capability (cached for process lifetime)");
     let _ = LINUX_P010_DELIVERABLE_CACHE.set(p010);
@@ -1662,38 +1766,11 @@ async fn probe_p010_submit_round_trip() -> anyhow::Result<()> {
     let probe_bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
     let p010 = bridge.convert_bgra_bytes(&probe_bytes)?;
 
-    const P010_FOURCC: u32 = u32::from_le_bytes(*b"P010");
-    const R16_FOURCC: u32 = u32::from_le_bytes(*b"R16 ");
-    const GR32_FOURCC: u32 = u32::from_le_bytes(*b"GR32");
-    let dup_fd = p010.fd.try_clone()?;
-    let y_off = u32::try_from(p010.y_offset)?;
-    let y_stride = u32::try_from(p010.y_stride)?;
-    let uv_off = u32::try_from(p010.uv_offset)?;
-    let uv_stride = u32::try_from(p010.uv_stride)?;
-    let codec_frame = tether_codec::DmaBufFrame {
-        fourcc: P010_FOURCC,
-        objects: vec![tether_codec::DmaBufObject {
-            fd: dup_fd,
-            size: p010.size,
-            drm_format_modifier: p010.modifier,
-        }],
-        layers: vec![
-            tether_codec::DmaBufLayer {
-                drm_format: R16_FOURCC,
-                num_planes: 1,
-                object_index: [0; 4],
-                offset: [y_off, 0, 0, 0],
-                pitch: [y_stride, 0, 0, 0],
-            },
-            tether_codec::DmaBufLayer {
-                drm_format: GR32_FOURCC,
-                num_planes: 1,
-                object_index: [0; 4],
-                offset: [uv_off, 0, 0, 0],
-                pitch: [uv_stride, 0, 0, 0],
-            },
-        ],
-    };
+    // Route the probe frame through the same helper the production
+    // hot path uses (`p010_dmabuf_to_codec_frame`). That way the
+    // startup probe and the per-frame send loop agree on descriptor
+    // shape by construction — there is no second table to drift.
+    let codec_frame = p010_dmabuf_to_codec_frame(p010);
 
     let mut enc = tether_codec::vaapi::VaapiEncoder::new(
         VideoProfile {

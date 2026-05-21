@@ -137,8 +137,20 @@ fn build_test_pipeline(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     target_format: wgpu::TextureFormat,
-    bit_depth: u8,
+    profile: VideoProfile,
 ) -> TestPipeline {
+    // The renderer dispatches on the negotiated (chroma, bit_depth) to
+    // pick between two bind-group layouts + two shaders:
+    //   - Biplanar (NV12 / P010 / P410): 2 textures + 1 sampler →
+    //     `shader.wgsl`.
+    //   - PackedXYUV (YUV444 8-bit on Linux): 1 texture + 1 sampler →
+    //     `shader_yuv444.wgsl`.
+    // The test pipeline must mirror that dispatch so the BGL shape we
+    // build agrees with what `gpu::import_dmabuf_textures` returns for
+    // this profile. The drift detector test (cross_table_consistency)
+    // pins the same dispatch.
+    let layout = crate::gpu::render_layout_for(profile.chroma, profile.bit_depth);
+    let bit_depth = profile.bit_depth;
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("test sampler"),
         mag_filter: wgpu::FilterMode::Linear,
@@ -147,34 +159,54 @@ fn build_test_pipeline(
     });
     let yuv_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("test yuv bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+        entries: match layout {
+            crate::gpu::RenderLayout::Biplanar8 | crate::gpu::RenderLayout::Biplanar16 => &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+            crate::gpu::RenderLayout::PackedXYUV => &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        },
     });
     let scale_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("test scale bgl"),
@@ -249,9 +281,15 @@ fn build_test_pipeline(
         }],
     });
 
+    let shader_src = match layout {
+        crate::gpu::RenderLayout::Biplanar8 | crate::gpu::RenderLayout::Biplanar16 => {
+            include_str!("shader.wgsl")
+        }
+        crate::gpu::RenderLayout::PackedXYUV => include_str!("shader_yuv444.wgsl"),
+    };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("test shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(shader_src.into()),
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("test pipeline layout"),
@@ -540,7 +578,7 @@ fn run_roundtrip(profile: VideoProfile) -> Option<((u8, u8, u8), (u8, u8, u8))> 
     );
 
     let target_format = wgpu::TextureFormat::Rgba8Unorm;
-    let pipeline = build_test_pipeline(&device, &queue, target_format, profile.bit_depth);
+    let pipeline = build_test_pipeline(&device, &queue, target_format, profile);
 
     let textures = gpu::import_dmabuf_textures(
         &device,
@@ -703,6 +741,41 @@ fn dmabuf_zero_copy_roundtrip_hevc_main_8bit() {
     );
 }
 
+/// HEVC 4:4:4 8-bit (Main 4:4:4). Exercises the packed-XYUV import
+/// path and the dedicated `shader_yuv444.wgsl` — neither of which the
+/// 4:2:0 cells touch. Encoder side reuses the CPU-upload path (the
+/// encoder's swscale stage handles BGRA→YUV444P→XYUV internally; the
+/// gpuconvert-side `Yuv444DmaBuf` bridge is exercised by
+/// `tether_codec::vaapi::tests::hevc_main444_dmabuf_roundtrip` on the
+/// encoder side). SKIPs cleanly when the driver lacks HEVC Main 4:4:4
+/// encode support (e.g. older Intel pre-Tiger Lake / older AMD VCN).
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 (Intel Tiger Lake+ / AMD VCN3+) + Vulkan dma-buf import"]
+fn dmabuf_zero_copy_roundtrip_hevc_main_444_8bit() {
+    let Some((left, right)) = run_roundtrip(VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv444,
+        bit_depth: 8,
+    }) else {
+        eprintln!(
+            "NOTE: HEVC 4:4:4 8-bit cell SKIPPED — driver lacks Main 4:4:4 encode \
+             or the dma-buf path. The renderer's PackedXYUV path remains \
+             untested on this hardware."
+        );
+        return;
+    };
+    // 4:4:4 doesn't subsample chroma, so the red/blue split is cleaner
+    // than 4:2:0 — same tolerance bands still apply with headroom.
+    assert!(
+        left.0 > 130 && left.1 < 80 && left.2 < 80,
+        "left region should be reddish; got {left:?}"
+    );
+    assert!(
+        right.2 > 130 && right.0 < 80 && right.1 < 80,
+        "right region should be blueish; got {right:?}"
+    );
+}
+
 /// HEVC 4:2:0 10-bit (Main10). The primary cell this work was about:
 /// exercises the full new 10-bit path — Bgra2P010DmaBuf produces the
 /// dma-buf, VAAPI consumes it via submit_dmabuf, the decoder yields a
@@ -753,50 +826,33 @@ fn dmabuf_zero_copy_roundtrip_hevc_main10() {
 /// `(chroma, bit_depth) → DRM fourcc` mapping. Not a drift detector
 /// today — it's a local table that ought to agree with the encoder's
 /// `vaapi_sw_format`, the encoder's `submit_dmabuf` fourcc match, the
-/// renderer's `import_dmabuf_textures` layout dispatch, and the host's
-/// `capture_filtered_encode_profiles` filter, but each of those is
-/// private to its own crate today. A real drift detector would need a
-/// `pub fn expected_dmabuf_fourcc(chroma, bit_depth) -> u32` in
-/// tether-codec (and matching exposure in tether-render +
-/// tether-gpuconvert) that this test imports from.
+/// renderer's `render_layout_for` dispatch, and (transitively) the
+/// host's `capture_filtered_encode_profiles` filter all key off the
+/// same `(chroma, bit_depth)` tuple. The encoder side is now
+/// canonical via `tether_codec::vaapi::expected_dmabuf_fourcc`; this
+/// test asserts that the renderer's layout dispatch agrees on the
+/// underlying texture family for every fourcc the encoder accepts.
 ///
-/// TODO(cross-table-drift): expose the encoder's `vaapi_sw_format` as
-/// `pub` (or wrap it in a small public helper) and replace
-/// `expected_fourcc` with a call into the real module. macOS commit
-/// `8c0398e` is the shape — its cross-table test imports from
-/// `videotoolbox/probe.rs::expected_iosurface_fourccs`. Linux needs
-/// the same exposure.
-///
-/// Until that refactor, the entries here serve as documentation
-/// pins: a contributor adding a new `(chroma, bit_depth)` cell
-/// has one canonical place to record the fourcc, and a future
-/// drift detector wires through this same table.
+/// Cross-checks three things on every supported `(chroma, bit_depth)`:
+///   1. The encoder's fourcc is non-zero and ASCII-printable (catches
+///      a `b"\0\0\0\0"` typo at the const-byte level).
+///   2. The renderer-side `render_layout_for` does not panic on a
+///      `(chroma, bit_depth)` that the encoder accepts. Panicking
+///      means a frame the encoder would emit can't be rendered.
+///   3. The renderer's `RenderLayout` choice matches the encoder
+///      fourcc family: NV12/P010 → Biplanar*; XYUV → PackedXYUV;
+///      XV30 → biplanar 16-bit (when the bridge ships).
 #[cfg(test)]
 mod cross_table_consistency {
+    use tether_codec::vaapi::expected_dmabuf_fourcc;
     use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
-    /// Expected DRM fourcc for each `(chroma, bit_depth)` combination
-    /// the Linux pipeline supports today. Drift in any of the four
-    /// tables (encoder `vaapi_sw_format` / encoder `submit_dmabuf` /
-    /// renderer import / host capture filter) shows up as a mismatch
-    /// between this single source of truth and the actual table.
-    ///
-    /// XV30 is in the encoder side but no bridge produces it yet
-    /// (probe layer gates it) — included here so when the bridge
-    /// ships, the consistency check already covers it.
-    fn expected_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> u32 {
-        match (chroma, bit_depth) {
-            (ChromaSubsampling::Yuv420, 8) => u32::from_le_bytes(*b"NV12"),
-            (ChromaSubsampling::Yuv420, 10) => u32::from_le_bytes(*b"P010"),
-            (ChromaSubsampling::Yuv444, 8) => u32::from_le_bytes(*b"XYUV"),
-            (ChromaSubsampling::Yuv444, 10) => u32::from_le_bytes(*b"XV30"),
-            _ => panic!("unmodeled (chroma, bit_depth) {chroma:?} {bit_depth}"),
-        }
-    }
+    use crate::gpu::{render_layout_for, RenderLayout};
 
-    /// All the `(chroma, bit_depth)` pairs the pipeline is expected
-    /// to round-trip through dma-buf. Update this when a new combo
-    /// ships (and all four tables grow matching entries).
+    /// Every `(chroma, bit_depth)` the encoder fourcc table currently
+    /// covers. New entries land here when both the encoder and the
+    /// renderer grow matching support — the `every_*` tests fail
+    /// otherwise.
     const MODELED: &[(ChromaSubsampling, u8)] = &[
         (ChromaSubsampling::Yuv420, 8),
         (ChromaSubsampling::Yuv420, 10),
@@ -804,35 +860,69 @@ mod cross_table_consistency {
         (ChromaSubsampling::Yuv444, 10),
     ];
 
-    /// Pin the expected fourccs. A future refactor that swaps NV12 for
-    /// the equivalent `NV21` (Cr/Cb swapped) or P010 for `P012` would
-    /// fail here before silently feeding the encoder a misordered UV
-    /// plane.
+    /// The fourcc family the renderer expects for a given encoder
+    /// output fourcc. Coupling is one-to-many on the encoder side
+    /// (NV12 and P010 both land on biplanar; XYUV is its own thing).
+    fn expected_layout_for_fourcc(fourcc: u32) -> RenderLayout {
+        match &fourcc.to_le_bytes() {
+            b"NV12" => RenderLayout::Biplanar8,
+            b"P010" => RenderLayout::Biplanar16,
+            b"XYUV" => RenderLayout::PackedXYUV,
+            // XV30 has no gpuconvert bridge today, but when it ships
+            // the renderer side will need biplanar-16 support extended
+            // to 4:4:4 (or a new packed-16 variant). Either way the
+            // current PackedXYUV is wrong; flag the disagreement
+            // early.
+            b"XV30" => RenderLayout::Biplanar16,
+            other => panic!("expected_layout_for_fourcc: unknown fourcc {other:?}"),
+        }
+    }
+
+    /// The encoder's fourcc for every modeled tuple is non-zero and
+    /// ASCII-printable. A renamed fourcc that ends up as
+    /// `b"\0\0\0\0"` after a refactor fails here.
     #[test]
-    fn expected_fourccs_are_stable() {
+    fn encoder_fourccs_are_well_formed() {
         for &(chroma, bit_depth) in MODELED {
-            let f = expected_fourcc(chroma, bit_depth);
+            let f = expected_dmabuf_fourcc(chroma, bit_depth)
+                .unwrap_or_else(|| panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})"));
             let bytes = f.to_le_bytes();
-            // All four fourccs are ASCII-printable per the DRM
-            // convention.
             assert!(
                 bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)),
-                "fourcc for ({chroma:?}, {bit_depth}) = 0x{f:08x} is not printable",
+                "encoder fourcc for ({chroma:?}, {bit_depth}) = 0x{f:08x} is not printable",
             );
         }
     }
 
-    /// Every VideoProfile that combines a Linux-supported chroma with
-    /// a Linux-supported bit_depth must have a fourcc in the table —
-    /// if `VideoProfile::HEVC_*` adds a constant for a combination
-    /// that isn't here, the panic in `expected_fourcc` catches it.
+    /// For every encoder-supported `(chroma, bit_depth)`, the
+    /// renderer's layout dispatch produces the same family the
+    /// encoder fourcc implies. This is the drift detector: if
+    /// someone tightens the encoder to a new fourcc or the renderer
+    /// flips its dispatch, the disagreement surfaces here in a unit
+    /// test, before the hardware round-trip cell would catch it.
     #[test]
-    fn modeled_profiles_match_video_profile_constants() {
-        // Every preference-listed VideoProfile that targets Linux's
-        // pipeline must be in the MODELED list. Doesn't fire today
-        // (the constants happen to cover exactly MODELED), but a new
-        // `VideoProfile::HEVC_*` constant landing without an
-        // expected_fourcc entry would surface here.
+    fn renderer_layout_matches_encoder_fourcc() {
+        for &(chroma, bit_depth) in MODELED {
+            let fourcc = expected_dmabuf_fourcc(chroma, bit_depth)
+                .unwrap_or_else(|| panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})"));
+            let renderer = render_layout_for(chroma, bit_depth);
+            let expected = expected_layout_for_fourcc(fourcc);
+            assert_eq!(
+                renderer,
+                expected,
+                "render_layout_for({chroma:?}, {bit_depth}) = {renderer:?} but \
+                 fourcc {:?} expects {expected:?}",
+                std::str::from_utf8(&fourcc.to_le_bytes()).unwrap_or("?"),
+            );
+        }
+    }
+
+    /// Every preference-listed VideoProfile that targets Linux's
+    /// pipeline must have an encoder fourcc. Catches a new
+    /// `PROFILE_PREFERENCE` entry landing without matching encoder
+    /// table coverage.
+    #[test]
+    fn preference_list_profiles_have_fourcc() {
         let profile_list = [
             VideoProfile {
                 codec: CodecKind::Hevc,
@@ -861,8 +951,8 @@ mod cross_table_consistency {
             },
         ];
         for p in profile_list {
-            let f = expected_fourcc(p.chroma, p.bit_depth);
-            assert_ne!(f, 0, "no fourcc for profile {p:?}");
+            let f = expected_dmabuf_fourcc(p.chroma, p.bit_depth);
+            assert!(f.is_some(), "no encoder fourcc for profile {p:?}");
         }
     }
 }

@@ -29,6 +29,7 @@ use tether_protocol::control::{
     ChromaSubsampling, ClientHello, CodecKind, ControlMessage, ServerHello, ServerHelloV1,
     VideoColorSpec,
 };
+use tether_protocol::video::VideoPacket;
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
@@ -298,6 +299,17 @@ async fn handle_client(
     let force_idr_for_send = force_idr.clone();
     let send_shutdown_for_thread = send_shutdown.clone();
     let stream_ready_for_thread = stream_ready.clone();
+    // Keyframes ride a reliable per-IDR QUIC unidirectional stream
+    // rather than the unreliable datagram path used for P-frames. The
+    // sync send thread doesn't own a tokio runtime, so it pushes
+    // keyframe packets through this unbounded mpsc to a dedicated
+    // async task that owns the open-uni / write / finish sequence.
+    // Unbounded is safe here because keyframes are infrequent
+    // (request-driven, ~one per error-recovery cycle) and the async
+    // sender drains in O(open_uni + write) time, well under a second.
+    let (keyframe_tx, keyframe_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPacket>();
+    let conn_keyframe = conn.clone();
+    tokio::spawn(run_keyframe_sender(conn_keyframe, keyframe_rx));
     let send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
         .spawn(move || {
@@ -309,6 +321,7 @@ async fn handle_client(
                 send_shutdown_for_thread,
                 chosen_codec,
                 stream_ready_for_thread,
+                keyframe_tx,
             )
         })?;
 
@@ -786,6 +799,7 @@ fn run_capture_and_send(
     shutdown: Arc<AtomicBool>,
     chosen_codec: CodecKind,
     stream_ready: Arc<AtomicBool>,
+    keyframe_tx: tokio::sync::mpsc::UnboundedSender<VideoPacket>,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
@@ -965,11 +979,26 @@ fn run_capture_and_send(
             dimensions: (frame_width, frame_height),
         };
 
-        let packets = fragmenter.fragment(meta, &combined);
-        for packet in packets {
-            if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
-                warn!(error = ?e, "send_datagram failed, terminating send loop");
+        if keyframe {
+            // Keyframes ride a reliable per-IDR QUIC uni stream. The
+            // single_packet path doesn't chunk into datagram-sized
+            // pieces because the stream layer handles segmentation;
+            // the receiver's reassembler sees a fragment_count=1
+            // packet that completes immediately. Frame_seq still
+            // advances so the next P-frame fragments slot in
+            // sequentially.
+            let packet = fragmenter.single_packet(meta, combined);
+            if keyframe_tx.send(packet).is_err() {
+                warn!("keyframe channel closed; terminating send loop");
                 return;
+            }
+        } else {
+            let packets = fragmenter.fragment(meta, &combined);
+            for packet in packets {
+                if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
+                    warn!(error = ?e, "send_datagram failed, terminating send loop");
+                    return;
+                }
             }
         }
 
@@ -1103,6 +1132,29 @@ async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
         TEST_PATTERN_HEIGHT,
         TEST_PATTERN_FPS,
     ))
+}
+
+/// Drains keyframe packets from the sync send loop and writes each on
+/// its own QUIC unidirectional stream. Ordering is preserved by the
+/// channel: the next keyframe doesn't start its open_uni until the
+/// previous one has been queued into quinn's send buffer. One stream
+/// per IDR keeps independent retransmits independent — a stuck packet
+/// on one IDR's stream doesn't head-of-line-block the next IDR.
+async fn run_keyframe_sender(
+    conn: Arc<Connection>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<VideoPacket>,
+) {
+    while let Some(packet) = rx.recv().await {
+        if let Err(e) = conn.send_video_keyframe(&packet).await {
+            // A failure here means the connection is dying (the only
+            // way send_video_keyframe errors is if quinn rejects the
+            // open_uni or write — typically a connection close). The
+            // recv loops on the main task will pick up the same close
+            // and tear the session down; nothing useful to do here
+            // beyond logging.
+            warn!(error = ?e, "send_video_keyframe failed; keyframe lost");
+        }
+    }
 }
 
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {

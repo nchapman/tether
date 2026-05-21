@@ -226,6 +226,24 @@ impl FrameFragmenter {
         self.next_frame_seq = 0;
     }
 
+    /// Build a single-fragment `VideoPacket::First` carrying the whole
+    /// body. For use on the reliable keyframe-stream path, where QUIC
+    /// handles segmentation so we don't need to chunk into datagram-
+    /// sized pieces. Advances `next_frame_seq` so subsequent P-frame
+    /// fragments still reference correct sequence numbers.
+    pub fn single_packet(&mut self, meta: VideoFrameMeta, body: Vec<u8>) -> VideoPacket {
+        let frame_seq = self.next_frame_seq;
+        self.next_frame_seq = self.next_frame_seq.wrapping_add(1);
+        VideoPacket::First {
+            display: self.display,
+            stream_epoch: self.stream_epoch,
+            frame_seq,
+            fragment_count: 1,
+            meta: VideoFrameMetaEnvelope::V1(meta),
+            payload: body,
+        }
+    }
+
     /// Fragment a frame body into one or more packets. `meta` rides in
     /// fragment 0 only, wrapped in the current `VideoFrameMetaEnvelope`
     /// variant. An empty body still produces a single

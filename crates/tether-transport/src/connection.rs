@@ -13,7 +13,7 @@ use tether_protocol::{
 };
 use tether_protocol::MonoNanos;
 
-use crate::{Result, TransportError, MAX_FRAMED_MESSAGE};
+use crate::{Result, TransportError, MAX_FRAMED_MESSAGE, MAX_VIDEO_STREAM_MESSAGE};
 
 /// Length of the per-stream preamble written by the client and consumed by
 /// the server immediately after `open_*` / `accept_*`. The bytes themselves
@@ -117,6 +117,47 @@ impl Connection {
 
     pub async fn recv_datagram(&self) -> Result<Datagram> {
         let bytes = self.conn.read_datagram().await?;
+        Ok(tether_protocol::decode(&bytes)?)
+    }
+
+    /// Send a keyframe video packet on a fresh QUIC unidirectional
+    /// stream. Reliable, ordered, retransmitted on loss — turns IDR
+    /// delivery from stochastic-recovery (wait for the next encoder
+    /// IDR after a lost fragment) into deterministic 1-RTT recovery.
+    /// One stream per IDR keeps the streams independent: a stalled
+    /// retransmit on one IDR doesn't head-of-line-block the next.
+    ///
+    /// Caller is responsible for only sending packets that are
+    /// genuinely keyframes — there is no protocol-level enforcement.
+    /// P-frames continue to ride [`Self::send_datagram`] for low
+    /// latency.
+    pub async fn send_video_keyframe(&self, packet: &VideoPacket) -> Result<()> {
+        let bytes = tether_protocol::encode(packet)?;
+        if bytes.len() > MAX_VIDEO_STREAM_MESSAGE {
+            return Err(TransportError::FrameTooLarge {
+                size: bytes.len(),
+                max: MAX_VIDEO_STREAM_MESSAGE,
+            });
+        }
+        let mut s = self.conn.open_uni().await?;
+        write_framed_with_max(&mut s, &bytes, MAX_VIDEO_STREAM_MESSAGE).await?;
+        // Finish signals EOF to the receiver, which is what the
+        // accept_video_keyframe loop uses to delimit the message.
+        // Ignored errors only happen if the peer reset the stream
+        // before our finish landed — in which case the packet was
+        // also not delivered, and the caller will see the loss via
+        // the auto-IDR path soon enough.
+        let _ = s.finish();
+        Ok(())
+    }
+
+    /// Accept the next host-opened unidirectional stream and read a
+    /// single keyframe video packet from it. The peer is expected to
+    /// `open_uni` → write one length-framed [`VideoPacket`] → `finish`.
+    /// Returns once that one packet has been fully read.
+    pub async fn accept_video_keyframe(&self) -> Result<VideoPacket> {
+        let mut s = self.conn.accept_uni().await?;
+        let bytes = read_framed_with_max(&mut s, MAX_VIDEO_STREAM_MESSAGE).await?;
         Ok(tether_protocol::decode(&bytes)?)
     }
 
@@ -240,9 +281,23 @@ impl std::fmt::Debug for Connection {
 }
 
 async fn write_framed(send: &mut quinn::SendStream, body: &[u8]) -> Result<()> {
+    write_framed_with_max(send, body, MAX_FRAMED_MESSAGE).await
+}
+
+async fn write_framed_with_max(
+    send: &mut quinn::SendStream,
+    body: &[u8],
+    max: usize,
+) -> Result<()> {
+    if body.len() > max {
+        return Err(TransportError::FrameTooLarge {
+            size: body.len(),
+            max,
+        });
+    }
     let len = u32::try_from(body.len()).map_err(|_| TransportError::FrameTooLarge {
         size: body.len(),
-        max: u32::MAX as usize,
+        max,
     })?;
     send.write_all(&len.to_le_bytes()).await?;
     send.write_all(body).await?;
@@ -250,14 +305,15 @@ async fn write_framed(send: &mut quinn::SendStream, body: &[u8]) -> Result<()> {
 }
 
 async fn read_framed(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    read_framed_with_max(recv, MAX_FRAMED_MESSAGE).await
+}
+
+async fn read_framed_with_max(recv: &mut quinn::RecvStream, max: usize) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     read_exact(recv, &mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAMED_MESSAGE {
-        return Err(TransportError::FrameTooLarge {
-            size: len,
-            max: MAX_FRAMED_MESSAGE,
-        });
+    if len > max {
+        return Err(TransportError::FrameTooLarge { size: len, max });
     }
     let mut buf = vec![0u8; len];
     read_exact(recv, &mut buf).await?;

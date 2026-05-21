@@ -38,6 +38,14 @@ use tether_protocol::CodecError;
 /// [`tether_protocol::MAX_DATAGRAM_PAYLOAD`]).
 pub const MAX_FRAMED_MESSAGE: usize = 64 * 1024;
 
+/// Hard cap on the size of a single video-keyframe message delivered on
+/// the per-IDR unidirectional stream. Sized for a worst-case 4K HEVC
+/// IDR (~2 MiB at high quality) plus headroom. Separate from
+/// [`MAX_FRAMED_MESSAGE`] so the control-stream cap stays tight against
+/// hostile peers while video streams can carry the legitimately-large
+/// keyframe payload.
+pub const MAX_VIDEO_STREAM_MESSAGE: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("io: {0}")]

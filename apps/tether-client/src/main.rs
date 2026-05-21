@@ -17,7 +17,7 @@ use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{
     ClientHello, ClientHelloV1, CodecKind, ControlMessage, GoodbyeCode, ServerHello,
 };
-use tether_protocol::video::FrameReassembler;
+use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::{Frame, RenderEvent};
 use tether_transport::{Client, Datagram};
@@ -297,256 +297,282 @@ async fn main() -> anyhow::Result<()> {
         const IDR_RATE_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
 
         loop {
-            match conn_recv.recv_datagram().await {
-                Ok(Datagram::Video(packet)) => {
-                    let Some(frame) = reassembler.handle(packet) else { continue };
-                    let now = MonoNanos::now();
-                    // Host timestamps -> client clock via the handshake
-                    // offset. host_in_client_clock is the moment the
-                    // host captured the frame; send_in_client_clock is
-                    // the moment the host handed it to QUIC. The
-                    // difference between them and `now` decomposes
-                    // total latency into capture-to-send (host
-                    // pipeline) and send-to-recv (network + reassembly).
-                    let host_in_client_clock =
-                        recv_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
-                    let send_in_client_clock =
-                        recv_clock_sync.remote_to_local(frame.meta.timing.t_send);
-                    let age_ns = now.saturating_sub(host_in_client_clock);
-                    let network_ns = now.saturating_sub(send_in_client_clock);
-                    frame_count += 1;
-                    latency_sum_ns = latency_sum_ns.saturating_add(age_ns);
-                    network_latency_sum_ns = network_latency_sum_ns.saturating_add(network_ns);
-                    bytes_received = bytes_received.saturating_add(frame.body.len() as u64);
-
-                    let t_decode_start = MonoNanos::now();
-                    // submit + drain. The trait swallows ffmpeg's
-                    // drain/flushed sentinels and returns them as
-                    // `Ok(None)`, so any `Err` we see here is a real
-                    // decode failure — never a benign "need more input".
-                    //
-                    // Some failure modes (HEVC RPS reconstruction —
-                    // "Could not find ref with POC N") don't surface
-                    // through the API at all: libavcodec internally
-                    // logs the error and skips the undecodable NALU,
-                    // returning Ok. We bracket the call with a
-                    // snapshot of the process-wide `av_log` warning
-                    // counter so we can treat "libavcodec was unhappy
-                    // during this packet" as a soft decode failure
-                    // worth a ForceIdr, even when `decoder.submit` /
-                    // `next_frame` reported Ok.
-                    let avlog_before = tether_codec::av_log::warning_or_above_count();
-                    let mut decoded: Vec<CodecFrame> = Vec::new();
-                    let mut decode_err: Option<tether_codec::CodecError> =
-                        decoder.submit(&frame.body).err();
-                    if decode_err.is_none() {
-                        loop {
-                            match decoder.next_frame() {
-                                Ok(Some(f)) => decoded.push(f),
-                                Ok(None) => break,
-                                Err(e) => {
-                                    decode_err = Some(e);
-                                    break;
-                                }
-                            }
+            // Race the unreliable datagram path (P-frames, cursor) against
+            // the reliable per-IDR uni stream path. `biased` so we always
+            // poll datagrams first — they're the latency-critical channel
+            // and the more frequent one; the keyframe stream is woken up
+            // only when an IDR is in flight. Both produce a `VideoPacket`
+            // that feeds the same reassembler.
+            let packet: VideoPacket = tokio::select! {
+                biased;
+                d = conn_recv.recv_datagram() => {
+                    match d {
+                        Ok(Datagram::Video(p)) => p,
+                        Ok(Datagram::HostCursor(_)) => {
+                            // Host cursor sprite/position rendering isn't wired
+                            // on this side yet; the wire slot is reserved.
+                            continue;
+                        }
+                        Ok(Datagram::ClientCursor(_)) => {
+                            // Client-originated cursor packets should never
+                            // come back to the client; ignore defensively.
+                            continue;
+                        }
+                        Err(e) => {
+                            // Promoted from warn → error: this is terminal for the
+                            // video stream and the user otherwise sees a frozen
+                            // last-frame with no indication anything broke. Also
+                            // close the connection explicitly so the host learns
+                            // about it instead of waiting for the idle timeout.
+                            error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
+                            conn_recv.close(1, b"recv failed");
+                            break;
                         }
                     }
-                    let avlog_warnings = tether_codec::av_log::warning_or_above_count()
-                        .saturating_sub(avlog_before);
-                    let t_decode_done = MonoNanos::now();
-                    decode_latency_sum_ns = decode_latency_sum_ns
-                        .saturating_add(t_decode_done.saturating_sub(t_decode_start));
-
-                    // Render any frames we *did* successfully decode
-                    // before reporting the error. With async_depth=0
-                    // and no B-frames this is almost always 0 or 1
-                    // frames; the loop is here so a mid-drain failure
-                    // doesn't silently throw away good output.
-                    for dec in decoded {
-                        let raw = match dec {
-                            CodecFrame::Cpu(c) => Frame::Cpu(CpuFrame {
-                                width: c.width,
-                                height: c.height,
-                                y: c.y,
-                                uv: c.uv,
-                                t_capture_client_clock: Some(host_in_client_clock),
-                            }),
-                            CodecFrame::Gpu(g) => {
-                                let (w, h, _pts, source, guard) = g.into_parts();
-                                Frame::Gpu(RenderGpuFrame {
-                                    width: w,
-                                    height: h,
-                                    t_capture_client_clock: Some(host_in_client_clock),
-                                    source,
-                                    guard,
-                                })
-                            }
-                        };
-                        // Drop on full — render is intentionally one-deep.
-                        if frame_tx.try_send(raw).is_err() {
-                            render_drops = render_drops.saturating_add(1);
-                        }
-                    }
-
-                    // Two distinct failure shapes ride the same recovery
-                    // path. (1) Hard failure: `decoder.submit` or
-                    // `next_frame` returned an Err (rare; almost always
-                    // a truly corrupt slice). (2) Soft failure:
-                    // libavcodec internally logged at warning or above
-                    // during this packet — the common case for
-                    // "P-frame references a fragment we dropped on the
-                    // wire," which the HEVC decoder skips silently
-                    // until the next IDR. Either way, the only recovery
-                    // is a fresh IDR. We count the soft path under the
-                    // same `decode_errs` metric (it was previously
-                    // lying as zero) and reuse the rate-limited
-                    // ForceIdr request below.
-                    let soft_failure = decode_err.is_none() && avlog_warnings > 0;
-                    if let Some(e) = decode_err.as_ref() {
-                        warn!(error = %e, "decode failed; dropping packet");
-                    } else if soft_failure {
-                        // Don't emit per-packet — the av_log bridge
-                        // already routed the underlying libavcodec
-                        // message into tracing. A trace-level here keeps
-                        // the metric attributable without doubling up.
-                        tracing::trace!(
-                            avlog_warnings,
-                            "libavcodec warned during decode; treating as soft failure"
-                        );
-                    }
-                    if decode_err.is_some() || soft_failure {
-                        decode_errors = decode_errors.saturating_add(1);
-                        // Asking the host for a fresh IDR is the only
-                        // way out — without it we stay garbled until
-                        // the next periodic IDR (up to one GOP).
-                        let now = Instant::now();
-                        if last_idr_request.is_none_or(|t| now.duration_since(t) > IDR_RATE_LIMIT) {
-                            let conn = conn_recv.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
-                                    warn!(error = ?e, "ForceIdr send failed");
-                                }
-                            });
-                            last_idr_request = Some(now);
-                            idr_requests = idr_requests.saturating_add(1);
-                        }
-                        if decode_err.is_some() {
-                            // Decoded frames (if any landed before the
-                            // mid-drain Err) were already rendered
-                            // above; `continue` here just skips the
-                            // per-window stats block for this iteration
-                            // so a packet that errored isn't counted
-                            // toward the network-latency average.
+                }
+                kf = conn_recv.accept_video_keyframe() => {
+                    match kf {
+                        Ok(p) => p,
+                        Err(e) => {
+                            // Stream-level read errors are transient on a
+                            // healthy connection (peer reset the stream).
+                            // The connection itself is fine; the next IDR
+                            // will arrive on its own fresh stream.
+                            warn!(error = ?e, "accept_video_keyframe failed; awaiting next stream");
                             continue;
                         }
                     }
+                }
+            };
 
-                    if last_log.elapsed() >= std::time::Duration::from_secs(1) {
-                        let window_secs = last_log.elapsed().as_secs_f64();
-                        // ClientStats — host uses this to drive future
-                        // adaptive bitrate / FEC strength / codec
-                        // downshift decisions. Counters are diffed
-                        // against last window so the wire field is a
-                        // per-interval rate; rtt_ewma_us is whole-
-                        // session EWMA on the QUIC RTT.
-                        let (frames_dropped_now, fragments_lost_now) =
-                            reassembler.loss_counters();
-                        let frames_dropped_delta = u32::try_from(
-                            frames_dropped_now.saturating_sub(last_frames_dropped),
-                        )
-                        .unwrap_or(u32::MAX);
-                        let fragments_lost_delta = u32::try_from(
-                            fragments_lost_now.saturating_sub(last_fragments_lost),
-                        )
-                        .unwrap_or(u32::MAX);
-                        last_frames_dropped = frames_dropped_now;
-                        last_fragments_lost = fragments_lost_now;
-                        let interval_ms = u32::try_from(
-                            (window_secs * 1000.0).round() as i64,
-                        )
-                        .unwrap_or(u32::MAX);
-                        let rtt_ewma_us = u32::try_from(
-                            conn_recv.rtt().as_micros().min(u128::from(u32::MAX)),
-                        )
-                        .unwrap_or(u32::MAX);
-                        let stats = ControlMessage::ClientStats {
-                            interval_ms,
-                            frames_received: u32::try_from(frame_count).unwrap_or(u32::MAX),
-                            frames_dropped: frames_dropped_delta,
-                            fragments_lost: fragments_lost_delta,
-                            rtt_ewma_us,
-                        };
-                        let conn_stats = conn_recv.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = conn_stats.send_control(&stats).await {
-                                tracing::trace!(error = ?e, "ClientStats send failed");
-                            }
-                        });
+            let Some(frame) = reassembler.handle(packet) else { continue };
+            let now = MonoNanos::now();
+            // Host timestamps -> client clock via the handshake
+            // offset. host_in_client_clock is the moment the
+            // host captured the frame; send_in_client_clock is
+            // the moment the host handed it to QUIC. The
+            // difference between them and `now` decomposes
+            // total latency into capture-to-send (host
+            // pipeline) and send-to-recv (network + reassembly).
+            let host_in_client_clock =
+                recv_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
+            let send_in_client_clock =
+                recv_clock_sync.remote_to_local(frame.meta.timing.t_send);
+            let age_ns = now.saturating_sub(host_in_client_clock);
+            let network_ns = now.saturating_sub(send_in_client_clock);
+            frame_count += 1;
+            latency_sum_ns = latency_sum_ns.saturating_add(age_ns);
+            network_latency_sum_ns = network_latency_sum_ns.saturating_add(network_ns);
+            bytes_received = bytes_received.saturating_add(frame.body.len() as u64);
 
-                        #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
-                        let avg_decode_ms = if frame_count > 0 {
-                            (decode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
-                        } else {
-                            0.0
-                        };
-                        #[allow(clippy::cast_precision_loss)]
-                        let avg_latency_ms = if frame_count > 0 {
-                            (latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
-                        } else {
-                            0.0
-                        };
-                        #[allow(clippy::cast_precision_loss)]
-                        let avg_network_ms = if frame_count > 0 {
-                            (network_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
-                        } else {
-                            0.0
-                        };
-                        #[allow(clippy::cast_precision_loss)]
-                        let kbps_in = if window_secs > 0.0 {
-                            (bytes_received as f64 * 8.0 / 1000.0) / window_secs
-                        } else {
-                            0.0
-                        };
-                        info!(
-                            frames_per_s = frame_count,
-                            latency_ms = format!("{avg_latency_ms:.2}"),
-                            network_ms = format!("{avg_network_ms:.2}"),
-                            avg_decode_ms = format!("{avg_decode_ms:.2}"),
-                            kbps_in = format!("{kbps_in:.0}"),
-                            decode_errs = decode_errors,
-                            render_drops = render_drops,
-                            idr_reqs = idr_requests,
-                            "frame stats"
-                        );
-                        frame_count = 0;
-                        decode_latency_sum_ns = 0;
-                        latency_sum_ns = 0;
-                        network_latency_sum_ns = 0;
-                        bytes_received = 0;
-                        decode_errors = 0;
-                        render_drops = 0;
-                        idr_requests = 0;
-                        last_log = Instant::now();
+            let t_decode_start = MonoNanos::now();
+            // submit + drain. The trait swallows ffmpeg's
+            // drain/flushed sentinels and returns them as
+            // `Ok(None)`, so any `Err` we see here is a real
+            // decode failure — never a benign "need more input".
+            //
+            // Some failure modes (HEVC RPS reconstruction —
+            // "Could not find ref with POC N") don't surface
+            // through the API at all: libavcodec internally
+            // logs the error and skips the undecodable NALU,
+            // returning Ok. We bracket the call with a
+            // snapshot of the process-wide `av_log` warning
+            // counter so we can treat "libavcodec was unhappy
+            // during this packet" as a soft decode failure
+            // worth a ForceIdr, even when `decoder.submit` /
+            // `next_frame` reported Ok.
+            let avlog_before = tether_codec::av_log::warning_or_above_count();
+            let mut decoded: Vec<CodecFrame> = Vec::new();
+            let mut decode_err: Option<tether_codec::CodecError> =
+                decoder.submit(&frame.body).err();
+            if decode_err.is_none() {
+                loop {
+                    match decoder.next_frame() {
+                        Ok(Some(f)) => decoded.push(f),
+                        Ok(None) => break,
+                        Err(e) => {
+                            decode_err = Some(e);
+                            break;
+                        }
                     }
                 }
-                Ok(Datagram::HostCursor(_)) => {
-                    // Host cursor sprite/position rendering isn't wired
-                    // on this side yet; the wire slot is reserved.
+            }
+            let avlog_warnings = tether_codec::av_log::warning_or_above_count()
+                .saturating_sub(avlog_before);
+            let t_decode_done = MonoNanos::now();
+            decode_latency_sum_ns = decode_latency_sum_ns
+                .saturating_add(t_decode_done.saturating_sub(t_decode_start));
+
+            // Render any frames we *did* successfully decode
+            // before reporting the error. With async_depth=0
+            // and no B-frames this is almost always 0 or 1
+            // frames; the loop is here so a mid-drain failure
+            // doesn't silently throw away good output.
+            for dec in decoded {
+                let raw = match dec {
+                    CodecFrame::Cpu(c) => Frame::Cpu(CpuFrame {
+                        width: c.width,
+                        height: c.height,
+                        y: c.y,
+                        uv: c.uv,
+                        t_capture_client_clock: Some(host_in_client_clock),
+                    }),
+                    CodecFrame::Gpu(g) => {
+                        let (w, h, _pts, source, guard) = g.into_parts();
+                        Frame::Gpu(RenderGpuFrame {
+                            width: w,
+                            height: h,
+                            t_capture_client_clock: Some(host_in_client_clock),
+                            source,
+                            guard,
+                        })
+                    }
+                };
+                // Drop on full — render is intentionally one-deep.
+                if frame_tx.try_send(raw).is_err() {
+                    render_drops = render_drops.saturating_add(1);
                 }
-                Ok(Datagram::ClientCursor(_)) => {
-                    // Client-originated cursor packets should never
-                    // come back to the client; ignore defensively.
+            }
+
+            // Two distinct failure shapes ride the same recovery
+            // path. (1) Hard failure: `decoder.submit` or
+            // `next_frame` returned an Err (rare; almost always
+            // a truly corrupt slice). (2) Soft failure:
+            // libavcodec internally logged at warning or above
+            // during this packet — the common case for
+            // "P-frame references a fragment we dropped on the
+            // wire," which the HEVC decoder skips silently
+            // until the next IDR. Either way, the only recovery
+            // is a fresh IDR. We count the soft path under the
+            // same `decode_errs` metric (it was previously
+            // lying as zero) and reuse the rate-limited
+            // ForceIdr request below.
+            let soft_failure = decode_err.is_none() && avlog_warnings > 0;
+            if let Some(e) = decode_err.as_ref() {
+                warn!(error = %e, "decode failed; dropping packet");
+            } else if soft_failure {
+                // Don't emit per-packet — the av_log bridge
+                // already routed the underlying libavcodec
+                // message into tracing. A trace-level here keeps
+                // the metric attributable without doubling up.
+                tracing::trace!(
+                    avlog_warnings,
+                    "libavcodec warned during decode; treating as soft failure"
+                );
+            }
+            if decode_err.is_some() || soft_failure {
+                decode_errors = decode_errors.saturating_add(1);
+                // Asking the host for a fresh IDR is the only
+                // way out — without it we stay garbled until
+                // the next periodic IDR (up to one GOP).
+                let now = Instant::now();
+                if last_idr_request.is_none_or(|t| now.duration_since(t) > IDR_RATE_LIMIT) {
+                    let conn = conn_recv.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
+                            warn!(error = ?e, "ForceIdr send failed");
+                        }
+                    });
+                    last_idr_request = Some(now);
+                    idr_requests = idr_requests.saturating_add(1);
                 }
-                Err(e) => {
-                    // Promoted from warn → error: this is terminal for the
-                    // video stream and the user otherwise sees a frozen
-                    // last-frame with no indication anything broke. Also
-                    // close the connection explicitly so the host learns
-                    // about it instead of waiting for the idle timeout.
-                    error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
-                    conn_recv.close(1, b"recv failed");
-                    break;
+                if decode_err.is_some() {
+                    // Decoded frames (if any landed before the
+                    // mid-drain Err) were already rendered
+                    // above; `continue` here just skips the
+                    // per-window stats block for this iteration
+                    // so a packet that errored isn't counted
+                    // toward the network-latency average.
+                    continue;
                 }
+            }
+
+            if last_log.elapsed() >= std::time::Duration::from_secs(1) {
+                let window_secs = last_log.elapsed().as_secs_f64();
+                // ClientStats — host uses this to drive future
+                // adaptive bitrate / FEC strength / codec
+                // downshift decisions. Counters are diffed
+                // against last window so the wire field is a
+                // per-interval rate; rtt_ewma_us is whole-
+                // session EWMA on the QUIC RTT.
+                let (frames_dropped_now, fragments_lost_now) =
+                    reassembler.loss_counters();
+                let frames_dropped_delta = u32::try_from(
+                    frames_dropped_now.saturating_sub(last_frames_dropped),
+                )
+                .unwrap_or(u32::MAX);
+                let fragments_lost_delta = u32::try_from(
+                    fragments_lost_now.saturating_sub(last_fragments_lost),
+                )
+                .unwrap_or(u32::MAX);
+                last_frames_dropped = frames_dropped_now;
+                last_fragments_lost = fragments_lost_now;
+                let interval_ms = u32::try_from(
+                    (window_secs * 1000.0).round() as i64,
+                )
+                .unwrap_or(u32::MAX);
+                let rtt_ewma_us = u32::try_from(
+                    conn_recv.rtt().as_micros().min(u128::from(u32::MAX)),
+                )
+                .unwrap_or(u32::MAX);
+                let stats = ControlMessage::ClientStats {
+                    interval_ms,
+                    frames_received: u32::try_from(frame_count).unwrap_or(u32::MAX),
+                    frames_dropped: frames_dropped_delta,
+                    fragments_lost: fragments_lost_delta,
+                    rtt_ewma_us,
+                };
+                let conn_stats = conn_recv.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = conn_stats.send_control(&stats).await {
+                        tracing::trace!(error = ?e, "ClientStats send failed");
+                    }
+                });
+
+                #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
+                let avg_decode_ms = if frame_count > 0 {
+                    (decode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
+                } else {
+                    0.0
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let avg_latency_ms = if frame_count > 0 {
+                    (latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
+                } else {
+                    0.0
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let avg_network_ms = if frame_count > 0 {
+                    (network_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
+                } else {
+                    0.0
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let kbps_in = if window_secs > 0.0 {
+                    (bytes_received as f64 * 8.0 / 1000.0) / window_secs
+                } else {
+                    0.0
+                };
+                info!(
+                    frames_per_s = frame_count,
+                    latency_ms = format!("{avg_latency_ms:.2}"),
+                    network_ms = format!("{avg_network_ms:.2}"),
+                    avg_decode_ms = format!("{avg_decode_ms:.2}"),
+                    kbps_in = format!("{kbps_in:.0}"),
+                    decode_errs = decode_errors,
+                    render_drops = render_drops,
+                    idr_reqs = idr_requests,
+                    "frame stats"
+                );
+                frame_count = 0;
+                decode_latency_sum_ns = 0;
+                latency_sum_ns = 0;
+                network_latency_sum_ns = 0;
+                bytes_received = 0;
+                decode_errors = 0;
+                render_drops = 0;
+                idr_requests = 0;
+        last_log = Instant::now();
             }
         }
     });

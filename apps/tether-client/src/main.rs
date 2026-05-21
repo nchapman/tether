@@ -662,6 +662,7 @@ async fn main() -> anyhow::Result<()> {
         "tether-client",
         (INITIAL_WIDTH, INITIAL_HEIGHT),
         server_body.color_space,
+        negotiated_profile.chroma,
         frames,
         Some(on_event),
     )?;

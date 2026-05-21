@@ -187,3 +187,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // pixels regardless of the surface format we picked.
     return vec4<f32>(rgb_linear, 1.0);
 }
+
+// HEVC Main444 sessions use a separate shader module (shader_yuv444.wgsl).
+// Two distinct module-scope binding declarations at @group(0) @binding(0)
+// in one WGSL file is a validation error per spec — even when only one
+// entry point is compiled into a given pipeline. Keep them in separate
+// files so each module's bindings stand on their own.

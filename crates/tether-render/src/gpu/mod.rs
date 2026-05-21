@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
-use tether_protocol::control::{ColorTransfer, VideoColorSpec};
+use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
 use winit::window::Window;
 
 use crate::{CpuFrame, Frame, GpuFrame, RenderError, Result};
@@ -11,22 +11,17 @@ mod import;
 #[cfg(target_os = "linux")]
 pub(crate) use import::import_dmabuf_textures;
 
-/// Y plus interleaved-UV textures and the bind group that points at
-/// them. Bundled together so resize-on-frame can swap them atomically.
-/// Y is R8Unorm at full resolution; UV is Rg8Unorm at half resolution
-/// (each texel holds one U byte in .r and one V byte in .g, matching
-/// the NV12 layout the decoder emits).
+/// One frame's worth of YUV plane textures plus the bind group that
+/// points at them. The variant matches the negotiated chroma — NV12
+/// shape for 4:2:0, three R8 planes for 4:4:4. Bundled with the bind
+/// group so resize-on-frame can swap them atomically.
 pub(crate) struct YuvTextures {
-    // Both textures own GPU memory and are kept alive solely for the
-    // bind group's views; we never reference them by name after the
-    // bind group is built. The allow keeps clippy quiet about the
-    // unused field reads.
-    #[allow(dead_code)]
-    y: wgpu::Texture,
-    #[allow(dead_code)]
-    uv: wgpu::Texture,
+    /// Per-chroma plane storage. Different variants in different
+    /// modes; bind group already references the correct plane set
+    /// via the (chroma-specific) bind-group layout.
+    planes: YuvPlanes,
     pub(crate) bind_group: wgpu::BindGroup,
-    /// Y-plane dimensions (chroma is derived).
+    /// Luma-plane dimensions (chroma is derived from chroma kind).
     size: (u32, u32),
     /// Backend-side lifetime extender from the decoder (DMA-BUF path)
     /// — typically an `AVFrame` whose Drop releases the VAAPI surface
@@ -36,6 +31,21 @@ pub(crate) struct YuvTextures {
     _guard: Option<GpuFrameGuard>,
 }
 
+/// Chroma-specific plane storage. The texture handles are kept alive
+/// solely for the bind group's views; we never reference them by name
+/// after the bind group is built.
+#[allow(dead_code)]
+pub(crate) enum YuvPlanes {
+    /// NV12: full-res R8 Y plus half-res Rg8 UV (interleaved chroma).
+    Nv12 { y: wgpu::Texture, uv: wgpu::Texture },
+    /// YUV444P: three full-res R8 planes (planar, no subsampling).
+    Yuv444 {
+        y: wgpu::Texture,
+        u: wgpu::Texture,
+        v: wgpu::Texture,
+    },
+}
+
 pub(crate) struct GpuState {
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
@@ -43,6 +53,10 @@ pub(crate) struct GpuState {
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     yuv_bgl: wgpu::BindGroupLayout,
+    /// Negotiated chroma for this session. Fixed at construction —
+    /// a chroma switch needs a full GpuState rebuild, the same way
+    /// a resolution change works.
+    chroma: ChromaSubsampling,
     sampler: wgpu::Sampler,
     textures: YuvTextures,
     /// Previous frame's textures + guard, retired for one extra render
@@ -105,7 +119,11 @@ fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
 }
 
 impl GpuState {
-    pub(crate) async fn new(window: Arc<Window>, color_space: VideoColorSpec) -> Result<Self> {
+    pub(crate) async fn new(
+        window: Arc<Window>,
+        color_space: VideoColorSpec,
+        chroma: ChromaSubsampling,
+    ) -> Result<Self> {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
@@ -214,23 +232,48 @@ impl GpuState {
             ..Default::default()
         });
 
-        // Two textures (Y + UV-interleaved) plus a sampler. We share
-        // one sampler — chroma upsampling uses the same bilinear
-        // filter as luma, and the visual difference vs. a chroma-only
-        // nearest sampler is invisible on 4:2:0 desktop content.
-        let yuv_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("tether-render yuv bgl"),
-            entries: &[
-                bgl_texture_entry(0),
-                bgl_texture_entry(1),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+        // Bind-group layout depends on chroma: NV12 has Y + UV (two
+        // textures + sampler at binding 2); YUV444 has Y + U + V
+        // (three textures + sampler at binding 3). Distinct layouts
+        // pair with distinct fragment entry points compiled into
+        // separate pipelines below.
+        let yuv_bgl = match chroma {
+            ChromaSubsampling::Yuv420 => {
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("tether-render yuv bgl (nv12)"),
+                    entries: &[
+                        bgl_texture_entry(0),
+                        bgl_texture_entry(1),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(
+                                wgpu::SamplerBindingType::Filtering,
+                            ),
+                            count: None,
+                        },
+                    ],
+                })
+            }
+            ChromaSubsampling::Yuv444 => {
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("tether-render yuv bgl (444)"),
+                    entries: &[
+                        bgl_texture_entry(0),
+                        bgl_texture_entry(1),
+                        bgl_texture_entry(2),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(
+                                wgpu::SamplerBindingType::Filtering,
+                            ),
+                            count: None,
+                        },
+                    ],
+                })
+            }
+        };
 
         let scale_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tether-render scale bgl"),
@@ -311,9 +354,16 @@ impl GpuState {
             }],
         });
 
+        let shader_src = match chroma {
+            ChromaSubsampling::Yuv420 => include_str!("../shader.wgsl"),
+            ChromaSubsampling::Yuv444 => include_str!("../shader_yuv444.wgsl"),
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tether-render shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shader.wgsl").into()),
+            label: Some(match chroma {
+                ChromaSubsampling::Yuv420 => "tether-render shader (nv12)",
+                ChromaSubsampling::Yuv444 => "tether-render shader (444)",
+            }),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -322,6 +372,10 @@ impl GpuState {
             immediate_size: 0,
         });
 
+        // Both shader files name their fragment entry point `fs`; the
+        // module selected above is what determines which fragment body
+        // gets compiled into this pipeline.
+        let fragment_entry = "fs";
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("tether-render pipeline"),
             layout: Some(&pipeline_layout),
@@ -333,7 +387,7 @@ impl GpuState {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs"),
+                entry_point: Some(fragment_entry),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: None,
@@ -348,7 +402,7 @@ impl GpuState {
             cache: None,
         });
 
-        let textures = make_yuv_textures(&device, &yuv_bgl, &sampler, 1, 1);
+        let textures = make_yuv_textures(&device, &yuv_bgl, &sampler, chroma, 1, 1);
 
         Ok(Self {
             surface,
@@ -357,6 +411,7 @@ impl GpuState {
             queue,
             pipeline,
             yuv_bgl,
+            chroma,
             sampler,
             textures,
             retired: None,
@@ -406,9 +461,19 @@ impl GpuState {
         if frame.width == 0 || frame.height == 0 {
             return Ok(());
         }
+        // CPU upload path is NV12-only today — the only CPU producer
+        // (sw-decoded fallback in dmabuf_test) emits NV12. A YUV444
+        // CPU producer would need a CpuFrame variant change, not a
+        // patch here.
+        if self.chroma != ChromaSubsampling::Yuv420 {
+            return Err(crate::RenderError::DmaBufImport(format!(
+                "CPU upload path is NV12-only; session negotiated {:?}",
+                self.chroma
+            )));
+        }
         // Two reasons to rebuild: the previous frame was DMA-BUF-imported
-        // (those textures aren't COPY_DST so write_texture would fail
-        // — checking `_guard.is_some()` is load-bearing; the size match
+        // (those textures aren't COPY_DST so write_texture would fail —
+        // checking `_guard.is_some()` is load-bearing; the size match
         // would silently skip the rebuild otherwise), or the resolution
         // changed.
         if self.textures._guard.is_some() || (frame.width, frame.height) != self.textures.size {
@@ -416,16 +481,20 @@ impl GpuState {
                 &self.device,
                 &self.yuv_bgl,
                 &self.sampler,
+                self.chroma,
                 frame.width,
                 frame.height,
             );
             self.retire_textures(fresh);
         }
         let (chroma_w, chroma_h) = frame.chroma_dims();
+        let YuvPlanes::Nv12 { y, uv } = &self.textures.planes else {
+            unreachable!("guarded by chroma check above");
+        };
         // Y is R8 — one byte per texel, so bytes_per_row == width.
         // UV is Rg8 — two bytes per texel, so bytes_per_row == chroma_w * 2.
-        write_plane_r8(&self.queue, &self.textures.y, &frame.y, frame.width, frame.height);
-        write_plane_rg8(&self.queue, &self.textures.uv, &frame.uv, chroma_w, chroma_h);
+        write_plane_r8(&self.queue, y, &frame.y, frame.width, frame.height);
+        write_plane_rg8(&self.queue, uv, &frame.uv, chroma_w, chroma_h);
         Ok(())
     }
 
@@ -450,6 +519,7 @@ impl GpuState {
             &self.device,
             &self.yuv_bgl,
             &self.sampler,
+            self.chroma,
             &dmabuf,
             frame.width,
             frame.height,
@@ -622,11 +692,10 @@ fn make_yuv_textures(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    chroma: ChromaSubsampling,
     width: u32,
     height: u32,
 ) -> YuvTextures {
-    let chroma_w = width.div_ceil(2);
-    let chroma_h = height.div_ceil(2);
     let y = make_plane_texture(
         device,
         "tether-render y plane",
@@ -634,39 +703,90 @@ fn make_yuv_textures(
         height,
         wgpu::TextureFormat::R8Unorm,
     );
-    let uv = make_plane_texture(
-        device,
-        "tether-render uv plane",
-        chroma_w,
-        chroma_h,
-        wgpu::TextureFormat::Rg8Unorm,
-    );
     let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
-    let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tether-render yuv bind group"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&y_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&uv_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    });
-    YuvTextures {
-        y,
-        uv,
-        bind_group,
-        size: (width, height),
-        _guard: None,
+    match chroma {
+        ChromaSubsampling::Yuv420 => {
+            let chroma_w = width.div_ceil(2);
+            let chroma_h = height.div_ceil(2);
+            let uv = make_plane_texture(
+                device,
+                "tether-render uv plane",
+                chroma_w,
+                chroma_h,
+                wgpu::TextureFormat::Rg8Unorm,
+            );
+            let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tether-render yuv bind group (nv12)"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            });
+            YuvTextures {
+                planes: YuvPlanes::Nv12 { y, uv },
+                bind_group,
+                size: (width, height),
+                _guard: None,
+            }
+        }
+        ChromaSubsampling::Yuv444 => {
+            let u = make_plane_texture(
+                device,
+                "tether-render u plane (444)",
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            );
+            let v = make_plane_texture(
+                device,
+                "tether-render v plane (444)",
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            );
+            let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
+            let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tether-render yuv bind group (444)"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&u_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&v_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            });
+            YuvTextures {
+                planes: YuvPlanes::Yuv444 { y, u, v },
+                bind_group,
+                size: (width, height),
+                _guard: None,
+            }
+        }
     }
 }
 

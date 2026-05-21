@@ -1,15 +1,55 @@
-//! Linux DMA-BUF import path: VAAPI-decoded NV12 surface → two
-//! `wgpu::Texture`s the renderer can sample. Pure Linux module —
-//! macOS will land its IOSurface equivalent here as a sibling file.
+//! Linux DMA-BUF import path: VAAPI-decoded surface → `wgpu::Texture`
+//! plane(s) the renderer can sample. Dispatches on the negotiated
+//! chroma — NV12 gets 2 planes (Y as R8, UV as Rg8); YUV444 gets 3
+//! planes (Y/U/V each as R8). Pure Linux module — macOS will land its
+//! IOSurface equivalent here as a sibling file.
 
 use tether_codec::{DmaBufFrame, GpuFrameGuard};
+use tether_protocol::control::ChromaSubsampling;
 
 use crate::{RenderError, Result};
 
-use super::YuvTextures;
+use super::{YuvPlanes, YuvTextures};
 
 #[allow(clippy::cast_lossless)] // u32 pitch into u64 stride is intentional
 pub(crate) fn import_dmabuf_textures(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    chroma: ChromaSubsampling,
+    dmabuf: &DmaBufFrame,
+    width: u32,
+    height: u32,
+    guard: GpuFrameGuard,
+) -> Result<YuvTextures> {
+    // Log the shape libva handed us at debug so a driver that emits an
+    // unexpected layer count (e.g. AMD VA exporting multi-plane YUV444P
+    // as a single layer rather than three) is self-diagnosing instead
+    // of producing an opaque "expected N layers, got M" error with no
+    // hint about what to change.
+    tracing::debug!(
+        chroma = ?chroma,
+        fourcc = format_args!("0x{:08x}", dmabuf.fourcc),
+        layers = dmabuf.layers.len(),
+        planes_per_layer = ?dmabuf
+            .layers
+            .iter()
+            .map(|l| l.num_planes)
+            .collect::<Vec<_>>(),
+        objects = dmabuf.objects.len(),
+        "import_dmabuf_textures dispatch"
+    );
+    match chroma {
+        ChromaSubsampling::Yuv420 => {
+            import_nv12(device, layout, sampler, dmabuf, width, height, guard)
+        }
+        ChromaSubsampling::Yuv444 => {
+            import_yuv444(device, layout, sampler, dmabuf, width, height, guard)
+        }
+    }
+}
+
+fn import_nv12(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
@@ -47,7 +87,7 @@ pub(crate) fn import_dmabuf_textures(
     let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
     let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tether-render yuv bind group (dmabuf)"),
+        label: Some("tether-render yuv bind group (dmabuf nv12)"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -65,8 +105,86 @@ pub(crate) fn import_dmabuf_textures(
         ],
     });
     Ok(YuvTextures {
-        y,
-        uv,
+        planes: YuvPlanes::Nv12 { y, uv },
+        bind_group,
+        size: (width, height),
+        _guard: Some(guard),
+    })
+}
+
+/// VAAPI exports a Main444 surface as three R8 layers (Y / U / V),
+/// one plane per layer, under `VA_EXPORT_SURFACE_SEPARATE_LAYERS`.
+/// Each layer's DRM format is `R8  ` (DRM_FORMAT_R8); the planes are
+/// full-resolution.
+fn import_yuv444(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    dmabuf: &DmaBufFrame,
+    width: u32,
+    height: u32,
+    guard: GpuFrameGuard,
+) -> Result<YuvTextures> {
+    if dmabuf.layers.len() != 3 {
+        return Err(RenderError::DmaBufImport(format!(
+            "expected 3 layers (YUV444 SEPARATE_LAYERS), got {}",
+            dmabuf.layers.len()
+        )));
+    }
+    let y = import_one_layer(
+        device,
+        "tether-render y plane (dmabuf 444)",
+        dmabuf,
+        0,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )?;
+    let u = import_one_layer(
+        device,
+        "tether-render u plane (dmabuf 444)",
+        dmabuf,
+        1,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )?;
+    let v = import_one_layer(
+        device,
+        "tether-render v plane (dmabuf 444)",
+        dmabuf,
+        2,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )?;
+    let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
+    let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
+    let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tether-render yuv bind group (dmabuf 444)"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&y_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&u_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&v_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    Ok(YuvTextures {
+        planes: YuvPlanes::Yuv444 { y, u, v },
         bind_group,
         size: (width, height),
         _guard: Some(guard),

@@ -203,6 +203,7 @@ pub fn run(
     title: &str,
     initial_size: (u32, u32),
     color_space: tether_protocol::control::VideoColorSpec,
+    chroma: tether_protocol::control::ChromaSubsampling,
     frames: LatestFrame,
     on_event: Option<EventSink>,
 ) -> Result<()> {
@@ -211,6 +212,7 @@ pub fn run(
         title: title.to_string(),
         initial_size,
         color_space,
+        chroma,
         window: None,
         gpu: None,
         frames,
@@ -228,6 +230,7 @@ struct App {
     title: String,
     initial_size: (u32, u32),
     color_space: tether_protocol::control::VideoColorSpec,
+    chroma: tether_protocol::control::ChromaSubsampling,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     frames: LatestFrame,
@@ -305,7 +308,11 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let gpu = match pollster::block_on(GpuState::new(win.clone(), self.color_space)) {
+        let gpu = match pollster::block_on(GpuState::new(
+            win.clone(),
+            self.color_space,
+            self.chroma,
+        )) {
             Ok(g) => g,
             Err(e) => {
                 tracing::error!(error = %e, "failed to initialise wgpu");

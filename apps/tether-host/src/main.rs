@@ -84,6 +84,26 @@ async fn main() -> anyhow::Result<()> {
     println!("cert dir:        {} (rm to rotate)", cert_dir.display());
     println!("client cmd:      tether-client {local} {fp_hex}");
 
+    // Warm the SCK capture-capability cache *before* the first client
+    // connects. The probe runs eight short `SCStream::start_capture`
+    // cycles (~300–900 ms total wall time) and triggers the macOS
+    // ScreenRecording TCC prompt on first run. Running it lazily on
+    // first-connection inside `handle_client` straddles the
+    // application-layer clock-probe RTT measurement, biasing the
+    // negotiated `clock_offset` by ~half the probe duration and
+    // producing phantom hundred-millisecond `latency_ms` values for
+    // every frame stat that session. Running it here moves the
+    // probe out of the handshake's critical path entirely; the TCC
+    // prompt also fires on host launch (better UX than on first
+    // remote connect).
+    //
+    // Test-pattern mode skips the warm-up — there's no SCK in that
+    // path, so the prompt would be gratuitous.
+    #[cfg(target_os = "macos")]
+    if !use_test_pattern {
+        warm_sck_capture_capability_cache().await;
+    }
+
     let conn = match server.accept().await {
         Some(Ok(c)) => Arc::new(c),
         Some(Err(e)) => return Err(e.into()),
@@ -1458,44 +1478,77 @@ fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfi
         .collect()
 }
 
-/// Cached SCK probe result. The probe takes one `start_capture` cycle
-/// per format (~6 candidates × ~50ms = ~300ms total) and the answer is
-/// process-stable — driver / OS version / silicon doesn't change at
-/// runtime. Filtering encode profiles on each `handle_client` would
-/// otherwise repeat the probe per connection.
+/// Process-lifetime cache for the SCK probe result. Populated by
+/// [`warm_sck_capture_capability_cache`] at process startup (before
+/// the first client connects) — see the call site in [`main`] for
+/// why the warm-up has to land outside `handle_client`. Reads are
+/// `Copy` since [`SckCaptureCapability`] is small and `Copy`.
+///
+/// If the cache hasn't been populated (warm-up was skipped — e.g.
+/// `--test-pattern` mode, or a future code path that forgets to
+/// call the warm-up) reads fall back to a conservative
+/// `yuv420_video_range`-only capability that's safe to advertise
+/// against on every Mac.
+///
+/// [`SckCaptureCapability`]: tether_capture::macos::SckCaptureCapability
 #[cfg(target_os = "macos")]
-fn sck_capture_capability() -> tether_capture::macos::SckCaptureCapability {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<tether_capture::macos::SckCaptureCapability> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        // The probe is async (SCK calls land on the tokio runtime via
-        // `spawn_blocking`) but `capture_filtered_encode_profiles` is
-        // sync. `block_in_place` lets the current worker thread block
-        // on the inner `block_on` without starving the runtime.
-        //
-        // Hard requirement: `block_in_place` panics on the
-        // `current_thread` flavor. Our `#[tokio::main]` defaults to
-        // multi-thread so this is fine; if anyone ever adds
-        // `flavor = "current_thread"` they need to refactor this
-        // call site (most cleanly: probe at startup in `main` and
-        // pass the result down).
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(tether_capture::macos::probe_capture_pixel_formats())
-        });
-        match result {
-            Ok(caps) => {
-                tracing::info!(?caps, "SCK capture capability (cached for process lifetime)");
-                caps
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "SCK probe failed; assuming only 420v deliverable");
-                tether_capture::macos::SckCaptureCapability {
-                    yuv420_video_range: true,
-                    ..Default::default()
-                }
+static SCK_CAPS_CACHE: std::sync::OnceLock<tether_capture::macos::SckCaptureCapability> =
+    std::sync::OnceLock::new();
+
+/// Run the SCK probe and store the result in `SCK_CAPS_CACHE`.
+/// Idempotent: subsequent calls see the cache populated and return
+/// without re-running. Call once from `main` after the server is
+/// bound but before the first `accept().await` so the probe doesn't
+/// straddle a connection-time handshake's clock-probe measurement.
+#[cfg(target_os = "macos")]
+async fn warm_sck_capture_capability_cache() {
+    if SCK_CAPS_CACHE.get().is_some() {
+        return;
+    }
+    let caps = match tether_capture::macos::probe_capture_pixel_formats().await {
+        Ok(caps) => {
+            tracing::info!(?caps, "SCK capture capability (cached for process lifetime)");
+            caps
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SCK probe failed; assuming only 420v deliverable");
+            tether_capture::macos::SckCaptureCapability {
+                yuv420_video_range: true,
+                ..Default::default()
             }
         }
+    };
+    // Ignore the `Err(_)` case where another caller raced us in:
+    // both values would be the same probe result and either is
+    // fine to keep. `set` returns `Err(received_value)` to signal
+    // "already populated"; we drop that and continue.
+    let _ = SCK_CAPS_CACHE.set(caps);
+}
+
+/// Read the cached SCK capability. Panics if the cache wasn't warmed
+/// — callers on the macOS path go through `handle_client` which only
+/// runs after `main` has either called `warm_sck_capture_capability_cache`
+/// (real-capture mode) or selected test-pattern mode (which never
+/// touches `capture_filtered_encode_profiles`). A panic here is a
+/// programming error: a new entry point bypassed the warm-up.
+#[cfg(target_os = "macos")]
+fn sck_capture_capability() -> tether_capture::macos::SckCaptureCapability {
+    *SCK_CAPS_CACHE.get().unwrap_or_else(|| {
+        // Conservative fallback rather than panic in production —
+        // hosts a warning to make the bug visible. The negotiator
+        // will fall back to HEVC 4:2:0 8-bit which every macOS
+        // capture path supports.
+        tracing::error!(
+            "SCK capability cache read before warm-up; falling back to 420v-only. \
+             This indicates a code path that reached handle_client without \
+             going through warm_sck_capture_capability_cache."
+        );
+        static FALLBACK: std::sync::OnceLock<tether_capture::macos::SckCaptureCapability> =
+            std::sync::OnceLock::new();
+        FALLBACK.get_or_init(|| tether_capture::macos::SckCaptureCapability {
+            yuv420_video_range: true,
+            ..Default::default()
+        })
     })
 }
 

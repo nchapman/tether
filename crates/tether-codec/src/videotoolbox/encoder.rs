@@ -11,7 +11,6 @@ use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
-use tracing::warn;
 
 use tether_protocol::control::CodecKind;
 
@@ -131,6 +130,25 @@ impl VideoToolboxEncoder {
         hw_frames_ref.init()?;
         encoder.set_hw_frames_ctx(hw_frames_ref);
 
+        // Color identity. Must be written before avcodec_open2 so the
+        // SPS VUI (and HEVC equivalent) records them. Without this,
+        // libavcodec leaves all four "Unspecified" and decoders guess —
+        // typically BT.709 at HD, BT.601 below, which silently produces
+        // a hue shift right at the 720p resolution boundary. The macOS
+        // host is NV12 video-range only ('420v' from ScreenCaptureKit),
+        // so pin to BT.709 limited unconditionally. Parity with the
+        // VAAPI encoder.
+        //
+        // SAFETY: AVCodecContext color fields must be set before
+        // avcodec_open2 — same invariant as the global-header flag.
+        unsafe {
+            let raw = encoder.deref_mut();
+            raw.color_primaries = ffi::AVCOL_PRI_BT709;
+            raw.color_trc = ffi::AVCOL_TRC_BT709;
+            raw.colorspace = ffi::AVCOL_SPC_BT709;
+            raw.color_range = ffi::AVCOL_RANGE_MPEG;
+        }
+
         // VideoToolbox-specific private options. The defaults are
         // tuned for file-based transcoding; we override for realtime:
         //   realtime=1 — bias the encoder toward low-latency mode.
@@ -188,7 +206,7 @@ impl VideoToolboxEncoder {
             }
         }
 
-        let bgra_to_nv12 = SwsContext::get_context(
+        let mut bgra_to_nv12 = SwsContext::get_context(
             width_i32,
             height_i32,
             ffi::AV_PIX_FMT_BGRA,
@@ -201,6 +219,31 @@ impl VideoToolboxEncoder {
             None,
         )
         .ok_or(CodecError::ScalerInit("BGRA -> NV12"))?;
+
+        // Pin swscale's RGB→YUV matrix to BT.709 limited so the encoded
+        // bytes match the VUI we wrote above. Default behaviour picks
+        // BT.601 for sources shorter than 576 lines and BT.709 above —
+        // a silent hue shift right at 720p that the round-trip test
+        // (320×240) would otherwise hit.
+        //
+        // SAFETY: sws_setColorspaceDetails takes the SwsContext pointer
+        // plus two coefficient tables returned by sws_getCoefficients.
+        // The tables are static lookups owned by libswscale; we never
+        // free them. brightness=0, contrast/saturation=65536 is the
+        // documented neutral default.
+        unsafe {
+            let coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as i32);
+            let _ = ffi::sws_setColorspaceDetails(
+                bgra_to_nv12.as_mut_ptr(),
+                coeffs,
+                1, // src_range: BGRA is full range
+                coeffs,
+                0, // dst_range: NV12 video range (matches AVCOL_RANGE_MPEG)
+                0,
+                65536,
+                65536,
+            );
+        }
 
         let mut bgra_frame = AVFrame::new();
         bgra_frame.set_format(ffi::AV_PIX_FMT_BGRA);
@@ -218,15 +261,9 @@ impl VideoToolboxEncoder {
 
         // Snapshot the parameter-set bundle libavcodec just wrote into
         // `extradata` so we can prepend it to every keyframe at drain
-        // time. See `encoder_common` for the contract.
-        let extradata = snapshot_extradata(&encoder);
-        if extradata.is_empty() {
-            warn!(
-                codec = vt_codec_name(kind),
-                "encoder.extradata was empty after open(); keyframes will not carry SPS/PPS \
-                 (clients that lose the first IDR will be stuck)"
-            );
-        }
+        // time. See `encoder_common` for the contract — an empty
+        // extradata here is fatal (would break self-decodable IDRs).
+        let extradata = snapshot_extradata(&encoder, vt_codec_name(kind))?;
 
         Ok(Self {
             kind,
@@ -329,7 +366,7 @@ impl VideoToolboxEncoder {
         // slots). The AVFrame's Drop releases buf[0] via
         // av_frame_unref, which calls `pixbuf_free` once the last ref
         // drops. hw_frames_ctx is reffed below.
-        unsafe {
+        let frames_ref = unsafe {
             let raw = src.deref_mut();
             raw.buf[0] = pixbuf_buf;
             raw.data[3] = pixbuf.cast::<u8>();
@@ -338,7 +375,17 @@ impl VideoToolboxEncoder {
                 .hw_frames_ctx_mut()
                 .expect("hw_frames_ctx set in new")
                 .as_ptr();
-            raw.hw_frames_ctx = ffi::av_buffer_ref(enc_frames_ref as *mut _);
+            let frames_ref = ffi::av_buffer_ref(enc_frames_ref as *mut _);
+            raw.hw_frames_ctx = frames_ref;
+            frames_ref
+        };
+        // av_buffer_ref returns null on OOM. Without hw_frames_ctx the
+        // encoder will reject the frame; bail with a clean error rather
+        // than letting send_frame surface a generic EINVAL. The
+        // CVPixelBuffer +1 retain is already owned by `pixbuf_buf` /
+        // `src.buf[0]`, so the AVFrame's Drop releases it.
+        if frames_ref.is_null() {
+            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(ffi::ENOMEM))));
         }
 
         src.set_pts(pts);

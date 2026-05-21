@@ -61,9 +61,13 @@ pub(crate) fn drain_encoder(
 
 /// Snapshot `AVCodecContext::extradata` into an owned `Vec<u8>`. Call
 /// this once immediately after `encoder.open()` has succeeded with
-/// `AV_CODEC_FLAG_GLOBAL_HEADER` set. Returns an empty vec if libavcodec
-/// did not populate extradata (a misconfiguration we surface as a
-/// warning at the call site).
+/// `AV_CODEC_FLAG_GLOBAL_HEADER` set. Returns
+/// `Err(CodecError::NoHardwareCodec(..))` if libavcodec did not populate
+/// extradata — without it, keyframes won't carry SPS/PPS and any client
+/// that loses the first IDR or rebuilds its decoder mid-session is
+/// permanently stuck. That breaks Tether's self-decodable-IDR invariant,
+/// so we fail loudly at encoder construction rather than silently
+/// continuing.
 ///
 /// SAFETY: libavcodec populates `extradata` inside `open()` when
 /// `AV_CODEC_FLAG_GLOBAL_HEADER` is set, and does not mutate it
@@ -72,8 +76,8 @@ pub(crate) fn drain_encoder(
 /// owned buffer immediately prevents any subsequent encoder operation
 /// from racing with our read.
 #[allow(clippy::cast_sign_loss)]
-pub(crate) fn snapshot_extradata(encoder: &AVCodecContext) -> Vec<u8> {
-    unsafe {
+pub(crate) fn snapshot_extradata(encoder: &AVCodecContext, codec_name: &str) -> Result<Vec<u8>> {
+    let extradata = unsafe {
         let raw = encoder.extradata;
         let size = encoder.extradata_size;
         if raw.is_null() || size <= 0 {
@@ -81,5 +85,15 @@ pub(crate) fn snapshot_extradata(encoder: &AVCodecContext) -> Vec<u8> {
         } else {
             slice::from_raw_parts(raw, size as usize).to_vec()
         }
+    };
+    if extradata.is_empty() {
+        return Err(CodecError::NoHardwareCodec(format!(
+            "{codec_name}: encoder.extradata was empty after open() despite \
+             AV_CODEC_FLAG_GLOBAL_HEADER. Keyframes would not carry SPS/PPS, \
+             so any client that loses the first IDR or rebuilds its decoder \
+             mid-session would be stuck. Verify the FFmpeg build honours \
+             AV_CODEC_FLAG_GLOBAL_HEADER for this codec."
+        )));
     }
+    Ok(extradata)
 }

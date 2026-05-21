@@ -172,8 +172,9 @@ pub fn bt709_limited_to_srgb_display(yuv: Yuv8, spec: VideoColorSpec) -> Bgra8 {
         // signal the production path would have logged.
         ColorTransfer::Pq | ColorTransfer::Hlg | ColorTransfer::Linear => {
             tracing::warn!(
+                side = "cpu_mirror",
                 ?spec.transfer,
-                "CPU color mirror doesn't yet implement this EOTF; falling back to BT.709"
+                "EOTF not yet implemented; falling back to BT.709"
             );
             (bt709_eotf(r_gamma), bt709_eotf(g_gamma), bt709_eotf(b_gamma))
         }

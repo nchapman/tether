@@ -95,8 +95,9 @@ fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
         // chain is in place.
         ColorTransfer::Pq | ColorTransfer::Hlg | ColorTransfer::Linear => {
             tracing::warn!(
+                side = "gpu",
                 ?spec.transfer,
-                "renderer doesn't yet implement this EOTF; falling back to BT.709"
+                "EOTF not yet implemented; falling back to BT.709"
             );
             TRANSFER_KIND_BT709
         }
@@ -735,7 +736,7 @@ fn write_plane(
 
 
 #[cfg(test)]
-mod transfer_kind_tests {
+mod tests {
     use super::{transfer_kind_for, TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB};
     use tether_protocol::control::{ColorTransfer, VideoColorSpec};
 
@@ -743,21 +744,29 @@ mod transfer_kind_tests {
     /// renumbers the WGSL constants (or reorders the Rust match
     /// arms) fails LOUDLY rather than silently rendering with the
     /// wrong EOTF. Cross-language constant agreement is otherwise
-    /// only documented in comments; this test makes it
-    /// machine-checked from the Rust side. The WGSL side stays
-    /// unchecked at default `cargo test` time (a GPU-readback
-    /// integration test would close that loop; deferred).
+    /// only documented in comments; this test makes the Rust side
+    /// machine-checked. The WGSL side stays unchecked at default
+    /// `cargo test` time (a GPU-readback integration test would
+    /// close that loop; deferred).
+    ///
+    /// Note on exhaustiveness: `transfer_kind_for`'s `match`
+    /// enforces exhaustiveness at compile time, so a new
+    /// `ColorTransfer` variant fails to build until it's wired into
+    /// the function. *This test* doesn't add coverage for that
+    /// case — the array below is hand-written and would silently
+    /// not exercise a future variant. The test pins the *intended*
+    /// mapping (sdr_desktop → Srgb, sdr_bt709 → BT.709, all current
+    /// unimplemented variants → BT.709 fallback) so an inadvertent
+    /// renumbering fails here.
     #[test]
     fn transfer_kind_for_pins_the_mapping() {
         assert_eq!(transfer_kind_for(VideoColorSpec::sdr_desktop()), TRANSFER_KIND_SRGB);
         assert_eq!(transfer_kind_for(VideoColorSpec::sdr_bt709()), TRANSFER_KIND_BT709);
 
-        // Construct each variant directly so the test breaks if
-        // someone adds a ColorTransfer variant and forgets to extend
-        // `transfer_kind_for`. (The match would still compile via
-        // the fallthrough `_`, but this test surfaces the omission
-        // by asserting the intent — Pq/Hlg/Linear all fall back to
-        // BT.709 today.)
+        // Each currently-unimplemented variant should hit the
+        // BT.709 fallback. Keep this array in sync with the
+        // `Pq | Hlg | Linear` arm in `transfer_kind_for`; a future
+        // variant added there should also be appended here.
         for transfer in [ColorTransfer::Pq, ColorTransfer::Hlg, ColorTransfer::Linear] {
             let spec = VideoColorSpec { transfer, ..VideoColorSpec::sdr_desktop() };
             assert_eq!(transfer_kind_for(spec), TRANSFER_KIND_BT709);

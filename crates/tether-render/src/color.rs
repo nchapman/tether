@@ -26,24 +26,21 @@
 //! identity (BGRA in → BGRA out within a few units per channel) over
 //! a spread of colors; if any stage's constants drift it fails.
 //!
-//! Today we hard-pin to BT.709 limited range on both sides, and we
-//! treat the framebuffer bytes as gamma-encoded without distinguishing
-//! sRGB from BT.709. The two transfer curves diverge by ≤~5% in
-//! midtones — visible as a ≤~15-unit lift on mid-gray in the
-//! round-trip test. The principled fix is:
-//!   1. Capture-side: apply sRGB EOTF to BGRA bytes → linear; apply
-//!      BT.709 OETF → BT.709 R'G'B'; then the matrix.
-//!   2. Decode-side: matrix → BT.709 R'G'B'; BT.709 EOTF → linear;
-//!      surface applies sRGB OETF on write.
-//! With both transfer pairs present, the round trip is identity within
-//! quantization noise.
+//! The decoder dispatches its EOTF on the negotiated
+//! [`VideoColorSpec`] — see [`bt709_limited_to_srgb_display`]. A
+//! stream advertising `sdr_desktop` (sRGB transfer) gets the sRGB
+//! EOTF; a stream advertising `sdr_bt709` gets the BT.709 EOTF.
+//! Picking the right one eliminates the ≤~5% midtone mismatch the
+//! spec-blind chain previously had to absorb.
 //!
-//! That fix is gated on stream-side color metadata negotiation (the
-//! decoder needs to know the source transfer curve to pick the right
-//! inverse). The module is structured so it slots in additively: a
-//! `ColorSpec`-like enum carried on the wire would dispatch to
-//! `bt601_*` / `bt2020_*` siblings, and HDR transfer functions (PQ /
-//! HLG) replace the EOTF/OETF pair.
+//! Today the matrix and range are still hard-pinned to BT.709 /
+//! limited regardless of the negotiated spec — the renderer doesn't
+//! yet have variants for `Bt2020Ncl` matrix or `Full` range. Adding
+//! them is a sibling enum-arm in `apply_eotf` / a sibling helper
+//! function; HDR transfer functions (PQ / HLG) drop into the same
+//! dispatch.
+
+use tether_protocol::control::{ColorTransfer, VideoColorSpec};
 
 /// 8-bit BGRA pixel as it appears in a desktop framebuffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -144,26 +141,43 @@ pub fn bgra_to_bt709_limited(bgra: Bgra8) -> Yuv8 {
 }
 
 /// Decode + display one limited-range BT.709 NV12 triplet into the
-/// sRGB byte that an `Bgra8UnormSrgb` surface ends up holding. Mirrors
-/// the WGSL fragment shader's range + matrix + EOTF chain, followed
-/// by wgpu's surface-write OETF.
+/// sRGB byte an `Bgra8UnormSrgb` surface ends up holding. Mirrors
+/// the WGSL fragment shader's range + matrix + EOTF chain (with the
+/// EOTF dispatched on `spec.transfer`, matching the shader's
+/// `apply_eotf`), followed by wgpu's surface-write OETF.
 ///
 /// If the WGSL diverges from this Rust the regression test fails —
 /// the comment on the module-level docstring is the contract.
 #[must_use]
-pub fn bt709_limited_to_srgb_display(yuv: Yuv8) -> Bgra8 {
-    // 1. RANGE: limited -> normalized.
+pub fn bt709_limited_to_srgb_display(yuv: Yuv8, spec: VideoColorSpec) -> Bgra8 {
+    // 1. RANGE: limited -> normalized. Today's only path; `Full`
+    // range would skip this step.
     let y = (f32::from(yuv.0) - 16.0) / 219.0;
     let u = (f32::from(yuv.1) - 128.0) / 224.0;
     let v = (f32::from(yuv.2) - 128.0) / 224.0;
-    // 2. MATRIX: Y'CbCr -> gamma-encoded R'G'B'.
+    // 2. MATRIX: Y'CbCr -> gamma-encoded R'G'B'. Today's only path
+    // is BT.709; `Bt2020Ncl` would dispatch to a different set of
+    // coefficients (and would typically pair with PQ/HLG transfer).
     let r_gamma = y + 1.574_8 * v;
     let g_gamma = y - 0.187_3 * u - 0.468_1 * v;
     let b_gamma = y + 1.855_6 * u;
-    // 3. TRANSFER: BT.709 EOTF -> linear.
-    let r_linear = bt709_eotf(r_gamma);
-    let g_linear = bt709_eotf(g_gamma);
-    let b_linear = bt709_eotf(b_gamma);
+    // 3. TRANSFER: EOTF dispatch — match `apply_eotf` in shader.wgsl.
+    let (r_linear, g_linear, b_linear) = match spec.transfer {
+        ColorTransfer::Bt709 => (bt709_eotf(r_gamma), bt709_eotf(g_gamma), bt709_eotf(b_gamma)),
+        ColorTransfer::Srgb => (srgb_eotf(r_gamma), srgb_eotf(g_gamma), srgb_eotf(b_gamma)),
+        // Pq / Hlg / Linear are unimplemented in the shader and
+        // fall through to BT.709. Match the GPU path's `tracing::warn!`
+        // (`transfer_kind_for` in gpu/mod.rs) so a caller that
+        // accidentally passes a PQ spec in a test sees the same
+        // signal the production path would have logged.
+        ColorTransfer::Pq | ColorTransfer::Hlg | ColorTransfer::Linear => {
+            tracing::warn!(
+                ?spec.transfer,
+                "CPU color mirror doesn't yet implement this EOTF; falling back to BT.709"
+            );
+            (bt709_eotf(r_gamma), bt709_eotf(g_gamma), bt709_eotf(b_gamma))
+        }
+    };
     // 4. SURFACE: sRGB OETF (what wgpu's surface write does for us).
     let r_srgb = srgb_oetf(r_linear);
     let g_srgb = srgb_oetf(g_linear);
@@ -177,11 +191,12 @@ pub fn bt709_limited_to_srgb_display(yuv: Yuv8) -> Bgra8 {
 }
 
 /// Full capture→display round trip. The regression test asserts this
-/// is approximately identity for SDR sRGB inputs.
+/// is approximately identity for SDR sRGB inputs when the decoder
+/// uses the matching spec.
 #[must_use]
-pub fn simulate_round_trip(input: Bgra8) -> Bgra8 {
+pub fn simulate_round_trip(input: Bgra8, spec: VideoColorSpec) -> Bgra8 {
     let yuv = bgra_to_bt709_limited(input);
-    bt709_limited_to_srgb_display(yuv)
+    bt709_limited_to_srgb_display(yuv, spec)
 }
 
 // Sign loss + truncation are intentional: we clamp to [0, 255] first,
@@ -195,41 +210,33 @@ fn round_clamp_u8(v: f32) -> u8 {
 mod tests {
     use super::*;
 
-    /// Per-channel tolerance for the round-trip identity test. Sources
-    /// of error:
-    ///   - sRGB vs BT.709 transfer-curve mismatch: the *dominant*
-    ///     error and the reason this isn't tighter. The capture-side
-    ///     framebuffer is sRGB-encoded, but `gpuconvert` and the
-    ///     shader treat it as BT.709-encoded (no transfer conversion
-    ///     before the matrix). The two transfer functions diverge by
-    ///     ≤~5% in midtones, which projects to ≤~15 units/255 after
-    ///     the matrix + decode round trip. Fixing this requires
-    ///     applying the sRGB EOTF on capture and the BT.709 OETF
-    ///     before the matrix (and the inverse pair on the decode
-    ///     side) — see the TODO at the bottom of the module-level
-    ///     docstring. That fix is gated on carrying the source
-    ///     transfer curve in the stream metadata so the decoder
-    ///     knows which inverse to apply.
-    ///   - u8 quantize on Y/Cb/Cr after limited-range expand
-    ///     (≤0.5/219 ≈ 0.23% on Y).
-    ///   - u8 quantize on display BGRA write (≤0.5/255 ≈ 0.2%).
-    ///   - 4:4:4 here vs 4:2:0 on the wire — not modelled (would
-    ///     add chroma-spatial averaging error; the test uses solid
-    ///     colors so this doesn't apply).
+    /// Per-channel tolerance for the round-trip identity test when the
+    /// decoder uses the wrong EOTF. The encoder treats source bytes
+    /// as gamma-encoded sRGB (every desktop framebuffer is), so a
+    /// BT.709-EOTF decode hits the ≤~5% sRGB-vs-BT.709 transfer
+    /// mismatch — ≤~15 units / 255 in midtones after the round trip.
     ///
-    /// 18 / 255 is the empirical ceiling across the test colors;
-    /// most cases shift by ≤12. Tightening this requires fixing the
-    /// transfer mismatch first.
+    /// The matching path (decoder uses sRGB EOTF) is the one
+    /// `sdr_desktop_round_trip_is_tight` exercises and tightens to
+    /// `TOLERANCE_TIGHT`.
     ///
-    /// **Floor on regression sensitivity:** the pre-fix bug shifted
-    /// mid-gray by ~64 units (`without_eotf_blacks_lift_visibly`
-    /// pins that). So with tolerance 18 we still catch any
-    /// regression that lifts blacks by more than ~3x what the
-    /// current chain does. Good enough to ensure no one accidentally
-    /// reintroduces the EOTF-skip bug.
+    /// **Floor on regression sensitivity:** the pre-fix EOTF-skip
+    /// bug shifted mid-gray by ~64 units
+    /// (`without_eotf_blacks_lift_visibly` pins that). With tolerance
+    /// 18 we still catch any regression that lifts blacks by more
+    /// than ~3× what the current spec-mismatched chain does. The
+    /// tight test (~3 units) catches a regression in the path
+    /// production actually uses.
     const TOLERANCE: i32 = 18;
+    /// Per-channel tolerance for the matching-EOTF round-trip
+    /// identity test (decoder uses the same transfer the encoder
+    /// produced). What remains is u8-quantize noise: ≤0.5/219 ≈
+    /// 0.23% on Y after limited-range expand + ≤0.5/255 ≈ 0.2% on
+    /// the surface byte = a few units total. If this fails the
+    /// matrix, range, or EOTF/OETF constants drifted.
+    const TOLERANCE_TIGHT: i32 = 3;
 
-    fn assert_close(label: &str, got: Bgra8, expected: Bgra8) {
+    fn assert_close(label: &str, got: Bgra8, expected: Bgra8, tolerance: i32) {
         for (chan, g, e) in [
             ("B", got.0, expected.0),
             ("G", got.1, expected.1),
@@ -237,45 +244,64 @@ mod tests {
         ] {
             let diff = i32::from(g) - i32::from(e);
             assert!(
-                diff.abs() <= TOLERANCE,
-                "{label}/{chan}: got {g}, expected {e} (±{TOLERANCE}), diff {diff}"
+                diff.abs() <= tolerance,
+                "{label}/{chan}: got {g}, expected {e} (±{tolerance}), diff {diff}"
             );
         }
         assert_eq!(got.3, expected.3, "{label}/A");
     }
 
-    /// Golden-value test for the full pipeline. Pins the exact bytes
-    /// `simulate_round_trip` produces for two diagnostic colors:
-    /// mid-gray (sensitive to transfer-function drift) and pure red
-    /// (sensitive to matrix-coefficient drift). The
-    /// `bgra_round_trip_is_approximately_identity` test catches large
-    /// regressions but accepts an 18-unit slop; the parallel
-    /// CPU/WGSL implementations could in principle drift the same
-    /// direction and stay inside that slop. These golden bytes are
-    /// the floor that catches a smaller correlated drift — change
-    /// either implementation's constants and the bytes shift, even
-    /// if both shift the same way.
+    /// Twelve test colors covering the parts of the gamut that
+    /// stress the matrix and EOTF differently — corners, neutrals,
+    /// primaries, and mid-saturated colors. Shared by the tight and
+    /// loose round-trip tests so a regression that lights up one
+    /// path lights up the other too.
+    fn round_trip_cases() -> &'static [(&'static str, Bgra8)] {
+        &[
+            ("black", Bgra8(0, 0, 0, 255)),
+            ("white", Bgra8(255, 255, 255, 255)),
+            ("mid gray", Bgra8(128, 128, 128, 255)),
+            ("dark gray", Bgra8(32, 32, 32, 255)),
+            ("light gray", Bgra8(220, 220, 220, 255)),
+            ("pure red", Bgra8(0, 0, 255, 255)),
+            ("pure green", Bgra8(0, 255, 0, 255)),
+            ("pure blue", Bgra8(255, 0, 0, 255)),
+            ("warm beige", Bgra8(180, 200, 220, 255)),
+            ("teal", Bgra8(200, 150, 60, 255)),
+            ("magenta", Bgra8(180, 40, 200, 255)),
+        ]
+    }
+
+    /// Golden-value test for the matching-spec pipeline (decoder
+    /// uses the same EOTF the encoder produced — i.e. sRGB for a
+    /// `sdr_desktop` advertisement). Pins exact bytes for mid-gray
+    /// (sensitive to transfer drift) and pure red (sensitive to
+    /// matrix drift). With matching specs the round trip is identity
+    /// within u8-quantize noise, so any drift in the WGSL or Rust
+    /// constants moves these values; correlated drift between the
+    /// two impls still moves them.
     ///
-    /// If these values change because of an intentional pipeline
-    /// improvement (e.g. switching the EOTF to sRGB), update them
-    /// from the freshly-printed output and note the reason here.
+    /// If these change because of an intentional pipeline change
+    /// (e.g. swapping a matrix variant), update from the
+    /// freshly-printed values and note the reason here.
     #[test]
     fn golden_round_trip_values() {
-        let gray = simulate_round_trip(Bgra8(128, 128, 128, 255));
+        let spec = VideoColorSpec::sdr_desktop();
+
+        let gray = simulate_round_trip(Bgra8(128, 128, 128, 255), spec);
         assert_eq!(
             (gray.0, gray.1, gray.2, gray.3),
-            (140, 140, 140, 255),
-            "mid-gray drift — TRANSFER curve constants likely changed"
+            (128, 128, 128, 255),
+            "mid-gray drift — TRANSFER constants (sRGB EOTF / OETF) likely changed"
         );
 
-        let red = simulate_round_trip(Bgra8(0, 0, 255, 255));
+        let red = simulate_round_trip(Bgra8(0, 0, 255, 255), spec);
         assert_eq!(
             (red.0, red.1, red.2, red.3),
-            (0, 2, 255, 255),
+            (0, 1, 255, 255),
             "pure red drift — MATRIX coefficients or RANGE constants likely \
-             changed. (The G=2 is a small chroma overshoot from the BT.709 \
-             matrix on pure red; it's stable as long as the matrix isn't \
-             touched.)"
+             changed. (The G=1 is a small chroma overshoot from the BT.709 \
+             matrix on pure red; stable as long as the matrix isn't touched.)"
         );
     }
 
@@ -305,35 +331,37 @@ mod tests {
         }
     }
 
-    /// The regression test for the washed-out-video bug. The shader
-    /// previously emitted gamma-encoded R'G'B' to an sRGB surface,
-    /// causing wgpu to re-encode and lift blacks / brighten midtones.
-    /// With the BT.709 EOTF correctly applied before the surface
-    /// write, the round trip is identity within `TOLERANCE`. If
-    /// someone removes the EOTF (or replaces it with the wrong
-    /// transfer curve), several colors here will fail.
+    /// **The principled regression test.** Decoder spec matches what
+    /// the host advertises today (`sdr_desktop`, sRGB transfer), so
+    /// the round trip is identity within u8-quantize noise. If the
+    /// shader's EOTF dispatch breaks, the matrix coefficients drift,
+    /// or the range expansion is mis-implemented, this fails. The
+    /// tight tolerance (3 units) is what gives the test real
+    /// regression power.
     #[test]
-    fn bgra_round_trip_is_approximately_identity() {
-        // Pure ramps across each channel + corners + a representative
-        // mid-tone gray. Picking values that hit both the linear toe
-        // and the gamma-curve highlights so a wrong transfer function
-        // fails at least one cell rather than being averaged out.
-        let cases: &[(&str, Bgra8)] = &[
-            ("black", Bgra8(0, 0, 0, 255)),
-            ("white", Bgra8(255, 255, 255, 255)),
-            ("mid gray", Bgra8(128, 128, 128, 255)),
-            ("dark gray", Bgra8(32, 32, 32, 255)),
-            ("light gray", Bgra8(220, 220, 220, 255)),
-            ("pure red", Bgra8(0, 0, 255, 255)),
-            ("pure green", Bgra8(0, 255, 0, 255)),
-            ("pure blue", Bgra8(255, 0, 0, 255)),
-            ("warm beige", Bgra8(180, 200, 220, 255)),
-            ("teal", Bgra8(200, 150, 60, 255)),
-            ("magenta", Bgra8(180, 40, 200, 255)),
-        ];
-        for (label, input) in cases {
-            let out = simulate_round_trip(*input);
-            assert_close(label, out, *input);
+    fn sdr_desktop_round_trip_is_tight() {
+        let spec = VideoColorSpec::sdr_desktop();
+        for (label, input) in round_trip_cases() {
+            let out = simulate_round_trip(*input, spec);
+            assert_close(label, out, *input, TOLERANCE_TIGHT);
+        }
+    }
+
+    /// Mismatched-spec test. Source bytes are sRGB-encoded (every
+    /// desktop framebuffer is) but the decoder applies BT.709 EOTF
+    /// — the spec-blind case from before the negotiation landed.
+    /// The transfer-curve mismatch projects to ≤18 units of midtone
+    /// lift; this test pins that, so a future regression that
+    /// *widens* the mismatch fails. The path is not the production
+    /// path anymore (host advertises `sdr_desktop` → decoder uses
+    /// sRGB EOTF) but is exercised here so the cost of the legacy
+    /// chain stays documented.
+    #[test]
+    fn sdr_bt709_round_trip_within_legacy_tolerance() {
+        let spec = VideoColorSpec::sdr_bt709();
+        for (label, input) in round_trip_cases() {
+            let out = simulate_round_trip(*input, spec);
+            assert_close(label, out, *input, TOLERANCE);
         }
     }
 
@@ -379,7 +407,8 @@ mod tests {
         assert!(
             diff > TOLERANCE,
             "broken decode (skipped EOTF) should lift mid-gray by more than {TOLERANCE} units — \
-             got diff {diff}. If this fails the regression test would have a blind spot."
+             got diff {diff}. If this fails, even the legacy-tolerance regression test \
+             would have a blind spot, let alone the tight test."
         );
     }
 }

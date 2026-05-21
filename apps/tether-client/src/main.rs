@@ -613,10 +613,15 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Render loop blocks until the user closes the window.
+    // Render loop blocks until the user closes the window. The
+    // host's advertised color spec drives the renderer's EOTF
+    // dispatch — for desktop captures (`sdr_desktop`) this is the
+    // sRGB path, eliminating the BT.709-vs-sRGB transfer-curve
+    // mismatch the spec-blind chain previously had to absorb.
     tether_render::run(
         "tether-client",
         (INITIAL_WIDTH, INITIAL_HEIGHT),
+        server_body.color_space,
         frame_rx,
         Some(on_event),
     )?;

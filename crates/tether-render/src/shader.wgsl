@@ -33,6 +33,14 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 @group(0) @binding(1) var uv_tex: texture_2d<f32>;
 @group(0) @binding(2) var s: sampler;
 
+// Color params. .x is the EOTF dispatch tag (see Rust constants
+// TRANSFER_KIND_* in gpu/mod.rs); .yzw are reserved padding for
+// future axes (matrix kind / range kind when they grow shader
+// variants).
+@group(2) @binding(0) var<uniform> color_params: vec4<u32>;
+const TRANSFER_KIND_BT709: u32 = 0u;
+const TRANSFER_KIND_SRGB: u32 = 1u;
+
 // =============================================================
 // YUV -> display: three independent transforms, each swappable.
 // =============================================================
@@ -121,6 +129,38 @@ fn bt709_eotf(rgb_gamma: vec3<f32>) -> vec3<f32> {
     );
 }
 
+fn srgb_eotf_component(v: f32) -> f32 {
+    // sRGB EOTF (IEC 61966-2-1). The principled transfer for desktop
+    // capture sources whose framebuffer bytes are sRGB-encoded
+    // (which is to say: macOS / Wayland / Windows compositor
+    // output). Same shape as the BT.709 EOTF but a different
+    // break-point and exponent — the curves agree at the endpoints
+    // and diverge by up to ~5% in midtones.
+    let vc = max(v, 0.0);
+    if (vc <= 0.04045) {
+        return vc / 12.92;
+    }
+    return pow((vc + 0.055) / 1.055, 2.4);
+}
+
+fn srgb_eotf(rgb_gamma: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        srgb_eotf_component(rgb_gamma.x),
+        srgb_eotf_component(rgb_gamma.y),
+        srgb_eotf_component(rgb_gamma.z),
+    );
+}
+
+fn apply_eotf(rgb_gamma: vec3<f32>) -> vec3<f32> {
+    // Per-frame uniform branch — every fragment in a draw takes the
+    // same path, so there's no warp divergence cost. Modern GPUs
+    // optimise this to a uniform control flow predicate.
+    if (color_params.x == TRANSFER_KIND_SRGB) {
+        return srgb_eotf(rgb_gamma);
+    }
+    return bt709_eotf(rgb_gamma);
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // 1. SAMPLE
@@ -135,8 +175,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // 3. MATRIX: BT.709 Y'CbCr -> gamma-encoded R'G'B'.
     let rgb_gamma = bt709_ycbcr_to_rgb_gamma(y, u, v);
 
-    // 4. TRANSFER: BT.709 EOTF -> linear light.
-    let rgb_linear = bt709_eotf(rgb_gamma);
+    // 4. TRANSFER: EOTF -> linear light. `apply_eotf` dispatches on
+    // the negotiated `color_params.x` so a stream that advertised
+    // sRGB transfer (desktop capture) doesn't get the BT.709 EOTF
+    // applied to it — that mismatch is the ≤~5% midtone lift the
+    // tolerance-18 regression test currently tolerates.
+    let rgb_linear = apply_eotf(rgb_gamma);
 
     // wgpu applies the surface format's OETF on write. Output is
     // therefore linear; the display receives correctly-encoded

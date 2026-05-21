@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
+use tether_protocol::control::{ColorTransfer, VideoColorSpec};
 use winit::window::Window;
 
 use crate::{CpuFrame, Frame, GpuFrame, RenderError, Result};
@@ -56,6 +57,15 @@ pub(crate) struct GpuState {
     retired: Option<YuvTextures>,
     scale_buffer: wgpu::Buffer,
     scale_bind_group: wgpu::BindGroup,
+    /// Color-params uniform: holds the EOTF kind the fragment shader
+    /// dispatches on (`bt709_eotf` vs `srgb_eotf`). Written once at
+    /// pipeline-build time from the negotiated `VideoColorSpec`.
+    /// Kept on the struct (rather than dropped after the write) so
+    /// a future mid-session resign — when the protocol grows one —
+    /// can `queue.write_buffer` into it without rebuilding the pipeline.
+    #[allow(dead_code)]
+    color_params_buffer: wgpu::Buffer,
+    color_params_bind_group: wgpu::BindGroup,
     /// True if `VULKAN_EXTERNAL_MEMORY_DMA_BUF` was negotiated on the
     /// adapter. Gates the DMA-BUF import path; without it, a `GpuFrame`
     /// from the decoder gets dropped with a warn — the decoder probe
@@ -64,8 +74,37 @@ pub(crate) struct GpuState {
     dmabuf_import_supported: bool,
 }
 
+/// Numeric tag for the WGSL fragment shader's EOTF dispatch. Keep in
+/// sync with the `bt709_eotf` / `srgb_eotf` switch in `shader.wgsl`.
+/// Encoding it as a single integer (rather than separate uniforms or
+/// pipeline variants) means the renderer never recompiles when a
+/// future stream renegotiates the transfer; the shader picks the
+/// right path per draw.
+const TRANSFER_KIND_BT709: u32 = 0;
+const TRANSFER_KIND_SRGB: u32 = 1;
+
+fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
+    match spec.transfer {
+        ColorTransfer::Bt709 => TRANSFER_KIND_BT709,
+        ColorTransfer::Srgb => TRANSFER_KIND_SRGB,
+        // PQ / HLG / Linear are reserved on the wire; the shader
+        // doesn't implement them yet. Fall back to BT.709 with a
+        // warn — the picture will look slightly off but won't be
+        // unwatchable. Promoting these to a hard error is what the
+        // HDR work should do once the surface format / tone-map
+        // chain is in place.
+        ColorTransfer::Pq | ColorTransfer::Hlg | ColorTransfer::Linear => {
+            tracing::warn!(
+                ?spec.transfer,
+                "renderer doesn't yet implement this EOTF; falling back to BT.709"
+            );
+            TRANSFER_KIND_BT709
+        }
+    }
+}
+
 impl GpuState {
-    pub(crate) async fn new(window: Arc<Window>) -> Result<Self> {
+    pub(crate) async fn new(window: Arc<Window>, color_space: VideoColorSpec) -> Result<Self> {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
@@ -224,6 +263,53 @@ impl GpuState {
             }],
         });
 
+        // Color-params bind group: a `vec4<u32>` whose .x is the EOTF
+        // dispatch tag the WGSL fragment shader switches on. The
+        // other three slots are reserved for future axes (matrix
+        // kind, range kind) when those gain shader variants — today
+        // only the transfer is variable. (WGSL's std140 layout pads
+        // a bare `u32` in a uniform block to 16 bytes anyway;
+        // `vec4<u32>` makes that explicit and the reserved slots
+        // self-documenting.)
+        let color_params_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tether-render color-params bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let color_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tether-render color-params uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let transfer_kind = transfer_kind_for(color_space);
+        let color_params: [u32; 4] = [transfer_kind, 0, 0, 0];
+        queue.write_buffer(&color_params_buffer, 0, &bytes_of_u32x4(&color_params));
+        tracing::info!(
+            matrix = ?color_space.matrix,
+            range = ?color_space.range,
+            transfer = ?color_space.transfer,
+            primaries = ?color_space.primaries,
+            transfer_kind,
+            "renderer color spec applied"
+        );
+        let color_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tether-render color-params bind group"),
+            layout: &color_params_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: color_params_buffer.as_entire_binding(),
+            }],
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tether-render shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shader.wgsl").into()),
@@ -231,7 +317,7 @@ impl GpuState {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tether-render pipeline layout"),
-            bind_group_layouts: &[Some(&yuv_bgl), Some(&scale_bgl)],
+            bind_group_layouts: &[Some(&yuv_bgl), Some(&scale_bgl), Some(&color_params_bgl)],
             immediate_size: 0,
         });
 
@@ -275,6 +361,8 @@ impl GpuState {
             retired: None,
             scale_buffer,
             scale_bind_group,
+            color_params_buffer,
+            color_params_bind_group,
             dmabuf_import_supported,
         })
     }
@@ -458,6 +546,7 @@ impl GpuState {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.textures.bind_group, &[]);
             pass.set_bind_group(1, &self.scale_bind_group, &[]);
+            pass.set_bind_group(2, &self.color_params_bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -500,6 +589,14 @@ fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
 }
 
 fn bytes_of_f32x4(v: &[f32; 4]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, x) in v.iter().enumerate() {
+        out[i * 4..(i + 1) * 4].copy_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn bytes_of_u32x4(v: &[u32; 4]) -> [u8; 16] {
     let mut out = [0u8; 16];
     for (i, x) in v.iter().enumerate() {
         out[i * 4..(i + 1) * 4].copy_from_slice(&x.to_le_bytes());
@@ -634,4 +731,36 @@ fn write_plane(
             depth_or_array_layers: 1,
         },
     );
+}
+
+
+#[cfg(test)]
+mod transfer_kind_tests {
+    use super::{transfer_kind_for, TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB};
+    use tether_protocol::control::{ColorTransfer, VideoColorSpec};
+
+    /// Pins the Rust→shader integer mapping so a refactor that
+    /// renumbers the WGSL constants (or reorders the Rust match
+    /// arms) fails LOUDLY rather than silently rendering with the
+    /// wrong EOTF. Cross-language constant agreement is otherwise
+    /// only documented in comments; this test makes it
+    /// machine-checked from the Rust side. The WGSL side stays
+    /// unchecked at default `cargo test` time (a GPU-readback
+    /// integration test would close that loop; deferred).
+    #[test]
+    fn transfer_kind_for_pins_the_mapping() {
+        assert_eq!(transfer_kind_for(VideoColorSpec::sdr_desktop()), TRANSFER_KIND_SRGB);
+        assert_eq!(transfer_kind_for(VideoColorSpec::sdr_bt709()), TRANSFER_KIND_BT709);
+
+        // Construct each variant directly so the test breaks if
+        // someone adds a ColorTransfer variant and forgets to extend
+        // `transfer_kind_for`. (The match would still compile via
+        // the fallthrough `_`, but this test surfaces the omission
+        // by asserting the intent — Pq/Hlg/Linear all fall back to
+        // BT.709 today.)
+        for transfer in [ColorTransfer::Pq, ColorTransfer::Hlg, ColorTransfer::Linear] {
+            let spec = VideoColorSpec { transfer, ..VideoColorSpec::sdr_desktop() };
+            assert_eq!(transfer_kind_for(spec), TRANSFER_KIND_BT709);
+        }
+    }
 }

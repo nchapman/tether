@@ -203,17 +203,16 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // exercises the legacy `color_space` field on ServerHelloV1
     fn round_trip_server_hello_hevc() {
         // Codec negotiation lands HEVC: client advertised [Hevc, H264],
         // host probed and picked Hevc, echoes back in chosen_codec.
         // Round-tripping confirms the host's selection survives the wire.
-        use crate::control::{ChromaSubsampling, ColorSpace, ServerHello, ServerHelloV1};
+        use crate::control::{ChromaSubsampling, ServerHello, ServerHelloV1, VideoColorSpec};
         let body = ServerHelloV1 {
             server_name: "tether-host".into(),
             chosen_codec: CodecKind::Hevc,
             chosen_chroma: ChromaSubsampling::Yuv420,
-            color_space: ColorSpace::Bt709Limited,
+            color_space: VideoColorSpec::sdr_desktop(),
             resolution: (1920, 1080),
             clock_probe_t0_echo: MonoNanos(42),
             t1_server_recv: MonoNanos(43),
@@ -386,14 +385,14 @@ mod tests {
     }
 
     #[test]
-    fn color_spec_extension_round_trips() {
+    fn video_color_spec_round_trips() {
         use crate::control::{
             ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, VideoColorSpec,
-            COLOR_SPEC_EXTENSION_KEY,
         };
         // Hand-build a non-default spec so every field is exercised
-        // (the legacy default would round-trip even if we accidentally
-        // dropped one of the four axes from the struct on either end).
+        // (a `default()` round-trip would still pass if we
+        // accidentally dropped one of the four axes from the struct
+        // on either end).
         let spec = VideoColorSpec {
             matrix: ColorMatrix::Bt2020Ncl,
             range: ColorRange::Full,
@@ -403,15 +402,6 @@ mod tests {
         let bytes = encode(&spec).unwrap();
         let decoded: VideoColorSpec = decode(&bytes).unwrap();
         assert_eq!(decoded, spec);
-
-        // Hello-extension integration shape: server stashes the
-        // bincode payload in the BTreeMap, client pulls it back out.
-        let mut ext = std::collections::BTreeMap::<String, Vec<u8>>::new();
-        ext.insert(COLOR_SPEC_EXTENSION_KEY.to_string(), bytes);
-        let read = ext.get(COLOR_SPEC_EXTENSION_KEY).expect("present");
-        let from_ext: VideoColorSpec = decode(read).unwrap();
-        assert_eq!(from_ext, spec);
-        assert_eq!(COLOR_SPEC_EXTENSION_KEY, "tether.color-spec");
     }
 
     #[test]
@@ -419,25 +409,26 @@ mod tests {
         use crate::control::{
             ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, VideoColorSpec,
         };
-        // `sdr_legacy` is the today-hard-pinned spec — what an
-        // absent `tether.color-spec` extension is taken to mean.
-        // Pin the four axes here so a future refactor that swaps
-        // a default fails loudly.
-        let legacy = VideoColorSpec::sdr_legacy();
-        assert_eq!(legacy.matrix, ColorMatrix::Bt709);
-        assert_eq!(legacy.range, ColorRange::Limited);
-        assert_eq!(legacy.transfer, ColorTransfer::Bt709);
-        assert_eq!(legacy.primaries, ColorPrimaries::Bt709);
-        assert_eq!(VideoColorSpec::default(), legacy);
-
-        // `sdr_desktop` is the principled SDR-screen-capture spec:
-        // sRGB transfer instead of BT.709. Everything else matches.
+        // `sdr_desktop` is what every current host backend advertises:
+        // sRGB transfer (compositor framebuffer reality) with BT.709
+        // matrix / primaries / limited range. Pin the four axes so a
+        // future refactor that swaps an axis fails loudly.
         let desktop = VideoColorSpec::sdr_desktop();
         assert_eq!(desktop.matrix, ColorMatrix::Bt709);
         assert_eq!(desktop.range, ColorRange::Limited);
         assert_eq!(desktop.transfer, ColorTransfer::Srgb);
         assert_eq!(desktop.primaries, ColorPrimaries::Bt709);
-        assert_ne!(desktop, legacy);
+        assert_eq!(VideoColorSpec::default(), desktop);
+
+        // `sdr_bt709` is the broadcast spec (BT.709 transfer instead
+        // of sRGB). Same matrix / primaries / range as desktop;
+        // distinguished only by the transfer curve.
+        let bt709 = VideoColorSpec::sdr_bt709();
+        assert_eq!(bt709.matrix, ColorMatrix::Bt709);
+        assert_eq!(bt709.range, ColorRange::Limited);
+        assert_eq!(bt709.transfer, ColorTransfer::Bt709);
+        assert_eq!(bt709.primaries, ColorPrimaries::Bt709);
+        assert_ne!(bt709, desktop);
     }
 
     #[test]

@@ -50,13 +50,6 @@
 //!   [`crate::audio::AudioConfig`]. Advertised on `ServerHelloV1`.
 //! - `tether.pixel-format` — host video pixel format; payload is
 //!   bincode-encoded [`PixelFormat`]. Advertised on `ServerHelloV1`.
-//! - `tether.color-spec` — host video color spec (matrix / range /
-//!   transfer / primaries); payload is bincode-encoded
-//!   [`VideoColorSpec`]. Advertised on `ServerHelloV1`. Absence
-//!   implies [`VideoColorSpec::sdr_legacy`]. The richer four-axis
-//!   shape is the negotiation prerequisite for the transfer-correct
-//!   shader path; the legacy [`ServerHelloV1::color_space`] field is
-//!   preserved alongside for clients that haven't been updated yet.
 //! - `tether.gamepad-rumble` — host → client rumble command; rides
 //!   [`ControlMessage::Extension`] until it earns a typed variant
 //!   in a future hello revision. Payload shape: TBD pending the
@@ -126,31 +119,8 @@ pub enum ChromaSubsampling {
     Yuv444,
 }
 
-/// Legacy single-axis color descriptor on [`ServerHelloV1`].
-/// Superseded by [`VideoColorSpec`] carried via the
-/// [`COLOR_SPEC_EXTENSION_KEY`] hello extension. Kept on
-/// `ServerHelloV1` for backwards compatibility with V1 clients that
-/// don't recognise the extension; new code should advertise both
-/// (this field set to `Bt709Limited`, the extension carrying the
-/// real four-axis spec) and prefer the extension when reading.
-///
-/// Will be removed when `ClientHelloV2` / `ServerHelloV2` lands.
-#[deprecated(
-    note = "use VideoColorSpec via the tether.color-spec hello extension; \
-            this single-axis enum is preserved only for V1 backwards compat \
-            and will be removed when the next hello version ships"
-)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ColorSpace {
-    /// BT.709 limited range. The only color space supported in v0.
-    Bt709Limited,
-}
-
 // =============================================================
-// Four-axis color spec — the principled replacement for
-// `ColorSpace`. Negotiated via the `tether.color-spec` hello
-// extension; absence implies [`VideoColorSpec::sdr_legacy`] (what
-// every Tether build through this commit hard-pins).
+// Four-axis color spec. Carried first-class on `ServerHelloV1`.
 // =============================================================
 //
 // A video stream's color identity is four orthogonal things, each
@@ -238,14 +208,8 @@ pub enum ColorPrimaries {
     Bt2020,
 }
 
-/// The four-axis tuple. Carried as the `tether.color-spec` hello
-/// extension payload (bincode-encoded), advertised on
-/// [`ServerHelloV1::extensions`].
-///
-/// The legacy [`color_space`](ServerHelloV1::color_space) field is
-/// preserved for backwards compatibility — old clients see
-/// `Bt709Limited` and the negotiated extension is opt-in. New
-/// clients that recognise the extension should prefer it.
+/// The four-axis tuple. Carried first-class on
+/// [`ServerHelloV1::color_space`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoColorSpec {
     pub matrix: ColorMatrix,
@@ -255,26 +219,11 @@ pub struct VideoColorSpec {
 }
 
 impl VideoColorSpec {
-    /// What every Tether build through this commit hard-pins: BT.709
-    /// matrix + primaries, limited range, BT.709 transfer assumed
-    /// (even when the source is actually sRGB). Implementations that
-    /// haven't yet wired the negotiated path should advertise this.
-    #[must_use]
-    pub const fn sdr_legacy() -> Self {
-        Self {
-            matrix: ColorMatrix::Bt709,
-            range: ColorRange::Limited,
-            transfer: ColorTransfer::Bt709,
-            primaries: ColorPrimaries::Bt709,
-        }
-    }
-
-    /// The principled spec for a desktop screen capture on macOS,
-    /// Linux Wayland, or Windows: sRGB transfer (compositor
-    /// framebuffer reality) with BT.709 matrix/primaries/range. A
-    /// decoder that respects this can apply the sRGB EOTF instead of
-    /// BT.709's, eliminating the ≤~5% mid-tone lift the legacy
-    /// chain introduces.
+    /// The honest spec for a desktop screen capture on macOS, Linux
+    /// Wayland, or Windows: sRGB transfer (compositor framebuffer
+    /// reality) with BT.709 matrix/primaries and limited range. What
+    /// `tether-host` advertises today. The decoder applies the sRGB
+    /// EOTF to match.
     #[must_use]
     pub const fn sdr_desktop() -> Self {
         Self {
@@ -284,19 +233,31 @@ impl VideoColorSpec {
             primaries: ColorPrimaries::Bt709,
         }
     }
-}
 
-impl Default for VideoColorSpec {
-    /// `sdr_legacy()` — preserves today's behaviour for any caller
-    /// that constructs a spec without thinking about it.
-    fn default() -> Self {
-        Self::sdr_legacy()
+    /// BT.709 transfer + matrix + primaries, limited range. The
+    /// classic broadcast spec; what a video file (`.mp4`, `.mkv`)
+    /// containing BT.709 content would carry. No host backend
+    /// advertises this today (everything goes through
+    /// `sdr_desktop`), but the variant exists so a future
+    /// file-playback or video-conference source can advertise its
+    /// real transfer.
+    #[must_use]
+    pub const fn sdr_bt709() -> Self {
+        Self {
+            matrix: ColorMatrix::Bt709,
+            range: ColorRange::Limited,
+            transfer: ColorTransfer::Bt709,
+            primaries: ColorPrimaries::Bt709,
+        }
     }
 }
 
-/// Hello-extension key for [`VideoColorSpec`] advertisement.
-/// Reverse-DNS per the [`ClientHelloV1::extensions`] convention.
-pub const COLOR_SPEC_EXTENSION_KEY: &str = "tether.color-spec";
+impl Default for VideoColorSpec {
+    /// `sdr_desktop()` — what every current host backend produces.
+    fn default() -> Self {
+        Self::sdr_desktop()
+    }
+}
 
 /// Pixel/bit-depth format the host's video stream uses. The hardware
 /// decoder pipeline (VAAPI, VideoToolbox, Media Foundation) needs this
@@ -409,17 +370,16 @@ pub enum ServerHello {
     V1(ServerHelloV1),
 }
 
-#[allow(deprecated)] // `ColorSpace` field below — see field docstring.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerHelloV1 {
     pub server_name: String,
     pub chosen_codec: CodecKind,
     pub chosen_chroma: ChromaSubsampling,
-    /// Legacy single-axis color descriptor — see [`ColorSpace`]. Kept
-    /// for V1 wire compat; new code reads the four-axis spec via the
-    /// [`COLOR_SPEC_EXTENSION_KEY`] hello extension and falls back to
-    /// this only when the extension is absent.
-    pub color_space: ColorSpace,
+    /// Color identity of the encoded stream — matrix, range,
+    /// transfer, primaries. Negotiated end-to-end so the renderer
+    /// can dispatch the right shader path (EOTF + matrix) without
+    /// guessing.
+    pub color_space: VideoColorSpec,
     pub resolution: (u32, u32),
     /// Echo of the client's `clock_probe_t0` so the client can match
     /// the response to the request it sent.

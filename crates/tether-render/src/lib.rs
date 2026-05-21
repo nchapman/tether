@@ -192,12 +192,17 @@ pub type EventSink = Box<dyn Fn(RenderEvent) + Send>;
 /// closes the window. The frame channel may disconnect; the window stays
 /// open showing the last received frame until the user closes it.
 ///
+/// `color_space` is the `VideoColorSpec` the host advertised in the
+/// handshake. Drives the renderer's EOTF dispatch so the decoded
+/// frame's bytes are interpreted with the right transfer function.
+///
 /// `on_event` is optional: pass `None` to skip input-event emission.
 /// Using a callback rather than a channel lets the caller bridge into
 /// whatever sync/async plumbing they already have.
 pub fn run(
     title: &str,
     initial_size: (u32, u32),
+    color_space: tether_protocol::control::VideoColorSpec,
     frames: Receiver<Frame>,
     on_event: Option<EventSink>,
 ) -> Result<()> {
@@ -205,6 +210,7 @@ pub fn run(
     let mut app = App {
         title: title.to_string(),
         initial_size,
+        color_space,
         window: None,
         gpu: None,
         frames,
@@ -221,6 +227,7 @@ pub fn run(
 struct App {
     title: String,
     initial_size: (u32, u32),
+    color_space: tether_protocol::control::VideoColorSpec,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     frames: Receiver<Frame>,
@@ -298,7 +305,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let gpu = match pollster::block_on(GpuState::new(win.clone())) {
+        let gpu = match pollster::block_on(GpuState::new(win.clone(), self.color_space)) {
             Ok(g) => g,
             Err(e) => {
                 tracing::error!(error = %e, "failed to initialise wgpu");

@@ -186,6 +186,18 @@ impl VideoToolboxDecoder {
     }
 }
 
+impl VideoToolboxDecoder {
+    /// Signal end-of-stream to libavcodec so any frames the decoder
+    /// was holding internally get drained on the next `next_frame`
+    /// call. Used by the capability probe path to extract a frame
+    /// from a single-IDR fixture submit (VT's wrapper otherwise
+    /// requires either another packet or EOF before emitting).
+    pub(crate) fn signal_eof(&mut self) -> Result<()> {
+        self.decoder.send_packet(None)?;
+        Ok(())
+    }
+}
+
 impl Decoder for VideoToolboxDecoder {
     fn submit(&mut self, encoded: &[u8]) -> Result<()> {
         if encoded.is_empty() {

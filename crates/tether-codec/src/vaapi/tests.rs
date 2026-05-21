@@ -178,12 +178,17 @@ fn vaapi_encoder_dmabuf_import() {
 
 #[test]
 #[ignore = "requires VAAPI; one-shot probe check"]
-fn probe_encoder_kind_smoke() {
-    use crate::probe_encoder_kind;
-    use tether_protocol::control::CodecKind;
-    println!("H264 buildable: {}", probe_encoder_kind(CodecKind::H264));
-    println!("HEVC buildable: {}", probe_encoder_kind(CodecKind::Hevc));
-    println!("AV1  buildable: {}", probe_encoder_kind(CodecKind::Av1));
+fn supported_profiles_smoke() {
+    // Diagnostic dump of the per-profile capability matrix on this
+    // box. Useful when investigating "why isn't HEVC 4:4:4 lighting
+    // up?" — the probe runs a real encode + decode round trip per
+    // profile and the output here shows which half failed.
+    for cap in crate::supported_profiles() {
+        println!(
+            "{:?} encode={} decode={}",
+            cap.profile, cap.encode, cap.decode
+        );
+    }
 }
 
 #[test]

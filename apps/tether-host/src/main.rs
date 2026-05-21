@@ -363,7 +363,7 @@ async fn handle_client(
     // portal handshake awaits a user permission dialog); test pattern is
     // sync. Both end up as a `Receiver<CapturedFrame>` so the send loop
     // is identical.
-    let frames = pick_capture_source(use_test_pattern).await?;
+    let frames = pick_capture_source(use_test_pattern, chosen_profile).await?;
 
     // Force-IDR signal: control-stream recv task `raise`s it on
     // `ControlMessage::ForceIdr`; the capture/encode thread `take`s it
@@ -1311,6 +1311,7 @@ fn parse_args() -> anyhow::Result<(SocketAddr, bool)> {
 
 async fn pick_capture_source(
     force_test_pattern: bool,
+    chosen_profile: VideoProfile,
 ) -> anyhow::Result<Receiver<CapturedFrame>> {
     if force_test_pattern {
         info!(
@@ -1325,11 +1326,11 @@ async fn pick_capture_source(
             TEST_PATTERN_FPS,
         ));
     }
-    real_capture().await
+    real_capture(chosen_profile).await
 }
 
 #[cfg(target_os = "linux")]
-async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
+async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<Receiver<CapturedFrame>> {
     info!("capture source: linux (PipeWire + xdg-desktop-portal)");
     // Query which DRM modifiers our wgpu/Vulkan importer can consume for
     // the BGRA-family capture formats PipeWire emits. PipeWire then
@@ -1366,19 +1367,31 @@ async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
 }
 
 #[cfg(target_os = "macos")]
-async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
-    // No gpuconvert preflight — VideoToolbox accepts the NV12
-    // IOSurface ScreenCaptureKit hands us directly. SCK's
-    // `start_capture` triggers the macOS ScreenRecording TCC prompt
-    // on first run; subsequent runs reuse the granted permission.
-    info!("capture source: macOS (ScreenCaptureKit, primary display)");
-    tether_capture::macos::start()
+async fn real_capture(chosen_profile: VideoProfile) -> anyhow::Result<Receiver<CapturedFrame>> {
+    // Pick the SCK pixel format that matches the negotiated encoder
+    // profile. The encoder's `submit_iosurface` cross-checks the
+    // delivered IOSurface fourcc against this; a mismatch would refuse
+    // the zero-copy fast path. SCK's `start_capture` triggers the
+    // macOS ScreenRecording TCC prompt on first run; subsequent runs
+    // reuse the granted permission.
+    let pixel_format = match tether_capture::macos::sck_pixel_format_for_profile(chosen_profile) {
+        tether_capture::macos::SckCapabilityCheck::Supported(p) => p,
+        tether_capture::macos::SckCapabilityCheck::Unsupported => {
+            anyhow::bail!(
+                "no SCK pixel format models the negotiated profile {:?} — the \
+                 capture-bridge filter should have prevented this profile from \
+                 reaching negotiation",
+                chosen_profile
+            );
+        }
+    };
+    tether_capture::macos::start(pixel_format)
         .await
         .map_err(anyhow::Error::from)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
+async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<Receiver<CapturedFrame>> {
     warn!("no real capture backend on this platform yet; falling back to test-pattern");
     Ok(tether_capture::test_pattern::start(
         TEST_PATTERN_WIDTH,
@@ -1414,12 +1427,10 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
 /// The encoder probe verifies the encoder *can produce* a given
 /// profile; this is a separate question from whether the live
 /// capture path can feed it. On macOS, the SCK stream is hardcoded
-/// to `'420v'` NV12 and `VideoToolboxEncoder::submit_iosurface`
-/// errors for any other `(chroma, bit_depth)` — a Main10 session,
-/// which the encoder probe correctly reports as supported, would
-/// crash at first frame. Until SCK-live wiring lets the live
-/// capture format track the negotiated profile, restrict the
-/// advertised set to what the live IOSurface path can carry.
+/// dispatches to the SCK pixel format the encoder needs based on the
+/// negotiated profile, so the advertised set tracks what this Mac's
+/// SCK actually accepts (probed once at process startup) intersected
+/// with what `vt_sw_format` / `iosurface_fourcc_matches` can ingest.
 ///
 /// On Linux the gpuconvert bridge (Nv12DmaBuf / Yuv444DmaBuf) is
 /// 8-bit only; the VAAPI encode probe already gates 10-bit at the
@@ -1429,27 +1440,58 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
 /// the bridge can deliver.
 #[cfg(target_os = "macos")]
 fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfile> {
-    use tether_protocol::control::ChromaSubsampling;
+    let caps = sck_capture_capability();
     probed
         .into_iter()
         .filter(|p| {
-            // Live SCK capture today is 8-bit 4:2:0 only. Until the
-            // SCK probe outcome drives the live stream's pixel
-            // format, anything else can't ride the IOSurface fast
-            // path. Logging is intentional — when 10-bit / 4:4:4
-            // probes start passing, the line below explains why
-            // the host isn't advertising them.
-            let deliverable = p.chroma == ChromaSubsampling::Yuv420 && p.bit_depth == 8;
+            let mapping = tether_capture::macos::sck_pixel_format_for_profile(*p);
+            let deliverable = mapping.is_deliverable(&caps);
             if !deliverable {
                 tracing::info!(
                     profile = ?p,
-                    "encoder probe accepted profile but live SCK capture is 420v 8-bit only; \
-                     filtering out until SCK→live wiring matches the probe"
+                    "encoder probe accepted profile but live SCK capture cannot deliver \
+                     the matching pixel format on this Mac; filtering out"
                 );
             }
             deliverable
         })
         .collect()
+}
+
+/// Cached SCK probe result. The probe takes one `start_capture` cycle
+/// per format (~6 candidates × ~50ms = ~300ms total) and the answer is
+/// process-stable — driver / OS version / silicon doesn't change at
+/// runtime. Filtering encode profiles on each `handle_client` would
+/// otherwise repeat the probe per connection.
+#[cfg(target_os = "macos")]
+fn sck_capture_capability() -> tether_capture::macos::SckCaptureCapability {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<tether_capture::macos::SckCaptureCapability> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        // Run the probe synchronously here. The function is sync from
+        // the caller's perspective but the underlying SCK calls
+        // require a tokio runtime; we bridge via `block_in_place` if
+        // we're inside the runtime, else spawn a temporary one. In
+        // practice this runs on the first `handle_client` call which
+        // is always inside the main tokio runtime.
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(tether_capture::macos::probe_capture_pixel_formats())
+        });
+        match result {
+            Ok(caps) => {
+                tracing::info!(?caps, "SCK capture capability (cached for process lifetime)");
+                caps
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SCK probe failed; assuming only 420v deliverable");
+                tether_capture::macos::SckCaptureCapability {
+                    yuv420_video_range: true,
+                    ..Default::default()
+                }
+            }
+        }
+    })
 }
 
 #[cfg(not(target_os = "macos"))]

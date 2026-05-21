@@ -318,16 +318,33 @@ impl VideoToolboxEncoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
-        // IOSurface fast path only wired for NV12 today — that's what
-        // SCK hands us via `'420v'` capture. If a session ever
-        // negotiates a higher chroma/depth profile, this path needs an
-        // IOSurface fourcc check + matching capture-side wiring before
-        // we wrap it in a CVPixelBuffer; surfaces from a different
-        // CV pixel format would silently mis-encode against the
-        // encoder's sw_format. Refuse here and let the caller fall
-        // back to `encode_bgra` (or, eventually, hit the matching
-        // surface path).
-        if self.chroma != ChromaSubsampling::Yuv420 || self.bit_depth != 8 {
+        // Fourcc cross-check: the IOSurface's pixel format must match
+        // the encoder's configured `sw_format` family. A
+        // mismatched-format IOSurface wrapped in a CVPixelBuffer would
+        // silently mis-encode (the FFmpeg VT hwaccel reads plane
+        // dimensions from the encoder's `sw_format`, not from the
+        // CVPixelBuffer's runtime format). Refuse and let the caller
+        // route through `encode_bgra` rather than ship corrupted
+        // video.
+        //
+        // Allowed families:
+        //   - (Yuv420, 8)  → `'420v'` / `'420f'` (NV12)
+        //   - (Yuv420, 10) → `'x420'` / `'xf20'` (P010-family video
+        //                    range / full range)
+        //   - (Yuv444, 8)  → `'444v'` / `'444f'` (NV24)  *
+        //   - (Yuv444, 10) → `'xf44'` (P410-family full range)        *
+        //
+        // (*) the encoder probe currently rejects 4:4:4 on macOS due
+        // to a VT silent-downsample bug, so those rows aren't
+        // exercised by a negotiated session today — they're listed
+        // for symmetry with `vt_sw_format`.
+        if !iosurface_fourcc_matches(self.chroma, self.bit_depth, frame.pixel_format) {
+            tracing::debug!(
+                encoder_chroma = ?self.chroma,
+                encoder_bit_depth = self.bit_depth,
+                iosurface_fourcc = format_args!("0x{:08x}", frame.pixel_format),
+                "IOSurface fourcc does not match encoder sw_format; refusing zero-copy submit"
+            );
             return Err(CodecError::UnsupportedInputFormat);
         }
         if frame.width != self.width || frame.height != self.height {
@@ -580,6 +597,65 @@ fn vt_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
         (ChromaSubsampling::Yuv444, 10) => ffi::AV_PIX_FMT_P410LE,
         _ => return Err(CodecError::UnsupportedInputFormat),
     })
+}
+
+/// Does the IOSurface's `kCVPixelFormatType_*` fourcc match the
+/// encoder's configured `(chroma, bit_depth)`? Used by
+/// [`VideoToolboxEncoder::submit_iosurface`] to reject zero-copy
+/// submissions whose surface format would silently mis-encode against
+/// the encoder's `sw_format` — VT's hwaccel reads plane dimensions
+/// from `sw_format`, not from the runtime CVPixelBuffer, so a mismatch
+/// produces corrupted output rather than an error.
+fn iosurface_fourcc_matches(chroma: ChromaSubsampling, bit_depth: u8, fourcc: u32) -> bool {
+    const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
+    const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
+    const P010_VIDEO: u32 = u32::from_be_bytes(*b"x420");
+    const P010_FULL: u32 = u32::from_be_bytes(*b"xf20");
+    const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
+    const NV24_FULL: u32 = u32::from_be_bytes(*b"444f");
+    const P410_FULL: u32 = u32::from_be_bytes(*b"xf44");
+    matches!(
+        (chroma, bit_depth, fourcc),
+        (ChromaSubsampling::Yuv420, 8, NV12_VIDEO | NV12_FULL)
+            | (ChromaSubsampling::Yuv420, 10, P010_VIDEO | P010_FULL)
+            | (ChromaSubsampling::Yuv444, 8, NV24_VIDEO | NV24_FULL)
+            | (ChromaSubsampling::Yuv444, 10, P410_FULL)
+    )
+}
+
+#[cfg(test)]
+mod fourcc_match_tests {
+    use super::*;
+
+    #[test]
+    fn fourcc_matches_for_each_supported_combo() {
+        // Encoder configured (chroma, bit_depth) ↔ IOSurface fourcc.
+        // Both range variants of 4:2:0 (8-bit / 10-bit) are accepted
+        // — the encoder doesn't care about video vs full range at
+        // this layer; the renderer's color matrix handles range
+        // conversion downstream.
+        for (chroma, bd, fourcc, accept) in [
+            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"420v"), true),
+            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"420f"), true),
+            (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"x420"), true),
+            (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"xf20"), true),
+            (ChromaSubsampling::Yuv444, 8, u32::from_be_bytes(*b"444v"), true),
+            (ChromaSubsampling::Yuv444, 8, u32::from_be_bytes(*b"444f"), true),
+            (ChromaSubsampling::Yuv444, 10, u32::from_be_bytes(*b"xf44"), true),
+            // Cross-bucket mismatches: 10-bit cells for an 8-bit
+            // encoder, 4:4:4 fourcc for a 4:2:0 encoder, etc.
+            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"x420"), false),
+            (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"420v"), false),
+            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"444v"), false),
+            (ChromaSubsampling::Yuv444, 10, u32::from_be_bytes(*b"x420"), false),
+        ] {
+            assert_eq!(
+                iosurface_fourcc_matches(chroma, bd, fourcc),
+                accept,
+                "({chroma:?}, {bd}, 0x{fourcc:08x}) accept={accept}"
+            );
+        }
+    }
 }
 
 

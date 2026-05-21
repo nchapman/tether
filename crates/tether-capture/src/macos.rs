@@ -32,6 +32,7 @@ use screencapturekit::prelude::{
     SCStreamConfiguration, SCStreamOutputTrait, SCStreamOutputType,
 };
 use screencapturekit::FourCharCode;
+use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 use tether_protocol::MonoNanos;
 
 use crate::{
@@ -50,20 +51,22 @@ const CAPTURE_CHANNEL_DEPTH: usize = 2;
 /// just the same value.
 const CAPTURE_FPS: u32 = 60;
 
-/// Start ScreenCaptureKit on the primary display.
+/// Start ScreenCaptureKit on the primary display with the requested
+/// pixel format.
 ///
 /// The returned receiver emits one [`CapturedFrame::Gpu`] per delivered
 /// sample. Dropping the receiver shuts the capture thread down on the
 /// next sample-buffer callback.
 ///
-/// Runs [`probe_capture_pixel_formats`] first and logs the result.
-/// The live stream still uses NV12 (`420v`) regardless — wiring the
-/// probe outcome into the host's capability advertisement is a
-/// downstream concern. The probe is here so the log captures
-/// "what *could* this Mac do?" alongside "what are we asking it for?"
-/// in every host startup, which is how we'll know empirically whether
-/// `xf44` / `'444v'` are reachable on each silicon generation.
-pub async fn start() -> Result<Receiver<CapturedFrame>> {
+/// The caller is responsible for picking a format the host's encoder
+/// can ingest — typically via [`sck_pixel_format_for_profile`] after
+/// the handshake's chosen profile is known. See
+/// [`probe_capture_pixel_formats`] for the per-Mac acceptance matrix.
+///
+/// Runs [`probe_capture_pixel_formats`] first and logs the result, so
+/// every host startup leaves an empirical "what could this Mac do?"
+/// alongside "what are we asking it for?" record.
+pub async fn start(pixel_format: PixelFormat) -> Result<Receiver<CapturedFrame>> {
     // The capability probe shares the SCK TCC prompt with the real
     // session — first attempt to start a stream triggers ScreenRecording
     // permission once per process. Whether the prompt fires from a
@@ -100,7 +103,7 @@ pub async fn start() -> Result<Receiver<CapturedFrame>> {
     let stop_thread = Arc::clone(&stop);
     std::thread::Builder::new()
         .name("tether-capture-sck".into())
-        .spawn(move || run_capture_thread(tx, ready_tx, stop_thread))?;
+        .spawn(move || run_capture_thread(tx, ready_tx, stop_thread, pixel_format))?;
 
     // Block on the readiness signal from the capture thread without
     // tying up the async runtime.
@@ -129,9 +132,10 @@ fn run_capture_thread(
     tx: Sender<CapturedFrame>,
     ready_tx: Sender<Result<()>>,
     stop: Arc<AtomicBool>,
+    pixel_format: PixelFormat,
 ) {
     let stop_handler = Arc::clone(&stop);
-    let stream = match build_and_start_stream(tx, stop_handler) {
+    let stream = match build_and_start_stream(tx, stop_handler, pixel_format) {
         Ok(s) => s,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -156,6 +160,7 @@ fn run_capture_thread(
 fn build_and_start_stream(
     tx: Sender<CapturedFrame>,
     stop: Arc<AtomicBool>,
+    pixel_format: PixelFormat,
 ) -> Result<SCStream> {
     let content = SCShareableContent::get()?;
     let primary = content
@@ -170,6 +175,7 @@ fn build_and_start_stream(
         width,
         height,
         fps = CAPTURE_FPS,
+        pixel_format = %pixel_format,
         "capture source: macOS (ScreenCaptureKit, primary display)"
     );
 
@@ -178,9 +184,7 @@ fn build_and_start_stream(
         .with_excluding_windows(&[])
         .build();
     let config = SCStreamConfiguration::new()
-        // NV12 video range. Matches what `tether-codec` configures the
-        // VideoToolbox encoder to consume zero-copy.
-        .with_pixel_format(PixelFormat::YCbCr_420v)
+        .with_pixel_format(pixel_format)
         .with_width(width)
         .with_height(height)
         .with_fps(CAPTURE_FPS)
@@ -290,6 +294,70 @@ fn build_frame(
         t_capture_userspace,
         release_guard: guard,
     }))
+}
+
+/// The ScreenCaptureKit pixel format the live stream should use to
+/// feed the given encoder [`VideoProfile`]. Mapping mirrors
+/// `vt_sw_format` on the encoder side — the encoder's configured
+/// `sw_format` and the IOSurface fourcc the capture delivers must
+/// agree, or `submit_iosurface` rejects the frame at the
+/// `iosurface_fourcc_matches` gate. The 4:2:0 paths pick *video range*
+/// (`420v` for 8-bit, `x420` for 10-bit) because VT's HEVC encoder
+/// expects limited-range input by default; mixing full-range capture
+/// against the encoder's video-range matrix would shift levels at the
+/// decoder.
+///
+/// Returns [`SckCapabilityCheck::Unsupported`] for combos this layer
+/// doesn't model — caller must reject or fall through.
+pub fn sck_pixel_format_for_profile(profile: VideoProfile) -> SckCapabilityCheck {
+    use SckCapabilityCheck::{Supported, Unsupported};
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => Supported(PixelFormat::YCbCr_420v),
+        (ChromaSubsampling::Yuv420, 10) => {
+            Supported(PixelFormat::Unknown(FourCharCode::from_bytes(*b"x420")))
+        }
+        (ChromaSubsampling::Yuv444, 8) => {
+            Supported(PixelFormat::Unknown(FourCharCode::from_bytes(*b"444v")))
+        }
+        (ChromaSubsampling::Yuv444, 10) => Supported(PixelFormat::xf44),
+        _ => Unsupported,
+    }
+}
+
+/// Outcome of mapping a `VideoProfile` to an SCK `PixelFormat`. Two
+/// variants so a caller can match exhaustively without a stringly
+/// "unknown" sentinel.
+#[derive(Debug, Clone, Copy)]
+pub enum SckCapabilityCheck {
+    Supported(PixelFormat),
+    Unsupported,
+}
+
+impl SckCapabilityCheck {
+    /// Check the mapped SCK pixel format against a probed
+    /// [`SckCaptureCapability`]. Returns `true` iff:
+    ///   1. the profile maps to an SCK format ([`Supported`]), AND
+    ///   2. that format was accepted by the SCK probe on this Mac.
+    ///
+    /// [`Supported`]: SckCapabilityCheck::Supported
+    pub fn is_deliverable(self, caps: &SckCaptureCapability) -> bool {
+        match self {
+            Self::Supported(PixelFormat::YCbCr_420v) => caps.yuv420_video_range,
+            Self::Supported(PixelFormat::YCbCr_420f) => caps.yuv420_full_range,
+            Self::Supported(PixelFormat::xf44) => caps.yuv444_10bit_full_range,
+            Self::Supported(PixelFormat::Unknown(code)) => {
+                match &code.display()[..] {
+                    "444v" => caps.yuv444_8bit_video_range,
+                    "444f" => caps.yuv444_8bit_full_range,
+                    "x420" => caps.yuv420_10bit_video_range,
+                    "xf20" => caps.yuv420_10bit_full_range,
+                    _ => false,
+                }
+            }
+            Self::Supported(_) => false,
+            Self::Unsupported => false,
+        }
+    }
 }
 
 /// Per-format ScreenCaptureKit capture acceptance, derived from a real
@@ -637,6 +705,66 @@ mod tests {
         // Print everything else for the operator running the probe to
         // record on a new Mac model.
         eprintln!("SCK probe matrix: {caps:#?}");
+    }
+
+    #[test]
+    fn sck_pixel_format_for_profile_covers_every_modeled_combo() {
+        use tether_protocol::control::{CodecKind, VideoProfile};
+        for (chroma, bit_depth, expected_fourcc) in [
+            (ChromaSubsampling::Yuv420, 8, *b"420v"),
+            (ChromaSubsampling::Yuv420, 10, *b"x420"),
+            (ChromaSubsampling::Yuv444, 8, *b"444v"),
+            (ChromaSubsampling::Yuv444, 10, *b"xf44"),
+        ] {
+            let profile = VideoProfile { codec: CodecKind::Hevc, chroma, bit_depth };
+            let mapping = sck_pixel_format_for_profile(profile);
+            match mapping {
+                SckCapabilityCheck::Supported(pf) => {
+                    let actual: FourCharCode = pf.into();
+                    assert_eq!(
+                        actual.as_u32(),
+                        u32::from_be_bytes(expected_fourcc),
+                        "({chroma:?}, {bit_depth}) should map to {:?}",
+                        std::str::from_utf8(&expected_fourcc).unwrap_or("<bin>")
+                    );
+                }
+                SckCapabilityCheck::Unsupported => {
+                    panic!("({chroma:?}, {bit_depth}) should be supported");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sck_pixel_format_for_profile_rejects_unmodeled_bit_depths() {
+        use tether_protocol::control::{CodecKind, VideoProfile};
+        let bogus = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 12 };
+        assert!(matches!(
+            sck_pixel_format_for_profile(bogus),
+            SckCapabilityCheck::Unsupported
+        ));
+    }
+
+    #[test]
+    fn is_deliverable_returns_true_only_when_caps_accept_mapped_format() {
+        use tether_protocol::control::{CodecKind, VideoProfile};
+        // Caps: only 420v accepted (the universal floor).
+        let caps = SckCaptureCapability {
+            yuv420_video_range: true,
+            ..Default::default()
+        };
+        let p_420_8 = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 8 };
+        let p_420_10 = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 10 };
+        assert!(sck_pixel_format_for_profile(p_420_8).is_deliverable(&caps));
+        assert!(!sck_pixel_format_for_profile(p_420_10).is_deliverable(&caps));
+
+        // Caps: x420 also accepted — now 10-bit 4:2:0 is deliverable too.
+        let caps10 = SckCaptureCapability {
+            yuv420_video_range: true,
+            yuv420_10bit_video_range: true,
+            ..Default::default()
+        };
+        assert!(sck_pixel_format_for_profile(p_420_10).is_deliverable(&caps10));
     }
 }
 

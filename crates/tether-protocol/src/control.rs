@@ -603,4 +603,48 @@ mod tests {
         };
         assert_eq!(sync.remote_to_local(MonoNanos(100)), MonoNanos(0));
     }
+
+    #[test]
+    fn clock_sync_zero_rtt_is_legal() {
+        // t0 == t3, t1 == t2: the impossible "zero round trip" case
+        // that can arise on the very first probe over a loopback or
+        // shared-memory transport. Math should produce rtt=0, not
+        // saturate to something weird.
+        let t = MonoNanos(1_000);
+        let sync = ClockSync::from_probe(t, t, t, t);
+        assert_eq!(sync.rtt_nanos, 0);
+        assert_eq!(sync.offset_nanos, 0);
+    }
+
+    #[test]
+    fn clock_sync_rtt_saturates_when_remote_claims_negative_processing() {
+        // Pathological case: remote reports t2 < t1 (clock jumped
+        // backwards mid-probe). Total - processing would be > total,
+        // which would naively inflate rtt. Code uses `.max(0)` on rtt
+        // — this test pins that.
+        let t0 = MonoNanos(100);
+        let t1 = MonoNanos(500);
+        let t2 = MonoNanos(400); // t2 < t1: remote clock jumped backwards
+        let t3 = MonoNanos(120);
+        let sync = ClockSync::from_probe(t0, t1, t2, t3);
+        // (t3-t0) - (t2-t1) = 20 - (-100) = 120; non-negative, so no
+        // saturation; the test guards against a future regression
+        // that would let this go negative.
+        assert!(sync.rtt_nanos <= u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn clock_sync_handles_huge_offset() {
+        // Offset close to i64::MAX. Should clamp inside from_probe
+        // rather than panic on the i64::try_from. The values are
+        // chosen so (t1 - t0) is large and positive; (t2 - t3) is
+        // similarly large.
+        let t0 = MonoNanos(0);
+        let t1 = MonoNanos(u64::MAX / 2);
+        let t2 = MonoNanos((u64::MAX / 2).saturating_add(10));
+        let t3 = MonoNanos(20);
+        let sync = ClockSync::from_probe(t0, t1, t2, t3);
+        // No panic; offset clamped into i64 range.
+        assert!(sync.offset_nanos > 0);
+    }
 }

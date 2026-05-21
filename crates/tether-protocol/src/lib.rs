@@ -872,4 +872,193 @@ mod tests {
             MAX_DATAGRAM_PAYLOAD
         );
     }
+
+    // Forward-compat probes. Each tagged enum we wire-serialise needs a
+    // test that pins "older receiver rejects a future variant cleanly"
+    // — otherwise a future V2 byte sequence could silently decode into
+    // the current variant's body shape. The probe hand-crafts a
+    // discriminator byte one past the highest known variant index;
+    // bincode's varint enum encoding makes that the right byte
+    // regardless of payload size.
+
+    #[test]
+    fn unknown_server_hello_variant_fails_decode() {
+        // V1 = discriminator 0. Variant 1 is hypothetical V2.
+        let bytes = [1u8, 0, 0, 0, 0];
+        assert!(decode::<crate::control::ServerHello>(&bytes).is_err());
+    }
+
+    #[test]
+    fn unknown_video_packet_variant_fails_decode() {
+        // First = 0, Continuation = 1. Variant 2 is hypothetical.
+        let bytes = [2u8, 0, 0, 0, 0];
+        assert!(decode::<crate::video::VideoPacket>(&bytes).is_err());
+    }
+
+    #[test]
+    fn unknown_video_frame_meta_envelope_variant_fails_decode() {
+        // V1 = 0. Variant 1 is hypothetical V2.
+        let bytes = [1u8, 0, 0, 0, 0];
+        assert!(decode::<crate::video::VideoFrameMetaEnvelope>(&bytes).is_err());
+    }
+
+    #[test]
+    fn unknown_control_message_variant_fails_decode() {
+        // ControlMessage has many variants. Pick a discriminator well
+        // beyond the current count; bincode rejects unknown
+        // discriminators cleanly.
+        let bytes = [200u8, 0, 0, 0, 0];
+        assert!(decode::<ControlMessage>(&bytes).is_err());
+    }
+
+    #[test]
+    fn reassembler_drops_cross_epoch_fragments() {
+        // ARCHITECTURE.md invariant: "stream_epoch bumped on encoder
+        // restart; defragmenter drops cross-epoch fragments." Without
+        // this, fragments from a pre-restart encoder state could fuse
+        // with post-restart fragments and produce a corrupt frame.
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
+        };
+
+        let mut reassembler = FrameReassembler::new();
+
+        // Deliver a complete frame under epoch 0.
+        let mut fragmenter_epoch0 = FrameFragmenter::new(0);
+        let packets_e0 = fragmenter_epoch0.fragment(meta.clone(), &[1u8; 200]);
+        let mut out0 = None;
+        for p in packets_e0 {
+            if let Some(f) = reassembler.handle(p) {
+                out0 = Some(f);
+            }
+        }
+        assert_eq!(out0.expect("epoch 0 frame should reassemble").stream_epoch, 0);
+
+        // Switch epochs (simulating encoder restart) and deliver an
+        // independent frame. The two streams share `(display=0)` but
+        // not `(display, epoch)`, so latest_seq for the old epoch
+        // stays parked. A First arrives under the new epoch with the
+        // same frame_seq=0 — must reassemble independently.
+        let mut fragmenter_epoch1 = FrameFragmenter::new(0);
+        fragmenter_epoch1.bump_epoch();
+        assert_eq!(fragmenter_epoch1.stream_epoch(), 1);
+        let packets_e1 = fragmenter_epoch1.fragment(meta, &[2u8; 200]);
+        let mut out1 = None;
+        for p in packets_e1 {
+            if let Some(f) = reassembler.handle(p) {
+                out1 = Some(f);
+            }
+        }
+        let frame1 = out1.expect("epoch 1 frame should reassemble");
+        assert_eq!(frame1.stream_epoch, 1);
+        assert_eq!(frame1.body[0], 2, "epoch 1 body must not be fused with epoch 0");
+    }
+
+    #[test]
+    fn fragmenter_single_packet_roundtrips_through_reassembler() {
+        // The reliable-keyframe path uses single_packet instead of
+        // fragment() — produces one VideoPacket::First with
+        // fragment_count=1 carrying the whole body. Receiver must
+        // accept this directly and complete the frame on the first
+        // (and only) fragment.
+        let mut fragmenter = FrameFragmenter::new(3);
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: true,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (1920, 1080),
+        };
+        let body: Vec<u8> = (0..50_000).map(|i| (i & 0xff) as u8).collect();
+        let packet = fragmenter.single_packet(meta.clone(), body.clone());
+        match &packet {
+            VideoPacket::First { fragment_count, payload, .. } => {
+                assert_eq!(*fragment_count, 1, "single_packet must produce fragment_count=1");
+                assert_eq!(payload.len(), body.len());
+            }
+            other => panic!("expected First, got {other:?}"),
+        }
+
+        // Also advances the seq counter so subsequent P-frames slot in.
+        let next = fragmenter.fragment(meta, &[0u8; 100]);
+        match &next[0] {
+            VideoPacket::First { frame_seq, .. } => {
+                assert_eq!(*frame_seq, 1, "next frame_seq must be 1 after single_packet");
+            }
+            other => panic!("expected First, got {other:?}"),
+        }
+
+        let mut reassembler = FrameReassembler::new();
+        let frame = reassembler
+            .handle(packet)
+            .expect("single_packet must complete reassembly on first fragment");
+        assert_eq!(frame.body, body);
+        assert_eq!(frame.display, 3);
+    }
+
+    #[test]
+    fn reassembler_handles_duplicate_fragments_idempotently() {
+        // Reliable streams shouldn't duplicate, datagrams shouldn't
+        // either, but quinn does retransmit at the QUIC layer and a
+        // future protocol bug could deliver the same fragment twice.
+        // Reassembler must not double-count or corrupt the frame.
+        let mut fragmenter = FrameFragmenter::new(0);
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
+        };
+        let body = vec![0xabu8; 2_500];
+        let packets = fragmenter.fragment(meta, &body);
+        assert!(packets.len() >= 2, "test needs a multi-fragment frame");
+
+        let mut reassembler = FrameReassembler::new();
+        // Deliver the first fragment twice.
+        reassembler.handle(packets[0].clone());
+        let after_dup = reassembler.handle(packets[0].clone());
+        assert!(after_dup.is_none(), "duplicate First must not complete the frame on its own");
+
+        // Now deliver the rest; the frame should still complete with
+        // the correct body, not a corrupted concatenation.
+        let mut out = None;
+        for p in packets.iter().skip(1) {
+            if let Some(f) = reassembler.handle(p.clone()) {
+                out = Some(f);
+            }
+        }
+        let frame = out.expect("frame should reassemble after duplicates");
+        assert_eq!(frame.body, body);
+    }
+
+    #[test]
+    fn reassembler_continuation_before_first_holds_then_completes() {
+        // A Continuation can legitimately arrive before its First on
+        // the wire (UDP reorder). Reassembler should buffer the
+        // Continuation, then complete the frame when First lands.
+        let mut fragmenter = FrameFragmenter::new(0);
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
+        };
+        let body = vec![0x5au8; 3_000];
+        let packets = fragmenter.fragment(meta, &body);
+        assert!(packets.len() >= 2);
+
+        let mut reassembler = FrameReassembler::new();
+        // Deliver continuations first.
+        for p in packets.iter().skip(1) {
+            assert!(reassembler.handle(p.clone()).is_none(),
+                "frame cannot complete without First (no meta)");
+        }
+        // Now First.
+        let frame = reassembler
+            .handle(packets[0].clone())
+            .expect("frame should complete after First arrives");
+        assert_eq!(frame.body, body);
+    }
 }

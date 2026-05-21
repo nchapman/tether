@@ -564,4 +564,45 @@ mod tests {
         assert!((n.0 - 0.1).abs() < 1e-4);
         assert!((n.1 - 0.1).abs() < 1e-4);
     }
+
+    /// Compile-time assertion that `LatestFrame` actually meets the
+    /// `Send + Sync` bound it implicitly relies on for cross-thread
+    /// use (decode std::thread → renderer winit thread). A regression
+    /// to the inner type that broke this would surface as a build
+    /// error here rather than at the use site.
+    #[test]
+    fn latest_frame_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<LatestFrame>();
+    }
+
+    #[test]
+    fn latest_frame_displaces_previous_on_set() {
+        let frames = LatestFrame::new();
+        let frame_a = Frame::Cpu(CpuFrame {
+            width: 1, height: 1,
+            y: vec![0xa], uv: vec![0, 0],
+            t_capture_client_clock: None,
+        });
+        let frame_b = Frame::Cpu(CpuFrame {
+            width: 2, height: 2,
+            y: vec![0xb], uv: vec![0, 0],
+            t_capture_client_clock: None,
+        });
+        // First set: empty slot, no displacement.
+        assert!(frames.set(frame_a).is_none(), "empty slot should return None");
+        // Second set: A is displaced; caller can count this as a render drop.
+        let displaced = frames.set(frame_b).expect("second set should displace");
+        match displaced {
+            Frame::Cpu(f) => assert_eq!(f.width, 1, "displaced frame should be A"),
+            _ => panic!("expected Cpu frame"),
+        }
+        // take() yields the latest (B), then empties the slot.
+        let latest = frames.take().expect("slot should hold B");
+        match latest {
+            Frame::Cpu(f) => assert_eq!(f.width, 2),
+            _ => panic!("expected Cpu frame"),
+        }
+        assert!(frames.take().is_none(), "slot should be empty after take");
+    }
 }

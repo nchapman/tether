@@ -126,6 +126,20 @@ pub enum ChromaSubsampling {
     Yuv444,
 }
 
+/// Legacy single-axis color descriptor on [`ServerHelloV1`].
+/// Superseded by [`VideoColorSpec`] carried via the
+/// [`COLOR_SPEC_EXTENSION_KEY`] hello extension. Kept on
+/// `ServerHelloV1` for backwards compatibility with V1 clients that
+/// don't recognise the extension; new code should advertise both
+/// (this field set to `Bt709Limited`, the extension carrying the
+/// real four-axis spec) and prefer the extension when reading.
+///
+/// Will be removed when `ClientHelloV2` / `ServerHelloV2` lands.
+#[deprecated(
+    note = "use VideoColorSpec via the tether.color-spec hello extension; \
+            this single-axis enum is preserved only for V1 backwards compat \
+            and will be removed when the next hello version ships"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorSpace {
     /// BT.709 limited range. The only color space supported in v0.
@@ -203,6 +217,17 @@ pub enum ColorTransfer {
 }
 
 /// Color primaries (the chromaticity coordinates of R, G, B).
+///
+/// Note: every variant here pairs with a corresponding
+/// [`ColorMatrix`] variant — BT.709 primaries with `ColorMatrix::Bt709`,
+/// BT.2020 primaries with `ColorMatrix::Bt2020Ncl`. Adding a new
+/// primaries variant without its matching matrix variant produces
+/// a silent wrong-color path (the decoder applies the wrong gamut
+/// conversion), so the two enums grow together. Display P3 is the
+/// next likely addition for Apple displays; it'll land alongside a
+/// `ColorMatrix::DisplayP3` variant (or, equivalently, a Bt709 →
+/// DisplayP3 gamut-mapping step in the renderer keyed off the
+/// primaries field).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorPrimaries {
     /// BT.709 / sRGB primaries. Identical chromaticities; the two
@@ -211,8 +236,6 @@ pub enum ColorPrimaries {
     /// BT.2020 / Rec. ITU-R BT.2100 primaries. Wider gamut; required
     /// for HDR.
     Bt2020,
-    /// Apple Display P3 primaries. Common on recent Mac displays.
-    DisplayP3,
 }
 
 /// The four-axis tuple. Carried as the `tether.color-spec` hello
@@ -386,11 +409,16 @@ pub enum ServerHello {
     V1(ServerHelloV1),
 }
 
+#[allow(deprecated)] // `ColorSpace` field below — see field docstring.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerHelloV1 {
     pub server_name: String,
     pub chosen_codec: CodecKind,
     pub chosen_chroma: ChromaSubsampling,
+    /// Legacy single-axis color descriptor — see [`ColorSpace`]. Kept
+    /// for V1 wire compat; new code reads the four-axis spec via the
+    /// [`COLOR_SPEC_EXTENSION_KEY`] hello extension and falls back to
+    /// this only when the extension is absent.
     pub color_space: ColorSpace,
     pub resolution: (u32, u32),
     /// Echo of the client's `clock_probe_t0` so the client can match

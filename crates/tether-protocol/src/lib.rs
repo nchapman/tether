@@ -203,6 +203,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises the legacy `color_space` field on ServerHelloV1
     fn round_trip_server_hello_hevc() {
         // Codec negotiation lands HEVC: client advertised [Hevc, H264],
         // host probed and picked Hevc, echoes back in chosen_codec.

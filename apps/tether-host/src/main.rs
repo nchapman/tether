@@ -25,9 +25,13 @@ use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 use tether_codec::GpuEncoderFrame;
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame};
+// ColorSpace is deprecated in favor of the four-axis VideoColorSpec
+// carried via tether.color-spec, but ServerHelloV1's wire shape still
+// requires the field for back-compat — see the field's docstring.
+#[allow(deprecated)]
+use tether_protocol::control::ColorSpace;
 use tether_protocol::control::{
-    ChromaSubsampling, ClientHello, CodecKind, ColorSpace, ControlMessage, ServerHello,
-    ServerHelloV1,
+    ChromaSubsampling, ClientHello, CodecKind, ControlMessage, ServerHello, ServerHelloV1,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
@@ -133,6 +137,8 @@ async fn handle_client(
                 // Goodbye it never tries to use it.
                 chosen_codec: chosen.unwrap_or(CodecKind::H264),
                 chosen_chroma: ChromaSubsampling::Yuv420,
+                // Legacy V1 field — see import-site #[allow(deprecated)].
+                #[allow(deprecated)]
                 color_space: ColorSpace::Bt709Limited,
                 // Encoded source dims aren't known yet (lazy encoder init
                 // happens on the first frame); use a placeholder and rely

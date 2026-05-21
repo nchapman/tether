@@ -244,6 +244,41 @@ mod tests {
         assert_eq!(got.3, expected.3, "{label}/A");
     }
 
+    /// Golden-value test for the full pipeline. Pins the exact bytes
+    /// `simulate_round_trip` produces for two diagnostic colors:
+    /// mid-gray (sensitive to transfer-function drift) and pure red
+    /// (sensitive to matrix-coefficient drift). The
+    /// `bgra_round_trip_is_approximately_identity` test catches large
+    /// regressions but accepts an 18-unit slop; the parallel
+    /// CPU/WGSL implementations could in principle drift the same
+    /// direction and stay inside that slop. These golden bytes are
+    /// the floor that catches a smaller correlated drift — change
+    /// either implementation's constants and the bytes shift, even
+    /// if both shift the same way.
+    ///
+    /// If these values change because of an intentional pipeline
+    /// improvement (e.g. switching the EOTF to sRGB), update them
+    /// from the freshly-printed output and note the reason here.
+    #[test]
+    fn golden_round_trip_values() {
+        let gray = simulate_round_trip(Bgra8(128, 128, 128, 255));
+        assert_eq!(
+            (gray.0, gray.1, gray.2, gray.3),
+            (140, 140, 140, 255),
+            "mid-gray drift — TRANSFER curve constants likely changed"
+        );
+
+        let red = simulate_round_trip(Bgra8(0, 0, 255, 255));
+        assert_eq!(
+            (red.0, red.1, red.2, red.3),
+            (0, 2, 255, 255),
+            "pure red drift — MATRIX coefficients or RANGE constants likely \
+             changed. (The G=2 is a small chroma overshoot from the BT.709 \
+             matrix on pure red; it's stable as long as the matrix isn't \
+             touched.)"
+        );
+    }
+
     #[test]
     fn bt709_oetf_eotf_round_trip() {
         // Inverse property holds across the curve; sample at the
@@ -302,10 +337,19 @@ mod tests {
         }
     }
 
-    /// Negative test: if the shader skipped the EOTF (the actual bug
-    /// we just fixed), the round trip would lift blacks dramatically.
-    /// Pin that math here so a future "simplify" refactor that drops
-    /// the EOTF fails LOUDLY rather than visually.
+    /// Tolerance calibration sentinel. Hand-codes the broken-decoder
+    /// shape (skips the BT.709 EOTF, feeds gamma-encoded R'G'B'
+    /// straight to the sRGB surface — the actual bug we just fixed)
+    /// and asserts that shape produces a shift LARGER than the
+    /// regression test's `TOLERANCE`. That's not regression
+    /// protection itself — `bgra_round_trip_is_approximately_identity`
+    /// does that work against the production functions. What this
+    /// pins is the GAP between "broken shape" and "tolerance," i.e.
+    /// "tolerance is calibrated tight enough to catch the bug if it
+    /// comes back via the production path." If someone widens
+    /// `TOLERANCE` past the broken-shape shift, this assertion
+    /// flips and forces a conversation about the regression test's
+    /// sensitivity.
     #[test]
     fn without_eotf_blacks_lift_visibly() {
         // Build a "broken" decoder that skips the EOTF and outputs

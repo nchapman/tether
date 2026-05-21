@@ -27,9 +27,28 @@ crossbeam-channel = { workspace = true }
 # once another crate pulls them in.
 # Migration trigger: drop the patch and bump to `version = "30"` once
 # wgpu 30 ships with the new API.
-wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["vulkan"] }
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["vulkan", "metal"] }
 winit = { workspace = true }
 pollster = "0.4"
+
+# macOS: hand-rolled FFI for the IOSurface→MTLTexture→wgpu texture
+# path. Pinned to the exact objc2 ecosystem versions wgpu's metal
+# backend pulls in so we don't end up with two incompatible copies
+# of the Retained / ProtocolObject types — same pattern as the
+# wgpu pin for the Vulkan DMA-BUF API.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.3"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+    "objc2-io-surface",
+] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }

@@ -11,6 +11,11 @@ mod import;
 #[cfg(target_os = "linux")]
 pub(crate) use import::import_dmabuf_textures;
 
+#[cfg(target_os = "macos")]
+mod metal;
+#[cfg(target_os = "macos")]
+pub(crate) use metal::import_iosurface_textures;
+
 /// One frame's worth of YUV plane textures plus the bind group that
 /// points at them. The variant matches the negotiated chroma — NV12
 /// shape for 4:2:0, three R8 planes for 4:4:4. Bundled with the bind
@@ -535,11 +540,31 @@ impl GpuState {
         self.retired = Some(previous);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn apply_gpu(&mut self, frame: GpuFrame) -> Result<()> {
+        // Match shape mirrors the Linux side: an explicit pattern, not
+        // `let else`, so adding a future `GpuFrameSource` variant
+        // surfaces here at compile time.
+        let iosurface = match &frame.source {
+            GpuFrameSource::IOSurface(s) => s,
+        };
+        let fresh = import_iosurface_textures(
+            &self.device,
+            &self.yuv_bgl,
+            &self.sampler,
+            self.chroma,
+            iosurface,
+            frame.guard,
+        )?;
+        self.retire_textures(fresh);
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn apply_gpu(&mut self, _frame: GpuFrame) -> Result<()> {
-        // GpuFrameSource has no variants off-Linux, so a GpuFrame is
-        // type-level uninhabitable here; this stub exists to keep the
-        // match in `apply_frame` exhaustive across cfgs.
+        // GpuFrameSource has no variants off-Linux/macOS, so a GpuFrame
+        // is type-level uninhabitable here; this stub exists to keep
+        // the match in `apply_frame` exhaustive across cfgs.
         unreachable!("GpuFrame cannot be constructed on this platform")
     }
 

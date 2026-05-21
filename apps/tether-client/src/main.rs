@@ -65,17 +65,21 @@ async fn main() -> anyhow::Result<()> {
     // the SPS automatically and the renderer dispatches on the
     // negotiated chroma to pick the right shader / bind-group layout.
     //
-    // The order in this list does NOT determine the negotiated outcome
-    // — the host's PROFILE_PREFERENCE is the authoritative ordering.
-    // We keep it best-first as a documentation cue and so the inline
-    // `preferred_codecs` (the legacy advert) is also ordered sensibly
-    // for older hosts that haven't been updated to read the structured
-    // extension.
-    let client_decode_profiles = vec![
-        VideoProfile::HEVC_8BIT_444,
-        VideoProfile::HEVC_8BIT_420,
-        VideoProfile::H264_8BIT_420,
-    ];
+    // Decode-side capability probe — same shape as the host's
+    // `supported_encode_profiles`. Order does NOT determine the
+    // negotiated outcome (host's PROFILE_PREFERENCE is authoritative),
+    // but the function returns the list in PROFILE_PREFERENCE order so
+    // logs look natural. macOS clients drop HEVC 4:4:4 here because
+    // FFmpeg's VideoToolbox wrapper doesn't expose Main444 / Rext
+    // decode; Linux clients keep it if the VAAPI driver builds it.
+    let client_decode_profiles = tether_codec::supported_decode_profiles();
+    if client_decode_profiles.is_empty() {
+        anyhow::bail!(
+            "no hardware video decoder is available on this client \
+             (no codec in PROFILE_PREFERENCE constructed). Tether requires \
+             GPU decode; there is no software fallback."
+        );
+    }
     let mut hello_extensions = std::collections::BTreeMap::new();
     hello_extensions.insert(
         CLIENT_DECODE_PROFILES_EXTENSION_KEY.to_string(),

@@ -20,13 +20,28 @@
 //! `tether-capture::macos`: NV12 video-range (`'420v'`), so the
 //! encoder's `sw_format` lines up without any conversion.
 //!
-//! Decoder lands with the macOS client work; this module is encoder-only
-//! today.
+//! Decoder mirrors the same shape: FFmpeg's `h264` / `hevc` decoders
+//! with the `AV_HWDEVICE_TYPE_VIDEOTOOLBOX` hwaccel selected via the
+//! `get_format` callback. Decoded output is an `AVFrame` whose
+//! `data[3]` is a `CVPixelBufferRef` — the reverse of the encoder's
+//! IOSurface→CVPixelBuffer wrap — and we hand the underlying IOSurface
+//! straight to the renderer.
 
+mod decoder;
 mod encoder;
 mod ffi;
 
 #[cfg(test)]
 mod tests;
 
+pub use decoder::VideoToolboxDecoder;
 pub use encoder::VideoToolboxEncoder;
+
+/// Surfaces beyond what the decoder needs for its own reference
+/// picture list. Same rationale as the VAAPI sibling: the renderer's
+/// `LatestFrame` cell holds the previous decoded `IOSurface` (via the
+/// `AVFrame` guard) until the next one lands, so the hwframes pool
+/// needs spare slots or `receive_frame` stalls. 4 covers the worst-case
+/// "one rendering, one in flight, one being sampled" overlap with
+/// headroom.
+pub(crate) const DECODE_EXTRA_HW_FRAMES: i32 = 4;

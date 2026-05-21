@@ -22,8 +22,9 @@ pub mod vaapi;
 pub mod videotoolbox;
 
 pub use probe::{
-    pick_supported_profile, probe_decoder, probe_encoder, probe_encoder_kind,
-    probe_encoder_profile, supported_encode_profiles, PROFILE_PREFERENCE,
+    pick_supported_profile, probe_decoder, probe_decoder_profile, probe_encoder,
+    probe_encoder_kind, probe_encoder_profile, supported_decode_profiles,
+    supported_encode_profiles, PROFILE_PREFERENCE,
 };
 
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. The decoder

@@ -246,6 +246,72 @@ pub fn probe_encoder_profile(profile: VideoProfile) -> bool {
     }
 }
 
+/// Enumerate the video profiles this client can actually decode
+/// today. Used to populate the `tether.cap.video.decode-profiles`
+/// hello extension so the host's negotiator never picks a profile we
+/// can't construct.
+///
+/// On Linux this is every entry in [`PROFILE_PREFERENCE`] — VAAPI
+/// covers H.264 4:2:0, HEVC 4:2:0, and HEVC 4:4:4 8-bit on Tiger
+/// Lake+ Intel / VCN3+ AMD. On macOS this is Yuv420 only: FFmpeg's
+/// VideoToolbox HEVC wrapper does not expose Main444 / Rext decode
+/// even on Apple Silicon Media Engines that can technically do it,
+/// and a 4:4:4 advert here would only set us up to fail at decoder
+/// construction time. Filtered through the same probe-and-tear-down
+/// pattern as [`supported_encode_profiles`] so a runtime gap (missing
+/// FFmpeg hwaccel, codec not compiled in) is caught at startup
+/// rather than at first-frame time.
+#[must_use]
+pub fn supported_decode_profiles() -> Vec<VideoProfile> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Vec<VideoProfile>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            PROFILE_PREFERENCE
+                .iter()
+                .copied()
+                .filter(|p| probe_decoder_profile(*p))
+                .collect()
+        })
+        .clone()
+}
+
+/// Profile-level decode probe. Mirrors [`probe_encoder_profile`]:
+/// real `Decoder::new` construction so driver-level gaps surface here
+/// rather than at first-frame time. On macOS the 4:4:4 path is
+/// gated off up front (see [`supported_decode_profiles`] for the
+/// rationale).
+///
+/// Linux caveat: `VaapiDecoder::new` is codec-keyed, not profile-keyed,
+/// so this probe returns `true` for HEVC 4:4:4 as long as a basic HEVC
+/// decoder constructs — the chroma is not actually verified at probe
+/// time. In practice, consumer VAAPI drivers always expose decode for
+/// the same chromas they expose encode for (decode being the cheaper
+/// path), and HEVC 4:4:4 decode failures would surface as `Err` from
+/// the first `receive_frame` rather than as silent corruption. A
+/// follow-up that constructs a tiny 4:4:4 test bitstream and runs it
+/// through the decoder would close this gap. The macOS arm has no such
+/// hole because it gates on chroma directly before constructing.
+#[must_use]
+pub fn probe_decoder_profile(profile: VideoProfile) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::vaapi::VaapiDecoder::new(profile.codec).is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if profile.chroma != ChromaSubsampling::Yuv420 || profile.bit_depth != 8 {
+            return false;
+        }
+        crate::videotoolbox::VideoToolboxDecoder::new(profile.codec).is_ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = profile;
+        false
+    }
+}
+
 /// Probe + construct the decoder for the codec the host chose in its
 /// [`ServerHelloV1`](tether_protocol::control::ServerHelloV1::chosen_codec).
 /// Errors if no GPU decoder is available for that codec on this client.
@@ -268,17 +334,18 @@ pub fn probe_decoder(kind: CodecKind) -> Result<Box<dyn Decoder>> {
 
     #[cfg(target_os = "macos")]
     {
-        // VideoToolbox decoder is a follow-up plan. This is a
-        // missing-feature, not a misconfiguration — make that
-        // unambiguous in the error so operators don't chase a
-        // permissions / driver problem that doesn't exist.
-        let _ = kind;
-        return Err(CodecError::NoHardwareCodec(
-            "VideoToolbox decoder is not yet implemented in this build — \
-             macOS client support is planned but not available. \
-             Run tether-client on Linux (VAAPI) to receive from a macOS host."
-                .to_string(),
-        ));
+        match crate::videotoolbox::VideoToolboxDecoder::new(kind) {
+            Ok(dec) => return Ok(Box::new(dec)),
+            Err(e) => {
+                tracing::error!(
+                    backend = "videotoolbox",
+                    codec = ?kind,
+                    error = %e,
+                    "VideoToolbox decoder construction failed"
+                );
+                return Err(no_hw_decoder_vt(kind, e));
+            }
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -326,6 +393,17 @@ fn no_hw_decoder(kind: CodecKind, source: CodecError) -> CodecError {
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn no_hw_decoder_vt(kind: CodecKind, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "VideoToolbox decoder unavailable for {kind:?} ({source}). \
+         Check that `ffmpeg -hide_banner -decoders | grep videotoolbox` reports \
+         hwaccel support for the codec — Homebrew's `ffmpeg` formula enables \
+         `--enable-videotoolbox` by default; a custom build may not. \
+         Tether requires GPU decode — there is no software fallback."
+    ))
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn no_hw_encoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
@@ -339,9 +417,9 @@ fn no_hw_encoder_for_platform() -> CodecError {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn no_hw_decoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
-        "Tether currently supports hardware decode on Linux (VAAPI). \
-         macOS/VideoToolbox (client), Windows/NVDEC, and Windows/D3D11VA \
-         backends are not yet implemented."
+        "Tether currently supports hardware decode on Linux (VAAPI) and \
+         macOS (VideoToolbox). Windows/NVDEC and Windows/D3D11VA backends \
+         are not yet implemented."
             .to_string(),
     )
 }

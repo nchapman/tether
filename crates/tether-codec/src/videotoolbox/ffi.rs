@@ -39,6 +39,18 @@ unsafe extern "C" {
         pixel_buffer_attributes: CFDictionaryRef,
         pixel_buffer_out: *mut CVPixelBufferRef,
     ) -> CVReturn;
+
+    /// Return the `IOSurfaceRef` backing a `CVPixelBufferRef`, or NULL
+    /// if the buffer is not IOSurface-backed. The returned IOSurface's
+    /// lifetime is the parent CVPixelBuffer's — no extra retain.
+    pub fn CVPixelBufferGetIOSurface(pixel_buffer: CVPixelBufferRef) -> IOSurfaceRef;
+
+    /// `kCVPixelFormatType_*` fourcc (e.g. `'420v'` for NV12 video
+    /// range) of the buffer's pixel data.
+    pub fn CVPixelBufferGetPixelFormatType(pixel_buffer: CVPixelBufferRef) -> u32;
+
+    pub fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
+    pub fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]

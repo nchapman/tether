@@ -1,6 +1,6 @@
 use crate::Encoder;
 
-use super::VideoToolboxEncoder;
+use super::{VideoToolboxDecoder, VideoToolboxEncoder};
 
 #[test]
 #[ignore = "requires macOS + VideoToolbox (run on Apple Silicon / Intel mac with: cargo test -p tether-codec --ignored videotoolbox)"]
@@ -121,6 +121,24 @@ fn videotoolbox_keyframes_carry_extradata() {
             keyframes_seen >= 2,
             "{kind:?} produced only {keyframes_seen} keyframes across 16 frames \
              with force_keyframe every 4; on-demand IDR plumbing may be broken"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires macOS + VideoToolbox"]
+fn videotoolbox_decoder_constructs() {
+    // Symmetric with `videotoolbox_hevc_constructs` on the encoder
+    // side: confirms FFmpeg's `--enable-videotoolbox` build path is
+    // present for both decoders. Round-trip behavior is exercised in
+    // `videotoolbox_round_trip` below.
+    use tether_protocol::control::CodecKind;
+    for kind in [CodecKind::H264, CodecKind::Hevc] {
+        let res = VideoToolboxDecoder::new(kind);
+        assert!(
+            res.is_ok(),
+            "{kind:?} VideoToolbox decoder should construct on macOS: {:?}",
+            res.err()
         );
     }
 }

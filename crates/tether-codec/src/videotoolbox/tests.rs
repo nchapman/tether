@@ -1,6 +1,19 @@
+use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+
 use crate::{Decoder, Encoder, Frame, GpuFrame, GpuFrameSource};
 
 use super::{VideoToolboxDecoder, VideoToolboxEncoder};
+
+/// Yuv420 8-bit profile for the given codec — what every VideoToolbox
+/// test in this file was implicitly constructing before the encoder's
+/// constructor became profile-parameterised.
+fn yuv420_8bit(kind: CodecKind) -> VideoProfile {
+    VideoProfile {
+        codec: kind,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    }
+}
 
 /// Test bitmap with broadband content (gradient + moving stripes) so
 /// the encoder has something to emit and the decoder has something
@@ -23,14 +36,8 @@ fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
 fn videotoolbox_encoder_smoke() {
     let w = 640;
     let h = 480;
-    let mut enc = VideoToolboxEncoder::new(
-        tether_protocol::control::CodecKind::H264,
-        w,
-        h,
-        30,
-        4_000,
-    )
-    .expect("VideoToolbox encoder");
+    let mut enc = VideoToolboxEncoder::new(yuv420_8bit(CodecKind::H264), w, h, 30, 4_000)
+        .expect("VideoToolbox encoder");
     let bgra = vec![0x80u8; (w * h * 4) as usize];
     let packets = enc.encode_bgra(&bgra, 0, true).expect("encode");
     // First frame may produce 0 packets (encoder warm-up) or 1+ packets
@@ -48,13 +55,7 @@ fn videotoolbox_hevc_constructs() {
     // the same: `find_encoder_by_name` returns None if FFmpeg wasn't
     // built with `--enable-videotoolbox`, and `encoder.open()` returns
     // an error if the device doesn't expose the HEVC encoder.
-    let res = VideoToolboxEncoder::new(
-        tether_protocol::control::CodecKind::Hevc,
-        320,
-        240,
-        30,
-        2_000,
-    );
+    let res = VideoToolboxEncoder::new(yuv420_8bit(CodecKind::Hevc), 320, 240, 30, 2_000);
     assert!(
         res.is_ok(),
         "hevc_videotoolbox should construct on a modern mac: {:?}",
@@ -71,12 +72,11 @@ fn videotoolbox_keyframes_carry_extradata() {
     // frames (forcing one keyframe at the start and another partway
     // through), then assert each keyframe packet begins with the SPS
     // bundle FFmpeg parked in `extradata` at open() time.
-    use tether_protocol::control::CodecKind;
 
     for kind in [CodecKind::H264, CodecKind::Hevc] {
         let w = 320;
         let h = 240;
-        let mut enc = VideoToolboxEncoder::new(kind, w, h, 30, 2_000)
+        let mut enc = VideoToolboxEncoder::new(yuv420_8bit(kind), w, h, 30, 2_000)
             .unwrap_or_else(|e| panic!("{kind:?} encoder: {e:?}"));
 
         // Two distinct grey BGRA frames so the encoder has actual
@@ -148,7 +148,6 @@ fn videotoolbox_decoder_constructs() {
     // side: confirms FFmpeg's `--enable-videotoolbox` build path is
     // present for both decoders. Round-trip behavior is exercised in
     // `videotoolbox_round_trip` below.
-    use tether_protocol::control::CodecKind;
     for kind in [CodecKind::H264, CodecKind::Hevc] {
         let res = VideoToolboxDecoder::new(kind);
         assert!(
@@ -178,7 +177,6 @@ fn videotoolbox_decoder_constructs() {
 #[test]
 #[ignore = "requires macOS + VideoToolbox (run with: cargo test -p tether-codec --ignored videotoolbox_round_trip)"]
 fn videotoolbox_round_trip() {
-    use tether_protocol::control::CodecKind;
 
     // NV12 fourccs the IOSurface may carry (matches what the renderer
     // accepts in `tether-render/src/gpu/metal.rs`).
@@ -188,7 +186,7 @@ fn videotoolbox_round_trip() {
     for kind in [CodecKind::H264, CodecKind::Hevc] {
         let w = 320;
         let h = 240;
-        let mut enc = VideoToolboxEncoder::new(kind, w, h, 30, 2_000)
+        let mut enc = VideoToolboxEncoder::new(yuv420_8bit(kind), w, h, 30, 2_000)
             .unwrap_or_else(|e| panic!("{kind:?} encoder: {e:?}"));
         let mut dec = VideoToolboxDecoder::new(kind)
             .unwrap_or_else(|e| panic!("{kind:?} decoder: {e:?}"));
@@ -292,12 +290,11 @@ fn videotoolbox_round_trip() {
 #[test]
 #[ignore = "requires macOS + VideoToolbox"]
 fn videotoolbox_decoder_recovers_from_mid_session_idr() {
-    use tether_protocol::control::CodecKind;
 
     for kind in [CodecKind::H264, CodecKind::Hevc] {
         let w = 320;
         let h = 240;
-        let mut enc = VideoToolboxEncoder::new(kind, w, h, 30, 2_000)
+        let mut enc = VideoToolboxEncoder::new(yuv420_8bit(kind), w, h, 30, 2_000)
             .unwrap_or_else(|e| panic!("{kind:?} encoder: {e:?}"));
 
         // Drive the encoder for enough frames to produce at least two
@@ -392,7 +389,6 @@ fn videotoolbox_decoder_recovers_from_mid_session_idr() {
 fn videotoolbox_codec_name_maps() {
     // Default-on (no hardware needed): exercises the codec_name map so
     // a typo in the cstring → str pair gets caught at CI time.
-    use tether_protocol::control::CodecKind;
     fn name(kind: CodecKind) -> &'static str {
         // Mirrors the private `vt_codec_name` in `encoder.rs`; if those
         // strings ever diverge from the cstr names the encoder asks for,

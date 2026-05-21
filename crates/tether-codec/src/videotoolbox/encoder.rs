@@ -12,7 +12,7 @@ use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
 
-use tether_protocol::control::CodecKind;
+use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
 use crate::encoder_common::{drain_encoder, snapshot_extradata};
 use crate::h264::frame_plane_mut;
@@ -33,8 +33,15 @@ const VT_POOL_SIZE: i32 = 8;
 
 pub struct VideoToolboxEncoder {
     kind: CodecKind,
+    /// Negotiated chroma sampling. Pinned at construction; the encoder
+    /// holds an FFmpeg pix_fmt that matches.
+    chroma: ChromaSubsampling,
+    /// Negotiated bit depth (8 or 10 in practice). VideoToolbox doesn't
+    /// expose 12-bit encode for anything we care about; the probe layer
+    /// surfaces a clean error if the wrapper refuses other combos.
+    bit_depth: u8,
     encoder: AVCodecContext,
-    bgra_to_nv12: SwsContext,
+    bgra_to_sw: SwsContext,
     sw_frame: AVFrame,
     bgra_frame: AVFrame,
     /// Annex-B SPS/PPS (and VPS for HEVC) captured at `open()` via
@@ -63,21 +70,33 @@ pub struct VideoToolboxEncoder {
 unsafe impl Send for VideoToolboxEncoder {}
 
 impl VideoToolboxEncoder {
-    /// Construct a VideoToolbox encoder for the given codec at the
-    /// given dimensions.
+    /// Construct a VideoToolbox encoder for the given video profile at
+    /// the given dimensions.
     ///
     /// Returns `Err(CodecError::CodecNotFound)` if the linked FFmpeg
     /// wasn't built with VideoToolbox support for the requested codec
     /// (Homebrew's `ffmpeg` formula enables `--enable-videotoolbox`
-    /// by default); any `RsmpegError` if the VT device fails to open.
+    /// by default); `Err(CodecError::UnsupportedInputFormat)` if no
+    /// FFmpeg pix_fmt matches the requested `(chroma, bit_depth)`;
+    /// any `RsmpegError` if the VT device fails to open or the FFmpeg
+    /// wrapper rejects the configuration. The probe layer treats every
+    /// failure path equivalently as `encode=false`, so an empirical
+    /// "VT silently does/doesn't support Main10/Main444/etc." answer
+    /// falls out of attempting `encoder.open()` rather than from any
+    /// table this code maintains.
     pub fn new(
-        kind: CodecKind,
+        profile: VideoProfile,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self> {
         init_ffmpeg();
+
+        let kind = profile.codec;
+        let chroma = profile.chroma;
+        let bit_depth = profile.bit_depth;
+        let sw_format = vt_sw_format(chroma, bit_depth)?;
 
         let codec_cname = vt_codec_cname(kind)?;
         let codec = AVCodec::find_encoder_by_name(codec_cname)
@@ -94,9 +113,12 @@ impl VideoToolboxEncoder {
         encoder.set_width(width_i32);
         encoder.set_height(height_i32);
         // pix_fmt is VIDEOTOOLBOX: pixels live in a CVPixelBuffer; the
-        // sw_format on the hwframes context says NV12 (matching what
-        // ScreenCaptureKit hands us as the IOSurface backing format
-        // and what the BGRA-upload path swscales into).
+        // sw_format on the hwframes context describes the in-memory
+        // layout VT and FFmpeg's `*_videotoolbox` wrapper agree on.
+        // For (Yuv420, 8) that's NV12 — what SCK hands us via IOSurface
+        // and what swscale targets from BGRA. Higher-bit / 4:4:4 paths
+        // pick P010 / NV24 / P410 (see `vt_sw_format`); whether the
+        // wrapper actually accepts those is what the probe surfaces.
         encoder.set_pix_fmt(ffi::AV_PIX_FMT_VIDEOTOOLBOX);
         encoder.set_time_base(ra(1, fps_i32));
         encoder.set_framerate(ra(fps_i32, 1));
@@ -117,13 +139,9 @@ impl VideoToolboxEncoder {
         #[allow(clippy::cast_possible_wrap)]
         encoder.set_flags(encoder.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
 
-        // Build + attach the hwframes context. NV12 video-range is the
-        // canonical VT input — Apple's hardware encoder natively
-        // consumes it and SCK is configured (in tether-capture::macos)
-        // to deliver IOSurfaces in the same format.
         let mut hw_frames_ref = hw_device.hwframe_ctx_alloc();
         hw_frames_ref.data().format = ffi::AV_PIX_FMT_VIDEOTOOLBOX;
-        hw_frames_ref.data().sw_format = ffi::AV_PIX_FMT_NV12;
+        hw_frames_ref.data().sw_format = sw_format;
         hw_frames_ref.data().width = width_i32;
         hw_frames_ref.data().height = height_i32;
         hw_frames_ref.data().initial_pool_size = VT_POOL_SIZE;
@@ -206,19 +224,20 @@ impl VideoToolboxEncoder {
             }
         }
 
-        let mut bgra_to_nv12 = SwsContext::get_context(
+        let scaler_label = vt_scaler_label(sw_format);
+        let mut bgra_to_sw = SwsContext::get_context(
             width_i32,
             height_i32,
             ffi::AV_PIX_FMT_BGRA,
             width_i32,
             height_i32,
-            ffi::AV_PIX_FMT_NV12,
+            sw_format,
             ffi::SWS_FAST_BILINEAR,
             None,
             None,
             None,
         )
-        .ok_or(CodecError::ScalerInit("BGRA -> NV12"))?;
+        .ok_or(CodecError::ScalerInit(scaler_label))?;
 
         // Pin swscale's RGB→YUV matrix to BT.709 limited so the encoded
         // bytes match the VUI we wrote above. Default behaviour picks
@@ -234,11 +253,11 @@ impl VideoToolboxEncoder {
         unsafe {
             let coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as i32);
             let _ = ffi::sws_setColorspaceDetails(
-                bgra_to_nv12.as_mut_ptr(),
+                bgra_to_sw.as_mut_ptr(),
                 coeffs,
                 1, // src_range: BGRA is full range
                 coeffs,
-                0, // dst_range: NV12 video range (matches AVCOL_RANGE_MPEG)
+                0, // dst_range: YUV video range (matches AVCOL_RANGE_MPEG)
                 0,
                 65536,
                 65536,
@@ -252,7 +271,7 @@ impl VideoToolboxEncoder {
         bgra_frame.alloc_buffer()?;
 
         let mut sw_frame = AVFrame::new();
-        sw_frame.set_format(ffi::AV_PIX_FMT_NV12);
+        sw_frame.set_format(sw_format);
         sw_frame.set_width(width_i32);
         sw_frame.set_height(height_i32);
         sw_frame.alloc_buffer()?;
@@ -267,8 +286,10 @@ impl VideoToolboxEncoder {
 
         Ok(Self {
             kind,
+            chroma,
+            bit_depth,
             encoder,
-            bgra_to_nv12,
+            bgra_to_sw,
             sw_frame,
             bgra_frame,
             extradata,
@@ -297,6 +318,18 @@ impl VideoToolboxEncoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
+        // IOSurface fast path only wired for NV12 today — that's what
+        // SCK hands us via `'420v'` capture. If a session ever
+        // negotiates a higher chroma/depth profile, this path needs an
+        // IOSurface fourcc check + matching capture-side wiring before
+        // we wrap it in a CVPixelBuffer; surfaces from a different
+        // CV pixel format would silently mis-encode against the
+        // encoder's sw_format. Refuse here and let the caller fall
+        // back to `encode_bgra` (or, eventually, hit the matching
+        // surface path).
+        if self.chroma != ChromaSubsampling::Yuv420 || self.bit_depth != 8 {
+            return Err(CodecError::UnsupportedInputFormat);
+        }
         if frame.width != self.width || frame.height != self.height {
             return Err(CodecError::UnsupportedInputFormat);
         }
@@ -447,8 +480,8 @@ impl Encoder for VideoToolboxEncoder {
             }
         }
 
-        // 2. swscale BGRA -> NV12.
-        self.bgra_to_nv12.scale_frame(
+        // 2. swscale BGRA -> hwframes sw_format (NV12 / P010 / NV24 / P410).
+        self.bgra_to_sw.scale_frame(
             &self.bgra_frame,
             0,
             i32::try_from(height).expect("height fits in i32"),
@@ -519,6 +552,41 @@ fn vt_codec_name(kind: CodecKind) -> &'static str {
         CodecKind::H264 => "h264_videotoolbox",
         CodecKind::Hevc => "hevc_videotoolbox",
         CodecKind::Av1 => "av1_videotoolbox",
+    }
+}
+
+/// Pick the FFmpeg pix_fmt that goes in the hwframes context's
+/// `sw_format` (and also in the BGRA→YUV swscale destination + the
+/// staging `sw_frame`) for a given `(chroma, bit_depth)` combination.
+///
+/// We map every combination FFmpeg has a pix_fmt for and let
+/// `encoder.open()` be the authority on whether the VideoToolbox
+/// wrapper actually accepts that pix_fmt as input. The probe layer
+/// treats an `encoder.open()` failure as `encode=false`, so anything
+/// VT silently refuses falls out as a clean negative result rather
+/// than as a panic. Combos with no matching FFmpeg pix_fmt return
+/// `UnsupportedInputFormat` here — there's nothing to probe.
+fn vt_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
+    Ok(match (chroma, bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => ffi::AV_PIX_FMT_NV12,
+        (ChromaSubsampling::Yuv420, 10) => ffi::AV_PIX_FMT_P010LE,
+        (ChromaSubsampling::Yuv444, 8) => ffi::AV_PIX_FMT_NV24,
+        (ChromaSubsampling::Yuv444, 10) => ffi::AV_PIX_FMT_P410LE,
+        _ => return Err(CodecError::UnsupportedInputFormat),
+    })
+}
+
+/// Static debug label for `CodecError::ScalerInit`, keyed off the
+/// destination `sw_format`. Tiny match because `ScalerInit` wants a
+/// `&'static str`; the alternative is heap-allocating per call which
+/// hides the (rare) probe failure in the allocator.
+fn vt_scaler_label(sw_format: i32) -> &'static str {
+    match sw_format {
+        x if x == ffi::AV_PIX_FMT_NV12 => "BGRA -> NV12",
+        x if x == ffi::AV_PIX_FMT_P010LE => "BGRA -> P010",
+        x if x == ffi::AV_PIX_FMT_NV24 => "BGRA -> NV24",
+        x if x == ffi::AV_PIX_FMT_P410LE => "BGRA -> P410",
+        _ => "BGRA -> sw_format",
     }
 }
 

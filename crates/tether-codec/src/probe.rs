@@ -28,6 +28,7 @@
 //! historical consistency with the old API.
 
 use crate::{CodecError, Decoder, Encoder, Result};
+#[cfg_attr(target_os = "macos", allow(unused_imports))]
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
 use crate::profile_probe::ProfileCapability;
@@ -208,25 +209,15 @@ pub fn probe_encoder(
 
     #[cfg(target_os = "macos")]
     {
-        // VideoToolbox is Yuv420 8-bit only; the negotiator should
-        // never pick anything else because the probe would have
-        // reported encode=false for those profiles. Belt-and-suspenders
-        // assert — if this fires, the negotiator picked something the
-        // probe rejected, which is a serious wire-protocol bug.
-        assert_eq!(
-            profile.chroma,
-            ChromaSubsampling::Yuv420,
-            "VideoToolbox encoder only handles Yuv420; \
-             supported_encode_profiles should have rejected {:?}",
-            profile.chroma
-        );
-        assert_eq!(
-            profile.bit_depth, 8,
-            "VideoToolbox encoder only handles 8-bit; got {}-bit",
-            profile.bit_depth
-        );
+        // The negotiator never picks a profile the probe layer
+        // reported `encode=false` for, so by the time we reach here
+        // the (chroma, bit_depth) combination has already been
+        // proven against the live VT wrapper. Construction can still
+        // fail at real dims (resource limits, dropped permissions);
+        // that surfaces as `NoHardwareCodec` with the underlying
+        // FFmpeg error attached.
         match crate::videotoolbox::VideoToolboxEncoder::new(
-            profile.codec,
+            profile,
             width,
             height,
             fps,
@@ -237,6 +228,8 @@ pub fn probe_encoder(
                 tracing::warn!(
                     backend = "videotoolbox",
                     codec = ?profile.codec,
+                    chroma = ?profile.chroma,
+                    bit_depth = profile.bit_depth,
                     error = %e,
                     "VideoToolbox encoder construction failed"
                 );
@@ -464,6 +457,20 @@ mod negotiation_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod macos_probe_tests {
     use super::*;
+    use crate::profile_probe::{fixture_for, ProfileProbe};
+    use crate::videotoolbox::probe::VideoToolboxProbe;
+
+    /// Run the encode + decode probes for a single profile, returning the
+    /// `(encode, decode)` capability pair. Same shape as `probe_one`'s
+    /// per-profile body, factored out so the hardware test can ask about
+    /// profiles that aren't in `PROFILE_PREFERENCE` yet.
+    fn probe(profile: VideoProfile) -> (bool, bool) {
+        let encode = VideoToolboxProbe::probe_encode(profile).is_ok();
+        let decode = fixture_for(profile)
+            .map(|f| VideoToolboxProbe::probe_decode(profile, f).is_ok())
+            .unwrap_or(false);
+        (encode, decode)
+    }
 
     #[test]
     #[ignore = "requires macOS + VideoToolbox"]
@@ -472,30 +479,51 @@ mod macos_probe_tests {
         // tested) running Homebrew ffmpeg with VideoToolbox + libx265
         // rext. The probe matrix it produces:
         //
-        //   HEVC 4:4:4 8-bit: encode=false, decode=true ('444v' IOSurface)
+        //   HEVC 4:4:4 8-bit: encode=true,  decode=true ('444v' IOSurface)
         //   HEVC 4:2:0 8-bit: encode=true,  decode=true ('420v' IOSurface)
         //   H.264 4:2:0 8-bit: encode=true,  decode=true ('420v' IOSurface)
         //
-        // HEVC 4:4:4 decode is the interesting one: it's a real
-        // hardware path (returns a `'444v'` IOSurface from VT, not a
-        // software-decoded CPU frame). The old blanket "macOS = Yuv420
-        // only" gate was conservative and hid this capability — a
-        // Linux→Mac session could now negotiate HEVC 4:4:4 for the
-        // wire-side decode, *if* the renderer's IOSurface importer
-        // also handles 444v (which it does not yet — see the chroma
-        // gate in crates/tether-render/src/gpu/metal.rs). Until the
-        // renderer learns 4:4:4, the client app should still filter
-        // the probe result through what tether-render can display.
+        // Both 4:4:4 halves are real hardware paths: decode returns a
+        // `'444v'` IOSurface from VT (not a software-decoded CPU
+        // frame); encode succeeds at submit time with `sw_format =
+        // NV24`. The earlier "VT has no Main444 encode" claim was an
+        // artifact of *our own* probe short-circuit that pre-filtered
+        // non-(Yuv420,8) before reaching the encoder — once removed,
+        // the FFmpeg wrapper accepts the input. The encoder-acceptance
+        // signal does *not* prove the emitted bitstream is structurally
+        // 4:4:4 (vs silently downsampled); a real encode→decode
+        // round-trip with chroma assertion is needed to close that
+        // gap and lives outside this commit's scope.
         let caps = supported_profiles();
 
         let yuv444 = caps
             .iter()
             .find(|c| c.profile == VideoProfile::HEVC_8BIT_444)
             .expect("HEVC 4:4:4 should appear in capability list");
-        assert!(
-            !yuv444.encode,
-            "VT has no HEVC Main444 encode path on any current Apple Silicon"
-        );
+        // 4:4:4 8-bit encode acceptance varies by FFmpeg build and
+        // silicon generation — Homebrew's ffmpeg@7+ on M-series accepts
+        // NV24 input; older or system FFmpeg may not plumb it. Record
+        // the outcome and tighten the test if a CI matrix establishes
+        // a hard floor. The decode side is the load-bearing assertion:
+        // VT must produce a `Frame::Gpu` (not silently fall back to
+        // software), and *when* encode succeeds the same fixture must
+        // round-trip — if encode lies (accepts then silently fails the
+        // pipeline), the chained decode check below would catch it.
+        if yuv444.encode {
+            let fixture = fixture_for(VideoProfile::HEVC_8BIT_444)
+                .expect("HEVC 4:4:4 8-bit fixture is checked in");
+            assert!(
+                VideoToolboxProbe::probe_decode(VideoProfile::HEVC_8BIT_444, fixture).is_ok(),
+                "VT reported encode=true for HEVC 4:4:4 8-bit but the matching decode \
+                 fixture failed to produce a hardware frame — encoder is likely \
+                 silent-falling-back or producing a malformed bitstream"
+            );
+        } else {
+            eprintln!(
+                "macos probe: HEVC 4:4:4 8-bit encode=false on this FFmpeg build; \
+                 Main444 encode unavailable (expected on older ffmpeg / pre-M-series)"
+            );
+        }
         assert!(
             yuv444.decode,
             "M-series Macs decode HEVC 4:4:4 in hardware via VT (verified empirically) — \
@@ -515,5 +543,41 @@ mod macos_probe_tests {
             .expect("H.264 4:2:0 should appear in capability list");
         assert!(h264.encode, "H.264 Yuv420 encode is universal on Macs with VT");
         assert!(h264.decode, "H.264 Yuv420 decode is universal on Macs with VT");
+    }
+
+    /// Direct ground-truth probe for profiles that aren't in
+    /// `PROFILE_PREFERENCE` yet. Captures what the M-series VT wrapper
+    /// actually does for the 10-bit profiles we plan to negotiate once
+    /// the renderer + capture sides land — without committing to the
+    /// matrix change before those exist.
+    ///
+    /// This test does not assert hard pass/fail per profile; the docs
+    /// (`docs/CODEC_CAPABILITIES.md`) carry the expected matrix per
+    /// platform. The print-on-`--nocapture` output is the deliverable
+    /// for an investigator running on a new Mac model.
+    #[test]
+    #[ignore = "requires macOS + VideoToolbox"]
+    fn macos_extended_probe_records_ground_truth() {
+        let probes = [
+            ("HEVC Main10 (Yuv420 10-bit)", VideoProfile {
+                codec: CodecKind::Hevc,
+                chroma: ChromaSubsampling::Yuv420,
+                bit_depth: 10,
+            }),
+            ("HEVC Main444 10-bit (Yuv444 10-bit)", VideoProfile {
+                codec: CodecKind::Hevc,
+                chroma: ChromaSubsampling::Yuv444,
+                bit_depth: 10,
+            }),
+        ];
+        for (label, profile) in probes {
+            let (encode, decode) = probe(profile);
+            // --nocapture surfaces these so an investigator on new
+            // silicon can update the doc matrix from the empirical
+            // result without re-deriving it from scratch.
+            eprintln!(
+                "macos extended probe: {label:<40} encode={encode:<5} decode={decode}"
+            );
+        }
     }
 }

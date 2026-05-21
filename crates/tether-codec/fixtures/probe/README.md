@@ -25,6 +25,26 @@ ffmpeg -y -hide_banner -loglevel warning \
   -f lavfi -i color=c=gray:s=128x128:r=30 -frames:v 1 \
   -c:v libx265 -preset ultrafast -x265-params "log-level=error" \
   -pix_fmt yuv444p -f hevc hevc_yuv444_8bit.idr
+
+ffmpeg -y -hide_banner -loglevel warning \
+  -f lavfi -i color=c=gray:s=128x128:r=30 -frames:v 1 \
+  -c:v libx265 -preset ultrafast -x265-params "log-level=error" \
+  -pix_fmt yuv420p10le -f hevc hevc_yuv420_10bit.idr
+
+ffmpeg -y -hide_banner -loglevel warning \
+  -f lavfi -i color=c=gray:s=128x128:r=30 -frames:v 1 \
+  -c:v libx265 -preset ultrafast -x265-params "log-level=error" \
+  -pix_fmt yuv422p -f hevc hevc_yuv422_8bit.idr
+
+ffmpeg -y -hide_banner -loglevel warning \
+  -f lavfi -i color=c=gray:s=128x128:r=30 -frames:v 1 \
+  -c:v libx265 -preset ultrafast -x265-params "log-level=error" \
+  -pix_fmt yuv422p10le -f hevc hevc_yuv422_10bit.idr
+
+ffmpeg -y -hide_banner -loglevel warning \
+  -f lavfi -i color=c=gray:s=128x128:r=30 -frames:v 1 \
+  -c:v libx265 -preset ultrafast -x265-params "log-level=error" \
+  -pix_fmt yuv444p10le -f hevc hevc_yuv444_10bit.idr
 ```
 
 Verify with `ffprobe`:
@@ -41,7 +61,11 @@ Expected:
 
 - `h264_yuv420_8bit.idr` — `h264`, profile `Constrained Baseline`, `yuv420p`, 128×128
 - `hevc_yuv420_8bit.idr` — `hevc`, profile `Main`, `yuv420p`, 128×128
+- `hevc_yuv420_10bit.idr` — `hevc`, profile `Main 10`, `yuv420p10le`, 128×128
+- `hevc_yuv422_8bit.idr` — `hevc`, profile `Rext`, `yuv422p`, 128×128
+- `hevc_yuv422_10bit.idr` — `hevc`, profile `Rext`, `yuv422p10le`, 128×128
 - `hevc_yuv444_8bit.idr` — `hevc`, profile `Rext`, `yuv444p`, 128×128
+- `hevc_yuv444_10bit.idr` — `hevc`, profile `Rext`, `yuv444p10le`, 128×128
 
 If the HEVC 4:4:4 fixture comes out as `Main` instead of `Rext`, the
 linked libx265 wasn't built with `--enable-rext`. On macOS rebuild via

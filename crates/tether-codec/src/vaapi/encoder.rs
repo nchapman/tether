@@ -30,19 +30,22 @@ use super::VAAPI_POOL_SIZE;
 
 pub struct VaapiEncoder {
     kind: CodecKind,
-    /// Negotiated chroma sampling. Determines:
-    /// - `sw_format` on the encoder's hwframes pool (`NV12` for 4:2:0,
-    ///   `YUV444P` for 4:4:4).
-    /// - The pixel-conversion swscale context fed in `encode_bgra`.
-    /// - The VAAPI driver profile string (`main` for 4:2:0, `rext` for
-    ///   HEVC Main444).
-    /// - The expected fourcc on imported DMA-BUFs in `submit_dmabuf`.
+    /// Negotiated chroma sampling. Pinned at construction; resolves
+    /// (alongside `bit_depth`) to a single FFmpeg pix_fmt through
+    /// [`vaapi_sw_format`], which is then used for the hwframes pool's
+    /// `sw_format`, the BGRA→YUV swscale destination, and the expected
+    /// fourcc on imported DMA-BUFs in `submit_dmabuf`.
     chroma: ChromaSubsampling,
+    /// Negotiated bit depth (8 or 10 in practice). Same role as
+    /// `chroma`: feeds `vaapi_sw_format`. Stored separately so
+    /// `submit_dmabuf` can validate `(chroma, bit_depth)` against the
+    /// imported DMA-BUF before mapping it.
+    bit_depth: u8,
     encoder: AVCodecContext,
-    /// BGRA → encoder-input swscale context. NV12 for 4:2:0, YUV444P
-    /// for 4:4:4. The output format matches the encoder's `sw_format`;
-    /// SwsContext is statically pinned to a single (src, dst) pair so
-    /// the chroma choice is baked in at construction.
+    /// BGRA → encoder-input swscale context. Output format matches the
+    /// encoder's `sw_format` (see [`vaapi_sw_format`]); SwsContext is
+    /// statically pinned to a single (src, dst) pair so the
+    /// (chroma, bit_depth) choice is baked in at construction.
     bgra_to_encoder_input: SwsContext,
     sw_frame: AVFrame,
     bgra_frame: AVFrame,
@@ -114,23 +117,30 @@ impl VaapiEncoder {
 
         let kind = profile.codec;
         let chroma = profile.chroma;
-        // 8-bit is the only depth wired today. The probe layer enforces
-        // this so we should never reach here with anything else; panic
-        // rather than silently mis-encode if the contract slips.
-        assert_eq!(
-            profile.bit_depth, 8,
-            "VAAPI encoder only supports 8-bit profiles; got {}-bit",
-            profile.bit_depth
-        );
+        let bit_depth = profile.bit_depth;
         // VAAPI has no H.264 4:4:4 encode profile across any driver we
         // target (Sunshine confirms the same — see
         // refs/Sunshine/src/platform/linux/vaapi.cpp:202). Refuse early
-        // rather than producing a confusing FFmpeg open() failure.
+        // rather than producing a confusing FFmpeg open() failure. This
+        // is a libva spec-level absence (no VAProfile enum entry), not
+        // a driver-version question — keep it short-circuited rather
+        // than feeding it to the probe.
         if kind == CodecKind::H264 && chroma == ChromaSubsampling::Yuv444 {
             return Err(CodecError::CodecNotFound(
                 "VAAPI does not expose an H.264 4:4:4 encode profile",
             ));
         }
+        // Map (chroma, bit_depth) to the FFmpeg pix_fmt used for both
+        // the hwframes context's `sw_format` and the BGRA→YUV swscale
+        // destination. Unsupported combinations (no FFmpeg pix_fmt for
+        // that input shape) return a clean `UnsupportedInputFormat`;
+        // probes record `encode=false`. Whether a *driver* accepts the
+        // mapped pix_fmt at `encoder.open()` time is a separate
+        // question the probe answers empirically by attempting the
+        // open — no documented VAAPI driver exposes 10-bit encode for
+        // any of these as of writing, but the probe will discover the
+        // day that changes without code changes here.
+        let sw_format = vaapi_sw_format(chroma, bit_depth)?;
 
         let codec_cname = vaapi_codec_cname(kind)?;
         let codec = AVCodec::find_encoder_by_name(codec_cname)
@@ -165,18 +175,12 @@ impl VaapiEncoder {
         encoder.set_max_b_frames(0);
 
         // Build + attach the hwframes context. The `sw_format` decides
-        // the on-device pixel layout. NV12 for 4:2:0 (interleaved UV
-        // at half resolution). For 4:4:4 we use VUYX (packed
-        // X|Y|U|V 8:8:8:8, 32 bpp) rather than planar YUV444P — the
-        // packed layout is the only 4:4:4 8-bit format ffmpeg's
-        // `vaapi_drm_format_map` can import via DRM_PRIME on the
-        // gpuconvert→encoder hop (no entry exists for planar
-        // YUV444P or its R8/YU24 DRM encodings). VAAPI's encoder
-        // accepts VUYX-format surfaces as input to HEVC Main 4:4:4.
-        let sw_format = match chroma {
-            ChromaSubsampling::Yuv420 => ffi::AV_PIX_FMT_NV12,
-            ChromaSubsampling::Yuv444 => ffi::AV_PIX_FMT_VUYX,
-        };
+        // the on-device pixel layout (see `vaapi_sw_format` above).
+        // 4:4:4 8-bit uses VUYX (packed X|Y|U|V 8:8:8:8, 32 bpp)
+        // rather than planar YUV444P — packed is the only 4:4:4 8-bit
+        // format ffmpeg's `vaapi_drm_format_map` can import via
+        // DRM_PRIME on the gpuconvert→encoder hop (no entry exists
+        // for planar YUV444P or its R8/YU24 DRM encodings).
         let mut hw_frames_ref = hw_device.hwframe_ctx_alloc();
         hw_frames_ref.data().format = ffi::AV_PIX_FMT_VAAPI;
         hw_frames_ref.data().sw_format = sw_format;
@@ -204,17 +208,28 @@ impl VaapiEncoder {
             raw.color_trc = ffi::AVCOL_TRC_BT709;
             raw.colorspace = ffi::AVCOL_SPC_BT709;
             raw.color_range = ffi::AVCOL_RANGE_MPEG;
-            // Pin the HEVC REXT profile via the context field rather
-            // than the `profile=rext` AVOption string. The string form
-            // is brittle: libavcodec's REXT umbrella covers Main 4:4:4
-            // 8-bit, Main 4:4:4 10-bit, Main Intra, and several other
-            // sub-profiles; the actual one selected is inferred from
-            // the hwframes `sw_format`. Setting the field directly is
-            // Sunshine's reference pattern (refs/Sunshine/src/video.cpp:1687)
-            // and future-proofs against a 10-bit code path drifting
-            // the inferred sub-profile.
-            if matches!(chroma, ChromaSubsampling::Yuv444) && kind == CodecKind::Hevc {
-                raw.profile = ffi::AV_PROFILE_HEVC_REXT as i32;
+            // HEVC profile pin. Sunshine's reference pattern (see
+            // refs/Sunshine/src/video.cpp:1687) sets `profile` on the
+            // context field rather than via the `profile=` AVOption
+            // string; the string form is brittle for the Rext
+            // umbrella (covers 4:4:4 8/10-bit, 4:2:2 10-bit, Main
+            // Intra, etc.) where the actual sub-profile is inferred
+            // from the hwframes `sw_format`. We pick:
+            //   - REXT for any 4:4:4 (Main 4:4:4 8/10-bit) — packed
+            //     pix_fmt + this profile is what hevc_vaapi picks up.
+            //   - MAIN_10 for Yuv420 10-bit so VAAPI doesn't fall
+            //     through to MAIN and produce a stream the driver
+            //     rejects against the negotiated bit depth.
+            // For Yuv420 8-bit we leave the field at FFmpeg's default
+            // and let the `profile=main` AVOption (below) drive it.
+            if kind == CodecKind::Hevc {
+                if matches!(chroma, ChromaSubsampling::Yuv444) {
+                    raw.profile = ffi::AV_PROFILE_HEVC_REXT as i32;
+                } else if matches!(chroma, ChromaSubsampling::Yuv420)
+                    && bit_depth == 10
+                {
+                    raw.profile = ffi::AV_PROFILE_HEVC_MAIN_10 as i32;
+                }
             }
         }
 
@@ -263,11 +278,16 @@ impl VaapiEncoder {
             .set(c"rc_mode", c"VBR", 0)
             .set(c"idr_interval", c"2147483647", 0)
             .set(c"sei", c"0", 0);
-        let dict = match chroma {
-            ChromaSubsampling::Yuv420 => dict_builder.set(c"profile", c"main", 0),
-            // 4:4:4 path: profile pinned via context field above, no
-            // AVOption needed.
-            ChromaSubsampling::Yuv444 => dict_builder,
+        let dict = match (chroma, bit_depth) {
+            // 4:2:0 8-bit: pin Main profile via AVOption — broadly
+            // compatible default the encoder picks up regardless of
+            // driver capability advertisements.
+            (ChromaSubsampling::Yuv420, 8) => dict_builder.set(c"profile", c"main", 0),
+            // 4:2:0 10-bit and any 4:4:4: profile pinned via the
+            // context-field assignment above (Main10 or REXT). The
+            // `profile=` AVOption string would override that field;
+            // skip it.
+            _ => dict_builder,
         };
         // AV_CODEC_FLAG_GLOBAL_HEADER routes the codec's parameter
         // sets (SPS/PPS for H.264, VPS+SPS+PPS for HEVC) into
@@ -302,10 +322,7 @@ impl VaapiEncoder {
             }
         }
 
-        let scaler_label = match chroma {
-            ChromaSubsampling::Yuv420 => "BGRA -> NV12",
-            ChromaSubsampling::Yuv444 => "BGRA -> VUYX",
-        };
+        let scaler_label = vaapi_scaler_label(sw_format);
         let bgra_to_encoder_input = SwsContext::get_context(
             width_i32,
             height_i32,
@@ -344,6 +361,7 @@ impl VaapiEncoder {
         Ok(Self {
             kind,
             chroma,
+            bit_depth,
             encoder,
             bgra_to_encoder_input,
             sw_frame,
@@ -383,6 +401,16 @@ impl VaapiEncoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
+        // 10-bit DMA-BUF import isn't wired yet — gpuconvert produces
+        // NV12 / XYUV only. If a future call lands here with a 10-bit
+        // encoder, the fourcc table below would silently accept the
+        // 8-bit DRM fourcc and produce a mis-encoded bitstream
+        // (caller asked for 10-bit, encoder got 8-bit input). Refuse
+        // explicitly until the 10-bit gpuconvert path lands and this
+        // function grows matching (P010 / XV30) fourcc entries.
+        if self.bit_depth != 8 {
+            return Err(CodecError::UnsupportedInputFormat);
+        }
         // DRM fourccs for the two pixel formats the encoder accepts.
         // The dma-buf bridge must hand us a frame matching the
         // negotiated chroma — otherwise av_hwframe_map would fail
@@ -646,10 +674,12 @@ impl Encoder for VaapiEncoder {
         )?;
 
         // 3. Allocate a VAAPI surface from the encoder's hwframes pool
-        // and upload the NV12 bytes via av_hwframe_transfer_data
-        // (CPU memcpy into GPU memory). The pool blocks if all
-        // surfaces are still in flight at the encoder, which with
-        // async_depth=1 + 8 surfaces basically never happens.
+        // and upload the sw_frame bytes via av_hwframe_transfer_data
+        // (CPU memcpy into GPU memory; sw_frame's pix_fmt was picked
+        // by `vaapi_sw_format` from the negotiated (chroma, bit_depth)).
+        // The pool blocks if all surfaces are still in flight at the
+        // encoder, which with async_depth=1 + 8 surfaces basically
+        // never happens.
         let mut hw_frame = AVFrame::new();
         self.encoder
             .hw_frames_ctx_mut()
@@ -720,6 +750,50 @@ fn vaapi_codec_name(kind: CodecKind) -> &'static str {
         CodecKind::H264 => "h264_vaapi",
         CodecKind::Hevc => "hevc_vaapi",
         CodecKind::Av1 => "av1_vaapi",
+    }
+}
+
+/// FFmpeg pix_fmt for the hwframes `sw_format` (and the matching
+/// BGRA→YUV swscale destination + staging `sw_frame`) at the given
+/// `(chroma, bit_depth)`. Mirrors `videotoolbox::encoder::vt_sw_format`
+/// in spirit: every combination FFmpeg has a pix_fmt for is mapped;
+/// `encoder.open()` is then the authority on whether the live VAAPI
+/// driver accepts that pix_fmt as encode input. Unmapped combinations
+/// return `UnsupportedInputFormat` here — there's nothing to attempt.
+///
+/// Notes on the 4:4:4 column: VUYX is the *only* 8-bit pix_fmt
+/// ffmpeg's `vaapi_drm_format_map` will import via DRM_PRIME, so
+/// gpuconvert must produce it for the zero-copy path; the planar
+/// alternative YUV444P fails at `av_hwframe_map` time. The 10-bit
+/// equivalents (XV30 / X2V10) sit alongside it — VAAPI's
+/// `vaapi_drm_format_map` table covers them, but no driver we've
+/// found exposes the matching encode profile, so the probe is the
+/// only honest signal.
+fn vaapi_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
+    Ok(match (chroma, bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => ffi::AV_PIX_FMT_NV12,
+        (ChromaSubsampling::Yuv420, 10) => ffi::AV_PIX_FMT_P010LE,
+        (ChromaSubsampling::Yuv444, 8) => ffi::AV_PIX_FMT_VUYX,
+        // FFmpeg exposes both packed (XV30) and planar (X2V10) 4:4:4
+        // 10-bit; VAAPI's vaapi_drm_format_map carries XV30. P410LE
+        // is biplanar and not in the DRM map, so we don't pick it
+        // here for VAAPI parity.
+        (ChromaSubsampling::Yuv444, 10) => ffi::AV_PIX_FMT_XV30LE,
+        _ => return Err(CodecError::UnsupportedInputFormat),
+    })
+}
+
+/// Static debug label for `CodecError::ScalerInit`, keyed off the
+/// destination `sw_format`. Match arms are exhaustive against
+/// `vaapi_sw_format`'s outputs; the fallback covers a future
+/// `vaapi_sw_format` addition that hasn't reached this table.
+fn vaapi_scaler_label(sw_format: i32) -> &'static str {
+    match sw_format {
+        x if x == ffi::AV_PIX_FMT_NV12 => "BGRA -> NV12",
+        x if x == ffi::AV_PIX_FMT_P010LE => "BGRA -> P010",
+        x if x == ffi::AV_PIX_FMT_VUYX => "BGRA -> VUYX",
+        x if x == ffi::AV_PIX_FMT_XV30LE => "BGRA -> XV30",
+        _ => "BGRA -> sw_format",
     }
 }
 

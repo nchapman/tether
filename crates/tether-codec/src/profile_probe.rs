@@ -62,7 +62,11 @@ pub(crate) trait ProfileProbe {
 /// 128×128 grey:
 ///   - `h264_yuv420_8bit.idr` — libx264 Constrained Baseline, ~700 B
 ///   - `hevc_yuv420_8bit.idr` — libx265 Main, ~2.4 KB
+///   - `hevc_yuv420_10bit.idr` — libx265 Main 10, ~2.4 KB
+///   - `hevc_yuv422_8bit.idr` — libx265 Rext (Main 4:2:2 8-bit), ~2.4 KB
+///   - `hevc_yuv422_10bit.idr` — libx265 Rext (Main 4:2:2 10-bit), ~2.4 KB
 ///   - `hevc_yuv444_8bit.idr` — libx265 Rext (Main 4:4:4 8-bit), ~2.4 KB
+///   - `hevc_yuv444_10bit.idr` — libx265 Rext (Main 4:4:4 10-bit), ~2.4 KB
 ///
 /// Regenerate via the commands documented in `fixtures/probe/README.md`.
 pub(crate) fn fixture_for(profile: VideoProfile) -> Option<&'static [u8]> {
@@ -73,11 +77,20 @@ pub(crate) fn fixture_for(profile: VideoProfile) -> Option<&'static [u8]> {
         (CodecKind::Hevc, ChromaSubsampling::Yuv420, 8) => Some(include_bytes!(
             "../fixtures/probe/hevc_yuv420_8bit.idr"
         )),
+        (CodecKind::Hevc, ChromaSubsampling::Yuv420, 10) => Some(include_bytes!(
+            "../fixtures/probe/hevc_yuv420_10bit.idr"
+        )),
         (CodecKind::Hevc, ChromaSubsampling::Yuv444, 8) => Some(include_bytes!(
             "../fixtures/probe/hevc_yuv444_8bit.idr"
         )),
-        // H.264 4:4:4, AV1, 10-bit profiles, etc. — no fixture means
-        // we conservatively report decode=false until one is added.
+        (CodecKind::Hevc, ChromaSubsampling::Yuv444, 10) => Some(include_bytes!(
+            "../fixtures/probe/hevc_yuv444_10bit.idr"
+        )),
+        // 4:2:2 fixtures (`hevc_yuv422_*bit.idr`) are checked in but
+        // not wired up until ChromaSubsampling::Yuv422 lands on the
+        // wire — see docs/CODEC_CAPABILITIES.md. H.264 4:4:4, AV1,
+        // etc. — no fixture means we conservatively report decode=false
+        // until one is added.
         _ => None,
     }
 }

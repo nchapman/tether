@@ -1,6 +1,22 @@
-use crate::Encoder;
+use crate::{Decoder, Encoder, Frame, GpuFrame, GpuFrameSource};
 
 use super::{VideoToolboxDecoder, VideoToolboxEncoder};
+
+/// Test bitmap with broadband content (gradient + moving stripes) so
+/// the encoder has something to emit and the decoder has something
+/// to reconstruct. Mirrors `vaapi::tests::make_test_bgra`.
+fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let r: u8 = if (x / 64 + t / 4) % 2 == 0 { 200 } else { 50 };
+            let g: u8 = if (y / 64) % 2 == 0 { 200 } else { 50 };
+            let b: u8 = 128;
+            data.extend_from_slice(&[b, g, r, 255]);
+        }
+    }
+    data
+}
 
 #[test]
 #[ignore = "requires macOS + VideoToolbox (run on Apple Silicon / Intel mac with: cargo test -p tether-codec --ignored videotoolbox)"]
@@ -139,6 +155,121 @@ fn videotoolbox_decoder_constructs() {
             res.is_ok(),
             "{kind:?} VideoToolbox decoder should construct on macOS: {:?}",
             res.err()
+        );
+    }
+}
+
+/// End-to-end hardware round-trip: VT encode (BGRA → Annex-B) →
+/// VT decode (Annex-B → IOSurface-backed `Frame::Gpu`). Verifies the
+/// invariants the rest of the macOS client depends on:
+///
+/// - Decoded frame is `Frame::Gpu(GpuFrameSource::IOSurface(...))` —
+///   never `Frame::Cpu` (the HW-only contract).
+/// - Frame dimensions match the encoded source.
+/// - The IOSurface pointer is non-null and the pixel format is a
+///   recognised NV12 fourcc (`'420v'` or `'420f'`).
+/// - SPS/PPS-on-every-keyframe extradata makes the very first decoder
+///   submit able to produce output (no need to feed multiple GOPs
+///   before the decoder accepts; that's the whole point of the
+///   self-decodable-IDR work).
+///
+/// Run on real macOS hardware with:
+/// `cargo test -p tether-codec --lib videotoolbox_round_trip -- --ignored --nocapture`.
+#[test]
+#[ignore = "requires macOS + VideoToolbox (run with: cargo test -p tether-codec --ignored videotoolbox_round_trip)"]
+fn videotoolbox_round_trip() {
+    use tether_protocol::control::CodecKind;
+
+    // NV12 fourccs the IOSurface may carry (matches what the renderer
+    // accepts in `tether-render/src/gpu/metal.rs`).
+    const NV12_VIDEO_RANGE: u32 = u32::from_be_bytes(*b"420v");
+    const NV12_FULL_RANGE: u32 = u32::from_be_bytes(*b"420f");
+
+    for kind in [CodecKind::H264, CodecKind::Hevc] {
+        let w = 320;
+        let h = 240;
+        let mut enc = VideoToolboxEncoder::new(kind, w, h, 30, 2_000)
+            .unwrap_or_else(|e| panic!("{kind:?} encoder: {e:?}"));
+        let mut dec = VideoToolboxDecoder::new(kind)
+            .unwrap_or_else(|e| panic!("{kind:?} decoder: {e:?}"));
+
+        let mut decoded: Option<GpuFrame> = None;
+        // 12 frames is plenty: the first keyframe carries extradata
+        // inline (per Phase 1.1) so the decoder doesn't need external
+        // priming, and any pipeline latency is < 4 frames on VT.
+        for t in 0..12i64 {
+            let bgra = make_test_bgra(w, h, t as u32);
+            let force_key = t == 0;
+            let packets = enc
+                .encode_bgra(&bgra, t, force_key)
+                .unwrap_or_else(|e| panic!("{kind:?} encode frame {t}: {e:?}"));
+            for p in packets {
+                dec.submit(&p.data)
+                    .unwrap_or_else(|e| panic!("{kind:?} submit frame {t}: {e:?}"));
+                while let Some(f) = dec
+                    .next_frame()
+                    .unwrap_or_else(|e| panic!("{kind:?} next_frame: {e:?}"))
+                {
+                    match f {
+                        Frame::Gpu(g) => decoded = Some(g),
+                        Frame::Cpu(_) => panic!(
+                            "{kind:?} VideoToolboxDecoder produced a Cpu frame; \
+                             violates the hardware-only contract"
+                        ),
+                    }
+                }
+            }
+            if decoded.is_some() {
+                break;
+            }
+        }
+        // Flush in case any frame is still buffered. The encoder's
+        // pipeline can hold one or two frames at the end of a short
+        // sequence (same shape as the keyframes-carry-extradata test);
+        // the decoder side has no explicit drain because the `Decoder`
+        // trait doesn't expose one — we just keep polling `next_frame`
+        // until it returns `None`, which is what would happen in
+        // production at end-of-session anyway.
+        if decoded.is_none() {
+            let trailing = enc
+                .flush()
+                .unwrap_or_else(|e| panic!("{kind:?} flush: {e:?}"));
+            for p in trailing {
+                dec.submit(&p.data)
+                    .unwrap_or_else(|e| panic!("{kind:?} submit flushed: {e:?}"));
+                while let Some(f) = dec
+                    .next_frame()
+                    .unwrap_or_else(|e| panic!("{kind:?} next_frame flush: {e:?}"))
+                {
+                    match f {
+                        Frame::Gpu(g) => decoded = Some(g),
+                        Frame::Cpu(_) => panic!(
+                            "{kind:?} flush produced a Cpu frame; \
+                             violates hardware-only contract"
+                        ),
+                    }
+                }
+            }
+        }
+
+        let frame = decoded.unwrap_or_else(|| {
+            panic!("{kind:?} no decoded frame produced after 12 inputs + flush")
+        });
+        // Single source of truth for dims: `GpuFrame::new` copies them
+        // from the IOSurface, so asserting `frame.width` covers both
+        // surfaces. The non-null pointer and fourcc checks are the
+        // load-bearing ones — they verify the renderer-facing contract.
+        assert_eq!(frame.width, w, "{kind:?} decoded width");
+        assert_eq!(frame.height, h, "{kind:?} decoded height");
+        let GpuFrameSource::IOSurface(io) = frame.source;
+        assert!(
+            !io.surface.is_null(),
+            "{kind:?} decoded IOSurface pointer is null"
+        );
+        assert!(
+            matches!(io.pixel_format, NV12_VIDEO_RANGE | NV12_FULL_RANGE),
+            "{kind:?} IOSurface pixel_format 0x{:08x} is not a recognised NV12 fourcc",
+            io.pixel_format
         );
     }
 }

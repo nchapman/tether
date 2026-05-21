@@ -26,7 +26,7 @@ use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tether_codec::GpuEncoderFrame;
 #[cfg(target_os = "linux")]
-use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame};
+use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame};
 use tether_protocol::control::{
     ChromaSubsampling, ClientHello, CodecKind, ControlMessage, ServerHello, ServerHelloV1,
     VideoColorSpec, VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY,
@@ -661,7 +661,17 @@ struct EncoderSlot {
 #[cfg(target_os = "linux")]
 enum BridgeState {
     NotYetBuilt,
-    Ready(Nv12DmaBuf),
+    Ready(GpuConvertBridge),
+}
+
+/// Negotiated-chroma-specific gpuconvert bridge. The encoder picks
+/// which one to build during lazy init; from then on the variant is
+/// fixed for the encoder's lifetime (a chroma switch needs a full
+/// encoder rebuild, same as a resolution change).
+#[cfg(target_os = "linux")]
+enum GpuConvertBridge {
+    Nv12(Nv12DmaBuf),
+    Yuv444(Yuv444DmaBuf),
 }
 
 /// Outcome of one Gpu-frame encode attempt. Distinguishes per-frame
@@ -679,43 +689,65 @@ enum GpuEncodeOutcome {
 }
 
 /// Encode one PipeWire-supplied DMA-BUF frame through the zero-copy
-/// pipeline: import BGRA into wgpu, compute BGRA→NV12 onto exported
-/// DMA-BUF Y/UV planes, hand both to the encoder's `encode_gpu`.
+/// pipeline: import BGRA into wgpu, compute BGRA→(NV12|YUV444) onto
+/// exported DMA-BUF planes, hand them to the encoder's `encode_gpu`.
 ///
-/// On first call, lazily opens the wgpu device and allocates the
-/// bridge; the result is cached on the `EncoderSlot`.
+/// The bridge variant matches the negotiated chroma — NV12 for 4:2:0,
+/// YUV444 for HEVC Main444. Chosen on lazy init and fixed for the
+/// encoder's lifetime (chroma switch needs a full encoder rebuild,
+/// same as resolution change).
 #[cfg(target_os = "linux")]
 fn encode_gpu_frame(
     slot: &mut EncoderSlot,
+    chroma: tether_protocol::control::ChromaSubsampling,
     gpu: tether_capture::GpuCapturedFrame,
     pts: i64,
     force_keyframe: bool,
 ) -> GpuEncodeOutcome {
+    use tether_protocol::control::ChromaSubsampling;
+
     let bridge = match &mut slot.bridge {
         BridgeState::Ready(b) => b,
         BridgeState::NotYetBuilt => {
-            match pollster::block_on(Nv12DmaBuf::new(slot.width, slot.height)) {
-                Ok(built) => {
-                    info!(
-                        width = slot.width,
-                        height = slot.height,
-                        "gpuconvert bridge initialised for zero-copy DMA-BUF encode"
-                    );
-                    slot.bridge = BridgeState::Ready(built);
-                    let BridgeState::Ready(b) = &mut slot.bridge else {
-                        unreachable!()
-                    };
-                    b
+            let built = match chroma {
+                ChromaSubsampling::Yuv420 => {
+                    match pollster::block_on(Nv12DmaBuf::new(slot.width, slot.height)) {
+                        Ok(b) => GpuConvertBridge::Nv12(b),
+                        Err(e) => {
+                            return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                                "Nv12 gpuconvert bridge init failed for {}x{} after \
+                                 startup probe succeeded — device loss or OOM: {e}",
+                                slot.width,
+                                slot.height,
+                            ));
+                        }
+                    }
                 }
-                Err(e) => {
-                    return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
-                        "gpuconvert bridge init failed for {}x{} after startup \
-                         probe succeeded — device loss or OOM: {e}",
-                        slot.width,
-                        slot.height,
-                    ));
+                ChromaSubsampling::Yuv444 => {
+                    match pollster::block_on(Yuv444DmaBuf::new(slot.width, slot.height)) {
+                        Ok(b) => GpuConvertBridge::Yuv444(b),
+                        Err(e) => {
+                            return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                                "Yuv444 gpuconvert bridge init failed for {}x{} after \
+                                 startup probe succeeded — device loss or OOM: {e}",
+                                slot.width,
+                                slot.height,
+                            ));
+                        }
+                    }
                 }
-            }
+            };
+            info!(
+                width = slot.width,
+                height = slot.height,
+                chroma = ?chroma,
+                "gpuconvert bridge initialised for zero-copy DMA-BUF encode"
+            );
+            slot.bridge = BridgeState::Ready(built);
+            let BridgeState::Ready(b) = &mut slot.bridge else {
+                unreachable!()
+            };
+            b
         }
     };
 
@@ -727,28 +759,52 @@ fn encode_gpu_frame(
         offset,
         modifier,
     } = dmabuf;
-
-    let imported = match bridge.import_bgra_dmabuf(fd, modifier, stride, offset) {
-        Ok(t) => t,
-        Err(e) => {
-            return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("import_bgra_dmabuf: {e}"));
-        }
-    };
-    let nv12 = match bridge.convert(&imported) {
-        Ok(f) => f,
-        Err(e) => {
-            return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("Nv12DmaBuf::convert: {e}"));
-        }
-    };
-    // gpu.release_guard drops here implicitly along with `imported`
-    // and `dmabuf` once `nv12` has the dup'd Y/UV fds owned. The
-    // bridge's poll-on-completion guarantees the compute write retired
-    // before we hand the fds to VAAPI.
-    drop(imported);
     let _ = fourcc; // PipeWire-side fourcc is informational; the
-                     // shader treats input as BGRA regardless.
+                    // shader treats input as BGRA regardless.
 
-    let codec_frame = nv12_dmabuf_to_codec_frame(nv12);
+    let codec_frame = match bridge {
+        GpuConvertBridge::Nv12(b) => {
+            let imported = match b.import_bgra_dmabuf(fd, modifier, stride, offset) {
+                Ok(t) => t,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "import_bgra_dmabuf (nv12 bridge): {e}"
+                    ));
+                }
+            };
+            let nv12 = match b.convert(&imported) {
+                Ok(f) => f,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "Nv12DmaBuf::convert: {e}"
+                    ));
+                }
+            };
+            drop(imported);
+            nv12_dmabuf_to_codec_frame(nv12)
+        }
+        GpuConvertBridge::Yuv444(b) => {
+            let imported = match b.import_bgra_dmabuf(fd, modifier, stride, offset) {
+                Ok(t) => t,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "import_bgra_dmabuf (yuv444 bridge): {e}"
+                    ));
+                }
+            };
+            let yuv = match b.convert(&imported) {
+                Ok(f) => f,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "Yuv444DmaBuf::convert: {e}"
+                    ));
+                }
+            };
+            drop(imported);
+            yuv444_dmabuf_to_codec_frame(yuv)
+        }
+    };
+
     match slot
         .encoder
         .encode_gpu(GpuEncoderFrame::DmaBuf(&codec_frame), pts, force_keyframe)
@@ -848,6 +904,44 @@ fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
                 ],
             },
         ],
+    }
+}
+
+/// Build a `DmaBufFrame` for the YUV 4:4:4 path: one DRM object,
+/// **one** layer with the `YU24` (DRM_FORMAT_YUV444) fourcc and three
+/// R8 planes pointing at `object_index=0` at per-plane offsets.
+///
+/// This single-layer/three-plane shape (rather than three separate
+/// single-plane layers) matches the
+/// `vaSurfaceAttribDRMFormatModifierList` import contract for VAAPI
+/// Main444 — the encoder's `submit_dmabuf` check expects the layer
+/// fourcc to equal `YU24`.
+#[cfg(target_os = "linux")]
+fn yuv444_dmabuf_to_codec_frame(out: Yuv444DmaBufFrame) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"YU24"),
+        objects: vec![DmaBufObject {
+            fd: out.fd,
+            size: out.size,
+            drm_format_modifier: out.modifier,
+        }],
+        layers: vec![DmaBufLayer {
+            drm_format: u32::from_le_bytes(*b"YU24"),
+            num_planes: 3,
+            object_index: [0, 0, 0, 0],
+            offset: [
+                u32::try_from(out.y_offset).expect("Y plane offset fits in u32"),
+                u32::try_from(out.u_offset).expect("U plane offset fits in u32"),
+                u32::try_from(out.v_offset).expect("V plane offset fits in u32"),
+                0,
+            ],
+            pitch: [
+                u32::try_from(out.y_stride).expect("Y plane stride fits in u32"),
+                u32::try_from(out.u_stride).expect("U plane stride fits in u32"),
+                u32::try_from(out.v_stride).expect("V plane stride fits in u32"),
+                0,
+            ],
+        }],
     }
 }
 
@@ -990,7 +1084,13 @@ fn run_capture_and_send(
                 }
             }
             #[cfg(target_os = "linux")]
-            CapturedFrame::Gpu(gpu) => match encode_gpu_frame(slot_mut, gpu, pts, force_kf) {
+            CapturedFrame::Gpu(gpu) => match encode_gpu_frame(
+                slot_mut,
+                chosen_profile.chroma,
+                gpu,
+                pts,
+                force_kf,
+            ) {
                 GpuEncodeOutcome::Packets(p) => p,
                 GpuEncodeOutcome::DropFrame(e) => {
                     warn!(error = %e, "GPU encode failed; dropping frame");

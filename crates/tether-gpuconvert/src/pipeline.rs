@@ -9,6 +9,7 @@
 //! Rust edit.
 
 pub(crate) const SHADER_SRC: &str = include_str!("bgra_to_nv12.wgsl");
+pub(crate) const YUV444_SHADER_SRC: &str = include_str!("bgra_to_yuv444.wgsl");
 
 /// Build the BGRA→NV12 compute pipeline and its bind-group layout.
 /// Caller owns both; bind groups are constructed per-call-site because
@@ -67,6 +68,69 @@ pub(crate) fn build_pipeline(
 
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("bgra_to_nv12"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    (pipeline, bgl)
+}
+
+/// Build the BGRA → YUV 4:4:4 planar compute pipeline + its bind-group
+/// layout. Mirror of [`build_pipeline`] for the 4:4:4 path: three R8
+/// storage targets (Y, U, V) at full resolution instead of NV12's R8 +
+/// Rg8 at half-chroma.
+///
+/// Same shape, same workgroup size, same dispatch math (dispatcher uses
+/// the luma plane dims directly because there is no chroma subsample).
+pub(crate) fn build_yuv444_pipeline(
+    device: &wgpu::Device,
+) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bgra_to_yuv444"),
+        source: wgpu::ShaderSource::Wgsl(YUV444_SHADER_SRC.into()),
+    });
+
+    let plane_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: wgpu::TextureFormat::R8Unorm,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    };
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bgra_to_yuv444 bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            plane_entry(1),
+            plane_entry(2),
+            plane_entry(3),
+        ],
+    });
+
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bgra_to_yuv444 pl"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("bgra_to_yuv444"),
         layout: Some(&pl),
         module: &shader,
         entry_point: Some("main"),

@@ -34,6 +34,8 @@ pub mod dmabuf_export;
 pub mod modifier_query;
 #[cfg(target_os = "linux")]
 pub mod nv12_dmabuf;
+#[cfg(target_os = "linux")]
+pub mod yuv444_dmabuf;
 mod pipeline;
 
 #[cfg(target_os = "linux")]
@@ -44,6 +46,8 @@ pub use dmabuf_export::{
 pub use modifier_query::{importable_dmabuf_modifiers, ModifierQueryError};
 #[cfg(target_os = "linux")]
 pub use nv12_dmabuf::{Nv12DmaBuf, Nv12DmaBufError, Nv12DmaBufFrame};
+#[cfg(target_os = "linux")]
+pub use yuv444_dmabuf::{Yuv444DmaBuf, Yuv444DmaBufError, Yuv444DmaBufFrame};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {

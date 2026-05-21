@@ -183,19 +183,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Sanity-check the host's chosen profile against what this client
-    // actually advertised it could decode. The host should always pick
-    // from the intersection set, but a hostile / buggy host could echo
-    // a profile we never offered. Treat that as a session-fatal
-    // wire-protocol error rather than silently rendering with the
-    // wrong pipeline.
+    // actually advertised it could decode. See
+    // `tether_codec::probe::validate_chosen_profile` for the rationale
+    // (and the unit tests on the same function for the contract).
     let client_caps = tether_codec::probe::supported_decode_profiles();
-    if !client_caps.contains(&negotiated_profile) {
-        anyhow::bail!(
-            "host chose profile {:?} which this client did not advertise \
-             ({} entries in supported_decode_profiles)",
-            negotiated_profile,
-            client_caps.len()
-        );
+    if let Err(e) =
+        tether_codec::probe::validate_chosen_profile(negotiated_profile, &client_caps)
+    {
+        anyhow::bail!("{e}");
     }
 
     // Render channel: producer is the recv loop, consumer is the wgpu

@@ -67,6 +67,30 @@ pub const PROFILE_PREFERENCE: &[VideoProfile] = &[
     VideoProfile::H264_8BIT_420,
 ];
 
+/// Verify that a host's chosen `VideoProfile` is one this client
+/// actually advertised it could decode. Returns `Ok(())` if `chosen`
+/// is in `advertised`, `Err` with an actionable message otherwise.
+///
+/// The host's negotiator picks from the intersection of host-encode
+/// and client-decode sets — a chosen profile outside `advertised` is
+/// either a buggy host or a hostile peer trying to push the client
+/// onto a code path it never opted into. Either way the right
+/// response is a session-fatal bail at handshake, not silent best-
+/// effort rendering with the wrong pipeline.
+pub fn validate_chosen_profile(
+    chosen: VideoProfile,
+    advertised: &[VideoProfile],
+) -> Result<()> {
+    if advertised.contains(&chosen) {
+        return Ok(());
+    }
+    Err(CodecError::NoHardwareCodec(format!(
+        "host chose profile {chosen:?} which this client did not advertise \
+         ({} entries in supported_decode_profiles)",
+        advertised.len()
+    )))
+}
+
 /// Best mutual profile between the host's encode capabilities and the
 /// client's decode capabilities, picked from [`PROFILE_PREFERENCE`].
 /// Returns `None` only when no preference-list entry appears in both
@@ -423,6 +447,62 @@ mod negotiation_tests {
             pick_supported_profile(&host, &legacy_client),
             Some(VideoProfile::H264_8BIT_420)
         );
+    }
+
+    #[test]
+    fn validate_chosen_profile_accepts_advertised() {
+        let advertised = vec![
+            VideoProfile::HEVC_8BIT_444,
+            VideoProfile::HEVC_8BIT_420,
+            VideoProfile::H264_8BIT_420,
+        ];
+        assert!(
+            validate_chosen_profile(VideoProfile::HEVC_8BIT_444, &advertised).is_ok()
+        );
+        assert!(
+            validate_chosen_profile(VideoProfile::H264_8BIT_420, &advertised).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_chosen_profile_rejects_unadvertised() {
+        let advertised = vec![VideoProfile::H264_8BIT_420];
+        // 4:4:4 wasn't in this client's advertised set — host that
+        // chose it is either buggy or hostile.
+        let err = validate_chosen_profile(VideoProfile::HEVC_8BIT_444, &advertised)
+            .expect_err("4:4:4 should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HEVC_8BIT_444") || msg.contains("Yuv444"),
+            "error should name the offending profile; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_chosen_profile_rejects_empty_advertised() {
+        // Defensive: a degenerate client that advertised nothing
+        // must reject every chosen profile, not vacuously accept.
+        assert!(
+            validate_chosen_profile(VideoProfile::H264_8BIT_420, &[]).is_err()
+        );
+    }
+
+    #[test]
+    fn pick_returns_none_for_unknown_bit_depth_only_in_client_caps() {
+        // Forward-compat: a future client advertising a profile with
+        // unknown bit_depth (12, 16, …) that this host doesn't
+        // support must produce `None` (graceful fall-through), not
+        // panic and not accidentally match against an 8-bit entry
+        // that shares the same codec+chroma. Pins the behavioural
+        // contract that `future_bit_depth_decodes_as_raw_u8` in
+        // tether-protocol only pins the wire form for.
+        let host = vec![VideoProfile::H264_8BIT_420, VideoProfile::HEVC_8BIT_420];
+        let future_client = vec![VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 12,
+        }];
+        assert_eq!(pick_supported_profile(&host, &future_client), None);
     }
 
     #[test]

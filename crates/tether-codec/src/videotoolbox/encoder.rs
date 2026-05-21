@@ -549,8 +549,11 @@ fn vt_codec_cname(kind: CodecKind) -> Result<&'static std::ffi::CStr> {
     }
 }
 
-/// Human-readable backend name for logs and `Encoder::name`.
-fn vt_codec_name(kind: CodecKind) -> &'static str {
+/// Human-readable backend name for logs and `Encoder::name`. Also
+/// exercised by the `videotoolbox_codec_name_maps` default-on test
+/// (the test calls *this* function — pinning the strings the
+/// encoder actually uses, not a separate copy of them).
+pub(crate) fn vt_codec_name(kind: CodecKind) -> &'static str {
     match kind {
         CodecKind::H264 => "h264_videotoolbox",
         CodecKind::Hevc => "hevc_videotoolbox",

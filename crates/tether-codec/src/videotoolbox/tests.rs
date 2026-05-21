@@ -39,11 +39,21 @@ fn videotoolbox_encoder_smoke() {
     let mut enc = VideoToolboxEncoder::new(yuv420_8bit(CodecKind::H264), w, h, 30, 4_000)
         .expect("VideoToolbox encoder");
     let bgra = vec![0x80u8; (w * h * 4) as usize];
-    let packets = enc.encode_bgra(&bgra, 0, true).expect("encode");
-    // First frame may produce 0 packets (encoder warm-up) or 1+ packets
-    // carrying SPS/PPS + the IDR slice. Either way it shouldn't error.
-    for p in packets {
-        assert!(!p.data.is_empty());
+    // First frame may produce 0 packets (encoder warm-up) — drain with
+    // `flush()` so the assertion below covers both shapes. Without the
+    // drain a zero-packet result would silently pass the loop assert
+    // and miss a "encoder produced nothing ever" regression.
+    let mut packets = enc.encode_bgra(&bgra, 0, true).expect("encode");
+    if packets.is_empty() {
+        packets = enc.flush().expect("flush");
+    }
+    assert!(
+        !packets.is_empty(),
+        "encoder produced no packets across one encode + flush — \
+         encoder is buffering forever or silently failing"
+    );
+    for p in &packets {
+        assert!(!p.data.is_empty(), "encoder produced an empty packet");
     }
 }
 
@@ -568,19 +578,14 @@ fn videotoolbox_decoder_recovers_from_mid_session_idr() {
 
 #[test]
 fn videotoolbox_codec_name_maps() {
-    // Default-on (no hardware needed): exercises the codec_name map so
-    // a typo in the cstring → str pair gets caught at CI time.
-    fn name(kind: CodecKind) -> &'static str {
-        // Mirrors the private `vt_codec_name` in `encoder.rs`; if those
-        // strings ever diverge from the cstr names the encoder asks for,
-        // log/diagnostic messages stop matching what `ffmpeg -encoders`
-        // shows. Keep this assertion shape in sync.
-        match kind {
-            CodecKind::H264 => "h264_videotoolbox",
-            CodecKind::Hevc => "hevc_videotoolbox",
-            CodecKind::Av1 => "av1_videotoolbox",
-        }
-    }
-    assert_eq!(name(CodecKind::H264), "h264_videotoolbox");
-    assert_eq!(name(CodecKind::Hevc), "hevc_videotoolbox");
+    // Default-on (no hardware needed): pin the actual `vt_codec_name`
+    // strings against what `ffmpeg -encoders | grep videotoolbox`
+    // emits. A typo or rename of the cstring on the encoder side
+    // breaks log messages and any future `--codec=` CLI dispatch
+    // that keys on these names; this test fires at `cargo test` time
+    // rather than at first encode attempt in production.
+    use crate::videotoolbox::encoder::vt_codec_name;
+    assert_eq!(vt_codec_name(CodecKind::H264), "h264_videotoolbox");
+    assert_eq!(vt_codec_name(CodecKind::Hevc), "hevc_videotoolbox");
+    assert_eq!(vt_codec_name(CodecKind::Av1), "av1_videotoolbox");
 }

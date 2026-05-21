@@ -9,8 +9,22 @@
 //! Rust edit.
 
 pub(crate) const SHADER_SRC: &str = include_str!("bgra_to_nv12.wgsl");
+
+// YUV444 / P010 / P410 pipelines are intentionally unused
+// scaffolding: the production `Nv12DmaBuf` / `Yuv444DmaBuf` bridges
+// are 8-bit-only, and 10-bit production goes live when the
+// gpuconvert P010/P410 → encoder bridge wires up (see
+// `tether-codec::vaapi::probe::probe_encode`'s temporary
+// `bit_depth != 8` gate for the matching half). The shader source
+// is `include_str!`'d so a syntactic regression in the WGSL gets
+// caught at build time regardless. Don't delete these as part of
+// a tidy-unused sweep — see the FIXME on `build_biplanar_16_pipeline`
+// for the wiring plan.
+#[allow(dead_code)]
 pub(crate) const YUV444_SHADER_SRC: &str = include_str!("bgra_to_yuv444.wgsl");
+#[allow(dead_code)]
 pub(crate) const P010_SHADER_SRC: &str = include_str!("bgra_to_p010.wgsl");
+#[allow(dead_code)]
 pub(crate) const P410_SHADER_SRC: &str = include_str!("bgra_to_p410.wgsl");
 
 /// Build the BGRA→NV12 compute pipeline and its bind-group layout.
@@ -86,6 +100,7 @@ pub(crate) fn build_pipeline(
 /// `vaapi_map_from_drm` recognises as VA_FOURCC_XYUV. See the comment
 /// at the top of `bgra_to_yuv444.wgsl` for why packed instead of
 /// planar.
+#[allow(dead_code)] // scaffolding; see module-level YUV444_SHADER_SRC comment
 pub(crate) fn build_yuv444_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
@@ -146,6 +161,7 @@ pub(crate) fn build_yuv444_pipeline(
 /// This pipeline is wired but not yet plumbed into a public API path;
 /// the production `Nv12DmaBuf` bridge stays 8-bit until the rest of
 /// the 10-bit stack (probe → renderer → wire) catches up.
+#[allow(dead_code)] // scaffolding; see module-level P010_SHADER_SRC comment
 pub(crate) fn build_p010_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
@@ -159,6 +175,7 @@ pub(crate) fn build_p010_pipeline(
 /// Build the BGRA → P410 (10-bit biplanar 4:4:4) compute pipeline.
 /// Same plane formats as P010 but full-resolution UV; see
 /// `bgra_to_p410.wgsl`. Plumbing status mirrors P010.
+#[allow(dead_code)] // scaffolding; see module-level P410_SHADER_SRC comment
 pub(crate) fn build_p410_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
@@ -185,6 +202,7 @@ pub(crate) fn build_p410_pipeline(
 /// validation errors at draw time). Adding a `STORAGE_IMAGE` probe
 /// in `modifier_query.rs` is the right gate to put in front of
 /// these pipelines before they go live.
+#[allow(dead_code)] // scaffolding; see module-level YUV444_SHADER_SRC comment
 fn build_biplanar_16_pipeline(
     device: &wgpu::Device,
     label: &'static str,

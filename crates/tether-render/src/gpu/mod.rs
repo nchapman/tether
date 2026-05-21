@@ -183,18 +183,21 @@ fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> RenderLayout {
         (ChromaSubsampling::Yuv420 | ChromaSubsampling::Yuv444, 10) => {
             RenderLayout::Biplanar16
         }
-        // Anything we haven't enumerated (12-bit, future chroma) falls
-        // back to Biplanar16 with a warn — better than a panic; the
-        // import-side fourcc validation surfaces a clean error if the
-        // backend can't actually deliver that shape.
-        (chroma, bit_depth) => {
-            tracing::warn!(
-                ?chroma,
-                bit_depth,
-                "unrecognised (chroma, bit_depth); defaulting to Biplanar16"
-            );
-            RenderLayout::Biplanar16
-        }
+        // Anything we haven't enumerated (12-bit, future chroma like
+        // Yuv422) reaches the renderer by construction — the
+        // negotiator filters on PROFILE_PREFERENCE, and the encoder
+        // probes return false for any combo no layer here can
+        // deliver. If we *do* reach this arm, the upstream filter
+        // is broken: defaulting to Biplanar16 silently would
+        // mis-render an 8-bit Yuv422 stream as if it were 16-bit
+        // (wrong texture formats, wrong sampler scale). Panic loud
+        // — it's a programmer error, not a runtime condition.
+        (chroma, bit_depth) => panic!(
+            "render_layout_for: unhandled (chroma={chroma:?}, bit_depth={bit_depth}). \
+             This combination must not reach the renderer — either the negotiator \
+             filter is broken or this enum needs a new arm wired to the right \
+             RenderLayout variant.",
+        ),
     }
 }
 

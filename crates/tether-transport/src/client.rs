@@ -2,13 +2,35 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::trace;
+use socket2::{Domain, Protocol, Socket, Type};
+use tracing::{trace, warn};
 
 use crate::{
     connection::{Connection, STREAM_PREAMBLE},
     tls::{ensure_crypto_provider, CertFingerprint, PinnedCertVerifier},
     Result, TransportError,
 };
+
+/// Target size for the UDP receive buffer (`SO_RCVBUF`). Linux's
+/// default of ~208 KB overflows in milliseconds when a bursty H.265
+/// keyframe (tens of KB at 5–8 Mbps) arrives faster than the recv
+/// loop drains. The kernel silently drops packets at that point —
+/// before quinn's own datagram buffer ever sees them — and the
+/// decoder gets a fragment-loss storm. 16 MiB gives multi-second
+/// headroom on a fast LAN.
+///
+/// The kernel caps the effective size at `net.core.rmem_max`. If
+/// `set_recv_buffer_size` returns a much smaller value, we log a
+/// warning telling the operator how to raise the ceiling rather
+/// than failing startup — the smaller buffer still works, just
+/// with less margin.
+///
+/// Linux quirk: `getsockopt(SO_RCVBUF)` returns roughly 2× the
+/// kernel's true allocation (the doubling accounts for protocol
+/// overhead). Our readback check compares against `_BYTES / 4` to
+/// account for that — anything below ~4 MiB true allocation
+/// (~8 MiB reported) warrants a warning.
+const UDP_RECV_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct Client {
     endpoint: quinn::Endpoint,
@@ -19,7 +41,42 @@ impl Client {
     pub fn new() -> Result<Self> {
         ensure_crypto_provider();
         let bind: SocketAddr = "0.0.0.0:0".parse().expect("static literal");
-        let endpoint = quinn::Endpoint::client(bind)?;
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.bind(&bind.into())?;
+        // Best-effort recv-buffer bump. Failure here isn't fatal —
+        // we just lose the headroom. Same for a kernel-imposed cap
+        // below our request.
+        if let Err(e) = socket.set_recv_buffer_size(UDP_RECV_BUFFER_BYTES) {
+            warn!(
+                error = %e,
+                requested = UDP_RECV_BUFFER_BYTES,
+                "set_recv_buffer_size failed; using kernel default. Raise net.core.rmem_max for headroom."
+            );
+        } else {
+            match socket.recv_buffer_size() {
+                Ok(actual) if actual < UDP_RECV_BUFFER_BYTES / 4 => {
+                    warn!(
+                        requested = UDP_RECV_BUFFER_BYTES,
+                        actual,
+                        "kernel capped UDP recv buffer well below requested size; \
+                         consider `sysctl -w net.core.rmem_max={}` to reduce LAN \
+                         freeze risk under bursty keyframes",
+                        UDP_RECV_BUFFER_BYTES,
+                    );
+                }
+                Ok(actual) => trace!(actual, "UDP recv buffer sized for headroom"),
+                Err(e) => trace!(error = %e, "recv_buffer_size readback failed"),
+            }
+        }
+        let std_socket: std::net::UdpSocket = socket.into();
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            std_socket,
+            runtime,
+        )?;
         Ok(Self { endpoint })
     }
 

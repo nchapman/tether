@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 quinn = "0.11"
+socket2 = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rcgen = "0.14"
 sha2 = "0.11"

@@ -33,7 +33,11 @@ const INITIAL_HEIGHT: u32 = 720;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
+    // `_tracing_guard` keeps the non-blocking writer's worker thread
+    // alive. Dropping it flushes pending log lines and shuts the
+    // worker down; binding it for the duration of `main` ensures
+    // logs aren't truncated at process exit.
+    let _tracing_guard = init_tracing();
 
     let mut args = std::env::args().skip(1);
     let addr: SocketAddr = args
@@ -664,10 +668,21 @@ async fn say_goodbye(conn: &tether_transport::Connection, reason: &str) {
 }
 
 
-fn init_tracing() {
+fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Non-blocking writer offloads formatting and the write syscall
+    // to a dedicated worker thread. Critical for the client because
+    // the FFmpeg log callback bridges into tracing from the decoder
+    // thread (which is also the QUIC datagram recv loop's thread);
+    // a synchronous stdout writer there would stall the recv loop
+    // and the input-send task during decode-error storms.
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .init();
+    guard
 }
 
 fn hex_decode(s: &str) -> anyhow::Result<[u8; 32]> {

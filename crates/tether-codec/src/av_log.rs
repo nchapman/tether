@@ -26,8 +26,9 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use rsmpeg::ffi;
 
 // FFmpeg's logging callback takes a `va_list`, whose concrete Rust
@@ -71,15 +72,67 @@ pub fn warning_or_above_count() -> u64 {
     WARNING_OR_ABOVE.load(Ordering::Relaxed)
 }
 
+/// Tracing emit happens on a dedicated drainer thread, not on the
+/// decoder thread that libavcodec invokes the callback from. The
+/// channel is bounded; on overflow we drop the line (the counter
+/// still bumps, which is the load-bearing signal). This isolates
+/// the QUIC datagram recv loop (which on the client is the same
+/// thread that runs decode) from tracing-subscriber latency.
+struct LogRecord {
+    level: c_int,
+    class: String,
+    msg: String,
+}
+
+/// Sized to absorb a worst-case dedup-suppressed error storm
+/// (a few hundred unique messages over ~1 s) without dropping
+/// anything in the common case. A full channel drops the line
+/// silently; that's preferable to blocking the decoder.
+const LOG_CHANNEL_CAPACITY: usize = 256;
+
+static LOG_SENDER: OnceLock<Sender<LogRecord>> = OnceLock::new();
+
 /// Install the `av_log_set_callback` bridge. Idempotent — safe to call
 /// from every codec constructor; the underlying install happens once.
 pub(crate) fn install() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        let (tx, rx) = bounded::<LogRecord>(LOG_CHANNEL_CAPACITY);
+        let _ = LOG_SENDER.set(tx);
+        std::thread::Builder::new()
+            .name("tether-avlog".into())
+            .spawn(move || {
+                #[allow(clippy::cast_possible_wrap)]
+                let warning_level = ffi::AV_LOG_WARNING as c_int;
+                #[allow(clippy::cast_possible_wrap)]
+                let error_level = ffi::AV_LOG_ERROR as c_int;
+                #[allow(clippy::cast_possible_wrap)]
+                let info_level = ffi::AV_LOG_INFO as c_int;
+                while let Ok(rec) = rx.recv() {
+                    // Wrap in catch_unwind so a buggy subscriber can't
+                    // kill the drainer thread.
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        if rec.level <= warning_level {
+                            if rec.level <= error_level {
+                                tracing::error!(target: "ffmpeg", class = %rec.class, "{}", rec.msg);
+                            } else {
+                                tracing::warn!(target: "ffmpeg", class = %rec.class, "{}", rec.msg);
+                            }
+                        } else if rec.level <= info_level {
+                            tracing::info!(target: "ffmpeg", class = %rec.class, "{}", rec.msg);
+                        }
+                    }));
+                }
+            })
+            .expect("spawn tether-avlog drainer thread");
+
         // SAFETY: `av_log_set_callback` accepts a thread-safe extern "C"
         // function pointer; ours satisfies that contract (it reads no
-        // shared mutable state besides the atomic counter, and the
-        // tracing crate's emit path is thread-safe).
+        // shared mutable state besides the atomic counter and a
+        // OnceLock-installed channel sender, both Sync). Order matters:
+        // `LOG_SENDER.set(tx)` above happens-before the callback is
+        // registered here, so a callback fired by a later codec
+        // construction always observes a populated sender.
         unsafe {
             ffi::av_log_set_callback(Some(tether_log_callback));
             // Dedup consecutive identical lines at the ffmpeg layer so
@@ -214,33 +267,36 @@ unsafe extern "C" fn tether_log_callback(
 
     #[allow(clippy::cast_possible_wrap)]
     let warning_level = ffi::AV_LOG_WARNING as c_int;
-    #[allow(clippy::cast_possible_wrap)]
-    let info_level = ffi::AV_LOG_INFO as c_int;
-    #[allow(clippy::cast_possible_wrap)]
-    let error_level = ffi::AV_LOG_ERROR as c_int;
-    // Bump the counter first so it lands even if the tracing emit
-    // below panics — a missed warning is worse than a missed log
+    // Bump the counter first so it lands even if the channel send
+    // below fails — a missed warning is worse than a missed log
     // line, and the counter is the load-bearing signal for the
     // client's auto-IDR path.
     if level <= warning_level {
         WARNING_OR_ABOVE.fetch_add(1, Ordering::Relaxed);
     }
-    // Wrap the tracing emit in `catch_unwind` so a buggy subscriber
-    // can't unwind across the `extern "C"` boundary (UB).
-    // `AssertUnwindSafe` is appropriate: if the subscriber panics
-    // it's already corrupting itself; we're not promising anything
-    // about caller state.
+    // Hand the formatted message to the drainer thread. The decoder
+    // thread never calls into `tracing` directly — that's the whole
+    // point of this bridge. `try_send` so a slow subscriber can't
+    // backpressure the decoder; full channel drops the line.
+    //
+    // `catch_unwind` wraps the channel send so a panic (e.g. an
+    // allocation failure in `String::from`) can't unwind across the
+    // `extern "C"` boundary (UB).
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        if level <= warning_level {
-            // Warning vs error split. We don't model fatal/panic
-            // separately — anything below warning gets ERROR.
-            if level <= error_level {
-                tracing::error!(target: "ffmpeg", class = class_name, "{msg}");
-            } else {
-                tracing::warn!(target: "ffmpeg", class = class_name, "{msg}");
+        if let Some(tx) = LOG_SENDER.get() {
+            let record = LogRecord {
+                level,
+                class: class_name.to_owned(),
+                msg: msg.to_owned(),
+            };
+            match tx.try_send(record) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => {
+                    // Drainer thread is gone; nothing we can do. The
+                    // counter still bumped above, which is what the
+                    // auto-IDR path actually needs.
+                }
             }
-        } else if level <= info_level {
-            tracing::info!(target: "ffmpeg", class = class_name, "{msg}");
         }
     }));
 }

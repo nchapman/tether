@@ -61,7 +61,12 @@ const TEST_PATTERN_FPS: u32 = 60;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
+    // Both host (encoder) and client (decoder) call av_log::install(),
+    // so FFmpeg messages can land on either side's hot thread. The
+    // encoder is quieter in steady state but the same non-blocking
+    // rationale applies — a synchronous stdout writer would stall
+    // whichever thread libavcodec calls into.
+    let _tracing_guard = init_tracing();
 
     let (bind, use_test_pattern) = parse_args()?;
 
@@ -1100,10 +1105,15 @@ async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
     ))
 }
 
-fn init_tracing() {
+fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .init();
+    guard
 }
 
 /// Pick the first codec from the client's preference list that this

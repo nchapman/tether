@@ -10,6 +10,7 @@ description = "Tether client binary - the computer doing the viewing/controlling
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 tokio.workspace = true
 crossbeam-channel.workspace = true
 

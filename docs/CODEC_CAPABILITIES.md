@@ -273,13 +273,42 @@ probe ever silently slipping past a future downsample.
   require `ChromaSubsampling::Yuv422` on the wire. The 4:2:2
   fixtures are checked in (`hevc_yuv422_*bit.idr`) ready for
   that change.
-- **SPS bit-depth parse as a second round-trip signal.** The
-  current fourcc check is a strong signal but parses through
-  the FFmpeg decoder; if VT's decoder ever started lying back
-  about its decode output's chroma the probe would too. A
-  10-line walker over `bit_depth_luma_minus8` and
-  `chroma_format_idc` in the SPS would be an independent gate
-  that doesn't depend on the decode side at all.
+
+The SPS second-signal probe noted as open in a prior revision
+landed in commit `ce6aa94` — `crates/tether-codec/src/bitstream_sps.rs`
+parses `chroma_format_idc` + `bit_depth_luma_minus8` directly from
+the encoder's emitted SPS NAL and cross-checks against the
+IOSurface fourcc family. An explicit disagreement between the two
+signals fails the probe; an absent SPS signal (unmodeled profile)
+falls back to fourcc-only. The probe layer now has two
+independent gates against silent transforms.
+
+### Live macOS 10-bit pipeline (M-series)
+
+As of commit `513f4c7` the producer side is wired:
+
+- SCK probes the eight pixel formats it might accept and caches
+  the result for the process lifetime
+  (`tether_capture::macos::probe_capture_pixel_formats`).
+- `tether_capture::macos::sck_pixel_format_for_profile(profile)`
+  maps each negotiated `VideoProfile` to the SCK fourcc the
+  capture should configure, mirroring `vt_sw_format` on the
+  encoder side so the IOSurface fourcc and the encoder's
+  `sw_format` agree by construction.
+- `VideoToolboxEncoder::submit_iosurface` accepts the matching
+  fourcc families per `(chroma, bit_depth)` and refuses
+  cross-bucket submissions, replacing the previous hard NV12-only
+  guard. The encoder's `vt_sw_format` already supports `P010LE`
+  (10-bit 4:2:0), `NV24` / `P410LE` (4:4:4 8 / 10-bit).
+- The host's `capture_filtered_encode_profiles` (macOS arm)
+  filters the encoder-probed profile list down to what the SCK
+  probe says this Mac can deliver. On M4 Max + macOS 26 that
+  intersects to HEVC 4:2:0 8-bit + 10-bit (Main10); the 4:4:4
+  rows are filtered out by the VT encode probe's silent-downsample
+  detection, not by the SCK side.
+
+The Linux producer side is the remaining gap (see the next
+section).
 
 ---
 
@@ -336,6 +365,77 @@ not probed and not in `PROFILE_PREFERENCE`. **No documented
 driver supports any 10-bit VAAPI encode profile across vendors**,
 but that absence is an absence of documentation, not a proof —
 needs an actual probe before we trust it.
+
+### Open work — Linux 10-bit encode handoff
+
+The probe + renderer + protocol surface for 10-bit are all live;
+the producer side is the remaining gap. Three independent pieces.
+All three need to land for a Linux→Linux session to negotiate
+HEVC Main10 (4:2:0 10-bit) end-to-end. macOS-host 10-bit is
+already live as of commit `513f4c7` (separate path — SCK direct
+to VT via x420 IOSurfaces, no gpuconvert involved).
+
+1. **VAAPI encoder 10-bit input path.**
+   `tether-codec/src/vaapi/encoder.rs::submit_dmabuf` and
+   `encode_bgra` both return `UnsupportedInputFormat` for
+   `bit_depth != 8` (lines 411, 650). Extend `vaapi_sw_format`
+   (look for the `match (chroma, bit_depth)` next to the existing
+   NV12 / VUYX entries) to return `AV_PIX_FMT_P010LE` for
+   `(Yuv420, 10)` and `AV_PIX_FMT_XV30LE` for `(Yuv444, 10)`.
+   Confirm against `vaapi_drm_format_map` in FFmpeg's
+   `libavutil/hwcontext_vaapi.c` — XV30LE is the *only* 10-bit
+   4:4:4 entry there (planar P410 has no map row, mirroring the
+   8-bit YUV444P→XYUV story).
+
+2. **gpuconvert 10-bit bridges + STORAGE_IMAGE probe.**
+   The shaders (`bgra_to_p010.wgsl`, `bgra_to_p410.wgsl`) and the
+   pipeline scaffolding (`build_p010_pipeline`,
+   `build_p410_pipeline` in `pipeline.rs`) are written and marked
+   `#[allow(dead_code)]`. To go live:
+   - Add `Bgra2P010DmaBuf` / `Bgra2P410DmaBuf` public bridges
+     mirroring `Nv12DmaBuf` / `Yuv444DmaBuf`. The output DMA-BUF
+     needs R16 Y + Rg16 UV plane fourccs (DRM_FORMAT_R16 = 'R16 ',
+     DRM_FORMAT_GR1616 = 'GR32') with `DRM_FORMAT_MOD_LINEAR`.
+   - Address the FIXME at `pipeline.rs::build_biplanar_16_pipeline`:
+     R16Unorm / Rg16Unorm as compute *storage outputs* require the
+     Vulkan `STORAGE_IMAGE_BIT` format feature flag, not just
+     `SAMPLED_IMAGE_BIT`. The existing `importable_dmabuf_modifiers`
+     in `modifier_query.rs` only checks SAMPLED; add a sibling
+     `storable_dmabuf_formats(fourcc)` (or extend the existing one
+     with a flag parameter) that queries STORAGE on the chosen
+     `VkFormat`. Some drivers expose 16-bit unorm as sampleable but
+     not storage-writable; on those the 10-bit pipeline will fail
+     at `create_compute_pipeline` without this gate.
+
+3. **Linux `capture_filtered_encode_profiles` tightening.**
+   `apps/tether-host/src/main.rs:1456` is a no-op on Linux today
+   because the VAAPI probe already gates 10-bit at the encoder
+   layer (item 1). Once item 1 lifts that gate, this function
+   should filter the same way the macOS arm does — against what
+   the gpuconvert P010 / P410 bridge can actually deliver, gated
+   by the STORAGE_IMAGE probe from item 2. The macOS arm
+   (`sck_pixel_format_for_profile` + `is_deliverable`) is the
+   shape to follow; the Linux equivalent would call
+   `tether_gpuconvert::storable_dmabuf_formats` per format and
+   intersect with `supported_encode_profiles()`.
+
+Order: (1) → (2) → (3). Each ships independently; nothing in
+the protocol or renderer changes. After all three, the
+`hevc_yuv420_10bit.idr` and `hevc_yuv444_10bit.idr` fixtures in
+`crates/tether-codec/fixtures/probe/` are what the VAAPI decode
+probe rides; the matching encode probes will start returning
+`encode=true` (or `false` with diagnostics) automatically once
+the encoder accepts the new sw_format.
+
+Verification: `cargo test -p tether-codec --lib bench --ignored
+--nocapture --test-threads=1` adds latency + headroom numbers
+for the new entries against the existing 8-bit cells; a passing
+end-to-end Linux→Linux session at HEVC Main10 confirms the
+chain. Don't ship without the gpuconvert bridge round-trip test
+that puts a known BGRA pattern through the 10-bit shader,
+encodes it via VAAPI, decodes it back, and compares against a
+reference — same shape as the existing `Nv12DmaBuf` hardware
+test in `tether-gpuconvert/tests/`.
 
 ---
 
@@ -454,12 +554,24 @@ fourcc. Today we support two layouts (`RenderLayout::Biplanar` and
 
 `VideoProfile { codec, chroma, bit_depth }` has a `u8` `bit_depth`
 field. The renderer's `RenderLayout::Biplanar16` variant + the
-`luma_scale` shader uniform handle the 10-bit display side; the
-encoder/decoder probes handle the host side. The negotiator picks
-the first entry that appears in *both* the host's
-`supported_encode_profiles()` and the client's advertised
-`supported_decode_profiles()` — anything a given device's hardware
-can't deliver gets filtered out by the probe layer automatically.
+shader's `range_kind` dispatch handle the 10-bit display side
+(native 10-bit limited-range breakpoints, no intermediate
+`luma_scale` indirection); the encoder/decoder probes handle the
+host side. The negotiator picks the first entry that appears in
+*both* the host's `supported_encode_profiles()` and the client's
+advertised `supported_decode_profiles()` — anything a given
+device's hardware can't deliver gets filtered out by the probe
+layer automatically.
+
+**Live status by platform pair** (as of commit `513f4c7`):
+
+| Host       | Client     | Expected pick (best mutual)      | Notes |
+| ---------- | ---------- | -------------------------------- | ----- |
+| Linux      | Linux      | HEVC 4:4:4 8-bit                 | 10-bit Linux encode still gated (see VAAPI handoff above) |
+| macOS M-series | Linux  | HEVC 4:2:0 10-bit (Main10)       | SCK delivers `'x420'` → VT encodes P010 → client decodes via VAAPI |
+| macOS M-series | macOS  | HEVC 4:2:0 10-bit (Main10)       | Same encode side; client decodes back to `'x420'` IOSurface |
+| Linux      | macOS      | HEVC 4:4:4 8-bit                 | VT client decodes 4:4:4 via NV24 even though encode side is 4:2:0-only |
+| any        | legacy 8-bit only | H.264 4:2:0 8-bit         | Universal floor; legacy client without decode-profiles extension |
 
 HEVC 4:2:2 8/10-bit is *not* yet in the matrix — it requires
 `ChromaSubsampling::Yuv422` on the wire, which is a separate wire

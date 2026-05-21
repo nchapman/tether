@@ -55,6 +55,15 @@
 //!   in a future hello revision. Payload shape: TBD pending the
 //!   gamepad pipeline.
 //! - `tether.cap.*` — capability advertisement. See the next section.
+//! - `tether.cap.video.decode-profiles` — client → host. Bincode
+//!   `Vec<VideoProfile>`; the full set of video profiles the client can
+//!   decode. Absence is interpreted as legacy `[{H264, Yuv420, 8}]`.
+//! - `tether.cap.video.encode-profile` — host → client. Bincode
+//!   [`VideoProfile`]; the single profile the host picked from the
+//!   intersection of its encode capabilities and the client's decode
+//!   capabilities. Echoed in the [`ServerHelloV1`]; the inline
+//!   [`ServerHelloV1::chosen_codec`] / [`ServerHelloV1::chosen_chroma`]
+//!   fields carry the same information for legacy clients.
 //!
 //! # Capability advertisement (`tether.cap.*`)
 //!
@@ -118,6 +127,67 @@ pub enum ChromaSubsampling {
     Yuv420,
     Yuv444,
 }
+
+/// Negotiation unit for video codec capabilities.
+///
+/// One end advertises the set it can decode; the other intersects with
+/// the set it can encode and picks the best mutual profile against a
+/// fixed preference order. Carried in hello extensions
+/// ([`CLIENT_DECODE_PROFILES_EXTENSION_KEY`] / [`SERVER_ENCODE_PROFILE_EXTENSION_KEY`])
+/// rather than inline fields so adding a new axis (10-bit, future
+/// HDR-specific profile) doesn't require a [`ClientHelloV1`] bump.
+///
+/// `bit_depth` is `u8` rather than an enum so the wire form stays
+/// stable as new depths land — 8, 10, and (hypothetically) 12 all
+/// round-trip identically. The host validates depths it doesn't support
+/// at probe time, not at decode time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoProfile {
+    pub codec: CodecKind,
+    pub chroma: ChromaSubsampling,
+    pub bit_depth: u8,
+}
+
+impl VideoProfile {
+    /// The universal floor: H.264 Main 4:2:0 8-bit. Every host backend
+    /// we ship supports it, every client backend can decode it. This
+    /// is what a legacy peer (no `tether.cap.video.*` extension) is
+    /// assumed to support.
+    pub const H264_8BIT_420: Self = Self {
+        codec: CodecKind::H264,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+
+    /// HEVC Main 4:2:0 8-bit — the better-compression mid-rung. Most
+    /// VAAPI / VideoToolbox hosts and clients support this today.
+    pub const HEVC_8BIT_420: Self = Self {
+        codec: CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+
+    /// HEVC Main444 8-bit — the desktop-quality top rung. Preserves
+    /// full chroma resolution (no subsampling) so antialiased text
+    /// edges and saturated UI accents stay sharp. Requires VAAPI
+    /// HEVC Main444 (Intel Tiger Lake+ / AMD VCN3+) on the host and
+    /// matching decode on the client.
+    pub const HEVC_8BIT_444: Self = Self {
+        codec: CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv444,
+        bit_depth: 8,
+    };
+}
+
+/// Hello extension key. Client → host. Payload: bincode
+/// `Vec<VideoProfile>`. Absence is legacy `[VideoProfile::H264_8BIT_420]`.
+pub const CLIENT_DECODE_PROFILES_EXTENSION_KEY: &str = "tether.cap.video.decode-profiles";
+
+/// Hello extension key. Host → client. Payload: bincode [`VideoProfile`].
+/// The single profile the host picked. Absence means the host built
+/// against an older protocol revision — the inline [`ServerHelloV1::chosen_codec`]
+/// and [`ServerHelloV1::chosen_chroma`] fields are then the source of truth.
+pub const SERVER_ENCODE_PROFILE_EXTENSION_KEY: &str = "tether.cap.video.encode-profile";
 
 // =============================================================
 // Four-axis color spec. Carried first-class on `ServerHelloV1`.

@@ -21,6 +21,7 @@ use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame, LatestFrame};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{
     ClientHello, ClientHelloV1, CodecKind, ControlMessage, GoodbyeCode, ServerHello,
+    VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY, SERVER_ENCODE_PROFILE_EXTENSION_KEY,
 };
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
@@ -59,19 +60,45 @@ async fn main() -> anyhow::Result<()> {
     let conn = Arc::new(conn);
     info!(remote = %conn.remote_address(), "connected to host");
 
+    // Client video decode capabilities. Phase A advertises only the
+    // profiles the decoder + renderer actually handle today
+    // (NV12 4:2:0 8-bit for both H.264 and HEVC); HEVC Main444 gets
+    // added once the 3-plane render path lands in phase D.
+    //
+    // The order in this list does NOT determine the negotiated outcome
+    // — the host's PROFILE_PREFERENCE is the authoritative ordering.
+    // We keep it best-first as a documentation cue and so the inline
+    // `preferred_codecs` (the legacy advert) is also ordered sensibly
+    // for older hosts that haven't been updated to read the structured
+    // extension.
+    let client_decode_profiles = vec![
+        VideoProfile::HEVC_8BIT_420,
+        VideoProfile::H264_8BIT_420,
+    ];
+    let mut hello_extensions = std::collections::BTreeMap::new();
+    hello_extensions.insert(
+        CLIENT_DECODE_PROFILES_EXTENSION_KEY.to_string(),
+        tether_protocol::encode(&client_decode_profiles)
+            .expect("VideoProfile list encodes; types under our control"),
+    );
+    info!(
+        client_decode_profiles = ?client_decode_profiles,
+        "advertising video decode capabilities to host"
+    );
+
     // Application-layer handshake: identify ourselves, request a codec,
     // and use the embedded probe to compute a host↔client clock offset
     // so latency logs are wall-clock-accurate from the first frame.
     let hello = ClientHello::V1(ClientHelloV1 {
         client_name: "tether-client".to_string(),
-        // Order matters: host picks the first that it can build, so
-        // HEVC takes precedence on hosts that have it (better
-        // compression at the same visual quality). H.264 is the
-        // universal fallback.
+        // Legacy inline advert kept for hosts that predate the
+        // structured extension. The structured extension is the source
+        // of truth on any post-phase-A host. Order: HEVC first because
+        // legacy hosts pick the first they can build.
         preferred_codecs: vec![CodecKind::Hevc, CodecKind::H264],
         max_resolution: None,
         clock_probe_t0: MonoNanos::ZERO,
-        extensions: Default::default(),
+        extensions: hello_extensions,
         resume_token: None,
     });
     let (server_hello, clock_sync) = conn.client_handshake(hello).await?;
@@ -81,13 +108,42 @@ async fn main() -> anyhow::Result<()> {
     // match exhaustively so a future V2 forces a compile-time update
     // rather than a silent fallthrough.
     let ServerHello::V1(server_body) = server_hello;
+
+    // Parse the structured encode-profile echo. The inline
+    // `chosen_codec` / `chosen_chroma` fields carry the same info for
+    // legacy hosts; the structured extension is authoritative on hosts
+    // that emit it.
+    let negotiated_profile: VideoProfile = server_body
+        .extensions
+        .get(SERVER_ENCODE_PROFILE_EXTENSION_KEY)
+        .and_then(|bytes| match tether_protocol::decode::<VideoProfile>(bytes) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    payload_len = bytes.len(),
+                    "host encode-profile extension failed to decode; \
+                     falling back to inline chosen_codec / chosen_chroma fields"
+                );
+                None
+            }
+        })
+        .unwrap_or(VideoProfile {
+            codec: server_body.chosen_codec,
+            chroma: server_body.chosen_chroma,
+            // Legacy hosts predate bit_depth advertisement; everything
+            // they emit today is 8-bit.
+            bit_depth: 8,
+        });
     info!(
         server = %server_body.server_name,
-        codec = ?server_body.chosen_codec,
+        negotiated_codec = ?negotiated_profile.codec,
+        negotiated_chroma = ?negotiated_profile.chroma,
+        negotiated_bit_depth = negotiated_profile.bit_depth,
         resolution = ?server_body.resolution,
         rtt_us = clock_sync.rtt_nanos / 1_000,
         clock_offset_us = clock_sync.offset_nanos / 1_000,
-        "handshake complete"
+        "video profile negotiated; handshake complete"
     );
 
     // Sanity-check the advertised pixel format. NV12 is the only one
@@ -224,7 +280,7 @@ async fn main() -> anyhow::Result<()> {
 
     let conn_recv = conn.clone();
     let recv_clock_sync = clock_sync;
-    let chosen_codec = server_body.chosen_codec;
+    let chosen_codec = negotiated_profile.codec;
     let conn_ready = conn.clone();
 
     // Decode runs on a dedicated std::thread so a GPU-driver stall

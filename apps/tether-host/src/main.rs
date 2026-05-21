@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
-use tether_codec::{probe_encoder, probe_encoder_kind, Encoder};
+use tether_codec::{
+    pick_supported_profile, probe_encoder, supported_encode_profiles, Encoder,
+};
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
 #[cfg(target_os = "linux")]
@@ -27,7 +29,8 @@ use tether_codec::GpuEncoderFrame;
 use tether_gpuconvert::{Nv12DmaBuf, Nv12DmaBufFrame};
 use tether_protocol::control::{
     ChromaSubsampling, ClientHello, CodecKind, ControlMessage, ServerHello, ServerHelloV1,
-    VideoColorSpec,
+    VideoColorSpec, VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY,
+    SERVER_ENCODE_PROFILE_EXTENSION_KEY,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
@@ -123,21 +126,85 @@ async fn handle_client(
     // outer Option; post-handshake we send a clean Goodbye(InternalError)
     // and exit rather than leaving the client waiting on frames that
     // will never arrive.
-    let mut chosen_codec_outer: Option<CodecKind> = None;
+    // Host encode capabilities — what this build can actually construct
+    // against the live VAAPI driver. Probe is process-cached (driver
+    // caps don't change at runtime), so per-connection cost is just a
+    // clone. Logged at debug because every reconnect would otherwise
+    // repeat the same line; the per-session negotiated result below
+    // is the operator-relevant signal.
+    let host_encode_profiles = supported_encode_profiles();
+    tracing::debug!(
+        host_encode_profiles = ?host_encode_profiles,
+        "host video encode capabilities"
+    );
+
+    let mut chosen_profile_outer: Option<VideoProfile> = None;
+    let mut client_decode_profiles_outer: Option<Vec<VideoProfile>> = None;
     let client_hello = conn
         .host_handshake(|hello| {
             let ClientHello::V1(body) = hello;
-            let chosen = pick_supported_codec(&body.preferred_codecs);
-            chosen_codec_outer = chosen;
+            // Parse the client's structured decode-profile advert. Absence
+            // means a legacy client built before this extension — assume
+            // the universal floor (H.264 4:2:0 8-bit) per the protocol
+            // doc on CLIENT_DECODE_PROFILES_EXTENSION_KEY.
+            let client_caps: Vec<VideoProfile> = body
+                .extensions
+                .get(CLIENT_DECODE_PROFILES_EXTENSION_KEY)
+                .and_then(|bytes| match tether_protocol::decode::<Vec<VideoProfile>>(bytes) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            payload_len = bytes.len(),
+                            "client decode-profiles extension failed to decode; \
+                             treating as legacy H.264 4:2:0 client"
+                        );
+                        None
+                    }
+                })
+                .unwrap_or_else(|| vec![VideoProfile::H264_8BIT_420]);
+            info!(
+                client_decode_profiles = ?client_caps,
+                legacy_preferred_codecs = ?body.preferred_codecs,
+                "client video decode capabilities (parsed from hello)"
+            );
+            client_decode_profiles_outer = Some(client_caps.clone());
+
+            let chosen = pick_supported_profile(&host_encode_profiles, &client_caps);
+            chosen_profile_outer = chosen;
+
+            let mut extensions = std::collections::BTreeMap::new();
+            // Advertise pixel format up front so the client's
+            // decoder import path (VAAPI / VT / MF) doesn't
+            // have to wait on the first SPS to decide between
+            // 8-bit and 10-bit. We're NV12 everywhere today;
+            // P010 lands with HDR.
+            extensions.insert(
+                tether_protocol::control::PIXEL_FORMAT_EXTENSION_KEY.to_string(),
+                tether_protocol::encode(&tether_protocol::control::PixelFormat::Nv12)
+                    .expect("PixelFormat::Nv12 encodes; types under our control"),
+            );
+            // Echo the structured negotiation result. The inline
+            // chosen_codec / chosen_chroma fields stay for legacy clients;
+            // the structured echo is the source of truth going forward.
+            if let Some(p) = chosen {
+                extensions.insert(
+                    SERVER_ENCODE_PROFILE_EXTENSION_KEY.to_string(),
+                    tether_protocol::encode(&p)
+                        .expect("VideoProfile encodes; types under our control"),
+                );
+            }
+
             ServerHello::V1(ServerHelloV1 {
                 server_name: "tether-host".to_string(),
-                // On no-match the response carries H264 as a placeholder
-                // — the immediately-following Goodbye is what the client
-                // actually acts on. We use H264 (not e.g. Av1) because
-                // it's the universal floor; if the client respects the
-                // Goodbye it never tries to use it.
-                chosen_codec: chosen.unwrap_or(CodecKind::H264),
-                chosen_chroma: ChromaSubsampling::Yuv420,
+                // On no-match the response carries H264 / Yuv420 as a
+                // placeholder — the immediately-following Goodbye is what
+                // the client actually acts on. We use the universal floor
+                // (not e.g. Av1) so a buggy client that ignores the
+                // Goodbye doesn't trip on an unknown variant before it
+                // sees the goodbye message.
+                chosen_codec: chosen.map_or(CodecKind::H264, |p| p.codec),
+                chosen_chroma: chosen.map_or(ChromaSubsampling::Yuv420, |p| p.chroma),
                 // sRGB transfer, BT.709 matrix / primaries / limited
                 // range — the honest spec for every host backend we
                 // ship today (PipeWire framebuffer interpreted as
@@ -150,51 +217,38 @@ async fn handle_client(
                 clock_probe_t0_echo: MonoNanos::ZERO,
                 t1_server_recv: MonoNanos::ZERO,
                 t2_server_send: MonoNanos::ZERO,
-                extensions: {
-                    let mut e = std::collections::BTreeMap::new();
-                    // Advertise pixel format up front so the client's
-                    // decoder import path (VAAPI / VT / MF) doesn't
-                    // have to wait on the first SPS to decide between
-                    // 8-bit and 10-bit. We're NV12 everywhere today;
-                    // P010 lands with HDR.
-                    e.insert(
-                        tether_protocol::control::PIXEL_FORMAT_EXTENSION_KEY.to_string(),
-                        tether_protocol::encode(
-                            &tether_protocol::control::PixelFormat::Nv12,
-                        )
-                        .expect("PixelFormat::Nv12 encodes; types under our control"),
-                    );
-                    e
-                },
+                extensions,
                 resume_token: None,
             })
         })
         .await?;
     let ClientHello::V1(client_body) = client_hello;
-    let chosen_codec = match chosen_codec_outer {
-        Some(k) => k,
+    let chosen_profile = match chosen_profile_outer {
+        Some(p) => p,
         None => {
             warn!(
-                preferred = ?client_body.preferred_codecs,
-                "no codec in client preference list is buildable on this host; \
+                client_decode_profiles = ?client_decode_profiles_outer,
+                host_encode_profiles = ?host_encode_profiles,
+                "no video profile intersects host encode + client decode capabilities; \
                  sending Goodbye(InternalError) and ending session"
             );
             let _ = conn
                 .send_control(&ControlMessage::Goodbye {
-                    reason: "host cannot build any of the client's preferred codecs"
-                        .to_string(),
+                    reason: "host and client video capabilities do not intersect".to_string(),
                     code: tether_protocol::control::GoodbyeCode::InternalError,
                 })
                 .await;
             return Ok(());
         }
     };
+    let chosen_codec = chosen_profile.codec;
     info!(
         client = %client_body.client_name,
-        preferred_codecs = ?client_body.preferred_codecs,
-        chosen_codec = ?chosen_codec,
+        chosen_codec = ?chosen_profile.codec,
+        chosen_chroma = ?chosen_profile.chroma,
+        chosen_bit_depth = chosen_profile.bit_depth,
         max_resolution = ?client_body.max_resolution,
-        "handshake complete"
+        "video profile negotiated; handshake complete"
     );
 
     // Send a single placeholder cursor shape so the client's receive
@@ -1156,20 +1210,6 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
         .with_writer(writer)
         .init();
     guard
-}
-
-/// Pick the first codec from the client's preference list that this
-/// host can actually construct an encoder for. Each candidate gets a
-/// real construction probe (`probe_encoder_kind`) so that an
-/// FFmpeg-built-but-driver-unsupported codec doesn't slip past the
-/// handshake and crash the send loop mid-session.
-///
-/// Returns `None` when nothing in `preferred` is buildable — the caller
-/// uses that signal to send a Goodbye and refuse the session. Returning
-/// a fallback codec here would lie to the client about what we can
-/// send and turn a clear "no codec match" into a session hang.
-fn pick_supported_codec(preferred: &[CodecKind]) -> Option<CodecKind> {
-    preferred.iter().copied().find(|k| probe_encoder_kind(*k))
 }
 
 /// Default VBR target bitrate as a function of resolution, fps, and

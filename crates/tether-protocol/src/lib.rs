@@ -385,6 +385,57 @@ mod tests {
     }
 
     #[test]
+    fn video_profile_round_trips_via_extension() {
+        use crate::control::{
+            VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY,
+            SERVER_ENCODE_PROFILE_EXTENSION_KEY,
+        };
+        // Client packs its full decode set into one extension value.
+        let client_caps = vec![
+            VideoProfile::HEVC_8BIT_444,
+            VideoProfile::HEVC_8BIT_420,
+            VideoProfile::H264_8BIT_420,
+        ];
+        let payload = encode(&client_caps).unwrap();
+        let decoded: Vec<VideoProfile> = decode(&payload).unwrap();
+        assert_eq!(decoded, client_caps);
+
+        // Host echoes a single chosen profile.
+        let chosen = VideoProfile::HEVC_8BIT_444;
+        let payload = encode(&chosen).unwrap();
+        let decoded: VideoProfile = decode(&payload).unwrap();
+        assert_eq!(decoded, chosen);
+
+        // Key strings are part of the wire contract — pin them so a
+        // typo in a future refactor breaks the test, not the network.
+        assert_eq!(
+            CLIENT_DECODE_PROFILES_EXTENSION_KEY,
+            "tether.cap.video.decode-profiles"
+        );
+        assert_eq!(
+            SERVER_ENCODE_PROFILE_EXTENSION_KEY,
+            "tether.cap.video.encode-profile"
+        );
+    }
+
+    #[test]
+    fn unknown_video_profile_codec_fails_decode() {
+        // Forward-compat: a future host that advertises an unknown
+        // codec discriminator should fail decode cleanly on an older
+        // client rather than silently misinterpret the byte. We let
+        // the serializer dictate the field layout (so the test stays
+        // valid if VideoProfile field order ever changes) and only
+        // corrupt the CodecKind discriminator byte at position 0.
+        let mut bytes = encode(&crate::control::VideoProfile::H264_8BIT_420).unwrap();
+        bytes[0] = 99; // past any known CodecKind variant
+        let result = decode::<crate::control::VideoProfile>(&bytes);
+        assert!(
+            result.is_err(),
+            "unknown CodecKind discriminator must fail decode"
+        );
+    }
+
+    #[test]
     fn video_color_spec_round_trips() {
         use crate::control::{
             ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, VideoColorSpec,

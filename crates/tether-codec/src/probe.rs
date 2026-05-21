@@ -25,7 +25,81 @@
 //! shape it against.
 
 use crate::{CodecError, Decoder, Encoder, Result};
-use tether_protocol::control::CodecKind;
+use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+
+/// Host preference order, best-first. The negotiation picks the first
+/// entry that appears in *both* the host's encode capabilities and the
+/// client's advertised decode capabilities.
+///
+/// Anchored to desktop content quality. HEVC Main444 8-bit goes first
+/// because it preserves antialiased text and UI chroma detail that
+/// 4:2:0 visibly smears. H.264 4:4:4 is intentionally absent — VAAPI
+/// has no encode profile for it, and there is no other host backend
+/// in this build yet (Sunshine confirms the same gap in
+/// refs/Sunshine/src/platform/linux/vaapi.cpp:202).
+pub const PROFILE_PREFERENCE: &[VideoProfile] = &[
+    VideoProfile::HEVC_8BIT_444,
+    VideoProfile::HEVC_8BIT_420,
+    VideoProfile::H264_8BIT_420,
+];
+
+/// Best mutual profile between the host's encode capabilities and the
+/// client's decode capabilities, picked from [`PROFILE_PREFERENCE`].
+/// Returns `None` only when no preference-list entry appears in both
+/// sets — the caller treats that as a session-end condition (no
+/// compatible codec).
+///
+/// Host caps are expected to come from [`supported_encode_profiles`];
+/// client caps from the bincode-decoded
+/// [`tether_protocol::control::CLIENT_DECODE_PROFILES_EXTENSION_KEY`]
+/// payload (or the legacy assumption `[VideoProfile::H264_8BIT_420]`
+/// when the extension is absent).
+#[must_use]
+pub fn pick_supported_profile(
+    host_caps: &[VideoProfile],
+    client_caps: &[VideoProfile],
+) -> Option<VideoProfile> {
+    PROFILE_PREFERENCE
+        .iter()
+        .copied()
+        .find(|p| host_caps.contains(p) && client_caps.contains(p))
+}
+
+/// Enumerate the video profiles this host can actually encode today.
+///
+/// Implemented as a real construction probe (same approach as
+/// [`probe_encoder_kind`]) per `(codec, chroma, bit_depth)` triple —
+/// VAAPI's runtime capability set depends on driver, kernel, and
+/// hardware generation, none of which FFmpeg's build-time codec list
+/// reflects accurately.
+///
+/// Today the constructor doesn't yet take a `VideoProfile`, so we only
+/// probe `(_, Yuv420, 8)` triples. The Yuv444 probes light up in phase B
+/// when [`crate::vaapi::VaapiEncoder::new`] grows the chroma parameter.
+/// Listing the to-be-supported profiles here would lie to the
+/// negotiator and cause a downstream encoder construction failure
+/// mid-session.
+#[must_use]
+pub fn supported_encode_profiles() -> Vec<VideoProfile> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Vec<VideoProfile>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let mut out = Vec::new();
+            for codec in [CodecKind::H264, CodecKind::Hevc] {
+                let profile_420 = VideoProfile {
+                    codec,
+                    chroma: ChromaSubsampling::Yuv420,
+                    bit_depth: 8,
+                };
+                if probe_encoder_kind(codec) {
+                    out.push(profile_420);
+                }
+            }
+            out
+        })
+        .clone()
+}
 
 /// Probe + construct an encoder for the first codec in `preferred`
 /// that this host can actually build. Returns the chosen
@@ -251,4 +325,100 @@ fn no_hw_decoder_for_platform() -> CodecError {
          backends are not yet implemented."
             .to_string(),
     )
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+
+    #[test]
+    fn picks_best_mutual_from_preference() {
+        // Both sides support all three; pref order wins -> HEVC 444.
+        let host = vec![
+            VideoProfile::H264_8BIT_420,
+            VideoProfile::HEVC_8BIT_420,
+            VideoProfile::HEVC_8BIT_444,
+        ];
+        let client = vec![
+            VideoProfile::HEVC_8BIT_444,
+            VideoProfile::HEVC_8BIT_420,
+            VideoProfile::H264_8BIT_420,
+        ];
+        assert_eq!(
+            pick_supported_profile(&host, &client),
+            Some(VideoProfile::HEVC_8BIT_444)
+        );
+    }
+
+    #[test]
+    fn falls_back_when_top_profile_one_sided() {
+        // Host has HEVC 4:4:4 but client only decodes H.264 4:2:0.
+        // Negotiation must walk down to the floor rather than failing.
+        let host = vec![
+            VideoProfile::HEVC_8BIT_444,
+            VideoProfile::H264_8BIT_420,
+        ];
+        let client = vec![VideoProfile::H264_8BIT_420];
+        assert_eq!(
+            pick_supported_profile(&host, &client),
+            Some(VideoProfile::H264_8BIT_420)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_disjoint() {
+        // No mutual entry in the preference list — host advertises
+        // a profile we know about (HEVC 4:2:0), client advertises a
+        // profile not in PROFILE_PREFERENCE at all (a hypothetical AV1
+        // 4:2:0). Caller treats None as a session-end signal.
+        let host = vec![VideoProfile::HEVC_8BIT_420];
+        let client = vec![VideoProfile {
+            codec: CodecKind::Av1,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        }];
+        assert_eq!(pick_supported_profile(&host, &client), None);
+    }
+
+    #[test]
+    fn legacy_client_assumed_h264_420_gets_h264_420() {
+        // Protocol contract: when the client doesn't send the
+        // decode-profiles extension, the host treats them as a legacy
+        // client supporting only the universal floor. The negotiation
+        // must still pick that floor on a host that has richer caps —
+        // otherwise pre-phase-A clients are silently broken when
+        // connecting to a phase-A+ host.
+        let host = vec![
+            VideoProfile::HEVC_8BIT_444,
+            VideoProfile::HEVC_8BIT_420,
+            VideoProfile::H264_8BIT_420,
+        ];
+        let legacy_client = vec![VideoProfile::H264_8BIT_420];
+        assert_eq!(
+            pick_supported_profile(&host, &legacy_client),
+            Some(VideoProfile::H264_8BIT_420)
+        );
+    }
+
+    #[test]
+    fn empty_host_or_client_returns_none() {
+        assert_eq!(
+            pick_supported_profile(&[], &[VideoProfile::H264_8BIT_420]),
+            None
+        );
+        assert_eq!(
+            pick_supported_profile(&[VideoProfile::H264_8BIT_420], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn preference_order_is_desktop_quality_first() {
+        // Pin the preference order — a future refactor that swaps the
+        // first two entries would silently regress desktop sessions
+        // from HEVC 4:4:4 to HEVC 4:2:0.
+        assert_eq!(PROFILE_PREFERENCE[0], VideoProfile::HEVC_8BIT_444);
+        assert_eq!(PROFILE_PREFERENCE[1], VideoProfile::HEVC_8BIT_420);
+        assert_eq!(PROFILE_PREFERENCE[2], VideoProfile::H264_8BIT_420);
+    }
 }

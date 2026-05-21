@@ -105,15 +105,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Linux equivalent: probe gpuconvert's 10-bit deliverability
-    // (STORAGE_IMAGE on R16 + GR32) once at startup so per-connection
-    // `capture_filtered_encode_profiles` reads the cache instead of
-    // re-running the Vulkan probe. Same handshake-critical-path
-    // rationale as the macOS warm-up above. Test-pattern mode skips
-    // — `capture_filtered_encode_profiles` isn't on its hot path.
+    // (storage-modifier probe + real submit_dmabuf round-trip) once
+    // at startup so per-connection `capture_filtered_encode_profiles`
+    // reads the cache instead of re-running. Same handshake-critical
+    // -path rationale as the macOS warm-up above. Unlike the macOS
+    // case, we run this even in test-pattern mode — the negotiation
+    // path still consults the cache and a debug_assert fires if it's
+    // unpopulated; the probe is cheap (~tens of ms) so the
+    // unconditional warm-up is the simpler invariant.
     #[cfg(target_os = "linux")]
-    if !use_test_pattern {
-        warm_gpuconvert_capability_cache().await;
-    }
+    warm_gpuconvert_capability_cache().await;
 
     // Warm the codec-probe cache for the same reason. The probe builds
     // each `VideoProfile` in `PROFILE_PREFERENCE` through a real VT (or
@@ -1615,9 +1616,101 @@ async fn warm_gpuconvert_capability_cache() {
     if LINUX_P010_DELIVERABLE_CACHE.get().is_some() {
         return;
     }
-    let p010 = tether_gpuconvert::linux_can_deliver_p010().await;
+    // Two-stage probe. The storage-modifier check passes if the
+    // Vulkan ICD says R16/GR32 are storage-writable; this is
+    // necessary but not sufficient — FFmpeg's
+    // `av_hwframe_map(DRM_PRIME → VAAPI)` may reject the P010
+    // descriptor at the driver-table level even when the storage
+    // probe is happy (empirically Intel iHD + Mesa + FFmpeg 8.1 hits
+    // this — see docs/CODEC_CAPABILITIES.md "Linux 10-bit encode —
+    // empirical state"). The actual `submit_dmabuf` round-trip is
+    // the authoritative answer; if it fails we degrade silently to
+    // 8-bit-only rather than advertise Main10 to clients we can't
+    // serve.
+    let storage_ok = tether_gpuconvert::linux_can_deliver_p010().await;
+    let p010 = if storage_ok {
+        match probe_p010_submit_round_trip().await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::info!(
+                    error = %e,
+                    "Main10 storage probe passed but submit_dmabuf round-trip \
+                     failed; falling back to 8-bit-only advertisement"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
     tracing::info!(p010, "Linux gpuconvert capability (cached for process lifetime)");
     let _ = LINUX_P010_DELIVERABLE_CACHE.set(p010);
+}
+
+/// One-shot end-to-end test: build a Bgra2P010DmaBuf bridge, build a
+/// VaapiEncoder for Main10, run a single submit_dmabuf. Success means
+/// the full producer chain works on this driver; failure means the
+/// codec-level construction probe was over-claiming (typical signature
+/// is `av_hwframe_map` rejecting the P010 descriptor).
+///
+/// Smallest viable: 128×128 (matches the codec layer's PROBE_DIM) so
+/// the probe is cheap (~tens of ms once at startup).
+#[cfg(target_os = "linux")]
+async fn probe_p010_submit_round_trip() -> anyhow::Result<()> {
+    const PROBE_DIM: u32 = 128;
+    let bridge = tether_gpuconvert::Bgra2P010DmaBuf::new(PROBE_DIM, PROBE_DIM).await?;
+    let probe_bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
+    let p010 = bridge.convert_bgra_bytes(&probe_bytes)?;
+
+    const P010_FOURCC: u32 = u32::from_le_bytes(*b"P010");
+    const R16_FOURCC: u32 = u32::from_le_bytes(*b"R16 ");
+    const GR32_FOURCC: u32 = u32::from_le_bytes(*b"GR32");
+    let dup_fd = p010.fd.try_clone()?;
+    let y_off = u32::try_from(p010.y_offset)?;
+    let y_stride = u32::try_from(p010.y_stride)?;
+    let uv_off = u32::try_from(p010.uv_offset)?;
+    let uv_stride = u32::try_from(p010.uv_stride)?;
+    let codec_frame = tether_codec::DmaBufFrame {
+        fourcc: P010_FOURCC,
+        objects: vec![tether_codec::DmaBufObject {
+            fd: dup_fd,
+            size: p010.size,
+            drm_format_modifier: p010.modifier,
+        }],
+        layers: vec![
+            tether_codec::DmaBufLayer {
+                drm_format: R16_FOURCC,
+                num_planes: 1,
+                object_index: [0; 4],
+                offset: [y_off, 0, 0, 0],
+                pitch: [y_stride, 0, 0, 0],
+            },
+            tether_codec::DmaBufLayer {
+                drm_format: GR32_FOURCC,
+                num_planes: 1,
+                object_index: [0; 4],
+                offset: [uv_off, 0, 0, 0],
+                pitch: [uv_stride, 0, 0, 0],
+            },
+        ],
+    };
+
+    let mut enc = tether_codec::vaapi::VaapiEncoder::new(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: tether_protocol::control::ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        },
+        PROBE_DIM,
+        PROBE_DIM,
+        30,
+        1_000,
+    )?;
+    // The first submit either succeeds (everything works) or surfaces
+    // the driver-layer rejection (e.g. "DRM format not supported by
+    // VAAPI"). Either way the answer is captured in the Result.
+    enc.submit_dmabuf(&codec_frame, 0, true)?;
+    Ok(())
 }
 
 /// Read the cached gpuconvert capability. Falls back to `false`

@@ -360,83 +360,58 @@ catches three failure modes the spec doesn't:
 - Format-map mismatches between encoder input and what
   gpuconvert can produce.
 
-10-bit HEVC encode (Main10, Main422_10, Main444_10) is currently
-not probed and not in `PROFILE_PREFERENCE`. **No documented
-driver supports any 10-bit VAAPI encode profile across vendors**,
-but that absence is an absence of documentation, not a proof —
-needs an actual probe before we trust it.
+### Linux 10-bit encode — empirical state (post-handoff)
 
-### Open work — Linux 10-bit encode handoff
+The handoff plan (`Bgra2P010DmaBuf` bridge + encoder bit_depth gate
+lift + storage-image probe + host capture filter) shipped across
+five commits. Each layer of the chain works on its own; the
+end-to-end path stops at the driver layer.
 
-The probe + renderer + protocol surface for 10-bit are all live;
-the producer side is the remaining gap. Three independent pieces.
-All three need to land for a Linux→Linux session to negotiate
-HEVC Main10 (4:2:0 10-bit) end-to-end. macOS-host 10-bit is
-already live as of commit `513f4c7` (separate path — SCK direct
-to VT via x420 IOSurfaces, no gpuconvert involved).
+| Layer | Build cell | Run cell |
+|-------|-----------|----------|
+| `tether_gpuconvert::Bgra2P010DmaBuf` | ✅ | ✅ Y plane reads back BT.709-correct red Y=250 and Cb=409 / Cr=960 on 10-bit storage |
+| `tether_gpuconvert::storable_dmabuf_modifiers(R16/GR32)` | ✅ | ✅ Mesa intel-Vulkan advertises STORAGE_IMAGE on both for LINEAR |
+| `tether_codec::vaapi::VaapiEncoder::new(Main10)` (avcodec_open2) | ✅ | ✅ on Intel iHD + FFmpeg 8.1 |
+| `tether_codec::vaapi::VaapiEncoder::submit_dmabuf` (P010 fourcc match) | ✅ | ✅ table accepts P010 + R16/GR32 layer shapes |
+| `av_hwframe_map(DRM_PRIME → VAAPI)` on P010 dma-buf | ✅ | ❌ **driver gap** — Intel iHD + Mesa + FFmpeg 8.1 rejects with "DRM format not supported by VAAPI". Both single-layer P010+2-planes and two-layer R16+GR32+1-plane descriptor shapes fail. |
 
-1. **VAAPI encoder 10-bit input path.**
-   In `tether-codec/src/vaapi/encoder.rs`, the `submit_dmabuf` and
-   `encode_bgra` methods both return `UnsupportedInputFormat` for
-   `bit_depth != 8` — grep for `self.bit_depth != 8` inside both.
-   Extend `vaapi_sw_format` (the `match (chroma, bit_depth)` next
-   to the existing NV12 / VUYX entries) to return `AV_PIX_FMT_P010LE`
-   for `(Yuv420, 10)` and `AV_PIX_FMT_XV30LE` for `(Yuv444, 10)`.
-   Confirm against `vaapi_drm_format_map` in FFmpeg's
-   `libavutil/hwcontext_vaapi.c` — XV30LE is the *only* 10-bit
-   4:4:4 entry there (planar P410 has no map row, mirroring the
-   8-bit YUV444P→XYUV story).
+The driver layer's `vaapi_drm_format_map` table doesn't include an
+entry that matches the P010 descriptor on this combination. This is
+the empirical answer to the earlier "no documented driver supports
+any 10-bit VAAPI encode profile" question — confirmed for the M-series
+hardware available locally (Intel Arc on Meteor Lake). AMD radeonsi
+and NVIDIA nvidia-vaapi-driver are untested but documentation
+suggests the same gap.
 
-2. **gpuconvert 10-bit bridges + STORAGE_IMAGE probe.**
-   The shaders (`bgra_to_p010.wgsl`, `bgra_to_p410.wgsl`) and the
-   pipeline scaffolding (`build_p010_pipeline`,
-   `build_p410_pipeline` in `pipeline.rs`) are written and marked
-   `#[allow(dead_code)]`. To go live:
-   - Add `Bgra2P010DmaBuf` / `Bgra2P410DmaBuf` public bridges
-     mirroring `Nv12DmaBuf` / `Yuv444DmaBuf`. The output DMA-BUF
-     needs R16 Y + Rg16 UV plane fourccs (DRM_FORMAT_R16 = 'R16 ',
-     DRM_FORMAT_GR1616 = 'GR32') with `DRM_FORMAT_MOD_LINEAR`.
-   - Address the FIXME on `build_biplanar_16_pipeline` in
-     `tether-gpuconvert/src/pipeline.rs`:
-     R16Unorm / Rg16Unorm as compute *storage outputs* require the
-     Vulkan `STORAGE_IMAGE_BIT` format feature flag, not just
-     `SAMPLED_IMAGE_BIT`. The existing `importable_dmabuf_modifiers`
-     in `modifier_query.rs` only checks SAMPLED; add a sibling
-     `storable_dmabuf_formats(fourcc)` (or extend the existing one
-     with a flag parameter) that queries STORAGE on the chosen
-     `VkFormat`. Some drivers expose 16-bit unorm as sampleable but
-     not storage-writable; on those the 10-bit pipeline will fail
-     at `create_compute_pipeline` without this gate.
+**Host doesn't advertise Main10 to clients** on a driver that hits
+this gap: `apps/tether-host/src/main.rs::warm_gpuconvert_capability_cache`
+runs a real `submit_dmabuf` round-trip at startup (not just the
+storage-image probe), and the cache populates `false` if the round-trip
+fails. The codec-side probe alone is construction-only for 10-bit
+(can't tell apart "driver lacks dma-buf map entry" from "driver
+genuinely supports the path") so the host's warm-time check is the
+authoritative gate.
 
-3. **Linux `capture_filtered_encode_profiles` tightening.**
-   `apps/tether-host/src/main.rs:1456` is a no-op on Linux today
-   because the VAAPI probe already gates 10-bit at the encoder
-   layer (item 1). Once item 1 lifts that gate, this function
-   should filter the same way the macOS arm does — against what
-   the gpuconvert P010 / P410 bridge can actually deliver, gated
-   by the STORAGE_IMAGE probe from item 2. The macOS arm
-   (`sck_pixel_format_for_profile` + `is_deliverable`) is the
-   shape to follow; the Linux equivalent would call
-   `tether_gpuconvert::storable_dmabuf_formats` per format and
-   intersect with `supported_encode_profiles()`.
+**Path forward** if/when a driver gains P010 dma-buf support:
+- No code changes needed in tether — the probe will populate `true`
+  and Main10 will appear in the advertised profile set
+- The renderer round-trip test
+  (`crates/tether-render/src/dmabuf_test.rs::dmabuf_zero_copy_roundtrip_hevc_main10`)
+  will go from SKIP to PASS on that driver
+- Cross-platform path (macOS host → Linux client at Main10) already
+  works today; it's only the Linux *encode* side that hits the gap
 
-Order: (1) → (2) → (3). Each ships independently; nothing in
-the protocol or renderer changes. After all three, the
-`hevc_yuv420_10bit.idr` and `hevc_yuv444_10bit.idr` fixtures in
-`crates/tether-codec/fixtures/probe/` are what the VAAPI decode
-probe rides; the matching encode probes will start returning
-`encode=true` (or `false` with diagnostics) automatically once
-the encoder accepts the new sw_format.
+### 4:4:4 10-bit — deliberately not yet wired
 
-Verification: `cargo test -p tether-codec --lib bench --ignored
---nocapture --test-threads=1` adds latency + headroom numbers
-for the new entries against the existing 8-bit cells; a passing
-end-to-end Linux→Linux session at HEVC Main10 confirms the
-chain. Don't ship without the gpuconvert bridge round-trip test
-that puts a known BGRA pattern through the 10-bit shader,
-encodes it via VAAPI, decodes it back, and compares against a
-reference — same shape as the existing `Nv12DmaBuf` hardware
-test in `tether-gpuconvert/tests/`.
+VAAPI's `vaapi_drm_format_map` lists `AV_PIX_FMT_XV30LE` (packed
+10:10:10:2) as the only 10-bit 4:4:4 entry — planar P410 has no map
+row, mirroring the 8-bit YUV444P→XYUV story. No gpuconvert bridge
+produces XV30 today. The codec-layer probe explicitly gates this
+combination out (`tether-codec/src/vaapi/probe.rs`, narrow `(Yuv444,
+10)` reject) so the host never advertises a profile it can't
+construct. The biplanar P410 shader stays in-tree dead-code for an
+eventual macOS gpuconvert-equivalent (where the IOSurface fourcc
+`'P410'` is biplanar).
 
 ---
 
@@ -564,11 +539,11 @@ advertised `supported_decode_profiles()` — anything a given
 device's hardware can't deliver gets filtered out by the probe
 layer automatically.
 
-**Live status by platform pair** (as of commit `513f4c7`):
+**Live status by platform pair** (post-10-bit handoff):
 
 | Host       | Client     | Expected pick (best mutual)      | Notes |
 | ---------- | ---------- | -------------------------------- | ----- |
-| Linux      | Linux      | HEVC 4:4:4 8-bit                 | 10-bit Linux encode still gated (see VAAPI handoff above) |
+| Linux      | Linux      | HEVC 4:4:4 8-bit                 | 10-bit Linux encode wired through the host's warm-time probe but blocked at the driver layer on the hardware tested (Intel iHD + Mesa + FFmpeg 8.1 rejects P010 dma-buf via `av_hwframe_map`). Main10 advertises only on drivers that pass the live `submit_dmabuf` round-trip — see the "Linux 10-bit encode — empirical state" section above. |
 | macOS M-series | Linux  | HEVC 4:2:0 10-bit (Main10)       | SCK delivers `'x420'` → VT encodes P010 → client decodes via VAAPI |
 | macOS M-series | macOS  | HEVC 4:2:0 10-bit (Main10)       | Same encode side; client decodes back to `'x420'` IOSurface |
 | Linux      | macOS      | HEVC 4:4:4 8-bit                 | VT client decodes 4:4:4 via NV24 even though encode side is 4:2:0-only |

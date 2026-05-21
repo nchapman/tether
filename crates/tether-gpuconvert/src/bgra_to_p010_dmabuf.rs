@@ -89,6 +89,13 @@ pub enum P010DmaBufError {
         w: u32,
         h: u32,
     },
+    #[error("input BGRA byte buffer is {got} bytes; converter at {w}x{h} expects {expected}")]
+    ByteLenMismatch {
+        got: usize,
+        expected: usize,
+        w: u32,
+        h: u32,
+    },
     #[error("wgpu poll: {0}")]
     Poll(String),
     #[error("dup fd: {0}")]
@@ -293,6 +300,64 @@ impl Bgra2P010DmaBuf {
                 .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_tex, &wgpu_desc)
         };
         Ok(tex)
+    }
+
+    /// Convenience wrapper around [`Self::convert`] that takes a
+    /// tightly-packed BGRA byte slice (`width * height * 4` bytes).
+    /// Allocates a transient source texture on the bridge's device,
+    /// uploads the bytes via `write_texture`, and runs the compute
+    /// pass. Returns the resulting P010 dma-buf frame.
+    ///
+    /// For callers that already have a wgpu BGRA texture (production
+    /// PipeWire path: imported via `import_bgra_dmabuf`), use
+    /// [`Self::convert`] directly to skip the upload. This helper
+    /// exists for test + probe contexts that have CPU-resident bytes
+    /// and don't want a wgpu dep in their crate just to allocate a
+    /// scratch source texture.
+    pub fn convert_bgra_bytes(&self, bgra: &[u8]) -> Result<P010DmaBufFrame> {
+        let expected = (self.width * self.height * 4) as usize;
+        if bgra.len() != expected {
+            return Err(P010DmaBufError::ByteLenMismatch {
+                got: bgra.len(),
+                expected,
+                w: self.width,
+                h: self.height,
+            });
+        }
+        let src = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("p010 bgra scratch"),
+            size: wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bgra,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.width * 4),
+                rows_per_image: Some(self.height),
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.convert(&src)
     }
 
     /// Convert one imported BGRA frame into the bridge's P010 DMA-BUF

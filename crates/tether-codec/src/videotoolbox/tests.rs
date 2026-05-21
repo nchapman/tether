@@ -274,6 +274,120 @@ fn videotoolbox_round_trip() {
     }
 }
 
+/// Decoder-rebuild round-trip: prove the self-decodable-IDR contract.
+///
+/// The single-decoder round-trip above can't distinguish "extradata is
+/// prepended correctly" from "VT's in-band SPS recovery happened to
+/// work" — once a VT decoder has parsed the first IDR's in-band
+/// parameter sets, every subsequent IDR uses the cached SPS. A
+/// regression that *stopped* prepending extradata would still pass
+/// `videotoolbox_round_trip`.
+///
+/// This test exercises the actual failure mode: encode many frames,
+/// skip the first IDR entirely (as a client joining mid-session
+/// would), and construct a *fresh* `VideoToolboxDecoder` that has
+/// never seen the session's first IDR. The decoder must still produce
+/// a frame from the next IDR alone, which only works if that IDR
+/// packet carries its own SPS/PPS prefix.
+#[test]
+#[ignore = "requires macOS + VideoToolbox"]
+fn videotoolbox_decoder_recovers_from_mid_session_idr() {
+    use tether_protocol::control::CodecKind;
+
+    for kind in [CodecKind::H264, CodecKind::Hevc] {
+        let w = 320;
+        let h = 240;
+        let mut enc = VideoToolboxEncoder::new(kind, w, h, 30, 2_000)
+            .unwrap_or_else(|e| panic!("{kind:?} encoder: {e:?}"));
+
+        // Drive the encoder for enough frames to produce at least two
+        // IDRs (frame 0 and an explicit force at frame 8). Collect every
+        // packet so we can replay a subset of them.
+        let mut packets: Vec<crate::EncodedPacket> = Vec::new();
+        for t in 0..16i64 {
+            let bgra = make_test_bgra(w, h, t as u32);
+            let force = t == 0 || t == 8;
+            let out = enc
+                .encode_bgra(&bgra, t, force)
+                .unwrap_or_else(|e| panic!("{kind:?} encode {t}: {e:?}"));
+            packets.extend(out);
+        }
+        packets.extend(
+            enc.flush()
+                .unwrap_or_else(|e| panic!("{kind:?} flush: {e:?}")),
+        );
+
+        // Pin the self-decodable-IDR contract at the wire level: every
+        // keyframe packet must begin with the encoder's captured
+        // extradata. Belt-and-suspenders against the cross-cutting
+        // `videotoolbox_keyframes_carry_extradata` test in case the
+        // round-trip path diverges from the standalone encoder path.
+        let extradata = enc.extradata.clone();
+        assert!(
+            !extradata.is_empty(),
+            "{kind:?} encoder extradata empty; AV_CODEC_FLAG_GLOBAL_HEADER may not be honoured"
+        );
+        let keyframe_indices: Vec<usize> = packets
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.keyframe)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            keyframe_indices.len() >= 2,
+            "{kind:?} need at least 2 keyframes to test mid-session rebuild; got {}",
+            keyframe_indices.len()
+        );
+        for &i in &keyframe_indices {
+            assert!(
+                packets[i].data.starts_with(&extradata),
+                "{kind:?} keyframe #{i} does not start with extradata; \
+                 self-decodable-IDR contract broken"
+            );
+        }
+
+        // Skip everything up to the *second* keyframe — simulates a
+        // client that joined mid-session and never saw the first IDR.
+        let resume_at = keyframe_indices[1];
+        let mut dec = VideoToolboxDecoder::new(kind)
+            .unwrap_or_else(|e| panic!("{kind:?} fresh decoder: {e:?}"));
+
+        let mut decoded: Option<GpuFrame> = None;
+        for p in &packets[resume_at..] {
+            dec.submit(&p.data)
+                .unwrap_or_else(|e| panic!("{kind:?} submit (post-resume): {e:?}"));
+            while let Some(f) = dec
+                .next_frame()
+                .unwrap_or_else(|e| panic!("{kind:?} next_frame (post-resume): {e:?}"))
+            {
+                match f {
+                    Frame::Gpu(g) => {
+                        decoded = Some(g);
+                    }
+                    Frame::Cpu(_) => panic!(
+                        "{kind:?} decoder produced Cpu frame post-resume; \
+                         violates hardware-only contract"
+                    ),
+                }
+            }
+            if decoded.is_some() {
+                break;
+            }
+        }
+
+        let frame = decoded.unwrap_or_else(|| {
+            panic!(
+                "{kind:?} fresh decoder failed to produce a frame starting from a \
+                 non-first IDR — self-decodable-IDR invariant is broken. Without \
+                 extradata prepended to every keyframe, a client that joins \
+                 mid-session has no recovery path."
+            )
+        });
+        assert_eq!(frame.width, w);
+        assert_eq!(frame.height, h);
+    }
+}
+
 #[test]
 fn videotoolbox_codec_name_maps() {
     // Default-on (no hardware needed): exercises the codec_name map so

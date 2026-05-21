@@ -108,3 +108,15 @@ See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
   limit; we don't have a test that opens more than the cap to confirm
   the rejection happens at the connection layer. Trusted to quinn's
   own test suite.
+- **VAAPI 4:4:4 decode probe.** `probe_decoder_profile` on Linux is
+  codec-keyed, not profile-keyed: a successful `VaapiDecoder::new` for
+  HEVC means we advertise HEVC 4:4:4 decode capability even though the
+  driver may only support 4:2:0 decode. In practice consumer VAAPI
+  drivers expose decode for the same chromas they expose encode for, so
+  this hasn't bitten anyone — but a driver mismatch would surface as a
+  first-frame `UnsupportedInputFormat` rather than a clean startup
+  failure. Closing the gap means encoding a tiny 4:4:4 bitstream with
+  `VaapiEncoder` and round-tripping it through `VaapiDecoder` at probe
+  time. The macOS path has no equivalent gap because
+  `probe_decoder_profile` gates on `ChromaSubsampling::Yuv420` before
+  constructing.

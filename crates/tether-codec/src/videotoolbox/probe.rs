@@ -24,6 +24,7 @@
 
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
+use crate::bitstream_sps::parse_sps_chroma_bit_depth;
 use crate::profile_probe::ProfileProbe;
 use crate::{CodecError, Decoder, Encoder, Frame, GpuFrameSource, Result};
 
@@ -58,6 +59,41 @@ impl ProfileProbe for VideoToolboxProbe {
         }
         if packets.is_empty() {
             return Err(CodecError::UnsupportedInputFormat);
+        }
+
+        // Second signal: parse the SPS NAL the encoder emitted and
+        // confirm `chroma_format_idc` + `bit_depth_luma_minus8` agree
+        // with the profile we requested. The IOSurface fourcc check
+        // below reflects what the *decoder* produced; the SPS reflects
+        // what the *encoder* declared. Two independent signals catch
+        // an edge the round-trip alone could miss — e.g. if a future
+        // decoder rendered a downsampled bitstream into the "expected"
+        // fourcc family, the fourcc check would silently pass.
+        //
+        // SPS parser doesn't model every profile (4:2:2, 12-bit, AV1
+        // OBU framing); when it returns `None` we accept the absence
+        // and fall back to fourcc-only. False negatives here (parser
+        // can't read this SPS) should not gate a profile that the
+        // round-trip otherwise confirms; only an *explicit*
+        // disagreement is fatal.
+        let keyframe_bitstream = packets
+            .iter()
+            .find(|p| p.keyframe)
+            .map_or(&*packets[0].data, |p| &p.data);
+        if let Some(parsed) = parse_sps_chroma_bit_depth(keyframe_bitstream, profile.codec)
+            .and_then(|s| s.to_profile_chroma_bit_depth())
+        {
+            let expected = (profile.chroma, profile.bit_depth);
+            if parsed != expected {
+                tracing::debug!(
+                    ?profile,
+                    sps_chroma = ?parsed.0,
+                    sps_bit_depth = parsed.1,
+                    "VT encoder emitted an SPS declaring a different chroma / \
+                     bit-depth than the profile requested — silent transform"
+                );
+                return Err(CodecError::UnsupportedInputFormat);
+            }
         }
 
         // Round-trip through a fresh VT decoder and check the output

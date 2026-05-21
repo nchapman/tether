@@ -78,6 +78,8 @@ pub async fn start() -> Result<Receiver<CapturedFrame>> {
                 yuv420_full_range = caps.yuv420_full_range,
                 yuv444_8bit_video_range = caps.yuv444_8bit_video_range,
                 yuv444_8bit_full_range = caps.yuv444_8bit_full_range,
+                yuv420_10bit_video_range = caps.yuv420_10bit_video_range,
+                yuv420_10bit_full_range = caps.yuv420_10bit_full_range,
                 yuv444_10bit_full_range = caps.yuv444_10bit_full_range,
                 "SCK pixel-format probe results (live stream still uses 420v)"
             );
@@ -315,6 +317,16 @@ pub struct SckCaptureCapability {
     /// `'444f'` (via `PixelFormat::Unknown`) — biplanar NV24 full
     /// range. Same status as `'444v'`.
     pub yuv444_8bit_full_range: bool,
+    /// `'x420'` (via `PixelFormat::Unknown`) — biplanar 10-bit 4:2:0
+    /// video range (CoreVideo `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`).
+    /// Not in SCK's documented enum; the path that unlocks macOS-host
+    /// HEVC Main 4:2:0 10-bit (Main10) encode in *video range* — the
+    /// VT encoder's expected limited-range input format.
+    pub yuv420_10bit_video_range: bool,
+    /// `'xf20'` (via `PixelFormat::Unknown`) — biplanar 10-bit 4:2:0
+    /// full range (CoreVideo `kCVPixelFormatType_420YpCbCr10BiPlanarFullRange`).
+    /// Companion of `x420` for full-range pipelines.
+    pub yuv420_10bit_full_range: bool,
     /// `xf44` — biplanar 10-bit 4:4:4 full range, the only 10-bit
     /// 4:4:4 SCK format Apple documents. If accepted, this is the
     /// path that unlocks macOS-host HEVC Main 4:4:4 10-bit encode
@@ -341,6 +353,14 @@ enum ProbeFormat {
     Yuv444v,
     /// Biplanar NV24 full range. Same status as `Yuv444v`.
     Yuv444f,
+    /// Biplanar 10-bit 4:2:0 video range (`'x420'`). Not in SCK's
+    /// named enum; passed via `Unknown`. The HEVC Main10 input format
+    /// VT's encoder consumes by default. Same false-positive concern
+    /// as the other `Unknown` variants — frame-arrival check required.
+    X420,
+    /// Biplanar 10-bit 4:2:0 full range (`'xf20'`). Companion of
+    /// `X420` for full-range pipelines.
+    Xf20,
     /// Apple's documented 10-bit 4:4:4 biplanar full range.
     Xf44,
 }
@@ -352,6 +372,8 @@ impl ProbeFormat {
         Self::Yuv420f,
         Self::Yuv444v,
         Self::Yuv444f,
+        Self::X420,
+        Self::Xf20,
         Self::Xf44,
     ];
 
@@ -362,6 +384,8 @@ impl ProbeFormat {
             Self::Yuv420f => PixelFormat::YCbCr_420f,
             Self::Yuv444v => PixelFormat::Unknown(FourCharCode::from_bytes(*b"444v")),
             Self::Yuv444f => PixelFormat::Unknown(FourCharCode::from_bytes(*b"444f")),
+            Self::X420 => PixelFormat::Unknown(FourCharCode::from_bytes(*b"x420")),
+            Self::Xf20 => PixelFormat::Unknown(FourCharCode::from_bytes(*b"xf20")),
             Self::Xf44 => PixelFormat::xf44,
         }
     }
@@ -373,6 +397,8 @@ impl ProbeFormat {
             Self::Yuv420f => "420f",
             Self::Yuv444v => "444v",
             Self::Yuv444f => "444f",
+            Self::X420 => "x420",
+            Self::Xf20 => "xf20",
             Self::Xf44 => "xf44",
         }
     }
@@ -390,7 +416,10 @@ impl ProbeFormat {
     /// also gets the frame-arrival check despite being a named
     /// enum variant.
     fn needs_frame_arrival_check(self) -> bool {
-        matches!(self, Self::Yuv444v | Self::Yuv444f | Self::Xf44)
+        matches!(
+            self,
+            Self::Yuv444v | Self::Yuv444f | Self::X420 | Self::Xf20 | Self::Xf44
+        )
     }
 
     fn apply(self, caps: &mut SckCaptureCapability, accepted: bool) {
@@ -400,6 +429,8 @@ impl ProbeFormat {
             Self::Yuv420f => caps.yuv420_full_range = accepted,
             Self::Yuv444v => caps.yuv444_8bit_video_range = accepted,
             Self::Yuv444f => caps.yuv444_8bit_full_range = accepted,
+            Self::X420 => caps.yuv420_10bit_video_range = accepted,
+            Self::Xf20 => caps.yuv420_10bit_full_range = accepted,
             Self::Xf44 => caps.yuv444_10bit_full_range = accepted,
         }
     }

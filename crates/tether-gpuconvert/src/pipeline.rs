@@ -78,13 +78,12 @@ pub(crate) fn build_pipeline(
     (pipeline, bgl)
 }
 
-/// Build the BGRA → YUV 4:4:4 planar compute pipeline + its bind-group
-/// layout. Mirror of [`build_pipeline`] for the 4:4:4 path: three R8
-/// storage targets (Y, U, V) at full resolution instead of NV12's R8 +
-/// Rg8 at half-chroma.
-///
-/// Same shape, same workgroup size, same dispatch math (dispatcher uses
-/// the luma plane dims directly because there is no chroma subsample).
+/// Build the BGRA → packed YUV 4:4:4 (DRM_FORMAT_XYUV8888 layout)
+/// compute pipeline. The output is a single Rgba8Unorm storage texture
+/// at full resolution; per-byte layout matches what ffmpeg's
+/// `vaapi_map_from_drm` recognises as VA_FOURCC_XYUV. See the comment
+/// at the top of `bgra_to_yuv444.wgsl` for why packed instead of
+/// planar.
 pub(crate) fn build_yuv444_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
@@ -92,17 +91,6 @@ pub(crate) fn build_yuv444_pipeline(
         label: Some("bgra_to_yuv444"),
         source: wgpu::ShaderSource::Wgsl(YUV444_SHADER_SRC.into()),
     });
-
-    let plane_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::StorageTexture {
-            access: wgpu::StorageTextureAccess::WriteOnly,
-            format: wgpu::TextureFormat::R8Unorm,
-            view_dimension: wgpu::TextureViewDimension::D2,
-        },
-        count: None,
-    };
 
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bgra_to_yuv444 bgl"),
@@ -117,9 +105,16 @@ pub(crate) fn build_yuv444_pipeline(
                 },
                 count: None,
             },
-            plane_entry(1),
-            plane_entry(2),
-            plane_entry(3),
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
         ],
     });
 

@@ -165,14 +165,17 @@ impl VaapiEncoder {
         encoder.set_max_b_frames(0);
 
         // Build + attach the hwframes context. The `sw_format` decides
-        // the on-device pixel layout: NV12 for 4:2:0 (interleaved UV at
-        // half resolution), YUV444P for 4:4:4 (three planar full-res
-        // planes). Intel/AMD VAAPI accept YUV444P only when the codec
-        // negotiates a Main444 profile (`rext` for HEVC); the encoder
-        // open below sets that profile string.
+        // the on-device pixel layout. NV12 for 4:2:0 (interleaved UV
+        // at half resolution). For 4:4:4 we use VUYX (packed
+        // X|Y|U|V 8:8:8:8, 32 bpp) rather than planar YUV444P — the
+        // packed layout is the only 4:4:4 8-bit format ffmpeg's
+        // `vaapi_drm_format_map` can import via DRM_PRIME on the
+        // gpuconvert→encoder hop (no entry exists for planar
+        // YUV444P or its R8/YU24 DRM encodings). VAAPI's encoder
+        // accepts VUYX-format surfaces as input to HEVC Main 4:4:4.
         let sw_format = match chroma {
             ChromaSubsampling::Yuv420 => ffi::AV_PIX_FMT_NV12,
-            ChromaSubsampling::Yuv444 => ffi::AV_PIX_FMT_YUV444P,
+            ChromaSubsampling::Yuv444 => ffi::AV_PIX_FMT_VUYX,
         };
         let mut hw_frames_ref = hw_device.hwframe_ctx_alloc();
         hw_frames_ref.data().format = ffi::AV_PIX_FMT_VAAPI;
@@ -301,7 +304,7 @@ impl VaapiEncoder {
 
         let scaler_label = match chroma {
             ChromaSubsampling::Yuv420 => "BGRA -> NV12",
-            ChromaSubsampling::Yuv444 => "BGRA -> YUV444P",
+            ChromaSubsampling::Yuv444 => "BGRA -> VUYX",
         };
         let bgra_to_encoder_input = SwsContext::get_context(
             width_i32,
@@ -386,10 +389,10 @@ impl VaapiEncoder {
     /// `encode_bgra`.
     ///
     /// Constraints: `frame.fourcc` must match the negotiated chroma
-    /// — `NV12` for 4:2:0 (the encoder's NV12 `sw_format`) or `YU24`
-    /// (DRM_FORMAT_YUV444) for HEVC Main444. Width/height are pinned
-    /// to the encoder's construction values; resolution changes go
-    /// through a full encoder rebuild.
+    /// — `NV12` for 4:2:0 (the encoder's NV12 `sw_format`) or `XYUV`
+    /// (DRM_FORMAT_XYUV8888 packed) for HEVC Main444. Width/height
+    /// are pinned to the encoder's construction values; resolution
+    /// changes go through a full encoder rebuild.
     ///
     /// Approach: reuse the encoder's existing VAAPI hwframes pool and
     /// let `vaapi_map_from_drm` add each imported surface into it
@@ -410,14 +413,15 @@ impl VaapiEncoder {
         // negotiated chroma — otherwise av_hwframe_map would fail
         // mid-pipeline with a much less actionable error.
         const NV12_FOURCC: u32 = u32::from_le_bytes(*b"NV12");
-        // YUV444P planar is exposed via DRM as three R8 planes; the
-        // aggregate fourcc on the layer side is `YU24` (yuv 4:4:4
-        // 8-bit, planar, Y/U/V plane order — matches V4L2_PIX_FMT_YUV444
-        // and what tether-gpuconvert's YUV444 export advertises).
-        const YU24_FOURCC: u32 = u32::from_le_bytes(*b"YU24");
+        // 4:4:4 path: DRM_FORMAT_XYUV8888 (`XYUV` in fourcc form;
+        // bytes V, U, Y, X in memory little-endian). This is the only
+        // 4:4:4 8-bit format ffmpeg's `vaapi_drm_format_map` recognises
+        // for DRM_PRIME import — planar YUV444P / YU24 / three-R8-layer
+        // shapes fail with "DRM format not supported by VAAPI".
+        const XYUV_FOURCC: u32 = u32::from_le_bytes(*b"XYUV");
         let expected_fourcc = match self.chroma {
             ChromaSubsampling::Yuv420 => NV12_FOURCC,
-            ChromaSubsampling::Yuv444 => YU24_FOURCC,
+            ChromaSubsampling::Yuv444 => XYUV_FOURCC,
         };
         if frame.fourcc != expected_fourcc {
             // Mismatch usually means a stale dma-buf bridge initialised

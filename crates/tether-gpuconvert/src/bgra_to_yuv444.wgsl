@@ -1,29 +1,27 @@
-// BGRA → YUV 4:4:4 planar (BT.709 limited-range) conversion.
+// BGRA → packed YUV 4:4:4 (DRM_FORMAT_XYUV8888 / AV_PIX_FMT_VUYX,
+// BT.709 limited-range).
 //
-// Each compute invocation processes one BGRA pixel and writes one Y, one
-// U, and one V sample. No chroma subsampling — U and V are full
-// resolution, matching what HEVC Main444 / `AV_PIX_FMT_YUV444P` expects
-// over the wire. This is the path that preserves text antialiasing and
-// saturated UI colour accents that 4:2:0 visibly smears.
+// Why packed (not planar): ffmpeg 8.x's `vaapi_drm_format_map` has no
+// entry for planar YUV444P over DRM_PRIME — `av_hwframe_map(DRM_PRIME
+// → VAAPI)` fails with "DRM format not supported by VAAPI" when fed a
+// three-R8-plane descriptor with the YU24 aggregate fourcc. The packed
+// XYUV8888 layout IS in the table and maps to VA_FOURCC_XYUV /
+// AV_PIX_FMT_VUYX, which Intel/AMD VAAPI encoders accept as input to
+// HEVC Main 4:4:4. One 32-bit-per-pixel plane in memory:
 //
-// Why three R8 storage targets (not one Rgba8 packed):
-//   - libavcodec's `AV_PIX_FMT_YUV444P` is strictly planar with separate
-//     stride per plane. Packing into a single image would require an
-//     additional CPU-side deinterleave the dma-buf path is designed to
-//     avoid.
-//   - VAAPI's DRM_PRIME importer accepts DRM_FORMAT_YUV444 as a
-//     three-plane layout (one DRM object with three offsets); this
-//     shader writes directly into that shape.
+//   DRM_FORMAT_XYUV8888 little-endian byte order: [V, U, Y, X]
+//   ↔ wgpu Rgba8Unorm channels with .r=V, .g=U, .b=Y, .a=X
 //
-// BT.709 limited-range — same matrix as `bgra_to_nv12.wgsl`. Keep the
-// constants in sync between the two shaders; the encoder VUI is shared,
-// so a divergence here would produce a colour shift visible only on
-// 4:4:4 sessions.
+// At ~2× the per-pixel bytes of NV12 the bandwidth cost is real
+// (~5.5 MB/frame at 1080p), but the encoder reads it once per frame
+// off LPDDR — nowhere near a bottleneck at 60 fps.
+//
+// BT.709 limited-range matrix kept in sync with the NV12 sibling
+// shader. Any divergence here would show up as a colour shift on
+// 4:4:4 sessions only — easy to miss in code review.
 
-@group(0) @binding(0) var src: texture_2d<f32>;          // Bgra8Unorm
-@group(0) @binding(1) var y_dst: texture_storage_2d<r8unorm, write>;
-@group(0) @binding(2) var u_dst: texture_storage_2d<r8unorm, write>;
-@group(0) @binding(3) var v_dst: texture_storage_2d<r8unorm, write>;
+@group(0) @binding(0) var src: texture_2d<f32>;             // Bgra8Unorm
+@group(0) @binding(1) var packed_dst: texture_storage_2d<rgba8unorm, write>;
 
 const Y_R: f32 = 0.2126;
 const Y_G: f32 = 0.7152;
@@ -55,19 +53,24 @@ fn rgb_to_v(rgb: vec3<f32>) -> f32 {
     return v * UV_SCALE + UV_OFFSET;
 }
 
-// 8x8 workgroup, one invocation per output pixel. No 2x2 collapse —
-// chroma is full-res in 4:4:4, so each invocation is one Y / one U /
-// one V sample.
+// 8x8 workgroup, one invocation per output pixel. No chroma collapse.
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(y_dst);
+    let dims = textureDimensions(packed_dst);
     if (gid.x >= dims.x || gid.y >= dims.y) {
         return;
     }
 
     let p = textureLoad(src, vec2<i32>(i32(gid.x), i32(gid.y)), 0).rgb;
-    let coord = vec2<i32>(i32(gid.x), i32(gid.y));
-    textureStore(y_dst, coord, vec4<f32>(rgb_to_y(p), 0.0, 0.0, 1.0));
-    textureStore(u_dst, coord, vec4<f32>(rgb_to_u(p), 0.0, 0.0, 1.0));
-    textureStore(v_dst, coord, vec4<f32>(rgb_to_v(p), 0.0, 0.0, 1.0));
+    let y = rgb_to_y(p);
+    let u = rgb_to_u(p);
+    let v = rgb_to_v(p);
+    // DRM_FORMAT_XYUV8888 byte 0 = V, byte 1 = U, byte 2 = Y, byte 3 = X.
+    // Rgba8Unorm channel-to-byte mapping is .r=byte0, .g=byte1, .b=byte2,
+    // .a=byte3. So we write (V, U, Y, 1.0) → memory becomes [V, U, Y, 0xFF].
+    textureStore(
+        packed_dst,
+        vec2<i32>(i32(gid.x), i32(gid.y)),
+        vec4<f32>(v, u, y, 1.0),
+    );
 }

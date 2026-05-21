@@ -31,20 +31,17 @@ use crate::{
 ///
 /// Field shape matches what `tether_codec::DmaBufFrame` needs for
 /// `av_hwframe_map(DRM_PRIME → VAAPI Main444)`: one DRM object, one
-/// layer (`YU24`) with three R8 planes pointing at `object_index=0` at
-/// per-plane offsets.
+/// layer (`DRM_FORMAT_XYUV8888`), one plane (packed 4 bytes/pixel,
+/// memory order V,U,Y,X — see shared_yuv444.rs for why packed not
+/// planar).
 pub struct Yuv444DmaBufFrame {
     pub width: u32,
     pub height: u32,
     pub fd: OwnedFd,
     pub size: u64,
     pub modifier: u64,
-    pub y_offset: u64,
-    pub y_stride: u64,
-    pub u_offset: u64,
-    pub u_stride: u64,
-    pub v_offset: u64,
-    pub v_stride: u64,
+    pub offset: u64,
+    pub stride: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,9 +90,7 @@ pub struct Yuv444DmaBuf {
     width: u32,
     height: u32,
     yuv: SharedYuv444Export,
-    y_view: wgpu::TextureView,
-    u_view: wgpu::TextureView,
-    v_view: wgpu::TextureView,
+    packed_view: wgpu::TextureView,
 }
 
 impl Yuv444DmaBuf {
@@ -138,9 +133,7 @@ impl Yuv444DmaBuf {
             wgpu::TextureUsages::STORAGE_BINDING,
         )?;
 
-        let y_view = yuv.y_texture.create_view(&Default::default());
-        let u_view = yuv.u_texture.create_view(&Default::default());
-        let v_view = yuv.v_texture.create_view(&Default::default());
+        let packed_view = yuv.packed_texture.create_view(&Default::default());
 
         Ok(Self {
             device,
@@ -150,9 +143,7 @@ impl Yuv444DmaBuf {
             width,
             height,
             yuv,
-            y_view,
-            u_view,
-            v_view,
+            packed_view,
         })
     }
 
@@ -270,15 +261,7 @@ impl Yuv444DmaBuf {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.y_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.u_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.v_view),
+                    resource: wgpu::BindingResource::TextureView(&self.packed_view),
                 },
             ],
         });
@@ -311,12 +294,8 @@ impl Yuv444DmaBuf {
             fd: self.yuv.fd.try_clone().map_err(Yuv444DmaBufError::DupFd)?,
             size: self.yuv.size,
             modifier: self.yuv.modifier,
-            y_offset: self.yuv.y_offset,
-            y_stride: self.yuv.y_pitch,
-            u_offset: self.yuv.u_offset,
-            u_stride: self.yuv.u_pitch,
-            v_offset: self.yuv.v_offset,
-            v_stride: self.yuv.v_pitch,
+            offset: self.yuv.offset,
+            stride: self.yuv.pitch,
         })
     }
 }
@@ -328,8 +307,8 @@ mod tests {
     /// Read one R8 plane back from the shared dma-buf by re-importing
     /// it at the given offset/stride, copying to a mappable buffer,
     /// and returning a tightly-packed `Vec<u8>`. Used by the round-trip
-    /// tests to verify Y / U / V independently.
-    fn read_plane(
+    /// tests to verify Y / U / V (extracted from the packed plane).
+    fn read_packed(
         bridge: &Yuv444DmaBuf,
         fd: OwnedFd,
         modifier: u64,
@@ -339,7 +318,7 @@ mod tests {
         height: u32,
     ) -> Vec<u8> {
         let import_desc = wgpu::hal::TextureDescriptor {
-            label: Some("plane reimport"),
+            label: Some("xyuv reimport"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -348,20 +327,20 @@ mod tests {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUses::COPY_SRC,
             memory_flags: wgpu::hal::MemoryFlags::empty(),
             view_formats: vec![],
         };
         // SAFETY: caller provides authoritative fd / modifier / stride / offset
-        // for a plane that was just exported by this bridge.
+        // for the packed plane just exported by this bridge.
         let hal_tex = unsafe {
             bridge
                 .device()
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .expect("vulkan backend")
                 .texture_from_dmabuf_fd(fd, &import_desc, modifier, stride, offset)
-                .expect("plane texture_from_dmabuf_fd")
+                .expect("packed texture_from_dmabuf_fd")
         };
         let import_tex = unsafe {
             bridge
@@ -369,7 +348,7 @@ mod tests {
                 .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
                     hal_tex,
                     &wgpu::TextureDescriptor {
-                        label: Some("plane reimport"),
+                        label: Some("xyuv reimport"),
                         size: wgpu::Extent3d {
                             width,
                             height,
@@ -378,16 +357,17 @@ mod tests {
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::R8Unorm,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         usage: wgpu::TextureUsages::COPY_SRC,
                         view_formats: &[],
                     },
                 )
         };
 
-        let padded_row = u64::from(width).div_ceil(256) * 256;
+        let bytes_per_row = width * 4;
+        let padded_row = u64::from(bytes_per_row).div_ceil(256) * 256;
         let readback = bridge.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("plane readback"),
+            label: Some("xyuv readback"),
             size: padded_row * u64::from(height),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -395,7 +375,7 @@ mod tests {
         let mut enc = bridge
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("plane readback enc"),
+                label: Some("xyuv readback enc"),
             });
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -427,28 +407,29 @@ mod tests {
         bridge
             .device()
             .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll plane readback");
+            .expect("poll packed readback");
         rx.recv().expect("cb").expect("map");
         let mapped = slice.get_mapped_range().expect("range");
 
-        let mut out = Vec::with_capacity((width * height) as usize);
+        let mut out = Vec::with_capacity((width * height * 4) as usize);
         for row in 0..height {
             let start = (u64::from(row) * padded_row) as usize;
-            out.extend_from_slice(&mapped[start..start + width as usize]);
+            out.extend_from_slice(&mapped[start..start + bytes_per_row as usize]);
         }
         out
     }
 
-    /// End-to-end without VAAPI: build the bridge, push a solid-colour
-    /// BGRA texture through it, re-import all three Y/U/V planes via
-    /// wgpu's `texture_from_dmabuf_fd`, read them back, assert the
-    /// bytes match what BT.709 limited-range gives. The Y/U/V triple
-    /// check catches binding-order bugs in the shader (e.g. Y and U
-    /// views swapped) that a Y-only check would miss — solid white
-    /// has Y=235 regardless of which plane it actually lands in.
+    /// End-to-end without VAAPI: build the bridge, push solid-colour
+    /// BGRA through it, re-import the packed XYUV plane, read it back,
+    /// and assert each per-pixel quad has the expected byte order
+    /// [V, U, Y, X] matching DRM_FORMAT_XYUV8888 + BT.709 limited
+    /// range. Catches both colour-math and channel-order regressions
+    /// — a shader that wrote (Y, U, V, 1.0) into RGBA would still get
+    /// the right Y for solid white but the U/V channels would land in
+    /// the wrong memory positions.
     #[test]
     #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
-    fn convert_solid_white_roundtrip_y() {
+    fn convert_solid_white_roundtrip_packed_xyuv() {
         let width = 64u32;
         let height = 32u32;
 
@@ -500,47 +481,21 @@ mod tests {
         );
 
         let out = bridge.convert(&src).expect("convert");
+        assert_eq!(out.offset, bridge.yuv.offset);
+        assert_eq!(out.stride, bridge.yuv.pitch);
 
-        // Pin the public-frame ↔ internal-export field correspondence
-        // so a future field-name swap in `convert()` is caught.
-        assert_eq!(out.y_offset, bridge.yuv.y_offset);
-        assert_eq!(out.y_stride, bridge.yuv.y_pitch);
-        assert_eq!(out.u_offset, bridge.yuv.u_offset);
-        assert_eq!(out.u_stride, bridge.yuv.u_pitch);
-        assert_eq!(out.v_offset, bridge.yuv.v_offset);
-        assert_eq!(out.v_stride, bridge.yuv.v_pitch);
-
-        let y_bytes = read_plane(
+        let packed = read_packed(
             &bridge,
-            out.fd.try_clone().expect("dup fd for Y"),
+            out.fd.try_clone().expect("dup fd"),
             out.modifier,
-            out.y_stride,
-            out.y_offset,
-            width,
-            height,
-        );
-        let u_bytes = read_plane(
-            &bridge,
-            out.fd.try_clone().expect("dup fd for U"),
-            out.modifier,
-            out.u_stride,
-            out.u_offset,
-            width,
-            height,
-        );
-        let v_bytes = read_plane(
-            &bridge,
-            out.fd.try_clone().expect("dup fd for V"),
-            out.modifier,
-            out.v_stride,
-            out.v_offset,
+            out.stride,
+            out.offset,
             width,
             height,
         );
 
-        // BT.709 limited-range for pure white (R=G=B=1):
-        //   Y = (1.0 * 219/255 + 16/255) * 255 = 235
-        //   U = V = (0 * 224/255 + 128/255) * 255 = 128 (neutral chroma)
+        // BT.709 limited-range for pure white: Y=235, U=V=128.
+        // DRM_FORMAT_XYUV8888 byte order: [V, U, Y, X].
         let assert_near = |label: &str, got: u8, expected: u8| {
             let diff = i32::from(got) - i32::from(expected);
             assert!(
@@ -553,48 +508,12 @@ mod tests {
             (width / 2, height / 2),
             (width - 1, height - 1),
         ] {
-            let idx = (y * width + x) as usize;
-            assert_near(&format!("Y[{x},{y}]"), y_bytes[idx], 235);
-            assert_near(&format!("U[{x},{y}]"), u_bytes[idx], 128);
-            assert_near(&format!("V[{x},{y}]"), v_bytes[idx], 128);
+            let idx = ((y * width + x) * 4) as usize;
+            assert_near(&format!("V[{x},{y}]"), packed[idx], 128);
+            assert_near(&format!("U[{x},{y}]"), packed[idx + 1], 128);
+            assert_near(&format!("Y[{x},{y}]"), packed[idx + 2], 235);
+            // X is don't-care under XYUV8888; shader writes 0xFF
+            // (the alpha channel) but a consumer must not rely on it.
         }
-    }
-
-    /// Plane offsets must monotonically increase and span their plane
-    /// sizes — no overlap, no negative gap. A regression here
-    /// (e.g. accidental Y/U/V swap in shared_yuv444.rs) would silently
-    /// corrupt every frame; pin the contract.
-    #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
-    fn plane_offsets_are_monotonic_and_span() {
-        let width = 64u32;
-        let height = 32u32;
-        let bridge = match pollster::block_on(Yuv444DmaBuf::new(width, height)) {
-            Ok(b) => b,
-            Err(Yuv444DmaBufError::NoAdapter | Yuv444DmaBufError::FeatureUnsupported) => {
-                eprintln!("SKIP: no wgpu adapter with DMA-BUF export feature");
-                return;
-            }
-            Err(e) => panic!("Yuv444DmaBuf::new: {e}"),
-        };
-        let yuv = &bridge.yuv;
-        let y_size = yuv.y_pitch * u64::from(height);
-        assert!(
-            yuv.u_offset >= yuv.y_offset + y_size,
-            "U offset {} does not span Y plane (Y offset {} + Y size {})",
-            yuv.u_offset, yuv.y_offset, y_size
-        );
-        let u_size = yuv.u_pitch * u64::from(height);
-        assert!(
-            yuv.v_offset >= yuv.u_offset + u_size,
-            "V offset {} does not span U plane (U offset {} + U size {})",
-            yuv.v_offset, yuv.u_offset, u_size
-        );
-        let v_size = yuv.v_pitch * u64::from(height);
-        assert!(
-            yuv.v_offset + v_size <= yuv.size,
-            "V plane (offset {} size {}) overruns allocation size {}",
-            yuv.v_offset, v_size, yuv.size
-        );
     }
 }

@@ -935,38 +935,39 @@ fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
     }
 }
 
-/// Build a `DmaBufFrame` for the YUV 4:4:4 path: one DRM object,
-/// **one** layer with the `YU24` (DRM_FORMAT_YUV444) fourcc and three
-/// R8 planes pointing at `object_index=0` at per-plane offsets.
+/// Build a `DmaBufFrame` for the YUV 4:4:4 path: one DRM object, one
+/// `XYUV` (DRM_FORMAT_XYUV8888) layer, one packed plane (32 bpp).
 ///
-/// This single-layer/three-plane shape (rather than three separate
-/// single-plane layers) matches the
-/// `vaSurfaceAttribDRMFormatModifierList` import contract for VAAPI
-/// Main444 — the encoder's `submit_dmabuf` check expects the layer
-/// fourcc to equal `YU24`.
+/// Why packed (not planar): ffmpeg 8.x's `vaapi_drm_format_map` has
+/// no entry for DRM_FORMAT_YUV444 / planar YUV444P / three-R8-layer
+/// shapes — `av_hwframe_map(DRM_PRIME → VAAPI)` rejects them all
+/// with "DRM format not supported by VAAPI". DRM_FORMAT_XYUV8888 IS
+/// in the table (maps to VA_FOURCC_XYUV / AV_PIX_FMT_VUYX) and is
+/// accepted as input to HEVC Main 4:4:4 encode. See
+/// `crates/tether-gpuconvert/src/dmabuf_export/shared_yuv444.rs`.
 #[cfg(target_os = "linux")]
 fn yuv444_dmabuf_to_codec_frame(out: Yuv444DmaBufFrame) -> DmaBufFrame {
     DmaBufFrame {
-        fourcc: u32::from_le_bytes(*b"YU24"),
+        fourcc: u32::from_le_bytes(*b"XYUV"),
         objects: vec![DmaBufObject {
             fd: out.fd,
             size: out.size,
             drm_format_modifier: out.modifier,
         }],
         layers: vec![DmaBufLayer {
-            drm_format: u32::from_le_bytes(*b"YU24"),
-            num_planes: 3,
+            drm_format: u32::from_le_bytes(*b"XYUV"),
+            num_planes: 1,
             object_index: [0, 0, 0, 0],
             offset: [
-                u32::try_from(out.y_offset).expect("Y plane offset fits in u32"),
-                u32::try_from(out.u_offset).expect("U plane offset fits in u32"),
-                u32::try_from(out.v_offset).expect("V plane offset fits in u32"),
+                u32::try_from(out.offset).expect("plane offset fits in u32"),
+                0,
+                0,
                 0,
             ],
             pitch: [
-                u32::try_from(out.y_stride).expect("Y plane stride fits in u32"),
-                u32::try_from(out.u_stride).expect("U plane stride fits in u32"),
-                u32::try_from(out.v_stride).expect("V plane stride fits in u32"),
+                u32::try_from(out.stride).expect("plane stride fits in u32"),
+                0,
+                0,
                 0,
             ],
         }],

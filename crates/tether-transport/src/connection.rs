@@ -133,13 +133,10 @@ impl Connection {
     /// latency.
     pub async fn send_video_keyframe(&self, packet: &VideoPacket) -> Result<()> {
         let bytes = tether_protocol::encode(packet)?;
-        if bytes.len() > MAX_VIDEO_STREAM_MESSAGE {
-            return Err(TransportError::FrameTooLarge {
-                size: bytes.len(),
-                max: MAX_VIDEO_STREAM_MESSAGE,
-            });
-        }
         let mut s = self.conn.open_uni().await?;
+        // Size check is owned by write_framed_with_max — the
+        // FrameTooLarge error attributes correctly without an
+        // outer guard.
         write_framed_with_max(&mut s, &bytes, MAX_VIDEO_STREAM_MESSAGE).await?;
         // Finish signals EOF to the receiver, which is what the
         // accept_video_keyframe loop uses to delimit the message.

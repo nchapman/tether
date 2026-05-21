@@ -1,8 +1,13 @@
-//! Tether client — connects to a host, reassembles incoming video frames,
-//! and presents them in a wgpu window.
+//! Tether client — connects to a host, reassembles incoming video
+//! frames, decodes them (HEVC/H.264 via VAAPI when available), and
+//! presents them in a wgpu window.
 //!
-//! v0 walking skeleton: raw BGRA frames over QUIC datagrams, no codec,
-//! no jitter buffer beyond the single-frame-deep render channel.
+//! Recv loop runs on a tokio task and races `recv_datagram` (P-frames,
+//! cursor) against `accept_video_keyframe` (reliable per-IDR uni
+//! streams). Decode runs on a dedicated `std::thread` (`tether-decode`)
+//! so a GPU-driver stall in libavcodec → libva can't starve the QUIC
+//! recv loop. Render is one-deep so a slow renderer drops frames
+//! rather than back-pressuring upstream.
 //!
 //! Usage: `tether-client <host_addr> <cert_fingerprint_hex>`.
 
@@ -10,8 +15,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossbeam_channel::bounded;
-use tether_codec::{probe_decoder, Decoder, Frame as CodecFrame};
+use crossbeam_channel::{bounded, Receiver as XbReceiver, Sender as XbSender};
+use tether_codec::{probe_decoder, Frame as CodecFrame};
 use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{
@@ -20,7 +25,7 @@ use tether_protocol::control::{
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::{Frame, RenderEvent};
-use tether_transport::{Client, Datagram};
+use tether_transport::{Client, Connection, Datagram};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -217,23 +222,45 @@ async fn main() -> anyhow::Result<()> {
     let recv_clock_sync = clock_sync;
     let chosen_codec = server_body.chosen_codec;
     let conn_ready = conn.clone();
+
+    // Decode runs on a dedicated std::thread so a GPU-driver stall
+    // (vaSyncSurface, vaExportSurfaceHandle, etc.) inside the
+    // libavcodec → libva path can't starve the QUIC recv loop's
+    // tokio task. The recv loop hands ReassembledFrames over a
+    // bounded crossbeam channel; if the decoder falls behind, the
+    // recv loop drops frames at the channel rather than blocking on
+    // the await.
+    let (decode_job_tx, decode_job_rx) = bounded::<DecodeJob>(8);
+    let (decode_completion_tx, decode_completion_rx) =
+        crossbeam_channel::unbounded::<DecodeCompletion>();
+    // Oneshot from the decode thread back to the recv task: lets the
+    // recv loop wait for decoder construction before announcing
+    // StreamReady to the host. If the decoder fails to build, the
+    // sender drops and `await` returns Err.
+    let (decoder_ready_tx, decoder_ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let runtime_handle = tokio::runtime::Handle::current();
+    let conn_for_decode = conn.clone();
+    let frame_tx_for_decode = frame_tx.clone();
+    std::thread::Builder::new()
+        .name("tether-decode".into())
+        .spawn(move || {
+            run_decode_thread(
+                chosen_codec,
+                decode_job_rx,
+                decode_completion_tx,
+                frame_tx_for_decode,
+                runtime_handle,
+                conn_for_decode,
+                decoder_ready_tx,
+            )
+        })?;
+
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
-        let mut decoder: Box<dyn Decoder> = match probe_decoder(chosen_codec) {
-            Ok(d) => {
-                info!(
-                    backend = d.name(),
-                    hardware = d.is_hardware(),
-                    codec = ?chosen_codec,
-                    "decoder initialised"
-                );
-                d
-            }
-            Err(e) => {
-                warn!(error = %e, codec = ?chosen_codec, "decoder init failed; aborting recv loop");
-                return;
-            }
-        };
+        if decoder_ready_rx.await.is_err() {
+            warn!("decode thread failed to initialise; aborting recv loop");
+            return;
+        }
         // Decoder is up; tell the host to start streaming. `audio: false`
         // because the Opus pipeline isn't wired yet (the wire-shape lands
         // in tether-protocol/audio.rs).
@@ -288,13 +315,17 @@ async fn main() -> anyhow::Result<()> {
         // keyframes on the host is *our* fault, not the encoder
         // misbehaving.
         let mut idr_requests: u32 = 0;
+        // Frames the recv loop reassembled but couldn't enqueue for
+        // decode because the bounded channel was full. Non-zero means
+        // the decoder is falling behind the network — a strong signal
+        // to drop quality or alert the user.
+        let mut decode_queue_drops: u32 = 0;
+        // Decode completions folded into the current stats window.
+        // Used as the divisor for avg_decode_ms so the metric stays
+        // honest when frame_count (recv-side) and completions drift
+        // under backpressure.
+        let mut decode_completion_count: u64 = 0;
         let mut last_log = Instant::now();
-        // Rate-limit ForceIdr requests so a corrupt stream doesn't
-        // turn into a keyframe storm. 500ms matches the human "is this
-        // still broken?" cadence; anything tighter just wastes
-        // bitrate on duplicate IDRs that haven't even been encoded yet.
-        let mut last_idr_request: Option<Instant> = None;
-        const IDR_RATE_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
 
         loop {
             // Race the unreliable datagram path (P-frames, cursor) against
@@ -303,8 +334,12 @@ async fn main() -> anyhow::Result<()> {
             // and the more frequent one; the keyframe stream is woken up
             // only when an IDR is in flight. Both produce a `VideoPacket`
             // that feeds the same reassembler.
+            // Fair select (no `biased`): on a high-fps stream the
+            // datagram future is almost always ready, and biasing it
+            // would let an IDR stream sit unaccepted for several
+            // iterations during a P-frame torrent — exactly the
+            // scenario where prompt IDR delivery is load-bearing.
             let packet: VideoPacket = tokio::select! {
-                biased;
                 d = conn_recv.recv_datagram() => {
                     match d {
                         Ok(Datagram::Video(p)) => p,
@@ -365,125 +400,33 @@ async fn main() -> anyhow::Result<()> {
             network_latency_sum_ns = network_latency_sum_ns.saturating_add(network_ns);
             bytes_received = bytes_received.saturating_add(frame.body.len() as u64);
 
-            let t_decode_start = MonoNanos::now();
-            // submit + drain. The trait swallows ffmpeg's
-            // drain/flushed sentinels and returns them as
-            // `Ok(None)`, so any `Err` we see here is a real
-            // decode failure — never a benign "need more input".
-            //
-            // Some failure modes (HEVC RPS reconstruction —
-            // "Could not find ref with POC N") don't surface
-            // through the API at all: libavcodec internally
-            // logs the error and skips the undecodable NALU,
-            // returning Ok. We bracket the call with a
-            // snapshot of the process-wide `av_log` warning
-            // counter so we can treat "libavcodec was unhappy
-            // during this packet" as a soft decode failure
-            // worth a ForceIdr, even when `decoder.submit` /
-            // `next_frame` reported Ok.
-            let avlog_before = tether_codec::av_log::warning_or_above_count();
-            let mut decoded: Vec<CodecFrame> = Vec::new();
-            let mut decode_err: Option<tether_codec::CodecError> =
-                decoder.submit(&frame.body).err();
-            if decode_err.is_none() {
-                loop {
-                    match decoder.next_frame() {
-                        Ok(Some(f)) => decoded.push(f),
-                        Ok(None) => break,
-                        Err(e) => {
-                            decode_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-            }
-            let avlog_warnings = tether_codec::av_log::warning_or_above_count()
-                .saturating_sub(avlog_before);
-            let t_decode_done = MonoNanos::now();
-            decode_latency_sum_ns = decode_latency_sum_ns
-                .saturating_add(t_decode_done.saturating_sub(t_decode_start));
-
-            // Render any frames we *did* successfully decode
-            // before reporting the error. With async_depth=0
-            // and no B-frames this is almost always 0 or 1
-            // frames; the loop is here so a mid-drain failure
-            // doesn't silently throw away good output.
-            for dec in decoded {
-                let raw = match dec {
-                    CodecFrame::Cpu(c) => Frame::Cpu(CpuFrame {
-                        width: c.width,
-                        height: c.height,
-                        y: c.y,
-                        uv: c.uv,
-                        t_capture_client_clock: Some(host_in_client_clock),
-                    }),
-                    CodecFrame::Gpu(g) => {
-                        let (w, h, _pts, source, guard) = g.into_parts();
-                        Frame::Gpu(RenderGpuFrame {
-                            width: w,
-                            height: h,
-                            t_capture_client_clock: Some(host_in_client_clock),
-                            source,
-                            guard,
-                        })
-                    }
-                };
-                // Drop on full — render is intentionally one-deep.
-                if frame_tx.try_send(raw).is_err() {
-                    render_drops = render_drops.saturating_add(1);
-                }
+            // Hand the reassembled frame to the decode thread.
+            // Bounded channel + try_send means a stalled decoder
+            // doesn't block the recv loop — we drop the frame and
+            // count the loss so the stats line surfaces it.
+            let job = DecodeJob {
+                body: frame.body,
+                host_in_client_clock,
+            };
+            if decode_job_tx.try_send(job).is_err() {
+                decode_queue_drops = decode_queue_drops.saturating_add(1);
             }
 
-            // Two distinct failure shapes ride the same recovery
-            // path. (1) Hard failure: `decoder.submit` or
-            // `next_frame` returned an Err (rare; almost always
-            // a truly corrupt slice). (2) Soft failure:
-            // libavcodec internally logged at warning or above
-            // during this packet — the common case for
-            // "P-frame references a fragment we dropped on the
-            // wire," which the HEVC decoder skips silently
-            // until the next IDR. Either way, the only recovery
-            // is a fresh IDR. We count the soft path under the
-            // same `decode_errs` metric (it was previously
-            // lying as zero) and reuse the rate-limited
-            // ForceIdr request below.
-            let soft_failure = decode_err.is_none() && avlog_warnings > 0;
-            if let Some(e) = decode_err.as_ref() {
-                warn!(error = %e, "decode failed; dropping packet");
-            } else if soft_failure {
-                // Don't emit per-packet — the av_log bridge
-                // already routed the underlying libavcodec
-                // message into tracing. A trace-level here keeps
-                // the metric attributable without doubling up.
-                tracing::trace!(
-                    avlog_warnings,
-                    "libavcodec warned during decode; treating as soft failure"
-                );
-            }
-            if decode_err.is_some() || soft_failure {
-                decode_errors = decode_errors.saturating_add(1);
-                // Asking the host for a fresh IDR is the only
-                // way out — without it we stay garbled until
-                // the next periodic IDR (up to one GOP).
-                let now = Instant::now();
-                if last_idr_request.is_none_or(|t| now.duration_since(t) > IDR_RATE_LIMIT) {
-                    let conn = conn_recv.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
-                            warn!(error = ?e, "ForceIdr send failed");
-                        }
-                    });
-                    last_idr_request = Some(now);
+            // Drain decode completions that arrived since the last
+            // iteration. Non-blocking — if the decoder hasn't
+            // produced anything yet, we'll pick it up next time
+            // round. Folds per-frame metrics into the stats window
+            // the recv loop owns.
+            while let Ok(c) = decode_completion_rx.try_recv() {
+                decode_completion_count = decode_completion_count.saturating_add(1);
+                decode_latency_sum_ns =
+                    decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
+                if c.decode_err || c.soft_failure {
+                    decode_errors = decode_errors.saturating_add(1);
+                }
+                render_drops = render_drops.saturating_add(c.render_drops);
+                if c.idr_request_fired {
                     idr_requests = idr_requests.saturating_add(1);
-                }
-                if decode_err.is_some() {
-                    // Decoded frames (if any landed before the
-                    // mid-drain Err) were already rendered
-                    // above; `continue` here just skips the
-                    // per-window stats block for this iteration
-                    // so a packet that errored isn't counted
-                    // toward the network-latency average.
-                    continue;
                 }
             }
 
@@ -529,9 +472,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
 
-                #[allow(clippy::cast_precision_loss)] // u64 frame_count well under 2^53
-                let avg_decode_ms = if frame_count > 0 {
-                    (decode_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
+                // Divide by completions, not recv-side frame_count:
+                // under backpressure they diverge (frame_count grows,
+                // completions lag). Dividing by frame_count would
+                // understate decode time exactly when it matters.
+                #[allow(clippy::cast_precision_loss)] // u64 well under 2^53
+                let avg_decode_ms = if decode_completion_count > 0 {
+                    (decode_latency_sum_ns as f64 / decode_completion_count as f64) / 1_000_000.0
                 } else {
                     0.0
                 };
@@ -562,6 +509,7 @@ async fn main() -> anyhow::Result<()> {
                     decode_errs = decode_errors,
                     render_drops = render_drops,
                     idr_reqs = idr_requests,
+                    decode_queue_drops,
                     "frame stats"
                 );
                 frame_count = 0;
@@ -572,7 +520,9 @@ async fn main() -> anyhow::Result<()> {
                 decode_errors = 0;
                 render_drops = 0;
                 idr_requests = 0;
-        last_log = Instant::now();
+                decode_queue_drops = 0;
+                decode_completion_count = 0;
+                last_log = Instant::now();
             }
         }
     });
@@ -693,6 +643,201 @@ async fn say_goodbye(conn: &tether_transport::Connection, reason: &str) {
     conn.close(0, reason.as_bytes());
 }
 
+
+/// One frame's worth of work handed from the recv (tokio) task to the
+/// decode (std::thread) worker. Keeping `host_in_client_clock` here
+/// (already translated through clock_sync on the recv side) lets the
+/// decode thread stamp each rendered frame without having to know
+/// anything about the clock-sync handshake.
+struct DecodeJob {
+    body: Vec<u8>,
+    host_in_client_clock: MonoNanos,
+}
+
+/// Per-frame metrics shipped back from the decode thread to the recv
+/// loop, which owns the per-second stats log. `idr_request_fired`
+/// reflects whether the decode thread *actually* sent a ForceIdr
+/// (post rate-limit), not just whether it wanted to.
+struct DecodeCompletion {
+    decode_duration_ns: u64,
+    decode_err: bool,
+    soft_failure: bool,
+    render_drops: u32,
+    idr_request_fired: bool,
+}
+
+/// Dedicated decoder thread. Owns the libavcodec/VAAPI decoder and
+/// the auto-IDR rate-limit state. Runs on a `std::thread` (not a
+/// tokio worker) so that a GPU-driver stall — `vaSyncSurface`,
+/// `vaExportSurfaceHandle`, decoder bind operations — can't starve
+/// the recv loop's QUIC datagram polling.
+///
+/// `runtime` is used to spawn the `ControlMessage::ForceIdr` send
+/// back onto the tokio runtime. We hold a Handle (not a runtime
+/// reference) because this thread is not itself a tokio worker.
+#[allow(clippy::too_many_arguments)]
+fn run_decode_thread(
+    chosen_codec: tether_protocol::control::CodecKind,
+    job_rx: XbReceiver<DecodeJob>,
+    completion_tx: XbSender<DecodeCompletion>,
+    frame_tx: XbSender<Frame>,
+    runtime: tokio::runtime::Handle,
+    conn: Arc<Connection>,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut decoder: Box<dyn tether_codec::Decoder> = match probe_decoder(chosen_codec) {
+        Ok(d) => {
+            info!(
+                backend = d.name(),
+                hardware = d.is_hardware(),
+                codec = ?chosen_codec,
+                "decoder initialised"
+            );
+            d
+        }
+        Err(e) => {
+            error!(error = %e, codec = ?chosen_codec, "decoder init failed; aborting decode thread");
+            // Dropping ready_tx without sending signals the recv task
+            // that decoder construction failed; it tears the session
+            // down rather than streaming into a sink-hole.
+            drop(ready_tx);
+            return;
+        }
+    };
+    let _ = ready_tx.send(());
+
+    // Rate-limit ForceIdr requests so a corrupt stream doesn't turn
+    // into a keyframe storm. 500ms matches the human "is this still
+    // broken?" cadence; anything tighter just wastes bitrate on
+    // duplicate IDRs that haven't even been encoded yet.
+    let mut last_idr_request: Option<Instant> = None;
+    const IDR_RATE_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+    // Shutdown contract: the recv task drops `decode_job_tx` when its
+    // `tokio::spawn` future returns. That causes `job_rx.recv()` to
+    // return Err and this loop to exit cleanly. The ctrl-c path uses
+    // `std::process::exit` and bypasses this entirely; that's fine
+    // because we own no state needing flush. If a future code path
+    // adds graceful shutdown we'd want a poison-pill signal here.
+    while let Ok(job) = job_rx.recv() {
+        let t_decode_start = MonoNanos::now();
+        // submit + drain. The trait swallows ffmpeg's drain/flushed
+        // sentinels and returns them as `Ok(None)`, so any `Err` we
+        // see here is a real decode failure — never a benign "need
+        // more input".
+        //
+        // Some failure modes (HEVC RPS reconstruction — "Could not
+        // find ref with POC N") don't surface through the API at
+        // all: libavcodec internally logs the error and skips the
+        // undecodable NALU, returning Ok. We bracket the call with
+        // a snapshot of the process-wide `av_log` warning counter
+        // so we can treat "libavcodec was unhappy during this
+        // packet" as a soft decode failure worth a ForceIdr, even
+        // when `decoder.submit` / `next_frame` reported Ok.
+        let avlog_before = tether_codec::av_log::warning_or_above_count();
+        let mut decoded: Vec<CodecFrame> = Vec::new();
+        let mut decode_err: Option<tether_codec::CodecError> = decoder.submit(&job.body).err();
+        if decode_err.is_none() {
+            loop {
+                match decoder.next_frame() {
+                    Ok(Some(f)) => decoded.push(f),
+                    Ok(None) => break,
+                    Err(e) => {
+                        decode_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+        let avlog_warnings =
+            tether_codec::av_log::warning_or_above_count().saturating_sub(avlog_before);
+        let decode_duration_ns = MonoNanos::now().saturating_sub(t_decode_start);
+
+        // Render any frames we *did* successfully decode before
+        // reporting the error. With async_depth=0 and no B-frames
+        // this is almost always 0 or 1 frames; the loop is here so
+        // a mid-drain failure doesn't silently throw away good
+        // output.
+        let mut render_drops: u32 = 0;
+        for dec in decoded {
+            let raw = match dec {
+                CodecFrame::Cpu(c) => Frame::Cpu(CpuFrame {
+                    width: c.width,
+                    height: c.height,
+                    y: c.y,
+                    uv: c.uv,
+                    t_capture_client_clock: Some(job.host_in_client_clock),
+                }),
+                CodecFrame::Gpu(g) => {
+                    let (w, h, _pts, source, guard) = g.into_parts();
+                    Frame::Gpu(RenderGpuFrame {
+                        width: w,
+                        height: h,
+                        t_capture_client_clock: Some(job.host_in_client_clock),
+                        source,
+                        guard,
+                    })
+                }
+            };
+            if frame_tx.try_send(raw).is_err() {
+                render_drops = render_drops.saturating_add(1);
+            }
+        }
+
+        // Two distinct failure shapes share the same recovery path.
+        // (1) Hard failure: `decoder.submit` or `next_frame`
+        //     returned an Err (rare; almost always a truly corrupt
+        //     slice). (2) Soft failure: libavcodec internally logged
+        //     at warning or above during this packet — the common
+        //     case for "P-frame references a fragment we dropped on
+        //     the wire," which the HEVC decoder skips silently until
+        //     the next IDR. Either way, the only recovery is a fresh
+        //     IDR.
+        let soft_failure = decode_err.is_none() && avlog_warnings > 0;
+        if let Some(e) = decode_err.as_ref() {
+            warn!(error = %e, "decode failed; dropping packet");
+        } else if soft_failure {
+            // Don't emit per-packet — the av_log bridge already
+            // routed the underlying libavcodec message into tracing.
+            // A trace-level here keeps the metric attributable
+            // without doubling up.
+            tracing::trace!(
+                avlog_warnings,
+                "libavcodec warned during decode; treating as soft failure"
+            );
+        }
+        let mut idr_request_fired = false;
+        if decode_err.is_some() || soft_failure {
+            let now = Instant::now();
+            if last_idr_request.is_none_or(|t| now.duration_since(t) > IDR_RATE_LIMIT) {
+                let conn = conn.clone();
+                // spawn onto the tokio runtime — we're a std::thread
+                // and can't await directly. The ForceIdr send is
+                // fire-and-forget; a failure here is logged but not
+                // retried (the next decode error will re-trigger
+                // after the rate-limit window expires).
+                runtime.spawn(async move {
+                    if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
+                        warn!(error = ?e, "ForceIdr send failed");
+                    }
+                });
+                last_idr_request = Some(now);
+                idr_request_fired = true;
+            }
+        }
+
+        // Send completion. If the recv loop has exited, the receiver
+        // is dropped — that's expected at session end; ignore.
+        let _ = completion_tx.send(DecodeCompletion {
+            decode_duration_ns,
+            decode_err: decode_err.is_some(),
+            soft_failure,
+            render_drops,
+            idr_request_fired,
+        });
+    }
+    info!("decode thread exiting");
+}
 
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

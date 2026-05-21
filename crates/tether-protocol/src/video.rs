@@ -500,7 +500,10 @@ impl FrameReassembler {
         let max_age = self.max_age;
         let max_pending_age = self.max_pending_age;
         let now = Instant::now();
-        let latest = self.latest_seq.clone();
+        // Disjoint borrow: `pending` (mut) and `latest_seq` (shared)
+        // are distinct fields; bind locally to make this explicit so
+        // we don't have to clone the map on every fragment.
+        let latest = &self.latest_seq;
         let before = self.pending.len();
         self.pending.retain(|(d, e, seq), pending| {
             // Wall-clock first: a frame that's been incomplete for

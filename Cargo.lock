@@ -3348,6 +3348,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "pollster",
  "tether-codec",
+ "tether-gpuconvert",
  "tether-protocol",
  "thiserror 2.0.18",
  "tracing",

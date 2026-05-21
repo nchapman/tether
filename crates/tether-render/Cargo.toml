@@ -54,5 +54,15 @@ objc2-io-surface = { version = "0.3.2", default-features = false, features = ["s
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Linux-only test dep: the dmabuf renderer round-trip test for HEVC
+# Main10 needs the production gpuconvert P010 bridge to produce a
+# real 10-bit dma-buf the VAAPI encoder consumes via submit_dmabuf.
+# Mirrors the macOS iosurface_test.rs pattern (which uses VT directly
+# because VT takes BGRA IOSurfaces natively — no separate gpuconvert
+# layer on macOS). Dev-only, doesn't pollute the production crate
+# dependency graph.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tether-gpuconvert = { workspace = true }
+
 [lints]
 workspace = true

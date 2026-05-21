@@ -104,6 +104,32 @@ async fn main() -> anyhow::Result<()> {
         warm_sck_capture_capability_cache().await;
     }
 
+    // Warm the codec-probe cache for the same reason. The probe builds
+    // each `VideoProfile` in `PROFILE_PREFERENCE` through a real VT (or
+    // VAAPI) encoder, runs a frame through, decodes it back, and checks
+    // the result — five profiles × (encoder + decoder + round-trip) is
+    // tens to hundreds of milliseconds the *first* time it runs. The
+    // result is `OnceLock`-cached for process lifetime, so subsequent
+    // reads are free.
+    //
+    // Without this warm-up, the first client's handshake straddles the
+    // probe and the application-layer clock-sync's t1/t2 stamps bracket
+    // it. The offset formula `((t1 - t0) + (t2 - t3)) / 2` assumes
+    // symmetric one-way latency; any work between t1 and t2 biases the
+    // offset by half that work's duration. Half of "all five codec
+    // probes" is non-trivial. RTT is unaffected (the formula
+    // explicitly subtracts t2 - t1), but per-frame `latency_ms` would
+    // pick up the bias from the offset alone.
+    //
+    // The probe is sync today (uses `Encoder::new` / `Decoder::new`,
+    // which are blocking FFmpeg constructions). `spawn_blocking` keeps
+    // the runtime healthy while the probe runs.
+    tokio::task::spawn_blocking(|| {
+        let _ = tether_codec::probe::supported_profiles();
+    })
+    .await
+    .ok();
+
     let conn = match server.accept().await {
         Some(Ok(c)) => Arc::new(c),
         Some(Err(e)) => return Err(e.into()),

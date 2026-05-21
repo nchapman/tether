@@ -194,6 +194,22 @@ impl Connection {
     /// returned ServerHello body immediately before sending the response.
     /// Returns the parsed `ClientHello` so the caller can also inspect
     /// what it agreed to.
+    ///
+    /// **Performance contract for `build`**: the closure runs between
+    /// `t1_server_recv` and `t2_server_send`, both of which the
+    /// `ClockSync::from_probe` estimator uses. The RTT half of that
+    /// formula explicitly subtracts `t2 - t1` and is unaffected by
+    /// the closure's wall-clock duration. The *offset* half is the
+    /// standard NTP-style estimator `((t1 - t0) + (t2 - t3)) / 2`,
+    /// which assumes symmetric one-way latency — and any work the
+    /// closure does biases the resulting offset by exactly half its
+    /// duration. A 100 ms closure produces a 50 ms phantom in every
+    /// subsequent `host_send_time + offset` computation for that
+    /// session.
+    ///
+    /// Keep `build` fast (sub-millisecond). Cache anything expensive
+    /// — codec probes, capture-format probes, GPU adapter queries —
+    /// at process startup before calling `host_handshake`.
     pub async fn host_handshake<F>(&self, build: F) -> Result<ClientHello>
     where
         F: FnOnce(&ClientHello) -> ServerHello,

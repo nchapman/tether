@@ -107,6 +107,47 @@ pub(crate) struct GpuState {
     metal_import_supported: bool,
 }
 
+/// Renderer plane layout — decoupled from `ChromaSubsampling` because
+/// the same chroma can arrive in different GPU shapes depending on
+/// backend:
+///
+/// - **Biplanar** = NV12 / NV24-style: Y in an R8 texture plus
+///   interleaved UV in an Rg8 texture. Plane resolutions differ
+///   between 4:2:0 (half-res UV) and 4:4:4 (full-res UV), but the
+///   bind-group layout and fragment shader are identical — bilinear
+///   sampling reads the right value at either resolution. Used by
+///   the macOS IOSurface import path for both Yuv420 (`'420v'`) and
+///   Yuv444 (`'444v'`), and by the Linux dma-buf path for Yuv420.
+/// - **PackedXYUV** = one Rgba8 texture with byte order V/U/Y/X.
+///   Only the Linux dma-buf path for Yuv444 — VAAPI's 4:4:4 surfaces
+///   are exposed this way and the shader pulls Y from `.z`, U from
+///   `.y`, V from `.x`.
+///
+/// Adding a new `(chroma, backend)` combo means returning the right
+/// variant from [`render_layout_for`] and (if it's a third shape)
+/// wiring a new fragment shader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderLayout {
+    Biplanar,
+    PackedXYUV,
+}
+
+fn render_layout_for(chroma: ChromaSubsampling) -> RenderLayout {
+    match chroma {
+        ChromaSubsampling::Yuv420 => RenderLayout::Biplanar,
+        // macOS gives us biplanar NV24 IOSurfaces for HEVC 4:4:4 via
+        // VideoToolbox; Linux gives us packed XYUV via VAAPI. The
+        // negotiated chroma is the same; the GPU-side shape is not.
+        ChromaSubsampling::Yuv444 => {
+            if cfg!(target_os = "macos") {
+                RenderLayout::Biplanar
+            } else {
+                RenderLayout::PackedXYUV
+            }
+        }
+    }
+}
+
 /// Numeric tag for the WGSL fragment shader's EOTF dispatch. Keep in
 /// sync with the `bt709_eotf` / `srgb_eotf` switch in `shader.wgsl`.
 /// Encoding it as a single integer (rather than separate uniforms or
@@ -281,15 +322,15 @@ impl GpuState {
             ..Default::default()
         });
 
-        // Bind-group layout depends on chroma: NV12 has Y + UV (two
-        // textures + sampler at binding 2); YUV444 has Y + U + V
-        // (three textures + sampler at binding 3). Distinct layouts
-        // pair with distinct fragment entry points compiled into
-        // separate pipelines below.
-        let yuv_bgl = match chroma {
-            ChromaSubsampling::Yuv420 => {
+        // Bind-group layout depends on the renderer's plane shape, not
+        // directly on chroma — see `RenderLayout` for why. Biplanar
+        // (NV12 / NV24) has Y + UV textures + sampler at binding 2;
+        // PackedXYUV has one Rgba8 texture + sampler at binding 1.
+        let layout = render_layout_for(chroma);
+        let yuv_bgl = match layout {
+            RenderLayout::Biplanar => {
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("tether-render yuv bgl (nv12)"),
+                    label: Some("tether-render yuv bgl (biplanar)"),
                     entries: &[
                         bgl_texture_entry(0),
                         bgl_texture_entry(1),
@@ -304,7 +345,7 @@ impl GpuState {
                     ],
                 })
             }
-            ChromaSubsampling::Yuv444 => {
+            RenderLayout::PackedXYUV => {
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("tether-render yuv bgl (444 packed)"),
                     entries: &[
@@ -401,14 +442,19 @@ impl GpuState {
             }],
         });
 
-        let shader_src = match chroma {
-            ChromaSubsampling::Yuv420 => include_str!("../shader.wgsl"),
-            ChromaSubsampling::Yuv444 => include_str!("../shader_yuv444.wgsl"),
+        // Shader matches the bind-group layout. Biplanar uses the
+        // chroma-resolution-agnostic Y+UV NV12 shader (works for NV12
+        // and NV24 alike — bilinear sampling is the same math at any
+        // UV resolution). PackedXYUV uses a separate shader that pulls
+        // Y/U/V from the channels of one Rgba8 sample.
+        let shader_src = match layout {
+            RenderLayout::Biplanar => include_str!("../shader.wgsl"),
+            RenderLayout::PackedXYUV => include_str!("../shader_yuv444.wgsl"),
         };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(match chroma {
-                ChromaSubsampling::Yuv420 => "tether-render shader (nv12)",
-                ChromaSubsampling::Yuv444 => "tether-render shader (444)",
+            label: Some(match layout {
+                RenderLayout::Biplanar => "tether-render shader (biplanar)",
+                RenderLayout::PackedXYUV => "tether-render shader (444 packed)",
             }),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
@@ -775,8 +821,8 @@ fn make_yuv_textures(
     width: u32,
     height: u32,
 ) -> YuvTextures {
-    match chroma {
-        ChromaSubsampling::Yuv420 => {
+    match render_layout_for(chroma) {
+        RenderLayout::Biplanar => {
             let y = make_plane_texture(
                 device,
                 "tether-render y plane",
@@ -785,8 +831,13 @@ fn make_yuv_textures(
                 wgpu::TextureFormat::R8Unorm,
             );
             let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
-            let chroma_w = width.div_ceil(2);
-            let chroma_h = height.div_ceil(2);
+            // UV plane dims: half-res for NV12 (Yuv420), full-res for
+            // NV24 (Yuv444). The same Rg8 plane format works for both —
+            // bilinear sampling reads the right value at either size.
+            let (chroma_w, chroma_h) = match chroma {
+                ChromaSubsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
+                ChromaSubsampling::Yuv444 => (width, height),
+            };
             let uv = make_plane_texture(
                 device,
                 "tether-render uv plane",
@@ -796,7 +847,7 @@ fn make_yuv_textures(
             );
             let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tether-render yuv bind group (nv12)"),
+                label: Some("tether-render yuv bind group (biplanar)"),
                 layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -820,7 +871,7 @@ fn make_yuv_textures(
                 _guard: None,
             }
         }
-        ChromaSubsampling::Yuv444 => {
+        RenderLayout::PackedXYUV => {
             let packed = make_plane_texture(
                 device,
                 "tether-render xyuv packed (444)",

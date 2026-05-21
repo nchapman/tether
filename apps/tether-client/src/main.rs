@@ -60,18 +60,17 @@ async fn main() -> anyhow::Result<()> {
     let conn = Arc::new(conn);
     info!(remote = %conn.remote_address(), "connected to host");
 
-    // Client video decode capabilities. HEVC Main444 8-bit is now in
-    // the advertised set: the decoder picks the surface format from
-    // the SPS automatically and the renderer dispatches on the
-    // negotiated chroma to pick the right shader / bind-group layout.
-    //
-    // Decode-side capability probe — same shape as the host's
-    // `supported_encode_profiles`. Order does NOT determine the
-    // negotiated outcome (host's PROFILE_PREFERENCE is authoritative),
-    // but the function returns the list in PROFILE_PREFERENCE order so
-    // logs look natural. macOS clients drop HEVC 4:4:4 here because
-    // FFmpeg's VideoToolbox wrapper doesn't expose Main444 / Rext
-    // decode; Linux clients keep it if the VAAPI driver builds it.
+    // Client video decode capabilities. The probe in tether-codec
+    // does a real encode + decode round trip per profile against the
+    // live driver — see crates/tether-codec/src/profile_probe.rs for
+    // why a construction-only probe wasn't enough. macOS clients on
+    // M-series silicon advertise HEVC 4:4:4 here (VT decodes Main444
+    // to a `'444v'` IOSurface and the renderer's biplanar path
+    // handles it). Linux clients keep 4:4:4 if the VAAPI driver
+    // supports it. Order doesn't determine the negotiated outcome —
+    // the host's PROFILE_PREFERENCE is authoritative — but the
+    // function returns profiles in PROFILE_PREFERENCE order so logs
+    // look natural.
     let client_decode_profiles = tether_codec::supported_decode_profiles();
     if client_decode_profiles.is_empty() {
         anyhow::bail!(

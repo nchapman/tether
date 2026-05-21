@@ -53,6 +53,17 @@ const NV12_VIDEO_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"420v");
 /// range expansion in the shader differ, and that's driven by the
 /// per-session `VideoColorSpec`, not the IOSurface fourcc.
 const NV12_FULL_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"420f");
+/// `kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange` — `'444v'`,
+/// NV24-style biplanar 4:4:4 video-range. M-series Apple Silicon's
+/// VideoToolbox HEVC decoder emits this for HEVC Main 4:4:4 input.
+/// Plane shape is identical to NV12 except the UV plane is full-res
+/// instead of half-res; same R8 + Rg8 textures, same fragment shader,
+/// no special handling needed in the import path.
+const NV24_VIDEO_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"444v");
+/// `kCVPixelFormatType_444YpCbCr8BiPlanarFullRange` — `'444f'`,
+/// full-range counterpart of `'444v'`. Same plane shape; range is
+/// signalled through `VideoColorSpec`, not the fourcc.
+const NV24_FULL_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"444f");
 
 pub(crate) fn import_iosurface_textures(
     device: &wgpu::Device,
@@ -62,27 +73,35 @@ pub(crate) fn import_iosurface_textures(
     iosurface: &IOSurfaceFrame,
     guard: GpuFrameGuard,
 ) -> Result<YuvTextures> {
-    if chroma != ChromaSubsampling::Yuv420 {
-        // macOS never negotiates 4:4:4 (VideoToolbox has no Main444
-        // hardware path); reaching this branch with anything else means
-        // the negotiator picked something the gate should have rejected.
+    let fourcc_ok = match chroma {
+        ChromaSubsampling::Yuv420 => matches!(
+            iosurface.pixel_format,
+            NV12_VIDEO_RANGE_FOURCC | NV12_FULL_RANGE_FOURCC
+        ),
+        ChromaSubsampling::Yuv444 => matches!(
+            iosurface.pixel_format,
+            NV24_VIDEO_RANGE_FOURCC | NV24_FULL_RANGE_FOURCC
+        ),
+    };
+    if !fourcc_ok {
+        let expected = match chroma {
+            ChromaSubsampling::Yuv420 => "'420v' or '420f' (NV12 biplanar)",
+            ChromaSubsampling::Yuv444 => "'444v' or '444f' (NV24 biplanar)",
+        };
         return Err(RenderError::DmaBufImport(format!(
-            "macOS IOSurface import only supports Yuv420; session negotiated {chroma:?}"
+            "IOSurface pixel format 0x{:08x} doesn't match negotiated chroma {chroma:?}; \
+             expected {expected}",
+            iosurface.pixel_format
         )));
     }
-    if iosurface.pixel_format != NV12_VIDEO_RANGE_FOURCC
-        && iosurface.pixel_format != NV12_FULL_RANGE_FOURCC
-    {
-        return Err(RenderError::DmaBufImport(format!(
-            "IOSurface pixel format 0x{:08x} not a recognised NV12 fourcc \
-             (expected 0x{:08x} '420v' or 0x{:08x} '420f')",
-            iosurface.pixel_format, NV12_VIDEO_RANGE_FOURCC, NV12_FULL_RANGE_FOURCC
-        )));
-    }
-    import_nv12(device, layout, sampler, iosurface, guard)
+    // NV12 and NV24 import through the same biplanar path — Y is R8,
+    // UV is Rg8, plane dims come from the IOSurface itself (which
+    // reports half-res UV for NV12 and full-res UV for NV24). The
+    // fragment shader is chroma-resolution-agnostic.
+    import_biplanar(device, layout, sampler, iosurface, guard)
 }
 
-fn import_nv12(
+fn import_biplanar(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,

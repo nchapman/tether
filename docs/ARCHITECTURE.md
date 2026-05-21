@@ -415,22 +415,30 @@ Both the VAAPI encoder (`VaapiEncoder::new` takes `VideoProfile`,
 switches `sw_format` + the AVCodecContext `profile` field for
 `AV_PROFILE_HEVC_REXT` on 4:4:4 + BGRA→input swscale stage; color
 primaries / transfer / colorspace / range tagged explicitly on the
-context so the SPS VUI doesn't say "Unspecified"), the gpuconvert
-bridge (NV12 with two-plane R8+Rg8 export vs. YUV444 with three-plane
-R8 export), and the renderer (NV12 fragment shader with `Y + UV` bind
-group vs. YUV444 sibling with `Y + U + V`) branch on the negotiated
-chroma at construction. Mid-session chroma switch is not supported —
-same rebuild path as a mid-session resolution change (encoder +
-bridge + render pipeline all reset).
+context so the SPS VUI doesn't say "Unspecified") and the gpuconvert
+bridge (NV12 with two-plane R8+Rg8 export vs. YUV444 with packed
+XYUV) branch on chroma at construction. The renderer dispatches on a
+derived `RenderLayout` (`Biplanar` vs `PackedXYUV`) rather than
+chroma directly: Yuv420 is always biplanar (NV12, half-res UV);
+Yuv444 is biplanar on macOS (NV24 IOSurface from VT, full-res UV
+through the same Y R8 + UV Rg8 shader) and packed XYUV on Linux
+(VAAPI dma-buf). Mid-session chroma switch is not supported — same
+rebuild path as a mid-session resolution change (encoder + bridge +
+render pipeline all reset).
 
-**Per-platform capability gate.** `probe_encoder_profile` on macOS
-returns `false` for any non-Yuv420 profile because VideoToolbox
-doesn't expose HEVC Main444 in hardware (Apple Silicon ships HEVC
-Main and Main10 only; ProRes 4444 is a separate codec). A macOS host
-therefore never negotiates 4:4:4 even when the Linux client
-advertises it; the intersection lands on the universal floor (H.264
-4:2:0 8-bit) or HEVC 4:2:0 8-bit depending on what the client also
-supports.
+**Per-platform asymmetries.** `supported_profiles()` in
+`tether-codec::probe` does a real encode + decode round trip per
+profile against the live driver (fixture IDRs ship in
+`crates/tether-codec/fixtures/probe/`; the trait is in
+`profile_probe.rs`). Empirical results on M-series Apple Silicon:
+VideoToolbox has no HEVC Main 4:4:4 *encode* path (so macOS hosts
+never advertise 4:4:4 — the intersection lands on HEVC 4:2:0 or H.264
+4:2:0), but the *decode* path produces a `'444v'` NV24 IOSurface and
+the renderer's biplanar import handles it. A Linux→Mac session can
+therefore negotiate HEVC 4:4:4 even though Mac→anything cannot. On
+Linux, VAAPI driver capabilities vary; the probe catches
+driver-specific 4:4:4 gaps that a codec-keyed construction probe
+would miss.
 
 **Bitrate is chroma-aware.** `derive_bitrate_kbps` takes a
 `VideoProfile` and applies a 1.4× multiplier for `Yuv444` on top of

@@ -76,10 +76,22 @@ const XF44_FOURCC: u32 = u32::from_be_bytes(*b"xf44");
 /// both have identical 16-bit MSB-aligned plane layouts so they
 /// import through the same code path.
 const P410_FOURCC: u32 = u32::from_be_bytes(*b"P410");
-/// `'P010'` — biplanar 10-bit 4:2:0 full-range. VT's Main10 decode
-/// path lands here. Shape: 16-bit Y plane + interleaved 16-bit UV
-/// plane at half resolution, 10 bits MSB-aligned in each cell.
+/// `'P010'` — biplanar 10-bit 4:2:0 full-range. The conventional
+/// label for the shape (16-bit Y plane + interleaved 16-bit UV at
+/// half resolution, 10 bits MSB-aligned). VT can emit this depending
+/// on the decoder configuration.
 const P010_FOURCC: u32 = u32::from_be_bytes(*b"P010");
+/// `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` / `'x420'` —
+/// the *actual* fourcc VT decode lands in for HEVC Main10 when the
+/// source bitstream is video-range (which our encoder emits, matching
+/// the `x420` SCK capture format on the host). Same shape as `'P010'`
+/// — the symbols differ only in declared range, which is a VUI
+/// signal handled by the renderer's `range_kind` dispatch, not a
+/// plane-layout difference. Both import through the same path.
+const X420_FOURCC: u32 = u32::from_be_bytes(*b"x420");
+/// `kCVPixelFormatType_420YpCbCr10BiPlanarFullRange` / `'xf20'` —
+/// full-range companion of `'x420'`. Same plane shape.
+const XF20_FOURCC: u32 = u32::from_be_bytes(*b"xf20");
 
 pub(crate) fn import_iosurface_textures(
     device: &wgpu::Device,
@@ -105,12 +117,24 @@ pub(crate) fn import_iosurface_textures(
             ),
             "'444v' or '444f' (NV24 biplanar 8-bit)",
         ),
-        // 10-bit 4:2:0: VT's Main10 decode lands in a 'P010' IOSurface
-        // with biplanar R16/Rg16 plane formats (10 bits MSB-aligned).
-        // Same fourcc family as the Linux DRM P010.
+        // 10-bit 4:2:0: VT's Main10 decode lands in a biplanar 10-bit
+        // 4:2:0 IOSurface with R16/Rg16 plane formats (10 bits
+        // MSB-aligned). The fourcc Apple uses varies by range:
+        //   - `'x420'` for video-range (limited) — what an HEVC Main10
+        //     bitstream emitted by VT's video-range encoder decodes to,
+        //     and what SCK delivers via the `x420` capture format.
+        //   - `'xf20'` for full-range companion.
+        //   - `'P010'` for the conventional cross-platform label;
+        //     some decoder configurations emit this. Same plane shape.
+        // All three import through the same R16 / Rg16 path; range
+        // differences are handled by the renderer's `range_kind`
+        // dispatch, not by texture layout.
         (ChromaSubsampling::Yuv420, 10) => (
-            iosurface.pixel_format == P010_FOURCC,
-            "'P010' (biplanar 4:2:0 10-bit)",
+            matches!(
+                iosurface.pixel_format,
+                X420_FOURCC | XF20_FOURCC | P010_FOURCC
+            ),
+            "'x420', 'xf20', or 'P010' (biplanar 4:2:0 10-bit)",
         ),
         (ChromaSubsampling::Yuv444, 10) => (
             matches!(iosurface.pixel_format, XF44_FOURCC | P410_FOURCC),

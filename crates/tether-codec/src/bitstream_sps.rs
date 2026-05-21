@@ -176,8 +176,10 @@ impl<'a> BitReader<'a> {
     }
 
     /// Unsigned exp-Golomb. Returns `None` on bitstream exhaustion or
-    /// codes longer than 32 leading zeros (which would overflow our
-    /// `u32` storage and is well outside anything sane in an SPS).
+    /// codes with 32+ leading zeros — the resulting value would not
+    /// fit in our `u32` storage without truncation, and a code that
+    /// long is well outside anything sane in an SPS (`chroma_format_idc`
+    /// is bounded to 3, `sps_seq_parameter_set_id` to 15).
     fn read_ue(&mut self) -> Option<u32> {
         let mut leading_zeros = 0;
         loop {
@@ -186,7 +188,11 @@ impl<'a> BitReader<'a> {
                 break;
             }
             leading_zeros += 1;
-            if leading_zeros > 32 {
+            // Strictly less than 32 — `leading_zeros == 32` would
+            // make the `(1<<32) - 1 + suffix` calculation exceed u32
+            // for any non-zero suffix and truncate silently on the
+            // `as u32` cast. Reject at the boundary, not past it.
+            if leading_zeros > 31 {
                 return None;
             }
         }
@@ -194,7 +200,12 @@ impl<'a> BitReader<'a> {
             return Some(0);
         }
         let suffix = self.read_bits(leading_zeros)?;
-        Some(((1u64 << leading_zeros) - 1 + suffix) as u32)
+        // Cannot overflow u32: leading_zeros ≤ 31, so the leading
+        // term is at most `(1<<31) - 1 = 0x7FFF_FFFF`, and `suffix`
+        // is bounded by `(1<<31) - 1` since we read exactly 31 bits.
+        // Sum fits in u32.
+        let value = (1u64 << leading_zeros) - 1 + suffix;
+        u32::try_from(value).ok()
     }
 }
 
@@ -359,6 +370,20 @@ mod tests {
             .expect("h264 4:2:0 8-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 1);
         assert_eq!(sps.bit_depth_luma, 8);
+    }
+
+    #[test]
+    fn read_ue_rejects_32_leading_zeros_rather_than_truncating() {
+        // 32 leading zeros + a `1` is the boundary case the silent-
+        // truncation fix targets. We craft the buffer manually:
+        // four bytes of all-zero, then a byte starting with `1`.
+        let buf = vec![0x00, 0x00, 0x00, 0x00, 0x80];
+        let mut r = BitReader::new(&buf);
+        assert_eq!(
+            r.read_ue(),
+            None,
+            "32-leading-zeros code must reject, not truncate to a corrupted u32"
+        );
     }
 
     #[test]

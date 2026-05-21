@@ -376,12 +376,12 @@ already live as of commit `513f4c7` (separate path — SCK direct
 to VT via x420 IOSurfaces, no gpuconvert involved).
 
 1. **VAAPI encoder 10-bit input path.**
-   `tether-codec/src/vaapi/encoder.rs::submit_dmabuf` and
-   `encode_bgra` both return `UnsupportedInputFormat` for
-   `bit_depth != 8` (lines 411, 650). Extend `vaapi_sw_format`
-   (look for the `match (chroma, bit_depth)` next to the existing
-   NV12 / VUYX entries) to return `AV_PIX_FMT_P010LE` for
-   `(Yuv420, 10)` and `AV_PIX_FMT_XV30LE` for `(Yuv444, 10)`.
+   In `tether-codec/src/vaapi/encoder.rs`, the `submit_dmabuf` and
+   `encode_bgra` methods both return `UnsupportedInputFormat` for
+   `bit_depth != 8` — grep for `self.bit_depth != 8` inside both.
+   Extend `vaapi_sw_format` (the `match (chroma, bit_depth)` next
+   to the existing NV12 / VUYX entries) to return `AV_PIX_FMT_P010LE`
+   for `(Yuv420, 10)` and `AV_PIX_FMT_XV30LE` for `(Yuv444, 10)`.
    Confirm against `vaapi_drm_format_map` in FFmpeg's
    `libavutil/hwcontext_vaapi.c` — XV30LE is the *only* 10-bit
    4:4:4 entry there (planar P410 has no map row, mirroring the
@@ -396,7 +396,8 @@ to VT via x420 IOSurfaces, no gpuconvert involved).
      mirroring `Nv12DmaBuf` / `Yuv444DmaBuf`. The output DMA-BUF
      needs R16 Y + Rg16 UV plane fourccs (DRM_FORMAT_R16 = 'R16 ',
      DRM_FORMAT_GR1616 = 'GR32') with `DRM_FORMAT_MOD_LINEAR`.
-   - Address the FIXME at `pipeline.rs::build_biplanar_16_pipeline`:
+   - Address the FIXME on `build_biplanar_16_pipeline` in
+     `tether-gpuconvert/src/pipeline.rs`:
      R16Unorm / Rg16Unorm as compute *storage outputs* require the
      Vulkan `STORAGE_IMAGE_BIT` format feature flag, not just
      `SAMPLED_IMAGE_BIT`. The existing `importable_dmabuf_modifiers`

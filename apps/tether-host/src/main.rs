@@ -1468,12 +1468,17 @@ fn sck_capture_capability() -> tether_capture::macos::SckCaptureCapability {
     use std::sync::OnceLock;
     static CACHED: OnceLock<tether_capture::macos::SckCaptureCapability> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        // Run the probe synchronously here. The function is sync from
-        // the caller's perspective but the underlying SCK calls
-        // require a tokio runtime; we bridge via `block_in_place` if
-        // we're inside the runtime, else spawn a temporary one. In
-        // practice this runs on the first `handle_client` call which
-        // is always inside the main tokio runtime.
+        // The probe is async (SCK calls land on the tokio runtime via
+        // `spawn_blocking`) but `capture_filtered_encode_profiles` is
+        // sync. `block_in_place` lets the current worker thread block
+        // on the inner `block_on` without starving the runtime.
+        //
+        // Hard requirement: `block_in_place` panics on the
+        // `current_thread` flavor. Our `#[tokio::main]` defaults to
+        // multi-thread so this is fine; if anyone ever adds
+        // `flavor = "current_thread"` they need to refactor this
+        // call site (most cleanly: probe at startup in `main` and
+        // pass the result down).
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(tether_capture::macos::probe_capture_pixel_formats())

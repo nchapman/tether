@@ -138,24 +138,45 @@ async fn main() -> anyhow::Result<()> {
     // here means the host's two advertisements disagree. Log the
     // mismatch and trust the negotiated profile (the structured cap
     // negotiation is the authoritative source).
-    use tether_protocol::control::{PixelFormat, PIXEL_FORMAT_EXTENSION_KEY};
+    use tether_protocol::control::{ChromaSubsampling, PixelFormat, PIXEL_FORMAT_EXTENSION_KEY};
     if let Some(pf_bytes) = server_body.extensions.get(PIXEL_FORMAT_EXTENSION_KEY) {
         match tether_protocol::decode::<PixelFormat>(pf_bytes) {
             Ok(pf) => {
-                let expected = match negotiated_profile.chroma {
-                    tether_protocol::control::ChromaSubsampling::Yuv420 => PixelFormat::Nv12,
-                    tether_protocol::control::ChromaSubsampling::Yuv444 => PixelFormat::Yuv444p,
-                };
-                if pf == expected {
-                    tracing::debug!(?pf, "host pixel-format extension matches negotiated chroma");
-                } else {
-                    warn!(
-                        advertised = ?pf,
-                        expected = ?expected,
-                        negotiated_chroma = ?negotiated_profile.chroma,
-                        "host pixel-format extension disagrees with negotiated chroma; \
-                         trusting the negotiated profile"
-                    );
+                // Both chroma *and* bit_depth participate — a 10-bit
+                // Main10 session ships `P010`, not `Nv12`. Mismatched
+                // expected/advertised here doesn't gate the session
+                // (the structured profile extension is authoritative)
+                // but is a real correctness signal worth warning about.
+                let expected =
+                    match (negotiated_profile.chroma, negotiated_profile.bit_depth) {
+                        (ChromaSubsampling::Yuv420, 8) => Some(PixelFormat::Nv12),
+                        (ChromaSubsampling::Yuv420, 10) => Some(PixelFormat::P010),
+                        (ChromaSubsampling::Yuv444, 8) => Some(PixelFormat::Yuv444p),
+                        (ChromaSubsampling::Yuv444, 10) => Some(PixelFormat::P410),
+                        _ => None,
+                    };
+                match expected {
+                    Some(exp) if pf == exp => {
+                        tracing::debug!(?pf, "host pixel-format extension matches negotiated chroma + bit_depth");
+                    }
+                    Some(exp) => {
+                        warn!(
+                            advertised = ?pf,
+                            expected = ?exp,
+                            negotiated_chroma = ?negotiated_profile.chroma,
+                            negotiated_bit_depth = negotiated_profile.bit_depth,
+                            "host pixel-format extension disagrees with negotiated chroma + bit_depth; \
+                             trusting the negotiated profile"
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            ?pf,
+                            negotiated_chroma = ?negotiated_profile.chroma,
+                            negotiated_bit_depth = negotiated_profile.bit_depth,
+                            "negotiated chroma/bit_depth combo not in pixel-format cross-check table; skipping"
+                        );
+                    }
                 }
             }
             Err(e) => {

@@ -84,7 +84,8 @@ pub async fn start(pixel_format: PixelFormat) -> Result<Receiver<CapturedFrame>>
                 yuv420_10bit_video_range = caps.yuv420_10bit_video_range,
                 yuv420_10bit_full_range = caps.yuv420_10bit_full_range,
                 yuv444_10bit_full_range = caps.yuv444_10bit_full_range,
-                "SCK pixel-format probe results (live stream still uses 420v)"
+                live_stream_format = %pixel_format,
+                "SCK pixel-format probe results"
             );
         }
         Err(e) => {
@@ -339,21 +340,29 @@ impl SckCapabilityCheck {
     ///   1. the profile maps to an SCK format ([`Supported`]), AND
     ///   2. that format was accepted by the SCK probe on this Mac.
     ///
+    /// `Unknown(code)` dispatch goes through `u32` fourcc comparison
+    /// rather than `code.display()` string match — matches the pattern
+    /// in `tether-codec::videotoolbox::probe::expected_iosurface_fourccs`
+    /// and avoids a per-call `String` allocation on the
+    /// `capture_filtered_encode_profiles` path.
+    ///
     /// [`Supported`]: SckCapabilityCheck::Supported
     pub fn is_deliverable(self, caps: &SckCaptureCapability) -> bool {
+        const V444V: u32 = u32::from_be_bytes(*b"444v");
+        const V444F: u32 = u32::from_be_bytes(*b"444f");
+        const VX420: u32 = u32::from_be_bytes(*b"x420");
+        const VXF20: u32 = u32::from_be_bytes(*b"xf20");
         match self {
             Self::Supported(PixelFormat::YCbCr_420v) => caps.yuv420_video_range,
             Self::Supported(PixelFormat::YCbCr_420f) => caps.yuv420_full_range,
             Self::Supported(PixelFormat::xf44) => caps.yuv444_10bit_full_range,
-            Self::Supported(PixelFormat::Unknown(code)) => {
-                match &code.display()[..] {
-                    "444v" => caps.yuv444_8bit_video_range,
-                    "444f" => caps.yuv444_8bit_full_range,
-                    "x420" => caps.yuv420_10bit_video_range,
-                    "xf20" => caps.yuv420_10bit_full_range,
-                    _ => false,
-                }
-            }
+            Self::Supported(PixelFormat::Unknown(code)) => match code.as_u32() {
+                V444V => caps.yuv444_8bit_video_range,
+                V444F => caps.yuv444_8bit_full_range,
+                VX420 => caps.yuv420_10bit_video_range,
+                VXF20 => caps.yuv420_10bit_full_range,
+                _ => false,
+            },
             Self::Supported(_) => false,
             Self::Unsupported => false,
         }

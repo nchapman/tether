@@ -79,12 +79,21 @@ any Linux machine:
 │     • h264_vaapi or hevc_vaapi encode → Annex-B NAL units           │
 │         │                                                           │
 │         ▼                                                           │
-│   tether-protocol::video::FrameFragmenter                           │
-│     • split into MTU-sized fragments, attach HostFrameTiming +      │
-│       stream_epoch + frame_seq + fragment_index                     │
+│   tether-codec::drain_encoder                                       │
+│     • prepend codec extradata (SPS/PPS/VPS) to every keyframe so    │
+│       each IDR is self-decodable                                    │
 │         │                                                           │
 │         ▼                                                           │
-│   tether-transport::Server (QUIC datagrams)                         │
+│   tether-protocol::video::FrameFragmenter                           │
+│     • P-frame:  fragment() → MTU-sized VideoPackets, datagram path  │
+│     • Keyframe: single_packet() → one fragment_count=1 packet,      │
+│                 reliable per-IDR uni stream path                    │
+│         │       attach HostFrameTiming + stream_epoch + frame_seq   │
+│         ▼                                                           │
+│   tether-transport::Server                                          │
+│     • P-frames → QUIC datagrams (unreliable, low latency)           │
+│     • IDRs → fresh QUIC uni stream per IDR (reliable, ~1 RTT        │
+│       deterministic recovery on loss vs one GOP stochastic)         │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
@@ -93,17 +102,25 @@ any Linux machine:
 ┌─────────────────────────────────────────────────────────────────────┐
 │ CLIENT                                                              │
 │                                                                     │
-│   tether-transport::Connection (QUIC datagrams)                     │
+│   tether-transport::Connection                                      │
+│     • tokio::select! races recv_datagram (P-frames, cursor) and     │
+│       accept_video_keyframe (per-IDR uni stream); both produce      │
+│       VideoPackets fed to the same reassembler                      │
 │         │                                                           │
 │         ▼                                                           │
-│   FrameDefragmenter (drops cross-epoch fragments)                   │
-│         │   complete H.264 frame                                    │
-│         ▼                                                           │
-│   tether-codec::vaapi::VaapiDecoder                                 │
-│     • h264_vaapi decode into a VASurface from an owned surface pool │
-│     • vaExportSurfaceHandle → DRM_PRIME (per-frame fresh export)    │
+│   FrameReassembler                                                  │
+│     • drops cross-epoch fragments                                   │
+│     • wall-clock-evicts pending frames older than max_pending_age   │
+│       (500ms default) on every fragment                             │
+│         │   complete encoded frame                                  │
+│         ▼  (bounded crossbeam channel, capacity 8)                  │
+│   tether-decode std::thread (owns the Decoder)                      │
+│     • VAAPI submit + drain                                          │
+│     • on decode error / libavcodec warn, fire rate-limited          │
+│       (500ms) ForceIdr via stashed tokio::runtime::Handle           │
+│     • vaSyncSurface + vaExportSurfaceHandle → DRM_PRIME             │
 │         │   Frame::Gpu(GpuFrame { DmaBuf { fd, stride, modifier } })│
-│         ▼                                                           │
+│         ▼  (LatestFrame single-slot drop-oldest)                    │
 │   tether-render::gpu                                                │
 │     • imports VAAPI dma-buf as two wgpu textures (Y + UV planes)    │
 │     • fragment shader does NV12→RGB matrix at present time          │
@@ -117,6 +134,29 @@ memcpy on the client between the decoder and the renderer. Measured on
 an Intel Arc iGPU (Meteor Lake), the host's average encode time is
 ~7-8 ms per 2880×1920 frame; client glass-to-glass latency on loopback
 is ~20-25 ms including the ~10 ms present scheduler wait.
+
+**Threading model on the client.** Three concurrent owners on the
+critical path: the recv tokio task (QUIC poll + reassemble + hand off
+to decoder), a dedicated `std::thread` named `tether-decode` (owns
+the VAAPI decoder + auto-IDR rate-limit), and winit's main thread
+running the wgpu render loop. Communication is via crossbeam channels
+(recv→decode is bounded(8) so decoder backpressure shows up as
+`decode_queue_drops` rather than starving the recv loop;
+decode→stats is unbounded, drained non-blocking once per recv
+iteration) and the `LatestFrame` single-slot mutex for the
+decode→render handoff. A GPU-driver stall inside libavcodec/libva
+(`vaSyncSurface`, `vaExportSurfaceHandle`) is contained to the decode
+thread — the recv loop keeps polling QUIC and the input-send task
+keeps responding.
+
+**Threading model on the host.** Capture + encode + send live on a
+dedicated `std::thread` (`tether-host-send`). The sync thread calls
+into async transport via `tokio::runtime::Handle::block_on` for the
+reliable-IDR write (which is the only blocking call in the loop); the
+P-frame datagram path is sync inside quinn. Blocking on the IDR write
+preserves ordering — by the time the next iteration of the loop runs,
+the keyframe is queued in quinn's send buffer and quinn's FIFO send
+order keeps it ahead of the following P-frames on the wire.
 
 **60 fps budget audit (Intel Arc iGPU, Meteor Lake; 60 fps budget =
 16.67 ms/frame; p99 over 60 sampled frames):**
@@ -234,6 +274,47 @@ Linux VAAPI client.
 
 ---
 
+## Robustness (mid-session freezes are unacceptable)
+
+Video is the load-bearing feature; even rare freezes are unacceptable.
+The pipeline carries the following defenses, all measured and
+documented in `docs/INVESTIGATION_lan_freeze.md`:
+
+- **Non-blocking tracing writer.** `tracing_appender::non_blocking`
+  on both apps. Required because the FFmpeg `av_log` callback runs on
+  the decoder thread; a sync subscriber would block decode under an
+  error storm.
+- **Async `av_log` bridge.** The FFmpeg log callback bumps an atomic
+  counter (load-bearing — the client polls this to detect "ffmpeg is
+  unhappy" states that don't surface through the API) then `try_send`s
+  a `LogRecord` onto a bounded crossbeam channel. A dedicated
+  drainer thread emits to tracing. The decoder thread never blocks on
+  log writes; on channel-full the line is dropped but the counter
+  still advances.
+- **`SO_RCVBUF = 16 MiB` on the client UDP socket.** Linux's ~208 KB
+  default overflows in milliseconds under bursty keyframes; the
+  kernel silently drops packets *before* quinn's datagram buffer
+  ever sees them.
+- **`FrameReassembler` wall-clock timeout.** Pending frames older
+  than `max_pending_age` (500 ms default) are evicted on every
+  fragment in addition to the existing frame_seq-distance eviction.
+  Stops a quiet-stream encoder restart from leaking incomplete frames.
+- **Reliable per-IDR uni streams.** Detailed in "Protocol shape"
+  below.
+- **Dedicated decode thread (`tether-decode`).** Owns the VAAPI
+  decoder and the auto-IDR 500 ms rate-limit. A GPU-driver stall
+  inside libavcodec/libva can't starve the recv loop's tokio task
+  or the input-send task running on the same runtime.
+- **`LatestFrame` single-slot drop-oldest channel between decoder
+  and renderer.** A remote-desktop viewer wants the freshest decoded
+  frame, not a queued backlog. Crossbeam bounded(N) drop-newest is
+  exactly wrong for this hop — under render backpressure the user
+  would stare at stale pixels while newer frames got rejected.
+- **DoS-relevant transport limits.** `MAX_VIDEO_STREAM_MESSAGE = 2 MiB`
+  caps per-keyframe-stream allocation; `max_concurrent_uni_streams = 4`
+  prevents a peer from opening thousands of streams and pinning
+  receive-side buffers.
+
 ## Protocol shape
 
 `tether-protocol` defines five logical channels, each carried by
@@ -249,13 +330,22 @@ its own QUIC primitive:
   telemetry (`ClientStats`), and the open-ended `Extension { key,
   payload }` escape for future features that aren't worth a typed
   variant yet (clipboard, file transfer, gamepad rumble, auth, …).
-- **Video** (unreliable datagrams) — `VideoPacket::First { display,
-  stream_epoch, frame_seq, fragment_count, meta:
-  VideoFrameMetaEnvelope, payload }` or `::Continuation { …,
-  fragment_index, payload }`. `stream_epoch` is `u32` so encoder
-  restarts can't wrap. `VideoFrameMetaEnvelope` is a versioned wrap
-  around `VideoFrameMeta` so future per-frame metadata (HDR ROI QP)
-  lands as additive variants instead of struct-field appends.
+- **Video** — `VideoPacket::First { display, stream_epoch, frame_seq,
+  fragment_count, meta: VideoFrameMetaEnvelope, payload }` or
+  `::Continuation { …, fragment_index, payload }`. Two transport
+  paths share the same wire shape: **P-frames** ride unreliable QUIC
+  datagrams (split MTU-sized via `FrameFragmenter::fragment`);
+  **IDR keyframes** ride a fresh QUIC unidirectional stream per IDR
+  via `Connection::send_video_keyframe`, carrying one
+  fragment_count=1 packet built by `FrameFragmenter::single_packet`.
+  Reliable streams turn IDR recovery from stochastic (wait for next
+  encoder IDR) into deterministic 1-RTT QUIC retransmit on loss. The
+  receiver's `FrameReassembler` doesn't care which path delivered
+  the fragment — it keys on `(display, stream_epoch, frame_seq)`
+  regardless. `stream_epoch` is `u32` so encoder restarts can't wrap.
+  `VideoFrameMetaEnvelope` is a versioned wrap around
+  `VideoFrameMeta` so future per-frame metadata (HDR ROI QP) lands
+  as additive variants instead of struct-field appends.
 - **Audio** (unreliable datagrams, host → client) — `AudioPacket::Opus
   { stream_epoch, frame_seq, t_capture, payload }`. The wire shape
   ships in V1; the Opus capture/encode/decode pipeline is its own
@@ -280,7 +370,7 @@ Forward-compat hooks every feature added later relies on:
 - **`VideoFrameMetaEnvelope`** so per-frame metadata grows by enum
   variant rather than struct field.
 
-Three non-negotiable invariants tracked end-to-end:
+Four non-negotiable invariants tracked end-to-end:
 
 1. **Clock sync.** Handshake measures RTT and computes a `MonoNanos`
    offset between host and client clocks. Every video fragment carries
@@ -296,6 +386,17 @@ Three non-negotiable invariants tracked end-to-end:
    so multiple requests between encode calls coalesce to one. GOP is
    long (~240 frames) and IDRs are driven by request, not cadence —
    the GOP is the safety net, not the primary recovery mechanism.
+   The client's decode thread also rate-limits ForceIdr emission to
+   one per 500 ms so a decode-error storm can't generate a keyframe
+   storm on the host.
+4. **Self-decodable IDRs.** Every keyframe carries its own codec
+   parameter sets (SPS/PPS for H.264, VPS+SPS+PPS for HEVC).
+   Achieved by setting `AV_CODEC_FLAG_GLOBAL_HEADER` on the VAAPI
+   encoder so libavcodec stashes parameter sets in `extradata` at
+   `open()`, and prepending `extradata` to every keyframe packet
+   inside `drain_encoder`. Without this, only the encoder's very
+   first packet would carry parameter sets, and a client that loses
+   that first IDR or rebuilds its decoder mid-session is stuck.
 
 ---
 
@@ -346,8 +447,37 @@ Listed to set expectations; each is a real follow-up, not a "never":
   `vaQueryConfigProfiles`. Both are the principled extensions, both
   need a small libva FFI add (vaQueryConfigProfiles,
   vaGetConfigAttributes) and an AMD test box to validate against.
-- **Multi-monitor.** Single primary monitor capture.
+- **Multi-monitor.** Single primary monitor capture; the
+  keyframe-sender path assumes one fragmenter, and `display = 0` is
+  hard-coded throughout the host send loop.
 - **Audio.** Video + input only.
+- **Periodic safety-net IDR.** Sunshine deliberately omits this on
+  the NVENC path; we follow suit. Worth adding if we ever see a
+  "client went silent without observing decode failure" stall mode
+  (display sleep, decoder lockup) — cheap insurance, ~20 LOC.
+- **FEC on keyframes.** Reliable per-IDR streams give us deterministic
+  1-RTT recovery with no bandwidth overhead in the no-loss case.
+  Sunshine/Apollo/Moonlight use FEC because RTP-over-UDP has no
+  reliable side-channel; we have QUIC streams and don't need to
+  reinvent FEC.
+- **Reference frame invalidation (RFI).** Cheaper than a full IDR for
+  recovering from limited reference loss, but adds wire complexity
+  and the benefit at our resolutions is marginal. Skip.
+- **`SO_PRIORITY` / `IP_TOS` QoS tagging.** Sunshine sets these on the
+  Linux send socket. Linux-specific; worth its own change once we
+  have benchmarks showing it helps on contested networks.
+- **Wgpu device-loss recovery on the client.** A driver crash today
+  exits the client process. A single rebuild attempt before fatal
+  exit would be a UX win.
+- **Periodic clock re-probe.** The handshake measures one offset; on a
+  long-running session (thermal drift, laptop sleep/wake) the offset
+  could drift. `ClockProbeRequest` exists but nothing initiates
+  re-probes. For sub-minute sessions, fine.
+- **Wraparound safety for `frame_seq` / `stream_epoch`.** Both are
+  `u32` with `wrapping_add`; at 60 fps it'd take 828 days to wrap
+  `frame_seq` and 2^32 encoder restarts for `stream_epoch`. Not
+  reachable today; document if we ever support multi-day persistent
+  sessions.
 - **Explicit GPU sync (`sync_file` fd).** The host blocks on
   `device.poll(wait_indefinitely)` after the compute pass to ensure
   the Vulkan write retires before VAAPI reads. Works in practice on

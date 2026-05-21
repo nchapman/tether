@@ -1,6 +1,14 @@
 # Investigation handoff: Linux client freezes during macOS → Linux LAN demo
 
-**Status:** open, needs Linux-side investigation
+**Status:** RESOLVED. Kept for the design rationale that produced the
+hardening in commits `ec29aea`, `61d9616`, `de7c811`, `f8a7a55`, and
+`1778e4e`. All three hypotheses below turned out to contribute; fixes
+landed in roughly that order. Post-fix measurement showed zero
+`decode_errs` / `idr_reqs` / `render_drops` on a 50 s Mac→Linux
+session at 13 Mbps peak. The current robustness posture is summarised
+in `docs/ARCHITECTURE.md#robustness`.
+
+**Original status (kept verbatim below):** open, needs Linux-side investigation
 **Symptom:** Mid-session freezes of both video AND mouse input simultaneously
 **Environment:** macOS Apple Silicon host → Linux Intel Arc client, fast LAN (LAN ping <2ms, WiFi for at least one end)
 **Confidence:** Symptom is real and reproducible; root cause uncertain.

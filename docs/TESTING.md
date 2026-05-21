@@ -8,12 +8,12 @@ each layer covers, and how to extend it.
 
 | Crate | Tests | Covers |
 | --- | --- | --- |
-| `tether-protocol` | 32 | Wire round-trips for every control variant (handshake, codec negotiation, video packets + `stream_epoch>u16` widening, `VideoFrameMetaEnvelope`, cursor position + control-stream cursor shapes, multi-monitor `DisplayList`, stream lifecycle, `ClientStats`, `ControlMessage::Extension`, audio `Opus`, `PixelFormat` hello extension, `InputEvent::device_id`), fragmenter / reassembler invariants, `HostFrameTimingBuilder` typestate, handshake forward-compat (unknown variant fails decode; trailing bytes fail decode). |
-| `tether-transport` | 4 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning. |
-| `tether-codec` | 3 unit + 8 `#[ignore]` Linux + 2 `#[ignore]` macOS | SW H264 round-trip (test-only); codec_name map sanity; VAAPI encoder/decoder/dma-buf-import on Linux hardware; HEVC + H.264 probe smoke check; per-codec × per-resolution benchmarks (`vaapi::bench`, 4 cells × 3 paths); VideoToolbox encoder construct + H.264 BGRA round-trip on macOS hardware. |
+| `tether-protocol` | 46 | Wire round-trips for every control variant (handshake, codec negotiation, video packets + `stream_epoch>u16` widening, `VideoFrameMetaEnvelope`, cursor position + control-stream cursor shapes, multi-monitor `DisplayList`, stream lifecycle, `ClientStats`, `ControlMessage::Extension`, audio `Opus`, `PixelFormat` hello extension, `InputEvent::device_id`), fragmenter / reassembler invariants (out-of-order, stale eviction, wall-clock-timeout eviction, cross-epoch rejection, duplicate-fragment idempotency, continuation-before-First, `single_packet` reliable-IDR path), `HostFrameTimingBuilder` typestate, forward-compat probes for every wire-serialised tagged enum (`ClientHello`, `ServerHello`, `ControlMessage`, `VideoPacket`, `VideoFrameMetaEnvelope`), clock-sync edges (zero-RTT, negative-processing, near-i64::MAX offset). |
+| `tether-transport` | 6 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning, oversized-datagram local reject, video-keyframe-stream round-trip, oversized-keyframe local reject. |
+| `tether-codec` | 2 default + 8 `#[ignore]` Linux + 2 `#[ignore]` macOS | SW H264 round-trip (test-only); codec_name map sanity; VAAPI encoder/decoder/dma-buf-import on Linux hardware; HEVC + H.264 probe smoke check; per-codec × per-resolution benchmarks (`vaapi::bench`, 4 cells × 3 paths); VideoToolbox encoder construct + H.264 BGRA round-trip on macOS hardware. |
 | `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |
 | `tether-session` | 5 | `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate. |
-| `tether-render` | 4 + 1 `#[ignore]` | Cursor letterbox clipping, aspect ratio; dma-buf zero-copy on hardware. |
+| `tether-render` | 13 + 1 `#[ignore]` | Cursor letterbox clipping, aspect ratio; `LatestFrame` Send+Sync + drop-oldest displacement; dma-buf zero-copy on hardware. |
 | `tether-gpuconvert` | 11 `#[ignore]` | BGRA→NV12 + DMA-BUF round-trip with real Vulkan adapter. |
 
 ## Test categories
@@ -31,12 +31,12 @@ with an explanatory string:
   etc.) so the next person can see at a glance whether their box
   should run them.
 
-Today there are **22 ignored tests**: `tether-codec/vaapi` (8 — 5
-correctness, plus 4 cells of the `bench` matrix that each exercise
-encode_bgra + encode_dmabuf + decode), `tether-codec/videotoolbox` (2 —
-encoder smoke + HEVC constructs), `tether-gpuconvert` (11), and
-`tether-render` (1). They are real and load-bearing on hardware; they
-are not abandoned.
+Today there are **~22 ignored tests** (count varies by platform-cfg):
+`tether-codec/vaapi` (8 — 5 correctness, plus 4 cells of the `bench`
+matrix that each exercise encode_bgra + encode_dmabuf + decode),
+`tether-codec/videotoolbox` (2 — encoder smoke + HEVC constructs),
+`tether-gpuconvert` (11), and `tether-render` (1). They are real and
+load-bearing on hardware; they are not abandoned.
 
 The benchmark cells (one per codec × resolution) live in
 `crates/tether-codec/src/vaapi/bench.rs`. Run with:
@@ -81,10 +81,10 @@ See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
 ## What's deliberately untested today
 
 - **End-to-end host↔client glass-to-glass.** Validated by hand on a
-  Linux↔Linux LAN; no automation. A `tether-session` loopback
-  integration test that runs `HostSession` and `ClientSession`
-  over a `tokio::io::duplex` shim is the natural next addition
-  once those session-level scaffolds exist.
+  Linux↔Linux LAN and Mac→Linux LAN; no automation. A `tether-session`
+  loopback integration test that runs `HostSession` and
+  `ClientSession` over a `tokio::io::duplex` shim is the natural next
+  addition once those session-level scaffolds exist.
 - **The actual rendered pixels.** `tether-render`'s shader output
   is validated by eye, not by image-diff. A headless `wgpu::Surface`
   + image diff against a checked-in fixture is a worthwhile
@@ -92,3 +92,19 @@ See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
 - **`tether-vaapi` directly.** The hand-rolled libva FFI bindings
   are tested transitively through `tether-codec/vaapi/tests.rs`.
   Direct tests would just exercise libva itself.
+- **`VaapiDecoder` SW-fallback rejection.** The hard-error path that
+  fires when the driver hands back a non-VAAPI AVFrame mid-stream
+  isn't unit-tested — reaching it requires either real hardware that
+  bails, or a substantial refactor to extract a test seam. The check
+  is short enough to verify by inspection and the failure mode is
+  observably loud (returns `Err(UnsupportedInputFormat)`, auto-IDR
+  fires from the client).
+- **Encoder parameter-set repetition.** The `drain_encoder` prepend of
+  extradata onto every keyframe is exercised by the hardware VAAPI
+  encoder tests; there's no fake-AVCodecContext path that would let
+  us unit-test the prepend logic in isolation. Verified by inspection
+  + hardware tests.
+- **`max_concurrent_uni_streams` enforcement.** Quinn enforces the
+  limit; we don't have a test that opens more than the cap to confirm
+  the rejection happens at the connection layer. Trusted to quinn's
+  own test suite.

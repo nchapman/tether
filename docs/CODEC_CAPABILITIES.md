@@ -431,33 +431,35 @@ fourcc. Today we support two layouts (`RenderLayout::Biplanar` and
 
 ---
 
-## Concrete consequences for the protocol matrix
+## Shipped protocol matrix
 
-`PROFILE_PREFERENCE` today contains three entries (HEVC 4:4:4 8,
-HEVC 4:2:0 8, H.264 4:2:0 8). Once the probes above land we
-should add, in order from most-to-least preferred:
+`PROFILE_PREFERENCE` now contains five entries (best-first):
 
-1. HEVC 4:4:4 10-bit  *(if both ends pass probes; macOS gates on
-   `xf44` capture working)*
-2. HEVC 4:4:4 8-bit   *(existing — adds macOS host once `'444v'`
-   capture probe lands)*
-3. HEVC 4:2:2 10-bit  *(if probes pass; useful step between 4:2:0
-   and 4:4:4 for chroma fidelity)*
-4. HEVC 4:2:2 8-bit
-5. HEVC 4:2:0 10-bit  *(Main10 — HDR-friendly)*
-6. HEVC 4:2:0 8-bit   *(existing baseline)*
-7. H.264 4:2:0 8-bit  *(existing fallback)*
+1. HEVC 4:4:4 10-bit — `VideoProfile::HEVC_10BIT_444`
+2. HEVC 4:4:4 8-bit  — `VideoProfile::HEVC_8BIT_444`
+3. HEVC 4:2:0 10-bit — `VideoProfile::HEVC_10BIT_420` (Main10)
+4. HEVC 4:2:0 8-bit  — `VideoProfile::HEVC_8BIT_420` (Main)
+5. H.264 4:2:0 8-bit — `VideoProfile::H264_8BIT_420` (universal floor)
 
-`VideoProfile { codec, chroma, bit_depth }` already has the right
-shape — bit_depth is a `u8` on the wire. The renderer's
-`RenderLayout` enum gains a 10-bit biplanar variant, and the
-encoder/decoder construction paths gain a bit_depth dimension.
+`VideoProfile { codec, chroma, bit_depth }` has a `u8` `bit_depth`
+field. The renderer's `RenderLayout::Biplanar16` variant + the
+`luma_scale` shader uniform handle the 10-bit display side; the
+encoder/decoder probes handle the host side. The negotiator picks
+the first entry that appears in *both* the host's
+`supported_encode_profiles()` and the client's advertised
+`supported_decode_profiles()` — anything a given device's hardware
+can't deliver gets filtered out by the probe layer automatically.
 
-The principle from the introduction reapplies: every new entry
-above is conditional on a probe, not an assumption. The day
-Apple or AMD ships a driver that flips one of the "no documented
-support" cases into "works," we want our probe to discover it
-without code changes.
+HEVC 4:2:2 8/10-bit is *not* yet in the matrix — it requires
+`ChromaSubsampling::Yuv422` on the wire, which is a separate wire
+change. The decode-probe fixtures for it are checked in
+(`hevc_yuv422_*bit.idr`) ready for that change.
+
+The principle from the introduction reapplies: every entry above
+is conditional on a probe, not an assumption. The day Apple or
+AMD ships a driver that flips one of the "no documented support"
+cases into "works," the probe layer discovers it without code
+changes here.
 
 ---
 

@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     // `chosen_codec` / `chosen_chroma` fields carry the same info for
     // legacy hosts; the structured extension is authoritative on hosts
     // that emit it.
-    let mut negotiated_profile: VideoProfile = server_body
+    let negotiated_profile: VideoProfile = server_body
         .extensions
         .get(SERVER_ENCODE_PROFILE_EXTENSION_KEY)
         .and_then(|bytes| match tether_protocol::decode::<VideoProfile>(bytes) {
@@ -182,18 +182,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Defense-in-depth bit_depth clamp on the negotiated profile. The
-    // host's PROFILE_PREFERENCE list only contains 8-bit entries today,
-    // but a hostile or buggy host could echo a different value in the
-    // structured extension. Clamp to 8 so any downstream consumer of
-    // negotiated_profile.bit_depth (logs today, code in the future)
-    // never sees an out-of-band value.
-    if negotiated_profile.bit_depth != 8 {
-        warn!(
-            bit_depth = negotiated_profile.bit_depth,
-            "host echoed unsupported bit_depth in encode-profile extension; clamping to 8"
+    // Sanity-check the host's chosen profile against what this client
+    // actually advertised it could decode. The host should always pick
+    // from the intersection set, but a hostile / buggy host could echo
+    // a profile we never offered. Treat that as a session-fatal
+    // wire-protocol error rather than silently rendering with the
+    // wrong pipeline.
+    let client_caps = tether_codec::probe::supported_decode_profiles();
+    if !client_caps.contains(&negotiated_profile) {
+        anyhow::bail!(
+            "host chose profile {:?} which this client did not advertise \
+             ({} entries in supported_decode_profiles)",
+            negotiated_profile,
+            client_caps.len()
         );
-        negotiated_profile.bit_depth = 8;
     }
 
     // Render channel: producer is the recv loop, consumer is the wgpu

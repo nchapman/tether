@@ -177,6 +177,30 @@ impl VideoProfile {
         chroma: ChromaSubsampling::Yuv444,
         bit_depth: 8,
     };
+
+    /// HEVC Main10 (4:2:0 10-bit). The 10-bit equivalent of the
+    /// Main rung — same chroma resolution, finer quantisation grid
+    /// (10 bits per sample instead of 8). Visible benefit on
+    /// gradient-heavy desktop content where 8-bit banding shows up.
+    /// macOS hosts produce this via VT HEVC Main10 encode; Linux
+    /// hosts produce it via VAAPI Main10 (driver support varies —
+    /// the probe layer answers).
+    pub const HEVC_10BIT_420: Self = Self {
+        codec: CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 10,
+    };
+
+    /// HEVC Main 4:4:4 10-bit — full chroma resolution + 10-bit
+    /// precision. The top rung for quality. macOS VT confirmed to
+    /// accept this end-to-end (encoder + decoder); Linux VAAPI
+    /// driver support is sparse and the probe layer surfaces the
+    /// reality per device.
+    pub const HEVC_10BIT_444: Self = Self {
+        codec: CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv444,
+        bit_depth: 10,
+    };
 }
 
 /// Hello extension key. Client → host. Payload: bincode

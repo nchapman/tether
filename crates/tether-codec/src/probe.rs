@@ -44,14 +44,25 @@ use crate::videotoolbox::probe::VideoToolboxProbe as ActiveProbe;
 /// entry that appears in *both* the host's encode capabilities and the
 /// client's advertised decode capabilities.
 ///
-/// Anchored to desktop content quality. HEVC Main444 8-bit goes first
+/// Anchored to desktop content quality. 4:4:4 goes ahead of 4:2:0
 /// because it preserves antialiased text and UI chroma detail that
-/// 4:2:0 visibly smears. H.264 4:4:4 is intentionally absent — VAAPI
-/// has no encode profile for it, and there is no other host backend
-/// in this build yet (Sunshine confirms the same gap in
-/// refs/Sunshine/src/platform/linux/vaapi.cpp:202).
+/// 4:2:0 visibly smears; 10-bit goes ahead of 8-bit at each chroma
+/// rung because the extra precision suppresses gradient banding on
+/// desktop content where flat colour fields are common. The probe
+/// layer filters out entries this hardware can't deliver, so the
+/// preference list can stay aspirational without breaking sessions
+/// on lower-capability hardware.
+///
+/// H.264 4:4:4 is intentionally absent — VAAPI has no encode profile
+/// for it, and there is no other host backend in this build yet
+/// (Sunshine confirms the same gap in
+/// refs/Sunshine/src/platform/linux/vaapi.cpp:202). Yuv422 is
+/// likewise absent until the wire-side `ChromaSubsampling` enum
+/// grows the variant.
 pub const PROFILE_PREFERENCE: &[VideoProfile] = &[
+    VideoProfile::HEVC_10BIT_444,
     VideoProfile::HEVC_8BIT_444,
+    VideoProfile::HEVC_10BIT_420,
     VideoProfile::HEVC_8BIT_420,
     VideoProfile::H264_8BIT_420,
 ];
@@ -428,12 +439,17 @@ mod negotiation_tests {
 
     #[test]
     fn preference_order_is_desktop_quality_first() {
-        // Pin the preference order — a future refactor that swaps the
-        // first two entries would silently regress desktop sessions
-        // from HEVC 4:4:4 to HEVC 4:2:0.
-        assert_eq!(PROFILE_PREFERENCE[0], VideoProfile::HEVC_8BIT_444);
-        assert_eq!(PROFILE_PREFERENCE[1], VideoProfile::HEVC_8BIT_420);
-        assert_eq!(PROFILE_PREFERENCE[2], VideoProfile::H264_8BIT_420);
+        // Pin the preference order — a future refactor that reorders
+        // entries would silently regress desktop sessions to a lower
+        // rung than the hardware can support. The principle: better
+        // chroma first (4:4:4 > 4:2:0), then higher bit depth
+        // (10-bit > 8-bit) at each chroma rung, then the legacy
+        // H.264 floor.
+        assert_eq!(PROFILE_PREFERENCE[0], VideoProfile::HEVC_10BIT_444);
+        assert_eq!(PROFILE_PREFERENCE[1], VideoProfile::HEVC_8BIT_444);
+        assert_eq!(PROFILE_PREFERENCE[2], VideoProfile::HEVC_10BIT_420);
+        assert_eq!(PROFILE_PREFERENCE[3], VideoProfile::HEVC_8BIT_420);
+        assert_eq!(PROFILE_PREFERENCE[4], VideoProfile::H264_8BIT_420);
     }
 
     #[test]
@@ -459,18 +475,6 @@ mod macos_probe_tests {
     use super::*;
     use crate::profile_probe::{fixture_for, ProfileProbe};
     use crate::videotoolbox::probe::VideoToolboxProbe;
-
-    /// Run the encode + decode probes for a single profile, returning the
-    /// `(encode, decode)` capability pair. Same shape as `probe_one`'s
-    /// per-profile body, factored out so the hardware test can ask about
-    /// profiles that aren't in `PROFILE_PREFERENCE` yet.
-    fn probe(profile: VideoProfile) -> (bool, bool) {
-        let encode = VideoToolboxProbe::probe_encode(profile).is_ok();
-        let decode = fixture_for(profile)
-            .map(|f| VideoToolboxProbe::probe_decode(profile, f).is_ok())
-            .unwrap_or(false);
-        (encode, decode)
-    }
 
     #[test]
     #[ignore = "requires macOS + VideoToolbox"]
@@ -545,39 +549,38 @@ mod macos_probe_tests {
         assert!(h264.decode, "H.264 Yuv420 decode is universal on Macs with VT");
     }
 
-    /// Direct ground-truth probe for profiles that aren't in
-    /// `PROFILE_PREFERENCE` yet. Captures what the M-series VT wrapper
-    /// actually does for the 10-bit profiles we plan to negotiate once
-    /// the renderer + capture sides land — without committing to the
-    /// matrix change before those exist.
-    ///
-    /// This test does not assert hard pass/fail per profile; the docs
-    /// (`docs/CODEC_CAPABILITIES.md`) carry the expected matrix per
-    /// platform. The print-on-`--nocapture` output is the deliverable
-    /// for an investigator running on a new Mac model.
+    /// Records the M-series probe matrix for the 10-bit entries now
+    /// that they're in `PROFILE_PREFERENCE`. When encode succeeds we
+    /// also exercise the checked-in fixture through the decoder —
+    /// that asserts VT can hardware-decode a known-good bitstream
+    /// at this profile. It does *not* prove the freshly-encoded
+    /// bytes are structurally 10-bit (the encoder may downsample
+    /// silently); a real encode→decode round-trip with chroma /
+    /// IOSurface-fourcc assertion is the next-stronger probe and
+    /// is tracked outside this commit.
     #[test]
     #[ignore = "requires macOS + VideoToolbox"]
-    fn macos_extended_probe_records_ground_truth() {
-        let probes = [
-            ("HEVC Main10 (Yuv420 10-bit)", VideoProfile {
-                codec: CodecKind::Hevc,
-                chroma: ChromaSubsampling::Yuv420,
-                bit_depth: 10,
-            }),
-            ("HEVC Main444 10-bit (Yuv444 10-bit)", VideoProfile {
-                codec: CodecKind::Hevc,
-                chroma: ChromaSubsampling::Yuv444,
-                bit_depth: 10,
-            }),
-        ];
-        for (label, profile) in probes {
-            let (encode, decode) = probe(profile);
-            // --nocapture surfaces these so an investigator on new
-            // silicon can update the doc matrix from the empirical
-            // result without re-deriving it from scratch.
+    fn macos_real_probe_handles_10_bit_entries() {
+        let caps = supported_profiles();
+        for profile in [VideoProfile::HEVC_10BIT_420, VideoProfile::HEVC_10BIT_444] {
+            let cap = caps
+                .iter()
+                .find(|c| c.profile == profile)
+                .unwrap_or_else(|| panic!("{profile:?} should appear in capability list"));
             eprintln!(
-                "macos extended probe: {label:<40} encode={encode:<5} decode={decode}"
+                "macos 10-bit probe: {profile:?} encode={} decode={}",
+                cap.encode, cap.decode
             );
+            if cap.encode {
+                let fixture = fixture_for(profile)
+                    .unwrap_or_else(|| panic!("{profile:?} fixture is checked in"));
+                assert!(
+                    VideoToolboxProbe::probe_decode(profile, fixture).is_ok(),
+                    "VT reported encode=true for {profile:?} but cannot \
+                     hardware-decode the matching checked-in fixture — \
+                     the decoder is failing on a known-good 10-bit bitstream"
+                );
+            }
         }
     }
 }

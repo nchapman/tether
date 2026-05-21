@@ -28,6 +28,24 @@ const PROBE_BITRATE_KBPS: u32 = 1_000;
 
 impl ProfileProbe for VaapiProbe {
     fn probe_encode(profile: VideoProfile) -> Result<()> {
+        // Temporary gate: the Linux gpuconvert bridges (Nv12DmaBuf /
+        // Yuv444DmaBuf) are 8-bit only today. The matching 10-bit
+        // shaders (bgra_to_p010.wgsl / bgra_to_p410.wgsl) exist as
+        // scaffolding but aren't plumbed into the production
+        // GpuConvertBridge variants yet. If a driver returns
+        // encode=true for a 10-bit profile here, the host's
+        // negotiator could pick it and then feed 8-bit dma-bufs to
+        // the 10-bit encoder — a silent format mismatch. Gate at the
+        // probe layer so the profile stays out of
+        // `supported_encode_profiles()` until the bridge is wired.
+        if profile.bit_depth != 8 {
+            return Err(crate::CodecError::NoHardwareCodec(format!(
+                "VAAPI 10-bit encode ({:?} {}-bit) is gated pending the \
+                 gpuconvert P010/P410 bridge wiring; remove this guard once \
+                 Nv12DmaBuf / Yuv444DmaBuf grow 10-bit variants",
+                profile.chroma, profile.bit_depth
+            )));
+        }
         let mut enc =
             VaapiEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)?;
         // Drive a single BGRA frame through the encoder so any driver

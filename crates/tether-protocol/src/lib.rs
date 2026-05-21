@@ -418,6 +418,54 @@ mod tests {
         );
     }
 
+    /// Pin the 10-bit profile constants on the wire: the bincode shape
+    /// for `VideoProfile { codec, chroma, bit_depth }` must round-trip
+    /// 10 cleanly so a session that negotiates HEVC Main10 / Main 4:4:4
+    /// 10-bit doesn't get the bit_depth byte silently corrupted. Pinned
+    /// alongside the 8-bit cases (no shared body) so the bit_depth axis
+    /// gets independent coverage from the codec+chroma axes — a
+    /// future refactor that drops or reorders the field is caught here.
+    #[test]
+    fn ten_bit_video_profile_round_trips() {
+        use crate::control::VideoProfile;
+        for profile in [
+            VideoProfile::HEVC_10BIT_420,
+            VideoProfile::HEVC_10BIT_444,
+        ] {
+            let bytes = encode(&profile).unwrap();
+            let decoded: VideoProfile = decode(&bytes).unwrap();
+            assert_eq!(decoded, profile);
+            assert_eq!(decoded.bit_depth, 10);
+        }
+    }
+
+    /// Regression guard: `bit_depth` must stay a plain `u8` on the
+    /// wire. If this field is ever changed to a closed enum (e.g.
+    /// `enum BitDepth { Eight, Ten }`), this test stops compiling,
+    /// surfacing the wire-compat break before it ships. The
+    /// behavioural forward-compat property — that older negotiators
+    /// gracefully ignore an unrecognised depth instead of panicking —
+    /// is covered by `returns_none_when_disjoint` in
+    /// `tether-codec::probe`.
+    #[test]
+    fn future_bit_depth_decodes_as_raw_u8() {
+        use crate::control::{ChromaSubsampling, CodecKind, VideoProfile};
+        let future = VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 12,
+        };
+        let bytes = encode(&future).unwrap();
+        let decoded: VideoProfile = decode(&bytes).unwrap();
+        assert_eq!(decoded.bit_depth, 12);
+        // The codec/chroma fields stay readable — the negotiator can
+        // skip the profile cleanly even when the bit_depth is one it
+        // doesn't recognise, instead of getting tripped by a decode
+        // error mid-handshake.
+        assert_eq!(decoded.codec, CodecKind::Hevc);
+        assert_eq!(decoded.chroma, ChromaSubsampling::Yuv420);
+    }
+
     #[test]
     fn unknown_video_profile_codec_fails_decode() {
         // Forward-compat: a future host that advertises an unknown

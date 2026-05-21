@@ -1,16 +1,20 @@
 # Tether — Architecture
 
 Tether is a low-latency open-source remote desktop in Rust. The first
-working end-to-end target is **Linux ↔ Linux on a LAN over QUIC**, with
-hardware H.264 or HEVC (negotiated per session) at 60 fps default and
-a zero-copy capture→encode→decode→render path. **macOS host (capture +
-encode + input injection) compiles and the encoder round-trips on
-Apple Silicon** via ScreenCaptureKit, VideoToolbox, and CGEvent;
+working end-to-end target is **Linux ↔ Linux on a LAN over QUIC**,
+with hardware H.264 or HEVC (negotiated per session) at 60 fps default
+and a zero-copy capture→encode→decode→render path. Sessions where both
+ends are on capable hardware (Intel Tiger Lake+ / AMD VCN3+) now
+negotiate **HEVC Main 4:4:4 8-bit** for desktop-content chroma
+fidelity over the 4:2:0 baseline. **macOS host** (ScreenCaptureKit
+capture, VideoToolbox encoder, CGEvent input injection) is in active
+development on Apple Silicon — the encoder round-trips and the
+IOSurface zero-copy hot path is wired through `encode_iosurface_frame`;
 end-to-end LAN streaming from a Mac to a Linux client is the next
-demo milestone. The macOS client (VideoToolbox decode + Metal render
-+ winit input capture) and the Windows backends (DXGI / Media
-Foundation / D3D11) are additional modules per platform, not a
-rewrite of the core path.
+demo milestone. The macOS client (VideoToolbox decode + Metal
+IOSurface→wgpu render + winit input capture) is the chunk after that.
+Windows backends (DXGI / Media Foundation / D3D11) are additional
+modules per platform, not a rewrite of the core path.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -48,7 +52,11 @@ the relevant crate (e.g. `tether-capture/src/macos.rs`).
 ## The frame hot path
 
 End-to-end for one frame, host on a Linux Wayland session, client on
-any Linux machine:
+any Linux machine. The **macOS host** variant diverges only inside the
+capture→encoder hop (ScreenCaptureKit hands NV12 IOSurfaces straight
+to VideoToolbox — no gpuconvert step); the rest of the pipeline from
+`FrameFragmenter` onward is identical. See the dedicated **macOS host
+(shipping today)** subsection further down.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -257,7 +265,7 @@ Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
 renderer a `GpuFrameGuard` (the shared `GpuResourceGuard` re-export) that
 holds the source `AVFrame` ref alive until the renderer drops it.
 
-**macOS host (shipping today).** ScreenCaptureKit emits NV12
+**macOS host (in active development).** ScreenCaptureKit emits NV12
 `CMSampleBuffer`s; `tether-capture::macos` unwraps each to its
 `IOSurface` and forwards as `CapturedFrame::Gpu(GpuCapturedSource::IOSurface(...))`.
 `tether-codec::videotoolbox::VideoToolboxEncoder` wraps the IOSurface
@@ -265,12 +273,23 @@ in a fresh `CVPixelBuffer` (`CVPixelBufferCreateWithIOSurface`) and
 feeds it to `h264_videotoolbox` / `hevc_videotoolbox` via the AVFrame
 `data[3]` slot — no NV12 conversion step is needed (SCK delivers
 NV12 video range natively), so the macOS host has no analogue of
-`tether-gpuconvert`. Input injection is via `enigo`'s CGEvent
-backend, sharing the modifier-reconciliation and HID→Key code with
-the Linux libei path through `inject::enigo_backend`. macOS client
-(VideoToolbox decode + Metal IOSurface→wgpu render + winit input
-capture) is a separate plan; for now a macOS host streams to a
-Linux VAAPI client.
+`tether-gpuconvert`, no `BridgeState`, and no chroma-aware dispatch
+(VideoToolbox is 4:2:0 only — see the per-platform capability gate
+in the negotiation section above). Input injection is via `enigo`'s
+CGEvent backend, sharing the modifier-reconciliation and HID→Key
+code with the Linux libei path through `inject::enigo_backend`.
+
+`encode_iosurface_frame` in `apps/tether-host/src/main.rs` is the
+macOS sibling of `encode_gpu_frame`: same `EncoderSlot` shape, same
+post-encode `FrameFragmenter` path — just simpler in the middle.
+
+**macOS client (next).** The decoder + render path is the next chunk
+of macOS work — VideoToolbox decoder constructing per the negotiated
+codec, IOSurface output, Metal → wgpu import via
+`CAMetalLayer`/`MTLTextureFromIOSurface`, present through the same
+wgpu surface the Linux client uses. Until that lands, `probe_decoder`
+on macOS returns a clear "not yet implemented" error and a macOS host
+streams to a Linux VAAPI client.
 
 ---
 
@@ -392,14 +411,42 @@ The chosen profile is echoed in `tether.cap.video.encode-profile`;
 information in legacy form so older clients can interoperate. Absent
 client extension is treated as the universal floor.
 
-Both the encoder (`VaapiEncoder::new` takes `VideoProfile`, switches
-`sw_format` + VAAPI `profile=` string + BGRA→input swscale stage),
-the gpuconvert bridge (NV12 with two-plane R8+Rg8 export vs. YUV444
-with three-plane R8 export), and the renderer (NV12 fragment shader
-with `Y + UV` bind group vs. YUV444 sibling with `Y + U + V`) branch
-on the negotiated chroma at construction. Mid-session chroma switch
-is not supported — same rebuild path as a mid-session resolution
-change (encoder + bridge + render pipeline all reset).
+Both the VAAPI encoder (`VaapiEncoder::new` takes `VideoProfile`,
+switches `sw_format` + the AVCodecContext `profile` field for
+`AV_PROFILE_HEVC_REXT` on 4:4:4 + BGRA→input swscale stage; color
+primaries / transfer / colorspace / range tagged explicitly on the
+context so the SPS VUI doesn't say "Unspecified"), the gpuconvert
+bridge (NV12 with two-plane R8+Rg8 export vs. YUV444 with three-plane
+R8 export), and the renderer (NV12 fragment shader with `Y + UV` bind
+group vs. YUV444 sibling with `Y + U + V`) branch on the negotiated
+chroma at construction. Mid-session chroma switch is not supported —
+same rebuild path as a mid-session resolution change (encoder +
+bridge + render pipeline all reset).
+
+**Per-platform capability gate.** `probe_encoder_profile` on macOS
+returns `false` for any non-Yuv420 profile because VideoToolbox
+doesn't expose HEVC Main444 in hardware (Apple Silicon ships HEVC
+Main and Main10 only; ProRes 4444 is a separate codec). A macOS host
+therefore never negotiates 4:4:4 even when the Linux client
+advertises it; the intersection lands on the universal floor (H.264
+4:2:0 8-bit) or HEVC 4:2:0 8-bit depending on what the client also
+supports.
+
+**Bitrate is chroma-aware.** `derive_bitrate_kbps` takes a
+`VideoProfile` and applies a 1.4× multiplier for `Yuv444` on top of
+the per-codec efficiency factor. 4:4:4 carries 3× the chroma samples
+of 4:2:0; rate-control absorbs some of that but not all, so a chroma-
+blind budget produces visibly blocky chroma in the same numbers that
+were sized for subsampled video.
+
+**Renderer accepts both YUV444 dma-buf shapes.** `vaExportSurfaceHandle`
+with `SEPARATE_LAYERS` is a *hint* the libva spec lets drivers ignore.
+Intel media-driver and current mesa return three R8 layers (one plane
+each); older mesa and nvidia-vaapi-driver return one `YU24` layer
+carrying three plane offsets. The import path accepts either. The
+encoder-side `yuv444_dmabuf_to_codec_frame` produces the
+one-layer/three-plane form, which matches VAAPI's PRIME_2 *importer*
+expectation on Main444.
 
 The `tether.pixel-format` extension echoes the on-wire pixel format
 of the encoded stream (`Nv12` for 4:2:0, `Yuv444p` for HEVC Main444)

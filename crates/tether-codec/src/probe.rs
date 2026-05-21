@@ -473,9 +473,6 @@ mod negotiation_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod macos_probe_tests {
     use super::*;
-    use crate::profile_probe::{fixture_for, ProfileProbe};
-    use crate::videotoolbox::probe::VideoToolboxProbe;
-
     #[test]
     #[ignore = "requires macOS + VideoToolbox"]
     fn macos_real_probe_matches_hardware() {
@@ -505,27 +502,18 @@ mod macos_probe_tests {
             .find(|c| c.profile == VideoProfile::HEVC_8BIT_444)
             .expect("HEVC 4:4:4 should appear in capability list");
         // 4:4:4 8-bit encode acceptance varies by FFmpeg build and
-        // silicon generation — Homebrew's ffmpeg@7+ on M-series accepts
-        // NV24 input; older or system FFmpeg may not plumb it. Record
-        // the outcome and tighten the test if a CI matrix establishes
-        // a hard floor. The decode side is the load-bearing assertion:
-        // VT must produce a `Frame::Gpu` (not silently fall back to
-        // software), and *when* encode succeeds the same fixture must
-        // round-trip — if encode lies (accepts then silently fails the
-        // pipeline), the chained decode check below would catch it.
-        if yuv444.encode {
-            let fixture = fixture_for(VideoProfile::HEVC_8BIT_444)
-                .expect("HEVC 4:4:4 8-bit fixture is checked in");
-            assert!(
-                VideoToolboxProbe::probe_decode(VideoProfile::HEVC_8BIT_444, fixture).is_ok(),
-                "VT reported encode=true for HEVC 4:4:4 8-bit but the matching decode \
-                 fixture failed to produce a hardware frame — encoder is likely \
-                 silent-falling-back or producing a malformed bitstream"
-            );
-        } else {
+        // silicon generation. Encode=true here is now a strong signal
+        // (not just "encoder didn't error"): the probe's encode path
+        // round-trips its own output through a VT decoder and asserts
+        // the resulting IOSurface fourcc lands in the `'444v'`/`'444f'`
+        // family — silent downsample to 4:2:0 would surface as the
+        // fourcc check failing and encode=false. So we just record
+        // the result here without further verification.
+        if !yuv444.encode {
             eprintln!(
                 "macos probe: HEVC 4:4:4 8-bit encode=false on this FFmpeg build; \
-                 Main444 encode unavailable (expected on older ffmpeg / pre-M-series)"
+                 Main444 encode unavailable (expected on older ffmpeg / pre-M-series, \
+                 or VT silently downsampling — round-trip fourcc check rejected)"
             );
         }
         assert!(
@@ -550,14 +538,14 @@ mod macos_probe_tests {
     }
 
     /// Records the M-series probe matrix for the 10-bit entries now
-    /// that they're in `PROFILE_PREFERENCE`. When encode succeeds we
-    /// also exercise the checked-in fixture through the decoder —
-    /// that asserts VT can hardware-decode a known-good bitstream
-    /// at this profile. It does *not* prove the freshly-encoded
-    /// bytes are structurally 10-bit (the encoder may downsample
-    /// silently); a real encode→decode round-trip with chroma /
-    /// IOSurface-fourcc assertion is the next-stronger probe and
-    /// is tracked outside this commit.
+    /// that they're in `PROFILE_PREFERENCE`. The probe layer already
+    /// does encode → decode → IOSurface-fourcc-check internally (see
+    /// `VideoToolboxProbe::probe_encode`), so encode=true here is a
+    /// load-bearing signal that bitstream chroma + bit-depth match
+    /// the request. Real end-to-end hardware coverage of the same
+    /// path (with extra assertions on per-fixture IOSurface fourcc
+    /// and chroma-detail survival) lives in
+    /// `videotoolbox/tests.rs::videotoolbox_round_trip_chroma_matrix`.
     #[test]
     #[ignore = "requires macOS + VideoToolbox"]
     fn macos_real_probe_handles_10_bit_entries() {
@@ -571,16 +559,9 @@ mod macos_probe_tests {
                 "macos 10-bit probe: {profile:?} encode={} decode={}",
                 cap.encode, cap.decode
             );
-            if cap.encode {
-                let fixture = fixture_for(profile)
-                    .unwrap_or_else(|| panic!("{profile:?} fixture is checked in"));
-                assert!(
-                    VideoToolboxProbe::probe_decode(profile, fixture).is_ok(),
-                    "VT reported encode=true for {profile:?} but cannot \
-                     hardware-decode the matching checked-in fixture — \
-                     the decoder is failing on a known-good 10-bit bitstream"
-                );
-            }
+            // Per-profile assertion would need machine-specific data
+            // (M1 vs M4, ffmpeg version) — we record + let the named
+            // hardware tests do the per-case asserts.
         }
     }
 }

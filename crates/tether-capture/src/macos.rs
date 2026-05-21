@@ -378,13 +378,19 @@ impl ProbeFormat {
     }
 
     /// SCK's named enum variants are Apple-documented as accepted by
-    /// `pixelFormat`. The `Unknown(FourCharCode)` escape hatch bypasses
-    /// that validation, so `start_capture` may return Ok for an
-    /// undocumented code without SCK actually delivering frames in it.
-    /// Probes for these variants must verify a delivered sample's
-    /// fourcc matches the request.
+    /// `pixelFormat` — `start_capture` Ok is a reliable signal for
+    /// those (BGRA, 420v, 420f). The `Unknown(FourCharCode)` escape
+    /// hatch bypasses that validation, so `start_capture` may return
+    /// Ok for an undocumented code without SCK actually delivering
+    /// frames in it; probes for those must verify a delivered
+    /// sample's fourcc matches the request. `xf44` is the documented
+    /// 10-bit 4:4:4 capture format but support is silicon-generation
+    /// dependent — some configurations (pre-M3 with stock macOS)
+    /// silently accept the config and deliver zero frames — so it
+    /// also gets the frame-arrival check despite being a named
+    /// enum variant.
     fn needs_frame_arrival_check(self) -> bool {
-        matches!(self, Self::Yuv444v | Self::Yuv444f)
+        matches!(self, Self::Yuv444v | Self::Yuv444f | Self::Xf44)
     }
 
     fn apply(self, caps: &mut SckCaptureCapability, accepted: bool) {

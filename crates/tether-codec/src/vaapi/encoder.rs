@@ -635,6 +635,21 @@ impl Encoder for VaapiEncoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
+        // Mirror of the bit_depth guard in submit_dmabuf — the BGRA
+        // path goes through swscale which *will* upscale 8-bit data
+        // into a 10-bit sw_format, producing low-precision 10-bit
+        // output rather than the expected 10-bit-fidelity content.
+        // The probe layer uses this method to verify (chroma,
+        // bit_depth) capability and is intentionally exempt; the
+        // production send loop should never reach here for a 10-bit
+        // session because PROFILE_PREFERENCE → probe → negotiation
+        // would have surfaced an Err earlier. If it does, fail
+        // loudly rather than ship 8-bit-source-as-10-bit. Remove
+        // both guards (here and submit_dmabuf) together when the
+        // gpuconvert P010/P410 bridge is wired.
+        if self.bit_depth != 8 {
+            return Err(CodecError::UnsupportedInputFormat);
+        }
         let height = self.height as usize;
         let expected = self.bgra_row_bytes * height;
         if bgra.len() != expected {

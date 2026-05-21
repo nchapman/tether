@@ -3,18 +3,26 @@
 Tether is a low-latency open-source remote desktop in Rust. The first
 working end-to-end target is **Linux ↔ Linux on a LAN over QUIC**,
 with hardware H.264 or HEVC (negotiated per session) at 60 fps default
-and a zero-copy capture→encode→decode→render path. Sessions where both
-ends are on capable hardware (Intel Tiger Lake+ / AMD VCN3+) now
-negotiate **HEVC Main 4:4:4 8-bit** for desktop-content chroma
-fidelity over the 4:2:0 baseline. **macOS host** (ScreenCaptureKit
-capture, VideoToolbox encoder, CGEvent input injection) is in active
-development on Apple Silicon — the encoder round-trips and the
-IOSurface zero-copy hot path is wired through `encode_iosurface_frame`;
-end-to-end LAN streaming from a Mac to a Linux client is the next
-demo milestone. The macOS client (VideoToolbox decode + Metal
-IOSurface→wgpu render + winit input capture) is the chunk after that.
-Windows backends (DXGI / Media Foundation / D3D11) are additional
-modules per platform, not a rewrite of the core path.
+and a zero-copy capture→encode→decode→render path. Profile negotiation
+is **probe-driven** — every layer (capture, encode, decode, renderer
+import) advertises only what a real attempt against the live driver
+has confirmed it can deliver. The shipped preference list ranks
+4:4:4 over 4:2:0 (text fidelity beats subsampled chroma on desktop
+content), and 10-bit over 8-bit at each chroma rung (precision
+beats banding). See `docs/CODEC_CAPABILITIES.md` for the per-layer
+hard-limit vs. probed framing and the M-series VT capability matrix.
+**macOS host** (ScreenCaptureKit capture, VideoToolbox encoder,
+CGEvent input injection) is wired end-to-end via
+`encode_iosurface_frame`; the live capture is hardcoded to NV12
+(`'420v'`) 8-bit pending SCK→live wiring (the SCK probe records
+that `'444v'`, `'444f'`, and `xf44` are reachable on M4 Max).
+**macOS client** (VideoToolbox decode + Metal IOSurface→wgpu
+render + winit input capture) covers HEVC Main, Main10, and Main
+4:4:4 (8 and 10-bit) decode — the renderer's biplanar 8 / biplanar
+16 / packed XYUV layouts cover the IOSurface and dma-buf shapes
+each profile produces. Windows backends (DXGI / Media Foundation
+/ D3D11) are additional modules per platform, not a rewrite of
+the core path.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -520,10 +528,18 @@ Listed to set expectations; each is a real follow-up, not a "never":
   decoder probe (no `vaapi_av1` encode entrypoint on most current
   Intel iGPUs) and a separate codec_id path. The probe stub returns
   `CodecNotFound` for AV1 today.
-- **HEVC Main10 / HDR.** HEVC Main 8-bit only. Main10 requires a
-  10-bit capture path on the host (PipeWire format negotiation) and
-  an HDR-aware renderer on the client (BT.2020 + PQ/HLG in the
-  fragment shader). Both are real, neither exists yet.
+- **HDR (BT.2020 + PQ / HLG).** The 10-bit *bit-depth* path is in
+  place (see `docs/CODEC_CAPABILITIES.md`): `PROFILE_PREFERENCE`
+  advertises HEVC Main10 and HEVC Main 4:4:4 10-bit; the renderer
+  has an R16/Rg16 biplanar `RenderLayout::Biplanar16` for both
+  Linux dma-buf and macOS IOSurface (`'P010'`/`'P410'`/`'xf44'`)
+  paths; the shader carries a `luma_scale` uniform that compensates
+  10-in-16 MSB-aligned sampler reads. What's *not* yet in place is
+  HDR signalling proper (BT.2020 primaries, PQ / HLG transfer
+  curves in the EOTF dispatch, HDR-capable surface format) — the
+  renderer hard-pins BT.709 limited range regardless of `bit_depth`.
+  10-bit on the wire today buys precision (less banding on
+  gradients) without HDR luminance range.
 - **NAT traversal.** LAN direct only. QUIC's pluggable transport makes
   adding ICE later straightforward; today the user runs the client
   binary with a host IP.

@@ -132,10 +132,22 @@ async fn handle_client(
     // clone. Logged at debug because every reconnect would otherwise
     // repeat the same line; the per-session negotiated result below
     // is the operator-relevant signal.
-    let host_encode_profiles = supported_encode_profiles();
+    // What VT / VAAPI's encode probe layer says we can produce
+    // (encoder + round-trip verified). Then filter that down to what
+    // the *live capture → encoder* bridge can actually deliver
+    // today — on macOS the live SCK stream is hardcoded to NV12
+    // (420v) 8-bit and the IOSurface fast path errors for any other
+    // input, so e.g. HEVC Main10 — which the encoder probe correctly
+    // confirms VT supports via the CPU swscale path — can't ride
+    // the live pipeline yet. The capture-aware filter prevents the
+    // negotiator from picking a profile that would crash at first
+    // frame. The filter is a no-op on Linux today (the VAAPI probe
+    // already gates 10-bit at the encoder layer pending the
+    // gpuconvert P010/P410 bridge wiring).
+    let host_encode_profiles = capture_filtered_encode_profiles(supported_encode_profiles());
     tracing::debug!(
         host_encode_profiles = ?host_encode_profiles,
-        "host video encode capabilities"
+        "host video encode capabilities (capture-bridge filtered)"
     );
 
     let mut chosen_profile_outer: Option<VideoProfile> = None;
@@ -199,11 +211,18 @@ async fn handle_client(
             // Advertise pixel format up front so the client's
             // decoder import path (VAAPI / VT / MF) doesn't have to
             // wait on the first SPS to decide between formats. The
-            // value matches the negotiated chroma — NV12 for 4:2:0,
-            // YUV444P for HEVC Main444. P010 lands with HDR.
-            let pixel_format = match chosen.map(|p| p.chroma) {
-                Some(ChromaSubsampling::Yuv444) => {
+            // value matches the negotiated (chroma, bit_depth) —
+            // NV12 for 4:2:0 8-bit, P010 for 4:2:0 10-bit, Yuv444p
+            // for 4:4:4 8-bit, P410 for 4:4:4 10-bit.
+            let pixel_format = match chosen.map(|p| (p.chroma, p.bit_depth)) {
+                Some((ChromaSubsampling::Yuv444, 10)) => {
+                    tether_protocol::control::PixelFormat::P410
+                }
+                Some((ChromaSubsampling::Yuv444, _)) => {
                     tether_protocol::control::PixelFormat::Yuv444p
+                }
+                Some((ChromaSubsampling::Yuv420, 10)) => {
+                    tether_protocol::control::PixelFormat::P010
                 }
                 _ => tether_protocol::control::PixelFormat::Nv12,
             };
@@ -1390,6 +1409,57 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
 /// chroma in the same budget that was sized for subsampled video.
 /// Clamped to a sane band so a tiny test pattern doesn't get a
 /// starvation-tier bitrate and a huge display doesn't blow the LAN.
+/// Filter the encoder-probe-supported profile list down to what the
+/// host's live capture → encoder bridge can actually deliver today.
+/// The encoder probe verifies the encoder *can produce* a given
+/// profile; this is a separate question from whether the live
+/// capture path can feed it. On macOS, the SCK stream is hardcoded
+/// to `'420v'` NV12 and `VideoToolboxEncoder::submit_iosurface`
+/// errors for any other `(chroma, bit_depth)` — a Main10 session,
+/// which the encoder probe correctly reports as supported, would
+/// crash at first frame. Until SCK-live wiring lets the live
+/// capture format track the negotiated profile, restrict the
+/// advertised set to what the live IOSurface path can carry.
+///
+/// On Linux the gpuconvert bridge (Nv12DmaBuf / Yuv444DmaBuf) is
+/// 8-bit only; the VAAPI encode probe already gates 10-bit at the
+/// encoder layer, so this filter is a no-op on Linux today. When
+/// the gpuconvert P010/P410 bridges are wired (and the VAAPI probe
+/// gate lifted) the Linux filter should similarly tighten to what
+/// the bridge can deliver.
+#[cfg(target_os = "macos")]
+fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfile> {
+    use tether_protocol::control::ChromaSubsampling;
+    probed
+        .into_iter()
+        .filter(|p| {
+            // Live SCK capture today is 8-bit 4:2:0 only. Until the
+            // SCK probe outcome drives the live stream's pixel
+            // format, anything else can't ride the IOSurface fast
+            // path. Logging is intentional — when 10-bit / 4:4:4
+            // probes start passing, the line below explains why
+            // the host isn't advertising them.
+            let deliverable = p.chroma == ChromaSubsampling::Yuv420 && p.bit_depth == 8;
+            if !deliverable {
+                tracing::info!(
+                    profile = ?p,
+                    "encoder probe accepted profile but live SCK capture is 420v 8-bit only; \
+                     filtering out until SCK→live wiring matches the probe"
+                );
+            }
+            deliverable
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfile> {
+    // Linux + future platforms: no filter today. The encoder-side
+    // probes (VAAPI, future NVENC, etc.) already gate profiles
+    // their gpuconvert / capture bridges can't deliver.
+    probed
+}
+
 fn derive_bitrate_kbps(profile: VideoProfile, width: u32, height: u32, fps: u32) -> u32 {
     const REFERENCE_PIXELS: u64 = 1920 * 1080;
     const REFERENCE_FPS: u64 = 60;

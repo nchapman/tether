@@ -230,50 +230,56 @@ have plumbed it. Conversely, the wrapper listing a profile like
 ### What's probed
 
 `tether-codec/src/videotoolbox/probe.rs` attempts every profile
-in `PROFILE_PREFERENCE` against the live VT wrapper — no
-pre-filter. `VideoToolboxEncoder::new` maps `(chroma, bit_depth)`
-to an FFmpeg pix_fmt via `vt_sw_format` and lets `encoder.open()`
-be the authority on whether VT accepts that combination. The
-probe layer takes any error path as `encode=false`.
+in `PROFILE_PREFERENCE` against the live VT wrapper. The encode
+probe is an **end-to-end chroma-survival round-trip**: encoder
+constructed at the requested profile, fed a high-frequency red /
+green BGRA stripe pattern (full chroma swing at 1px pitch — any
+silent 4:4:4 → 4:2:0 downsample collapses adjacent columns into
+a uniform yellow bar), output packets round-tripped through a
+fresh VT decoder, and the decoded IOSurface fourcc must land in
+the expected family for the requested profile. Encoder
+*acceptance* alone (the encoder opens, packets emit) is not
+enough — VT has documented history of accepting input it then
+silently transcodes (e.g. H.264 4:2:2 → 4:2:0), and our pre-
+round-trip probe was over-claiming HEVC 4:4:4 encode for exactly
+that reason. The fourcc check rejects silent downsample.
 
 Empirical results on M4 Max (Homebrew ffmpeg, VideoToolbox):
 
-| Profile                  | encode | decode | output IOSurface |
-| ------------------------ | :----: | :----: | ---------------- |
-| HEVC 4:2:0 8-bit (Main)  | ✅     | ✅     | `'420v'`          |
-| HEVC 4:2:0 10-bit (Main10)| ✅    | ✅     | needs probe      |
-| HEVC 4:4:4 8-bit (Rext)  | ✅     | ✅     | `'444v'` (NV24)   |
-| HEVC 4:4:4 10-bit (Rext) | ✅     | ✅     | needs probe      |
-| H.264 4:2:0 8-bit        | ✅     | ✅     | `'420v'`          |
+| Profile                  | encode | decode | output IOSurface (encode round-trip) |
+| ------------------------ | :----: | :----: | ----------------------------------- |
+| HEVC 4:2:0 8-bit (Main)  | ✅     | ✅     | `'420v'`                            |
+| HEVC 4:2:0 10-bit (Main10)| ✅    | ✅     | `'x420'`                            |
+| HEVC 4:4:4 8-bit (Rext)  | ❌ (silent downsample) | ✅ | encoder produces `'420v'` |
+| HEVC 4:4:4 10-bit (Rext) | ❌ (silent downsample) | ✅ | encoder produces `'x420'` |
+| H.264 4:2:0 8-bit        | ✅     | ✅     | `'420v'`                            |
 
-Two consequential findings vs. the original audit:
-
-1. **HEVC Main444 encode is real on M4 Max.** The earlier "VT
-   has no Main444 encode" claim was an artifact of our own probe
-   short-circuit pre-filtering non-(Yuv420 8-bit) before reaching
-   the encoder. Once the short-circuit was removed, the FFmpeg
-   wrapper accepts NV24 / P410LE input. The probe currently
-   verifies *encoder acceptance*, not *bitstream conformance* —
-   it's possible VT silently downsamples to 4:2:0 internally;
-   confirming that needs an encode→decode round-trip with an
-   IOSurface fourcc assertion (planned follow-up).
-2. **HEVC Main10 encode is real on M4 Max.** Same shape — FFmpeg
-   accepts P010LE input. Same bitstream-conformance caveat applies.
+Per-row reading: an `encode=❌` here means the VT encoder accepts
+the input (the FFmpeg wrapper plumbs it) and produces a bitstream,
+but the resulting bitstream's chroma format doesn't match what we
+asked for — the silent-downsample case. The named hardware test
+`videotoolbox_round_trip_chroma_matrix` cross-checks the probe's
+`encode` bit against the same round-trip the probe runs internally,
+and a disagreement panics; that's the regression guard against the
+probe ever silently slipping past a future downsample.
 
 ### What's open
 
 - **Per-generation results (M1 / M2 / M3 / M4).** Probe matrix
   above is M4 Max only. Pre-M3 silicon may be more limited for
-  4:2:2 specifically.
-- **Bitstream-conformance round-trip.** Encoder acceptance ≠
-  correct chroma in the emitted bitstream. A real probe that
-  encodes → decodes → asserts the output IOSurface fourcc
-  matches the input chroma is the next-strongest signal short
-  of decoding on a different platform.
+  4:2:2 specifically and may also accept-then-silently-downsample
+  for the 4:4:4 cases the probe correctly rejects on M4 Max.
 - **HEVC Main422 8/10-bit encode.** Not exercised — would
-  require adding `ChromaSubsampling::Yuv422` on the wire (see
-  Commit 5 in the rollout plan). The 4:2:2 fixtures are checked
-  in (`hevc_yuv422_*bit.idr`) ready for that change.
+  require `ChromaSubsampling::Yuv422` on the wire. The 4:2:2
+  fixtures are checked in (`hevc_yuv422_*bit.idr`) ready for
+  that change.
+- **SPS bit-depth parse as a second round-trip signal.** The
+  current fourcc check is a strong signal but parses through
+  the FFmpeg decoder; if VT's decoder ever started lying back
+  about its decode output's chroma the probe would too. A
+  10-line walker over `bit_depth_luma_minus8` and
+  `chroma_format_idc` in the SPS would be an independent gate
+  that doesn't depend on the decode side at all.
 
 ---
 

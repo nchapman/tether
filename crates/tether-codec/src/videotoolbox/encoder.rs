@@ -435,13 +435,16 @@ impl VideoToolboxEncoder {
     }
 }
 
-#[cfg(test)]
 impl VideoToolboxEncoder {
     /// Signal EOF and drain any packets the encoder was still buffering.
-    /// Hardware encoders typically hold the latest one or two submitted
-    /// frames; without an explicit flush, the last keyframe of a short
-    /// test run can be left inside the pipeline. Test-only.
-    pub(super) fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+    /// VideoToolbox typically holds the latest one or two submitted
+    /// frames in its pipeline; without an explicit flush, the last
+    /// keyframe of a short sequence can be left inside the encoder.
+    /// Used by hardware tests and by the capability probe's encode →
+    /// decode round-trip (which feeds one BGRA frame and needs to
+    /// drain whatever VT buffered before the round-trip can examine
+    /// the emitted bitstream).
+    pub(crate) fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         self.encoder.send_frame(None)?;
         drain_encoder(&mut self.encoder, &self.extradata)
     }

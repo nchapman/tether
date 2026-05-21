@@ -366,14 +366,19 @@ pub enum PixelFormat {
     Bgra8,
     /// 8-bit 4:2:0 planar. The default for encoded video.
     Nv12,
-    /// 10-bit 4:2:0 planar — the path Main10 / HDR rides. Reserved;
-    /// the encoder and decoder both need 10-bit hardware support
-    /// before this is meaningful.
+    /// 10-bit 4:2:0 biplanar — the path Main10 / HDR rides. 10-bit
+    /// samples MSB-aligned in 16-bit cells per FFmpeg's P010LE
+    /// convention.
     P010,
     /// 8-bit 4:4:4 planar (Y/U/V each at full resolution). The path
     /// HEVC Main444 emits; selected when [`ServerHelloV1::chosen_chroma`]
     /// is [`ChromaSubsampling::Yuv444`].
     Yuv444p,
+    /// 10-bit 4:4:4 biplanar — the path HEVC Main 4:4:4 10-bit rides
+    /// on macOS (matching VT's `'P410'` / `'xf44'` IOSurfaces) and
+    /// (if the renderer-side biplanar 16-bit import is what's wired)
+    /// on Linux too. 10-bit MSB-aligned in 16-bit cells.
+    P410,
 }
 
 /// Hello extension key for [`PixelFormat`] advertisement. Reverse-DNS

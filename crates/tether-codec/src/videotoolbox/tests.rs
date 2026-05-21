@@ -272,6 +272,187 @@ fn videotoolbox_round_trip() {
     }
 }
 
+/// End-to-end hardware round-trip across the full chroma × bit-depth
+/// matrix we may negotiate, **independently** of the probe layer's
+/// own round-trip — the two must agree.
+///
+/// For each `(chroma, bit_depth)` profile, this test:
+///
+/// 1. Runs an explicit encode → decode round-trip with a
+///    high-frequency chroma BGRA pattern (alternating red / green
+///    vertical stripes — survives only with full UV resolution).
+/// 2. Categorises the result as `Supported` (encoder constructed,
+///    packets produced, decoded IOSurface fourcc landed in the
+///    expected family for the profile) or `Unsupported` (any step
+///    failed — encoder open, no packets, decoder error, or
+///    fourcc mismatch indicating silent downsample).
+/// 3. Cross-checks the result against `supported_profiles()`. The
+///    probe and the explicit round-trip must agree: if the probe
+///    says `encode=true` the round-trip must succeed, and if the
+///    probe says `encode=false` the round-trip must fail. A
+///    disagreement is the bug — either the probe is over-claiming
+///    (silent downsample slips through) or under-claiming (a
+///    capability is being hidden).
+///
+/// This is the primary regression test for the audit's "silent
+/// downsample" risk: the probe layer was over-claiming HEVC 4:4:4
+/// encode on M4 Max before commit history added the round-trip
+/// fourcc check, and an independent test pinning the agreement
+/// stops that regression from coming back.
+#[test]
+#[ignore = "requires macOS + VideoToolbox"]
+fn videotoolbox_round_trip_chroma_matrix() {
+    const W: u32 = 128;
+    const H: u32 = 128;
+    let profiles: &[VideoProfile] = &[
+        VideoProfile::HEVC_8BIT_420,
+        VideoProfile::HEVC_10BIT_420,
+        VideoProfile::HEVC_8BIT_444,
+        VideoProfile::HEVC_10BIT_444,
+        VideoProfile::H264_8BIT_420,
+    ];
+    let bgra = make_chroma_detail_bgra(W, H);
+    let caps = crate::probe::supported_profiles();
+
+    for &profile in profiles {
+        let round_trip = try_round_trip(profile, &bgra, W, H);
+        let probe_says = caps
+            .iter()
+            .find(|c| c.profile == profile)
+            .map(|c| c.encode)
+            .unwrap_or(false);
+
+        match (&round_trip, probe_says) {
+            (Ok(fourcc), true) => {
+                eprintln!(
+                    "round-trip matrix: {profile:?} OK (IOSurface 0x{fourcc:08x}); \
+                     probe agrees encode=true"
+                );
+            }
+            (Err(reason), false) => {
+                eprintln!(
+                    "round-trip matrix: {profile:?} unsupported ({reason}); \
+                     probe agrees encode=false"
+                );
+            }
+            (Ok(fourcc), false) => panic!(
+                "{profile:?} disagreement: explicit round-trip succeeded \
+                 (IOSurface 0x{fourcc:08x}) but probe reports encode=false — \
+                 probe is under-claiming, the profile should be advertised"
+            ),
+            (Err(reason), true) => panic!(
+                "{profile:?} disagreement: probe reports encode=true but explicit \
+                 round-trip failed ({reason}) — probe is over-claiming (likely \
+                 silent downsample slipping past the probe's fourcc check), \
+                 the profile must not be advertised"
+            ),
+        }
+    }
+}
+
+/// Run one round-trip and return `Ok(observed_fourcc)` if every step
+/// (encode open, encode packets, decode, fourcc match) succeeded, or
+/// `Err(reason)` if any step failed. The chroma-matrix test treats
+/// either outcome as informative — the panic only fires when the
+/// probe layer's claim doesn't match this independent result.
+fn try_round_trip(
+    profile: VideoProfile,
+    bgra: &[u8],
+    w: u32,
+    h: u32,
+) -> std::result::Result<u32, String> {
+    let mut enc = VideoToolboxEncoder::new(profile, w, h, 30, 2_000)
+        .map_err(|e| format!("encoder construction: {e:?}"))?;
+    let mut packets = enc
+        .encode_bgra(bgra, 0, true)
+        .map_err(|e| format!("encode_bgra: {e:?}"))?;
+    if packets.is_empty() {
+        packets = enc.flush().map_err(|e| format!("flush: {e:?}"))?;
+    }
+    if packets.is_empty() {
+        return Err("no packets produced".into());
+    }
+    let mut dec = VideoToolboxDecoder::new(profile.codec)
+        .map_err(|e| format!("decoder construction: {e:?}"))?;
+    for p in &packets {
+        dec.submit(&p.data)
+            .map_err(|e| format!("decoder submit: {e:?}"))?;
+    }
+    dec.signal_eof()
+        .map_err(|e| format!("decoder signal_eof: {e:?}"))?;
+    loop {
+        match dec
+            .next_frame()
+            .map_err(|e| format!("decoder next_frame: {e:?}"))?
+        {
+            Some(Frame::Gpu(g)) => {
+                let GpuFrameSource::IOSurface(io) = g.source;
+                let expected = expected_iosurface_fourccs_for(profile);
+                if !expected.contains(&io.pixel_format) {
+                    return Err(format!(
+                        "IOSurface fourcc 0x{:08x} not in expected family {:?} \
+                         (likely silent downsample)",
+                        io.pixel_format,
+                        expected
+                            .iter()
+                            .map(|f| format!("0x{f:08x}"))
+                            .collect::<Vec<_>>()
+                    ));
+                }
+                return Ok(io.pixel_format);
+            }
+            Some(Frame::Cpu(_)) => return Err("decoder produced Cpu frame".into()),
+            None => return Err("decoder produced no frame after EOF".into()),
+        }
+    }
+}
+
+/// Generate a BGRA buffer with high-frequency chroma content. Vertical
+/// red / green stripes at 1-pixel pitch — any encoder that silently
+/// downsamples 4:4:4 → 4:2:0 collapses adjacent columns into a
+/// uniform yellow-ish bar, which shifts the bitstream's
+/// `chroma_format_idc` to 1 and lands the decoded IOSurface in the
+/// 4:2:0 family. Used by `videotoolbox_round_trip_chroma_matrix`.
+fn make_chroma_detail_bgra(width: u32, height: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for _y in 0..height {
+        for x in 0..width {
+            if x % 2 == 0 {
+                data.extend_from_slice(&[0, 0, 255, 255]); // saturated red
+            } else {
+                data.extend_from_slice(&[0, 255, 0, 255]); // saturated green
+            }
+        }
+    }
+    data
+}
+
+/// Per-profile set of IOSurface fourccs a *correctly-encoded*
+/// bitstream's decode should land in. Range variants (`'420v'` /
+/// `'420f'`, etc.) both count — range is signalled in the VUI, not
+/// in the chroma fourcc, and we deliberately don't constrain it
+/// here. Mirrors the probe's `expected_iosurface_fourccs` (kept
+/// duplicated rather than re-exported to keep the test self-contained
+/// and the cross-module coupling minimal).
+fn expected_iosurface_fourccs_for(profile: VideoProfile) -> &'static [u32] {
+    const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
+    const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
+    const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
+    const NV24_FULL: u32 = u32::from_be_bytes(*b"444f");
+    const P010: u32 = u32::from_be_bytes(*b"P010");
+    const XF20: u32 = u32::from_be_bytes(*b"xf20");
+    const X420: u32 = u32::from_be_bytes(*b"x420");
+    const XF44: u32 = u32::from_be_bytes(*b"xf44");
+    const P410: u32 = u32::from_be_bytes(*b"P410");
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => &[NV12_VIDEO, NV12_FULL],
+        (ChromaSubsampling::Yuv420, 10) => &[P010, XF20, X420],
+        (ChromaSubsampling::Yuv444, 8) => &[NV24_VIDEO, NV24_FULL],
+        (ChromaSubsampling::Yuv444, 10) => &[XF44, P410],
+        _ => &[],
+    }
+}
+
 /// Decoder-rebuild round-trip: prove the self-decodable-IDR contract.
 ///
 /// The single-decoder round-trip above can't distinguish "extradata is

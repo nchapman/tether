@@ -606,7 +606,14 @@ fn vt_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
 /// the encoder's `sw_format` — VT's hwaccel reads plane dimensions
 /// from `sw_format`, not from the runtime CVPixelBuffer, so a mismatch
 /// produces corrupted output rather than an error.
-fn iosurface_fourcc_matches(chroma: ChromaSubsampling, bit_depth: u8, fourcc: u32) -> bool {
+///
+/// Exposed at `pub` so cross-crate consistency tests can confirm the
+/// encoder's accept set is a superset of what the capture layer
+/// (`tether-capture::macos::sck_pixel_format_for_profile`) can
+/// deliver — drift in either direction would crash a session at
+/// first frame.
+#[must_use]
+pub fn iosurface_fourcc_matches(chroma: ChromaSubsampling, bit_depth: u8, fourcc: u32) -> bool {
     const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
     const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
     const P010_VIDEO: u32 = u32::from_be_bytes(*b"x420");

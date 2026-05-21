@@ -1720,4 +1720,119 @@ mod tests {
             drops.load(Ordering::SeqCst)
         );
     }
+
+    /// **Cross-table fourcc consistency** for the macOS IOSurface
+    /// path. Four crates each carry a `(chroma, bit_depth) → fourcc`
+    /// table:
+    ///
+    ///   * `tether_capture::macos::sck_pixel_format_for_profile` — the
+    ///     fourcc SCK will deliver for a chosen `VideoProfile`.
+    ///   * `tether_codec::videotoolbox::encoder::iosurface_fourcc_matches`
+    ///     — the fourccs the VT encoder accepts as zero-copy input.
+    ///   * `tether_codec::videotoolbox::probe::expected_iosurface_fourccs`
+    ///     — the fourccs the VT decoder is allowed to emit for a
+    ///     given profile (= the probe's accept set on the decode
+    ///     side of the round-trip).
+    ///   * `tether_render::accepts_iosurface_fourcc` — the fourccs the
+    ///     renderer's IOSurface import path accepts.
+    ///
+    /// The full pipeline is `SCK → encoder → decoder → renderer`. For
+    /// each profile we negotiate, the per-link invariants are:
+    ///
+    ///   * **SCK output ⊆ encoder accept** — the encoder must accept
+    ///     whatever the capture layer delivers. A miss here crashes
+    ///     the first frame after handshake.
+    ///   * **Decoder output (probe expected) ⊆ renderer accept** —
+    ///     the renderer must accept anything the VT decoder might
+    ///     emit. A miss here silently drops every frame after
+    ///     decode, exactly the shape of bug `621badc` (renderer
+    ///     rejected `'x420'` for HEVC Main10).
+    ///
+    /// This is a unit test on purpose. The bug shipped to a real
+    /// session because no probe or unit test compared the four
+    /// tables, and the existing `videotoolbox_round_trip_chroma_matrix`
+    /// stops at the decoder's IOSurface — the renderer is on a
+    /// parallel track. Catching drift in default CI is cheaper than
+    /// catching it on a user's desk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_iosurface_fourcc_tables_agree_across_crates() {
+        use tether_capture::macos::sck_pixel_format_for_profile;
+        use tether_codec::videotoolbox::encoder::iosurface_fourcc_matches;
+        use tether_codec::videotoolbox::probe::expected_iosurface_fourccs;
+        use tether_render::accepts_iosurface_fourcc;
+        use tether_codec::PROFILE_PREFERENCE;
+
+        // Walk every profile the negotiator could pick.
+        for profile in PROFILE_PREFERENCE {
+            let chroma = profile.chroma;
+            let bd = profile.bit_depth;
+
+            // (1) SCK output ⊆ encoder accept.
+            // If SCK has a mapping for this profile, whatever it
+            // would deliver must be in the encoder's accept set.
+            if let Some(fourcc) = sck_pixel_format_for_profile(*profile).fourcc() {
+                assert!(
+                    iosurface_fourcc_matches(chroma, bd, fourcc),
+                    "SCK delivers 0x{fourcc:08x} for profile {profile:?} but the VT encoder \
+                     does not accept it via submit_iosurface. This would crash at first frame."
+                );
+            }
+
+            // (2) Probe expected ⊆ renderer accept.
+            // Every fourcc the VT decoder might emit for a confirmed
+            // round-trip of this profile must be in the renderer's
+            // accept set. Bug 621badc was this invariant broken for
+            // (Yuv420, 10) — probe expected `'x420'` but renderer
+            // only accepted `'P010'`, so the renderer rejected every
+            // frame of the first live Main10 session.
+            for &fourcc in expected_iosurface_fourccs(*profile) {
+                assert!(
+                    accepts_iosurface_fourcc(chroma, bd, fourcc),
+                    "VT probe expects the decoder may emit 0x{fourcc:08x} for profile \
+                     {profile:?} but the renderer's IOSurface import rejects it. \
+                     Renderer would drop every frame of a negotiated session."
+                );
+            }
+        }
+    }
+
+    /// Companion to `macos_iosurface_fourcc_tables_agree_across_crates`:
+    /// for profiles that are *not* in PROFILE_PREFERENCE today (e.g.
+    /// 4:2:2 — checked-in fixtures exist but no wire support yet),
+    /// nothing should accept anything. Guards against a half-wired
+    /// future profile that's accepted by one table but unhandled by
+    /// the others.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_iosurface_fourcc_tables_reject_unmodeled_profiles() {
+        use tether_codec::videotoolbox::encoder::iosurface_fourcc_matches;
+        use tether_codec::videotoolbox::probe::expected_iosurface_fourccs;
+        use tether_render::accepts_iosurface_fourcc;
+        use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+
+        // 12-bit isn't in the model; nor is 4:2:2.
+        let bogus = VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 12,
+        };
+        assert!(
+            expected_iosurface_fourccs(bogus).is_empty(),
+            "probe should not expect any fourcc for a 12-bit profile"
+        );
+        // Every plausible fourcc must be rejected by encoder + renderer.
+        for label in ["420v", "x420", "xf20", "P010", "444v", "xf44", "P410"] {
+            let bytes: [u8; 4] = label.as_bytes().try_into().unwrap();
+            let fourcc = u32::from_be_bytes(bytes);
+            assert!(
+                !iosurface_fourcc_matches(bogus.chroma, bogus.bit_depth, fourcc),
+                "encoder accepted fourcc {label} for unmodeled 12-bit profile"
+            );
+            assert!(
+                !accepts_iosurface_fourcc(bogus.chroma, bogus.bit_depth, fourcc),
+                "renderer accepted fourcc {label} for unmodeled 12-bit profile"
+            );
+        }
+    }
 }

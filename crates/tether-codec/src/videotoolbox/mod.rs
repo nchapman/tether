@@ -28,9 +28,9 @@
 //! straight to the renderer.
 
 mod decoder;
-mod encoder;
+pub mod encoder;
 mod ffi;
-pub(crate) mod probe;
+pub mod probe;
 
 #[cfg(test)]
 mod tests;

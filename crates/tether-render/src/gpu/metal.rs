@@ -102,56 +102,12 @@ pub(crate) fn import_iosurface_textures(
     iosurface: &IOSurfaceFrame,
     guard: GpuFrameGuard,
 ) -> Result<YuvTextures> {
-    let (fourcc_ok, expected) = match (chroma, bit_depth) {
-        (ChromaSubsampling::Yuv420, 8) => (
-            matches!(
-                iosurface.pixel_format,
-                NV12_VIDEO_RANGE_FOURCC | NV12_FULL_RANGE_FOURCC
-            ),
-            "'420v' or '420f' (NV12 biplanar 8-bit)",
-        ),
-        (ChromaSubsampling::Yuv444, 8) => (
-            matches!(
-                iosurface.pixel_format,
-                NV24_VIDEO_RANGE_FOURCC | NV24_FULL_RANGE_FOURCC
-            ),
-            "'444v' or '444f' (NV24 biplanar 8-bit)",
-        ),
-        // 10-bit 4:2:0: VT's Main10 decode lands in a biplanar 10-bit
-        // 4:2:0 IOSurface with R16/Rg16 plane formats (10 bits
-        // MSB-aligned). The fourcc Apple uses varies by range:
-        //   - `'x420'` for video-range (limited) — what an HEVC Main10
-        //     bitstream emitted by VT's video-range encoder decodes to,
-        //     and what SCK delivers via the `x420` capture format.
-        //   - `'xf20'` for full-range companion.
-        //   - `'P010'` for the conventional cross-platform label;
-        //     some decoder configurations emit this. Same plane shape.
-        // All three import through the same R16 / Rg16 path; range
-        // differences are handled by the renderer's `range_kind`
-        // dispatch, not by texture layout.
-        (ChromaSubsampling::Yuv420, 10) => (
-            matches!(
-                iosurface.pixel_format,
-                X420_FOURCC | XF20_FOURCC | P010_FOURCC
-            ),
-            "'x420', 'xf20', or 'P010' (biplanar 4:2:0 10-bit)",
-        ),
-        (ChromaSubsampling::Yuv444, 10) => (
-            matches!(iosurface.pixel_format, XF44_FOURCC | P410_FOURCC),
-            "'xf44' or 'P410' (biplanar 4:4:4 10-bit)",
-        ),
-        // Other (chroma, bit_depth) combos haven't been wired; surface
-        // an actionable error rather than mapping them silently.
-        _ => (
-            false,
-            "an IOSurface fourcc supported by this build (8-bit 4:2:0/4:4:4 or 10-bit 4:2:0/4:4:4)",
-        ),
-    };
-    if !fourcc_ok {
+    if !accepts_iosurface_fourcc(chroma, bit_depth, iosurface.pixel_format) {
         return Err(RenderError::DmaBufImport(format!(
             "IOSurface pixel format 0x{:08x} doesn't match negotiated profile \
-             ({chroma:?} {bit_depth}-bit); expected {expected}",
-            iosurface.pixel_format
+             ({chroma:?} {bit_depth}-bit); expected {}",
+            iosurface.pixel_format,
+            iosurface_fourcc_expected_label(chroma, bit_depth)
         )));
     }
     // Pick per-plane Metal + wgpu formats from bit depth. Plane *count*
@@ -418,4 +374,45 @@ fn import_plane(
         device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &wgpu_desc)
     };
     Ok(texture)
+}
+
+/// Whether the renderer's IOSurface import path will accept the given
+/// `(chroma, bit_depth, fourcc)` triple. Extracted as a `pub(crate)`
+/// table so the cross-table consistency test (in `tether-host`) can
+/// compare this set against the encoder's accept set
+/// ([`tether_codec::videotoolbox::encoder::iosurface_fourcc_matches`])
+/// and the VT probe's expected-output set
+/// ([`tether_codec::videotoolbox::probe::expected_iosurface_fourccs`])
+/// without resorting to live hardware. Drift between any of the three
+/// tables is the family of bug that bit us in commits `621badc`
+/// (renderer rejected `'x420'`) — fast feedback in default CI is
+/// cheaper than catching it in a session.
+#[must_use]
+pub fn accepts_iosurface_fourcc(
+    chroma: ChromaSubsampling,
+    bit_depth: u8,
+    fourcc: u32,
+) -> bool {
+    matches!(
+        (chroma, bit_depth, fourcc),
+        (ChromaSubsampling::Yuv420, 8, NV12_VIDEO_RANGE_FOURCC | NV12_FULL_RANGE_FOURCC)
+            | (ChromaSubsampling::Yuv444, 8, NV24_VIDEO_RANGE_FOURCC | NV24_FULL_RANGE_FOURCC)
+            | (ChromaSubsampling::Yuv420, 10, X420_FOURCC | XF20_FOURCC | P010_FOURCC)
+            | (ChromaSubsampling::Yuv444, 10, XF44_FOURCC | P410_FOURCC)
+    )
+}
+
+/// Human-readable label of the fourcc family this profile expects.
+/// Only used to compose the error message in `import_iosurface_textures`
+/// when the fourcc check rejects an unexpected surface; keeping it
+/// alongside the accept set means a new family added to one place
+/// gets a matching error message in the other.
+fn iosurface_fourcc_expected_label(chroma: ChromaSubsampling, bit_depth: u8) -> &'static str {
+    match (chroma, bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => "'420v' or '420f' (NV12 biplanar 8-bit)",
+        (ChromaSubsampling::Yuv444, 8) => "'444v' or '444f' (NV24 biplanar 8-bit)",
+        (ChromaSubsampling::Yuv420, 10) => "'x420', 'xf20', or 'P010' (biplanar 4:2:0 10-bit)",
+        (ChromaSubsampling::Yuv444, 10) => "'xf44' or 'P410' (biplanar 4:4:4 10-bit)",
+        _ => "an IOSurface fourcc supported by this build (8-bit 4:2:0/4:4:4 or 10-bit 4:2:0/4:4:4)",
+    }
 }

@@ -15,6 +15,8 @@ pub(crate) use import::import_dmabuf_textures;
 mod metal;
 #[cfg(target_os = "macos")]
 pub(crate) use metal::import_iosurface_textures;
+#[cfg(target_os = "macos")]
+pub use metal::accepts_iosurface_fourcc;
 
 /// One frame's worth of YUV plane textures plus the bind group that
 /// points at them. The variant matches the negotiated chroma — NV12

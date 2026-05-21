@@ -335,6 +335,21 @@ pub enum SckCapabilityCheck {
 }
 
 impl SckCapabilityCheck {
+    /// The raw `kCVPixelFormatType_*` fourcc this profile maps to, as
+    /// a big-endian `u32`. Exposed so cross-crate consistency tests
+    /// can compare against the VT encoder / probe / renderer accept
+    /// tables without depending on the `screencapturekit` crate
+    /// directly.
+    #[must_use]
+    pub fn fourcc(self) -> Option<u32> {
+        match self {
+            Self::Supported(pf) => Some(FourCharCode::from(pf).as_u32()),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+impl SckCapabilityCheck {
     /// Check the mapped SCK pixel format against a probed
     /// [`SckCaptureCapability`]. Returns `true` iff:
     ///   1. the profile maps to an SCK format ([`Supported`]), AND

@@ -3304,6 +3304,7 @@ dependencies = [
  "tether-gpuconvert",
  "tether-input",
  "tether-protocol",
+ "tether-render",
  "tether-session",
  "tether-transport",
  "tokio",

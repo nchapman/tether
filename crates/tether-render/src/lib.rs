@@ -30,6 +30,16 @@ use gpu::GpuState;
 pub use winit::event::MouseButton;
 pub use winit::keyboard::{KeyCode, ModifiersState};
 
+/// macOS-only — whether the renderer's IOSurface import path accepts
+/// the given `(chroma, bit_depth, fourcc)` triple. Exported so
+/// cross-crate tests (in `tether-host`) can confirm the renderer's
+/// accept set agrees with the encoder's and the VT probe's parallel
+/// tables. Drift between any of the three is the family of bug that
+/// shipped a broken 10-bit session in commit `621badc` — fast
+/// feedback in default CI is cheaper than catching it in a session.
+#[cfg(target_os = "macos")]
+pub use gpu::accepts_iosurface_fourcc;
+
 /// One frame ready for display. Either the pixels live in CPU memory
 /// and need an `R8` + `Rg8` upload (the SW decoder path), or they live
 /// on the GPU as a DMA-BUF exported from a HW decoder surface and the

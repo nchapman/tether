@@ -193,7 +193,15 @@ fn probe_bgra_with_chroma_detail() -> Vec<u8> {
 /// variants (`'420v'` vs `'420f'`, etc.) both count — range is a VUI
 /// signal, not a chroma-resolution one, and we deliberately don't
 /// gate on it.
-fn expected_iosurface_fourccs(profile: VideoProfile) -> &'static [u32] {
+///
+/// Exposed at `pub` so cross-crate consistency tests can confirm the
+/// renderer's IOSurface accept set (`tether-render::gpu::metal`) is a
+/// superset of this — i.e. that the renderer can import everything
+/// the probe expects the decoder to produce. A subset mismatch is
+/// what bit us in commit `621badc` (renderer rejected `'x420'` even
+/// though the probe correctly listed it).
+#[must_use]
+pub fn expected_iosurface_fourccs(profile: VideoProfile) -> &'static [u32] {
     // Apple's `kCVPixelFormatType_*` values, big-endian fourccs.
     const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
     const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");

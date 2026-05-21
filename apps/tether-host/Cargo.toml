@@ -29,5 +29,13 @@ tether-gpuconvert = { workspace = true }
 # tether-gpuconvert; declared directly here to make the use explicit.
 pollster = "0.4"
 
+# dev-dep on tether-render so the macOS fourcc-table cross-check unit
+# test (`macos_iosurface_fourcc_tables_agree_across_crates`) can call
+# `tether_render::accepts_iosurface_fourcc` alongside the encoder /
+# probe / capture accept tables. Production host binary does not link
+# the renderer — that's a client-side concern.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tether-render = { workspace = true }
+
 [lints]
 workspace = true

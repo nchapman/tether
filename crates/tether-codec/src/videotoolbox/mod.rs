@@ -41,7 +41,12 @@ pub use encoder::VideoToolboxEncoder;
 /// picture list. Same rationale as the VAAPI sibling: the renderer's
 /// `LatestFrame` cell holds the previous decoded `IOSurface` (via the
 /// `AVFrame` guard) until the next one lands, so the hwframes pool
-/// needs spare slots or `receive_frame` stalls. 4 covers the worst-case
-/// "one rendering, one in flight, one being sampled" overlap with
-/// headroom.
-pub(crate) const DECODE_EXTRA_HW_FRAMES: i32 = 4;
+/// needs spare slots or `receive_frame` stalls.
+///
+/// 8 is sized for HEVC headroom: HEVC L5.1 has a DPB up to 6 reference
+/// pictures, and although the host disables B-frames, a remote peer
+/// running a different encoder could legally send more references than
+/// our own encoder produces. Cost is ~8 × (W×H×1.5) bytes of wired
+/// memory per session — trivial. Matches Sunshine's setting for the
+/// same reason.
+pub(crate) const DECODE_EXTRA_HW_FRAMES: i32 = 8;

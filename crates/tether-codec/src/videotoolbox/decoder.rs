@@ -130,14 +130,15 @@ impl VideoToolboxDecoder {
 
         // libavutil's VideoToolbox hwaccel parks the `CVPixelBufferRef`
         // in `data[3]` (same channel as the VAAPI surface ID, just a
-        // different opaque type). Null would mean ffmpeg violated its
-        // own contract — treat as unreachable rather than as a
-        // user-facing format error.
+        // different opaque type). A null pointer here would mean ffmpeg
+        // either violated its own contract or fell into a format
+        // renegotiation path; surface as a recoverable error so the
+        // decode thread doesn't panic on adversarial input.
         let pixbuf = frame.data[3] as CVPixelBufferRef;
-        assert!(
-            !pixbuf.is_null(),
-            "VideoToolbox frame missing CVPixelBufferRef in data[3]"
-        );
+        if pixbuf.is_null() {
+            warn!("VideoToolbox frame missing CVPixelBufferRef in data[3]");
+            return Err(CodecError::UnsupportedInputFormat);
+        }
 
         // SAFETY: pixbuf is non-null (checked above) and was just
         // produced by libavcodec; it stays valid until the AVFrame's
@@ -150,13 +151,12 @@ impl VideoToolboxDecoder {
             (surface, fourcc, w, h)
         };
         // A non-IOSurface-backed CVPixelBuffer would be a CPU buffer —
-        // again, contradicts the hwaccel contract. The VT FFmpeg
-        // wrapper always allocates IOSurface-backed buffers when
-        // `AV_PIX_FMT_VIDEOTOOLBOX` is selected.
-        assert!(
-            !surface.is_null(),
-            "VideoToolbox CVPixelBuffer is not IOSurface-backed"
-        );
+        // contradicts the hwaccel contract but again, treat as a
+        // recoverable format error rather than aborting.
+        if surface.is_null() {
+            warn!("VideoToolbox CVPixelBuffer is not IOSurface-backed");
+            return Err(CodecError::UnsupportedInputFormat);
+        }
 
         let iosurface = IOSurfaceFrame {
             surface,
@@ -259,9 +259,10 @@ fn vt_decoder_name(kind: CodecKind) -> &'static str {
 /// reveal the format options. The candidate array is null-terminated
 /// and includes `AV_PIX_FMT_VIDEOTOOLBOX` because we set
 /// `hw_device_ctx`; we pick it (signalling "yes, allocate
-/// IOSurface-backed CVPixelBuffers"). Returning anything else makes
-/// ffmpeg bail or fall back to software, both of which the receive
-/// path treats as errors.
+/// IOSurface-backed CVPixelBuffers"). Returning `AV_PIX_FMT_NONE`
+/// causes ffmpeg to fall back to its software pixel format selection;
+/// the `next_frame` SW-frame guard then rejects those with
+/// `UnsupportedInputFormat`, preserving the HW-only contract.
 unsafe extern "C" fn get_videotoolbox_format(
     _ctx: *mut ffi::AVCodecContext,
     pix_fmts: *const ffi::AVPixelFormat,

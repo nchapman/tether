@@ -5,7 +5,6 @@
 //! and profile differ per codec.
 
 use std::os::fd::AsRawFd;
-use std::slice;
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{ra, AVDictionary, AVFrame, AVHWDeviceContext};
@@ -17,6 +16,7 @@ use tracing::warn;
 
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
+use crate::encoder_common::{drain_encoder, snapshot_extradata};
 use crate::h264::frame_plane_mut;
 use crate::{
     init_ffmpeg, CodecError, DmaBufFrame, Encoder, EncodedPacket, Result, GOP_SECONDS,
@@ -334,30 +334,12 @@ impl VaapiEncoder {
 
         let bgra_row_bytes = (width as usize) * 4;
 
-        // Snapshot the encoder's parameter-set extradata. For
-        // h264_vaapi/hevc_vaapi at Main, this is the Annex-B SPS/PPS
-        // (HEVC also includes VPS). We prepend this to keyframe
-        // packets at drain time. Without it, only the encoder's very
-        // first packet would carry parameter sets — a decoder that
-        // rebuilds (resume, resize) or loses that first IDR has no
-        // recovery path.
-        //
-        // SAFETY: extradata is populated by libavcodec inside
-        // open() when AV_CODEC_FLAG_GLOBAL_HEADER is set (above).
-        // libavcodec does not update extradata mid-stream for
-        // h264_vaapi/hevc_vaapi at fixed resolution; the VaapiEncoder
-        // rebuilds entirely on resolution change rather than mutating
-        // in place. We copy into an owned Vec immediately so no
-        // subsequent encoder operations can race with our read.
-        let extradata = unsafe {
-            let raw = encoder.extradata;
-            let size = encoder.extradata_size;
-            if raw.is_null() || size <= 0 {
-                Vec::new()
-            } else {
-                slice::from_raw_parts(raw, size as usize).to_vec()
-            }
-        };
+        // Snapshot the encoder's parameter-set extradata so we can
+        // prepend it to every keyframe at drain time. For
+        // h264_vaapi/hevc_vaapi at Main this is the Annex-B SPS/PPS
+        // (HEVC also includes VPS). See `encoder_common` for why we
+        // do this.
+        let extradata = snapshot_extradata(&encoder);
         if extradata.is_empty() {
             warn!(
                 codec = vaapi_codec_name(kind),
@@ -748,53 +730,3 @@ fn vaapi_codec_name(kind: CodecKind) -> &'static str {
     }
 }
 
-/// Drain all packets currently buffered in the encoder. Returns the
-/// (possibly empty) list of fresh `EncodedPacket`s — empty is normal
-/// on the very first frame while libavcodec buffers SPS/PPS.
-///
-/// `extradata` is the Annex-B parameter set bundle captured from the
-/// encoder at construction. For each keyframe packet we prepend it so
-/// the decoder gets fresh SPS/PPS/VPS in band with every IDR (the
-/// streaming-friendly contract that mp4 muxers don't need but our
-/// raw wire format does). Cost: one allocation per keyframe of size
-/// `extradata.len()` (~25 bytes H.264, ~50 bytes HEVC). P-frames
-/// pass through untouched.
-///
-/// Without this, only the encoder's first packet carries parameter
-/// sets, and any client that joins mid-session or rebuilds its
-/// decoder (resume, resolution change) is stuck.
-#[allow(clippy::cast_sign_loss)]
-fn drain_encoder(encoder: &mut AVCodecContext, extradata: &[u8]) -> Result<Vec<EncodedPacket>> {
-    let mut out = Vec::new();
-    loop {
-        let packet = match encoder.receive_packet() {
-            Ok(p) => p,
-            Err(RsmpegError::EncoderDrainError | RsmpegError::EncoderFlushedError) => break,
-            Err(e) => return Err(CodecError::Ffmpeg(e)),
-        };
-        let size = packet.size as usize;
-        // SAFETY: packet.data points to packet.size valid bytes
-        // owned by the AVPacket; we copy them before drop.
-        let raw = unsafe { slice::from_raw_parts(packet.data, size) };
-        let keyframe = (packet.flags & ffi::AV_PKT_FLAG_KEY as i32) != 0;
-        let data = if keyframe && !extradata.is_empty() {
-            let mut buf = Vec::with_capacity(extradata.len() + raw.len());
-            buf.extend_from_slice(extradata);
-            buf.extend_from_slice(raw);
-            buf
-        } else {
-            raw.to_vec()
-        };
-        let pts_out = if packet.pts == ffi::AV_NOPTS_VALUE {
-            None
-        } else {
-            Some(packet.pts)
-        };
-        out.push(EncodedPacket {
-            data,
-            pts: pts_out,
-            keyframe,
-        });
-    }
-    Ok(out)
-}

@@ -431,6 +431,37 @@ mod negotiation_tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires macOS + VideoToolbox"]
+    fn macos_advertises_yuv420_only() {
+        // VideoToolbox has no HEVC Main444 hardware path (and never has,
+        // up through M4 generation as of this writing). The negotiator
+        // must never see a 4:4:4 profile from a macOS host, or it will
+        // pick something we can't construct end-to-end. This nails the
+        // gate down so a refactor of `probe_encoder_profile` that
+        // accidentally lifts the macOS check gets caught at test time.
+        let advertised = supported_encode_profiles();
+        for p in &advertised {
+            assert_eq!(
+                p.chroma,
+                ChromaSubsampling::Yuv420,
+                "macOS host advertised non-Yuv420 profile {p:?}"
+            );
+            assert_eq!(p.bit_depth, 8, "macOS host advertised >8-bit profile {p:?}");
+        }
+        // Hevc-420 should be available on any modern Apple Silicon
+        // device. H.264-420 on every Mac that ships VideoToolbox at
+        // all. If neither appears the linked FFmpeg isn't built with
+        // VideoToolbox — fail loudly rather than silently passing.
+        assert!(
+            advertised.contains(&VideoProfile::HEVC_8BIT_420)
+                || advertised.contains(&VideoProfile::H264_8BIT_420),
+            "neither HEVC nor H.264 Yuv420 probed successfully on macOS \
+             (FFmpeg build missing VideoToolbox?): got {advertised:?}"
+        );
+    }
+
     #[test]
     fn preference_order_is_desktop_quality_first() {
         // Pin the preference order — a future refactor that swaps the

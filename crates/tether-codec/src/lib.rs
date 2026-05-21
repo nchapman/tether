@@ -12,6 +12,9 @@ pub mod av_log;
 pub mod h264;
 pub mod probe;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod encoder_common;
+
 #[cfg(target_os = "linux")]
 pub mod vaapi;
 

@@ -4,7 +4,6 @@
 //! VAAPI sibling so the host's send loop is backend-agnostic.
 
 use std::ptr;
-use std::slice;
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{ra, AVFrame, AVHWDeviceContext};
@@ -12,9 +11,11 @@ use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
+use tracing::warn;
 
 use tether_protocol::control::CodecKind;
 
+use crate::encoder_common::{drain_encoder, snapshot_extradata};
 use crate::h264::frame_plane_mut;
 use crate::{
     init_ffmpeg, CodecError, Encoder, EncodedPacket, IOSurfaceFrame, Result, GOP_SECONDS,
@@ -37,6 +38,15 @@ pub struct VideoToolboxEncoder {
     bgra_to_nv12: SwsContext,
     sw_frame: AVFrame,
     bgra_frame: AVFrame,
+    /// Annex-B SPS/PPS (and VPS for HEVC) captured at `open()` via
+    /// `AV_CODEC_FLAG_GLOBAL_HEADER`. Prepended to every keyframe so
+    /// each IDR is self-decodable; clients that join mid-session or
+    /// rebuild their decoder don't have to wait for the next periodic
+    /// IDR to recover. Empty only if libavcodec refused to populate
+    /// extradata at open() (warned at construction).
+    // pub(super): exposed for hardware tests in `tests.rs` only, not
+    // part of the type's public contract.
+    pub(super) extradata: Vec<u8>,
     // Keep the device context alive for the encoder's lifetime. Drop
     // order: `encoder` (and its `hw_frames_ctx`) tear down before
     // `_hw_device`, which is the correct order — surfaces must be freed
@@ -96,6 +106,17 @@ impl VideoToolboxEncoder {
             .saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
         encoder.set_gop_size(gop_frames);
         encoder.set_max_b_frames(0);
+
+        // AV_CODEC_FLAG_GLOBAL_HEADER routes parameter sets (SPS/PPS,
+        // and VPS for HEVC) into `AVCodecContext::extradata` at open()
+        // rather than emitting them only in band with the first IDR.
+        // We then prepend extradata to every keyframe at drain time so
+        // any IDR is independently decodable — required for clients
+        // that join mid-session, rebuild their decoder on device loss,
+        // or lose the session's first IDR on the wire. Parity with the
+        // VAAPI sibling (see `vaapi/encoder.rs` AV_CODEC_FLAG_GLOBAL_HEADER).
+        #[allow(clippy::cast_possible_wrap)]
+        encoder.set_flags(encoder.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
 
         // Build + attach the hwframes context. NV12 video-range is the
         // canonical VT input — Apple's hardware encoder natively
@@ -195,12 +216,25 @@ impl VideoToolboxEncoder {
 
         let bgra_row_bytes = (width as usize) * 4;
 
+        // Snapshot the parameter-set bundle libavcodec just wrote into
+        // `extradata` so we can prepend it to every keyframe at drain
+        // time. See `encoder_common` for the contract.
+        let extradata = snapshot_extradata(&encoder);
+        if extradata.is_empty() {
+            warn!(
+                codec = vt_codec_name(kind),
+                "encoder.extradata was empty after open(); keyframes will not carry SPS/PPS \
+                 (clients that lose the first IDR will be stuck)"
+            );
+        }
+
         Ok(Self {
             kind,
             encoder,
             bgra_to_nv12,
             sw_frame,
             bgra_frame,
+            extradata,
             _hw_device: hw_device,
             width,
             height,
@@ -317,7 +351,19 @@ impl VideoToolboxEncoder {
         self.encoder.send_frame(Some(&src))?;
         drop(src);
 
-        drain_encoder(&mut self.encoder)
+        drain_encoder(&mut self.encoder, &self.extradata)
+    }
+}
+
+#[cfg(test)]
+impl VideoToolboxEncoder {
+    /// Signal EOF and drain any packets the encoder was still buffering.
+    /// Hardware encoders typically hold the latest one or two submitted
+    /// frames; without an explicit flush, the last keyframe of a short
+    /// test run can be left inside the pipeline. Test-only.
+    pub(super) fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+        self.encoder.send_frame(None)?;
+        drain_encoder(&mut self.encoder, &self.extradata)
     }
 }
 
@@ -378,7 +424,7 @@ impl Encoder for VideoToolboxEncoder {
         });
 
         self.encoder.send_frame(Some(&hw_frame))?;
-        drain_encoder(&mut self.encoder)
+        drain_encoder(&mut self.encoder, &self.extradata)
     }
 
     fn is_hardware(&self) -> bool {
@@ -429,30 +475,3 @@ fn vt_codec_name(kind: CodecKind) -> &'static str {
     }
 }
 
-#[allow(clippy::cast_sign_loss)]
-fn drain_encoder(encoder: &mut AVCodecContext) -> Result<Vec<EncodedPacket>> {
-    let mut out = Vec::new();
-    loop {
-        let packet = match encoder.receive_packet() {
-            Ok(p) => p,
-            Err(RsmpegError::EncoderDrainError | RsmpegError::EncoderFlushedError) => break,
-            Err(e) => return Err(CodecError::Ffmpeg(e)),
-        };
-        let size = packet.size as usize;
-        // SAFETY: packet.data points to packet.size valid bytes owned
-        // by the AVPacket; we copy them before drop.
-        let data = unsafe { slice::from_raw_parts(packet.data, size) }.to_vec();
-        let keyframe = (packet.flags & ffi::AV_PKT_FLAG_KEY as i32) != 0;
-        let pts_out = if packet.pts == ffi::AV_NOPTS_VALUE {
-            None
-        } else {
-            Some(packet.pts)
-        };
-        out.push(EncodedPacket {
-            data,
-            pts: pts_out,
-            keyframe,
-        });
-    }
-    Ok(out)
-}

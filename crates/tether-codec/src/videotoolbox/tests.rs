@@ -47,6 +47,85 @@ fn videotoolbox_hevc_constructs() {
 }
 
 #[test]
+#[ignore = "requires macOS + VideoToolbox"]
+fn videotoolbox_keyframes_carry_extradata() {
+    // Every keyframe must be self-decodable: clients that join
+    // mid-session, rebuild their decoder, or lose the session's first
+    // IDR have no recovery path otherwise. We encode ≥2 GOPs worth of
+    // frames (forcing one keyframe at the start and another partway
+    // through), then assert each keyframe packet begins with the SPS
+    // bundle FFmpeg parked in `extradata` at open() time.
+    use tether_protocol::control::CodecKind;
+
+    for kind in [CodecKind::H264, CodecKind::Hevc] {
+        let w = 320;
+        let h = 240;
+        let mut enc = VideoToolboxEncoder::new(kind, w, h, 30, 2_000)
+            .unwrap_or_else(|e| panic!("{kind:?} encoder: {e:?}"));
+
+        // Two distinct grey BGRA frames so the encoder has actual
+        // residual to emit on P-frames; an all-zero buffer can collapse
+        // into degenerate empty packets on some builds.
+        let frame_a = vec![0x40u8; (w * h * 4) as usize];
+        let frame_b = vec![0xC0u8; (w * h * 4) as usize];
+
+        // Pre-stash extradata so the assertion message doesn't have
+        // to reach back into a borrowed encoder mid-loop.
+        let extradata = enc.extradata.clone();
+        assert!(
+            !extradata.is_empty(),
+            "{kind:?} extradata empty after open(); \
+             AV_CODEC_FLAG_GLOBAL_HEADER may not be honoured"
+        );
+
+        let mut keyframes_seen = 0;
+        // Force a keyframe every 4 frames so we drive multiple IDRs
+        // through the encoder regardless of `h264_videotoolbox`'s
+        // periodic GOP cadence. This is the same channel the host's
+        // `ForceIdr` plumbing uses (`AV_PICTURE_TYPE_I` on input
+        // frames).
+        for pts in 0..16i64 {
+            let bgra = if pts % 2 == 0 { &frame_a } else { &frame_b };
+            let force = pts % 4 == 0;
+            let packets = enc
+                .encode_bgra(bgra, pts, force)
+                .unwrap_or_else(|e| panic!("{kind:?} encode frame {pts}: {e:?}"));
+            for p in packets {
+                if p.keyframe {
+                    keyframes_seen += 1;
+                    assert!(
+                        p.data.starts_with(&extradata),
+                        "{kind:?} keyframe packet does not start with extradata: \
+                         keyframe head = {:02x?}, extradata = {:02x?}",
+                        &p.data[..extradata.len().min(p.data.len())],
+                        extradata
+                    );
+                }
+            }
+        }
+        // Flush any packets still buffered inside the encoder pipeline.
+        // VideoToolbox can hold the last submitted frame's packet until
+        // the next frame arrives; without this drain a forced keyframe
+        // late in the loop would be missed.
+        let trailing = enc.flush().unwrap_or_else(|e| panic!("{kind:?} flush: {e:?}"));
+        for p in trailing {
+            if p.keyframe {
+                keyframes_seen += 1;
+                assert!(
+                    p.data.starts_with(&extradata),
+                    "{kind:?} flushed keyframe packet does not start with extradata"
+                );
+            }
+        }
+        assert!(
+            keyframes_seen >= 2,
+            "{kind:?} produced only {keyframes_seen} keyframes across 16 frames \
+             with force_keyframe every 4; on-demand IDR plumbing may be broken"
+        );
+    }
+}
+
+#[test]
 fn videotoolbox_codec_name_maps() {
     // Default-on (no hardware needed): exercises the codec_name map so
     // a typo in the cstring → str pair gets caught at CI time.

@@ -806,6 +806,53 @@ mod tests {
     }
 
     #[test]
+    fn reassembler_evicts_pending_past_wall_clock_timeout() {
+        // Quiet-stream case: a frame goes incomplete and no newer
+        // frames arrive to advance `latest_seq` past `max_age`. The
+        // wall-clock timeout is the only thing standing between us
+        // and a stuck pending entry that holds memory indefinitely.
+        let mut reassembler = FrameReassembler::new()
+            .with_max_pending_age(std::time::Duration::from_millis(20));
+
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (320, 240),
+        };
+
+        // Half-deliver frame 0 — First arrives but Continuation
+        // doesn't.
+        let first = VideoPacket::First {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_count: 2,
+            meta: VideoFrameMetaEnvelope::V1(meta.clone()),
+            payload: vec![0u8; 100],
+        };
+        assert!(reassembler.handle(first).is_none());
+        let (dropped_before, _) = reassembler.loss_counters();
+        assert_eq!(dropped_before, 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        // Feeding any other fragment triggers prune_old. The stuck
+        // frame_seq=0 entry should be evicted by the wall-clock check.
+        let unrelated = VideoPacket::First {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 1,
+            fragment_count: 1,
+            meta: VideoFrameMetaEnvelope::V1(meta),
+            payload: vec![0u8; 10],
+        };
+        let _ = reassembler.handle(unrelated);
+        let (dropped_after, _) = reassembler.loss_counters();
+        assert_eq!(dropped_after, 1, "wall-clock timeout did not evict stuck pending frame");
+    }
+
+    #[test]
     fn continuation_video_packet_fits_in_datagram() {
         // Even with max-valued numeric fields (worst case for varint
         // expansion), a continuation packet must fit in the datagram budget.

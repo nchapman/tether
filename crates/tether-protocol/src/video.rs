@@ -1,6 +1,7 @@
 //! Video datagram format + fragmentation / reassembly helpers.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::MonoNanos;
 use serde::{Deserialize, Serialize};
@@ -287,6 +288,14 @@ pub struct FrameReassembler {
     pending: HashMap<FrameKey, Pending>,
     latest_seq: HashMap<StreamKey, u32>,
     max_age: u32,
+    /// Wall-clock cap on how long a pending (incomplete) frame stays
+    /// in the buffer before being evicted. Belt-and-braces alongside
+    /// `max_age`: a near-quiet stream that suddenly stops can leave a
+    /// half-reassembled frame sitting around because no newer
+    /// fragments arrive to advance `latest_seq` past the eviction
+    /// threshold. The timeout fires on the next fragment of any
+    /// frame, so the cost is one `Instant::now()` per packet.
+    max_pending_age: Duration,
     /// Cumulative count of frames the reassembler started but pruned
     /// (timed out past `max_age`) before completing — i.e. frames the
     /// client never got to render.
@@ -307,6 +316,9 @@ struct Pending {
     received_count: u16,
     fragments: Vec<Option<Vec<u8>>>,
     meta: Option<VideoFrameMeta>,
+    /// When the first fragment for this frame arrived. Used by the
+    /// wall-clock timeout in `prune_old`.
+    first_seen: Instant,
 }
 
 impl Default for FrameReassembler {
@@ -321,6 +333,7 @@ impl FrameReassembler {
             pending: HashMap::new(),
             latest_seq: HashMap::new(),
             max_age: 4,
+            max_pending_age: Duration::from_millis(500),
             frames_dropped: 0,
             fragments_lost: 0,
         }
@@ -330,6 +343,16 @@ impl FrameReassembler {
     /// before being dropped. Default is 4.
     pub fn with_max_age(mut self, max_age: u32) -> Self {
         self.max_age = max_age;
+        self
+    }
+
+    /// Configure the wall-clock timeout for incomplete pending frames.
+    /// Default is 500 ms — chosen as roughly the "user will notice a
+    /// freeze" threshold; lower values evict faster but risk pruning a
+    /// frame whose final fragments are still in flight on a high-RTT
+    /// link.
+    pub fn with_max_pending_age(mut self, max_pending_age: Duration) -> Self {
+        self.max_pending_age = max_pending_age;
         self
     }
 
@@ -380,9 +403,12 @@ impl FrameReassembler {
             return None;
         }
 
-        if latest == frame_seq {
-            self.prune_old();
-        }
+        // Run the wall-clock + frame_seq prune on every fragment so a
+        // stream that suddenly goes silent (e.g. encoder restart with
+        // half-delivered final frame) doesn't leak the orphan past
+        // `max_pending_age`. Frame_seq-distance pruning happens here
+        // too for parity with the previous "only on latest" trigger.
+        self.prune_old();
 
         let key = (display, stream_epoch, frame_seq);
         let entry = self.pending.entry(key).or_insert_with(|| Pending {
@@ -390,6 +416,7 @@ impl FrameReassembler {
             received_count: 0,
             fragments: Vec::new(),
             meta: None,
+            first_seen: Instant::now(),
         });
 
         match packet {
@@ -453,9 +480,19 @@ impl FrameReassembler {
 
     fn prune_old(&mut self) {
         let max_age = self.max_age;
+        let max_pending_age = self.max_pending_age;
+        let now = Instant::now();
         let latest = self.latest_seq.clone();
         let before = self.pending.len();
-        self.pending.retain(|(d, e, seq), _| {
+        self.pending.retain(|(d, e, seq), pending| {
+            // Wall-clock first: a frame that's been incomplete for
+            // longer than `max_pending_age` is evicted even if no
+            // newer frames have arrived on the stream to advance
+            // `latest_seq`. Catches the "encoder went silent
+            // mid-frame" case.
+            if now.duration_since(pending.first_seen) > max_pending_age {
+                return false;
+            }
             latest
                 .get(&(*d, *e))
                 .is_none_or(|l| l.saturating_sub(*seq) <= max_age)

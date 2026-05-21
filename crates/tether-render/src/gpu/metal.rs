@@ -108,6 +108,16 @@ fn import_nv12(
         surface_ref.width_of_plane(1) as u32,
         surface_ref.height_of_plane(1) as u32,
     );
+    // Reject zero-dimension planes before they reach
+    // `MTLTextureDescriptor::setWidth/setHeight`, which is documented as
+    // UB for zero values. A pathological bitstream (or some Apple
+    // hardware that has historically produced 0-height UV planes for
+    // 1-row luma) could otherwise abort the renderer thread.
+    if y_w == 0 || y_h == 0 || uv_w == 0 || uv_h == 0 {
+        return Err(RenderError::DmaBufImport(format!(
+            "IOSurface plane has zero dimension: Y={y_w}x{y_h} UV={uv_w}x{uv_h}"
+        )));
+    }
 
     let y = import_plane(
         device,
@@ -166,12 +176,16 @@ fn import_nv12(
 /// whose Drop releases the CVPixelBuffer ref).
 ///
 /// SAFETY: `IOSurfaceRef` is a `repr(C)` opaque type with a zero-size
-/// inline body (see `objc2-io-surface::IOSurfaceRef`), so the cast is
-/// a pure type reinterpret. The struct carries a `PhantomPinned` field
-/// which makes it `!Unpin`, but that only constrains `Pin<&mut T>`
-/// ergonomics — a shared `&IOSurfaceRef` derived from a raw pointer is
-/// unaffected. The caller must hold the guard for as long as the
-/// returned reference is used; that's the contract of this module.
+/// inline body and a single `UnsafeCell<PhantomData<…>>` marker field
+/// (see `objc2-io-surface::IOSurfaceRef`). The `UnsafeCell` is a
+/// Rust-side opaque marker that the binding uses to express "may be
+/// mutated through &IOSurfaceRef by the C API" — no Rust code in this
+/// crate mutates through it, and the C IOSurface API the marker
+/// describes is thread-safe on a refcounted surface. The struct also
+/// carries `PhantomPinned`, but that only constrains `Pin<&mut T>`
+/// ergonomics and is unaffected by a shared `&IOSurfaceRef` derived
+/// from a raw pointer. The caller must hold the guard for as long as
+/// the returned reference is used; that's the contract of this module.
 fn iosurface_as_ref(iosurface: &IOSurfaceFrame) -> Result<&IOSurfaceRef> {
     if iosurface.surface.is_null() {
         return Err(RenderError::DmaBufImport(
@@ -225,10 +239,13 @@ fn import_plane(
         descriptor.setArrayLength(1);
     }
     descriptor.setUsage(MTLTextureUsage::ShaderRead);
-    // IOSurface-backed textures live in shared memory regardless of
-    // what we ask for; passing Shared makes that explicit and matches
-    // what `kCVMetalTextureUsage` does internally.
-    descriptor.setStorageMode(MTLStorageMode::Shared);
+    // Storage mode for IOSurface-backed textures is dictated by the
+    // IOSurface itself, so Metal ignores this field in practice. Apple's
+    // sample code and CVMetalTextureCache both pass Private, which also
+    // avoids a Metal validation-layer warning on discrete-GPU Macs
+    // (where Shared is reserved for unified-memory devices). Match that
+    // pattern.
+    descriptor.setStorageMode(MTLStorageMode::Private);
 
     let mtl_texture = mtl_device
         .newTextureWithDescriptor_iosurface_plane(&descriptor, surface_ref, plane)

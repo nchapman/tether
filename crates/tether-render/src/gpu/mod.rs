@@ -24,15 +24,25 @@ pub(crate) struct YuvTextures {
     /// Per-chroma plane storage. Different variants in different
     /// modes; bind group already references the correct plane set
     /// via the (chroma-specific) bind-group layout.
+    ///
+    /// FIELD ORDER IS LOAD-BEARING. Rust drops struct fields in
+    /// declaration order, and on macOS the MTLTexture inside each plane
+    /// holds the IOSurface alive (via Metal's internal retain), while
+    /// `_guard` below holds it alive via the AVFrame's CVPixelBuffer
+    /// retain. The texture drop must run first so Metal releases its
+    /// retain before the AVFrame drops the CVPixelBuffer; otherwise a
+    /// future reorder could leave a dangling MTLTexture pointing at a
+    /// released IOSurface. Same ordering serves the Linux side (wgpu
+    /// texture releases the imported DMA-BUF before the VAAPI surface
+    /// returns to the pool).
     planes: YuvPlanes,
     pub(crate) bind_group: wgpu::BindGroup,
     /// Luma-plane dimensions (chroma is derived from chroma kind).
     size: (u32, u32),
-    /// Backend-side lifetime extender from the decoder (DMA-BUF path)
-    /// — typically an `AVFrame` whose Drop releases the VAAPI surface
-    /// back to the hwframes pool. `None` for CPU-uploaded textures.
-    /// Held in the same struct as the textures so dropping `textures`
-    /// (on resize / new frame) releases the surface in the same step.
+    /// Backend-side lifetime extender from the decoder (DMA-BUF path
+    /// on Linux, AVFrame holding the CVPixelBuffer on macOS). `None`
+    /// for CPU-uploaded textures. Declared *after* `planes` so the
+    /// textures' Drop runs first — see field-order note above.
     _guard: Option<GpuFrameGuard>,
 }
 
@@ -87,7 +97,14 @@ pub(crate) struct GpuState {
     /// from the decoder gets dropped with a warn — the decoder probe
     /// shouldn't have picked the HW backend in that case, so reaching
     /// this branch indicates a misconfiguration.
+    #[cfg(target_os = "linux")]
     dmabuf_import_supported: bool,
+    /// True if the wgpu device exposes a Metal HAL. Required by the
+    /// IOSurface→MTLTexture→wgpu import path. Probed at construction so
+    /// any backend mismatch (e.g. a forced Vulkan adapter on macOS via
+    /// MoltenVK) surfaces here instead of as a first-frame error.
+    #[cfg(target_os = "macos")]
+    metal_import_supported: bool,
 }
 
 /// Numeric tag for the WGSL fragment shader's EOTF dispatch. Keep in
@@ -180,13 +197,43 @@ impl GpuState {
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
             .await?;
+        #[cfg(target_os = "linux")]
         let dmabuf_import_supported =
             device.features().contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
+        // Probe the Metal HAL once at startup. If the wgpu device wasn't
+        // built on the Metal backend (could happen if a future config
+        // forces Vulkan via MoltenVK on macOS) we want a clean failure
+        // here, not a panic deep in `import_iosurface_textures` on the
+        // first decoded frame.
+        #[cfg(target_os = "macos")]
+        let metal_import_supported = unsafe {
+            // SAFETY: as_hal is only unsafe because the returned guard
+            // must not outlive the device; we drop the result immediately.
+            device.as_hal::<wgpu::hal::api::Metal>().is_some()
+        };
+        #[cfg(target_os = "macos")]
+        if !metal_import_supported {
+            return Err(RenderError::DmaBufImport(format!(
+                "wgpu adapter '{}' (driver: '{}', backend: {:?}) is not Metal-backed; \
+                 macOS IOSurface import requires the Metal HAL. Tether requires \
+                 zero-copy decode — there is no CPU-upload fallback.",
+                info.name, info.driver, info.backend
+            )));
+        }
+        #[cfg(target_os = "linux")]
         tracing::info!(
             adapter = info.name,
             driver = info.driver,
             backend = ?info.backend,
             dmabuf_import_supported,
+            "wgpu device initialised"
+        );
+        #[cfg(target_os = "macos")]
+        tracing::info!(
+            adapter = info.name,
+            driver = info.driver,
+            backend = ?info.backend,
+            metal_import_supported,
             "wgpu device initialised"
         );
 
@@ -419,7 +466,10 @@ impl GpuState {
             scale_bind_group,
             color_params_buffer,
             color_params_bind_group,
+            #[cfg(target_os = "linux")]
             dmabuf_import_supported,
+            #[cfg(target_os = "macos")]
+            metal_import_supported,
         })
     }
 
@@ -542,6 +592,15 @@ impl GpuState {
 
     #[cfg(target_os = "macos")]
     fn apply_gpu(&mut self, frame: GpuFrame) -> Result<()> {
+        // `GpuState::new` hard-errors when the Metal HAL isn't
+        // available on macOS, so reaching this branch with the flag
+        // false would mean the constructor's check is broken — not
+        // a runtime condition the caller can recover from. Mirrors
+        // the dma-buf invariant on the Linux side.
+        debug_assert!(
+            self.metal_import_supported,
+            "apply_gpu reached without Metal HAL; GpuState::new should have failed"
+        );
         // Match shape mirrors the Linux side: an explicit pattern, not
         // `let else`, so adding a future `GpuFrameSource` variant
         // surfaces here at compile time.

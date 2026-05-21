@@ -175,14 +175,20 @@ async fn handle_client(
 
             let mut extensions = std::collections::BTreeMap::new();
             // Advertise pixel format up front so the client's
-            // decoder import path (VAAPI / VT / MF) doesn't
-            // have to wait on the first SPS to decide between
-            // 8-bit and 10-bit. We're NV12 everywhere today;
-            // P010 lands with HDR.
+            // decoder import path (VAAPI / VT / MF) doesn't have to
+            // wait on the first SPS to decide between formats. The
+            // value matches the negotiated chroma — NV12 for 4:2:0,
+            // YUV444P for HEVC Main444. P010 lands with HDR.
+            let pixel_format = match chosen.map(|p| p.chroma) {
+                Some(ChromaSubsampling::Yuv444) => {
+                    tether_protocol::control::PixelFormat::Yuv444p
+                }
+                _ => tether_protocol::control::PixelFormat::Nv12,
+            };
             extensions.insert(
                 tether_protocol::control::PIXEL_FORMAT_EXTENSION_KEY.to_string(),
-                tether_protocol::encode(&tether_protocol::control::PixelFormat::Nv12)
-                    .expect("PixelFormat::Nv12 encodes; types under our control"),
+                tether_protocol::encode(&pixel_format)
+                    .expect("PixelFormat encodes; types under our control"),
             );
             // Echo the structured negotiation result. The inline
             // chosen_codec / chosen_chroma fields stay for legacy clients;
@@ -1062,7 +1068,33 @@ fn run_capture_and_send(
                     })
                 }
                 Err(e) => {
-                    warn!(error = %e, "encoder init failed, exiting send loop");
+                    // The probe approved this profile at handshake on a
+                    // 128×128 scratch surface, but real dims rejected.
+                    // Common Main444 trip-wire: hardware accepts the
+                    // probe size but rejects 16-pixel-misaligned real
+                    // dimensions. Surface this to the client as a clean
+                    // Goodbye(InternalError) rather than a silent black
+                    // window — the client otherwise sits forever
+                    // waiting for video that won't arrive.
+                    warn!(
+                        error = %e,
+                        codec = ?chosen_profile.codec,
+                        chroma = ?chosen_profile.chroma,
+                        width = frame_width,
+                        height = frame_height,
+                        "encoder init failed; sending Goodbye(InternalError) and exiting send loop"
+                    );
+                    let goodbye_conn = conn.clone();
+                    let reason = format!(
+                        "host could not construct {:?} {:?} encoder for {}x{}: {}",
+                        chosen_profile.codec, chosen_profile.chroma, frame_width, frame_height, e
+                    );
+                    let _ = runtime.block_on(goodbye_conn.send_control(
+                        &ControlMessage::Goodbye {
+                            reason,
+                            code: tether_protocol::control::GoodbyeCode::InternalError,
+                        },
+                    ));
                     return;
                 }
             };

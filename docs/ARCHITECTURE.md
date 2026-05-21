@@ -370,6 +370,42 @@ Forward-compat hooks every feature added later relies on:
 - **`VideoFrameMetaEnvelope`** so per-frame metadata grows by enum
   variant rather than struct field.
 
+### Codec / chroma / depth negotiation
+
+Video profile is negotiated host-authoritatively via two hello
+extensions. The client advertises its decode capabilities under
+`tether.cap.video.decode-profiles` as `Vec<VideoProfile { codec,
+chroma, bit_depth }>`. The host intersects that set with its own
+buildable encode profiles (from a `OnceLock`-cached
+`supported_encode_profiles()` probe that calls the real
+`VaapiEncoder::new` at 128×128 per triple) and picks the best mutual
+match against a fixed preference list:
+
+1. HEVC 4:4:4 8-bit (desktop-quality top rung — preserves text and UI
+   chroma detail that 4:2:0 visibly smears).
+2. HEVC 4:2:0 8-bit.
+3. H.264 4:2:0 8-bit (universal floor; H.264 4:4:4 is absent because
+   VAAPI has no encode profile for it).
+
+The chosen profile is echoed in `tether.cap.video.encode-profile`;
+`ServerHelloV1.chosen_codec` / `chosen_chroma` carry the same
+information in legacy form so older clients can interoperate. Absent
+client extension is treated as the universal floor.
+
+Both the encoder (`VaapiEncoder::new` takes `VideoProfile`, switches
+`sw_format` + VAAPI `profile=` string + BGRA→input swscale stage),
+the gpuconvert bridge (NV12 with two-plane R8+Rg8 export vs. YUV444
+with three-plane R8 export), and the renderer (NV12 fragment shader
+with `Y + UV` bind group vs. YUV444 sibling with `Y + U + V`) branch
+on the negotiated chroma at construction. Mid-session chroma switch
+is not supported — same rebuild path as a mid-session resolution
+change (encoder + bridge + render pipeline all reset).
+
+The `tether.pixel-format` extension echoes the on-wire pixel format
+of the encoded stream (`Nv12` for 4:2:0, `Yuv444p` for HEVC Main444)
+so client decoders that wire their import path before the first SPS
+arrives can pick the right plane layout up front.
+
 Four non-negotiable invariants tracked end-to-end:
 
 1. **Clock sync.** Handshake measures RTT and computes a `MonoNanos`

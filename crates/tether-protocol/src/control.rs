@@ -340,12 +340,16 @@ pub enum PixelFormat {
     /// encoded video, but listed for completeness — a future raw
     /// debug stream could use it).
     Bgra8,
-    /// 8-bit 4:2:0 planar. Today's default for encoded video.
+    /// 8-bit 4:2:0 planar. The default for encoded video.
     Nv12,
     /// 10-bit 4:2:0 planar — the path Main10 / HDR rides. Reserved;
     /// the encoder and decoder both need 10-bit hardware support
     /// before this is meaningful.
     P010,
+    /// 8-bit 4:4:4 planar (Y/U/V each at full resolution). The path
+    /// HEVC Main444 emits; selected when [`ServerHelloV1::chosen_chroma`]
+    /// is [`ChromaSubsampling::Yuv444`].
+    Yuv444p,
 }
 
 /// Hello extension key for [`PixelFormat`] advertisement. Reverse-DNS

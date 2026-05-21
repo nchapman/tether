@@ -60,10 +60,10 @@ async fn main() -> anyhow::Result<()> {
     let conn = Arc::new(conn);
     info!(remote = %conn.remote_address(), "connected to host");
 
-    // Client video decode capabilities. Phase A advertises only the
-    // profiles the decoder + renderer actually handle today
-    // (NV12 4:2:0 8-bit for both H.264 and HEVC); HEVC Main444 gets
-    // added once the 3-plane render path lands in phase D.
+    // Client video decode capabilities. HEVC Main444 8-bit is now in
+    // the advertised set: the decoder picks the surface format from
+    // the SPS automatically and the renderer dispatches on the
+    // negotiated chroma to pick the right shader / bind-group layout.
     //
     // The order in this list does NOT determine the negotiated outcome
     // — the host's PROFILE_PREFERENCE is the authoritative ordering.
@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     // for older hosts that haven't been updated to read the structured
     // extension.
     let client_decode_profiles = vec![
+        VideoProfile::HEVC_8BIT_444,
         VideoProfile::HEVC_8BIT_420,
         VideoProfile::H264_8BIT_420,
     ];
@@ -146,18 +147,19 @@ async fn main() -> anyhow::Result<()> {
         "video profile negotiated; handshake complete"
     );
 
-    // Sanity-check the advertised pixel format. NV12 is the only one
-    // the client decode → render path handles today; anything else
-    // (P010 for HDR, etc.) means the host is running ahead of this
-    // build. We log but don't refuse — the user might still get a
-    // partial render if we're lucky.
+    // Sanity-check the advertised pixel format. Nv12 (4:2:0 8-bit)
+    // and Yuv444p (4:4:4 8-bit) are the two the renderer handles
+    // today; anything else (P010 for HDR, etc.) means the host is
+    // running ahead of this build. Log and continue; the renderer
+    // will fail loudly downstream if it actually can't import.
     if let Some(pf_bytes) = server_body
         .extensions
         .get(tether_protocol::control::PIXEL_FORMAT_EXTENSION_KEY)
     {
         match tether_protocol::decode::<tether_protocol::control::PixelFormat>(pf_bytes) {
-            Ok(tether_protocol::control::PixelFormat::Nv12) => {
-                tracing::debug!("host advertised pixel format: Nv12");
+            Ok(pf @ (tether_protocol::control::PixelFormat::Nv12
+                | tether_protocol::control::PixelFormat::Yuv444p)) => {
+                tracing::debug!(?pf, "host advertised pixel format");
             }
             Ok(other) => {
                 warn!(?other, "host advertised an unsupported pixel format; expect rendering issues");

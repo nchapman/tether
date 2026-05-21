@@ -104,6 +104,17 @@ async fn main() -> anyhow::Result<()> {
         warm_sck_capture_capability_cache().await;
     }
 
+    // Linux equivalent: probe gpuconvert's 10-bit deliverability
+    // (STORAGE_IMAGE on R16 + GR32) once at startup so per-connection
+    // `capture_filtered_encode_profiles` reads the cache instead of
+    // re-running the Vulkan probe. Same handshake-critical-path
+    // rationale as the macOS warm-up above. Test-pattern mode skips
+    // — `capture_filtered_encode_profiles` isn't on its hot path.
+    #[cfg(target_os = "linux")]
+    if !use_test_pattern {
+        warm_gpuconvert_capability_cache().await;
+    }
+
     // Warm the codec-probe cache for the same reason. The probe builds
     // each `VideoProfile` in `PROFILE_PREFERENCE` through a real VT (or
     // VAAPI) encoder, runs a frame through, decodes it back, and checks
@@ -1578,11 +1589,115 @@ fn sck_capture_capability() -> tether_capture::macos::SckCaptureCapability {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Process-lifetime cache for the Linux gpuconvert 10-bit
+/// deliverability probe — `true` iff R16 + GR32 both advertise
+/// STORAGE_IMAGE for `DRM_FORMAT_MOD_LINEAR` (the requirement for the
+/// BGRA→P010 compute shader). Populated by
+/// [`warm_gpuconvert_capability_cache`] at process startup; same
+/// rationale as the macOS [`SCK_CAPS_CACHE`].
+///
+/// 8-bit profiles (NV12, XYUV) aren't gated through this cache — they
+/// only need SAMPLED + 8-bit storage which the existing
+/// `importable_dmabuf_modifiers` startup probe already verifies, and
+/// the Nv12DmaBuf / Yuv444DmaBuf constructors fail loudly if the
+/// adapter doesn't host them. The cache exists specifically for the
+/// 10-bit gate.
+#[cfg(target_os = "linux")]
+static LINUX_P010_DELIVERABLE_CACHE: std::sync::OnceLock<bool> =
+    std::sync::OnceLock::new();
+
+/// Run the gpuconvert P010 deliverability probe and store the result
+/// in [`LINUX_P010_DELIVERABLE_CACHE`]. Idempotent. Call from `main`
+/// after the server binds but before the first `accept().await` so the
+/// probe doesn't straddle a connection-time handshake.
+#[cfg(target_os = "linux")]
+async fn warm_gpuconvert_capability_cache() {
+    if LINUX_P010_DELIVERABLE_CACHE.get().is_some() {
+        return;
+    }
+    let p010 = tether_gpuconvert::linux_can_deliver_p010().await;
+    tracing::info!(p010, "Linux gpuconvert capability (cached for process lifetime)");
+    let _ = LINUX_P010_DELIVERABLE_CACHE.set(p010);
+}
+
+/// Read the cached gpuconvert capability. Falls back to `false`
+/// (conservative — filter out 10-bit) with a logged error if the
+/// cache wasn't warmed; same rationale as
+/// [`sck_capture_capability`]'s fallback. Debug builds also assert —
+/// reaching this fallback means a `handle_client` path bypassed
+/// `warm_gpuconvert_capability_cache` in `main`, and silent fallback
+/// would mean a Main10-capable host advertises only 8-bit with no
+/// signal beyond an `error!` log that might scroll past unnoticed.
+#[cfg(target_os = "linux")]
+fn linux_p010_deliverable() -> bool {
+    *LINUX_P010_DELIVERABLE_CACHE.get().unwrap_or_else(|| {
+        tracing::error!(
+            "gpuconvert capability cache read before warm-up; assuming P010 \
+             undeliverable. This indicates a code path that reached \
+             handle_client without going through warm_gpuconvert_capability_cache."
+        );
+        debug_assert!(
+            false,
+            "gpuconvert capability cache read before warm-up — a new \
+             handle_client entry point skipped warm_gpuconvert_capability_cache",
+        );
+        &false
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfile> {
-    // Linux + future platforms: no filter today. The encoder-side
-    // probes (VAAPI, future NVENC, etc.) already gate profiles
-    // their gpuconvert / capture bridges can't deliver.
+    let p010_ok = linux_p010_deliverable();
+    probed
+        .into_iter()
+        .filter(|p| {
+            // Linux gpuconvert deliverability today:
+            //   - Yuv420 8-bit (NV12)   — always (Nv12DmaBuf)
+            //   - Yuv444 8-bit (XYUV)   — always (Yuv444DmaBuf)
+            //   - Yuv420 10-bit (P010)  — gated by storage-modifier probe
+            //   - Yuv444 10-bit (XV30)  — never (no bridge); gated upstream
+            //                             at the encoder probe, won't reach
+            //                             here under normal flow
+            let deliverable = match (p.chroma, p.bit_depth) {
+                (
+                    tether_protocol::control::ChromaSubsampling::Yuv420
+                    | tether_protocol::control::ChromaSubsampling::Yuv444,
+                    8,
+                ) => true,
+                (tether_protocol::control::ChromaSubsampling::Yuv420, 10) => p010_ok,
+                // Yuv444 10-bit (XV30) and any future shape: no bridge
+                // yet. Add an explicit arm here when adding a bridge —
+                // exhaustiveness on `ChromaSubsampling` doesn't fire on
+                // this expression because the bit_depth axis is `u8`.
+                _ => false,
+            };
+            if !deliverable {
+                tracing::info!(
+                    profile = ?p,
+                    p010_supported = p010_ok,
+                    "encoder probe accepted profile but Linux gpuconvert cannot deliver \
+                     the matching dma-buf shape on this host; filtering out"
+                );
+            }
+            deliverable
+        })
+        .collect()
+}
+
+// Catch-all stub for any future non-Linux non-macOS host platform
+// (Windows host backend, BSDs, etc.). The encoder-side probe is the
+// only gate until a platform-specific bridge-deliverability layer
+// lands.
+//
+// TODO(windows-host): when the Windows DXGI / Media Foundation
+// capture path lands, it MUST add its own filter here. The current
+// pass-through is structurally identical to the no-op Linux arm this
+// commit replaces — a Windows host backed by it would advertise
+// profiles its bridge can't deliver and the send loop would crash
+// mid-session on the first frame. Add a deliverability gate next to
+// the bridge in the same change.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfile> {
     probed
 }
 

@@ -241,7 +241,6 @@ async fn handle_client(
             return Ok(());
         }
     };
-    let chosen_codec = chosen_profile.codec;
     info!(
         client = %client_body.client_name,
         chosen_codec = ?chosen_profile.codec,
@@ -379,7 +378,7 @@ async fn handle_client(
                 force_idr_for_send,
                 display_dims_tx,
                 send_shutdown_for_thread,
-                chosen_codec,
+                chosen_profile,
                 stream_ready_for_thread,
                 runtime_handle_for_send,
                 conn_keyframe,
@@ -858,11 +857,12 @@ fn run_capture_and_send(
     force_idr: tether_session::IdrSignal,
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
     shutdown: Arc<AtomicBool>,
-    chosen_codec: CodecKind,
+    chosen_profile: VideoProfile,
     stream_ready: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
     keyframe_conn: Arc<Connection>,
 ) {
+    let chosen_codec = chosen_profile.codec;
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
     let mut slot: Option<EncoderSlot> = None;
@@ -941,17 +941,19 @@ fn run_capture_and_send(
             // list-form for API symmetry with the initial handshake
             // probe; per-resize cost is one construction attempt.
             slot = match probe_encoder(
-                &[chosen_codec],
+                chosen_profile,
                 frame_width,
                 frame_height,
                 ENCODER_FPS,
                 derive_bitrate_kbps(chosen_codec, frame_width, frame_height, ENCODER_FPS),
             ) {
-                Ok((_kind, e)) => {
+                Ok((_profile, e)) => {
                     info!(
                         backend = e.name(),
                         hardware = e.is_hardware(),
-                        codec = ?chosen_codec,
+                        codec = ?chosen_profile.codec,
+                        chroma = ?chosen_profile.chroma,
+                        bit_depth = chosen_profile.bit_depth,
                         width = frame_width,
                         height = frame_height,
                         fps = ENCODER_FPS,

@@ -15,7 +15,7 @@ use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
 use tracing::warn;
 
-use tether_protocol::control::CodecKind;
+use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
 use crate::h264::frame_plane_mut;
 use crate::{
@@ -30,8 +30,20 @@ use super::VAAPI_POOL_SIZE;
 
 pub struct VaapiEncoder {
     kind: CodecKind,
+    /// Negotiated chroma sampling. Determines:
+    /// - `sw_format` on the encoder's hwframes pool (`NV12` for 4:2:0,
+    ///   `YUV444P` for 4:4:4).
+    /// - The pixel-conversion swscale context fed in `encode_bgra`.
+    /// - The VAAPI driver profile string (`main` for 4:2:0, `rext` for
+    ///   HEVC Main444).
+    /// - The expected fourcc on imported DMA-BUFs in `submit_dmabuf`.
+    chroma: ChromaSubsampling,
     encoder: AVCodecContext,
-    bgra_to_nv12: SwsContext,
+    /// BGRA → encoder-input swscale context. NV12 for 4:2:0, YUV444P
+    /// for 4:4:4. The output format matches the encoder's `sw_format`;
+    /// SwsContext is statically pinned to a single (src, dst) pair so
+    /// the chroma choice is baked in at construction.
+    bgra_to_encoder_input: SwsContext,
     sw_frame: AVFrame,
     bgra_frame: AVFrame,
     /// Codec parameter sets (Annex-B SPS/PPS for H.264, VPS+SPS+PPS
@@ -92,13 +104,33 @@ impl VaapiEncoder {
     /// libva capability query before encoder.open(); deferring until
     /// the win is worth the FFI surface.
     pub fn new(
-        kind: CodecKind,
+        profile: VideoProfile,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self> {
         init_ffmpeg();
+
+        let kind = profile.codec;
+        let chroma = profile.chroma;
+        // 8-bit is the only depth wired today. The probe layer enforces
+        // this so we should never reach here with anything else; panic
+        // rather than silently mis-encode if the contract slips.
+        assert_eq!(
+            profile.bit_depth, 8,
+            "VAAPI encoder only supports 8-bit profiles; got {}-bit",
+            profile.bit_depth
+        );
+        // VAAPI has no H.264 4:4:4 encode profile across any driver we
+        // target (Sunshine confirms the same — see
+        // refs/Sunshine/src/platform/linux/vaapi.cpp:202). Refuse early
+        // rather than producing a confusing FFmpeg open() failure.
+        if kind == CodecKind::H264 && chroma == ChromaSubsampling::Yuv444 {
+            return Err(CodecError::CodecNotFound(
+                "VAAPI does not expose an H.264 4:4:4 encode profile",
+            ));
+        }
 
         let codec_cname = vaapi_codec_cname(kind)?;
         let codec = AVCodec::find_encoder_by_name(codec_cname)
@@ -132,14 +164,19 @@ impl VaapiEncoder {
         encoder.set_gop_size(gop_frames);
         encoder.set_max_b_frames(0);
 
-        // Build + attach the hwframes context. NV12 is the canonical
-        // VAAPI surface layout — Intel/AMD/NVIDIA all natively encode
-        // from NV12. The encoder mutates the pool over its lifetime,
-        // so once set_hw_frames_ctx moves ownership in, we go through
-        // encoder.hw_frames_ctx_mut() to allocate frames.
+        // Build + attach the hwframes context. The `sw_format` decides
+        // the on-device pixel layout: NV12 for 4:2:0 (interleaved UV at
+        // half resolution), YUV444P for 4:4:4 (three planar full-res
+        // planes). Intel/AMD VAAPI accept YUV444P only when the codec
+        // negotiates a Main444 profile (`rext` for HEVC); the encoder
+        // open below sets that profile string.
+        let sw_format = match chroma {
+            ChromaSubsampling::Yuv420 => ffi::AV_PIX_FMT_NV12,
+            ChromaSubsampling::Yuv444 => ffi::AV_PIX_FMT_YUV444P,
+        };
         let mut hw_frames_ref = hw_device.hwframe_ctx_alloc();
         hw_frames_ref.data().format = ffi::AV_PIX_FMT_VAAPI;
-        hw_frames_ref.data().sw_format = ffi::AV_PIX_FMT_NV12;
+        hw_frames_ref.data().sw_format = sw_format;
         hw_frames_ref.data().width = width_i32;
         hw_frames_ref.data().height = height_i32;
         hw_frames_ref.data().initial_pool_size = VAAPI_POOL_SIZE;
@@ -180,7 +217,18 @@ impl VaapiEncoder {
         //   sei=0 — suppress SEI prefix NAL units (timing info, recovery
         //     point, etc.). Saves a few bytes per IDR and no decoder we
         //     ship to needs them.
-        let dict = AVDictionary::new(c"profile", c"main", 0)
+        // Profile string for the VAAPI encoder private opts. `main` is
+        // the 4:2:0 Main profile (H.264 Main, HEVC Main). `rext` is
+        // libavcodec's name for HEVC Range Extensions, which is where
+        // Main 4:4:4 lives — `hevc_vaapi` accepts `rext` and picks the
+        // appropriate 4:4:4 sub-profile based on the hwframes
+        // `sw_format` we set above. H.264 4:4:4 is rejected at the top
+        // of this function (no VAAPI profile exists).
+        let profile_cstr = match chroma {
+            ChromaSubsampling::Yuv420 => c"main",
+            ChromaSubsampling::Yuv444 => c"rext",
+        };
+        let dict = AVDictionary::new(c"profile", profile_cstr, 0)
             .set(c"async_depth", c"1", 0)
             .set(c"rc_mode", c"VBR", 0)
             .set(c"idr_interval", c"2147483647", 0)
@@ -218,19 +266,23 @@ impl VaapiEncoder {
             }
         }
 
-        let bgra_to_nv12 = SwsContext::get_context(
+        let scaler_label = match chroma {
+            ChromaSubsampling::Yuv420 => "BGRA -> NV12",
+            ChromaSubsampling::Yuv444 => "BGRA -> YUV444P",
+        };
+        let bgra_to_encoder_input = SwsContext::get_context(
             width_i32,
             height_i32,
             ffi::AV_PIX_FMT_BGRA,
             width_i32,
             height_i32,
-            ffi::AV_PIX_FMT_NV12,
+            sw_format,
             ffi::SWS_FAST_BILINEAR,
             None,
             None,
             None,
         )
-        .ok_or(CodecError::ScalerInit("BGRA -> NV12"))?;
+        .ok_or(CodecError::ScalerInit(scaler_label))?;
 
         let mut bgra_frame = AVFrame::new();
         bgra_frame.set_format(ffi::AV_PIX_FMT_BGRA);
@@ -239,7 +291,7 @@ impl VaapiEncoder {
         bgra_frame.alloc_buffer()?;
 
         let mut sw_frame = AVFrame::new();
-        sw_frame.set_format(ffi::AV_PIX_FMT_NV12);
+        sw_frame.set_format(sw_format);
         sw_frame.set_width(width_i32);
         sw_frame.set_height(height_i32);
         sw_frame.alloc_buffer()?;
@@ -280,8 +332,9 @@ impl VaapiEncoder {
 
         Ok(Self {
             kind,
+            chroma,
             encoder,
-            bgra_to_nv12,
+            bgra_to_encoder_input,
             sw_frame,
             bgra_frame,
             extradata,
@@ -299,10 +352,11 @@ impl VaapiEncoder {
     /// immediately after this returns. `force_keyframe` mirrors
     /// `encode_bgra`.
     ///
-    /// Constraints: `frame.fourcc` must be NV12 (the encoder's
-    /// `sw_format`); width/height are pinned to the encoder's
-    /// construction values. Resolution changes go through a full
-    /// encoder rebuild — same as the BGRA path.
+    /// Constraints: `frame.fourcc` must match the negotiated chroma
+    /// — `NV12` for 4:2:0 (the encoder's NV12 `sw_format`) or `YU24`
+    /// (DRM_FORMAT_YUV444) for HEVC Main444. Width/height are pinned
+    /// to the encoder's construction values; resolution changes go
+    /// through a full encoder rebuild.
     ///
     /// Approach: reuse the encoder's existing VAAPI hwframes pool and
     /// let `vaapi_map_from_drm` add each imported surface into it
@@ -318,11 +372,32 @@ impl VaapiEncoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
+        // DRM fourccs for the two pixel formats the encoder accepts.
+        // The dma-buf bridge must hand us a frame matching the
+        // negotiated chroma — otherwise av_hwframe_map would fail
+        // mid-pipeline with a much less actionable error.
         const NV12_FOURCC: u32 = u32::from_le_bytes(*b"NV12");
-        if frame.fourcc != NV12_FOURCC {
-            // Only NV12 is in the encoder's hw_frames_ctx sw_format;
-            // mapping any other fourcc would fail mid-pipeline with a
-            // less actionable error.
+        // YUV444P planar is exposed via DRM as three R8 planes; the
+        // aggregate fourcc on the layer side is `YU24` (yuv 4:4:4
+        // 8-bit, planar, Y/U/V plane order — matches V4L2_PIX_FMT_YUV444
+        // and what tether-gpuconvert's YUV444 export advertises).
+        const YU24_FOURCC: u32 = u32::from_le_bytes(*b"YU24");
+        let expected_fourcc = match self.chroma {
+            ChromaSubsampling::Yuv420 => NV12_FOURCC,
+            ChromaSubsampling::Yuv444 => YU24_FOURCC,
+        };
+        if frame.fourcc != expected_fourcc {
+            // Mismatch usually means a stale dma-buf bridge initialised
+            // for one chroma was fed a frame from the other (or
+            // gpuconvert and the encoder disagree on the YUV444P
+            // wire fourcc). Both numbers in the log so the root cause
+            // is obvious without running with AV_LOG_DEBUG.
+            warn!(
+                actual = format_args!("0x{:08x}", frame.fourcc),
+                expected = format_args!("0x{:08x}", expected_fourcc),
+                chroma = ?self.chroma,
+                "imported dma-buf fourcc does not match the negotiated chroma"
+            );
             return Err(CodecError::UnsupportedInputFormat);
         }
         if frame.objects.len() > AV_DRM_MAX_PLANES
@@ -547,11 +622,11 @@ impl Encoder for VaapiEncoder {
             }
         }
 
-        // 2. swscale BGRA -> NV12 into the CPU-side sw_frame. This is
-        // the CPU pixel-format conversion the DMA-BUF zero-copy path
-        // will eventually eliminate by handing us a GPU surface in
-        // the native format.
-        self.bgra_to_nv12.scale_frame(
+        // 2. swscale BGRA -> encoder input format (NV12 or YUV444P
+        // depending on the negotiated chroma) into the CPU-side
+        // sw_frame. The DMA-BUF zero-copy path delivers the same
+        // pixel format pre-converted by tether-gpuconvert.
+        self.bgra_to_encoder_input.scale_frame(
             &self.bgra_frame,
             0,
             i32::try_from(height).expect("height fits in i32"),

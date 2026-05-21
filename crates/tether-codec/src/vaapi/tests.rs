@@ -8,7 +8,7 @@ use super::{VaapiDecoder, VaapiEncoder};
 fn vaapi_encoder_smoke() {
     let w = 640;
     let h = 480;
-    let mut enc = VaapiEncoder::new(tether_protocol::control::CodecKind::H264, w, h, 30, 4_000).expect("VAAPI encoder");
+    let mut enc = VaapiEncoder::new(tether_protocol::control::VideoProfile::H264_8BIT_420, w, h, 30, 4_000).expect("VAAPI encoder");
     let bgra = vec![0x80u8; (w * h * 4) as usize];
     let packets = enc.encode_bgra(&bgra, 0, true).expect("encode");
     // First frame may produce 0 packets (encoder warm-up) or 1+
@@ -117,7 +117,7 @@ fn vaapi_encoder_dmabuf_import() {
 
     let mut sw_enc = H264Encoder::new_bgra(w, h, 30, 2_000).expect("sw encoder");
     let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
-    let mut hw_enc = VaapiEncoder::new(tether_protocol::control::CodecKind::H264, w, h, 30, 4_000).expect("VAAPI encoder");
+    let mut hw_enc = VaapiEncoder::new(tether_protocol::control::VideoProfile::H264_8BIT_420, w, h, 30, 4_000).expect("VAAPI encoder");
 
     // Pump frames through SW encode → VAAPI decode until we get a
     // GpuFrame holding a DMA-BUF. Six frames is the same budget
@@ -184,4 +184,44 @@ fn probe_encoder_kind_smoke() {
     println!("H264 buildable: {}", probe_encoder_kind(CodecKind::H264));
     println!("HEVC buildable: {}", probe_encoder_kind(CodecKind::Hevc));
     println!("AV1  buildable: {}", probe_encoder_kind(CodecKind::Av1));
+}
+
+#[test]
+#[ignore = "requires VAAPI HEVC Main444 (Intel Tiger Lake+ / AMD VCN3+)"]
+fn hevc_main444_encoder_constructs() {
+    // The desktop-quality top rung. If this fails on a known-good
+    // box, the negotiator silently downgrades sessions to 4:2:0 and
+    // text-edge quality regresses without surfacing a clear error.
+    // Failing this test is the actionable signal.
+    let w = 640;
+    let h = 480;
+    let mut enc = VaapiEncoder::new(
+        tether_protocol::control::VideoProfile::HEVC_8BIT_444,
+        w,
+        h,
+        30,
+        8_000,
+    )
+    .expect("HEVC Main444 encoder construction");
+    // BGRA → YUV444P swscale path must also succeed end-to-end. A
+    // mid-grey frame is enough; we don't validate fidelity here —
+    // that's the round-trip integration test in dmabuf_test.
+    let bgra = vec![0x80u8; (w * h * 4) as usize];
+    let _ = enc.encode_bgra(&bgra, 0, true).expect("encode 1 frame");
+}
+
+#[test]
+#[ignore = "requires VAAPI device; exercises supported_encode_profiles"]
+fn supported_encode_profiles_includes_baseline() {
+    // Floor contract: on any working VAAPI box, the H.264 4:2:0
+    // profile must be in the cache. Without it, no client could
+    // negotiate at all. The probe result is OnceLock-cached, so
+    // running this after other VAAPI tests in the same process
+    // returns the same list — the determinism is the point.
+    let profiles = crate::supported_encode_profiles();
+    println!("supported encode profiles: {profiles:?}");
+    assert!(
+        profiles.contains(&tether_protocol::control::VideoProfile::H264_8BIT_420),
+        "H.264 4:2:0 8-bit must be available on any VAAPI driver this build supports"
+    );
 }

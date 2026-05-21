@@ -73,30 +73,27 @@ pub fn pick_supported_profile(
 /// hardware generation, none of which FFmpeg's build-time codec list
 /// reflects accurately.
 ///
-/// Today the constructor doesn't yet take a `VideoProfile`, so we only
-/// probe `(_, Yuv420, 8)` triples. The Yuv444 probes light up in phase B
-/// when [`crate::vaapi::VaapiEncoder::new`] grows the chroma parameter.
-/// Listing the to-be-supported profiles here would lie to the
-/// negotiator and cause a downstream encoder construction failure
-/// mid-session.
+/// Probes every entry in [`PROFILE_PREFERENCE`] (skipping any that the
+/// driver rejects — Main444 on Tiger Lake- Intel, for example) plus
+/// the 4:2:0 H.264 floor, in deterministic order. Output order is
+/// preserved so the negotiator's `contains` check sees the same list
+/// shape regardless of which driver / build is running.
 #[must_use]
 pub fn supported_encode_profiles() -> Vec<VideoProfile> {
     use std::sync::OnceLock;
     static CACHED: OnceLock<Vec<VideoProfile>> = OnceLock::new();
     CACHED
         .get_or_init(|| {
-            let mut out = Vec::new();
-            for codec in [CodecKind::H264, CodecKind::Hevc] {
-                let profile_420 = VideoProfile {
-                    codec,
-                    chroma: ChromaSubsampling::Yuv420,
-                    bit_depth: 8,
-                };
-                if probe_encoder_kind(codec) {
-                    out.push(profile_420);
-                }
-            }
-            out
+            // Walk PROFILE_PREFERENCE so we never advertise a profile
+            // that isn't in the negotiator's preference list. The
+            // (HEVC, Yuv444) probe is the load-bearing addition here:
+            // it lights up the desktop-quality rung on hosts that
+            // can actually do it and stays absent elsewhere.
+            PROFILE_PREFERENCE
+                .iter()
+                .copied()
+                .filter(|p| probe_encoder_profile(*p))
+                .collect()
         })
         .clone()
 }
@@ -116,69 +113,59 @@ pub fn supported_encode_profiles() -> Vec<VideoProfile> {
 /// upstream (the client's `preferred_codecs` defaults to a non-empty
 /// list).
 pub fn probe_encoder(
-    preferred: &[CodecKind],
+    profile: VideoProfile,
     width: u32,
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
-) -> Result<(CodecKind, Box<dyn Encoder>)> {
-    if preferred.is_empty() {
-        return Err(CodecError::NoHardwareCodec(
-            "client preferred_codecs list was empty".to_string(),
-        ));
-    }
-
+) -> Result<(VideoProfile, Box<dyn Encoder>)> {
     #[cfg(target_os = "linux")]
     {
-        let mut last_err: Option<(CodecKind, CodecError)> = None;
-        for kind in preferred {
-            match crate::vaapi::VaapiEncoder::new(*kind, width, height, fps, bitrate_kbps) {
-                Ok(enc) => return Ok((*kind, Box::new(enc))),
-                Err(e) => {
-                    tracing::warn!(
-                        backend = "vaapi",
-                        codec = ?kind,
-                        error = %e,
-                        "VAAPI encoder construction failed for codec; trying next"
-                    );
-                    last_err = Some((*kind, e));
-                }
+        match crate::vaapi::VaapiEncoder::new(profile, width, height, fps, bitrate_kbps) {
+            Ok(enc) => Ok((profile, Box::new(enc))),
+            Err(e) => {
+                tracing::warn!(
+                    backend = "vaapi",
+                    codec = ?profile.codec,
+                    chroma = ?profile.chroma,
+                    bit_depth = profile.bit_depth,
+                    error = %e,
+                    "VAAPI encoder construction failed"
+                );
+                Err(no_hw_encoder(profile, e))
             }
         }
-        let (kind, src) = last_err.expect("loop entered with non-empty preferred");
-        return Err(no_hw_encoder(kind, src));
     }
 
     #[cfg(target_os = "macos")]
     {
-        let mut last_err: Option<(CodecKind, CodecError)> = None;
-        for kind in preferred {
-            match crate::videotoolbox::VideoToolboxEncoder::new(
-                *kind,
-                width,
-                height,
-                fps,
-                bitrate_kbps,
-            ) {
-                Ok(enc) => return Ok((*kind, Box::new(enc))),
-                Err(e) => {
-                    tracing::warn!(
-                        backend = "videotoolbox",
-                        codec = ?kind,
-                        error = %e,
-                        "VideoToolbox encoder construction failed for codec; trying next"
-                    );
-                    last_err = Some((*kind, e));
-                }
+        // VideoToolbox doesn't yet take VideoProfile (4:4:4 / Main444
+        // path on Apple Silicon is separate work). For now we map by
+        // codec only and let chroma slip through unenforced — Apple
+        // silicon Main encodes accept 4:2:0 only in practice.
+        match crate::videotoolbox::VideoToolboxEncoder::new(
+            profile.codec,
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+        ) {
+            Ok(enc) => Ok((profile, Box::new(enc))),
+            Err(e) => {
+                tracing::warn!(
+                    backend = "videotoolbox",
+                    codec = ?profile.codec,
+                    error = %e,
+                    "VideoToolbox encoder construction failed"
+                );
+                Err(no_hw_encoder_vt(profile.codec, e))
             }
         }
-        let (kind, src) = last_err.expect("loop entered with non-empty preferred");
-        return Err(no_hw_encoder_vt(kind, src));
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (preferred, width, height, fps, bitrate_kbps);
+        let _ = (profile, width, height, fps, bitrate_kbps);
         Err(no_hw_encoder_for_platform())
     }
 }
@@ -206,25 +193,41 @@ pub fn probe_encoder(
 /// `vaQueryConfigProfiles` libva probe before construction. Today
 /// we accept the risk because we don't have the test hardware.
 pub fn probe_encoder_kind(kind: CodecKind) -> bool {
+    probe_encoder_profile(VideoProfile {
+        codec: kind,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    })
+}
+
+/// Profile-level capability probe: construct + tear down an encoder
+/// at the given profile to learn whether this driver actually supports
+/// it. Same 128×128 floor as [`probe_encoder_kind`]; same Drop-on-failure
+/// caveat.
+///
+/// 4:4:4 probes go through here. `(Hevc, Yuv444, 8)` builds successfully
+/// on Intel Tiger Lake+ and AMD VCN3+; the open() returns an error
+/// elsewhere and we filter the profile out of [`supported_encode_profiles`].
+#[must_use]
+pub fn probe_encoder_profile(profile: VideoProfile) -> bool {
     #[cfg(target_os = "linux")]
     {
-        crate::vaapi::VaapiEncoder::new(kind, 128, 128, 30, 1_000).is_ok()
+        crate::vaapi::VaapiEncoder::new(profile, 128, 128, 30, 1_000).is_ok()
     }
     #[cfg(target_os = "macos")]
     {
-        // Apple Silicon h264/hevc_videotoolbox accept down to 128×128,
-        // matching the VAAPI floor. Intel Macs (pre-M1) have been
-        // observed to reject HEVC below ~144×144 — bumping to 256×144
-        // gives headroom across both arches and still costs the probe
-        // only a single one-shot encode. If the probe ever passes here
-        // and `new()` then fails at a real resolution on an Intel mac,
-        // raise the floor further; we don't have an Intel mac in CI to
-        // validate against today.
-        crate::videotoolbox::VideoToolboxEncoder::new(kind, 256, 144, 30, 1_000).is_ok()
+        // VideoToolbox 4:4:4 isn't wired yet — refuse to advertise it
+        // so the negotiator doesn't pick a profile we can't actually
+        // construct end-to-end. Yuv420 8-bit is the only macOS profile
+        // we support today.
+        if profile.chroma != ChromaSubsampling::Yuv420 || profile.bit_depth != 8 {
+            return false;
+        }
+        crate::videotoolbox::VideoToolboxEncoder::new(profile.codec, 256, 144, 30, 1_000).is_ok()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = kind;
+        let _ = profile;
         false
     }
 }
@@ -272,17 +275,19 @@ pub fn probe_decoder(kind: CodecKind) -> Result<Box<dyn Decoder>> {
 }
 
 #[cfg(target_os = "linux")]
-fn no_hw_encoder(kind: CodecKind, source: CodecError) -> CodecError {
-    let profile_hint = match kind {
-        CodecKind::H264 => "VAProfileH264{ConstrainedBaseline,Main,High}",
-        CodecKind::Hevc => "VAProfileHEVCMain",
-        CodecKind::Av1 => "VAProfileAV1Profile0",
+fn no_hw_encoder(profile: VideoProfile, source: CodecError) -> CodecError {
+    let profile_hint = match (profile.codec, profile.chroma) {
+        (CodecKind::H264, _) => "VAProfileH264{ConstrainedBaseline,Main,High}",
+        (CodecKind::Hevc, ChromaSubsampling::Yuv420) => "VAProfileHEVCMain",
+        (CodecKind::Hevc, ChromaSubsampling::Yuv444) => "VAProfileHEVCMain444",
+        (CodecKind::Av1, _) => "VAProfileAV1Profile0",
     };
     CodecError::NoHardwareCodec(format!(
-        "VAAPI encoder unavailable for {kind:?} ({source}). \
+        "VAAPI encoder unavailable for {:?} {:?} {}-bit ({source}). \
          Check that /dev/dri/renderD128 is present and readable, and that `vainfo` \
          lists {profile_hint} with VAEntrypointEnc*. \
-         Tether requires GPU encode — there is no software fallback."
+         Tether requires GPU encode — there is no software fallback.",
+        profile.codec, profile.chroma, profile.bit_depth
     ))
 }
 

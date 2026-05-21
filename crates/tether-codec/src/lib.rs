@@ -20,7 +20,7 @@ pub mod videotoolbox;
 
 pub use probe::{
     pick_supported_profile, probe_decoder, probe_encoder, probe_encoder_kind,
-    supported_encode_profiles, PROFILE_PREFERENCE,
+    probe_encoder_profile, supported_encode_profiles, PROFILE_PREFERENCE,
 };
 
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. The decoder

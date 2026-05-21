@@ -85,7 +85,17 @@ fn bench_encode_bgra(
     iters: usize,
     budget_ms: f64,
 ) {
-    let mut enc = match VaapiEncoder::new(codec, width, height, fps, bitrate_kbps) {
+    let mut enc = match VaapiEncoder::new(
+        tether_protocol::control::VideoProfile {
+            codec,
+            chroma: tether_protocol::control::ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+    ) {
         Ok(e) => e,
         Err(e) => {
             println!("  encode_bgra:   SKIP ({codec:?} @ {width}x{height}: {e})");
@@ -132,7 +142,17 @@ fn bench_encode_dmabuf(
     };
     let GpuFrameSource::DmaBuf(ref dmabuf) = dmabuf_holder.source;
 
-    let mut enc = match VaapiEncoder::new(codec, width, height, fps, bitrate_kbps) {
+    let mut enc = match VaapiEncoder::new(
+        tether_protocol::control::VideoProfile {
+            codec,
+            chroma: tether_protocol::control::ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+    ) {
         Ok(e) => e,
         Err(e) => {
             println!("  encode_dmabuf: SKIP ({codec:?} @ {width}x{height}: {e})");
@@ -169,7 +189,17 @@ fn bench_decode(
     // Build the input bitstream first. We share one encoder; if it
     // fails to construct, the decoder bench has nothing to feed and
     // we skip cleanly.
-    let mut enc = match VaapiEncoder::new(codec, width, height, fps, bitrate_kbps) {
+    let mut enc = match VaapiEncoder::new(
+        tether_protocol::control::VideoProfile {
+            codec,
+            chroma: tether_protocol::control::ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+    ) {
         Ok(e) => e,
         Err(e) => {
             println!("  decode:        SKIP (cannot build {codec:?} encoder for bitstream: {e})");
@@ -234,7 +264,13 @@ fn bench_decode(
 /// dropping it releases the VA surface back to the source decoder's
 /// pool.
 fn build_dmabuf_source(width: u32, height: u32) -> Result<GpuFrame, String> {
-    let mut src_enc = VaapiEncoder::new(CodecKind::H264, width, height, 60, 8_000)
+    let mut src_enc = VaapiEncoder::new(
+        tether_protocol::control::VideoProfile::H264_8BIT_420,
+        width,
+        height,
+        60,
+        8_000,
+    )
         .map_err(|e| format!("source encoder failed: {e}"))?;
     let mut src_dec = VaapiDecoder::new(CodecKind::H264)
         .map_err(|e| format!("source decoder failed: {e}"))?;

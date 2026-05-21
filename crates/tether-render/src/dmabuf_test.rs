@@ -273,7 +273,14 @@ fn dmabuf_zero_copy_roundtrip_yields_recognisable_pixels() {
 
     // Encode the test pattern. First frame is forced IDR; we feed a
     // few frames so the decoder has enough to actually emit one.
-    let mut enc = VaapiEncoder::new(CodecKind::H264, w, h, 30, 4_000).expect("VAAPI encoder");
+    let mut enc = VaapiEncoder::new(
+        tether_protocol::control::VideoProfile::H264_8BIT_420,
+        w,
+        h,
+        30,
+        4_000,
+    )
+    .expect("VAAPI encoder");
     let mut packets = Vec::new();
     for t in 0..6i64 {
         packets.extend(

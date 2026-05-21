@@ -322,6 +322,7 @@ fn dmabuf_zero_copy_roundtrip_yields_recognisable_pixels() {
         &pipeline.yuv_bgl,
         &pipeline.sampler,
         tether_protocol::control::ChromaSubsampling::Yuv420,
+        8,
         &dmabuf,
         gw,
         gh,

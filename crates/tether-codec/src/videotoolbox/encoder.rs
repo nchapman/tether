@@ -461,7 +461,13 @@ impl VideoToolboxEncoder {
     /// decode round-trip (which feeds one BGRA frame and needs to
     /// drain whatever VT buffered before the round-trip can examine
     /// the emitted bitstream).
-    pub(crate) fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+    ///
+    /// `pub` rather than `pub(crate)` so cross-crate hardware tests
+    /// (e.g. `tether-render::iosurface_test`) can also drive the
+    /// flush — the production trait shape (`Encoder`) deliberately
+    /// doesn't expose flush because the live send loop never needs
+    /// it, but tests that submit a short frame burst do.
+    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         self.encoder.send_frame(None)?;
         drain_encoder(&mut self.encoder, &self.extradata)
     }

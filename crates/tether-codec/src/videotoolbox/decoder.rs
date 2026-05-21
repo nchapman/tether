@@ -192,7 +192,13 @@ impl VideoToolboxDecoder {
     /// call. Used by the capability probe path to extract a frame
     /// from a single-IDR fixture submit (VT's wrapper otherwise
     /// requires either another packet or EOF before emitting).
-    pub(crate) fn signal_eof(&mut self) -> Result<()> {
+    ///
+    /// `pub` rather than `pub(crate)` for the same reason
+    /// `VideoToolboxEncoder::flush` is `pub`: cross-crate hardware
+    /// tests need to drain a short stream, even though the production
+    /// `Decoder` trait deliberately omits EOF (the live recv loop
+    /// runs until disconnect, never EOFs).
+    pub fn signal_eof(&mut self) -> Result<()> {
         self.decoder.send_packet(None)?;
         Ok(())
     }

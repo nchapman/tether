@@ -9,6 +9,9 @@ mod gpu;
 #[cfg(test)]
 mod dmabuf_test;
 
+#[cfg(test)]
+mod iosurface_test;
+
 use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};

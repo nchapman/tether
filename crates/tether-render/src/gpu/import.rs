@@ -112,10 +112,14 @@ fn import_nv12(
     })
 }
 
-/// VAAPI exports a Main444 surface as three R8 layers (Y / U / V),
-/// one plane per layer, under `VA_EXPORT_SURFACE_SEPARATE_LAYERS`.
-/// Each layer's DRM format is `R8  ` (DRM_FORMAT_R8); the planes are
-/// full-resolution.
+/// VAAPI exports a Main444 surface in one of two shapes depending on
+/// the driver. `VA_EXPORT_SURFACE_SEPARATE_LAYERS` is a *hint* — the
+/// libva spec lets drivers ignore it. Intel media-driver and current
+/// mesa honor it and return three R8 layers (Y / U / V), one plane
+/// per layer. Other drivers (older mesa, nvidia-vaapi-driver) return
+/// one layer with the aggregate DRM_FORMAT_YUV444 fourcc and three
+/// plane offsets within it. We accept either; rejecting the latter
+/// would break otherwise-valid streams from those decoders.
 fn import_yuv444(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -125,39 +129,101 @@ fn import_yuv444(
     height: u32,
     guard: GpuFrameGuard,
 ) -> Result<YuvTextures> {
-    if dmabuf.layers.len() != 3 {
-        return Err(RenderError::DmaBufImport(format!(
-            "expected 3 layers (YUV444 SEPARATE_LAYERS), got {}",
-            dmabuf.layers.len()
-        )));
-    }
-    let y = import_one_layer(
-        device,
-        "tether-render y plane (dmabuf 444)",
-        dmabuf,
-        0,
-        width,
-        height,
-        wgpu::TextureFormat::R8Unorm,
-    )?;
-    let u = import_one_layer(
-        device,
-        "tether-render u plane (dmabuf 444)",
-        dmabuf,
-        1,
-        width,
-        height,
-        wgpu::TextureFormat::R8Unorm,
-    )?;
-    let v = import_one_layer(
-        device,
-        "tether-render v plane (dmabuf 444)",
-        dmabuf,
-        2,
-        width,
-        height,
-        wgpu::TextureFormat::R8Unorm,
-    )?;
+    let (y, u, v) = match dmabuf.layers.len() {
+        3 => {
+            // Three R8 layers, one plane each — the SEPARATE_LAYERS
+            // path. Sanity-check that each layer is actually a single
+            // R8 plane; multi-plane layers here would be an unrelated
+            // export shape we'd want to fall through into the 1-layer
+            // path for.
+            for (i, l) in dmabuf.layers.iter().enumerate() {
+                if l.num_planes != 1 {
+                    return Err(RenderError::DmaBufImport(format!(
+                        "YUV444 SEPARATE_LAYERS: layer {i} has {} planes; expected 1",
+                        l.num_planes
+                    )));
+                }
+            }
+            let y = import_one_layer(
+                device,
+                "tether-render y plane (dmabuf 444 separate)",
+                dmabuf,
+                0,
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            )?;
+            let u = import_one_layer(
+                device,
+                "tether-render u plane (dmabuf 444 separate)",
+                dmabuf,
+                1,
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            )?;
+            let v = import_one_layer(
+                device,
+                "tether-render v plane (dmabuf 444 separate)",
+                dmabuf,
+                2,
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            )?;
+            (y, u, v)
+        }
+        1 => {
+            // Single layer carrying three plane offsets within one
+            // DRM object — the COMPOSED form the libva spec allows
+            // even with SEPARATE_LAYERS requested. This is also the
+            // shape the encoder side produces (see
+            // `yuv444_dmabuf_to_codec_frame` in apps/tether-host).
+            let layer = &dmabuf.layers[0];
+            if layer.num_planes != 3 {
+                return Err(RenderError::DmaBufImport(format!(
+                    "YUV444 single-layer: expected 3 planes, got {}",
+                    layer.num_planes
+                )));
+            }
+            let y = import_one_plane(
+                device,
+                "tether-render y plane (dmabuf 444 composed)",
+                dmabuf,
+                0,
+                0,
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            )?;
+            let u = import_one_plane(
+                device,
+                "tether-render u plane (dmabuf 444 composed)",
+                dmabuf,
+                0,
+                1,
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            )?;
+            let v = import_one_plane(
+                device,
+                "tether-render v plane (dmabuf 444 composed)",
+                dmabuf,
+                0,
+                2,
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            )?;
+            (y, u, v)
+        }
+        n => {
+            return Err(RenderError::DmaBufImport(format!(
+                "YUV444 dma-buf has {n} layers; expected 3 (separate) or 1 (composed)"
+            )));
+        }
+    };
     let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
     let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
     let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
@@ -202,23 +268,50 @@ fn import_one_layer(
 ) -> Result<wgpu::Texture> {
     let layer = &dmabuf.layers[layer_idx];
     // SEPARATE_LAYERS gives one plane per layer; multi-plane within a
-    // layer would mean we're looking at a COMPOSED export, which we
-    // explicitly didn't ask for and don't import.
+    // layer would mean we're looking at a COMPOSED export, which the
+    // YUV444 path imports via `import_one_plane` instead.
     if layer.num_planes != 1 {
         return Err(RenderError::DmaBufImport(format!(
             "layer {layer_idx} has {} planes; expected 1 (SEPARATE_LAYERS)",
             layer.num_planes
         )));
     }
-    let obj_idx = layer.object_index[0] as usize;
+    import_one_plane(device, label, dmabuf, layer_idx, 0, width, height, format)
+}
+
+/// Import one plane of a (possibly multi-plane) layer. Generalises
+/// `import_one_layer` for the COMPOSED YUV444 case, where a single
+/// `DmaBufLayer` carries three plane offsets within one DRM object.
+/// For the SEPARATE_LAYERS case (`plane_idx=0`), this collapses to
+/// the same code path.
+#[allow(clippy::too_many_arguments)]
+fn import_one_plane(
+    device: &wgpu::Device,
+    label: &str,
+    dmabuf: &DmaBufFrame,
+    layer_idx: usize,
+    plane_idx: usize,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> Result<wgpu::Texture> {
+    let layer = &dmabuf.layers[layer_idx];
+    if plane_idx >= layer.num_planes as usize {
+        return Err(RenderError::DmaBufImport(format!(
+            "layer {layer_idx} plane {plane_idx} out of range ({} planes)",
+            layer.num_planes
+        )));
+    }
+    let obj_idx = layer.object_index[plane_idx] as usize;
     let obj = dmabuf.objects.get(obj_idx).ok_or_else(|| {
         RenderError::DmaBufImport(format!(
-            "layer {layer_idx} references object {obj_idx} but only {} present",
+            "layer {layer_idx} plane {plane_idx} references object {obj_idx} but \
+             only {} present",
             dmabuf.objects.len()
         ))
     })?;
     // dup the fd because wgpu takes ownership and the same object may
-    // also back another layer. `try_clone` is dup(2) with CLOEXEC.
+    // also back another plane. `try_clone` is dup(2) with CLOEXEC.
     let fd = obj
         .fd
         .try_clone()
@@ -255,8 +348,8 @@ fn import_one_layer(
                 fd,
                 &hal_desc,
                 obj.drm_format_modifier,
-                u64::from(layer.pitch[0]),
-                u64::from(layer.offset[0]),
+                u64::from(layer.pitch[plane_idx]),
+                u64::from(layer.offset[plane_idx]),
             )
             .map_err(|e| {
                 RenderError::DmaBufImport(format!("texture_from_dmabuf_fd: {e:?}"))

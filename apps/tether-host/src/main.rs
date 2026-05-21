@@ -147,19 +147,41 @@ async fn handle_client(
             // means a legacy client built before this extension — assume
             // the universal floor (H.264 4:2:0 8-bit) per the protocol
             // doc on CLIENT_DECODE_PROFILES_EXTENSION_KEY.
+            // Bound the extension payload before decoding. A legitimate
+            // decode-profiles list is a handful of entries — the bincode
+            // overhead per `VideoProfile` is ~5–7 bytes, so 256 bytes
+            // accommodates dozens of profiles with headroom. The cap
+            // prevents a hostile peer from forcing the host to allocate
+            // a huge `Vec<VideoProfile>` during handshake just by setting
+            // a large length prefix; without it the only ceiling would
+            // be the 64 KiB transport frame limit, which translates to
+            // a ~13k-element allocation per connection. Cheap defense
+            // in depth.
+            const MAX_DECODE_PROFILES_BYTES: usize = 256;
             let client_caps: Vec<VideoProfile> = body
                 .extensions
                 .get(CLIENT_DECODE_PROFILES_EXTENSION_KEY)
-                .and_then(|bytes| match tether_protocol::decode::<Vec<VideoProfile>>(bytes) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
+                .and_then(|bytes| {
+                    if bytes.len() > MAX_DECODE_PROFILES_BYTES {
                         warn!(
-                            error = %e,
                             payload_len = bytes.len(),
-                            "client decode-profiles extension failed to decode; \
+                            cap = MAX_DECODE_PROFILES_BYTES,
+                            "client decode-profiles extension exceeds size cap; \
                              treating as legacy H.264 4:2:0 client"
                         );
-                        None
+                        return None;
+                    }
+                    match tether_protocol::decode::<Vec<VideoProfile>>(bytes) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                payload_len = bytes.len(),
+                                "client decode-profiles extension failed to decode; \
+                                 treating as legacy H.264 4:2:0 client"
+                            );
+                            None
+                        }
                     }
                 })
                 .unwrap_or_else(|| vec![VideoProfile::H264_8BIT_420]);
@@ -962,7 +984,6 @@ fn run_capture_and_send(
     runtime: tokio::runtime::Handle,
     keyframe_conn: Arc<Connection>,
 ) {
-    let chosen_codec = chosen_profile.codec;
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
     let mut slot: Option<EncoderSlot> = None;
@@ -1045,7 +1066,7 @@ fn run_capture_and_send(
                 frame_width,
                 frame_height,
                 ENCODER_FPS,
-                derive_bitrate_kbps(chosen_codec, frame_width, frame_height, ENCODER_FPS),
+                derive_bitrate_kbps(chosen_profile, frame_width, frame_height, ENCODER_FPS),
             ) {
                 Ok((_profile, e)) => {
                     info!(
@@ -1129,7 +1150,18 @@ fn run_capture_and_send(
                     continue;
                 }
                 GpuEncodeOutcome::Fatal(e) => {
-                    tracing::error!(error = %e, "GPU encode bridge collapsed; exiting send loop");
+                    tracing::error!(
+                        error = %e,
+                        "GPU encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
+                    );
+                    let goodbye_conn = conn.clone();
+                    let reason = format!("host GPU encode bridge collapsed: {e}");
+                    let _ = runtime.block_on(goodbye_conn.send_control(
+                        &ControlMessage::Goodbye {
+                            reason,
+                            code: tether_protocol::control::GoodbyeCode::InternalError,
+                        },
+                    ));
                     return;
                 }
             },
@@ -1346,14 +1378,18 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
     guard
 }
 
-/// Default VBR target bitrate as a function of resolution, fps, and
-/// codec. Anchored at 1080p60 H.264 = 8 Mbps (the [`ENCODER_BITRATE_KBPS`]
-/// floor); scales linearly with `pixels × fps`; HEVC gets a 0.7×
-/// multiplier (conservative ~30% efficiency gain over H.264 at the
-/// same visual quality). Clamped to a sane band so a tiny test pattern
-/// doesn't get a starvation-tier bitrate and a huge display doesn't
-/// blow the LAN.
-fn derive_bitrate_kbps(codec: CodecKind, width: u32, height: u32, fps: u32) -> u32 {
+/// Default VBR target bitrate as a function of resolution, fps,
+/// codec, and chroma. Anchored at 1080p60 H.264 4:2:0 = 8 Mbps (the
+/// [`ENCODER_BITRATE_KBPS`] floor); scales linearly with `pixels × fps`;
+/// HEVC gets a 0.7× codec multiplier (conservative ~30% efficiency
+/// gain over H.264 at the same visual quality); 4:4:4 gets a 1.4×
+/// chroma multiplier on top because the encoder is now carrying 3×
+/// the chroma samples (vs. 4:2:0's 1×) and rate-control only absorbs
+/// some of the cost — without the bump, 4:4:4 sessions ship blocky
+/// chroma in the same budget that was sized for subsampled video.
+/// Clamped to a sane band so a tiny test pattern doesn't get a
+/// starvation-tier bitrate and a huge display doesn't blow the LAN.
+fn derive_bitrate_kbps(profile: VideoProfile, width: u32, height: u32, fps: u32) -> u32 {
     const REFERENCE_PIXELS: u64 = 1920 * 1080;
     const REFERENCE_FPS: u64 = 60;
     const REFERENCE_KBPS_H264: u64 = ENCODER_BITRATE_KBPS as u64;
@@ -1364,7 +1400,7 @@ fn derive_bitrate_kbps(codec: CodecKind, width: u32, height: u32, fps: u32) -> u
         .saturating_mul(u64::from(fps))
         / (REFERENCE_PIXELS * REFERENCE_FPS).max(1);
 
-    let codec_scaled = match codec {
+    let codec_scaled = match profile.codec {
         CodecKind::H264 => scaled,
         // HEVC: 70% of H.264 for similar visual quality.
         CodecKind::Hevc => scaled * 7 / 10,
@@ -1373,7 +1409,18 @@ fn derive_bitrate_kbps(codec: CodecKind, width: u32, height: u32, fps: u32) -> u
         CodecKind::Av1 => scaled * 6 / 10,
     };
 
-    codec_scaled.clamp(500, 30_000) as u32
+    // 4:4:4 has 3× the chroma samples of 4:2:0 (full-res U + V vs.
+    // half-res interleaved UV). Empirically HEVC Main444 needs
+    // ~1.3–1.5× the 4:2:0 bitrate to maintain quality parity on
+    // mixed content; less penalty (closer to 1.1×) on pure UI where
+    // chroma is mostly piecewise-constant. 1.4× is the conservative
+    // middle of that band.
+    let chroma_scaled = match profile.chroma {
+        ChromaSubsampling::Yuv420 => codec_scaled,
+        ChromaSubsampling::Yuv444 => codec_scaled * 14 / 10,
+    };
+
+    chroma_scaled.clamp(500, 30_000) as u32
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

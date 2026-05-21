@@ -183,6 +183,38 @@ impl VaapiEncoder {
         hw_frames_ref.init()?;
         encoder.set_hw_frames_ctx(hw_frames_ref);
 
+        // Color identity. The SPS VUI records what conforming decoders
+        // need to interpret the YCbCr bytes correctly. libavcodec
+        // defaults all four to "Unspecified" when these fields are
+        // untouched — and conforming decoders are then free to guess.
+        // 4:2:0 hardware decoders mostly guess BT.709 at HD+ and get
+        // it right by luck; 4:4:4 on saturated UI text reveals the
+        // mismatch as a visible color shift. Set explicitly so the
+        // gpuconvert shader's BT.709 limited-range math matches what
+        // the decoder applies on the other end.
+        //
+        // SAFETY: these AVCodecContext fields must be written before
+        // avcodec_open2 — same invariant as `extra_hw_frames` below.
+        unsafe {
+            let raw = encoder.deref_mut();
+            raw.color_primaries = ffi::AVCOL_PRI_BT709;
+            raw.color_trc = ffi::AVCOL_TRC_BT709;
+            raw.colorspace = ffi::AVCOL_SPC_BT709;
+            raw.color_range = ffi::AVCOL_RANGE_MPEG;
+            // Pin the HEVC REXT profile via the context field rather
+            // than the `profile=rext` AVOption string. The string form
+            // is brittle: libavcodec's REXT umbrella covers Main 4:4:4
+            // 8-bit, Main 4:4:4 10-bit, Main Intra, and several other
+            // sub-profiles; the actual one selected is inferred from
+            // the hwframes `sw_format`. Setting the field directly is
+            // Sunshine's reference pattern (refs/Sunshine/src/video.cpp:1687)
+            // and future-proofs against a 10-bit code path drifting
+            // the inferred sub-profile.
+            if matches!(chroma, ChromaSubsampling::Yuv444) && kind == CodecKind::Hevc {
+                raw.profile = ffi::AV_PROFILE_HEVC_REXT as i32;
+            }
+        }
+
         // VAAPI private options. The defaults are tuned for file-based
         // transcoding throughput, not realtime; we override the knobs
         // that cost us the most:
@@ -217,22 +249,23 @@ impl VaapiEncoder {
         //   sei=0 — suppress SEI prefix NAL units (timing info, recovery
         //     point, etc.). Saves a few bytes per IDR and no decoder we
         //     ship to needs them.
-        // Profile string for the VAAPI encoder private opts. `main` is
-        // the 4:2:0 Main profile (H.264 Main, HEVC Main). `rext` is
-        // libavcodec's name for HEVC Range Extensions, which is where
-        // Main 4:4:4 lives — `hevc_vaapi` accepts `rext` and picks the
-        // appropriate 4:4:4 sub-profile based on the hwframes
-        // `sw_format` we set above. H.264 4:4:4 is rejected at the top
-        // of this function (no VAAPI profile exists).
-        let profile_cstr = match chroma {
-            ChromaSubsampling::Yuv420 => c"main",
-            ChromaSubsampling::Yuv444 => c"rext",
-        };
-        let dict = AVDictionary::new(c"profile", profile_cstr, 0)
-            .set(c"async_depth", c"1", 0)
+        // Profile string for the 4:2:0 path. HEVC Main444 uses the
+        // direct AVCodecContext.profile assignment above instead — see
+        // the comment there for why. For 4:2:0 we still go through the
+        // string AVOption because libavcodec's `profile=main` is the
+        // safest broadly-supported value across drivers; the encoder
+        // defaults to High for H.264, which fails to open on hardware
+        // that only exposes Main for the chosen entrypoint.
+        let dict_builder = AVDictionary::new(c"async_depth", c"1", 0)
             .set(c"rc_mode", c"VBR", 0)
             .set(c"idr_interval", c"2147483647", 0)
             .set(c"sei", c"0", 0);
+        let dict = match chroma {
+            ChromaSubsampling::Yuv420 => dict_builder.set(c"profile", c"main", 0),
+            // 4:4:4 path: profile pinned via context field above, no
+            // AVOption needed.
+            ChromaSubsampling::Yuv444 => dict_builder,
+        };
         // AV_CODEC_FLAG_GLOBAL_HEADER routes the codec's parameter
         // sets (SPS/PPS for H.264, VPS+SPS+PPS for HEVC) into
         // `AVCodecContext.extradata` at open() rather than emitting

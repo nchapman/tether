@@ -140,9 +140,23 @@ pub fn probe_encoder(
     #[cfg(target_os = "macos")]
     {
         // VideoToolbox doesn't yet take VideoProfile (4:4:4 / Main444
-        // path on Apple Silicon is separate work). For now we map by
-        // codec only and let chroma slip through unenforced — Apple
-        // silicon Main encodes accept 4:2:0 only in practice.
+        // path on Apple Silicon is separate work). The macOS arm of
+        // `probe_encoder_profile` already returns false for non-Yuv420
+        // profiles, so the negotiator never picks one — but this
+        // function is the next layer of defense, in case the gate
+        // ever moves. Fail loudly rather than silently mis-encoding.
+        assert_eq!(
+            profile.chroma,
+            ChromaSubsampling::Yuv420,
+            "VideoToolbox encoder only handles Yuv420 today; \
+             probe_encoder_profile should have rejected {:?}",
+            profile.chroma
+        );
+        assert_eq!(
+            profile.bit_depth, 8,
+            "VideoToolbox encoder only handles 8-bit today; got {}-bit",
+            profile.bit_depth
+        );
         match crate::videotoolbox::VideoToolboxEncoder::new(
             profile.codec,
             width,

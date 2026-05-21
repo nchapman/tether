@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
     // `chosen_codec` / `chosen_chroma` fields carry the same info for
     // legacy hosts; the structured extension is authoritative on hosts
     // that emit it.
-    let negotiated_profile: VideoProfile = server_body
+    let mut negotiated_profile: VideoProfile = server_body
         .extensions
         .get(SERVER_ENCODE_PROFILE_EXTENSION_KEY)
         .and_then(|bytes| match tether_protocol::decode::<VideoProfile>(bytes) {
@@ -147,27 +147,50 @@ async fn main() -> anyhow::Result<()> {
         "video profile negotiated; handshake complete"
     );
 
-    // Sanity-check the advertised pixel format. Nv12 (4:2:0 8-bit)
-    // and Yuv444p (4:4:4 8-bit) are the two the renderer handles
-    // today; anything else (P010 for HDR, etc.) means the host is
-    // running ahead of this build. Log and continue; the renderer
-    // will fail loudly downstream if it actually can't import.
-    if let Some(pf_bytes) = server_body
-        .extensions
-        .get(tether_protocol::control::PIXEL_FORMAT_EXTENSION_KEY)
-    {
-        match tether_protocol::decode::<tether_protocol::control::PixelFormat>(pf_bytes) {
-            Ok(pf @ (tether_protocol::control::PixelFormat::Nv12
-                | tether_protocol::control::PixelFormat::Yuv444p)) => {
-                tracing::debug!(?pf, "host advertised pixel format");
-            }
-            Ok(other) => {
-                warn!(?other, "host advertised an unsupported pixel format; expect rendering issues");
+    // Cross-check the advertised pixel format against the negotiated
+    // chroma. The chroma in the encode-profile extension is what the
+    // renderer actually picks its pipeline against, so a divergence
+    // here means the host's two advertisements disagree. Log the
+    // mismatch and trust the negotiated profile (the structured cap
+    // negotiation is the authoritative source).
+    use tether_protocol::control::{PixelFormat, PIXEL_FORMAT_EXTENSION_KEY};
+    if let Some(pf_bytes) = server_body.extensions.get(PIXEL_FORMAT_EXTENSION_KEY) {
+        match tether_protocol::decode::<PixelFormat>(pf_bytes) {
+            Ok(pf) => {
+                let expected = match negotiated_profile.chroma {
+                    tether_protocol::control::ChromaSubsampling::Yuv420 => PixelFormat::Nv12,
+                    tether_protocol::control::ChromaSubsampling::Yuv444 => PixelFormat::Yuv444p,
+                };
+                if pf == expected {
+                    tracing::debug!(?pf, "host pixel-format extension matches negotiated chroma");
+                } else {
+                    warn!(
+                        advertised = ?pf,
+                        expected = ?expected,
+                        negotiated_chroma = ?negotiated_profile.chroma,
+                        "host pixel-format extension disagrees with negotiated chroma; \
+                         trusting the negotiated profile"
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "host advertised an unparseable pixel format extension");
             }
         }
+    }
+
+    // Defense-in-depth bit_depth clamp on the negotiated profile. The
+    // host's PROFILE_PREFERENCE list only contains 8-bit entries today,
+    // but a hostile or buggy host could echo a different value in the
+    // structured extension. Clamp to 8 so any downstream consumer of
+    // negotiated_profile.bit_depth (logs today, code in the future)
+    // never sees an out-of-band value.
+    if negotiated_profile.bit_depth != 8 {
+        warn!(
+            bit_depth = negotiated_profile.bit_depth,
+            "host echoed unsupported bit_depth in encode-profile extension; clamping to 8"
+        );
+        negotiated_profile.bit_depth = 8;
     }
 
     // Render channel: producer is the recv loop, consumer is the wgpu

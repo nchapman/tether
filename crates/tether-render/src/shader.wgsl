@@ -36,16 +36,20 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 // Color params:
 //   .x = EOTF dispatch tag (see Rust constants TRANSFER_KIND_* in
 //        gpu/mod.rs).
-//   .y = luma_scale as f32 bit-pattern. The shader multiplies sampled
-//        Y/UV by this before the range expansion. For 8-bit data the
-//        scale is 1.0 (no-op multiply); for 10-bit MSB-aligned in 16-bit
-//        storage it compensates the ~0.999 max-value sampler reading
-//        back to 1.0. See `luma_scale_for` in gpu/mod.rs for the
-//        derivation.
-//   .zw = reserved (matrix kind / range kind when they grow variants).
+//   .y = range_kind dispatch tag. Selects 8-bit vs 10-bit
+//        limited-range breakpoints. The 8-bit breakpoints
+//        (16/255, 235/255) and the idealised 10-bit breakpoints
+//        (4096/65535, 60160/65535) differ by ~1% in mid-tone
+//        normalised luma; sharing the 8-bit math on 10-bit data
+//        produces a small but systematic lift (visible only at
+//        HDR-grade calibration today, would compound under PQ).
+//   .z = reserved (matrix kind when BT.2020 gains a shader variant).
+//   .w = reserved.
 @group(2) @binding(0) var<uniform> color_params: vec4<u32>;
 const TRANSFER_KIND_BT709: u32 = 0u;
 const TRANSFER_KIND_SRGB: u32 = 1u;
+const RANGE_KIND_LIMITED_8: u32 = 0u;
+const RANGE_KIND_LIMITED_10: u32 = 1u;
 
 // =============================================================
 // YUV -> display: three independent transforms, each swappable.
@@ -91,15 +95,29 @@ const TRANSFER_KIND_SRGB: u32 = 1u;
 // configure today produces.
 
 fn limited_y_to_normalized(y_lim: f32) -> f32 {
-    // Y[16..235] -> [0..1]. Out-of-range values stay out-of-range;
-    // we don't clamp because the matrix and EOTF below tolerate it
-    // (and clamping here would crush legitimate overshoots from
-    // chroma siting / encoder rate-control).
+    // Y[footroom..headroom] -> [0..1]. Out-of-range values stay
+    // out-of-range; we don't clamp because the matrix and EOTF
+    // below tolerate it (and clamping here would crush legitimate
+    // overshoots from chroma siting / encoder rate-control).
+    //
+    // 10-bit-in-16 MSB-aligned: black = 64*64/65535 = 4096/65535,
+    // white = 940*64/65535 = 60160/65535. Range = 876*64/65535 =
+    // 56064/65535. 8-bit: black=16/255, white=235/255, range=219/255.
+    if color_params.y == RANGE_KIND_LIMITED_10 {
+        return (y_lim - 4096.0 / 65535.0) * (65535.0 / 56064.0);
+    }
     return (y_lim - 16.0 / 255.0) * (255.0 / 219.0);
 }
 
 fn limited_c_to_normalized(c_lim: f32) -> f32 {
-    // Cb/Cr[16..240] -> [-0.5..0.5].
+    // Cb/Cr[footroom..headroom] -> [-0.5..0.5].
+    //
+    // 10-bit-in-16 MSB-aligned: neutral = 512*64/65535 = 32768/65535,
+    // range = 896*64/65535 = 57344/65535. 8-bit: neutral=128/255,
+    // range=224/255.
+    if color_params.y == RANGE_KIND_LIMITED_10 {
+        return (c_lim - 32768.0 / 65535.0) * (65535.0 / 57344.0);
+    }
     return (c_lim - 128.0 / 255.0) * (255.0 / 224.0);
 }
 
@@ -169,13 +187,12 @@ fn apply_eotf(rgb_gamma: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    // 1. SAMPLE. Multiply by `luma_scale` to normalise 10-bit
-    // MSB-aligned data to the 8-bit-style [0,1] coordinate the
-    // range expansion below expects. For 8-bit input `luma_scale`
-    // is 1.0 (compile-time-free for the GPU).
-    let luma_scale = bitcast<f32>(color_params.y);
-    let y_lim = textureSample(y_tex, s, in.uv).r * luma_scale;
-    let chroma_lim = textureSample(uv_tex, s, in.uv).rg * luma_scale;
+    // 1. SAMPLE. The range expansion below dispatches on
+    // `color_params.y` (RANGE_KIND_LIMITED_8 / _10) so 10-bit
+    // MSB-aligned input lands on the right footroom / headroom
+    // breakpoints natively — no pre-scaling needed.
+    let y_lim = textureSample(y_tex, s, in.uv).r;
+    let chroma_lim = textureSample(uv_tex, s, in.uv).rg;
 
     // 2. RANGE: limited -> normalized.
     let y = limited_y_to_normalized(y_lim);

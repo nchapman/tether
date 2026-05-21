@@ -475,8 +475,8 @@ impl GpuState {
             mapped_at_creation: false,
         });
         let transfer_kind = transfer_kind_for(color_space);
-        let luma_scale = luma_scale_for(bit_depth, layout);
-        let color_params: [u32; 4] = [transfer_kind, luma_scale.to_bits(), 0, 0];
+        let range_kind = range_kind_for(bit_depth, layout);
+        let color_params: [u32; 4] = [transfer_kind, range_kind, 0, 0];
         queue.write_buffer(&color_params_buffer, 0, &bytes_of_u32x4(&color_params));
         tracing::info!(
             matrix = ?color_space.matrix,
@@ -485,7 +485,7 @@ impl GpuState {
             primaries = ?color_space.primaries,
             transfer_kind,
             bit_depth,
-            luma_scale,
+            range_kind,
             "renderer color spec applied"
         );
         let color_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -986,34 +986,31 @@ fn make_yuv_textures(
     }
 }
 
-/// Scale factor the shader multiplies sampled Y/UV by to land 10-bit
-/// MSB-aligned data on the `[0, 1]` normalized range the existing
-/// limited-range expansion math expects.
+/// Range-kind dispatch tag the WGSL fragment shader uses to pick the
+/// right limited-range breakpoints for the sampled `(y_lim, c_lim)`.
+/// Keep in sync with the `RANGE_KIND_LIMITED_*` constants at the top
+/// of `shader.wgsl`.
 ///
-/// 10-bit data stored in 16-bit cells uses bits `[15:6]` (MSB-aligned;
-/// the Apple `'P410'`/`'xf44'` IOSurface convention and the DRM
-/// `P010`/`P410` convention agree on this). The max 10-bit value
-/// `1023` ends up as the 16-bit integer `65472` in storage, and an
-/// `R16Unorm` sampler reads it as `65472 / 65535 ≈ 0.99904`. Without
-/// compensation the limited-range expansion lands just shy of white;
-/// multiplying by `65535 / 65472` puts the white point back at 1.0.
-///
-/// For 8-bit (or the PackedXYUV path where the shader is different
-/// entirely) the scale is `1.0` — multiplication by 1.0 is a single
-/// cheap shader instruction so the uniform is always written rather
-/// than branched on.
-///
-/// Approximation note: the limited-range *math* in `shader.wgsl` was
-/// derived from the 8-bit breakpoints (`16/255`, `235/255`). The
-/// idealised 10-bit breakpoints (`64/1023`, `940/1023`) differ by
-/// ≈0.3% in luminance scale. We accept that approximation — visible
-/// only as a sub-perceptual offset — until the renderer grows a
-/// bit-depth-parameterised range expansion (likely alongside HDR /
-/// wide-gamut work).
-fn luma_scale_for(bit_depth: u8, layout: RenderLayout) -> f32 {
+/// **Why bit-depth-parameterised breakpoints:** 8-bit limited-range
+/// Y' lives in `[16, 235]` (`16/255 .. 235/255` normalised); 10-bit
+/// limited-range Y' lives in `[64, 940]` (10-bit raw), which when
+/// stored MSB-aligned in an `R16Unorm` cell lands at `[4096/65535,
+/// 60160/65535]`. The 8-bit math `(y_lim - 16/255) * (255/219)` and
+/// the 10-bit math `(y_lim - 4096/65535) * (65535/56064)` differ by
+/// about 1% in mid-tone normalised luma when the sample is 10-bit
+/// data — a small but systematic offset that's invisible in SDR but
+/// compounds under PQ's steep mid-tone slope. The earlier renderer
+/// version compensated for the storage MSB-align with a single
+/// `luma_scale` multiplier and reused the 8-bit math, which left
+/// the offset in place; this version branches in the shader and
+/// gets it right at all luma levels for both bit depths.
+const RANGE_KIND_LIMITED_8: u32 = 0;
+const RANGE_KIND_LIMITED_10: u32 = 1;
+
+fn range_kind_for(bit_depth: u8, layout: RenderLayout) -> u32 {
     match (bit_depth, layout) {
-        (10, RenderLayout::Biplanar16) => 65535.0 / 65472.0,
-        _ => 1.0,
+        (10, RenderLayout::Biplanar16) => RANGE_KIND_LIMITED_10,
+        _ => RANGE_KIND_LIMITED_8,
     }
 }
 
@@ -1085,42 +1082,43 @@ fn write_plane(
 #[cfg(test)]
 mod tests {
     use super::{
-        luma_scale_for, render_layout_for, transfer_kind_for, RenderLayout,
-        TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB,
+        range_kind_for, render_layout_for, transfer_kind_for, RenderLayout,
+        RANGE_KIND_LIMITED_10, RANGE_KIND_LIMITED_8, TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB,
     };
     use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
 
-    /// 10-bit MSB-aligned data lives in bits [15:6] of a 16-bit cell.
-    /// The max 10-bit value (1023) reads through an `R16Unorm` sampler
-    /// as `65472 / 65535`; the `luma_scale_for` factor must bring it
-    /// back to (within FP-rounding) 1.0 so the limited-range expansion
-    /// lands on the right breakpoint. This test is the cheap unit-level
-    /// pin on that contract; full shader correctness lives behind the
-    /// GPU-readback integration tests.
+    /// Pin the Rust → shader range-kind constants so a renumber in
+    /// either side surfaces here, not as a silent miscoloured 10-bit
+    /// session. Same shape as `transfer_kind_for_pins_the_mapping`.
     #[test]
-    fn luma_scale_normalises_msb_aligned_10_bit_max_to_one() {
-        let scale = luma_scale_for(10, RenderLayout::Biplanar16);
-        let sampler_max = 65472.0_f32 / 65535.0_f32;
-        let normalised = sampler_max * scale;
-        // 1e-6 tolerance: scale is exactly 65535/65472, sampler max is
-        // 65472/65535, so the product is exactly 1.0 in real arithmetic
-        // but f32 round-off can shave a few ulps. 1 ppm covers that
-        // without admitting any systemic drift.
-        assert!(
-            (normalised - 1.0).abs() < 1e-6,
-            "10-bit max should normalise to 1.0; got {normalised}"
+    fn range_kind_dispatch_matches_bit_depth() {
+        assert_eq!(
+            range_kind_for(10, RenderLayout::Biplanar16),
+            RANGE_KIND_LIMITED_10,
+            "10-bit biplanar input must use the 10-bit range breakpoints"
         );
+        assert_eq!(range_kind_for(8, RenderLayout::Biplanar8), RANGE_KIND_LIMITED_8);
+        assert_eq!(range_kind_for(8, RenderLayout::Biplanar16), RANGE_KIND_LIMITED_8);
+        assert_eq!(range_kind_for(8, RenderLayout::PackedXYUV), RANGE_KIND_LIMITED_8);
     }
 
-    /// 8-bit profiles must keep their existing 1.0 scale so the
-    /// fragment shader's `* luma_scale` multiply is a no-op for them.
-    /// Without this pin, a future refactor that always returns the
-    /// 10-bit scale would silently push every 8-bit white point slightly
-    /// past 1.0.
+    /// Algebraic check on the 10-bit range constants the shader uses.
+    /// 10-bit limited-range Y' = 940 (white) in MSB-aligned 16-bit
+    /// storage = `940 * 64 = 60160`. As `R16Unorm` that samples as
+    /// `60160 / 65535`. The shader's 10-bit range expansion is
+    /// `(y_lim - 4096/65535) * (65535/56064)` — feeding the sample
+    /// value back through that math should land at exactly 1.0
+    /// (within f32 round-off). Same check for black at the footroom
+    /// floor (64 * 64 = 4096).
     #[test]
-    fn luma_scale_is_identity_for_8_bit_paths() {
-        assert_eq!(luma_scale_for(8, RenderLayout::Biplanar8), 1.0);
-        assert_eq!(luma_scale_for(8, RenderLayout::PackedXYUV), 1.0);
+    fn ten_bit_breakpoints_map_white_and_black_correctly() {
+        let footroom = 4096.0_f32 / 65535.0;
+        let headroom = 60160.0_f32 / 65535.0;
+        let range = 65535.0_f32 / 56064.0;
+        let white = (headroom - 4096.0 / 65535.0) * range;
+        let black = (footroom - 4096.0 / 65535.0) * range;
+        assert!((white - 1.0).abs() < 1e-6, "10-bit white expected 1.0; got {white}");
+        assert!(black.abs() < 1e-6, "10-bit black expected 0.0; got {black}");
     }
 
     /// `render_layout_for` dispatch table — pinned so the (chroma,

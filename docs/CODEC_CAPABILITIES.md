@@ -406,14 +406,19 @@ fourcc. Today we support two layouts (`RenderLayout::Biplanar` and
   current pin must go via `R16Unorm` + `Rg16Unorm` per plane.**
   Bumping the pin to acquire P010/P410 is an option; doing
   R16/Rg16 manually is the path with the fewest dependencies.
-- **MSB-aligned 10-in-16 sampler scaling**: a 10-bit value max
+- **MSB-aligned 10-in-16 sampler arithmetic**: a 10-bit value max
   (1023) stored in bits [15:6] of a 16-bit word reads through an
-  `R16Unorm` sampler as `65472 / 65535 ≈ 0.999`, **not 1.0**.
-  This is a hardware behaviour of normalized samplers, not a
-  bug. The shader must compensate (multiply by `65535.0 /
-  65472.0`) or use an integer load and unpack manually. There
-  is no escape — a sampler that "just gives 1.0" for max 10-bit
-  values does not exist for this storage convention.
+  `R16Unorm` sampler as `60160 / 65535 ≈ 0.918` (limited-range
+  white, raw 10-bit value 940 × 64 = 60160). This is a hardware
+  behaviour of normalized samplers, not a bug. The renderer's
+  shader uses 10-bit-derived limited-range breakpoints directly
+  (`(y - 4096/65535) * (65535/56064)`) rather than the 8-bit
+  ones, so the same `y_lim` sample lands on the right `[0, 1]`
+  normalised value at all luma levels — black, mid-grey, and
+  white — without an intermediate `luma_scale` indirection. An
+  earlier renderer version used an intermediate scale +
+  8-bit-derived breakpoints, which produced a systematic ~1%
+  mid-tone lift; the per-bit-depth dispatch eliminates it.
 
 ### What's probed
 

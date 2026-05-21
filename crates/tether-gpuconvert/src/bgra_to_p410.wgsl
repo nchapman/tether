@@ -31,15 +31,24 @@ const Y_OFFSET_10: f32 =  4096.0 / 65535.0;
 const UV_SCALE_10:  f32 = 57344.0 / 65535.0;
 const UV_OFFSET_10: f32 = 32768.0 / 65535.0;
 
+// MSB-aligned 10-bit cell ceilings — see bgra_to_p010.wgsl for the
+// derivation. Clamping ensures storage values have bits [5:0] zero
+// instead of saturating to 0xFFFF (low 6 bits set) on super-white
+// or extreme-chroma input — out-of-spec for MSB-aligned 10-bit.
+const Y_STORAGE_CEILING:  f32 = 60160.0 / 65535.0;
+const UV_STORAGE_CEILING: f32 = 61440.0 / 65535.0;
+const UV_STORAGE_FLOOR:   f32 =  4096.0 / 65535.0;
+
 fn rgb_to_y(rgb: vec3<f32>) -> f32 {
     let yp = Y_R * rgb.r + Y_G * rgb.g + Y_B * rgb.b;
-    return yp * Y_SCALE_10 + Y_OFFSET_10;
+    return clamp(yp * Y_SCALE_10 + Y_OFFSET_10, Y_OFFSET_10, Y_STORAGE_CEILING);
 }
 
 fn rgb_to_uv(rgb: vec3<f32>) -> vec2<f32> {
     let u = U_R * rgb.r + U_G * rgb.g + U_B * rgb.b;
     let v = V_R * rgb.r + V_G * rgb.g + V_B * rgb.b;
-    return vec2<f32>(u, v) * UV_SCALE_10 + vec2<f32>(UV_OFFSET_10, UV_OFFSET_10);
+    let raw = vec2<f32>(u, v) * UV_SCALE_10 + vec2<f32>(UV_OFFSET_10, UV_OFFSET_10);
+    return clamp(raw, vec2<f32>(UV_STORAGE_FLOOR), vec2<f32>(UV_STORAGE_CEILING));
 }
 
 @compute @workgroup_size(8, 8, 1)

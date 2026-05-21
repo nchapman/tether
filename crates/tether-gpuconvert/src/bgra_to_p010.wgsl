@@ -43,15 +43,29 @@ const Y_OFFSET_10: f32 =  4096.0 / 65535.0;
 const UV_SCALE_10:  f32 = 57344.0 / 65535.0;
 const UV_OFFSET_10: f32 = 32768.0 / 65535.0;
 
+// MSB-aligned 10-bit cell ceiling. textureStore on R16/Rg16Unorm
+// saturates super-white / extreme-chroma input to 0xFFFF, where the
+// low 6 bits are 1 — a *valid* 16-bit storage state for P010 but
+// technically out-of-spec for the MSB-aligned 10-bit contract some
+// buggy decoders rely on (the spec says bits [5:0] are zero). Clamp
+// before writing so all storage values have their low 6 bits clear.
+//   Y headroom (max 10-bit = 940) = 60160/65535
+//   UV neutral ± 448 (raw 10-bit ±) = (512+448)*64/65535 = 61440/65535
+//                                   = (512-448)*64/65535 =  4096/65535
+const Y_STORAGE_CEILING:  f32 = 60160.0 / 65535.0;
+const UV_STORAGE_CEILING: f32 = 61440.0 / 65535.0;
+const UV_STORAGE_FLOOR:   f32 =  4096.0 / 65535.0;
+
 fn rgb_to_y(rgb: vec3<f32>) -> f32 {
     let yp = Y_R * rgb.r + Y_G * rgb.g + Y_B * rgb.b;
-    return yp * Y_SCALE_10 + Y_OFFSET_10;
+    return clamp(yp * Y_SCALE_10 + Y_OFFSET_10, Y_OFFSET_10, Y_STORAGE_CEILING);
 }
 
 fn rgb_to_uv(rgb: vec3<f32>) -> vec2<f32> {
     let u = U_R * rgb.r + U_G * rgb.g + U_B * rgb.b;
     let v = V_R * rgb.r + V_G * rgb.g + V_B * rgb.b;
-    return vec2<f32>(u, v) * UV_SCALE_10 + vec2<f32>(UV_OFFSET_10, UV_OFFSET_10);
+    let raw = vec2<f32>(u, v) * UV_SCALE_10 + vec2<f32>(UV_OFFSET_10, UV_OFFSET_10);
+    return clamp(raw, vec2<f32>(UV_STORAGE_FLOOR), vec2<f32>(UV_STORAGE_CEILING));
 }
 
 @compute @workgroup_size(8, 8, 1)

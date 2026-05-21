@@ -126,16 +126,127 @@ pub async fn importable_dmabuf_modifiers(drm_fourcc: u32) -> Result<Vec<u64>> {
     Ok(modifiers)
 }
 
-/// Map the DRM fourcc codes PipeWire emits for our 4-byte BGR-family
-/// formats to the Vulkan format the importer expects. AR24/XR24 both
-/// land on `B8G8R8A8_UNORM` — Vulkan has no separate "X" form, and the
-/// shader ignores the alpha channel for BGRx, so the alias is safe.
+/// Map DRM fourcc codes to the Vulkan format the importer would use.
+///
+/// **What this answers, precisely**: "If we asked Vulkan to import a
+/// DMA-BUF carrying `drm_fourcc` as a sampled image, which `VkFormat`
+/// would we use?" — and consequently, when paired with
+/// [`importable_dmabuf_modifiers`], "can the renderer / gpuconvert
+/// sample-read this format at all on this device?" The `SAMPLED_IMAGE`
+/// filter in the caller is the gate.
+///
+/// **What this does *not* answer**: whether the VAAPI encoder accepts
+/// the format as input via `av_hwframe_map(DRM_PRIME → VAAPI)`. That
+/// path goes through `vaapi_drm_format_map` in libavcodec, not through
+/// Vulkan modifier tables — it has its own probe (see
+/// `tether-codec::vaapi::probe`). A 10-bit encode profile may only be
+/// advertised when *both* probes return supported: renderer importable
+/// (this function via `importable_dmabuf_modifiers`) AND encoder
+/// accepts the input format (the VAAPI probe).
+///
+/// Fourcc families covered:
+/// - Capture input (BGRA family): `AR24`, `XR24` → `B8G8R8A8_UNORM`.
+///   Vulkan has no separate "X" form; the shader ignores alpha for
+///   BGRx, so the alias is safe.
+/// - Encoder-output 8-bit planes: `R8`, `GR88` for NV12/NV24 Y/UV.
+/// - Encoder-output 10-bit planes: `R16`, `GR32` for P010/P410 Y/UV
+///   (10 bits MSB-aligned in 16-bit cells).
+/// - Encoder-output packed 4:4:4 8-bit: `XYUV` → `R8G8B8A8_UNORM` per
+///   the `VK_EXT_image_drm_format_modifier` spec appendix's table of
+///   DRM-fourcc-to-VkFormat compatibility. Memory layout on LE is
+///   `[V][U][Y][X]` which the renderer samples as `.r/.g/.b/.a` =
+///   `V/U/Y/X`.
 fn drm_fourcc_to_vk_format(drm_fourcc: u32) -> Result<vk::Format> {
     // Fourcc constants from <drm/drm_fourcc.h> — little-endian 4-char.
     const AR24: u32 = u32::from_le_bytes(*b"AR24"); // DRM_FORMAT_ARGB8888
     const XR24: u32 = u32::from_le_bytes(*b"XR24"); // DRM_FORMAT_XRGB8888
+    // Y plane of NV12 / NV24 — single-channel 8-bit, DRM_FORMAT_R8.
+    const R8: u32 = u32::from_le_bytes(*b"R8  ");
+    // UV plane of NV12 / NV24 — two-channel 8-bit, DRM_FORMAT_GR88.
+    const GR88: u32 = u32::from_le_bytes(*b"GR88");
+    // Y plane of P010 / P410 — single-channel 16-bit, DRM_FORMAT_R16.
+    // MSB-aligned 10-bit data lives in bits [15:6] of each cell.
+    const R16: u32 = u32::from_le_bytes(*b"R16 ");
+    // UV plane of P010 / P410 — two-channel 16-bit,
+    // DRM_FORMAT_GR1616 (`fourcc_code('G','R','3','2')`; the "32" in
+    // the fourcc means 32 total bits across both channels, not 32
+    // bits per channel). Same MSB-align convention as R16.
+    const GR32: u32 = u32::from_le_bytes(*b"GR32");
+    // Packed XYUV (DRM_FORMAT_XYUV8888) for HEVC Main 4:4:4 8-bit; the
+    // VAAPI encoder accepts this as input. The
+    // VK_EXT_image_drm_format_modifier spec lists XYUV8888 as
+    // compatible with R8G8B8A8_UNORM — the alias is spec-mandated,
+    // not a convenience choice (changing it to B8G8R8A8_UNORM would
+    // silently query the wrong modifier table).
+    const XYUV: u32 = u32::from_le_bytes(*b"XYUV");
     match drm_fourcc {
         AR24 | XR24 => Ok(vk::Format::B8G8R8A8_UNORM),
+        R8 => Ok(vk::Format::R8_UNORM),
+        GR88 => Ok(vk::Format::R8G8_UNORM),
+        R16 => Ok(vk::Format::R16_UNORM),
+        GR32 => Ok(vk::Format::R16G16_UNORM),
+        XYUV => Ok(vk::Format::R8G8B8A8_UNORM),
         other => Err(ModifierQueryError::UnsupportedFourcc(other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the fourcc → Vulkan format table so a future addition can't
+    /// silently break P010/P410 advertisement. Comparing by Vulkan
+    /// format discriminant keeps the test stable against ash version
+    /// bumps that might wrap `vk::Format` in a newtype.
+    #[test]
+    fn drm_fourcc_table_covers_10_bit_biplanar_planes() {
+        let r16 = u32::from_le_bytes(*b"R16 ");
+        let gr32 = u32::from_le_bytes(*b"GR32");
+        assert_eq!(drm_fourcc_to_vk_format(r16).unwrap(), vk::Format::R16_UNORM);
+        assert_eq!(
+            drm_fourcc_to_vk_format(gr32).unwrap(),
+            vk::Format::R16G16_UNORM
+        );
+    }
+
+    /// XYUV and the NV12 plane fourccs are new entries; pin them so
+    /// the spec-mandated aliasing (esp. XYUV → R8G8B8A8_UNORM per the
+    /// VK_EXT_image_drm_format_modifier appendix) doesn't drift.
+    #[test]
+    fn drm_fourcc_table_covers_xyuv_and_nv12_planes() {
+        let xyuv = u32::from_le_bytes(*b"XYUV");
+        let r8 = u32::from_le_bytes(*b"R8  ");
+        let gr88 = u32::from_le_bytes(*b"GR88");
+        assert_eq!(
+            drm_fourcc_to_vk_format(xyuv).unwrap(),
+            vk::Format::R8G8B8A8_UNORM
+        );
+        assert_eq!(drm_fourcc_to_vk_format(r8).unwrap(), vk::Format::R8_UNORM);
+        assert_eq!(drm_fourcc_to_vk_format(gr88).unwrap(), vk::Format::R8G8_UNORM);
+    }
+
+    #[test]
+    fn drm_fourcc_table_still_handles_existing_8_bit_inputs() {
+        // Regression pin: the 10-bit addition must not break the
+        // BGRA capture-input paths the live host uses today.
+        let ar24 = u32::from_le_bytes(*b"AR24");
+        let xr24 = u32::from_le_bytes(*b"XR24");
+        assert_eq!(
+            drm_fourcc_to_vk_format(ar24).unwrap(),
+            vk::Format::B8G8R8A8_UNORM
+        );
+        assert_eq!(
+            drm_fourcc_to_vk_format(xr24).unwrap(),
+            vk::Format::B8G8R8A8_UNORM
+        );
+    }
+
+    #[test]
+    fn drm_fourcc_table_rejects_unknown_codes() {
+        let unknown = 0xDEADBEEFu32;
+        assert!(matches!(
+            drm_fourcc_to_vk_format(unknown),
+            Err(ModifierQueryError::UnsupportedFourcc(0xDEADBEEF))
+        ));
     }
 }

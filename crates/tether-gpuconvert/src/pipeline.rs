@@ -10,6 +10,8 @@
 
 pub(crate) const SHADER_SRC: &str = include_str!("bgra_to_nv12.wgsl");
 pub(crate) const YUV444_SHADER_SRC: &str = include_str!("bgra_to_yuv444.wgsl");
+pub(crate) const P010_SHADER_SRC: &str = include_str!("bgra_to_p010.wgsl");
+pub(crate) const P410_SHADER_SRC: &str = include_str!("bgra_to_p410.wgsl");
 
 /// Build the BGRA→NV12 compute pipeline and its bind-group layout.
 /// Caller owns both; bind groups are constructed per-call-site because
@@ -126,6 +128,119 @@ pub(crate) fn build_yuv444_pipeline(
 
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("bgra_to_yuv444"),
+        layout: Some(&pl),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    (pipeline, bgl)
+}
+
+/// Build the BGRA → P010 (10-bit biplanar 4:2:0) compute pipeline and
+/// its bind-group layout. Y plane is `R16Unorm`, UV plane is `Rg16Unorm`,
+/// both half-resolution UV (4:2:0). 10-bit data is MSB-aligned in the
+/// 16-bit cells — see `bgra_to_p010.wgsl` for the encoding.
+///
+/// This pipeline is wired but not yet plumbed into a public API path;
+/// the production `Nv12DmaBuf` bridge stays 8-bit until the rest of
+/// the 10-bit stack (probe → renderer → wire) catches up.
+pub(crate) fn build_p010_pipeline(
+    device: &wgpu::Device,
+) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    build_biplanar_16_pipeline(
+        device,
+        "bgra_to_p010",
+        P010_SHADER_SRC,
+    )
+}
+
+/// Build the BGRA → P410 (10-bit biplanar 4:4:4) compute pipeline.
+/// Same plane formats as P010 but full-resolution UV; see
+/// `bgra_to_p410.wgsl`. Plumbing status mirrors P010.
+pub(crate) fn build_p410_pipeline(
+    device: &wgpu::Device,
+) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    build_biplanar_16_pipeline(
+        device,
+        "bgra_to_p410",
+        P410_SHADER_SRC,
+    )
+}
+
+/// Shared 10-bit biplanar pipeline construction — the bind-group
+/// layout and dispatch shape are identical between P010 and P410 (both
+/// have an R16 Y plane + Rg16 UV plane); only the shader's per-pixel
+/// math + the runtime dispatch dims differ.
+///
+/// FIXME(10-bit storage feature gating): `R16Unorm` /
+/// `Rg16Unorm` as compute storage outputs require the Vulkan format
+/// feature flag `STORAGE_IMAGE_BIT` on the chosen `VkFormat`. The
+/// existing `importable_dmabuf_modifiers` probe filters on
+/// `SAMPLED_IMAGE` — that doesn't cover the storage write the
+/// compute shader does here. Some drivers expose 16-bit unorm as
+/// sampleable but not as storage-writable; on those, this pipeline
+/// will fail at `create_compute_pipeline` (or worse, produce
+/// validation errors at draw time). Adding a `STORAGE_IMAGE` probe
+/// in `modifier_query.rs` is the right gate to put in front of
+/// these pipelines before they go live.
+fn build_biplanar_16_pipeline(
+    device: &wgpu::Device,
+    label: &'static str,
+    shader_src: &str,
+) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+    });
+
+    let bgl_label = format!("{label} bgl");
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(&bgl_label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::R16Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rg16Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let pl_label = format!("{label} pl");
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&pl_label),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
         layout: Some(&pl),
         module: &shader,
         entry_point: Some("main"),

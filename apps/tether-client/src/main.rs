@@ -113,32 +113,14 @@ async fn main() -> anyhow::Result<()> {
     // rather than a silent fallthrough.
     let ServerHello::V1(server_body) = server_hello;
 
-    // Parse the structured encode-profile echo. The inline
-    // `chosen_codec` / `chosen_chroma` fields carry the same info for
-    // legacy hosts; the structured extension is authoritative on hosts
-    // that emit it.
-    let negotiated_profile: VideoProfile = server_body
-        .extensions
-        .get(SERVER_ENCODE_PROFILE_EXTENSION_KEY)
-        .and_then(|bytes| match tether_protocol::decode::<VideoProfile>(bytes) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    payload_len = bytes.len(),
-                    "host encode-profile extension failed to decode; \
-                     falling back to inline chosen_codec / chosen_chroma fields"
-                );
-                None
-            }
-        })
-        .unwrap_or(VideoProfile {
-            codec: server_body.chosen_codec,
-            chroma: server_body.chosen_chroma,
-            // Legacy hosts predate bit_depth advertisement; everything
-            // they emit today is 8-bit.
-            bit_depth: 8,
-        });
+    let negotiated_profile = resolve_negotiated_profile(
+        server_body
+            .extensions
+            .get(SERVER_ENCODE_PROFILE_EXTENSION_KEY)
+            .map(Vec::as_slice),
+        server_body.chosen_codec,
+        server_body.chosen_chroma,
+    )?;
     info!(
         server = %server_body.server_name,
         negotiated_codec = ?negotiated_profile.codec,
@@ -945,6 +927,110 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
         .with_writer(writer)
         .init();
     guard
+}
+
+/// Resolve the negotiated [`VideoProfile`] from a [`ServerHelloV1`].
+///
+/// Three cases the host can leave us in:
+///
+///   1. **Extension present and decodes.** The structured
+///      `tether.cap.video.encode-profile` payload is authoritative —
+///      carries codec, chroma, and `bit_depth` together.
+///   2. **Extension absent.** Genuine legacy host. The inline
+///      `chosen_codec` / `chosen_chroma` on `ServerHelloV1` are the
+///      source of truth, and `bit_depth = 8` is safe because legacy
+///      hosts predate any 10-bit advertisement.
+///   3. **Extension present but undecodable.** A newer host with a
+///      payload shape this client can't parse. Bail. Falling through
+///      to the inline 8-bit assumption would silently downgrade a
+///      10-bit (or future-encoded) host to an 8-bit client decoder
+///      pipeline and feed it data it can't interpret. The host
+///      *tried* to advertise something specific; we don't fabricate
+///      a substitute.
+fn resolve_negotiated_profile(
+    extension_bytes: Option<&[u8]>,
+    chosen_codec: tether_protocol::control::CodecKind,
+    chosen_chroma: tether_protocol::control::ChromaSubsampling,
+) -> anyhow::Result<VideoProfile> {
+    match extension_bytes {
+        Some(bytes) => tether_protocol::decode::<VideoProfile>(bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "host encode-profile extension failed to decode ({e}, \
+                 payload_len={}); refusing to fall back to the inline \
+                 8-bit assumption — a future 10-bit host with an \
+                 unexpected payload shape would silently downgrade. \
+                 The host should be updated to emit a profile this \
+                 client can parse.",
+                bytes.len()
+            )
+        }),
+        None => Ok(VideoProfile {
+            codec: chosen_codec,
+            chroma: chosen_chroma,
+            bit_depth: 8,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod resolve_profile_tests {
+    use super::*;
+    use tether_protocol::control::{ChromaSubsampling, CodecKind};
+
+    #[test]
+    fn extension_present_and_decodes_is_authoritative() {
+        let profile = VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 10,
+        };
+        let bytes = tether_protocol::encode(&profile).unwrap();
+        let resolved = resolve_negotiated_profile(
+            Some(&bytes),
+            // Inline fields deliberately *disagree* with the extension
+            // — the extension wins.
+            CodecKind::H264,
+            ChromaSubsampling::Yuv420,
+        )
+        .unwrap();
+        assert_eq!(resolved, profile);
+    }
+
+    #[test]
+    fn extension_absent_synthesizes_8bit_legacy_profile() {
+        let resolved = resolve_negotiated_profile(
+            None,
+            CodecKind::Hevc,
+            ChromaSubsampling::Yuv420,
+        )
+        .unwrap();
+        assert_eq!(resolved.codec, CodecKind::Hevc);
+        assert_eq!(resolved.chroma, ChromaSubsampling::Yuv420);
+        assert_eq!(resolved.bit_depth, 8);
+    }
+
+    #[test]
+    fn extension_present_but_undecodable_bails_rather_than_falling_back() {
+        // Garbage bytes that can't possibly decode as a VideoProfile.
+        // The fallback to inline-8-bit would silently downgrade a
+        // future 10-bit host; we want the error instead.
+        let garbage = [0xFFu8; 3];
+        let err = resolve_negotiated_profile(
+            Some(&garbage),
+            CodecKind::Hevc,
+            ChromaSubsampling::Yuv420,
+        )
+        .expect_err("undecodable extension should refuse the 8-bit fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("encode-profile extension failed to decode"),
+            "error should explain the decode failure; got: {msg}"
+        );
+        assert!(
+            msg.contains("8-bit"),
+            "error should mention the 8-bit fallback we're refusing; got: {msg}"
+        );
+    }
 }
 
 fn hex_decode(s: &str) -> anyhow::Result<[u8; 32]> {

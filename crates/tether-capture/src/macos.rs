@@ -31,6 +31,7 @@ use screencapturekit::prelude::{
     CMSampleBuffer, PixelFormat, SCContentFilter, SCShareableContent, SCStream,
     SCStreamConfiguration, SCStreamOutputTrait, SCStreamOutputType,
 };
+use screencapturekit::FourCharCode;
 use tether_protocol::MonoNanos;
 
 use crate::{
@@ -54,7 +55,42 @@ const CAPTURE_FPS: u32 = 60;
 /// The returned receiver emits one [`CapturedFrame::Gpu`] per delivered
 /// sample. Dropping the receiver shuts the capture thread down on the
 /// next sample-buffer callback.
+///
+/// Runs [`probe_capture_pixel_formats`] first and logs the result.
+/// The live stream still uses NV12 (`420v`) regardless — wiring the
+/// probe outcome into the host's capability advertisement is a
+/// downstream concern. The probe is here so the log captures
+/// "what *could* this Mac do?" alongside "what are we asking it for?"
+/// in every host startup, which is how we'll know empirically whether
+/// `xf44` / `'444v'` are reachable on each silicon generation.
 pub async fn start() -> Result<Receiver<CapturedFrame>> {
+    // The capability probe shares the SCK TCC prompt with the real
+    // session — first attempt to start a stream triggers ScreenRecording
+    // permission once per process. Whether the prompt fires from a
+    // probe or from the live stream is the same UX moment; running the
+    // probe first means our log records what's possible before we
+    // start consuming frames.
+    match probe_capture_pixel_formats().await {
+        Ok(caps) => {
+            tracing::info!(
+                bgra = caps.bgra,
+                yuv420_video_range = caps.yuv420_video_range,
+                yuv420_full_range = caps.yuv420_full_range,
+                yuv444_8bit_video_range = caps.yuv444_8bit_video_range,
+                yuv444_8bit_full_range = caps.yuv444_8bit_full_range,
+                yuv444_10bit_full_range = caps.yuv444_10bit_full_range,
+                "SCK pixel-format probe results (live stream still uses 420v)"
+            );
+        }
+        Err(e) => {
+            // Probe failure is not fatal — fall through to the real
+            // session attempt, which will surface the same underlying
+            // SCK error with a clearer call site if the issue is
+            // structural (missing permission, no displays, etc.).
+            tracing::warn!(error = %e, "SCK pixel-format probe failed");
+        }
+    }
+
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
     let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
     let stop = Arc::new(AtomicBool::new(false));
@@ -252,5 +288,318 @@ fn build_frame(
         t_capture_userspace,
         release_guard: guard,
     }))
+}
+
+/// Per-format ScreenCaptureKit capture acceptance, derived from a real
+/// `SCStream::start_capture()` attempt at probe-time. Independent bits
+/// per format: a Mac may accept 4:2:0 video range but not 4:2:0 full
+/// range, or accept `xf44` (10-bit) without accepting `'444v'` (8-bit),
+/// etc. The `Unknown(FourCharCode)` SCK formats (`'444v'`/`'444f'`) are
+/// in CoreVideo but not in SCK's documented `pixelFormat` enum; whether
+/// SCK accepts them via the `Unknown` escape hatch is what the probe
+/// answers empirically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SckCaptureCapability {
+    /// `BGRA` — packed 32-bit, SCK's documented default before macOS 26.
+    pub bgra: bool,
+    /// `420v` — biplanar NV12 video range. The format the live stream
+    /// uses today and what `tether-codec`'s VideoToolbox NV12 fast path
+    /// is wired to consume.
+    pub yuv420_video_range: bool,
+    /// `420f` — biplanar NV12 full range.
+    pub yuv420_full_range: bool,
+    /// `'444v'` (via `PixelFormat::Unknown`) — biplanar NV24 video
+    /// range. Not in SCK's documented enum; if accepted, this is the
+    /// path that unlocks macOS-host HEVC Main 4:4:4 8-bit encode.
+    pub yuv444_8bit_video_range: bool,
+    /// `'444f'` (via `PixelFormat::Unknown`) — biplanar NV24 full
+    /// range. Same status as `'444v'`.
+    pub yuv444_8bit_full_range: bool,
+    /// `xf44` — biplanar 10-bit 4:4:4 full range, the only 10-bit
+    /// 4:4:4 SCK format Apple documents. If accepted, this is the
+    /// path that unlocks macOS-host HEVC Main 4:4:4 10-bit encode
+    /// (which Commit 1's probe confirmed VT can accept).
+    pub yuv444_10bit_full_range: bool,
+}
+
+/// The set of pixel formats we probe. Order is arbitrary — every probe
+/// is independent. Adding a variant here forces every match arm below
+/// to be updated (no string-keyed dispatch), so a new format can't get
+/// half-plumbed silently.
+#[derive(Debug, Clone, Copy)]
+enum ProbeFormat {
+    Bgra,
+    Yuv420v,
+    Yuv420f,
+    /// Biplanar NV24 video range. Not in the SCK crate's named enum;
+    /// passed through the `PixelFormat::Unknown(FourCharCode)` escape
+    /// hatch. Whether SCK actually delivers frames in this format vs.
+    /// silently downgrading is the question the frame-arrival check
+    /// answers — `start_capture` Ok alone is a false-positive risk for
+    /// the `Unknown` variants (the catch-all bypasses any named-format
+    /// validation SCK does internally).
+    Yuv444v,
+    /// Biplanar NV24 full range. Same status as `Yuv444v`.
+    Yuv444f,
+    /// Apple's documented 10-bit 4:4:4 biplanar full range.
+    Xf44,
+}
+
+impl ProbeFormat {
+    const ALL: &'static [Self] = &[
+        Self::Bgra,
+        Self::Yuv420v,
+        Self::Yuv420f,
+        Self::Yuv444v,
+        Self::Yuv444f,
+        Self::Xf44,
+    ];
+
+    fn pixel_format(self) -> PixelFormat {
+        match self {
+            Self::Bgra => PixelFormat::BGRA,
+            Self::Yuv420v => PixelFormat::YCbCr_420v,
+            Self::Yuv420f => PixelFormat::YCbCr_420f,
+            Self::Yuv444v => PixelFormat::Unknown(FourCharCode::from_bytes(*b"444v")),
+            Self::Yuv444f => PixelFormat::Unknown(FourCharCode::from_bytes(*b"444f")),
+            Self::Xf44 => PixelFormat::xf44,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bgra => "BGRA",
+            Self::Yuv420v => "420v",
+            Self::Yuv420f => "420f",
+            Self::Yuv444v => "444v",
+            Self::Yuv444f => "444f",
+            Self::Xf44 => "xf44",
+        }
+    }
+
+    /// SCK's named enum variants are Apple-documented as accepted by
+    /// `pixelFormat`. The `Unknown(FourCharCode)` escape hatch bypasses
+    /// that validation, so `start_capture` may return Ok for an
+    /// undocumented code without SCK actually delivering frames in it.
+    /// Probes for these variants must verify a delivered sample's
+    /// fourcc matches the request.
+    fn needs_frame_arrival_check(self) -> bool {
+        matches!(self, Self::Yuv444v | Self::Yuv444f)
+    }
+
+    fn apply(self, caps: &mut SckCaptureCapability, accepted: bool) {
+        match self {
+            Self::Bgra => caps.bgra = accepted,
+            Self::Yuv420v => caps.yuv420_video_range = accepted,
+            Self::Yuv420f => caps.yuv420_full_range = accepted,
+            Self::Yuv444v => caps.yuv444_8bit_video_range = accepted,
+            Self::Yuv444f => caps.yuv444_8bit_full_range = accepted,
+            Self::Xf44 => caps.yuv444_10bit_full_range = accepted,
+        }
+    }
+}
+
+/// Per-format outcome of the probe attempt. The outer `Result` covers
+/// fatal SCK errors that should abort the probe loop (cleanup failure
+/// would leave zombie streams running alongside subsequent probes and
+/// the live session); `Ok(false)` is the regular "not supported" answer
+/// and continues the loop.
+enum ProbeOutcome {
+    /// `start_capture` returned Ok and (for `Unknown` formats) a
+    /// delivered sample buffer carried the fourcc we asked for.
+    Accepted,
+    /// `start_capture` returned an error, or `start_capture` returned
+    /// Ok but the format-arrival check timed out / saw a wrong fourcc.
+    Rejected,
+}
+
+/// Try each candidate SCK pixel format against a real, briefly-started
+/// stream on the primary display. Two-tier signal:
+///
+/// - For Apple-documented `PixelFormat` variants (BGRA, 420v, 420f,
+///   xf44) we treat `SCStream::start_capture` returning Ok as a
+///   sufficient acceptance signal — SCK validates these against its
+///   internal table at configuration time, so the rejection path is
+///   reliable.
+/// - For `PixelFormat::Unknown(FourCharCode)` variants (`'444v'`,
+///   `'444f'`) we additionally wait briefly for the first delivered
+///   sample buffer and assert `CVPixelBuffer::pixel_format()` matches
+///   the requested fourcc. SCK accepts arbitrary FourCharCodes through
+///   the escape hatch but may silently downgrade — without the
+///   frame-arrival check we'd record false positives that would later
+///   manifest as wrong-format IOSurfaces in a negotiated session.
+///
+/// Probe + live-session UX: SCK's ScreenRecording TCC prompt fires on
+/// the first stream attempt per process. Running this probe before
+/// the live session means the first prompt the user sees is ours, in
+/// the same callsite as the rest of our startup logs — better than
+/// the alternative where the probe is the second attempt and the user
+/// sees a prompt for "tether host" twice.
+pub async fn probe_capture_pixel_formats() -> Result<SckCaptureCapability> {
+    let content = SCShareableContent::get()?;
+    let display = content
+        .displays()
+        .into_iter()
+        .next()
+        .ok_or_else(|| CaptureError::Sck("no displays reported by SCShareableContent".into()))?;
+    let display_width = display.width();
+    let display_height = display.height();
+
+    // Build one filter and reuse across probes — it's just a reference
+    // to the display, no per-format coupling.
+    let filter = SCContentFilter::create()
+        .with_display(&display)
+        .with_excluding_windows(&[])
+        .build();
+
+    // Probes are blocking SCK calls; run them in spawn_blocking so the
+    // async runtime isn't tied up waiting on SCK's dispatch queue.
+    tokio::task::spawn_blocking(move || {
+        let mut caps = SckCaptureCapability::default();
+        for &probe in ProbeFormat::ALL {
+            match probe_one_format(&filter, probe, display_width, display_height) {
+                Ok(outcome) => {
+                    let accepted = matches!(outcome, ProbeOutcome::Accepted);
+                    tracing::debug!(
+                        format = probe.label(),
+                        accepted,
+                        "SCK probe result"
+                    );
+                    probe.apply(&mut caps, accepted);
+                }
+                Err(e) => {
+                    // Fatal probe error (cleanup failure most likely).
+                    // Abort the loop so we don't leave zombie probe
+                    // streams running alongside subsequent probes and
+                    // the live session — SCK allows concurrent streams,
+                    // but a partial cleanup compounds across iterations.
+                    tracing::warn!(
+                        format = probe.label(),
+                        error = %e,
+                        "SCK probe aborted; remaining formats reported as not-supported"
+                    );
+                    return Ok(caps);
+                }
+            }
+        }
+        Ok(caps)
+    })
+    .await
+    .map_err(|e| CaptureError::Sck(format!("probe task join: {e}")))?
+}
+
+/// Configure + start + (briefly verify) + stop an SCStream for one
+/// candidate format. Returns the per-format outcome on success, or
+/// `Err(CaptureError)` if cleanup failed in a way that would leak a
+/// running stream into subsequent probes.
+fn probe_one_format(
+    filter: &SCContentFilter,
+    probe: ProbeFormat,
+    width: u32,
+    height: u32,
+) -> Result<ProbeOutcome> {
+    let format = probe.pixel_format();
+    let config = SCStreamConfiguration::new()
+        .with_pixel_format(format)
+        .with_width(width)
+        .with_height(height)
+        .with_fps(CAPTURE_FPS)
+        .with_queue_depth(2)
+        .with_shows_cursor(false);
+    let mut stream = SCStream::new(filter, &config);
+
+    let (frame_tx, frame_rx) = bounded::<u32>(1);
+    let handler = ProbeFrameSink { frame_tx };
+    stream.add_output_handler(handler, SCStreamOutputType::Screen);
+
+    if stream.start_capture().is_err() {
+        return Ok(ProbeOutcome::Rejected);
+    }
+
+    let outcome = if probe.needs_frame_arrival_check() {
+        // Wait for one frame and check its delivered fourcc against
+        // what we asked for. 250ms is plenty at 60fps (≈4 frame
+        // intervals) and bounds the worst-case probe time at 1.5s
+        // total if all six Unknown probes hit the timeout.
+        let expected: u32 = FourCharCode::from(format).as_u32();
+        match frame_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(actual) if actual == expected => ProbeOutcome::Accepted,
+            Ok(actual) => {
+                tracing::debug!(
+                    format = probe.label(),
+                    expected = format_args!("0x{:08x}", expected),
+                    actual = format_args!("0x{:08x}", actual),
+                    "SCK accepted configuration but delivered a different fourcc"
+                );
+                ProbeOutcome::Rejected
+            }
+            Err(_) => ProbeOutcome::Rejected,
+        }
+    } else {
+        ProbeOutcome::Accepted
+    };
+
+    if let Err(e) = stream.stop_capture() {
+        // Cleanup failed — SCStream may still be running. Returning
+        // Err here aborts the probe loop so we don't accumulate
+        // running streams across subsequent iterations.
+        return Err(CaptureError::Sck(format!(
+            "SCStream::stop_capture failed during probe for {label}: {e}",
+            label = probe.label()
+        )));
+    }
+    Ok(outcome)
+}
+
+/// Probe-only output handler. Reports the first delivered frame's
+/// pixel format on a one-shot channel so the probe can verify the
+/// delivered fourcc matches the configured one (the
+/// `PixelFormat::Unknown` escape hatch makes `start_capture` Ok an
+/// unreliable signal on its own).
+struct ProbeFrameSink {
+    frame_tx: Sender<u32>,
+}
+
+impl SCStreamOutputTrait for ProbeFrameSink {
+    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
+        if !matches!(of_type, SCStreamOutputType::Screen) {
+            return;
+        }
+        // Only the first frame matters — `try_send` against a depth-1
+        // bounded channel drops every later sample silently, which is
+        // the desired behaviour (we're sampling the format, not the
+        // stream).
+        if let Some(pixel_buffer) = sample.image_buffer() {
+            let fourcc = pixel_buffer.pixel_format();
+            let _ = self.frame_tx.try_send(fourcc);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hardware probe — runs SCK and records what this Mac accepts.
+    /// 4:2:0 video range should always come back true; the higher
+    /// chroma / 10-bit results are the interesting ones to log.
+    /// Triggers the ScreenRecording TCC prompt on first run.
+    #[tokio::test]
+    #[ignore = "requires macOS + ScreenRecording permission"]
+    async fn probe_capture_pixel_formats_reports_baseline() {
+        let caps = probe_capture_pixel_formats()
+            .await
+            .expect("SCK probe should succeed when permission is granted");
+        // 420v is the floor — every Mac with SCK accepts it. If this
+        // is false, the probe shape itself is broken.
+        assert!(
+            caps.yuv420_video_range,
+            "SCK should always accept 420v (NV12 video range) — \
+             probe likely returning false negatives across the board"
+        );
+        // Print everything else for the operator running the probe to
+        // record on a new Mac model.
+        eprintln!("SCK probe matrix: {caps:#?}");
+    }
 }
 

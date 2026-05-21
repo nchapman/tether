@@ -138,16 +138,39 @@ gpuconvert shader.
 
 ### What's probed
 
-- **8-bit 4:4:4 via `Unknown('444v')` / `Unknown('444f')`**: try
-  configuring an SC stream with these fourccs and check whether
-  the stream starts producing frames. Probe lives at
-  `tether-capture::macos::probe_pixel_format()` (not yet
-  implemented). Failure mode: stream config call returns an error
-  or frames never arrive.
-- **10-bit 4:4:4 via `xf44`**: documented as supported, but we
-  haven't actually run the path. Probe should confirm the per-plane
-  layout (16-bit Y + 16-bit Rg interleaved, MSB-aligned 10 bits)
-  matches what the renderer expects.
+`tether-capture::macos::probe_capture_pixel_formats()` runs at
+host startup, attempts `SCStream::start_capture` for each
+candidate, and (for `PixelFormat::Unknown(FourCharCode)`
+variants — the SCK escape hatch) waits briefly for the first
+sample and verifies its delivered fourcc matches the requested
+one. Acceptance signals are stored in `SckCaptureCapability` and
+logged; the live stream still uses `420v` regardless until the
+renderer wires up the higher-chroma / 10-bit IOSurface import
+paths.
+
+Empirical results on M4 Max (macOS 26, SCK v6.0.1):
+
+| Format         | Accepted | Frame verification |
+| -------------- | :------: | ------------------ |
+| `BGRA`         | ✅       | not required (documented enum variant) |
+| `420v` (NV12 video range)    | ✅ | not required (documented) |
+| `420f` (NV12 full range)     | ✅ | not required (documented) |
+| `'444v'` (NV24 video, Unknown escape) | ✅ | delivered samples carry `'444v'` |
+| `'444f'` (NV24 full, Unknown escape)  | ✅ | delivered samples carry `'444f'` |
+| `xf44` (10-bit 4:4:4)        | ✅ | not required (documented) |
+
+Two consequential findings:
+
+1. **SCK does deliver `'444v'` / `'444f'` on M4 Max** despite
+   being undocumented in Apple's `SCStreamConfiguration.pixelFormat`
+   list. The frame-arrival check rules out the "SCK accepts the
+   FourCharCode but silently downgrades" failure mode for these
+   two specifically. Combined with VT's confirmed Main 4:4:4
+   encode acceptance (see the encode section above), macOS host
+   → anything HEVC Main 4:4:4 8-bit is reachable end-to-end.
+2. **`xf44` is reachable** — the documented 10-bit 4:4:4 capture
+   format. The renderer-side 10-bit IOSurface import is the
+   remaining gate.
 
 ---
 

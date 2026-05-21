@@ -40,11 +40,22 @@ pub const MAX_FRAMED_MESSAGE: usize = 64 * 1024;
 
 /// Hard cap on the size of a single video-keyframe message delivered on
 /// the per-IDR unidirectional stream. Sized for a worst-case 4K HEVC
-/// IDR (~2 MiB at high quality) plus headroom. Separate from
+/// IDR plus modest headroom (~2 MiB total). Separate from
 /// [`MAX_FRAMED_MESSAGE`] so the control-stream cap stays tight against
 /// hostile peers while video streams can carry the legitimately-large
-/// keyframe payload.
-pub const MAX_VIDEO_STREAM_MESSAGE: usize = 4 * 1024 * 1024;
+/// keyframe payload. Pre-allocated by `read_framed_with_max` on stream
+/// arrival, so any growth here directly widens a peer-controlled
+/// allocation; only bump if a real keyframe overruns.
+pub const MAX_VIDEO_STREAM_MESSAGE: usize = 2 * 1024 * 1024;
+
+/// Per-connection cap on concurrent host→client unidirectional streams.
+/// The reliable-keyframe protocol needs O(1) streams alive at once
+/// (the previous keyframe's stream finishes before the next is opened
+/// today, but quinn permits in-flight overlap). 4 leaves headroom for
+/// a brief overlap during a back-to-back IDR burst while denying a
+/// malicious peer the ability to open thousands of streams and pin
+/// the receive-side allocations.
+pub const MAX_CONCURRENT_UNI_STREAMS: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {

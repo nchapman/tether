@@ -34,6 +34,18 @@ pub struct VaapiEncoder {
     bgra_to_nv12: SwsContext,
     sw_frame: AVFrame,
     bgra_frame: AVFrame,
+    /// Codec parameter sets (Annex-B SPS/PPS for H.264, VPS+SPS+PPS
+    /// for HEVC) captured once after `encoder.open()`. We prepend
+    /// these to every keyframe packet so a decoder that joins
+    /// mid-stream, rebuilds after a device loss, or loses the
+    /// session's very first IDR can recover on the next IDR rather
+    /// than getting stuck waiting for parameter sets that libavcodec
+    /// only emitted in band on the encoder's first packet.
+    ///
+    /// Empty if the encoder didn't populate `extradata` (shouldn't
+    /// happen for h264_vaapi/hevc_vaapi at Main profile — both write
+    /// Annex-B parameter sets to extradata at open()).
+    extradata: Vec<u8>,
     // Keep the device context alive for the encoder's lifetime. The
     // encoder's `hw_frames_ctx` holds an internal ref-counted handle
     // to the device, so dropping this field early wouldn't free VAAPI
@@ -173,6 +185,16 @@ impl VaapiEncoder {
             .set(c"rc_mode", c"VBR", 0)
             .set(c"idr_interval", c"2147483647", 0)
             .set(c"sei", c"0", 0);
+        // AV_CODEC_FLAG_GLOBAL_HEADER routes the codec's parameter
+        // sets (SPS/PPS for H.264, VPS+SPS+PPS for HEVC) into
+        // `AVCodecContext.extradata` at open() rather than emitting
+        // them only in band with the first IDR. We then prepend
+        // extradata to every keyframe at drain time, so any IDR is
+        // independently decodable — required for clients that join
+        // mid-session, rebuild their decoder on device loss, or
+        // lose the session's first IDR on the wire.
+        #[allow(clippy::cast_possible_wrap)]
+        encoder.set_flags(encoder.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
         let leftover = encoder.open(Some(dict))?;
         if let Some(unused) = leftover {
             // Driver/encoder didn't recognise one or more opts. Not
@@ -224,12 +246,45 @@ impl VaapiEncoder {
 
         let bgra_row_bytes = (width as usize) * 4;
 
+        // Snapshot the encoder's parameter-set extradata. For
+        // h264_vaapi/hevc_vaapi at Main, this is the Annex-B SPS/PPS
+        // (HEVC also includes VPS). We prepend this to keyframe
+        // packets at drain time. Without it, only the encoder's very
+        // first packet would carry parameter sets — a decoder that
+        // rebuilds (resume, resize) or loses that first IDR has no
+        // recovery path.
+        //
+        // SAFETY: extradata is populated by libavcodec inside
+        // open() when AV_CODEC_FLAG_GLOBAL_HEADER is set (above).
+        // libavcodec does not update extradata mid-stream for
+        // h264_vaapi/hevc_vaapi at fixed resolution; the VaapiEncoder
+        // rebuilds entirely on resolution change rather than mutating
+        // in place. We copy into an owned Vec immediately so no
+        // subsequent encoder operations can race with our read.
+        let extradata = unsafe {
+            let raw = encoder.extradata;
+            let size = encoder.extradata_size;
+            if raw.is_null() || size <= 0 {
+                Vec::new()
+            } else {
+                slice::from_raw_parts(raw, size as usize).to_vec()
+            }
+        };
+        if extradata.is_empty() {
+            warn!(
+                codec = vaapi_codec_name(kind),
+                "encoder.extradata was empty after open(); keyframes will not carry SPS/PPS \
+                 (clients that lose the first IDR will be stuck)"
+            );
+        }
+
         Ok(Self {
             kind,
             encoder,
             bgra_to_nv12,
             sw_frame,
             bgra_frame,
+            extradata,
             _hw_device: hw_device,
             width,
             height,
@@ -451,7 +506,7 @@ impl VaapiEncoder {
         drop(dst);
         drop(src);
 
-        drain_encoder(&mut self.encoder)
+        drain_encoder(&mut self.encoder, &self.extradata)
     }
 }
 
@@ -526,7 +581,7 @@ impl Encoder for VaapiEncoder {
         // the second; the loop generalises gracefully if a future
         // async_depth bump emits multiple packets per submit.
         self.encoder.send_frame(Some(&hw_frame))?;
-        drain_encoder(&mut self.encoder)
+        drain_encoder(&mut self.encoder, &self.extradata)
     }
 
     fn is_hardware(&self) -> bool {
@@ -584,8 +639,20 @@ fn vaapi_codec_name(kind: CodecKind) -> &'static str {
 /// Drain all packets currently buffered in the encoder. Returns the
 /// (possibly empty) list of fresh `EncodedPacket`s — empty is normal
 /// on the very first frame while libavcodec buffers SPS/PPS.
+///
+/// `extradata` is the Annex-B parameter set bundle captured from the
+/// encoder at construction. For each keyframe packet we prepend it so
+/// the decoder gets fresh SPS/PPS/VPS in band with every IDR (the
+/// streaming-friendly contract that mp4 muxers don't need but our
+/// raw wire format does). Cost: one allocation per keyframe of size
+/// `extradata.len()` (~25 bytes H.264, ~50 bytes HEVC). P-frames
+/// pass through untouched.
+///
+/// Without this, only the encoder's first packet carries parameter
+/// sets, and any client that joins mid-session or rebuilds its
+/// decoder (resume, resolution change) is stuck.
 #[allow(clippy::cast_sign_loss)]
-fn drain_encoder(encoder: &mut AVCodecContext) -> Result<Vec<EncodedPacket>> {
+fn drain_encoder(encoder: &mut AVCodecContext, extradata: &[u8]) -> Result<Vec<EncodedPacket>> {
     let mut out = Vec::new();
     loop {
         let packet = match encoder.receive_packet() {
@@ -596,8 +663,16 @@ fn drain_encoder(encoder: &mut AVCodecContext) -> Result<Vec<EncodedPacket>> {
         let size = packet.size as usize;
         // SAFETY: packet.data points to packet.size valid bytes
         // owned by the AVPacket; we copy them before drop.
-        let data = unsafe { slice::from_raw_parts(packet.data, size) }.to_vec();
+        let raw = unsafe { slice::from_raw_parts(packet.data, size) };
         let keyframe = (packet.flags & ffi::AV_PKT_FLAG_KEY as i32) != 0;
+        let data = if keyframe && !extradata.is_empty() {
+            let mut buf = Vec::with_capacity(extradata.len() + raw.len());
+            buf.extend_from_slice(extradata);
+            buf.extend_from_slice(raw);
+            buf
+        } else {
+            raw.to_vec()
+        };
         let pts_out = if packet.pts == ffi::AV_NOPTS_VALUE {
             None
         } else {

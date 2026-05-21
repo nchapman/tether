@@ -29,7 +29,6 @@ use tether_protocol::control::{
     ChromaSubsampling, ClientHello, CodecKind, ControlMessage, ServerHello, ServerHelloV1,
     VideoColorSpec,
 };
-use tether_protocol::video::VideoPacket;
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
@@ -300,16 +299,23 @@ async fn handle_client(
     let send_shutdown_for_thread = send_shutdown.clone();
     let stream_ready_for_thread = stream_ready.clone();
     // Keyframes ride a reliable per-IDR QUIC unidirectional stream
-    // rather than the unreliable datagram path used for P-frames. The
-    // sync send thread doesn't own a tokio runtime, so it pushes
-    // keyframe packets through this unbounded mpsc to a dedicated
-    // async task that owns the open-uni / write / finish sequence.
-    // Unbounded is safe here because keyframes are infrequent
-    // (request-driven, ~one per error-recovery cycle) and the async
-    // sender drains in O(open_uni + write) time, well under a second.
-    let (keyframe_tx, keyframe_rx) = tokio::sync::mpsc::unbounded_channel::<VideoPacket>();
+    // rather than the unreliable datagram path used for P-frames.
+    // The sync send thread is not a tokio worker, so it calls into
+    // the async send via `Handle::block_on`. We send keyframes
+    // synchronously (block the send thread until the IDR is queued
+    // into quinn) instead of routing them through an mpsc to a
+    // separate task, because:
+    //   1. Ordering: a P-frame's stream_epoch must agree with the
+    //      IDR's. The earlier mpsc design opened a window where
+    //      `bump_epoch()` could fire between IDR enqueue and IDR
+    //      wire-write, mis-attributing the IDR to the old epoch.
+    //   2. Cost: keyframes are request-driven and infrequent. The
+    //      blocking write is ~1 ms on LAN (open_uni + write_all +
+    //      finish into quinn's send buffer). That frame's latency
+    //      budget already absorbs an extra round trip for
+    //      reliability.
+    let runtime_handle_for_send = tokio::runtime::Handle::current();
     let conn_keyframe = conn.clone();
-    tokio::spawn(run_keyframe_sender(conn_keyframe, keyframe_rx));
     let send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
         .spawn(move || {
@@ -321,7 +327,8 @@ async fn handle_client(
                 send_shutdown_for_thread,
                 chosen_codec,
                 stream_ready_for_thread,
-                keyframe_tx,
+                runtime_handle_for_send,
+                conn_keyframe,
             )
         })?;
 
@@ -799,7 +806,8 @@ fn run_capture_and_send(
     shutdown: Arc<AtomicBool>,
     chosen_codec: CodecKind,
     stream_ready: Arc<AtomicBool>,
-    keyframe_tx: tokio::sync::mpsc::UnboundedSender<VideoPacket>,
+    runtime: tokio::runtime::Handle,
+    keyframe_conn: Arc<Connection>,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
@@ -987,9 +995,14 @@ fn run_capture_and_send(
             // packet that completes immediately. Frame_seq still
             // advances so the next P-frame fragments slot in
             // sequentially.
+            //
+            // Synchronous block_on (rather than an mpsc to a separate
+            // task) keeps strict ordering between the IDR and the
+            // P-frames that follow — see the comment on the spawn
+            // site for the epoch-race rationale.
             let packet = fragmenter.single_packet(meta, combined);
-            if keyframe_tx.send(packet).is_err() {
-                warn!("keyframe channel closed; terminating send loop");
+            if let Err(e) = runtime.block_on(keyframe_conn.send_video_keyframe(&packet)) {
+                warn!(error = ?e, "send_video_keyframe failed, terminating send loop");
                 return;
             }
         } else {
@@ -1132,29 +1145,6 @@ async fn real_capture() -> anyhow::Result<Receiver<CapturedFrame>> {
         TEST_PATTERN_HEIGHT,
         TEST_PATTERN_FPS,
     ))
-}
-
-/// Drains keyframe packets from the sync send loop and writes each on
-/// its own QUIC unidirectional stream. Ordering is preserved by the
-/// channel: the next keyframe doesn't start its open_uni until the
-/// previous one has been queued into quinn's send buffer. One stream
-/// per IDR keeps independent retransmits independent — a stuck packet
-/// on one IDR's stream doesn't head-of-line-block the next IDR.
-async fn run_keyframe_sender(
-    conn: Arc<Connection>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<VideoPacket>,
-) {
-    while let Some(packet) = rx.recv().await {
-        if let Err(e) = conn.send_video_keyframe(&packet).await {
-            // A failure here means the connection is dying (the only
-            // way send_video_keyframe errors is if quinn rejects the
-            // open_uni or write — typically a connection close). The
-            // recv loops on the main task will pick up the same close
-            // and tear the session down; nothing useful to do here
-            // beyond logging.
-            warn!(error = ?e, "send_video_keyframe failed; keyframe lost");
-        }
-    }
 }
 
 fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {

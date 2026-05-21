@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver as XbReceiver, Sender as XbSender};
 use tether_codec::{probe_decoder, Frame as CodecFrame};
-use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame};
+use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame, LatestFrame};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{
     ClientHello, ClientHelloV1, CodecKind, ControlMessage, GoodbyeCode, ServerHello,
@@ -115,7 +115,11 @@ async fn main() -> anyhow::Result<()> {
     // Render channel: producer is the recv loop, consumer is the wgpu
     // window. Bounded(2) with drop-newest semantics matches the rest of
     // the project.
-    let (frame_tx, frame_rx) = bounded::<Frame>(2);
+    // Single-slot drop-oldest channel: the renderer always wants
+    // the freshest decoded frame, not a queued backlog. Cheap clone
+    // (Arc inside); the decoder thread takes one, the renderer
+    // takes another.
+    let frames = LatestFrame::new();
 
     // First IDR request goes out immediately after the handshake: the
     // host's encoder always emits IDR on its very first frame, but if
@@ -240,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
     let (decoder_ready_tx, decoder_ready_rx) = tokio::sync::oneshot::channel::<()>();
     let runtime_handle = tokio::runtime::Handle::current();
     let conn_for_decode = conn.clone();
-    let frame_tx_for_decode = frame_tx.clone();
+    let frames_for_decode = frames.clone();
     std::thread::Builder::new()
         .name("tether-decode".into())
         .spawn(move || {
@@ -248,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
                 chosen_codec,
                 decode_job_rx,
                 decode_completion_tx,
-                frame_tx_for_decode,
+                frames_for_decode,
                 runtime_handle,
                 conn_for_decode,
                 decoder_ready_tx,
@@ -304,11 +308,11 @@ async fn main() -> anyhow::Result<()> {
         // mean we're losing IDR/SPS/PPS frames or the bitstream is
         // getting corrupted between encode and decode.
         let mut decode_errors: u32 = 0;
-        // Frames the recv loop produced but the render channel
-        // couldn't accept (bounded(2), drop-newest). Non-zero
-        // means the render thread isn't keeping up with arrival
-        // rate — typically a wgpu/present pacing issue, not a
-        // codec issue.
+        // Frames the decoder produced but displaced before the
+        // renderer could pick them up (LatestFrame is single-slot
+        // drop-oldest). Non-zero means the render thread isn't
+        // keeping up with arrival rate — typically a wgpu/present
+        // pacing issue, not a codec issue.
         let mut render_drops: u32 = 0;
         // ForceIdr control messages we sent in the window. Pairs
         // with the host's kf_per_s — if these match, the storm of
@@ -602,7 +606,7 @@ async fn main() -> anyhow::Result<()> {
         "tether-client",
         (INITIAL_WIDTH, INITIAL_HEIGHT),
         server_body.color_space,
-        frame_rx,
+        frames,
         Some(on_event),
     )?;
 
@@ -680,7 +684,7 @@ fn run_decode_thread(
     chosen_codec: tether_protocol::control::CodecKind,
     job_rx: XbReceiver<DecodeJob>,
     completion_tx: XbSender<DecodeCompletion>,
-    frame_tx: XbSender<Frame>,
+    frames: LatestFrame,
     runtime: tokio::runtime::Handle,
     conn: Arc<Connection>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
@@ -779,7 +783,11 @@ fn run_decode_thread(
                     })
                 }
             };
-            if frame_tx.try_send(raw).is_err() {
+            // LatestFrame.set displaces the previous frame; count
+            // each displacement as a render drop (the renderer never
+            // saw the displaced frame). On steady state with a
+            // keeping-up renderer, `set` mostly returns None.
+            if frames.set(raw).is_some() {
                 render_drops = render_drops.saturating_add(1);
             }
         }

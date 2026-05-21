@@ -13,10 +13,10 @@ use tracing::warn;
 
 use tether_protocol::control::CodecKind;
 
-use crate::h264::{frame_plane, interleave_uv, pack_plane, packet_from_bytes};
+use crate::h264::packet_from_bytes;
 use crate::{
-    init_ffmpeg, CodecError, DecodedFrame, Decoder, DmaBufFrame, DmaBufLayer, DmaBufObject, Frame,
-    GpuFrame, GpuFrameSource, Result,
+    init_ffmpeg, CodecError, Decoder, DmaBufFrame, DmaBufLayer, DmaBufObject, Frame, GpuFrame,
+    GpuFrameSource, Result,
 };
 
 use super::ffi::AVVAAPIDeviceContext;
@@ -269,88 +269,19 @@ impl Decoder for VaapiDecoder {
         // Reaching here means ffmpeg decoded into system memory
         // despite our get_format callback insisting on VAAPI. The
         // probe in `new()` already verified the build advertises
-        // VAAPI hwaccel for h264, so this only happens if the driver
-        // bailed mid-stream — silently doing CPU decode at 4K would
-        // make CPU usage spike with no obvious cause. Refuse loudly
-        // so the failure mode is observable. The remaining
-        // CPU-packing logic stays below in case a future SW backend
-        // wants to reuse it via a different decoder type.
+        // VAAPI hwaccel for the codec, so this only happens if the
+        // driver bailed mid-stream (HW context loss, OOM,
+        // unsupported profile slipping through). Silently doing CPU
+        // decode at 4K would spike CPU with no obvious cause and
+        // contradicts CLAUDE.md's "Hard requirement on hardware
+        // codecs" contract. Refuse — auto-IDR in the client will log
+        // it loudly via the av_log bridge and the user sees a clean
+        // failure mode rather than a mysterious slowdown.
         warn!(
             format = frame.format,
-            "VaapiDecoder fell back to software decode unexpectedly"
+            "VaapiDecoder produced a software frame; refusing per HW-only contract"
         );
-        let sw_frame = frame;
-
-        let width = sw_frame.width;
-        let height = sw_frame.height;
-        let w = width as usize;
-        let h = height as usize;
-        let chroma_w = w.div_ceil(2);
-        let chroma_h = h.div_ceil(2);
-
-        // Two formats we accept from the system-memory side:
-        //  - NV12 (canonical VAAPI sw_format) — already the
-        //    renderer's preferred layout, just pack the Y and UV
-        //    planes tight (strip any compositor stride padding).
-        //  - YUV420P (SW fallback emitted this directly) — interleave
-        //    U and V into NV12 layout before handing off. Pure byte
-        //    permutation; no resampling.
-        // Anything else (notably NV21, which is V-first instead of
-        // U-first) lands in the error arm rather than silently
-        // shipping inverted colors. If a future hwaccel surfaces
-        // NV21 we'd need either a dedicated arm or a U/V swap in
-        // the packing step.
-        let fmt = sw_frame.format;
-        let (y, uv) = if fmt == ffi::AV_PIX_FMT_NV12 {
-            let y = pack_plane(
-                frame_plane(&sw_frame, 0, h),
-                sw_frame.linesize[0] as usize,
-                w,
-                h,
-            );
-            // NV12 plane 1: interleaved UV at half resolution. Each
-            // "chroma sample" is two bytes (U, V) so a row carries
-            // `chroma_w * 2` bytes; `pack_plane` strips any extra
-            // padding the driver may have added.
-            let uv = pack_plane(
-                frame_plane(&sw_frame, 1, chroma_h),
-                sw_frame.linesize[1] as usize,
-                chroma_w * 2,
-                chroma_h,
-            );
-            (y, uv)
-        } else if fmt == ffi::AV_PIX_FMT_YUV420P {
-            let y = pack_plane(
-                frame_plane(&sw_frame, 0, h),
-                sw_frame.linesize[0] as usize,
-                w,
-                h,
-            );
-            let uv = interleave_uv(
-                frame_plane(&sw_frame, 1, chroma_h),
-                sw_frame.linesize[1] as usize,
-                frame_plane(&sw_frame, 2, chroma_h),
-                sw_frame.linesize[2] as usize,
-                chroma_w,
-                chroma_h,
-            );
-            (y, uv)
-        } else {
-            return Err(CodecError::UnsupportedInputFormat);
-        };
-
-        let pts_out = if sw_frame.pts == ffi::AV_NOPTS_VALUE {
-            None
-        } else {
-            Some(sw_frame.pts)
-        };
-        Ok(Some(Frame::Cpu(DecodedFrame {
-            width: width as u32,
-            height: height as u32,
-            pts: pts_out,
-            y,
-            uv,
-        })))
+        Err(CodecError::UnsupportedInputFormat)
     }
 
     fn codec_kind(&self) -> CodecKind {

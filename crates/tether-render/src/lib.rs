@@ -1,5 +1,7 @@
 //! Client-side display: a winit window driving a wgpu render pipeline,
-//! fed from a crossbeam channel of [`Frame`]s.
+//! fed from a [`LatestFrame`] slot. The slot keeps exactly one frame at
+//! a time — drop-oldest semantics — because a remote-desktop viewer
+//! always wants the most recent picture, not a queued backlog.
 
 pub mod color;
 mod gpu;
@@ -7,11 +9,9 @@ mod gpu;
 #[cfg(test)]
 mod dmabuf_test;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
-
-use crossbeam_channel::Receiver;
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
 use tether_protocol::MonoNanos;
 use tracing::warn;
@@ -203,7 +203,7 @@ pub fn run(
     title: &str,
     initial_size: (u32, u32),
     color_space: tether_protocol::control::VideoColorSpec,
-    frames: Receiver<Frame>,
+    frames: LatestFrame,
     on_event: Option<EventSink>,
 ) -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -230,7 +230,7 @@ struct App {
     color_space: tether_protocol::control::VideoColorSpec,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
-    frames: Receiver<Frame>,
+    frames: LatestFrame,
     latest: Option<Frame>,
     on_event: Option<EventSink>,
     /// Per-frame present-latency stats: sum / count / start.
@@ -412,26 +412,47 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        let mut received = false;
-        loop {
-            match self.frames.try_recv() {
-                Ok(frame) => {
-                    self.latest = Some(frame);
-                    received = true;
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    // Producer is gone — keep showing the last frame
-                    // until the user closes the window.
-                    break;
-                }
-            }
-        }
-        if received {
+        // LatestFrame holds at most one frame — if the producer wrote
+        // multiple times since we last polled, only the newest is
+        // visible. That's the intended drop-oldest semantics: a
+        // remote-desktop viewer wants the freshest picture, not a
+        // queued backlog.
+        if let Some(frame) = self.frames.take() {
+            self.latest = Some(frame);
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
         }
+    }
+}
+
+/// Single-slot, latest-wins frame channel between the decoder thread
+/// and the renderer. Replaces a bounded queue: a remote-desktop
+/// viewer never benefits from rendering a stale frame when a newer
+/// one is available. The producer side `set`s, optionally caring
+/// about the displaced frame (e.g. to bump a drop counter); the
+/// renderer `take`s once per redraw cycle.
+///
+/// Cheap clone (`Arc` inside). Both sides hold a clone.
+#[derive(Clone, Default)]
+pub struct LatestFrame(Arc<Mutex<Option<Frame>>>);
+
+impl LatestFrame {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace whatever frame is currently held. Returns the
+    /// displaced frame if one was present — the producer can use
+    /// that for a drop count or just drop it.
+    #[must_use = "displaced frame should be counted as a render drop or explicitly ignored"]
+    pub fn set(&self, frame: Frame) -> Option<Frame> {
+        std::mem::replace(&mut *self.0.lock().expect("LatestFrame mutex poisoned"), Some(frame))
+    }
+
+    /// Take the currently-held frame, leaving the slot empty.
+    pub fn take(&self) -> Option<Frame> {
+        self.0.lock().expect("LatestFrame mutex poisoned").take()
     }
 }
 

@@ -138,6 +138,10 @@ fn transport_config() -> quinn::TransportConfig {
     // LAN; tune down once we have telemetry.
     t.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     t.datagram_send_buffer_size(4 * 1024 * 1024);
+    // Cap client→host uni streams. Today only the input stream is
+    // opened in this direction at handshake time; the cap denies a
+    // hostile client the ability to open many concurrent streams.
+    t.max_concurrent_uni_streams(crate::MAX_CONCURRENT_UNI_STREAMS.into());
     // TODO(latency): switch to a no-pacer / BBR controller for LAN once we
     // have measurements showing Cubic adds visible jitter. Per the expert
     // review, the right place is

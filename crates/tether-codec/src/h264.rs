@@ -32,6 +32,7 @@ use crate::{init_ffmpeg, DecodedFrame, Decoder, Encoder, EncodedPacket, Frame, G
 /// Pack a planar AVFrame plane into a tight `Vec<u8>`, stripping any
 /// stride padding so downstream consumers can upload row-major without
 /// per-row math.
+#[cfg(test)]
 pub(crate) fn pack_plane(plane: &[u8], stride: usize, row_bytes: usize, height: usize) -> Vec<u8> {
     let mut packed = Vec::with_capacity(row_bytes * height);
     if stride == row_bytes {
@@ -52,6 +53,7 @@ pub(crate) fn pack_plane(plane: &[u8], stride: usize, row_bytes: usize, height: 
 /// of U and one of V. Replaces the per-plane swscale we used to do
 /// after the VAAPI decoder; for the software path this is a fast
 /// memory-bound shuffle (no resampling).
+#[cfg(test)]
 pub(crate) fn interleave_uv(
     u: &[u8],
     u_stride: usize,
@@ -91,6 +93,7 @@ pub(crate) fn frame_plane_mut(frame: &mut AVFrame, idx: usize, height: usize) ->
 
 /// Borrow plane `idx` of an allocated `AVFrame` as a read-only slice.
 #[allow(clippy::cast_sign_loss)] // ffmpeg linesize is i32 but non-negative for allocated frames
+#[cfg(test)]
 pub(crate) fn frame_plane(frame: &AVFrame, idx: usize, height: usize) -> &[u8] {
     let stride = frame.linesize[idx] as usize;
     let ptr = frame.data[idx];

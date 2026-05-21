@@ -160,5 +160,10 @@ fn transport_config() -> quinn::TransportConfig {
     // desktop targets, would need trimming on embedded.
     t.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     t.datagram_send_buffer_size(4 * 1024 * 1024);
+    // Cap host→client uni streams. The client accepts these for the
+    // reliable-keyframe protocol; without an explicit limit a hostile
+    // host could open enough streams to pin 2 MiB of receive buffer
+    // per stream (see MAX_VIDEO_STREAM_MESSAGE).
+    t.max_concurrent_uni_streams(crate::MAX_CONCURRENT_UNI_STREAMS.into());
     t
 }

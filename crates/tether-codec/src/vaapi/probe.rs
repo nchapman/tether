@@ -28,39 +28,61 @@ const PROBE_BITRATE_KBPS: u32 = 1_000;
 
 impl ProfileProbe for VaapiProbe {
     fn probe_encode(profile: VideoProfile) -> Result<()> {
-        // Temporary gate: the Linux gpuconvert bridges (Nv12DmaBuf /
-        // Yuv444DmaBuf) are 8-bit only today. The matching 10-bit
-        // shaders (bgra_to_p010.wgsl / bgra_to_p410.wgsl) exist as
-        // scaffolding but aren't plumbed into the production
-        // GpuConvertBridge variants yet. If a driver returns
-        // encode=true for a 10-bit profile here, the host's
-        // negotiator could pick it and then feed 8-bit dma-bufs to
-        // the 10-bit encoder — a silent format mismatch. Gate at the
-        // probe layer so the profile stays out of
-        // `supported_encode_profiles()` until the bridge is wired.
-        if profile.bit_depth != 8 {
-            return Err(crate::CodecError::NoHardwareCodec(format!(
-                "VAAPI 10-bit encode ({:?} {}-bit) is gated pending the \
-                 gpuconvert P010/P410 bridge wiring; remove this guard once \
-                 Nv12DmaBuf / Yuv444DmaBuf grow 10-bit variants",
-                profile.chroma, profile.bit_depth
-            )));
+        // Narrow gate for HEVC 4:4:4 10-bit: VAAPI's encode side
+        // takes packed XV30 input (vaapi_drm_format_map has no P410
+        // entry), and no gpuconvert bridge produces XV30 today. If a
+        // driver constructs the encoder for (Yuv444, 10) successfully
+        // and we report encode=true, the host's send loop would crash
+        // trying to build a bridge for XV30. Until an XV30 bridge
+        // lands, gate this combination explicitly. The 4:2:0 10-bit
+        // and 4:4:4 8-bit paths are both fully wired and not gated.
+        if profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv444
+            && profile.bit_depth == 10
+        {
+            return Err(crate::CodecError::NoHardwareCodec(
+                "HEVC 4:4:4 10-bit (XV30 input) — VAAPI accepts packed XV30 \
+                 input but no gpuconvert bridge produces it yet. Profile \
+                 will become available when Bgra2Xv30DmaBuf ships."
+                    .into(),
+            ));
         }
+
         let mut enc =
             VaapiEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)?;
-        // Drive a single BGRA frame through the encoder so any driver
-        // rejection that only fires at submit time (not construction)
-        // surfaces here. A solid-grey buffer is the smallest "real"
-        // input; the encoder doesn't care about content for capability
-        // purposes.
-        let bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
-        use crate::Encoder;
-        let packets = enc.encode_bgra(&bytes, 0, true)?;
-        // Some encoders buffer the first frame and don't return a packet
-        // until the second. The contract we care about is "no error" —
-        // the empty-packet case still means the encoder accepted the
-        // input. (Real session use exercises the drain loop properly.)
-        let _ = packets;
+        if profile.bit_depth == 8 {
+            // Drive a single BGRA frame through the encoder so any
+            // driver rejection that only fires at submit time (not
+            // construction) surfaces here. The CPU-upload path is
+            // 8-bit-only by design — see `encode_bgra`'s comment.
+            let bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
+            use crate::Encoder;
+            let packets = enc.encode_bgra(&bytes, 0, true)?;
+            // Some encoders buffer the first frame and don't return a
+            // packet until the second. The contract we care about is
+            // "no error" — the empty-packet case still means the
+            // encoder accepted the input.
+            let _ = packets;
+        } else {
+            // 10-bit probe is construction-only: `VaapiEncoder::new`
+            // succeeded above means avcodec_open2 accepted the
+            // P010LE sw_format + the Main10 profile (the only 10-bit
+            // path that reaches here today; the Yuv444+10 case is
+            // gated above). Submit-time driver rejection at
+            // `send_frame` is a real concern (see the docstring at
+            // module top) but driving a real 10-bit frame here would
+            // need a transient gpuconvert P010 bridge in this crate,
+            // pulling tether-gpuconvert into the codec layer's
+            // dependency surface — too much coupling for the marginal
+            // probe completeness gain. When the Linux
+            // `capture_filtered_encode_profiles` grows a
+            // bridge-deliverability filter (Step 4 of the 10-bit
+            // port), that provides an independent backstop; until
+            // then, profile filtering relies on the host's existing
+            // `Bgra2P010DmaBuf::new` failing loudly mid-session if
+            // the bridge can't be built (per the bridge-fatal-init
+            // contract in CLAUDE.md).
+            let _ = enc;
+        }
         Ok(())
     }
 

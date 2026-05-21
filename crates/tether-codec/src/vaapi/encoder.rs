@@ -401,30 +401,51 @@ impl VaapiEncoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
-        // 10-bit DMA-BUF import isn't wired yet — gpuconvert produces
-        // NV12 / XYUV only. If a future call lands here with a 10-bit
-        // encoder, the fourcc table below would silently accept the
-        // 8-bit DRM fourcc and produce a mis-encoded bitstream
-        // (caller asked for 10-bit, encoder got 8-bit input). Refuse
-        // explicitly until the 10-bit gpuconvert path lands and this
-        // function grows matching (P010 / XV30) fourcc entries.
-        if self.bit_depth != 8 {
-            return Err(CodecError::UnsupportedInputFormat);
-        }
-        // DRM fourccs for the two pixel formats the encoder accepts.
-        // The dma-buf bridge must hand us a frame matching the
-        // negotiated chroma — otherwise av_hwframe_map would fail
-        // mid-pipeline with a much less actionable error.
+        // DRM fourccs for the four pixel formats the encoder accepts,
+        // keyed on `(chroma, bit_depth)`. The dma-buf bridge must hand
+        // us a frame matching the negotiated profile — otherwise
+        // av_hwframe_map would fail mid-pipeline with a much less
+        // actionable error.
         const NV12_FOURCC: u32 = u32::from_le_bytes(*b"NV12");
-        // 4:4:4 path: DRM_FORMAT_XYUV8888 (`XYUV` in fourcc form;
-        // bytes V, U, Y, X in memory little-endian). This is the only
-        // 4:4:4 8-bit format ffmpeg's `vaapi_drm_format_map` recognises
-        // for DRM_PRIME import — planar YUV444P / YU24 / three-R8-layer
+        // 4:4:4 8-bit path: DRM_FORMAT_XYUV8888 (`XYUV` in fourcc form;
+        // bytes V, U, Y, X in memory little-endian). The only 4:4:4
+        // 8-bit format ffmpeg's `vaapi_drm_format_map` recognises for
+        // DRM_PRIME import — planar YUV444P / YU24 / three-R8-layer
         // shapes fail with "DRM format not supported by VAAPI".
         const XYUV_FOURCC: u32 = u32::from_le_bytes(*b"XYUV");
+        // 4:2:0 10-bit path: DRM_FORMAT_P010. Two-plane biplanar
+        // (R16 Y + GR32 UV in DRM fourcc terms), 10 bits MSB-aligned
+        // in 16-bit cells. Maps to AV_PIX_FMT_P010LE on the VAAPI side
+        // — the only 10-bit 4:2:0 entry in `vaapi_drm_format_map`.
+        // Produced by [`tether_gpuconvert::Bgra2P010DmaBuf`].
+        const P010_FOURCC: u32 = u32::from_le_bytes(*b"P010");
+        // 4:4:4 10-bit path: DRM_FORMAT_XV30 — packed 10:10:10:2
+        // (V:U:Y:X) in a single 32-bit cell. The only 10-bit 4:4:4
+        // entry in `vaapi_drm_format_map`, mapped to AV_PIX_FMT_XV30LE.
+        // Currently no gpuconvert bridge produces this; the entry
+        // exists so that when an XV30 bridge ships, the encoder side
+        // is already wired (no need to revisit the fourcc table). A
+        // submission landing here with this fourcc today means the
+        // upstream bridge negotiation got ahead of itself; surfaces as
+        // a clean UnsupportedInputFormat below.
+        const XV30_FOURCC: u32 = u32::from_le_bytes(*b"XV30");
+        // Nested match keeps the outer `match self.chroma` exhaustive on
+        // the enum so a future `Yuv422` variant forces a code change
+        // here rather than silently falling through to
+        // UnsupportedInputFormat at submit time (which is exactly the
+        // failure mode the old `bit_depth != 8` guard protected
+        // against). Inner arms hand-cover the bit-depths we accept.
         let expected_fourcc = match self.chroma {
-            ChromaSubsampling::Yuv420 => NV12_FOURCC,
-            ChromaSubsampling::Yuv444 => XYUV_FOURCC,
+            ChromaSubsampling::Yuv420 => match self.bit_depth {
+                8 => NV12_FOURCC,
+                10 => P010_FOURCC,
+                _ => return Err(CodecError::UnsupportedInputFormat),
+            },
+            ChromaSubsampling::Yuv444 => match self.bit_depth {
+                8 => XYUV_FOURCC,
+                10 => XV30_FOURCC,
+                _ => return Err(CodecError::UnsupportedInputFormat),
+            },
         };
         if frame.fourcc != expected_fourcc {
             // Mismatch usually means a stale dma-buf bridge initialised
@@ -635,18 +656,25 @@ impl Encoder for VaapiEncoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
-        // Mirror of the bit_depth guard in submit_dmabuf — the BGRA
-        // path goes through swscale which *will* upscale 8-bit data
-        // into a 10-bit sw_format, producing low-precision 10-bit
-        // output rather than the expected 10-bit-fidelity content.
-        // The probe layer uses this method to verify (chroma,
-        // bit_depth) capability and is intentionally exempt; the
-        // production send loop should never reach here for a 10-bit
-        // session because PROFILE_PREFERENCE → probe → negotiation
-        // would have surfaced an Err earlier. If it does, fail
-        // loudly rather than ship 8-bit-source-as-10-bit. Remove
-        // both guards (here and submit_dmabuf) together when the
-        // gpuconvert P010/P410 bridge is wired.
+        // CPU-upload path: the BGRA→sw_format swscale stage here is
+        // 8-bit-only by design. Adding a 10-bit swscale path would
+        // need its own conversion table + verification that swscale's
+        // P010LE output lands in the right MSB-align convention; the
+        // gpuconvert P010 bridge is the production answer for 10-bit
+        // and the CPU-upload path is only used by the test pattern
+        // and the bench harness. Probe layer also skips this method
+        // for 10-bit (see `vaapi::probe::probe_encode`); the
+        // production send loop never reaches here for a 10-bit
+        // session. If anyone does, fail explicitly rather than ship
+        // 8-bit-source-as-10-bit.
+        //
+        // When a 10-bit CPU-upload path is eventually needed (e.g. for
+        // the bench harness to report Main10 numbers), add a
+        // `(Yuv420, 10)` swscale branch + matching sw_frame allocation
+        // here and re-enable 10-bit probing through `encode_bgra` in
+        // `probe.rs::probe_encode`. Do not just delete this guard —
+        // the swscale conversion needs the bit-depth-aware
+        // configuration too.
         if self.bit_depth != 8 {
             return Err(CodecError::UnsupportedInputFormat);
         }

@@ -691,6 +691,7 @@ async fn main() -> anyhow::Result<()> {
         (INITIAL_WIDTH, INITIAL_HEIGHT),
         server_body.color_space,
         negotiated_profile.chroma,
+        negotiated_profile.bit_depth,
         frames,
         Some(on_event),
     )?;

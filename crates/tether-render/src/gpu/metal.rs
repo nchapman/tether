@@ -64,49 +64,114 @@ const NV24_VIDEO_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"444v");
 /// full-range counterpart of `'444v'`. Same plane shape; range is
 /// signalled through `VideoColorSpec`, not the fourcc.
 const NV24_FULL_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"444f");
+/// `kCVPixelFormatType_4444AYpCbCr10` style biplanar 4:4:4 10-bit
+/// full-range — Apple's `'xf44'`. SCK exposes this as its documented
+/// 10-bit 4:4:4 capture format and VT decoders can land here for
+/// 10-bit Main 4:4:4 input. Plane shape is biplanar with 16-bit Y +
+/// 16-bit interleaved UV cells, 10 bits MSB-aligned in each.
+const XF44_FOURCC: u32 = u32::from_be_bytes(*b"xf44");
+/// `kCVPixelFormatType_4444YpCbCrA10` / `'P410'` — biplanar 10-bit
+/// 4:4:4 full-range, the conventional fourcc for the same shape as
+/// `'xf44'`. Some VT decoder configurations emit this label instead;
+/// both have identical 16-bit MSB-aligned plane layouts so they
+/// import through the same code path.
+const P410_FOURCC: u32 = u32::from_be_bytes(*b"P410");
+/// `'P010'` — biplanar 10-bit 4:2:0 full-range. VT's Main10 decode
+/// path lands here. Shape: 16-bit Y plane + interleaved 16-bit UV
+/// plane at half resolution, 10 bits MSB-aligned in each cell.
+const P010_FOURCC: u32 = u32::from_be_bytes(*b"P010");
 
 pub(crate) fn import_iosurface_textures(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     chroma: ChromaSubsampling,
+    bit_depth: u8,
     iosurface: &IOSurfaceFrame,
     guard: GpuFrameGuard,
 ) -> Result<YuvTextures> {
-    let fourcc_ok = match chroma {
-        ChromaSubsampling::Yuv420 => matches!(
-            iosurface.pixel_format,
-            NV12_VIDEO_RANGE_FOURCC | NV12_FULL_RANGE_FOURCC
+    let (fourcc_ok, expected) = match (chroma, bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => (
+            matches!(
+                iosurface.pixel_format,
+                NV12_VIDEO_RANGE_FOURCC | NV12_FULL_RANGE_FOURCC
+            ),
+            "'420v' or '420f' (NV12 biplanar 8-bit)",
         ),
-        ChromaSubsampling::Yuv444 => matches!(
-            iosurface.pixel_format,
-            NV24_VIDEO_RANGE_FOURCC | NV24_FULL_RANGE_FOURCC
+        (ChromaSubsampling::Yuv444, 8) => (
+            matches!(
+                iosurface.pixel_format,
+                NV24_VIDEO_RANGE_FOURCC | NV24_FULL_RANGE_FOURCC
+            ),
+            "'444v' or '444f' (NV24 biplanar 8-bit)",
+        ),
+        // 10-bit 4:2:0: VT's Main10 decode lands in a 'P010' IOSurface
+        // with biplanar R16/Rg16 plane formats (10 bits MSB-aligned).
+        // Same fourcc family as the Linux DRM P010.
+        (ChromaSubsampling::Yuv420, 10) => (
+            iosurface.pixel_format == P010_FOURCC,
+            "'P010' (biplanar 4:2:0 10-bit)",
+        ),
+        (ChromaSubsampling::Yuv444, 10) => (
+            matches!(iosurface.pixel_format, XF44_FOURCC | P410_FOURCC),
+            "'xf44' or 'P410' (biplanar 4:4:4 10-bit)",
+        ),
+        // Other (chroma, bit_depth) combos haven't been wired; surface
+        // an actionable error rather than mapping them silently.
+        _ => (
+            false,
+            "an IOSurface fourcc supported by this build (8-bit 4:2:0/4:4:4 or 10-bit 4:2:0/4:4:4)",
         ),
     };
     if !fourcc_ok {
-        let expected = match chroma {
-            ChromaSubsampling::Yuv420 => "'420v' or '420f' (NV12 biplanar)",
-            ChromaSubsampling::Yuv444 => "'444v' or '444f' (NV24 biplanar)",
-        };
         return Err(RenderError::DmaBufImport(format!(
-            "IOSurface pixel format 0x{:08x} doesn't match negotiated chroma {chroma:?}; \
-             expected {expected}",
+            "IOSurface pixel format 0x{:08x} doesn't match negotiated profile \
+             ({chroma:?} {bit_depth}-bit); expected {expected}",
             iosurface.pixel_format
         )));
     }
-    // NV12 and NV24 import through the same biplanar path — Y is R8,
-    // UV is Rg8, plane dims come from the IOSurface itself (which
-    // reports half-res UV for NV12 and full-res UV for NV24). The
-    // fragment shader is chroma-resolution-agnostic.
-    import_biplanar(device, layout, sampler, iosurface, guard)
+    // Pick per-plane Metal + wgpu formats from bit depth. Plane *count*
+    // (always 2 for the biplanar fourccs we accept) and per-plane dims
+    // come from the IOSurface — Apple reports the correct half-res or
+    // full-res UV per the source fourcc.
+    let (y_mtl, y_wgpu, uv_mtl, uv_wgpu, hbd) = match bit_depth {
+        8 => (
+            MTLPixelFormat::R8Unorm,
+            wgpu::TextureFormat::R8Unorm,
+            MTLPixelFormat::RG8Unorm,
+            wgpu::TextureFormat::Rg8Unorm,
+            false,
+        ),
+        10 => (
+            MTLPixelFormat::R16Unorm,
+            wgpu::TextureFormat::R16Unorm,
+            MTLPixelFormat::RG16Unorm,
+            wgpu::TextureFormat::Rg16Unorm,
+            true,
+        ),
+        other => {
+            return Err(RenderError::DmaBufImport(format!(
+                "no IOSurface plane format wired for {other}-bit input"
+            )))
+        }
+    };
+    import_biplanar(
+        device, layout, sampler, iosurface, guard, y_mtl, y_wgpu, uv_mtl, uv_wgpu, hbd,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_biplanar(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     iosurface: &IOSurfaceFrame,
     guard: GpuFrameGuard,
+    y_mtl: MTLPixelFormat,
+    y_wgpu: wgpu::TextureFormat,
+    uv_mtl: MTLPixelFormat,
+    uv_wgpu: wgpu::TextureFormat,
+    high_bit_depth: bool,
 ) -> Result<YuvTextures> {
     let surface_ref = iosurface_as_ref(iosurface)?;
     // Plane dims via IOSurface itself. For odd resolutions the
@@ -115,7 +180,7 @@ fn import_biplanar(
     // 959×539 on others); the IOSurface is the ground truth.
     if surface_ref.plane_count() < 2 {
         return Err(RenderError::DmaBufImport(format!(
-            "NV12 IOSurface should have 2 planes; got {}",
+            "biplanar IOSurface should have 2 planes; got {}",
             surface_ref.plane_count()
         )));
     }
@@ -145,8 +210,8 @@ fn import_biplanar(
         0,
         y_w,
         y_h,
-        MTLPixelFormat::R8Unorm,
-        wgpu::TextureFormat::R8Unorm,
+        y_mtl,
+        y_wgpu,
     )?;
     let uv = import_plane(
         device,
@@ -155,13 +220,17 @@ fn import_biplanar(
         1,
         uv_w,
         uv_h,
-        MTLPixelFormat::RG8Unorm,
-        wgpu::TextureFormat::Rg8Unorm,
+        uv_mtl,
+        uv_wgpu,
     )?;
     let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
     let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tether-render yuv bind group (iosurface nv12)"),
+        label: Some(if high_bit_depth {
+            "tether-render yuv bind group (iosurface biplanar 16)"
+        } else {
+            "tether-render yuv bind group (iosurface biplanar 8)"
+        }),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -180,8 +249,13 @@ fn import_biplanar(
     });
     // Public size tag is the luma-plane dims — the renderer uses this
     // for letterboxing and for the cursor-normalisation math in lib.rs.
+    let planes = if high_bit_depth {
+        YuvPlanes::Biplanar16 { y, uv }
+    } else {
+        YuvPlanes::Biplanar8 { y, uv }
+    };
     Ok(YuvTextures {
-        planes: YuvPlanes::Nv12 { y, uv },
+        planes,
         bind_group,
         size: (y_w, y_h),
         _guard: Some(guard),

@@ -1,8 +1,9 @@
 //! Linux DMA-BUF import path: VAAPI-decoded surface → `wgpu::Texture`
 //! plane(s) the renderer can sample. Dispatches on the negotiated
-//! chroma — NV12 gets 2 planes (Y as R8, UV as Rg8); YUV444 gets 3
-//! planes (Y/U/V each as R8). Pure Linux module — macOS will land its
-//! IOSurface equivalent here as a sibling file.
+//! `(chroma, bit_depth)` — 8-bit 4:2:0 gets biplanar NV12 (R8 Y +
+//! Rg8 UV), 8-bit 4:4:4 gets packed XYUV in a single Rgba8 texture,
+//! 10-bit gets biplanar P010/P410 (R16 Y + Rg16 UV). Pure Linux
+//! module — macOS lands its IOSurface equivalent in `metal.rs`.
 
 use tether_codec::{DmaBufFrame, GpuFrameGuard};
 use tether_protocol::control::ChromaSubsampling;
@@ -12,11 +13,13 @@ use crate::{RenderError, Result};
 use super::{YuvPlanes, YuvTextures};
 
 #[allow(clippy::cast_lossless)] // u32 pitch into u64 stride is intentional
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn import_dmabuf_textures(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     chroma: ChromaSubsampling,
+    bit_depth: u8,
     dmabuf: &DmaBufFrame,
     width: u32,
     height: u32,
@@ -29,6 +32,7 @@ pub(crate) fn import_dmabuf_textures(
     // hint about what to change.
     tracing::debug!(
         chroma = ?chroma,
+        bit_depth,
         fourcc = format_args!("0x{:08x}", dmabuf.fourcc),
         layers = dmabuf.layers.len(),
         planes_per_layer = ?dmabuf
@@ -39,55 +43,96 @@ pub(crate) fn import_dmabuf_textures(
         objects = dmabuf.objects.len(),
         "import_dmabuf_textures dispatch"
     );
-    match chroma {
-        ChromaSubsampling::Yuv420 => {
-            import_nv12(device, layout, sampler, dmabuf, width, height, guard)
+    match (chroma, bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => import_biplanar(
+            device, layout, sampler, chroma, dmabuf, width, height, guard, false,
+        ),
+        (ChromaSubsampling::Yuv444, 8) => {
+            import_yuv444_packed(device, layout, sampler, dmabuf, width, height, guard)
         }
-        ChromaSubsampling::Yuv444 => {
-            import_yuv444(device, layout, sampler, dmabuf, width, height, guard)
+        (ChromaSubsampling::Yuv420 | ChromaSubsampling::Yuv444, 10) => {
+            // 10-bit 4:2:0 (P010) and 4:4:4 (P410) both land here:
+            // biplanar 16-bit cells, MSB-aligned 10-bit data. UV plane
+            // dims come from `chroma` (half-res for 4:2:0, full-res
+            // for 4:4:4) — passing it through means we never have to
+            // sniff the DRM fourcc for layout decisions, which would
+            // be wrong for any driver that emits a non-P010/P410
+            // fourcc for the same (chroma, bit_depth) shape.
+            import_biplanar(
+                device, layout, sampler, chroma, dmabuf, width, height, guard, true,
+            )
         }
+        _ => Err(RenderError::DmaBufImport(format!(
+            "no Linux dma-buf import path wired for {chroma:?} {bit_depth}-bit"
+        ))),
     }
 }
 
-fn import_nv12(
+#[allow(clippy::too_many_arguments)]
+fn import_biplanar(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    chroma: ChromaSubsampling,
     dmabuf: &DmaBufFrame,
     width: u32,
     height: u32,
     guard: GpuFrameGuard,
+    high_bit_depth: bool,
 ) -> Result<YuvTextures> {
     if dmabuf.layers.len() != 2 {
         return Err(RenderError::DmaBufImport(format!(
-            "expected 2 layers (NV12 SEPARATE_LAYERS), got {}",
+            "expected 2 layers (biplanar SEPARATE_LAYERS), got {}",
             dmabuf.layers.len()
         )));
     }
-    let chroma_w = width.div_ceil(2);
-    let chroma_h = height.div_ceil(2);
+    // Chroma sub-sampling drives the UV plane dimensions directly;
+    // the bit depth picks the per-plane formats further down. We
+    // never look at the DRM fourcc for layout decisions — the
+    // negotiated `chroma` is the source of truth.
+    let (chroma_w, chroma_h) = match chroma {
+        ChromaSubsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
+        ChromaSubsampling::Yuv444 => (width, height),
+    };
+    let (y_fmt, uv_fmt) = if high_bit_depth {
+        (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
+    } else {
+        (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
+    };
     let y = import_one_layer(
         device,
-        "tether-render y plane (dmabuf)",
+        if high_bit_depth {
+            "tether-render y plane (dmabuf 16-bit)"
+        } else {
+            "tether-render y plane (dmabuf 8-bit)"
+        },
         dmabuf,
         0,
         width,
         height,
-        wgpu::TextureFormat::R8Unorm,
+        y_fmt,
     )?;
     let uv = import_one_layer(
         device,
-        "tether-render uv plane (dmabuf)",
+        if high_bit_depth {
+            "tether-render uv plane (dmabuf 16-bit)"
+        } else {
+            "tether-render uv plane (dmabuf 8-bit)"
+        },
         dmabuf,
         1,
         chroma_w,
         chroma_h,
-        wgpu::TextureFormat::Rg8Unorm,
+        uv_fmt,
     )?;
     let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
     let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tether-render yuv bind group (dmabuf nv12)"),
+        label: Some(if high_bit_depth {
+            "tether-render yuv bind group (dmabuf biplanar 16)"
+        } else {
+            "tether-render yuv bind group (dmabuf biplanar 8)"
+        }),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -104,8 +149,13 @@ fn import_nv12(
             },
         ],
     });
+    let planes = if high_bit_depth {
+        YuvPlanes::Biplanar16 { y, uv }
+    } else {
+        YuvPlanes::Biplanar8 { y, uv }
+    };
     Ok(YuvTextures {
-        planes: YuvPlanes::Nv12 { y, uv },
+        planes,
         bind_group,
         size: (width, height),
         _guard: Some(guard),
@@ -123,7 +173,7 @@ fn import_nv12(
 /// planar 4:4:4 8-bit, so libavcodec returns the packed XYUV form
 /// regardless of how the driver allocated the surface internally.
 /// (See `bgra_to_yuv444.wgsl` for the matching encoder-side rationale.)
-fn import_yuv444(
+fn import_yuv444_packed(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
@@ -177,7 +227,7 @@ fn import_yuv444(
         ],
     });
     Ok(YuvTextures {
-        planes: YuvPlanes::Yuv444 { packed },
+        planes: YuvPlanes::Yuv444Packed { packed },
         bind_group,
         size: (width, height),
         _guard: Some(guard),

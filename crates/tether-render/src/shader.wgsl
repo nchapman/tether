@@ -33,10 +33,16 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 @group(0) @binding(1) var uv_tex: texture_2d<f32>;
 @group(0) @binding(2) var s: sampler;
 
-// Color params. .x is the EOTF dispatch tag (see Rust constants
-// TRANSFER_KIND_* in gpu/mod.rs); .yzw are reserved padding for
-// future axes (matrix kind / range kind when they grow shader
-// variants).
+// Color params:
+//   .x = EOTF dispatch tag (see Rust constants TRANSFER_KIND_* in
+//        gpu/mod.rs).
+//   .y = luma_scale as f32 bit-pattern. The shader multiplies sampled
+//        Y/UV by this before the range expansion. For 8-bit data the
+//        scale is 1.0 (no-op multiply); for 10-bit MSB-aligned in 16-bit
+//        storage it compensates the ~0.999 max-value sampler reading
+//        back to 1.0. See `luma_scale_for` in gpu/mod.rs for the
+//        derivation.
+//   .zw = reserved (matrix kind / range kind when they grow variants).
 @group(2) @binding(0) var<uniform> color_params: vec4<u32>;
 const TRANSFER_KIND_BT709: u32 = 0u;
 const TRANSFER_KIND_SRGB: u32 = 1u;
@@ -163,9 +169,13 @@ fn apply_eotf(rgb_gamma: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    // 1. SAMPLE
-    let y_lim = textureSample(y_tex, s, in.uv).r;
-    let chroma_lim = textureSample(uv_tex, s, in.uv).rg;
+    // 1. SAMPLE. Multiply by `luma_scale` to normalise 10-bit
+    // MSB-aligned data to the 8-bit-style [0,1] coordinate the
+    // range expansion below expects. For 8-bit input `luma_scale`
+    // is 1.0 (compile-time-free for the GPU).
+    let luma_scale = bitcast<f32>(color_params.y);
+    let y_lim = textureSample(y_tex, s, in.uv).r * luma_scale;
+    let chroma_lim = textureSample(uv_tex, s, in.uv).rg * luma_scale;
 
     // 2. RANGE: limited -> normalized.
     let y = limited_y_to_normalized(y_lim);

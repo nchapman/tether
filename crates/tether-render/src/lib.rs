@@ -204,6 +204,7 @@ pub fn run(
     initial_size: (u32, u32),
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
+    bit_depth: u8,
     frames: LatestFrame,
     on_event: Option<EventSink>,
 ) -> Result<()> {
@@ -213,6 +214,7 @@ pub fn run(
         initial_size,
         color_space,
         chroma,
+        bit_depth,
         window: None,
         gpu: None,
         frames,
@@ -231,6 +233,7 @@ struct App {
     initial_size: (u32, u32),
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
+    bit_depth: u8,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     frames: LatestFrame,
@@ -312,6 +315,7 @@ impl ApplicationHandler for App {
             win.clone(),
             self.color_space,
             self.chroma,
+            self.bit_depth,
         )) {
             Ok(g) => g,
             Err(e) => {

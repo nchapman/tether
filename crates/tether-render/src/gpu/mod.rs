@@ -51,11 +51,23 @@ pub(crate) struct YuvTextures {
 /// after the bind group is built.
 #[allow(dead_code)]
 pub(crate) enum YuvPlanes {
-    /// NV12: full-res R8 Y plus half-res Rg8 UV (interleaved chroma).
-    Nv12 { y: wgpu::Texture, uv: wgpu::Texture },
+    /// 8-bit biplanar: full-res R8 Y plus Rg8 UV. NV12 (4:2:0
+    /// half-res UV) and NV24 (4:4:4 full-res UV) take the same
+    /// variant; the dimensions differ but the format and shader
+    /// don't.
+    Biplanar8 { y: wgpu::Texture, uv: wgpu::Texture },
+    /// 10-bit (or 16-bit) biplanar: R16Unorm Y plus Rg16Unorm UV.
+    /// Used by macOS `'P410'`/`'xf44'` IOSurfaces and Linux
+    /// `DRM_FORMAT_P010`/`P410` dma-bufs. The 10-bit data is
+    /// MSB-aligned in the 16-bit storage cell (Apple + DRM
+    /// convention); the shader's `luma_scale` uniform compensates
+    /// the resulting `≈0.999` max-value sampler reading back to
+    /// `1.0` so the limited-range expansion lands on the right
+    /// breakpoints.
+    Biplanar16 { y: wgpu::Texture, uv: wgpu::Texture },
     /// XYUV8888 packed 4:4:4: one Rgba8 texture, byte order V/U/Y/X.
     /// See `shader_yuv444.wgsl` for why packed instead of planar.
-    Yuv444 { packed: wgpu::Texture },
+    Yuv444Packed { packed: wgpu::Texture },
 }
 
 pub(crate) struct GpuState {
@@ -69,6 +81,12 @@ pub(crate) struct GpuState {
     /// a chroma switch needs a full GpuState rebuild, the same way
     /// a resolution change works.
     chroma: ChromaSubsampling,
+    /// Negotiated bit depth (8 or 10 in practice). Pairs with
+    /// `chroma` to pick the `RenderLayout` and the texture formats
+    /// in [`make_yuv_textures`]. A bit-depth switch needs a full
+    /// rebuild for the same reason chroma does (different texture
+    /// formats, different shader luma_scale).
+    bit_depth: u8,
     sampler: wgpu::Sampler,
     textures: YuvTextures,
     /// Previous frame's textures + guard, retired for one extra render
@@ -109,41 +127,73 @@ pub(crate) struct GpuState {
 
 /// Renderer plane layout — decoupled from `ChromaSubsampling` because
 /// the same chroma can arrive in different GPU shapes depending on
-/// backend:
+/// backend + bit depth:
 ///
-/// - **Biplanar** = NV12 / NV24-style: Y in an R8 texture plus
+/// - **Biplanar8** = NV12 / NV24-style: Y in an R8 texture plus
 ///   interleaved UV in an Rg8 texture. Plane resolutions differ
 ///   between 4:2:0 (half-res UV) and 4:4:4 (full-res UV), but the
 ///   bind-group layout and fragment shader are identical — bilinear
 ///   sampling reads the right value at either resolution. Used by
 ///   the macOS IOSurface import path for both Yuv420 (`'420v'`) and
 ///   Yuv444 (`'444v'`), and by the Linux dma-buf path for Yuv420.
+/// - **Biplanar16** = P010 / P410 / xf44-style: Y in R16Unorm plus
+///   interleaved UV in Rg16Unorm, with 10-bit data MSB-aligned in
+///   the 16-bit storage cells. Apple's `'P410'` IOSurface (10-bit
+///   4:4:4 from VT HEVC Main 4:4:4 10-bit decode), `'xf44'` (same
+///   shape via SCK capture), and Linux's `DRM_FORMAT_P010`/`P410`
+///   dma-bufs all land here. Same bind-group layout + same shader
+///   as Biplanar8 — the `luma_scale` uniform in `color_params`
+///   compensates the MSB-align so max-value samples normalise to
+///   1.0 instead of `≈0.999`.
 /// - **PackedXYUV** = one Rgba8 texture with byte order V/U/Y/X.
-///   Only the Linux dma-buf path for Yuv444 — VAAPI's 4:4:4 surfaces
-///   are exposed this way and the shader pulls Y from `.z`, U from
-///   `.y`, V from `.x`.
+///   Only the Linux dma-buf path for Yuv444 8-bit — VAAPI's 4:4:4
+///   8-bit surfaces are exposed this way and the shader pulls Y
+///   from `.z`, U from `.y`, V from `.x`. There is no 10-bit
+///   PackedXYUV path; Linux 10-bit 4:4:4 lands on Biplanar16
+///   instead.
 ///
-/// Adding a new `(chroma, backend)` combo means returning the right
-/// variant from [`render_layout_for`] and (if it's a third shape)
-/// wiring a new fragment shader.
+/// Adding a new `(chroma, bit_depth, backend)` combo means returning
+/// the right variant from [`render_layout_for`] and (if it's a third
+/// shape) wiring a new fragment shader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderLayout {
-    Biplanar,
+    Biplanar8,
+    Biplanar16,
     PackedXYUV,
 }
 
-fn render_layout_for(chroma: ChromaSubsampling) -> RenderLayout {
-    match chroma {
-        ChromaSubsampling::Yuv420 => RenderLayout::Biplanar,
-        // macOS gives us biplanar NV24 IOSurfaces for HEVC 4:4:4 via
-        // VideoToolbox; Linux gives us packed XYUV via VAAPI. The
-        // negotiated chroma is the same; the GPU-side shape is not.
-        ChromaSubsampling::Yuv444 => {
+fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> RenderLayout {
+    match (chroma, bit_depth) {
+        // 8-bit: existing macOS-IOSurface / Linux-dma-buf split. macOS
+        // gives biplanar NV12/NV24; Linux gives packed XYUV for 4:4:4
+        // and biplanar NV12 for 4:2:0.
+        (ChromaSubsampling::Yuv420, 8) => RenderLayout::Biplanar8,
+        (ChromaSubsampling::Yuv444, 8) => {
             if cfg!(target_os = "macos") {
-                RenderLayout::Biplanar
+                RenderLayout::Biplanar8
             } else {
                 RenderLayout::PackedXYUV
             }
+        }
+        // 10-bit: both platforms land on biplanar 16-bit. macOS receives
+        // `'P410'` (HEVC 4:4:4 10-bit decode) / `'xf44'` (SCK 4:4:4 10-bit
+        // capture) / `'P010'` (HEVC Main10 decode); Linux receives
+        // `DRM_FORMAT_P010`/`P410` dma-bufs. The 10-in-16 MSB-align
+        // applies uniformly.
+        (ChromaSubsampling::Yuv420 | ChromaSubsampling::Yuv444, 10) => {
+            RenderLayout::Biplanar16
+        }
+        // Anything we haven't enumerated (12-bit, future chroma) falls
+        // back to Biplanar16 with a warn — better than a panic; the
+        // import-side fourcc validation surfaces a clean error if the
+        // backend can't actually deliver that shape.
+        (chroma, bit_depth) => {
+            tracing::warn!(
+                ?chroma,
+                bit_depth,
+                "unrecognised (chroma, bit_depth); defaulting to Biplanar16"
+            );
+            RenderLayout::Biplanar16
         }
     }
 }
@@ -183,6 +233,7 @@ impl GpuState {
         window: Arc<Window>,
         color_space: VideoColorSpec,
         chroma: ChromaSubsampling,
+        bit_depth: u8,
     ) -> Result<Self> {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
@@ -323,12 +374,13 @@ impl GpuState {
         });
 
         // Bind-group layout depends on the renderer's plane shape, not
-        // directly on chroma — see `RenderLayout` for why. Biplanar
-        // (NV12 / NV24) has Y + UV textures + sampler at binding 2;
+        // directly on chroma — see `RenderLayout` for why. Biplanar8
+        // and Biplanar16 share a single bgl (R8/R16 + Rg8/Rg16 are all
+        // filterable-float-sampleable, so the bgl can stay format-blind);
         // PackedXYUV has one Rgba8 texture + sampler at binding 1.
-        let layout = render_layout_for(chroma);
+        let layout = render_layout_for(chroma, bit_depth);
         let yuv_bgl = match layout {
-            RenderLayout::Biplanar => {
+            RenderLayout::Biplanar8 | RenderLayout::Biplanar16 => {
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("tether-render yuv bgl (biplanar)"),
                     entries: &[
@@ -423,7 +475,8 @@ impl GpuState {
             mapped_at_creation: false,
         });
         let transfer_kind = transfer_kind_for(color_space);
-        let color_params: [u32; 4] = [transfer_kind, 0, 0, 0];
+        let luma_scale = luma_scale_for(bit_depth, layout);
+        let color_params: [u32; 4] = [transfer_kind, luma_scale.to_bits(), 0, 0];
         queue.write_buffer(&color_params_buffer, 0, &bytes_of_u32x4(&color_params));
         tracing::info!(
             matrix = ?color_space.matrix,
@@ -431,6 +484,8 @@ impl GpuState {
             transfer = ?color_space.transfer,
             primaries = ?color_space.primaries,
             transfer_kind,
+            bit_depth,
+            luma_scale,
             "renderer color spec applied"
         );
         let color_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -442,18 +497,23 @@ impl GpuState {
             }],
         });
 
-        // Shader matches the bind-group layout. Biplanar uses the
-        // chroma-resolution-agnostic Y+UV NV12 shader (works for NV12
-        // and NV24 alike — bilinear sampling is the same math at any
-        // UV resolution). PackedXYUV uses a separate shader that pulls
-        // Y/U/V from the channels of one Rgba8 sample.
+        // Shader matches the bind-group layout. Biplanar (8 or 16-bit)
+        // uses the chroma-resolution-agnostic Y+UV biplanar shader —
+        // works for NV12, NV24, P010, P410 alike since bilinear
+        // sampling is the same math at any UV resolution and the
+        // 10-in-16 MSB-align is normalised by `color_params.y`.
+        // PackedXYUV uses a separate shader that pulls Y/U/V from the
+        // channels of one Rgba8 sample.
         let shader_src = match layout {
-            RenderLayout::Biplanar => include_str!("../shader.wgsl"),
+            RenderLayout::Biplanar8 | RenderLayout::Biplanar16 => {
+                include_str!("../shader.wgsl")
+            }
             RenderLayout::PackedXYUV => include_str!("../shader_yuv444.wgsl"),
         };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(match layout {
-                RenderLayout::Biplanar => "tether-render shader (biplanar)",
+                RenderLayout::Biplanar8 => "tether-render shader (biplanar 8)",
+                RenderLayout::Biplanar16 => "tether-render shader (biplanar 16)",
                 RenderLayout::PackedXYUV => "tether-render shader (444 packed)",
             }),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
@@ -495,7 +555,8 @@ impl GpuState {
             cache: None,
         });
 
-        let textures = make_yuv_textures(&device, &yuv_bgl, &sampler, chroma, 1, 1);
+        let textures =
+            make_yuv_textures(&device, &yuv_bgl, &sampler, chroma, bit_depth, 1, 1);
 
         Ok(Self {
             surface,
@@ -505,6 +566,7 @@ impl GpuState {
             pipeline,
             yuv_bgl,
             chroma,
+            bit_depth,
             sampler,
             textures,
             retired: None,
@@ -557,14 +619,14 @@ impl GpuState {
         if frame.width == 0 || frame.height == 0 {
             return Ok(());
         }
-        // CPU upload path is NV12-only today — the only CPU producer
-        // (sw-decoded fallback in dmabuf_test) emits NV12. A YUV444
-        // CPU producer would need a CpuFrame variant change, not a
-        // patch here.
-        if self.chroma != ChromaSubsampling::Yuv420 {
+        // CPU upload path is NV12 8-bit only today — the only CPU
+        // producer (sw-decoded fallback in dmabuf_test) emits NV12. A
+        // YUV444 or 10-bit CPU producer would need a CpuFrame variant
+        // change, not a patch here.
+        if self.chroma != ChromaSubsampling::Yuv420 || self.bit_depth != 8 {
             return Err(crate::RenderError::DmaBufImport(format!(
-                "CPU upload path is NV12-only; session negotiated {:?}",
-                self.chroma
+                "CPU upload path is NV12 8-bit only; session negotiated {:?} {}-bit",
+                self.chroma, self.bit_depth,
             )));
         }
         // Two reasons to rebuild: the previous frame was DMA-BUF-imported
@@ -578,14 +640,15 @@ impl GpuState {
                 &self.yuv_bgl,
                 &self.sampler,
                 self.chroma,
+                self.bit_depth,
                 frame.width,
                 frame.height,
             );
             self.retire_textures(fresh);
         }
         let (chroma_w, chroma_h) = frame.chroma_dims();
-        let YuvPlanes::Nv12 { y, uv } = &self.textures.planes else {
-            unreachable!("guarded by chroma check above");
+        let YuvPlanes::Biplanar8 { y, uv } = &self.textures.planes else {
+            unreachable!("guarded by chroma + bit_depth check above");
         };
         // Y is R8 — one byte per texel, so bytes_per_row == width.
         // UV is Rg8 — two bytes per texel, so bytes_per_row == chroma_w * 2.
@@ -616,6 +679,7 @@ impl GpuState {
             &self.yuv_bgl,
             &self.sampler,
             self.chroma,
+            self.bit_depth,
             &dmabuf,
             frame.width,
             frame.height,
@@ -658,6 +722,7 @@ impl GpuState {
             &self.yuv_bgl,
             &self.sampler,
             self.chroma,
+            self.bit_depth,
             iosurface,
             frame.guard,
         )?;
@@ -818,22 +883,34 @@ fn make_yuv_textures(
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     chroma: ChromaSubsampling,
+    bit_depth: u8,
     width: u32,
     height: u32,
 ) -> YuvTextures {
-    match render_layout_for(chroma) {
-        RenderLayout::Biplanar => {
+    let render_layout = render_layout_for(chroma, bit_depth);
+    match render_layout {
+        RenderLayout::Biplanar8 | RenderLayout::Biplanar16 => {
+            let (y_format, uv_format) = match render_layout {
+                RenderLayout::Biplanar8 => {
+                    (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
+                }
+                RenderLayout::Biplanar16 => {
+                    (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
+                }
+                RenderLayout::PackedXYUV => unreachable!("guarded by outer match"),
+            };
             let y = make_plane_texture(
                 device,
                 "tether-render y plane",
                 width,
                 height,
-                wgpu::TextureFormat::R8Unorm,
+                y_format,
             );
             let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
-            // UV plane dims: half-res for NV12 (Yuv420), full-res for
-            // NV24 (Yuv444). The same Rg8 plane format works for both —
-            // bilinear sampling reads the right value at either size.
+            // UV plane dims: half-res for 4:2:0 (NV12/P010), full-res
+            // for 4:4:4 (NV24/P410/xf44). The Rg{8,16}Unorm plane works
+            // for either size — bilinear sampling reads the right value
+            // regardless.
             let (chroma_w, chroma_h) = match chroma {
                 ChromaSubsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
                 ChromaSubsampling::Yuv444 => (width, height),
@@ -843,7 +920,7 @@ fn make_yuv_textures(
                 "tether-render uv plane",
                 chroma_w,
                 chroma_h,
-                wgpu::TextureFormat::Rg8Unorm,
+                uv_format,
             );
             let uv_view = uv.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -864,8 +941,13 @@ fn make_yuv_textures(
                     },
                 ],
             });
+            let planes = match render_layout {
+                RenderLayout::Biplanar8 => YuvPlanes::Biplanar8 { y, uv },
+                RenderLayout::Biplanar16 => YuvPlanes::Biplanar16 { y, uv },
+                RenderLayout::PackedXYUV => unreachable!(),
+            };
             YuvTextures {
-                planes: YuvPlanes::Nv12 { y, uv },
+                planes,
                 bind_group,
                 size: (width, height),
                 _guard: None,
@@ -895,12 +977,43 @@ fn make_yuv_textures(
                 ],
             });
             YuvTextures {
-                planes: YuvPlanes::Yuv444 { packed },
+                planes: YuvPlanes::Yuv444Packed { packed },
                 bind_group,
                 size: (width, height),
                 _guard: None,
             }
         }
+    }
+}
+
+/// Scale factor the shader multiplies sampled Y/UV by to land 10-bit
+/// MSB-aligned data on the `[0, 1]` normalized range the existing
+/// limited-range expansion math expects.
+///
+/// 10-bit data stored in 16-bit cells uses bits `[15:6]` (MSB-aligned;
+/// the Apple `'P410'`/`'xf44'` IOSurface convention and the DRM
+/// `P010`/`P410` convention agree on this). The max 10-bit value
+/// `1023` ends up as the 16-bit integer `65472` in storage, and an
+/// `R16Unorm` sampler reads it as `65472 / 65535 ≈ 0.99904`. Without
+/// compensation the limited-range expansion lands just shy of white;
+/// multiplying by `65535 / 65472` puts the white point back at 1.0.
+///
+/// For 8-bit (or the PackedXYUV path where the shader is different
+/// entirely) the scale is `1.0` — multiplication by 1.0 is a single
+/// cheap shader instruction so the uniform is always written rather
+/// than branched on.
+///
+/// Approximation note: the limited-range *math* in `shader.wgsl` was
+/// derived from the 8-bit breakpoints (`16/255`, `235/255`). The
+/// idealised 10-bit breakpoints (`64/1023`, `940/1023`) differ by
+/// ≈0.3% in luminance scale. We accept that approximation — visible
+/// only as a sub-perceptual offset — until the renderer grows a
+/// bit-depth-parameterised range expansion (likely alongside HDR /
+/// wide-gamut work).
+fn luma_scale_for(bit_depth: u8, layout: RenderLayout) -> f32 {
+    match (bit_depth, layout) {
+        (10, RenderLayout::Biplanar16) => 65535.0 / 65472.0,
+        _ => 1.0,
     }
 }
 
@@ -971,8 +1084,77 @@ fn write_plane(
 
 #[cfg(test)]
 mod tests {
-    use super::{transfer_kind_for, TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB};
-    use tether_protocol::control::{ColorTransfer, VideoColorSpec};
+    use super::{
+        luma_scale_for, render_layout_for, transfer_kind_for, RenderLayout,
+        TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB,
+    };
+    use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
+
+    /// 10-bit MSB-aligned data lives in bits [15:6] of a 16-bit cell.
+    /// The max 10-bit value (1023) reads through an `R16Unorm` sampler
+    /// as `65472 / 65535`; the `luma_scale_for` factor must bring it
+    /// back to (within FP-rounding) 1.0 so the limited-range expansion
+    /// lands on the right breakpoint. This test is the cheap unit-level
+    /// pin on that contract; full shader correctness lives behind the
+    /// GPU-readback integration tests.
+    #[test]
+    fn luma_scale_normalises_msb_aligned_10_bit_max_to_one() {
+        let scale = luma_scale_for(10, RenderLayout::Biplanar16);
+        let sampler_max = 65472.0_f32 / 65535.0_f32;
+        let normalised = sampler_max * scale;
+        // 1e-6 tolerance: scale is exactly 65535/65472, sampler max is
+        // 65472/65535, so the product is exactly 1.0 in real arithmetic
+        // but f32 round-off can shave a few ulps. 1 ppm covers that
+        // without admitting any systemic drift.
+        assert!(
+            (normalised - 1.0).abs() < 1e-6,
+            "10-bit max should normalise to 1.0; got {normalised}"
+        );
+    }
+
+    /// 8-bit profiles must keep their existing 1.0 scale so the
+    /// fragment shader's `* luma_scale` multiply is a no-op for them.
+    /// Without this pin, a future refactor that always returns the
+    /// 10-bit scale would silently push every 8-bit white point slightly
+    /// past 1.0.
+    #[test]
+    fn luma_scale_is_identity_for_8_bit_paths() {
+        assert_eq!(luma_scale_for(8, RenderLayout::Biplanar8), 1.0);
+        assert_eq!(luma_scale_for(8, RenderLayout::PackedXYUV), 1.0);
+    }
+
+    /// `render_layout_for` dispatch table — pinned so the (chroma,
+    /// bit_depth) → RenderLayout mapping doesn't drift without an
+    /// explicit test update. The macOS branch for Yuv444 8-bit is
+    /// covered indirectly by the cfg switch in the function; this
+    /// test runs whichever side the build is on.
+    #[test]
+    fn render_layout_dispatch_pins_the_mapping() {
+        // 8-bit baseline.
+        assert_eq!(
+            render_layout_for(ChromaSubsampling::Yuv420, 8),
+            RenderLayout::Biplanar8
+        );
+        let yuv444_8bit = render_layout_for(ChromaSubsampling::Yuv444, 8);
+        if cfg!(target_os = "macos") {
+            assert_eq!(yuv444_8bit, RenderLayout::Biplanar8);
+        } else {
+            assert_eq!(yuv444_8bit, RenderLayout::PackedXYUV);
+        }
+        // 10-bit: both chroma subsamplings land on biplanar 16. Pin
+        // both explicitly so a future refactor that splits these into
+        // separate variants (e.g. PackedXVYU2101010) fails here.
+        assert_eq!(
+            render_layout_for(ChromaSubsampling::Yuv420, 10),
+            RenderLayout::Biplanar16,
+            "Yuv420 10-bit must dispatch to Biplanar16; the renderer's import \
+             path relies on this for UV-plane dimensioning"
+        );
+        assert_eq!(
+            render_layout_for(ChromaSubsampling::Yuv444, 10),
+            RenderLayout::Biplanar16
+        );
+    }
 
     /// Pins the Rust→shader integer mapping so a refactor that
     /// renumbers the WGSL constants (or reorders the Rust match

@@ -224,7 +224,7 @@ impl VideoToolboxEncoder {
             }
         }
 
-        let scaler_label = vt_scaler_label(sw_format);
+        let scaler_label = crate::encoder_common::pix_fmt_scaler_label(sw_format);
         let mut bgra_to_sw = SwsContext::get_context(
             width_i32,
             height_i32,
@@ -582,17 +582,4 @@ fn vt_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
     })
 }
 
-/// Static debug label for `CodecError::ScalerInit`, keyed off the
-/// destination `sw_format`. Tiny match because `ScalerInit` wants a
-/// `&'static str`; the alternative is heap-allocating per call which
-/// hides the (rare) probe failure in the allocator.
-fn vt_scaler_label(sw_format: i32) -> &'static str {
-    match sw_format {
-        x if x == ffi::AV_PIX_FMT_NV12 => "BGRA -> NV12",
-        x if x == ffi::AV_PIX_FMT_P010LE => "BGRA -> P010",
-        x if x == ffi::AV_PIX_FMT_NV24 => "BGRA -> NV24",
-        x if x == ffi::AV_PIX_FMT_P410LE => "BGRA -> P410",
-        _ => "BGRA -> sw_format",
-    }
-}
 

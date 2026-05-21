@@ -322,7 +322,7 @@ impl VaapiEncoder {
             }
         }
 
-        let scaler_label = vaapi_scaler_label(sw_format);
+        let scaler_label = crate::encoder_common::pix_fmt_scaler_label(sw_format);
         let bgra_to_encoder_input = SwsContext::get_context(
             width_i32,
             height_i32,
@@ -798,17 +798,4 @@ fn vaapi_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
     })
 }
 
-/// Static debug label for `CodecError::ScalerInit`, keyed off the
-/// destination `sw_format`. Match arms are exhaustive against
-/// `vaapi_sw_format`'s outputs; the fallback covers a future
-/// `vaapi_sw_format` addition that hasn't reached this table.
-fn vaapi_scaler_label(sw_format: i32) -> &'static str {
-    match sw_format {
-        x if x == ffi::AV_PIX_FMT_NV12 => "BGRA -> NV12",
-        x if x == ffi::AV_PIX_FMT_P010LE => "BGRA -> P010",
-        x if x == ffi::AV_PIX_FMT_VUYX => "BGRA -> VUYX",
-        x if x == ffi::AV_PIX_FMT_XV30LE => "BGRA -> XV30",
-        _ => "BGRA -> sw_format",
-    }
-}
 

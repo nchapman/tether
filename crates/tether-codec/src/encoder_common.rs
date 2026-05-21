@@ -97,3 +97,50 @@ pub(crate) fn snapshot_extradata(encoder: &AVCodecContext, codec_name: &str) -> 
     }
     Ok(extradata)
 }
+
+/// Static debug label for `CodecError::ScalerInit`, keyed off the
+/// destination `AVPixelFormat`. Shared between every hardware backend
+/// so the table stays in one place — VAAPI's `vaapi_sw_format` and
+/// VideoToolbox's `vt_sw_format` both feed their outputs here. Falls
+/// back to a generic label for a future `*_sw_format` addition that
+/// hasn't reached this table yet (the fallback keeps `ScalerInit` a
+/// `&'static str` instead of a heap-allocating per-call format).
+pub(crate) fn pix_fmt_scaler_label(sw_format: i32) -> &'static str {
+    match sw_format {
+        x if x == ffi::AV_PIX_FMT_NV12 => "BGRA -> NV12",
+        x if x == ffi::AV_PIX_FMT_P010LE => "BGRA -> P010",
+        x if x == ffi::AV_PIX_FMT_NV24 => "BGRA -> NV24",
+        x if x == ffi::AV_PIX_FMT_P410LE => "BGRA -> P410",
+        x if x == ffi::AV_PIX_FMT_VUYX => "BGRA -> VUYX",
+        x if x == ffi::AV_PIX_FMT_XV30LE => "BGRA -> XV30",
+        _ => "BGRA -> sw_format",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pix_fmt_scaler_label_covers_every_sw_format_in_use() {
+        // Every format any `*_sw_format` function in the codec backends
+        // returns must produce a specific label — not the generic
+        // fallback. If you add a new sw_format to a backend, add the
+        // case here too.
+        for (fmt, expected) in [
+            (ffi::AV_PIX_FMT_NV12, "BGRA -> NV12"),
+            (ffi::AV_PIX_FMT_P010LE, "BGRA -> P010"),
+            (ffi::AV_PIX_FMT_NV24, "BGRA -> NV24"),
+            (ffi::AV_PIX_FMT_P410LE, "BGRA -> P410"),
+            (ffi::AV_PIX_FMT_VUYX, "BGRA -> VUYX"),
+            (ffi::AV_PIX_FMT_XV30LE, "BGRA -> XV30"),
+        ] {
+            assert_eq!(pix_fmt_scaler_label(fmt), expected);
+        }
+    }
+
+    #[test]
+    fn pix_fmt_scaler_label_falls_back_for_unknown_format() {
+        assert_eq!(pix_fmt_scaler_label(-1), "BGRA -> sw_format");
+    }
+}

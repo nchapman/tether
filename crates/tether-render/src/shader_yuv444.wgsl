@@ -1,9 +1,21 @@
-// YUV 4:4:4 planar fragment shader.
+// YUV 4:4:4 packed fragment shader.
 //
 // Sibling of `shader.wgsl` for sessions that negotiate HEVC Main444.
-// Decoded surfaces arrive as three full-resolution R8 planes (Y/U/V)
-// — no chroma subsampling — so the fragment path samples three
-// single-channel textures instead of NV12's one R8 + one Rg8.
+// Decoded surfaces arrive as packed XYUV (DRM_FORMAT_XYUV8888 /
+// VA_FOURCC_XYUV): one Rgba8Unorm-shaped texture, 32 bpp, memory
+// byte order [V, U, Y, X]. Reading via wgpu's R8G8B8A8_UNORM mapping:
+//
+//   .r = byte 0 = V
+//   .g = byte 1 = U
+//   .b = byte 2 = Y
+//   .a = byte 3 = X (don't-care)
+//
+// Why packed (not planar): ffmpeg's `vaapi_drm_format_map` has no
+// entry for planar YUV444P over DRM_PRIME — `vaExportSurfaceHandle`
+// on a 4:4:4 surface in production returns the packed XYUV shape
+// regardless. The encoder side feeds the same packed format via
+// gpuconvert's BGRA→XYUV compute pass; see
+// `crates/tether-gpuconvert/src/dmabuf_export/shared_yuv444.rs`.
 //
 // The Range / Matrix / EOTF pipeline is identical to the NV12 sibling;
 // only the SAMPLE step changes. Keep the matrix and EOTF constants in
@@ -42,10 +54,8 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
-@group(0) @binding(0) var y_tex: texture_2d<f32>;
-@group(0) @binding(1) var u_tex: texture_2d<f32>;
-@group(0) @binding(2) var v_tex: texture_2d<f32>;
-@group(0) @binding(3) var s: sampler;
+@group(0) @binding(0) var packed_tex: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
 
 @group(2) @binding(0) var<uniform> color_params: vec4<u32>;
 const TRANSFER_KIND_BT709: u32 = 0u;
@@ -107,9 +117,11 @@ fn apply_eotf(rgb_gamma: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let y_lim = textureSample(y_tex, s, in.uv).r;
-    let u_lim = textureSample(u_tex, s, in.uv).r;
-    let v_lim = textureSample(v_tex, s, in.uv).r;
+    // XYUV8888 byte order V, U, Y, X → Rgba8 .rgba.
+    let p = textureSample(packed_tex, s, in.uv);
+    let y_lim = p.b;
+    let u_lim = p.g;
+    let v_lim = p.r;
 
     let y = limited_y_to_normalized(y_lim);
     let u = limited_c_to_normalized(u_lim);

@@ -29,5 +29,16 @@ rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a2002567
 [target.'cfg(target_os = "linux")'.dependencies]
 tether-vaapi = { workspace = true }
 
+# Hardware-gated round-trip tests need a real gpuconvert bridge to
+# produce the dma-buf descriptor shape the encoder expects (XYUV for
+# 4:4:4, NV12 for 4:2:0). Test-only — production code paths don't
+# depend on gpuconvert from inside tether-codec.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tether-gpuconvert = { workspace = true }
+# wgpu pinned to the same trunk SHA used elsewhere in the workspace.
+# Test-only; production tether-codec doesn't link wgpu.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["vulkan"] }
+pollster = "0.4"
+
 [lints]
 workspace = true

@@ -38,12 +38,9 @@ pub(crate) struct YuvTextures {
 pub(crate) enum YuvPlanes {
     /// NV12: full-res R8 Y plus half-res Rg8 UV (interleaved chroma).
     Nv12 { y: wgpu::Texture, uv: wgpu::Texture },
-    /// YUV444P: three full-res R8 planes (planar, no subsampling).
-    Yuv444 {
-        y: wgpu::Texture,
-        u: wgpu::Texture,
-        v: wgpu::Texture,
-    },
+    /// XYUV8888 packed 4:4:4: one Rgba8 texture, byte order V/U/Y/X.
+    /// See `shader_yuv444.wgsl` for why packed instead of planar.
+    Yuv444 { packed: wgpu::Texture },
 }
 
 pub(crate) struct GpuState {
@@ -257,13 +254,11 @@ impl GpuState {
             }
             ChromaSubsampling::Yuv444 => {
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("tether-render yuv bgl (444)"),
+                    label: Some("tether-render yuv bgl (444 packed)"),
                     entries: &[
                         bgl_texture_entry(0),
-                        bgl_texture_entry(1),
-                        bgl_texture_entry(2),
                         wgpu::BindGroupLayoutEntry {
-                            binding: 3,
+                            binding: 1,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler(
                                 wgpu::SamplerBindingType::Filtering,
@@ -696,16 +691,16 @@ fn make_yuv_textures(
     width: u32,
     height: u32,
 ) -> YuvTextures {
-    let y = make_plane_texture(
-        device,
-        "tether-render y plane",
-        width,
-        height,
-        wgpu::TextureFormat::R8Unorm,
-    );
-    let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
     match chroma {
         ChromaSubsampling::Yuv420 => {
+            let y = make_plane_texture(
+                device,
+                "tether-render y plane",
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            );
+            let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
             let chroma_w = width.div_ceil(2);
             let chroma_h = height.div_ceil(2);
             let uv = make_plane_texture(
@@ -742,46 +737,30 @@ fn make_yuv_textures(
             }
         }
         ChromaSubsampling::Yuv444 => {
-            let u = make_plane_texture(
+            let packed = make_plane_texture(
                 device,
-                "tether-render u plane (444)",
+                "tether-render xyuv packed (444)",
                 width,
                 height,
-                wgpu::TextureFormat::R8Unorm,
+                wgpu::TextureFormat::Rgba8Unorm,
             );
-            let v = make_plane_texture(
-                device,
-                "tether-render v plane (444)",
-                width,
-                height,
-                wgpu::TextureFormat::R8Unorm,
-            );
-            let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
-            let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
+            let packed_view = packed.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tether-render yuv bind group (444)"),
+                label: Some("tether-render yuv bind group (444 packed)"),
                 layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&y_view),
+                        resource: wgpu::BindingResource::TextureView(&packed_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&u_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&v_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
                         resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
             });
             YuvTextures {
-                planes: YuvPlanes::Yuv444 { y, u, v },
+                planes: YuvPlanes::Yuv444 { packed },
                 bind_group,
                 size: (width, height),
                 _guard: None,

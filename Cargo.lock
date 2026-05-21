@@ -3259,11 +3259,14 @@ name = "tether-codec"
 version = "0.0.1"
 dependencies = [
  "crossbeam-channel",
+ "pollster",
  "rsmpeg",
+ "tether-gpuconvert",
  "tether-protocol",
  "tether-vaapi",
  "thiserror 2.0.18",
  "tracing",
+ "wgpu",
 ]
 
 [[package]]

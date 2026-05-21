@@ -112,14 +112,17 @@ fn import_nv12(
     })
 }
 
-/// VAAPI exports a Main444 surface in one of two shapes depending on
-/// the driver. `VA_EXPORT_SURFACE_SEPARATE_LAYERS` is a *hint* — the
-/// libva spec lets drivers ignore it. Intel media-driver and current
-/// mesa honor it and return three R8 layers (Y / U / V), one plane
-/// per layer. Other drivers (older mesa, nvidia-vaapi-driver) return
-/// one layer with the aggregate DRM_FORMAT_YUV444 fourcc and three
-/// plane offsets within it. We accept either; rejecting the latter
-/// would break otherwise-valid streams from those decoders.
+/// VAAPI exports a Main444 surface as a single packed XYUV layer:
+/// one DRM object, one layer with fourcc `XYUV` (DRM_FORMAT_XYUV8888),
+/// one plane (32 bpp, byte order V/U/Y/X). Confirmed on Intel
+/// media-driver via the `hevc_main444_dmabuf_roundtrip` hardware
+/// test in `tether-codec/src/vaapi/tests.rs`.
+///
+/// Planar YUV444P is *not* a possible shape on this codepath:
+/// ffmpeg's `vaapi_drm_format_map` has no DRM_PRIME entry for
+/// planar 4:4:4 8-bit, so libavcodec returns the packed XYUV form
+/// regardless of how the driver allocated the surface internally.
+/// (See `bgra_to_yuv444.wgsl` for the matching encoder-side rationale.)
 fn import_yuv444(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -129,128 +132,52 @@ fn import_yuv444(
     height: u32,
     guard: GpuFrameGuard,
 ) -> Result<YuvTextures> {
-    let (y, u, v) = match dmabuf.layers.len() {
-        3 => {
-            // Three R8 layers, one plane each — the SEPARATE_LAYERS
-            // path. Sanity-check that each layer is actually a single
-            // R8 plane; multi-plane layers here would be an unrelated
-            // export shape we'd want to fall through into the 1-layer
-            // path for.
-            for (i, l) in dmabuf.layers.iter().enumerate() {
-                if l.num_planes != 1 {
-                    return Err(RenderError::DmaBufImport(format!(
-                        "YUV444 SEPARATE_LAYERS: layer {i} has {} planes; expected 1",
-                        l.num_planes
-                    )));
-                }
-            }
-            let y = import_one_layer(
-                device,
-                "tether-render y plane (dmabuf 444 separate)",
-                dmabuf,
-                0,
-                width,
-                height,
-                wgpu::TextureFormat::R8Unorm,
-            )?;
-            let u = import_one_layer(
-                device,
-                "tether-render u plane (dmabuf 444 separate)",
-                dmabuf,
-                1,
-                width,
-                height,
-                wgpu::TextureFormat::R8Unorm,
-            )?;
-            let v = import_one_layer(
-                device,
-                "tether-render v plane (dmabuf 444 separate)",
-                dmabuf,
-                2,
-                width,
-                height,
-                wgpu::TextureFormat::R8Unorm,
-            )?;
-            (y, u, v)
-        }
-        1 => {
-            // Single layer carrying three plane offsets within one
-            // DRM object — the COMPOSED form the libva spec allows
-            // even with SEPARATE_LAYERS requested. This is also the
-            // shape the encoder side produces (see
-            // `yuv444_dmabuf_to_codec_frame` in apps/tether-host).
-            let layer = &dmabuf.layers[0];
-            if layer.num_planes != 3 {
-                return Err(RenderError::DmaBufImport(format!(
-                    "YUV444 single-layer: expected 3 planes, got {}",
-                    layer.num_planes
-                )));
-            }
-            let y = import_one_plane(
-                device,
-                "tether-render y plane (dmabuf 444 composed)",
-                dmabuf,
-                0,
-                0,
-                width,
-                height,
-                wgpu::TextureFormat::R8Unorm,
-            )?;
-            let u = import_one_plane(
-                device,
-                "tether-render u plane (dmabuf 444 composed)",
-                dmabuf,
-                0,
-                1,
-                width,
-                height,
-                wgpu::TextureFormat::R8Unorm,
-            )?;
-            let v = import_one_plane(
-                device,
-                "tether-render v plane (dmabuf 444 composed)",
-                dmabuf,
-                0,
-                2,
-                width,
-                height,
-                wgpu::TextureFormat::R8Unorm,
-            )?;
-            (y, u, v)
-        }
-        n => {
-            return Err(RenderError::DmaBufImport(format!(
-                "YUV444 dma-buf has {n} layers; expected 3 (separate) or 1 (composed)"
-            )));
-        }
-    };
-    let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
-    let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
-    let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
+    if dmabuf.layers.len() != 1 {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444 dma-buf has {} layers; expected 1 (packed XYUV)",
+            dmabuf.layers.len()
+        )));
+    }
+    let layer = &dmabuf.layers[0];
+    if layer.num_planes != 1 {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444 packed layer should have 1 plane, got {}",
+            layer.num_planes
+        )));
+    }
+    let expected_fourcc = u32::from_le_bytes(*b"XYUV");
+    if layer.drm_format != expected_fourcc {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444 layer fourcc 0x{:08x} != expected XYUV (0x{:08x})",
+            layer.drm_format, expected_fourcc
+        )));
+    }
+    let packed = import_one_layer(
+        device,
+        "tether-render xyuv packed (dmabuf 444)",
+        dmabuf,
+        0,
+        width,
+        height,
+        wgpu::TextureFormat::Rgba8Unorm,
+    )?;
+    let packed_view = packed.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tether-render yuv bind group (dmabuf 444)"),
+        label: Some("tether-render yuv bind group (dmabuf 444 packed)"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&y_view),
+                resource: wgpu::BindingResource::TextureView(&packed_view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&u_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&v_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
         ],
     });
     Ok(YuvTextures {
-        planes: YuvPlanes::Yuv444 { y, u, v },
+        planes: YuvPlanes::Yuv444 { packed },
         bind_group,
         size: (width, height),
         _guard: Some(guard),

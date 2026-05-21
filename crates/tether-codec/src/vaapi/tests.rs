@@ -203,11 +203,180 @@ fn hevc_main444_encoder_constructs() {
         8_000,
     )
     .expect("HEVC Main444 encoder construction");
-    // BGRA → YUV444P swscale path must also succeed end-to-end. A
+    // BGRA → VUYX swscale path must also succeed end-to-end. A
     // mid-grey frame is enough; we don't validate fidelity here —
-    // that's the round-trip integration test in dmabuf_test.
+    // that's the round-trip integration test below.
     let bgra = vec![0x80u8; (w * h * 4) as usize];
     let _ = enc.encode_bgra(&bgra, 0, true).expect("encode 1 frame");
+}
+
+/// Full BGRA → gpuconvert (XYUV dma-buf) → VAAPI encoder → VAAPI
+/// decoder → DMA-BUF export round-trip for HEVC Main444.
+///
+/// This is the test that should have existed before the loopback
+/// test green-screen. It exercises every layer the production hot
+/// path touches for 4:4:4 specifically:
+///
+/// 1. `Yuv444DmaBuf` bridge constructs (gpuconvert wgpu device +
+///    feature negotiation works).
+/// 2. Compute pass writes a valid XYUV dma-buf.
+/// 3. `VaapiEncoder::submit_dmabuf` accepts the XYUV layer — i.e.
+///    ffmpeg's `vaapi_drm_format_map` actually has a path for our
+///    DRM_FORMAT_XYUV8888 descriptor (the original bug was that the
+///    map had no entry for the planar `YU24` we'd been emitting).
+/// 4. The encoder produces a HEVC Main 4:4:4 bitstream.
+/// 5. `VaapiDecoder` accepts that bitstream and emits a frame.
+/// 6. The decoded surface is exportable as a DMA-BUF (catches the
+///    symmetric ffmpeg gap on the decode side — if `vaExportSurfaceHandle`
+///    can't represent the 444 surface as DRM_PRIME, the production
+///    client would see frame drops without any actionable diagnostic).
+///
+/// Test pattern is a mid-grey solid because we care about
+/// "does the pipeline run end-to-end?", not chroma fidelity (that's
+/// covered by gpuconvert's own packed-XYUV round-trip test).
+#[test]
+#[ignore = "requires VAAPI HEVC Main444 + Vulkan DMA-BUF export"]
+fn hevc_main444_dmabuf_roundtrip() {
+    use crate::{DmaBufFrame, DmaBufLayer, DmaBufObject};
+    use tether_gpuconvert::Yuv444DmaBuf;
+    use tether_protocol::control::VideoProfile;
+
+    // 128×128 is the encoder's minimum-block floor (the same number
+    // probe_encoder_kind uses). Small enough for the test to be
+    // cheap, large enough that the encoder doesn't reject dims.
+    let w = 128u32;
+    let h = 128u32;
+
+    let bridge = match pollster::block_on(Yuv444DmaBuf::new(w, h)) {
+        Ok(b) => b,
+        Err(e) => {
+            // No Vulkan dma-buf device on this box → skip, don't
+            // fail. The ignore tag already gates the test on
+            // hardware presence; this is the secondary gate for
+            // adapters that don't expose the export feature.
+            eprintln!("SKIP: Yuv444DmaBuf::new failed: {e}");
+            return;
+        }
+    };
+
+    // Build a BGRA source texture on the bridge's device (same
+    // Vulkan instance as the compute pipeline) and fill it with mid-
+    // grey. We don't need a fancy gradient — we're testing the
+    // pipeline plumbing, not chroma fidelity.
+    let src = bridge
+        .device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("test bgra mid-grey"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+    let n = (w * h) as usize;
+    let bgra = vec![0x80u8; n * 4];
+    bridge.queue().write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &src,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bgra,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let mut enc = VaapiEncoder::new(VideoProfile::HEVC_8BIT_444, w, h, 30, 8_000)
+        .expect("VAAPI HEVC Main444 encoder");
+    let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::Hevc)
+        .expect("VAAPI HEVC decoder");
+
+    // Push 8 frames so the encoder can emit at least one IDR plus a
+    // P-frame chain — the decoder usually needs a couple of frames
+    // of latency before it produces output. Re-using the same BGRA
+    // buffer is fine; we're testing plumbing.
+    let mut got_decoded = false;
+    for t in 0..8i64 {
+        let bridge_frame = bridge.convert(&src).expect("bridge.convert");
+        // Build the codec-side DmaBufFrame the same way
+        // apps/tether-host does. Duplicates `yuv444_dmabuf_to_codec_frame`
+        // — kept inline so this test stays in tether-codec without a
+        // dep on the host binary.
+        let codec_frame = DmaBufFrame {
+            fourcc: u32::from_le_bytes(*b"XYUV"),
+            objects: vec![DmaBufObject {
+                fd: bridge_frame.fd,
+                size: bridge_frame.size,
+                drm_format_modifier: bridge_frame.modifier,
+            }],
+            layers: vec![DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"XYUV"),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(bridge_frame.offset).expect("offset fits"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(bridge_frame.stride).expect("stride fits"),
+                    0,
+                    0,
+                    0,
+                ],
+            }],
+        };
+        let packets = enc
+            .submit_dmabuf(&codec_frame, t, t == 0)
+            .expect("submit_dmabuf");
+        for p in packets {
+            assert!(!p.data.is_empty(), "encoded packet must not be empty");
+            dec.submit(&p.data).expect("decoder submit");
+            while let Some(f) = dec.next_frame().expect("decoder next_frame") {
+                let Frame::Gpu(g) = f else {
+                    panic!("VaapiDecoder must emit Gpu frames for Main444");
+                };
+                let GpuFrameSource::DmaBuf(dmabuf) = g.source;
+                assert_eq!(g.width, w);
+                assert_eq!(g.height, h);
+                // Whatever DMA-BUF shape the driver picks, log it so
+                // a future driver shift (e.g. Intel changing the
+                // export form) shows up in test output rather than
+                // silently breaking the renderer's `import_yuv444`
+                // dispatcher.
+                eprintln!(
+                    "decoded 4:4:4 surface exported: fourcc=0x{:08x} layers={} planes_per_layer={:?}",
+                    dmabuf.fourcc,
+                    dmabuf.layers.len(),
+                    dmabuf.layers.iter().map(|l| l.num_planes).collect::<Vec<_>>(),
+                );
+                got_decoded = true;
+            }
+        }
+        if got_decoded {
+            break;
+        }
+    }
+    assert!(
+        got_decoded,
+        "decoder must emit at least one 4:4:4 frame within 8 input frames"
+    );
 }
 
 #[test]

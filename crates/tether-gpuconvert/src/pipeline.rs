@@ -10,19 +10,19 @@
 
 pub(crate) const SHADER_SRC: &str = include_str!("bgra_to_nv12.wgsl");
 
-// YUV444 / P010 / P410 pipelines are intentionally unused
-// scaffolding: the production `Nv12DmaBuf` / `Yuv444DmaBuf` bridges
-// are 8-bit-only, and 10-bit production goes live when the
-// gpuconvert P010/P410 → encoder bridge wires up (see
-// `tether-codec::vaapi::probe::probe_encode`'s temporary
-// `bit_depth != 8` gate for the matching half). The shader source
-// is `include_str!`'d so a syntactic regression in the WGSL gets
-// caught at build time regardless. Don't delete these as part of
-// a tidy-unused sweep — see the FIXME on `build_biplanar_16_pipeline`
-// for the wiring plan.
+// YUV444 (8-bit) is scaffolding kept alive for an as-yet-unwired Linux
+// 4:4:4 8-bit path through `Yuv444DmaBuf`. P010 (10-bit 4:2:0) is live
+// via [`crate::Bgra2P010DmaBuf`] — `build_p010_pipeline` is no longer
+// dead. P410 (10-bit 4:4:4 biplanar) is intentionally still dead on
+// Linux: VAAPI's `vaapi_drm_format_map` has no P410 entry, so the
+// encoder takes `AV_PIX_FMT_XV30LE` (packed) for 4:4:4 10-bit input —
+// not biplanar. The biplanar shader stays in-tree because it covers
+// the macOS render-side IOSurface fourcc `'P410'`; an eventual macOS
+// gpuconvert-equivalent or a future driver that *does* accept P410
+// would revive it. `include_str!` validates the WGSL syntax at build
+// time regardless.
 #[allow(dead_code)]
 pub(crate) const YUV444_SHADER_SRC: &str = include_str!("bgra_to_yuv444.wgsl");
-#[allow(dead_code)]
 pub(crate) const P010_SHADER_SRC: &str = include_str!("bgra_to_p010.wgsl");
 #[allow(dead_code)]
 pub(crate) const P410_SHADER_SRC: &str = include_str!("bgra_to_p410.wgsl");
@@ -155,13 +155,12 @@ pub(crate) fn build_yuv444_pipeline(
 
 /// Build the BGRA → P010 (10-bit biplanar 4:2:0) compute pipeline and
 /// its bind-group layout. Y plane is `R16Unorm`, UV plane is `Rg16Unorm`,
-/// both half-resolution UV (4:2:0). 10-bit data is MSB-aligned in the
+/// half-resolution UV (4:2:0). 10-bit data is MSB-aligned in the
 /// 16-bit cells — see `bgra_to_p010.wgsl` for the encoding.
 ///
-/// This pipeline is wired but not yet plumbed into a public API path;
-/// the production `Nv12DmaBuf` bridge stays 8-bit until the rest of
-/// the 10-bit stack (probe → renderer → wire) catches up.
-#[allow(dead_code)] // scaffolding; see module-level P010_SHADER_SRC comment
+/// Live via [`crate::Bgra2P010DmaBuf`]. Callers MUST first gate on
+/// [`crate::storable_dmabuf_modifiers`] for `R16` + `GR32` — see the
+/// rationale on [`build_biplanar_16_pipeline`].
 pub(crate) fn build_p010_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
@@ -174,8 +173,14 @@ pub(crate) fn build_p010_pipeline(
 
 /// Build the BGRA → P410 (10-bit biplanar 4:4:4) compute pipeline.
 /// Same plane formats as P010 but full-resolution UV; see
-/// `bgra_to_p410.wgsl`. Plumbing status mirrors P010.
-#[allow(dead_code)] // scaffolding; see module-level P410_SHADER_SRC comment
+/// `bgra_to_p410.wgsl`.
+///
+/// Not wired into any Linux production path — VAAPI's
+/// `vaapi_drm_format_map` has no P410 entry, so 4:4:4 10-bit encode
+/// input takes packed XV30 instead. This builder is kept for an
+/// eventual macOS gpuconvert-equivalent path that does want biplanar
+/// 10-bit 4:4:4 (IOSurface fourcc `'P410'`).
+#[allow(dead_code)] // see module-level comment on P410_SHADER_SRC
 pub(crate) fn build_p410_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
@@ -191,18 +196,14 @@ pub(crate) fn build_p410_pipeline(
 /// have an R16 Y plane + Rg16 UV plane); only the shader's per-pixel
 /// math + the runtime dispatch dims differ.
 ///
-/// FIXME(10-bit storage feature gating): `R16Unorm` /
-/// `Rg16Unorm` as compute storage outputs require the Vulkan format
-/// feature flag `STORAGE_IMAGE_BIT` on the chosen `VkFormat`. The
-/// existing `importable_dmabuf_modifiers` probe filters on
-/// `SAMPLED_IMAGE` — that doesn't cover the storage write the
-/// compute shader does here. Some drivers expose 16-bit unorm as
+/// Storage-feature gating: `R16Unorm` / `Rg16Unorm` as compute storage
+/// outputs require the Vulkan format feature flag `STORAGE_IMAGE_BIT`
+/// on the chosen `VkFormat`. Some drivers expose 16-bit unorm as
 /// sampleable but not as storage-writable; on those, this pipeline
-/// will fail at `create_compute_pipeline` (or worse, produce
-/// validation errors at draw time). Adding a `STORAGE_IMAGE` probe
-/// in `modifier_query.rs` is the right gate to put in front of
-/// these pipelines before they go live.
-#[allow(dead_code)] // scaffolding; see module-level YUV444_SHADER_SRC comment
+/// would fail at `create_compute_pipeline`. The
+/// [`crate::storable_dmabuf_modifiers`] probe is the gate — callers
+/// invoke it before constructing the bridge (see
+/// [`crate::Bgra2P010DmaBuf::new`] for the live wiring).
 fn build_biplanar_16_pipeline(
     device: &wgpu::Device,
     label: &'static str,

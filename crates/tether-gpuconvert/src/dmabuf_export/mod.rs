@@ -25,6 +25,7 @@ use std::os::fd::OwnedFd;
 use ash::vk;
 
 mod shared_nv12;
+mod shared_p010;
 mod shared_yuv444;
 mod single;
 
@@ -32,6 +33,7 @@ mod single;
 mod tests;
 
 pub use shared_nv12::{export_nv12_shared_dmabuf, SharedNv12Export};
+pub use shared_p010::{export_p010_shared_dmabuf, SharedP010Export};
 pub use shared_yuv444::{export_yuv444_shared_dmabuf, SharedYuv444Export};
 pub use single::export_texture_as_dmabuf;
 
@@ -123,12 +125,15 @@ pub(super) fn find_memory_type(
 }
 
 /// Translate the wgpu texture formats we export to their Vulkan
-/// equivalents. Small fixed set — we only export single-plane Y/UV
-/// for NV12, plus BGRA8 for round-trip tests. New formats add here.
+/// equivalents. Small fixed set — single-plane Y/UV in 8 and 10 bit
+/// flavours (NV12 / P010) plus BGRA8 for round-trip tests. New formats
+/// add here.
 pub(super) fn wgpu_format_to_vk(f: wgpu::TextureFormat) -> Result<vk::Format> {
     match f {
         wgpu::TextureFormat::R8Unorm => Ok(vk::Format::R8_UNORM),
         wgpu::TextureFormat::Rg8Unorm => Ok(vk::Format::R8G8_UNORM),
+        wgpu::TextureFormat::R16Unorm => Ok(vk::Format::R16_UNORM),
+        wgpu::TextureFormat::Rg16Unorm => Ok(vk::Format::R16G16_UNORM),
         wgpu::TextureFormat::Bgra8Unorm => Ok(vk::Format::B8G8R8A8_UNORM),
         _ => Err(ExportError::UnsupportedFormat(f)),
     }

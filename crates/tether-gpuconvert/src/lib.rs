@@ -29,6 +29,8 @@
 //!   Small, focused, easy to test in isolation.
 
 #[cfg(target_os = "linux")]
+pub mod bgra_to_p010_dmabuf;
+#[cfg(target_os = "linux")]
 pub mod dmabuf_export;
 #[cfg(target_os = "linux")]
 pub mod modifier_query;
@@ -38,6 +40,8 @@ pub mod nv12_dmabuf;
 pub mod yuv444_dmabuf;
 mod pipeline;
 
+#[cfg(target_os = "linux")]
+pub use bgra_to_p010_dmabuf::{Bgra2P010DmaBuf, P010DmaBufError, P010DmaBufFrame};
 #[cfg(target_os = "linux")]
 pub use dmabuf_export::{
     export_texture_as_dmabuf, DmaBufExport, ExportError, DRM_FORMAT_MOD_LINEAR,

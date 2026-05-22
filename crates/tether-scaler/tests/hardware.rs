@@ -17,8 +17,9 @@
 
 use std::sync::Arc;
 
+use half::f16;
 use tether_scaler::reference;
-use tether_scaler::{Pipelines, Scaler, ScalerError};
+use tether_scaler::{ColorSpace, Pipelines, Scaler, ScalerError};
 use wgpu::util::DeviceExt;
 
 /// Build a wgpu device for tests. No special features required —
@@ -460,6 +461,286 @@ fn no_scale_needed_errors_at_exact_match() {
     // Zero dim must error with ZeroDim, not NoScaleNeeded.
     let z = Scaler::new(pipelines, device, queue, (0, 64), (32, 32));
     assert!(matches!(z, Err(ScalerError::ZeroDim { .. })));
+}
+
+/// Upload an `Rgba16Float` source from fp32 linear-light values.
+fn upload_rgba16f(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    f32_rgba: &[f32],
+    width: u32,
+    height: u32,
+) -> wgpu::Texture {
+    // Pack 4 f32 channels → 4 f16 cells per pixel.
+    let mut packed: Vec<f16> = Vec::with_capacity(f32_rgba.len());
+    for &v in f32_rgba {
+        packed.push(f16::from_f32(v));
+    }
+    let bytes: &[u8] = bytemuck::cast_slice(&packed);
+    device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("scaler-test linear source"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        bytes,
+    )
+}
+
+/// Read back an `Rgba16Float` texture into a flat `Vec<f32>`.
+fn read_texture_rgba16f(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+) -> Vec<f32> {
+    let (width, height) = (tex.width(), tex.height());
+    let bytes_per_pixel = 8u32; // 4 channels × 2 bytes (f16)
+    let unpadded_row = width * bytes_per_pixel;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_row = unpadded_row.div_ceil(align) * align;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("scaler-test linear readback"),
+        size: (padded_row * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("scaler-test linear readback"),
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([enc.finish()]);
+    let slice = buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        tx.send(r).ok();
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("device poll");
+    rx.recv().expect("map result").expect("map ok");
+    let data = slice.get_mapped_range().expect("range");
+    let mut out = Vec::with_capacity((unpadded_row * height) as usize / 2);
+    for y in 0..height {
+        let start = (y * padded_row) as usize;
+        let end = start + unpadded_row as usize;
+        let row_f16: &[f16] = bytemuck::cast_slice(&data[start..end]);
+        out.extend(row_f16.iter().map(|h| h.to_f32()));
+    }
+    drop(data);
+    buf.unmap();
+    out
+}
+
+/// Linear-light Mitchell reference: same separable bicubic math as
+/// the sRGB reference but skips the transfer functions, mirroring
+/// the `horizontal_linear` / `vertical_linear` shader entry points.
+fn mitchell_filter_linear(
+    src: &[f32],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<f32> {
+    use tether_scaler::reference::{mitchell_weight, tap_count};
+    assert_eq!(src.len(), (src_w as usize) * (src_h as usize) * 4);
+    let scale_x = src_w as f32 / dst_w as f32;
+    let n_taps_x = tap_count(scale_x);
+    let support_x = scale_x.max(1.0);
+    let mut intermediate = vec![0.0_f32; (dst_w as usize) * (src_h as usize) * 3];
+    for y in 0..src_h as usize {
+        for ox in 0..dst_w as usize {
+            let center = (ox as f32 + 0.5) * scale_x - 0.5;
+            let half = (n_taps_x / 2) as i32;
+            let i0 = center.floor() as i32 - half + 1;
+            let mut sum = [0.0_f32; 3];
+            let mut w_sum = 0.0_f32;
+            for k in 0..n_taps_x as i32 {
+                let x = i0 + k;
+                let xc = x.clamp(0, src_w as i32 - 1) as usize;
+                let w = mitchell_weight((x as f32 - center) / support_x, 1.0 / 3.0, 1.0 / 3.0);
+                let off = (y * src_w as usize + xc) * 4;
+                sum[0] += src[off] * w;
+                sum[1] += src[off + 1] * w;
+                sum[2] += src[off + 2] * w;
+                w_sum += w;
+            }
+            let ws = if w_sum.abs() < 1e-6 { 1.0 } else { w_sum };
+            let off = (y * dst_w as usize + ox) * 3;
+            intermediate[off] = sum[0] / ws;
+            intermediate[off + 1] = sum[1] / ws;
+            intermediate[off + 2] = sum[2] / ws;
+        }
+    }
+    let scale_y = src_h as f32 / dst_h as f32;
+    let n_taps_y = tap_count(scale_y);
+    let support_y = scale_y.max(1.0);
+    let mut dst = vec![0.0_f32; (dst_w as usize) * (dst_h as usize) * 4];
+    for oy in 0..dst_h as usize {
+        let center = (oy as f32 + 0.5) * scale_y - 0.5;
+        let half = (n_taps_y / 2) as i32;
+        let i0 = center.floor() as i32 - half + 1;
+        for ox in 0..dst_w as usize {
+            let mut sum = [0.0_f32; 3];
+            let mut w_sum = 0.0_f32;
+            for k in 0..n_taps_y as i32 {
+                let y = i0 + k;
+                let yc = y.clamp(0, src_h as i32 - 1) as usize;
+                let w = mitchell_weight((y as f32 - center) / support_y, 1.0 / 3.0, 1.0 / 3.0);
+                let off = (yc * dst_w as usize + ox) * 3;
+                sum[0] += intermediate[off] * w;
+                sum[1] += intermediate[off + 1] * w;
+                sum[2] += intermediate[off + 2] * w;
+                w_sum += w;
+            }
+            let ws = if w_sum.abs() < 1e-6 { 1.0 } else { w_sum };
+            let off = (oy * dst_w as usize + ox) * 4;
+            dst[off] = sum[0] / ws;
+            dst[off + 1] = sum[1] / ws;
+            dst[off + 2] = sum[2] / ws;
+            dst[off + 3] = 1.0;
+        }
+    }
+    dst
+}
+
+#[test]
+#[ignore = "requires wgpu adapter"]
+fn linear_light_scaler_matches_linear_reference() {
+    // The renderer's client upscale path runs LinearF16 — same
+    // Mitchell math, no sRGB transfer. The Srgb8 path's PSNR/SSIM
+    // tests above prove the Mitchell weights and tap-count widening
+    // are correct on the GPU; this test proves the LinearF16 variant
+    // shares that correctness on its own shader entry points.
+    let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
+    let pipelines = Arc::new(Pipelines::build(&device));
+
+    // Synthesize a 128×128 linear-light test image: smooth radial
+    // gradient + a few edge features that exercise Mitchell's
+    // negative lobes. Values in [0, 1].
+    let src_w = 128u32;
+    let src_h = 128u32;
+    let dst_w = 256u32;
+    let dst_h = 256u32;
+    let mut src_f32 = Vec::with_capacity((src_w * src_h * 4) as usize);
+    for y in 0..src_h {
+        for x in 0..src_w {
+            let cx = src_w as f32 * 0.5;
+            let cy = src_h as f32 * 0.5;
+            let dx = (x as f32 - cx) / cx;
+            let dy = (y as f32 - cy) / cy;
+            let r = (1.0 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+            src_f32.extend_from_slice(&[r, r * 0.5, 1.0 - r, 1.0]);
+        }
+    }
+
+    let src_tex = upload_rgba16f(&device, &queue, &src_f32, src_w, src_h);
+    let scaler = Scaler::new_with_color_space(
+        pipelines,
+        device.clone(),
+        queue.clone(),
+        (src_w, src_h),
+        (dst_w, dst_h),
+        ColorSpace::LinearF16,
+    )
+    .expect("scaler new");
+    let out = scaler.scale(&src_tex).expect("scale");
+    assert_eq!(out.format(), wgpu::TextureFormat::Rgba16Float);
+    let gpu_f32 = read_texture_rgba16f(&device, &queue, out);
+
+    let ref_f32 = mitchell_filter_linear(&src_f32, src_w, src_h, dst_w, dst_h);
+    assert_eq!(gpu_f32.len(), ref_f32.len());
+
+    // Per-pixel diff in linear-light space. fp16 quantization gives
+    // ~10 bits of precision → ~1/1024 worst-case per channel. We
+    // assert both a strict per-channel bound (catches gross math
+    // errors) and a per-channel RMS bound (catches systematic drift).
+    let mut max_diff = 0.0_f32;
+    let mut sum_sq = 0.0_f64;
+    let mut n = 0u64;
+    for (a, b) in gpu_f32.chunks_exact(4).zip(ref_f32.chunks_exact(4)) {
+        for c in 0..3 {
+            let d = (a[c] - b[c]).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            sum_sq += f64::from(d) * f64::from(d);
+            n += 1;
+        }
+    }
+    let rms = (sum_sq / n as f64).sqrt();
+    println!(
+        "linear-light upscale 128→256: max diff {max_diff:.4}, RMS {rms:.5}"
+    );
+    // 1/256 ≈ 0.004 — tighter than fp16 quantization at the high
+    // end of the range and still substantially below human-visible
+    // (a 1/256 sRGB byte step).
+    assert!(
+        max_diff < 0.01,
+        "max linear-light diff {max_diff:.4} exceeds 0.01"
+    );
+    assert!(rms < 0.001, "linear-light RMS {rms:.5} exceeds 0.001");
+}
+
+#[test]
+#[ignore = "requires wgpu adapter"]
+fn linear_light_solid_color_preserves_color() {
+    // Solid color round-trip in LinearF16: the simplest possible
+    // sanity check that the shader isn't swizzling channels,
+    // applying a transfer function it shouldn't, or producing NaN.
+    // Catches gross failures faster than the reference test if the
+    // shader is broken.
+    let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
+    let pipelines = Arc::new(Pipelines::build(&device));
+    let src_f32: Vec<f32> = (0..64 * 64).flat_map(|_| [0.4_f32, 0.2, 0.7, 1.0]).collect();
+    let src_tex = upload_rgba16f(&device, &queue, &src_f32, 64, 64);
+    let scaler = Scaler::new_with_color_space(
+        pipelines,
+        device.clone(),
+        queue.clone(),
+        (64, 64),
+        (32, 32),
+        ColorSpace::LinearF16,
+    )
+    .expect("scaler new");
+    let out = scaler.scale(&src_tex).expect("scale");
+    let gpu_f32 = read_texture_rgba16f(&device, &queue, out);
+    for chunk in gpu_f32.chunks_exact(4) {
+        assert!((chunk[0] - 0.4).abs() < 0.01, "R drift: {}", chunk[0]);
+        assert!((chunk[1] - 0.2).abs() < 0.01, "G drift: {}", chunk[1]);
+        assert!((chunk[2] - 0.7).abs() < 0.01, "B drift: {}", chunk[2]);
+        assert!(chunk[3].is_finite());
+    }
 }
 
 #[test]

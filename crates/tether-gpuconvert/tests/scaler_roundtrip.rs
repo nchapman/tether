@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use tether_gpuconvert::{export_texture_as_dmabuf, Nv12DmaBuf};
+use tether_gpuconvert::{export_texture_as_dmabuf, Bgra2P010DmaBuf, Nv12DmaBuf, Yuv444DmaBuf};
 use tether_scaler::{ColorSpace, Pipelines, Scaler};
 
 /// Helper: run capture (BGRA dma-buf) -> scaler -> Nv12 bridge for the
@@ -118,4 +118,153 @@ fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
 #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
 fn scaler_heavy_downscale_through_mip_prefilter_into_bridge() {
     run_scaler_to_nv12_chain((256, 256), (64, 64));
+}
+
+/// Same shape as the NV12 round-trip, generalised over the three
+/// production chroma bridges. Each variant exercises a different
+/// gpuconvert pipeline (BGRA→NV12, BGRA→YUV444-XYUV, BGRA→P010) and
+/// validates the Rgba8Unorm source acceptance independently —
+/// without these, a backend-specific rejection in any single
+/// bridge's bind-group binding would slip past the tests.
+fn run_scaler_to_yuv444_chain(capture: (u32, u32), encode: (u32, u32)) {
+    let bridge = match pollster::block_on(Yuv444DmaBuf::new(encode.0, encode.1)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP: cannot build Yuv444DmaBuf bridge: {e}");
+            return;
+        }
+    };
+    let src_export = export_texture_as_dmabuf(
+        bridge.device(),
+        capture.0,
+        capture.1,
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        "scaler-test bgra source (yuv444)",
+    )
+    .expect("export bgra source");
+    fill_solid_red(bridge.device(), bridge.queue(), &src_export.texture, capture);
+    let dup_fd = src_export.fd.try_clone().expect("dup");
+    let imported = bridge
+        .import_bgra_dmabuf(
+            dup_fd,
+            src_export.drm_format_modifier,
+            src_export.stride,
+            src_export.offset,
+            capture.0,
+            capture.1,
+        )
+        .expect("import_bgra_dmabuf");
+    let pipelines = Arc::new(Pipelines::build(bridge.device()));
+    let scaler = Scaler::new_with_color_space(
+        pipelines,
+        bridge.device().clone(),
+        bridge.queue().clone(),
+        capture,
+        encode,
+        ColorSpace::Srgb8,
+    )
+    .expect("scaler new");
+    let scaled = scaler.scale(&imported).expect("scaler scale");
+    let _yuv = bridge.convert(scaled).expect("Yuv444DmaBuf::convert");
+}
+
+fn run_scaler_to_p010_chain(capture: (u32, u32), encode: (u32, u32)) {
+    let bridge = match pollster::block_on(Bgra2P010DmaBuf::new(encode.0, encode.1)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP: cannot build Bgra2P010DmaBuf bridge: {e}");
+            return;
+        }
+    };
+    let src_export = export_texture_as_dmabuf(
+        bridge.device(),
+        capture.0,
+        capture.1,
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        "scaler-test bgra source (p010)",
+    )
+    .expect("export bgra source");
+    fill_solid_red(bridge.device(), bridge.queue(), &src_export.texture, capture);
+    let dup_fd = src_export.fd.try_clone().expect("dup");
+    let imported = bridge
+        .import_bgra_dmabuf(
+            dup_fd,
+            src_export.drm_format_modifier,
+            src_export.stride,
+            src_export.offset,
+            capture.0,
+            capture.1,
+        )
+        .expect("import_bgra_dmabuf");
+    let pipelines = Arc::new(Pipelines::build(bridge.device()));
+    let scaler = Scaler::new_with_color_space(
+        pipelines,
+        bridge.device().clone(),
+        bridge.queue().clone(),
+        capture,
+        encode,
+        ColorSpace::Srgb8,
+    )
+    .expect("scaler new");
+    let scaled = scaler.scale(&imported).expect("scaler scale");
+    let _p010 = bridge.convert(scaled).expect("Bgra2P010DmaBuf::convert");
+}
+
+fn fill_solid_red(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    dims: (u32, u32),
+) {
+    let n = (dims.0 * dims.1) as usize;
+    let mut bgra = Vec::with_capacity(n * 4);
+    for _ in 0..n {
+        bgra.extend_from_slice(&[0, 0, 255, 255]);
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bgra,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(dims.0 * 4),
+            rows_per_image: Some(dims.1),
+        },
+        wgpu::Extent3d {
+            width: dims.0,
+            height: dims.1,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::empty());
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll write");
+}
+
+/// HEVC Main 4:4:4 8-bit: scaler → Yuv444DmaBuf bridge (packed
+/// XYUV output). Independent code path from NV12 in the bridge's
+/// `convert()` so the Rgba8Unorm acceptance change has to be
+/// validated separately.
+#[test]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+fn scaler_downscale_then_yuv444_bridge() {
+    run_scaler_to_yuv444_chain((64, 64), (32, 32));
+}
+
+/// HEVC Main10 / Main 4:4:4 10-bit: scaler → Bgra2P010DmaBuf
+/// bridge. Same Rgba8Unorm-acceptance concern as above; the 10-bit
+/// output goes to R16Unorm + Rg16Unorm storage textures and the
+/// storage-modifier probe gates whether this even runs (the bridge
+/// reports a clean error rather than failing later).
+#[test]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF + 16-bit storage"]
+fn scaler_downscale_then_p010_bridge() {
+    run_scaler_to_p010_chain((64, 64), (32, 32));
 }

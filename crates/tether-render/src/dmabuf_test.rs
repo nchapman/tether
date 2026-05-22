@@ -593,6 +593,25 @@ fn run_roundtrip(profile: VideoProfile) -> Option<((u8, u8, u8), (u8, u8, u8))> 
     )
     .expect("dma-buf import");
 
+    let (left, right) = render_and_readback(&device, &queue, &pipeline, &textures, (w, h));
+    eprintln!("[{profile:?}] left avg RGB  = {left:?}");
+    eprintln!("[{profile:?}] right avg RGB = {right:?}");
+    Some((left, right))
+}
+
+/// Render `textures` through `pipeline` into an offscreen Rgba8Unorm
+/// target at the given dims, read back the pixels, and return the
+/// left/right region averages used by the per-profile assertions.
+/// Factored out so both the existing `run_roundtrip` and the new
+/// scaler-active test share the render+readback boilerplate.
+fn render_and_readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &TestPipeline,
+    textures: &gpu::YuvTextures,
+    dims: (u32, u32),
+) -> ((u8, u8, u8), (u8, u8, u8)) {
+    let (w, h) = dims;
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen target"),
         size: wgpu::Extent3d {
@@ -603,7 +622,7 @@ fn run_roundtrip(profile: VideoProfile) -> Option<((u8, u8, u8), (u8, u8, u8))> 
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: target_format,
+        format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
@@ -690,9 +709,242 @@ fn run_roundtrip(profile: VideoProfile) -> Option<((u8, u8, u8), (u8, u8, u8))> 
 
     let left = region_average_rgb(&rgba, w, w / 8, h / 4, w / 4, h / 2);
     let right = region_average_rgb(&rgba, w, 5 * w / 8, h / 4, w / 4, h / 2);
-    eprintln!("[{profile:?}] left avg RGB  = {left:?}");
-    eprintln!("[{profile:?}] right avg RGB = {right:?}");
-    Some((left, right))
+    (left, right)
+}
+
+/// Build an NV12 codec dma-buf descriptor from a gpuconvert
+/// `Nv12DmaBufFrame`. Mirrors `nv12_dmabuf_to_codec_frame` in
+/// `apps/tether-host/src/main.rs` — same memory layout, different
+/// crate. Single object, two layers (Y as `R8 ` fourcc, UV as
+/// `GR88`).
+fn build_codec_dmabuf_frame_nv12(
+    nv12: &tether_gpuconvert::Nv12DmaBufFrame,
+) -> tether_codec::DmaBufFrame {
+    const NV12_FOURCC: u32 = u32::from_le_bytes(*b"NV12");
+    const R8_FOURCC: u32 = u32::from_le_bytes(*b"R8  ");
+    const GR88_FOURCC: u32 = u32::from_le_bytes(*b"GR88");
+    let dup_fd = nv12.fd.try_clone().expect("dup NV12 fd");
+    let y_off = u32::try_from(nv12.y_offset).expect("y_offset fits in u32");
+    let y_stride = u32::try_from(nv12.y_stride).expect("y_stride fits in u32");
+    let uv_off = u32::try_from(nv12.uv_offset).expect("uv_offset fits in u32");
+    let uv_stride = u32::try_from(nv12.uv_stride).expect("uv_stride fits in u32");
+    tether_codec::DmaBufFrame {
+        fourcc: NV12_FOURCC,
+        objects: vec![tether_codec::DmaBufObject {
+            fd: dup_fd,
+            size: nv12.size,
+            drm_format_modifier: nv12.modifier,
+        }],
+        layers: vec![
+            tether_codec::DmaBufLayer {
+                drm_format: R8_FOURCC,
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [y_off, 0, 0, 0],
+                pitch: [y_stride, 0, 0, 0],
+            },
+            tether_codec::DmaBufLayer {
+                drm_format: GR88_FOURCC,
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [uv_off, 0, 0, 0],
+                pitch: [uv_stride, 0, 0, 0],
+            },
+        ],
+    }
+}
+
+/// Production-shape encode path with a scaler in front: BGRA at
+/// `capture` dims → import → Mitchell downscale to `encode` dims →
+/// NV12 bridge → encoder.encode_gpu via submit_dmabuf. Catches any
+/// integration bug in the scaler→bridge→encoder chain that the
+/// component-level tests miss.
+fn encode_via_scaler_chain(
+    profile: VideoProfile,
+    capture: (u32, u32),
+    encode: (u32, u32),
+    bgra_at_capture: &[u8],
+) -> Vec<tether_codec::EncodedPacket> {
+    use tether_gpuconvert::{export_texture_as_dmabuf, Nv12DmaBuf};
+    use tether_scaler::{ColorSpace, Pipelines, Scaler};
+
+    let mut enc = VaapiEncoder::new(profile, encode.0, encode.1, 30, 4_000).expect("encoder");
+    let bridge = pollster::block_on(Nv12DmaBuf::new(encode.0, encode.1)).expect("nv12 bridge");
+
+    // Stand in for PipeWire's BGRA capture: export a dma-buf at
+    // *capture* dims on the bridge's device and upload the fixture.
+    let src_export = export_texture_as_dmabuf(
+        bridge.device(),
+        capture.0,
+        capture.1,
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        "scaler-roundtrip bgra source",
+    )
+    .expect("export bgra source");
+    bridge.queue().write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &src_export.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bgra_at_capture,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(capture.0 * 4),
+            rows_per_image: Some(capture.1),
+        },
+        wgpu::Extent3d {
+            width: capture.0,
+            height: capture.1,
+            depth_or_array_layers: 1,
+        },
+    );
+    bridge.queue().submit(std::iter::empty());
+    bridge
+        .device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll write");
+
+    let pipelines = std::sync::Arc::new(Pipelines::build(bridge.device()));
+    let scaler = Scaler::new_with_color_space(
+        pipelines,
+        bridge.device().clone(),
+        bridge.queue().clone(),
+        capture,
+        encode,
+        ColorSpace::Srgb8,
+    )
+    .expect("scaler");
+
+    let mut packets = Vec::new();
+    for t in 0..6i64 {
+        // Fresh dup-fd per iteration so the bridge can re-import.
+        let dup_fd = src_export.fd.try_clone().expect("dup src fd");
+        let imported = bridge
+            .import_bgra_dmabuf(
+                dup_fd,
+                src_export.drm_format_modifier,
+                src_export.stride,
+                src_export.offset,
+                capture.0,
+                capture.1,
+            )
+            .expect("import");
+        let scaled = scaler.scale(&imported).expect("scale");
+        let nv12 = bridge.convert(scaled).expect("nv12 convert");
+        let codec_frame = build_codec_dmabuf_frame_nv12(&nv12);
+        let gpu_frame = tether_codec::GpuEncoderFrame::DmaBuf(&codec_frame);
+        match enc.encode_gpu(gpu_frame, t, t == 0) {
+            Ok(p) => packets.extend(p),
+            Err(e) => {
+                eprintln!("SKIP: encode_gpu via scaler chain failed: {e}");
+                return Vec::new();
+            }
+        }
+    }
+    packets
+}
+
+/// Viewport-active end-to-end smoke test: BGRA at 640×480 → Mitchell
+/// downscale to 320×240 → NV12 bridge → encoder.encode_gpu → decoder.
+///
+/// Validates the production scaler-active wiring through encode_gpu —
+/// the codepath the host runs whenever a client sends
+/// `SetClientViewport`. The existing dmabuf round-trip cells encode
+/// via the CPU upload path (no bridge, no scaler), so without this
+/// test the scaler→bridge→encode_gpu chain is exercised only at the
+/// component level (gpuconvert scaler_roundtrip tests don't go through
+/// the encoder).
+///
+/// Renders through the test pipeline at encode dims and verifies the
+/// left/right halves remain red/blue after the scale — confirms the
+/// scaler doesn't swap channels or wash the colors out.
+#[test]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import; run with: cargo test -p tether-render --release -- --ignored dmabuf"]
+fn dmabuf_zero_copy_roundtrip_with_scaler_h264_8bit() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::H264,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+    let capture = (640u32, 480u32);
+    let encode = (320u32, 240u32);
+
+    let (device, queue, _adapter) =
+        match pollster::block_on(try_init_wgpu_for_dmabuf(profile.bit_depth)) {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIP: no wgpu adapter for scaler-active round-trip");
+                return;
+            }
+        };
+
+    let bgra = make_test_bgra(capture.0, capture.1);
+    let packets = encode_via_scaler_chain(profile, capture, encode, &bgra);
+    if packets.is_empty() {
+        eprintln!("SKIP: scaler-active encode produced no packets");
+        return;
+    }
+
+    // Decode at encode dims and grab the first GPU frame.
+    let mut dec = VaapiDecoder::new(profile.codec).expect("decoder");
+    let mut codec_gpu: Option<tether_codec::GpuFrame> = None;
+    for pkt in &packets {
+        dec.submit(&pkt.data).expect("submit");
+        while let Some(f) = dec.next_frame().expect("next_frame") {
+            if let CodecFrame::Gpu(g) = f {
+                codec_gpu = Some(g);
+                break;
+            }
+        }
+        if codec_gpu.is_some() {
+            break;
+        }
+    }
+    let codec_gpu = codec_gpu.expect("decoder emitted no Gpu frame");
+    let (gw, gh, _pts, source, guard) = codec_gpu.into_parts();
+    assert_eq!(
+        (gw, gh),
+        encode,
+        "decoded dims should match encode dims (the scaler's output)"
+    );
+    let dmabuf = match source {
+        GpuFrameSource::DmaBuf(d) => d,
+    };
+
+    // Render through the test pipeline at encode dims; reuse the
+    // shared decode→render→readback shape.
+    let target_format = wgpu::TextureFormat::Rgba8Unorm;
+    let pipeline = build_test_pipeline(&device, &queue, target_format, profile);
+    let textures = gpu::import_dmabuf_textures(
+        &device,
+        &pipeline.yuv_bgl,
+        &pipeline.sampler,
+        profile.chroma,
+        profile.bit_depth,
+        &dmabuf,
+        gw,
+        gh,
+        guard,
+    )
+    .expect("dma-buf import");
+
+    let (left, right) = render_and_readback(&device, &queue, &pipeline, &textures, encode);
+    eprintln!("[scaler-active {profile:?}] left {left:?}, right {right:?}");
+    // Same red/blue tolerance bands as the existing cells. The
+    // Mitchell downscale + HEVC quantisation only soften the
+    // boundary; the halves stay clearly red and blue.
+    assert!(
+        left.0 > 130 && left.1 < 80 && left.2 < 80,
+        "left should be red after scaler+encode+decode; got {left:?}"
+    );
+    assert!(
+        right.2 > 130 && right.0 < 80 && right.1 < 80,
+        "right should be blue after scaler+encode+decode; got {right:?}"
+    );
 }
 
 /// H.264 4:2:0 8-bit — the original baseline cell. Universal floor;

@@ -10,6 +10,12 @@ description = "Mitchell-Netravali bicubic image scaler in linear-light, shared b
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
+# fp16 conversion for the LinearF16 hardware test: the scaler's
+# linear-light output is Rgba16Float, so test setup + readback need
+# f32 ↔ f16. Pulled in dev-dep style via the main deps because cargo
+# requires consistent feature sets across the crate, and the half
+# crate is small and pure-Rust.
+half = { version = "2", features = ["bytemuck"] }
 
 # Same wgpu trunk pin as tether-render / tether-gpuconvert. The shader
 # uses Rgba16Float storage textures + textureLoad on Bgra8Unorm /

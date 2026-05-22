@@ -12,17 +12,16 @@ content), and 10-bit over 8-bit at each chroma rung (precision
 beats banding). See `docs/CODEC_CAPABILITIES.md` for the per-layer
 hard-limit vs. probed framing and the M-series VT capability matrix.
 **macOS host** (ScreenCaptureKit capture, VideoToolbox encoder,
-CGEvent input injection) is wired end-to-end via
-`encode_iosurface_frame`; the live capture is hardcoded to NV12
-(`'420v'`) 8-bit pending SCK→live wiring (the SCK probe records
-that `'444v'`, `'444f'`, and `xf44` are reachable on M4 Max).
-**macOS client** (VideoToolbox decode + Metal IOSurface→wgpu
-render + winit input capture) covers HEVC Main, Main10, and Main
-4:4:4 (8 and 10-bit) decode — the renderer's biplanar 8 / biplanar
-16 / packed XYUV layouts cover the IOSurface and dma-buf shapes
-each profile produces. Windows backends (DXGI / Media Foundation
-/ D3D11) are additional modules per platform, not a rewrite of
-the core path.
+CGEvent input injection) and **macOS client** (VideoToolbox decode
++ Metal IOSurface→wgpu render + winit input capture) are both
+wired end-to-end. The macOS client covers HEVC Main, Main10, and
+Main 4:4:4 (8 and 10-bit) decode — the renderer's biplanar 8 /
+biplanar 16 / packed XYUV layouts cover the IOSurface and dma-buf
+shapes each profile produces, verified by the four
+`iosurface_zero_copy_roundtrip_*` tests in
+`tether-render/src/iosurface_test.rs`. Windows backends (DXGI /
+Media Foundation / D3D11) are additional modules per platform, not
+a rewrite of the core path.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -273,7 +272,7 @@ Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
 renderer a `GpuFrameGuard` (the shared `GpuResourceGuard` re-export) that
 holds the source `AVFrame` ref alive until the renderer drops it.
 
-**macOS host (in active development).** ScreenCaptureKit emits NV12
+**macOS host.** ScreenCaptureKit emits NV12
 `CMSampleBuffer`s; `tether-capture::macos` unwraps each to its
 `IOSurface` and forwards as `CapturedFrame::Gpu(GpuCapturedSource::IOSurface(...))`.
 `tether-codec::videotoolbox::VideoToolboxEncoder` wraps the IOSurface
@@ -291,13 +290,14 @@ code with the Linux libei path through `inject::enigo_backend`.
 macOS sibling of `encode_gpu_frame`: same `EncoderSlot` shape, same
 post-encode `FrameFragmenter` path — just simpler in the middle.
 
-**macOS client (next).** The decoder + render path is the next chunk
-of macOS work — VideoToolbox decoder constructing per the negotiated
-codec, IOSurface output, Metal → wgpu import via
-`CAMetalLayer`/`MTLTextureFromIOSurface`, present through the same
-wgpu surface the Linux client uses. Until that lands, `probe_decoder`
-on macOS returns a clear "not yet implemented" error and a macOS host
-streams to a Linux VAAPI client.
+**macOS client.** VideoToolbox decoder (`tether-codec::videotoolbox::decoder`)
+constructs per the negotiated codec; output IOSurfaces are imported
+into wgpu via `tether-render::metal::import_iosurface_textures`
+(`MTLDevice::newTextureWithIOSurface`) and presented through the
+same `LatestFrame` → wgpu surface path the Linux client uses. The
+renderer's import is verified by `iosurface_zero_copy_roundtrip_*`
+in `tether-render/src/iosurface_test.rs` for HEVC Main / Main10 /
+Main 4:4:4 8-bit / Main 4:4:4 10-bit.
 
 ---
 
@@ -522,11 +522,9 @@ to a transport-agnostic HID-style `InputEvent`, sends to host.
 
 Listed to set expectations; each is a real follow-up, not a "never":
 
-- **macOS client and Windows backends.** macOS host ships today
-  (see "Cross-platform additivity"); the macOS client (VideoToolbox
-  decode + Metal IOSurface→wgpu render + winit input capture) and
-  the Windows host/client (DXGI / Media Foundation / D3D11) are
-  follow-up modules per platform.
+- **Windows backends.** macOS host and macOS client both ship today
+  (see "Cross-platform additivity"); the Windows host/client (DXGI /
+  Media Foundation / D3D11) are follow-up modules per platform.
 - **AV1.** H.264 and HEVC are supported; AV1 needs a different VAAPI
   decoder probe (no `vaapi_av1` encode entrypoint on most current
   Intel iGPUs) and a separate codec_id path. The probe stub returns

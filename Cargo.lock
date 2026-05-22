@@ -3263,6 +3263,7 @@ dependencies = [
  "tether-probe",
  "tether-protocol",
  "tether-render",
+ "tether-session",
  "tether-transport",
  "tokio",
  "tracing",
@@ -3380,6 +3381,9 @@ dependencies = [
 name = "tether-session"
 version = "0.0.1"
 dependencies = [
+ "tether-protocol",
+ "tether-transport",
+ "thiserror 2.0.18",
  "tracing",
 ]
 

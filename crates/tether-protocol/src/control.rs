@@ -139,13 +139,32 @@ pub enum ChromaSubsampling {
 ///
 /// `bit_depth` is `u8` rather than an enum so the wire form stays
 /// stable as new depths land — 8, 10, and (hypothetically) 12 all
-/// round-trip identically. The host validates depths it doesn't support
-/// at probe time, not at decode time.
+/// round-trip identically. Decode-side callers should use
+/// [`is_known_bit_depth`] to filter out values this build doesn't
+/// implement, rather than trusting the wire blindly. A peer sending
+/// `bit_depth = 9`, `255`, or `0` is either malformed or from the
+/// future — both cases reduce to "drop this profile, don't try to
+/// build a pipeline for it."
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoProfile {
     pub codec: CodecKind,
     pub chroma: ChromaSubsampling,
     pub bit_depth: u8,
+}
+
+/// The bit depths this build of tether knows how to construct an
+/// encode/decode/render pipeline for. Adding a new depth means
+/// extending the encoder dispatch (`derive_bitrate_kbps`,
+/// `EncoderSlot` chroma/depth match arms), the decoder side (codec
+/// probe), and the renderer (texture-format dispatch) at the same
+/// time — anything less ships a half-wired profile.
+pub const KNOWN_BIT_DEPTHS: &[u8] = &[8, 10];
+
+/// `true` iff `depth` is one of [`KNOWN_BIT_DEPTHS`]. Decode-side
+/// boundary check for `VideoProfile`s that arrived over the wire.
+#[must_use]
+pub fn is_known_bit_depth(depth: u8) -> bool {
+    KNOWN_BIT_DEPTHS.contains(&depth)
 }
 
 impl VideoProfile {

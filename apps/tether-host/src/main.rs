@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
 use tether_codec::{build_encoder, Encoder};
-use tether_probe::pick_supported_profile;
+use tether_session::{AcceptError, HostSession, HostSessionConfig};
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
 #[cfg(target_os = "linux")]
@@ -28,11 +28,7 @@ use tether_codec::GpuEncoderFrame;
 use tether_gpuconvert::{
     Bgra2P010DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
 };
-use tether_protocol::control::{
-    ChromaSubsampling, ClientHello, CodecKind, ControlMessage, ServerHello, ServerHelloV1,
-    VideoColorSpec, VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY,
-    SERVER_ENCODE_PROFILE_EXTENSION_KEY,
-};
+use tether_protocol::control::{ChromaSubsampling, CodecKind, ControlMessage, VideoProfile};
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
@@ -124,17 +120,72 @@ async fn main() -> anyhow::Result<()> {
         .ok();
     }
 
-    let conn = match server.accept().await {
-        Some(Ok(c)) => Arc::new(c),
-        Some(Err(e)) => return Err(e.into()),
-        None => {
-            warn!("server closed before any connection arrived");
-            return Ok(());
-        }
-    };
-    info!(remote = %conn.remote_address(), "client connected");
+    // Reconnect loop: one host process serves a stream of clients,
+    // each in its own `handle_client` lifecycle. Per-session state —
+    // encoder, libei injector, recv tasks — is fully owned by
+    // `handle_client` and dropped when it returns; nothing leaks
+    // between sessions. Errors from a single session are logged and
+    // the loop continues, so a malformed client or a transient
+    // decoder failure can't take the host process down. Ctrl-C (handled
+    // inside `handle_client`'s `tokio::select!`) ends the current
+    // session; the outer loop sees that as a normal session end and
+    // accepts the next client. Process-level shutdown is via SIGTERM
+    // / SIGKILL, not by the loop reaching a natural end.
+    loop {
+        let conn = match server.accept().await {
+            Some(Ok(c)) => Arc::new(c),
+            Some(Err(e)) => {
+                warn!(error = ?e, "server.accept failed; continuing");
+                continue;
+            }
+            None => {
+                warn!("server closed; ending main loop");
+                break;
+            }
+        };
+        info!(remote = %conn.remote_address(), "client connected");
 
-    handle_client(conn, use_test_pattern).await?;
+        let host_encode_profiles: Vec<VideoProfile> = if use_test_pattern {
+            vec![VideoProfile::H264_8BIT_420]
+        } else {
+            tether_probe::host_encode_profiles()
+        };
+        tracing::debug!(
+            host_encode_profiles = ?host_encode_profiles,
+            "host video encode capabilities (capture-bridge filtered)"
+        );
+
+        let cfg = HostSessionConfig {
+            server_name: "tether-host".to_string(),
+        };
+        let session = match HostSession::accept(conn, cfg, |client_caps| {
+            tether_probe::pick_supported_profile(&host_encode_profiles, client_caps)
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(AcceptError::NoProfileIntersection { client }) => {
+                // HostSession has already sent Goodbye(InternalError).
+                // We log the host list ourselves — the error doesn't
+                // carry it because the selector (which closes over it)
+                // is the only thing that saw both sides.
+                warn!(
+                    host_encode_profiles = ?host_encode_profiles,
+                    client_decode_profiles = ?client,
+                    "no mutual video profile; session ended"
+                );
+                continue;
+            }
+            Err(AcceptError::Transport(e)) => {
+                warn!(error = ?e, "handshake transport error; session ended");
+                continue;
+            }
+        };
+
+        if let Err(e) = handle_client(session, use_test_pattern).await {
+            warn!(error = ?e, "session ended with error; accepting next client");
+        }
+    }
 
     server.close_and_wait(0, b"host shutdown").await;
     Ok(())
@@ -146,195 +197,29 @@ async fn main() -> anyhow::Result<()> {
 /// frees its hardware context. Anything that needs to survive across
 /// reconnects must live in `main`, not here.
 async fn handle_client(
-    conn: Arc<Connection>,
+    session: HostSession,
     use_test_pattern: bool,
 ) -> anyhow::Result<()> {
-    // Application-layer handshake. The closure walks the client's
-    // codec preference list and picks the first one this host can
-    // actually build (cheap construction probe at 64×64), so the
-    // ServerHello we return carries an authoritative `chosen_codec`
-    // rather than a guess. The transport layer stamps the clock-probe
-    // timestamps right around the send.
+    // The handshake (decode-profile negotiation, pixel-format advert,
+    // Goodbye-on-no-match) ran in `HostSession::accept`. Unpack the
+    // per-connection state it produced.
     //
-    // Newer clients sending an unknown ClientHello variant fail decode
-    // upstream of this closure; the transport surfaces that as an error
-    // we return below. Reaching the closure means the variant decoded.
-    // Two-stage codec selection: the closure picks (and may fail to
-    // pick), but the handshake must still produce a syntactically valid
-    // ServerHello to send. If the pick failed, the closure writes a
-    // placeholder codec into the response and surfaces None via the
-    // outer Option; post-handshake we send a clean Goodbye(InternalError)
-    // and exit rather than leaving the client waiting on frames that
-    // will never arrive.
-    // Host encode capabilities — what this build can actually construct
-    // against the live VAAPI driver. Probe is process-cached (driver
-    // caps don't change at runtime), so per-connection cost is just a
-    // clone. Logged at debug because every reconnect would otherwise
-    // repeat the same line; the per-session negotiated result below
-    // Host encode capabilities — what the live pipeline can actually
-    // deliver, end-to-end. `tether_probe::host_encode_profiles`
-    // round-trips capture → bridge → encoder → decoder per profile
-    // and returns only the ones where every stage succeeded. Cached
-    // process-wide (warmed in main).
-    //
-    // Test-pattern mode bypasses the probe (see the warm-up site for
-    // why) and advertises the conservative H.264 4:2:0 8-bit floor.
-    let host_encode_profiles: Vec<VideoProfile> = if use_test_pattern {
-        vec![VideoProfile::H264_8BIT_420]
-    } else {
-        tether_probe::host_encode_profiles()
-    };
-    tracing::debug!(
-        host_encode_profiles = ?host_encode_profiles,
-        "host video encode capabilities (capture-bridge filtered)"
-    );
+    // Bind `_client_decode_profiles` and `_client_hello` because the
+    // immediate orchestration below doesn't read them — they're kept on
+    // the session for callers (logs, diagnostics, future adaptive
+    // policy) and accessible via the field names if needed.
+    let HostSession {
+        conn,
+        negotiated: chosen_profile,
+        client_hello: _client_hello,
+        client_decode_profiles: _client_decode_profiles,
+        idr_signal: force_idr,
+        stream_ready,
+    } = session;
 
-    let mut chosen_profile_outer: Option<VideoProfile> = None;
-    let mut client_decode_profiles_outer: Option<Vec<VideoProfile>> = None;
-    let client_hello = conn
-        .host_handshake(|hello| {
-            let ClientHello::V1(body) = hello;
-            // Parse the client's structured decode-profile advert. Absence
-            // means a legacy client built before this extension — assume
-            // the universal floor (H.264 4:2:0 8-bit) per the protocol
-            // doc on CLIENT_DECODE_PROFILES_EXTENSION_KEY.
-            // Bound the extension payload before decoding. A legitimate
-            // decode-profiles list is a handful of entries — the bincode
-            // overhead per `VideoProfile` is ~5–7 bytes, so 256 bytes
-            // accommodates dozens of profiles with headroom. The cap
-            // prevents a hostile peer from forcing the host to allocate
-            // a huge `Vec<VideoProfile>` during handshake just by setting
-            // a large length prefix; without it the only ceiling would
-            // be the 64 KiB transport frame limit, which translates to
-            // a ~13k-element allocation per connection. Cheap defense
-            // in depth.
-            const MAX_DECODE_PROFILES_BYTES: usize = 256;
-            let client_caps: Vec<VideoProfile> = body
-                .extensions
-                .get(CLIENT_DECODE_PROFILES_EXTENSION_KEY)
-                .and_then(|bytes| {
-                    if bytes.len() > MAX_DECODE_PROFILES_BYTES {
-                        warn!(
-                            payload_len = bytes.len(),
-                            cap = MAX_DECODE_PROFILES_BYTES,
-                            "client decode-profiles extension exceeds size cap; \
-                             treating as legacy H.264 4:2:0 client"
-                        );
-                        return None;
-                    }
-                    match tether_protocol::decode::<Vec<VideoProfile>>(bytes) {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                payload_len = bytes.len(),
-                                "client decode-profiles extension failed to decode; \
-                                 treating as legacy H.264 4:2:0 client"
-                            );
-                            None
-                        }
-                    }
-                })
-                .unwrap_or_else(|| vec![VideoProfile::H264_8BIT_420]);
-            info!(
-                client_decode_profiles = ?client_caps,
-                legacy_preferred_codecs = ?body.preferred_codecs,
-                "client video decode capabilities (parsed from hello)"
-            );
-            client_decode_profiles_outer = Some(client_caps.clone());
-
-            let chosen = pick_supported_profile(&host_encode_profiles, &client_caps);
-            chosen_profile_outer = chosen;
-
-            let mut extensions = std::collections::BTreeMap::new();
-            // Advertise pixel format up front so the client's
-            // decoder import path (VAAPI / VT / MF) doesn't have to
-            // wait on the first SPS to decide between formats. The
-            // value matches the negotiated (chroma, bit_depth) —
-            // NV12 for 4:2:0 8-bit, P010 for 4:2:0 10-bit, Yuv444p
-            // for 4:4:4 8-bit, P410 for 4:4:4 10-bit.
-            let pixel_format = match chosen.map(|p| (p.chroma, p.bit_depth)) {
-                Some((ChromaSubsampling::Yuv444, 10)) => {
-                    tether_protocol::control::PixelFormat::P410
-                }
-                Some((ChromaSubsampling::Yuv444, _)) => {
-                    tether_protocol::control::PixelFormat::Yuv444p
-                }
-                Some((ChromaSubsampling::Yuv420, 10)) => {
-                    tether_protocol::control::PixelFormat::P010
-                }
-                _ => tether_protocol::control::PixelFormat::Nv12,
-            };
-            extensions.insert(
-                tether_protocol::control::PIXEL_FORMAT_EXTENSION_KEY.to_string(),
-                tether_protocol::encode(&pixel_format)
-                    .expect("PixelFormat encodes; types under our control"),
-            );
-            // Echo the structured negotiation result. The inline
-            // chosen_codec / chosen_chroma fields stay for legacy clients;
-            // the structured echo is the source of truth going forward.
-            if let Some(p) = chosen {
-                extensions.insert(
-                    SERVER_ENCODE_PROFILE_EXTENSION_KEY.to_string(),
-                    tether_protocol::encode(&p)
-                        .expect("VideoProfile encodes; types under our control"),
-                );
-            }
-
-            ServerHello::V1(ServerHelloV1 {
-                server_name: "tether-host".to_string(),
-                // On no-match the response carries H264 / Yuv420 as a
-                // placeholder — the immediately-following Goodbye is what
-                // the client actually acts on. We use the universal floor
-                // (not e.g. Av1) so a buggy client that ignores the
-                // Goodbye doesn't trip on an unknown variant before it
-                // sees the goodbye message.
-                chosen_codec: chosen.map_or(CodecKind::H264, |p| p.codec),
-                chosen_chroma: chosen.map_or(ChromaSubsampling::Yuv420, |p| p.chroma),
-                // sRGB transfer, BT.709 matrix / primaries / limited
-                // range — the honest spec for every host backend we
-                // ship today (PipeWire framebuffer interpreted as
-                // gamma-encoded sRGB on Linux; SCK NV12 on macOS).
-                color_space: VideoColorSpec::sdr_desktop(),
-                // Encoded source dims aren't known yet (lazy encoder init
-                // happens on the first frame); use a placeholder and rely
-                // on per-frame VideoFrameMeta::dimensions for the truth.
-                resolution: (0, 0),
-                clock_probe_t0_echo: MonoNanos::ZERO,
-                t1_server_recv: MonoNanos::ZERO,
-                t2_server_send: MonoNanos::ZERO,
-                extensions,
-                resume_token: None,
-            })
-        })
-        .await?;
-    let ClientHello::V1(client_body) = client_hello;
-    let chosen_profile = match chosen_profile_outer {
-        Some(p) => p,
-        None => {
-            warn!(
-                client_decode_profiles = ?client_decode_profiles_outer,
-                host_encode_profiles = ?host_encode_profiles,
-                "no video profile intersects host encode + client decode capabilities; \
-                 sending Goodbye(InternalError) and ending session"
-            );
-            let _ = conn
-                .send_control(&ControlMessage::Goodbye {
-                    reason: "host and client video capabilities do not intersect".to_string(),
-                    code: tether_protocol::control::GoodbyeCode::InternalError,
-                })
-                .await;
-            return Ok(());
-        }
-    };
-    info!(
-        client = %client_body.client_name,
-        chosen_codec = ?chosen_profile.codec,
-        chosen_chroma = ?chosen_profile.chroma,
-        chosen_bit_depth = chosen_profile.bit_depth,
-        max_resolution = ?client_body.max_resolution,
-        "video profile negotiated; handshake complete"
-    );
+    // `use_test_pattern` from here on only switches the capture source;
+    // the handshake-time profile floor it implied is already baked into
+    // the negotiated profile.
 
     // Send a single placeholder cursor shape so the client's receive
     // path is exercised end-to-end. Real cursor-shape capture (querying
@@ -404,11 +289,12 @@ async fn handle_client(
     // is identical.
     let frames = pick_capture_source(use_test_pattern, chosen_profile).await?;
 
-    // Force-IDR signal: control-stream recv task `raise`s it on
+    // Force-IDR signal + stream-readiness gate were created by
+    // `HostSession::accept` and destructured at the top of this fn.
+    // `force_idr`: control-stream recv task `raise`s it on
     // `ControlMessage::ForceIdr`; the capture/encode thread `take`s it
     // each frame. Coalescing comes for free — N raises between two
     // takes produce one keyframe. See `tether_session::IdrSignal`.
-    let force_idr = tether_session::IdrSignal::new();
 
     // Shared display-dimensions channel: the capture thread learns the
     // real host display size on the first frame and posts (w, h) here;
@@ -426,13 +312,12 @@ async fn handle_client(
     // flag breaks the send loop out of its idle wait on a quiet desktop,
     // where `frames.recv` would otherwise block past disconnect detection.
     let send_shutdown = Arc::new(AtomicBool::new(false));
-    // Stream-readiness gate. The client signals it has built its
-    // decoders by sending `ControlMessage::StreamReady`; until then
-    // we drop captured frames at the head of the send loop. Without
-    // this, the first ~100-500 ms of frames race the client's
-    // decoder construction and render as garbage or get dropped on
-    // the floor (depending on which side wins).
-    let stream_ready = Arc::new(AtomicBool::new(false));
+    // `stream_ready`: gate at the head of the send loop. The client
+    // signals it has built its decoders by sending
+    // `ControlMessage::StreamReady`; until then we drop captured frames
+    // so the first ~100-500 ms don't race the client's decoder
+    // construction and render as garbage. Bound to the session in
+    // `HostSession::accept`.
     let conn_send = conn.clone();
     let force_idr_for_send = force_idr.clone();
     let send_shutdown_for_thread = send_shutdown.clone();
@@ -1575,7 +1460,21 @@ fn derive_bitrate_kbps(profile: VideoProfile, width: u32, height: u32, fps: u32)
         ChromaSubsampling::Yuv444 => codec_scaled * 14 / 10,
     };
 
-    chroma_scaled.clamp(500, 30_000) as u32
+    // 10-bit precision: extra 2 bits per sample means ~25% more entropy
+    // per pixel before motion-compensated prediction and entropy coding
+    // recover most of it. ~1.2× is the standard reference multiplier
+    // for 10-bit at the same perceptual quality as 8-bit at the same
+    // chroma. Without this term, 10-bit sessions ship at the 8-bit
+    // budget and visibly lose precision on gradients — defeating the
+    // reason a host advertised the 10-bit profile in the first place.
+    let depth_scaled = match profile.bit_depth {
+        10 => chroma_scaled * 12 / 10,
+        // 8 and any future depth fall back to no multiplier; the probe
+        // layer is the authority on which depths actually ship.
+        _ => chroma_scaled,
+    };
+
+    depth_scaled.clamp(500, 30_000) as u32
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

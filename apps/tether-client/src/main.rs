@@ -19,10 +19,8 @@ use crossbeam_channel::{bounded, Receiver as XbReceiver, Sender as XbSender};
 use tether_codec::{build_decoder, Frame as CodecFrame};
 use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame, LatestFrame};
 use tether_input::{WinitTranslator, WireEvent};
-use tether_protocol::control::{
-    ClientHello, ClientHelloV1, CodecKind, ControlMessage, GoodbyeCode, ServerHello,
-    VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY, SERVER_ENCODE_PROFILE_EXTENSION_KEY,
-};
+use tether_protocol::control::{ControlMessage, GoodbyeCode};
+use tether_session::{ClientSession, ClientSessionConfig, ConnectError};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::{Frame, RenderEvent};
@@ -60,18 +58,36 @@ async fn main() -> anyhow::Result<()> {
     let conn = Arc::new(conn);
     info!(remote = %conn.remote_address(), "connected to host");
 
-    // Client video decode capabilities. The probe in tether-codec
-    // does a real encode + decode round trip per profile against the
-    // live driver — see crates/tether-codec/src/profile_probe.rs for
-    // why a construction-only probe wasn't enough. macOS clients on
-    // M-series silicon advertise HEVC 4:4:4 here (VT decodes Main444
-    // to a `'444v'` IOSurface and the renderer's biplanar path
-    // handles it). Linux clients keep 4:4:4 if the VAAPI driver
-    // supports it. Order doesn't determine the negotiated outcome —
-    // the host's PROFILE_PREFERENCE is authoritative — but the
+    // Client video decode capabilities. The probe in tether-probe does
+    // a real encode + decode round trip per profile against the live
+    // driver — see crates/tether-codec/src/profile_probe.rs for why a
+    // construction-only probe wasn't enough. macOS clients on M-series
+    // silicon advertise HEVC 4:4:4 here (VT decodes Main444 to a
+    // `'444v'` IOSurface and the renderer's biplanar path handles it).
+    // Linux clients keep 4:4:4 if the VAAPI driver supports it. The
     // function returns profiles in PROFILE_PREFERENCE order so logs
     // look natural.
-    let client_decode_profiles = tether_probe::client_decode_profiles();
+    let mut client_decode_profiles = tether_probe::client_decode_profiles();
+    // Renderer capability gate: the 10-bit biplanar (`Biplanar16`) layout
+    // allocates `R16Unorm` Y + `Rg16Unorm` UV textures which require the
+    // adapter to advertise `TEXTURE_FORMAT_16BIT_NORM`. On adapters that
+    // don't (lavapipe, SwiftShader, very old mobile GPUs) the renderer
+    // would panic on the first 10-bit frame allocation. The codec probe
+    // alone can't see this — it doesn't build a wgpu adapter. Filter
+    // 10-bit profiles out of our advert so the host's negotiator never
+    // picks one we can't actually render.
+    if !tether_render::supports_10bit_render().await {
+        let before = client_decode_profiles.len();
+        client_decode_profiles.retain(|p| p.bit_depth == 8);
+        let dropped = before - client_decode_profiles.len();
+        if dropped > 0 {
+            info!(
+                dropped_profiles = dropped,
+                "renderer adapter lacks TEXTURE_FORMAT_16BIT_NORM; \
+                 dropping 10-bit profiles from the decode-capability advert"
+            );
+        }
+    }
     if client_decode_profiles.is_empty() {
         anyhow::bail!(
             "no hardware video decoder is available on this client \
@@ -79,139 +95,39 @@ async fn main() -> anyhow::Result<()> {
              GPU decode; there is no software fallback."
         );
     }
-    let mut hello_extensions = std::collections::BTreeMap::new();
-    hello_extensions.insert(
-        CLIENT_DECODE_PROFILES_EXTENSION_KEY.to_string(),
-        tether_protocol::encode(&client_decode_profiles)
-            .expect("VideoProfile list encodes; types under our control"),
-    );
-    info!(
-        client_decode_profiles = ?client_decode_profiles,
-        "advertising video decode capabilities to host"
-    );
 
-    // Application-layer handshake: identify ourselves, request a codec,
-    // and use the embedded probe to compute a host↔client clock offset
+    // Application-layer handshake: identify ourselves, advertise our
+    // decode profiles, resolve + validate the host's pick, and prime
+    // the host with a `ForceIdr` so the next frame is a keyframe.
+    // The clock-sync probe round-trip happens inside `client_handshake`
     // so latency logs are wall-clock-accurate from the first frame.
-    let hello = ClientHello::V1(ClientHelloV1 {
-        client_name: "tether-client".to_string(),
-        // Legacy inline advert kept for hosts that predate the
-        // structured extension. The structured extension is the source
-        // of truth on any post-phase-A host. Order: HEVC first because
-        // legacy hosts pick the first they can build.
-        preferred_codecs: vec![CodecKind::Hevc, CodecKind::H264],
-        max_resolution: None,
-        clock_probe_t0: MonoNanos::ZERO,
-        extensions: hello_extensions,
-        resume_token: None,
-    });
-    let (server_hello, clock_sync) = conn.client_handshake(hello).await?;
-    // Newer hosts may send a future ServerHello variant we don't know;
-    // bincode's enum-variant decode catches that as an error before we
-    // get here. Reaching this point means the variant decoded; we
-    // match exhaustively so a future V2 forces a compile-time update
-    // rather than a silent fallthrough.
-    let ServerHello::V1(server_body) = server_hello;
+    let session = ClientSession::connect(
+        conn.clone(),
+        ClientSessionConfig {
+            client_name: "tether-client".to_string(),
+            client_decode_profiles: client_decode_profiles.clone(),
+        },
+    )
+    .await
+    .map_err(|e| match e {
+        ConnectError::ProfileNotAdvertised { .. }
+        | ConnectError::InvalidEncodeProfile { .. }
+        | ConnectError::UnknownBitDepth(_, _) => anyhow::anyhow!("{e}"),
+        ConnectError::Transport(t) => anyhow::Error::from(t),
+    })?;
+    let ClientSession {
+        conn: _,
+        negotiated: negotiated_profile,
+        server_hello,
+        clock_sync,
+        client_decode_profiles: _,
+    } = session;
 
-    let negotiated_profile = resolve_negotiated_profile(
-        server_body
-            .extensions
-            .get(SERVER_ENCODE_PROFILE_EXTENSION_KEY)
-            .map(Vec::as_slice),
-        server_body.chosen_codec,
-        server_body.chosen_chroma,
-    )?;
-    info!(
-        server = %server_body.server_name,
-        negotiated_codec = ?negotiated_profile.codec,
-        negotiated_chroma = ?negotiated_profile.chroma,
-        negotiated_bit_depth = negotiated_profile.bit_depth,
-        resolution = ?server_body.resolution,
-        rtt_us = clock_sync.rtt_nanos / 1_000,
-        clock_offset_us = clock_sync.offset_nanos / 1_000,
-        "video profile negotiated; handshake complete"
-    );
-
-    // Cross-check the advertised pixel format against the negotiated
-    // chroma. The chroma in the encode-profile extension is what the
-    // renderer actually picks its pipeline against, so a divergence
-    // here means the host's two advertisements disagree. Log the
-    // mismatch and trust the negotiated profile (the structured cap
-    // negotiation is the authoritative source).
-    use tether_protocol::control::{ChromaSubsampling, PixelFormat, PIXEL_FORMAT_EXTENSION_KEY};
-    if let Some(pf_bytes) = server_body.extensions.get(PIXEL_FORMAT_EXTENSION_KEY) {
-        match tether_protocol::decode::<PixelFormat>(pf_bytes) {
-            Ok(pf) => {
-                // Both chroma *and* bit_depth participate — a 10-bit
-                // Main10 session ships `P010`, not `Nv12`. Mismatched
-                // expected/advertised here doesn't gate the session
-                // (the structured profile extension is authoritative)
-                // but is a real correctness signal worth warning about.
-                let expected =
-                    match (negotiated_profile.chroma, negotiated_profile.bit_depth) {
-                        (ChromaSubsampling::Yuv420, 8) => Some(PixelFormat::Nv12),
-                        (ChromaSubsampling::Yuv420, 10) => Some(PixelFormat::P010),
-                        (ChromaSubsampling::Yuv444, 8) => Some(PixelFormat::Yuv444p),
-                        (ChromaSubsampling::Yuv444, 10) => Some(PixelFormat::P410),
-                        _ => None,
-                    };
-                match expected {
-                    Some(exp) if pf == exp => {
-                        tracing::debug!(?pf, "host pixel-format extension matches negotiated chroma + bit_depth");
-                    }
-                    Some(exp) => {
-                        warn!(
-                            advertised = ?pf,
-                            expected = ?exp,
-                            negotiated_chroma = ?negotiated_profile.chroma,
-                            negotiated_bit_depth = negotiated_profile.bit_depth,
-                            "host pixel-format extension disagrees with negotiated chroma + bit_depth; \
-                             trusting the negotiated profile"
-                        );
-                    }
-                    None => {
-                        tracing::debug!(
-                            ?pf,
-                            negotiated_chroma = ?negotiated_profile.chroma,
-                            negotiated_bit_depth = negotiated_profile.bit_depth,
-                            "negotiated chroma/bit_depth combo not in pixel-format cross-check table; skipping"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "host advertised an unparseable pixel format extension");
-            }
-        }
-    }
-
-    // Sanity-check the host's chosen profile against what this client
-    // actually advertised it could decode. See
-    // `tether_codec::probe::validate_chosen_profile` for the rationale
-    // (and the unit tests on the same function for the contract).
-    if let Err(e) =
-        tether_codec::probe::validate_chosen_profile(negotiated_profile, &client_decode_profiles)
-    {
-        anyhow::bail!("{e}");
-    }
-
-    // Render channel: producer is the recv loop, consumer is the wgpu
-    // window. Bounded(2) with drop-newest semantics matches the rest of
-    // the project.
-    // Single-slot drop-oldest channel: the renderer always wants
-    // the freshest decoded frame, not a queued backlog. Cheap clone
-    // (Arc inside); the decoder thread takes one, the renderer
-    // takes another.
+    // Single-slot drop-oldest channel: the renderer always wants the
+    // freshest decoded frame, not a queued backlog. Cheap clone (Arc
+    // inside); the decoder thread takes one, the renderer takes
+    // another.
     let frames = LatestFrame::new();
-
-    // First IDR request goes out immediately after the handshake: the
-    // host's encoder always emits IDR on its very first frame, but if
-    // capture hasn't started yet (portal prompt still up, etc.) we
-    // need to make sure the *next* frame we see is a keyframe instead
-    // of joining the host's P-frame chain mid-GOP.
-    if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
-        warn!(error = ?e, "initial ForceIdr send failed; continuing anyway");
-    }
 
     // Receive-side control loop. Today the host doesn't initiate any
     // typed messages we need to act on, but the Extension escape and
@@ -345,7 +261,21 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
         if decoder_ready_rx.await.is_err() {
-            warn!("decode thread failed to initialise; aborting recv loop");
+            // Decoder construction failed and the thread dropped the
+            // sender without signalling ready. The host has no other
+            // way to learn we won't ever render its frames, so send a
+            // Goodbye(InternalError) before exiting — otherwise the
+            // host keeps encoding into a black hole until idle
+            // timeout, and the user sees a frozen window with no
+            // explanation. `say_goodbye_with_code` closes the
+            // connection as part of its shutdown.
+            error!("decode thread failed to initialise; sending Goodbye(InternalError) and exiting");
+            say_goodbye_with_code(
+                &conn_ready,
+                "client decoder failed to initialise",
+                GoodbyeCode::InternalError,
+            )
+            .await;
             return;
         }
         // Decoder is up; tell the host to start streaming. `audio: false`
@@ -688,7 +618,7 @@ async fn main() -> anyhow::Result<()> {
     tether_render::run(
         "tether-client",
         (INITIAL_WIDTH, INITIAL_HEIGHT),
-        server_body.color_space,
+        server_hello.color_space,
         negotiated_profile.chroma,
         negotiated_profile.bit_depth,
         frames,
@@ -718,10 +648,22 @@ async fn main() -> anyhow::Result<()> {
 /// and the cap bounds shutdown latency on a high-RTT link where the
 /// peer may already be unreachable anyway.
 async fn say_goodbye(conn: &tether_transport::Connection, reason: &str) {
+    say_goodbye_with_code(conn, reason, GoodbyeCode::Clean).await;
+}
+
+/// Variant that lets the caller signal *why* the session ended.
+/// Use [`GoodbyeCode::InternalError`] for fatal local failures (decoder
+/// init failed, render thread died) so the host's session-end log
+/// distinguishes a genuine crash from a user closing the window.
+async fn say_goodbye_with_code(
+    conn: &tether_transport::Connection,
+    reason: &str,
+    code: GoodbyeCode,
+) {
     use std::time::Duration;
     let msg = ControlMessage::Goodbye {
         reason: reason.to_string(),
-        code: GoodbyeCode::Clean,
+        code,
     };
     if let Err(e) = conn.send_control(&msg).await {
         warn!(error = ?e, "send Goodbye failed; host will fall back to timeout");
@@ -949,110 +891,6 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
         .with_writer(writer)
         .init();
     guard
-}
-
-/// Resolve the negotiated [`VideoProfile`] from a [`ServerHelloV1`].
-///
-/// Three cases the host can leave us in:
-///
-///   1. **Extension present and decodes.** The structured
-///      `tether.cap.video.encode-profile` payload is authoritative —
-///      carries codec, chroma, and `bit_depth` together.
-///   2. **Extension absent.** Genuine legacy host. The inline
-///      `chosen_codec` / `chosen_chroma` on `ServerHelloV1` are the
-///      source of truth, and `bit_depth = 8` is safe because legacy
-///      hosts predate any 10-bit advertisement.
-///   3. **Extension present but undecodable.** A newer host with a
-///      payload shape this client can't parse. Bail. Falling through
-///      to the inline 8-bit assumption would silently downgrade a
-///      10-bit (or future-encoded) host to an 8-bit client decoder
-///      pipeline and feed it data it can't interpret. The host
-///      *tried* to advertise something specific; we don't fabricate
-///      a substitute.
-fn resolve_negotiated_profile(
-    extension_bytes: Option<&[u8]>,
-    chosen_codec: tether_protocol::control::CodecKind,
-    chosen_chroma: tether_protocol::control::ChromaSubsampling,
-) -> anyhow::Result<VideoProfile> {
-    match extension_bytes {
-        Some(bytes) => tether_protocol::decode::<VideoProfile>(bytes).map_err(|e| {
-            anyhow::anyhow!(
-                "host encode-profile extension failed to decode ({e}, \
-                 payload_len={}); refusing to fall back to the inline \
-                 8-bit assumption — a future 10-bit host with an \
-                 unexpected payload shape would silently downgrade. \
-                 The host should be updated to emit a profile this \
-                 client can parse.",
-                bytes.len()
-            )
-        }),
-        None => Ok(VideoProfile {
-            codec: chosen_codec,
-            chroma: chosen_chroma,
-            bit_depth: 8,
-        }),
-    }
-}
-
-#[cfg(test)]
-mod resolve_profile_tests {
-    use super::*;
-    use tether_protocol::control::{ChromaSubsampling, CodecKind};
-
-    #[test]
-    fn extension_present_and_decodes_is_authoritative() {
-        let profile = VideoProfile {
-            codec: CodecKind::Hevc,
-            chroma: ChromaSubsampling::Yuv444,
-            bit_depth: 10,
-        };
-        let bytes = tether_protocol::encode(&profile).unwrap();
-        let resolved = resolve_negotiated_profile(
-            Some(&bytes),
-            // Inline fields deliberately *disagree* with the extension
-            // — the extension wins.
-            CodecKind::H264,
-            ChromaSubsampling::Yuv420,
-        )
-        .unwrap();
-        assert_eq!(resolved, profile);
-    }
-
-    #[test]
-    fn extension_absent_synthesizes_8bit_legacy_profile() {
-        let resolved = resolve_negotiated_profile(
-            None,
-            CodecKind::Hevc,
-            ChromaSubsampling::Yuv420,
-        )
-        .unwrap();
-        assert_eq!(resolved.codec, CodecKind::Hevc);
-        assert_eq!(resolved.chroma, ChromaSubsampling::Yuv420);
-        assert_eq!(resolved.bit_depth, 8);
-    }
-
-    #[test]
-    fn extension_present_but_undecodable_bails_rather_than_falling_back() {
-        // Garbage bytes that can't possibly decode as a VideoProfile.
-        // The fallback to inline-8-bit would silently downgrade a
-        // future 10-bit host; we want the error instead.
-        let garbage = [0xFFu8; 3];
-        let err = resolve_negotiated_profile(
-            Some(&garbage),
-            CodecKind::Hevc,
-            ChromaSubsampling::Yuv420,
-        )
-        .expect_err("undecodable extension should refuse the 8-bit fallback");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("encode-profile extension failed to decode"),
-            "error should explain the decode failure; got: {msg}"
-        );
-        assert!(
-            msg.contains("8-bit"),
-            "error should mention the 8-bit fallback we're refusing; got: {msg}"
-        );
-    }
 }
 
 fn hex_decode(s: &str) -> anyhow::Result<[u8; 32]> {

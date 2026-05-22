@@ -43,6 +43,8 @@ pub use winit::keyboard::{KeyCode, ModifiersState};
 #[cfg(target_os = "macos")]
 pub use gpu::accepts_iosurface_fourcc;
 
+pub use gpu::supports_10bit_render;
+
 /// One frame ready for display. Either the pixels live in CPU memory
 /// and need an `R8` + `Rg8` upload (the SW decoder path), or they live
 /// on the GPU as a DMA-BUF exported from a HW decoder surface and the

@@ -233,6 +233,54 @@ fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
     }
 }
 
+/// Whether the renderer can allocate the `R16Unorm` Y + `Rg16Unorm` UV
+/// textures used by the 10-bit biplanar (`Biplanar16`) layout.
+///
+/// Probes the same adapter the renderer would pick on this host
+/// (`HighPerformance`, no surface tied) and reports whether
+/// `wgpu::Features::TEXTURE_FORMAT_16BIT_NORM` is advertised. Run this
+/// at handshake time so the client's decode-capability advert can
+/// filter out 10-bit profiles on adapters that wouldn't be able to
+/// render the frames anyway (lavapipe, SwiftShader, very old mobile
+/// GPUs).
+///
+/// On adapter-init failure this returns `false` — better to under-
+/// advertise and have negotiation pick a working 8-bit profile than to
+/// claim 10-bit support and panic on the first frame allocation. The
+/// renderer's own `GpuState::new` will surface a real error at session
+/// start if no adapter can be found at all.
+///
+/// Note that this probe and `GpuState::new`'s feature check run
+/// independent `request_adapter` calls. On multi-GPU hosts (laptop
+/// igpu + dgpu) those two calls *could* in principle pick different
+/// adapters with different feature sets — the probe says yes, the
+/// real renderer picks a different adapter and lacks the feature.
+/// `GpuState::new` remains the authoritative gate (it opts the
+/// feature in iff the renderer's own adapter advertises it), so the
+/// worst case is a 10-bit session that builds the decoder, fails at
+/// `make_yuv_textures`, and panics — same failure mode as before
+/// the probe existed, just narrower. Closing the gap fully would
+/// mean sharing one adapter handle between this probe and
+/// `GpuState::new`, which is more plumbing than the residual risk
+/// justifies today.
+pub async fn supports_10bit_render() -> bool {
+    let instance = wgpu::Instance::default();
+    let Ok(adapter) = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+    else {
+        return false;
+    };
+    adapter
+        .features()
+        .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+}
+
 impl GpuState {
     pub(crate) async fn new(
         window: Arc<Window>,
@@ -296,11 +344,11 @@ impl GpuState {
         // don't (lavapipe / SwiftShader / very old mobile), the
         // negotiator would still pick a 10-bit profile and we'd
         // panic at `make_yuv_textures` on first frame allocation.
-        // FIXME: the symmetric gate — `tether-render` exposing a
-        // `supports_10_bit_render()` probe that the client calls
-        // before assembling `supported_decode_profiles()` — would
-        // close that residual gap. The codec layer's profile probe
-        // doesn't see renderer features today.
+        // The client filters 10-bit profiles out of its decode-capability
+        // advert when this feature is absent (`supports_10bit_render`),
+        // so by the time we reach here, negotiation has already picked
+        // an 8-bit profile if we're on such an adapter — the opt-in
+        // below is harmless either way.
         if adapter_features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
             required |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
         }

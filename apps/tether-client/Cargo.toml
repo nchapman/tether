@@ -20,6 +20,7 @@ tether-render = { workspace = true }
 tether-input = { workspace = true }
 tether-codec = { workspace = true }
 tether-probe = { workspace = true }
+tether-session = { workspace = true }
 
 [lints]
 workspace = true

@@ -18,15 +18,12 @@ use std::sync::Arc;
 use tether_gpuconvert::{export_texture_as_dmabuf, Nv12DmaBuf};
 use tether_scaler::{ColorSpace, Pipelines, Scaler};
 
-#[test]
-#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
-fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
-    // Source 64×64 solid red. Downscale to 32×32 via the Mitchell
-    // shader, convert through the NV12 bridge built at the encode
-    // dims (32×32), read back the Y plane.
-    let capture = (64u32, 64u32);
-    let encode = (32u32, 32u32);
-
+/// Helper: run capture (BGRA dma-buf) -> scaler -> Nv12 bridge for the
+/// given dims pair. Asserts the wiring runs to completion without
+/// rejection. Solid-red input keeps the test stable across whatever
+/// the scaler produces; the bridge's `convert()` is the contract
+/// under test, not the visual result.
+fn run_scaler_to_nv12_chain(capture: (u32, u32), encode: (u32, u32)) {
     let bridge = match pollster::block_on(Nv12DmaBuf::new(encode.0, encode.1)) {
         Ok(b) => b,
         Err(e) => {
@@ -34,11 +31,6 @@ fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
             return;
         }
     };
-
-    // Stand in for PipeWire: export a BGRA dma-buf on the bridge's
-    // device and fill with solid red (B=0, G=0, R=255). The bridge's
-    // device is shared with the scaler so the imported texture is
-    // directly usable as the scaler's source.
     let src_export = export_texture_as_dmabuf(
         bridge.device(),
         capture.0,
@@ -51,7 +43,7 @@ fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
     let n = (capture.0 * capture.1) as usize;
     let mut bgra = Vec::with_capacity(n * 4);
     for _ in 0..n {
-        bgra.extend_from_slice(&[0, 0, 255, 255]); // pure red (BGRA byte order)
+        bgra.extend_from_slice(&[0, 0, 255, 255]);
     }
     bridge.queue().write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -90,7 +82,6 @@ fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
         )
         .expect("import_bgra_dmabuf");
 
-    // Build scaler sharing the bridge's device.
     let pipelines = Arc::new(Pipelines::build(bridge.device()));
     let scaler = Scaler::new_with_color_space(
         pipelines,
@@ -104,17 +95,27 @@ fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
     let scaled = scaler.scale(&imported).expect("scaler scale");
     assert_eq!(scaled.format(), wgpu::TextureFormat::Rgba8Unorm);
 
-    // Bridge ingests the scaler's Rgba8Unorm output. This is the wire
-    // that previously required Bgra8Unorm; if the bridge change is
-    // wrong, convert() returns InputFormat here.
     let _nv12 = bridge.convert(scaled).expect("Nv12DmaBuf::convert");
+}
 
-    // Successful end-to-end run is the test signal: the bridge
-    // accepted the scaler output, the compute pass ran, and the
-    // output dma-buf was produced without error. Reading back the
-    // chroma to assert a specific Y value would require the same
-    // dma-buf round-trip apparatus as `convert_via_imported_bgra` and
-    // duplicates that coverage. This test's contract is "the wiring
-    // works"; quality is verified upstream in the scaler crate's
-    // own hardware tests.
+/// 2× downscale: no mip prefilter triggered; pure Mitchell
+/// horizontal + vertical from 64×64 → 32×32. This is the wiring
+/// smoke test for the host's encode path: BGRA dma-buf → scaler
+/// Rgba8Unorm → chroma bridge accepts the Rgba8Unorm input.
+#[test]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
+    run_scaler_to_nv12_chain((64, 64), (32, 32));
+}
+
+/// 4× downscale exercises the scaler's 2× box mip prefilter path
+/// (one mip level). The mip pass reads the original `Bgra8Unorm`
+/// imported dma-buf as `texture_2d<f32>` — without this test, no
+/// hardware suite covers the Bgra8Unorm → mip_box_down binding,
+/// and a backend that validated the binding more strictly than
+/// the dev machine would silently fail in production.
+#[test]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+fn scaler_heavy_downscale_through_mip_prefilter_into_bridge() {
+    run_scaler_to_nv12_chain((256, 256), (64, 64));
 }

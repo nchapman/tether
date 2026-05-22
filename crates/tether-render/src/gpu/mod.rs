@@ -155,11 +155,16 @@ pub(crate) struct UpscaleStage {
     /// in at least one axis. Rebuilt on window resize or video
     /// dims change.
     scaler: Option<tether_scaler::Scaler>,
-    /// Sticky flag set when scaler construction fails for the
-    /// current (video, window) pair. Without this we'd retry every
-    /// frame, logging a warn at video frame rate. Cleared whenever
-    /// video dims change (a device reset can become valid again).
-    scaler_failed: bool,
+    /// Sticky failure marker: when scaler construction fails for a
+    /// given target `upscale_dims`, we record those dims so the
+    /// per-frame retry-loop skips that specific construction without
+    /// silencing future attempts at a *different* set of dims (e.g.
+    /// the user resizes the window again and the new ratio happens
+    /// to compile fine). `None` means "no known failure" — try
+    /// construction normally. Without the per-dims keying, a
+    /// failure at one ratio would mask later valid ratios for as
+    /// long as the video dims stayed the same.
+    scaler_failed_for: Option<(u32, u32)>,
     /// Blit pipeline + bind-group layout for the swapchain pass.
     /// Samples an Rgba16Float texture with the project-standard
     /// bilinear letterbox. Bind groups are rebuilt per render
@@ -797,7 +802,7 @@ impl GpuState {
             intermediate_dims: (0, 0),
             scaler_pipelines: None,
             scaler: None,
-            scaler_failed: false,
+            scaler_failed_for: None,
             blit_pipeline,
             blit_bgl,
             blit_sampler,
@@ -1029,7 +1034,7 @@ impl GpuState {
             self.upscale.rgb_intermediate = Some(make_rgb_intermediate(&self.device, video_dims));
             self.upscale.intermediate_dims = video_dims;
             self.upscale.scaler = None;
-            self.upscale.scaler_failed = false;
+            self.upscale.scaler_failed_for = None;
         }
         // Decide if we need to (re)build the Mitchell scaler:
         // upscale only, never for window ≤ video. Skipping the
@@ -1043,7 +1048,7 @@ impl GpuState {
             video_dims
         };
         let scaler_needs_rebuild = need_upscale
-            && !self.upscale.scaler_failed
+            && self.upscale.scaler_failed_for != Some(upscale_dims)
             && self
                 .upscale
                 .scaler
@@ -1066,7 +1071,7 @@ impl GpuState {
                         "Mitchell upscale scaler construction failed; falling back to bilinear blit for this (video, window) pair"
                     );
                     self.upscale.scaler = None;
-                    self.upscale.scaler_failed = true;
+                    self.upscale.scaler_failed_for = Some(upscale_dims);
                 }
             }
         } else if !need_upscale {

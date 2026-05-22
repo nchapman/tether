@@ -209,6 +209,62 @@ fn psnr_db(mse: f64) -> f64 {
     }
 }
 
+/// 2D SSIM (Structural Similarity Index) per channel, averaged.
+/// SSIM is a perceptual metric — it catches structured error patterns
+/// (ringing, edge smearing) that PSNR is blind to. Computed over an
+/// 8×8 sliding window (smaller than the canonical 11×11 for test speed;
+/// the difference is < 0.001 on natural images). Returns a value in
+/// `[-1, 1]`, where 1.0 is identical and ≥ 0.99 is "perceptually
+/// indistinguishable" on natural content.
+fn ssim_rgb(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
+    assert_eq!(a.len(), b.len());
+    const WIN: i32 = 8;
+    // SSIM constants per Wang et al. 2004; K1=0.01, K2=0.03, L=255.
+    let c1: f64 = (0.01_f64 * 255.0).powi(2);
+    let c2: f64 = (0.03_f64 * 255.0).powi(2);
+    let mut total = 0.0_f64;
+    let mut n_windows: u64 = 0;
+    let w = width as i32;
+    let h = height as i32;
+    for wy in 0..(h - WIN + 1).max(0) {
+        for wx in 0..(w - WIN + 1).max(0) {
+            for ch in 0..3 {
+                let mut sum_a = 0.0_f64;
+                let mut sum_b = 0.0_f64;
+                let mut sum_aa = 0.0_f64;
+                let mut sum_bb = 0.0_f64;
+                let mut sum_ab = 0.0_f64;
+                let n_pix = (WIN * WIN) as f64;
+                for dy in 0..WIN {
+                    for dx in 0..WIN {
+                        let off = (((wy + dy) * w + (wx + dx)) * 4 + ch) as usize;
+                        let pa = f64::from(a[off]);
+                        let pb = f64::from(b[off]);
+                        sum_a += pa;
+                        sum_b += pb;
+                        sum_aa += pa * pa;
+                        sum_bb += pb * pb;
+                        sum_ab += pa * pb;
+                    }
+                }
+                let mu_a = sum_a / n_pix;
+                let mu_b = sum_b / n_pix;
+                let var_a = (sum_aa / n_pix) - mu_a * mu_a;
+                let var_b = (sum_bb / n_pix) - mu_b * mu_b;
+                let cov_ab = (sum_ab / n_pix) - mu_a * mu_b;
+                let num = (2.0 * mu_a * mu_b + c1) * (2.0 * cov_ab + c2);
+                let den = (mu_a * mu_a + mu_b * mu_b + c1) * (var_a + var_b + c2);
+                total += num / den;
+                n_windows += 1;
+            }
+        }
+    }
+    if n_windows == 0 {
+        return 1.0;
+    }
+    total / (n_windows as f64)
+}
+
 /// Max absolute per-channel difference (excluding alpha).
 fn max_abs_diff_rgb(a: &[u8], b: &[u8]) -> u8 {
     assert_eq!(a.len(), b.len());
@@ -288,25 +344,34 @@ fn assert_matches_reference(
     let mse = mse_rgb(&gpu_out, &ref_out);
     let psnr = psnr_db(mse);
     let max_diff = max_abs_diff_rgb(&gpu_out, &ref_out);
+    let ssim = ssim_rgb(&gpu_out, &ref_out, dst_w, dst_h);
     println!(
-        "{case_label}: {}x{} -> {}x{} (mip levels {}) — PSNR {:.2} dB, max diff {max_diff}",
+        "{case_label}: {}x{} -> {}x{} (mip levels {}) — PSNR {:.2} dB, SSIM {:.4}, max diff {max_diff}",
         src_w,
         src_h,
         dst_w,
         dst_h,
         scaler.mip_levels(),
         psnr,
+        ssim,
     );
-    // Measured baseline (Vulkan/Linux trunk wgpu): 57–inf dB across
-    // the test matrix, max diff 0–1. Floor is set 7 dB below the worst
-    // observed result to absorb backend variation (Metal vs Vulkan
+    // Measured baseline (Vulkan/Linux trunk wgpu): PSNR 57–inf dB,
+    // SSIM > 0.999 across the test matrix, max diff 0–1. Floors are
+    // set conservatively to absorb backend variation (Metal vs Vulkan
     // fp16 arithmetic can differ by 1–2 ULP in the last mantissa bit)
-    // while still catching real regressions. 50 dB is a ~3000× tighter
-    // MSE bound than the original 38; below this means the shader is
-    // visibly diverging from the spec.
+    // while still catching real regressions.
+    //
+    // SSIM ≥ 0.995 catches structured error patterns (ringing, edge
+    // smearing) that PSNR alone is blind to — Wang et al. (2004)
+    // argue this is the more important number for perceptual filter
+    // verification, and the plan's quality bar called for both.
     assert!(
         psnr >= 50.0,
         "{case_label}: PSNR {psnr:.2} dB below 50 (mse {mse:.2})"
+    );
+    assert!(
+        ssim >= 0.995,
+        "{case_label}: SSIM {ssim:.4} below 0.995 — possible structured error"
     );
     assert!(
         max_diff <= 2,

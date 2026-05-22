@@ -799,6 +799,17 @@ struct EncoderSlot {
     /// phase-2 follow-up tracked in ARCHITECTURE.md.
     #[cfg(target_os = "linux")]
     scaler: Option<Scaler>,
+    /// Compiled Mitchell shader pipelines, cached across scaler
+    /// rebuilds. Without this, every viewport change recompiles
+    /// five WGSL compute pipelines from scratch — on Vulkan that's
+    /// a few hundred microseconds, on Metal / DX12 it's 50–200 ms
+    /// per pipeline. The `Scaler` itself holds a clone of this
+    /// `Arc` (so the actual `Pipelines` only drop when both
+    /// references are gone), but storing it on the slot lets the
+    /// next scaler reuse the compiled pipelines without going
+    /// through `ScalerPipelines::build` again.
+    #[cfg(target_os = "linux")]
+    scaler_pipelines: Option<Arc<ScalerPipelines>>,
 }
 
 /// Per-encoder adaptive bitrate state.
@@ -858,21 +869,22 @@ fn bridge_device_queue(b: &GpuConvertBridge) -> (wgpu::Device, wgpu::Queue) {
     }
 }
 
-/// Compile scaler pipelines + construct a Scaler for the given (src,
-/// dst). The Scaler holds the pipelines internally via Arc, so we
-/// don't need to retain a separate handle in the slot — when the
-/// slot is destroyed (on resolution change) the pipelines drop with
-/// it. Future "rebuild scaler with new dims but keep the pipelines"
-/// fast-path would expose `pipelines.clone()` here for the caller to
-/// stash; today there's no such caller.
+/// Build a Mitchell scaler for the given (src, dst), reusing the
+/// pre-compiled pipelines from `cached_pipelines` if present.
+/// Lazily compiles on first call per slot; subsequent calls (e.g.
+/// a viewport change) clone the cached Arc instead of re-running
+/// the shader compilation.
 #[cfg(target_os = "linux")]
 fn build_scaler_for_slot(
     device: wgpu::Device,
     queue: wgpu::Queue,
+    cached_pipelines: &mut Option<Arc<ScalerPipelines>>,
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
 ) -> Result<Scaler, ScalerError> {
-    let pipelines = Arc::new(ScalerPipelines::build(&device));
+    let pipelines = cached_pipelines
+        .get_or_insert_with(|| Arc::new(ScalerPipelines::build(&device)))
+        .clone();
     Scaler::new(pipelines, device, queue, src_dims, dst_dims)
 }
 
@@ -999,6 +1011,7 @@ fn encode_gpu_frame(
                 match build_scaler_for_slot(
                     device,
                     queue,
+                    &mut slot.scaler_pipelines,
                     (slot.capture_width, slot.capture_height),
                     (slot.width, slot.height),
                 ) {
@@ -1732,6 +1745,8 @@ fn run_capture_and_send(
                         bridge: BridgeState::NotYetBuilt,
                         #[cfg(target_os = "linux")]
                         scaler: None,
+                        #[cfg(target_os = "linux")]
+                        scaler_pipelines: None,
                     })
                 }
                 Err(e) => {

@@ -25,6 +25,16 @@ tether-session = { workspace = true }
 # capture→encode path. The non-Linux build does CPU-side encode only.
 [target.'cfg(target_os = "linux")'.dependencies]
 tether-gpuconvert = { workspace = true }
+# Mitchell-Netravali downscaler inserted between PipeWire's BGRA
+# DMA-BUF import and the chroma bridge when the client's viewport
+# is smaller than the capture. macOS host has SCK do the scaling at
+# capture time and doesn't link the scaler in this phase — see
+# ARCHITECTURE.md for the phase-2 plan.
+tether-scaler = { workspace = true }
+# Direct wgpu::Device / wgpu::Queue / wgpu::Texture types in the
+# scaler glue. Same trunk pin as tether-render / tether-gpuconvert via
+# workspace [patch.crates-io].
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9" }
 # pollster::block_on lets us drive Nv12DmaBuf::new (async) from the
 # synchronous send-thread context. Already a transitive dep through
 # tether-gpuconvert; declared directly here to make the use explicit.

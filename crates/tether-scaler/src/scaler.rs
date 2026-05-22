@@ -15,8 +15,11 @@ use crate::pipeline::Pipelines;
 use crate::reference::{tap_count, MAX_TAPS};
 use crate::ScalerError;
 
-// Re-use the shader compilation across Scaler rebuilds.
-type PipelineHandle = Arc<Pipelines>;
+/// Shared, pre-compiled [`Pipelines`] reused across [`Scaler`]
+/// rebuilds. wgpu's `Device` / `Queue` are themselves cheap handle
+/// types (Arc-backed internally) so they're stored owned, not behind
+/// an outer Arc.
+pub type PipelineHandle = Arc<Pipelines>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
@@ -34,8 +37,8 @@ struct Params {
 /// allocated up front so a per-frame `scale()` call only records and
 /// submits a command buffer.
 pub struct Scaler {
-    device: Arc<Device>,
-    queue: Arc<Queue>,
+    device: Device,
+    queue: Queue,
     pipelines: PipelineHandle,
 
     /// Box-filter mip outputs. Length = number of mip passes; level 0
@@ -77,8 +80,8 @@ impl Scaler {
     ///   doesn't trip this error — that's the client path.
     pub fn new(
         pipelines: PipelineHandle,
-        device: Arc<Device>,
-        queue: Arc<Queue>,
+        device: Device,
+        queue: Queue,
         src_dims: (u32, u32),
         dst_dims: (u32, u32),
     ) -> Result<Self, ScalerError> {

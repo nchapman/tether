@@ -23,7 +23,7 @@ use wgpu::util::DeviceExt;
 
 /// Build a wgpu device for tests. No special features required —
 /// the scaler uses only core wgpu (Rgba16Float storage is core).
-async fn build_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+async fn build_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -45,7 +45,7 @@ async fn build_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
         })
         .await
         .ok()?;
-    Some((Arc::new(device), Arc::new(queue)))
+    Some((device, queue))
 }
 
 /// Upload an RGBA8 buffer as a `Rgba8Unorm` texture suitable for
@@ -254,8 +254,8 @@ fn fiducial_channel_order_red_stays_red() {
 /// precision in the intermediate texture; tightening below this
 /// chases noise.
 fn assert_matches_reference(
-    device: &Arc<wgpu::Device>,
-    queue: &Arc<wgpu::Queue>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     pipelines: &Arc<Pipelines>,
     src_w: u32,
     src_h: u32,

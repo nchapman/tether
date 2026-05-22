@@ -3410,12 +3410,14 @@ dependencies = [
  "tether-probe",
  "tether-protocol",
  "tether-render",
+ "tether-scaler",
  "tether-session",
  "tether-transport",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "wgpu",
 ]
 
 [[package]]

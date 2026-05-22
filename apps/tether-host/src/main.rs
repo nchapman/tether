@@ -31,6 +31,8 @@ use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 use tether_gpuconvert::{
     Bgra2P010DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
 };
+#[cfg(target_os = "linux")]
+use tether_scaler::{Pipelines as ScalerPipelines, Scaler, ScalerError};
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ControlMessage, VideoProfile, Viewport,
 };
@@ -783,6 +785,26 @@ struct EncoderSlot {
     /// silent per-frame drop.
     #[cfg(target_os = "linux")]
     bridge: BridgeState,
+    /// Mitchell-Netravali downscaler inserted between PipeWire's BGRA
+    /// dma-buf import and the gpuconvert bridge when the client's
+    /// viewport calls for a smaller encode than the capture size.
+    /// `None` when `capture_dims == encode_dims` (1:1 pass-through;
+    /// the bridge consumes the imported texture directly). Lazily
+    /// built alongside the bridge so it can reuse the bridge's wgpu
+    /// device — see `build_scaler_for_slot`.
+    ///
+    /// macOS host has no equivalent here: SCK already does the
+    /// scaling at capture time via `SCStreamConfiguration.width/
+    /// height`. Unifying the Mac host path on this shader is the
+    /// phase-2 follow-up tracked in ARCHITECTURE.md.
+    #[cfg(target_os = "linux")]
+    scaler: Option<Scaler>,
+    /// Shared scaler shader compilation. Held alongside the slot so
+    /// it's destroyed when the slot is (a resolution change destroys
+    /// the bridge's device too, so caching across rebuilds would
+    /// dangle).
+    #[cfg(target_os = "linux")]
+    scaler_pipelines: Option<Arc<ScalerPipelines>>,
 }
 
 /// Per-encoder adaptive bitrate state.
@@ -827,6 +849,51 @@ enum GpuEncodeOutcome {
     Packets(Vec<tether_codec::EncodedPacket>),
     DropFrame(anyhow::Error),
     Fatal(anyhow::Error),
+}
+
+/// Borrow the bridge's wgpu device + queue for sharing with the
+/// scaler. Both are cheap-to-clone handle types (Arc-backed
+/// internally) so cloning here costs an atomic increment, not a real
+/// resource alloc.
+#[cfg(target_os = "linux")]
+fn bridge_device_queue(b: &GpuConvertBridge) -> (wgpu::Device, wgpu::Queue) {
+    match b {
+        GpuConvertBridge::Nv12(b) => (b.device().clone(), b.queue().clone()),
+        GpuConvertBridge::Yuv444(b) => (b.device().clone(), b.queue().clone()),
+        GpuConvertBridge::P010(b) => (b.device().clone(), b.queue().clone()),
+    }
+}
+
+/// Compile scaler pipelines + construct a Scaler for the given (src,
+/// dst). Returns the shared pipelines so the slot owns them across
+/// any future per-frame scaler rebuilds (none today; placeholder for
+/// the renderer-side path where the device is long-lived).
+#[cfg(target_os = "linux")]
+fn build_scaler_for_slot(
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    src_dims: (u32, u32),
+    dst_dims: (u32, u32),
+) -> Result<(Arc<ScalerPipelines>, Scaler), ScalerError> {
+    let pipelines = Arc::new(ScalerPipelines::build(&device));
+    let scaler = Scaler::new(pipelines.clone(), device, queue, src_dims, dst_dims)?;
+    Ok((pipelines, scaler))
+}
+
+/// If `scaler` is `Some`, run it on `imported` and return a reference
+/// to the scaler's output texture. Otherwise return `imported`. The
+/// lifetime ties to whichever is borrowed.
+#[cfg(target_os = "linux")]
+fn scale_if_needed<'a>(
+    scaler: Option<&'a Scaler>,
+    imported: &'a wgpu::Texture,
+) -> Result<&'a wgpu::Texture, anyhow::Error> {
+    match scaler {
+        Some(s) => s
+            .scale(imported)
+            .map_err(|e| anyhow::anyhow!("Scaler::scale: {e}")),
+        None => Ok(imported),
+    }
 }
 
 /// Encode one PipeWire-supplied DMA-BUF frame through the zero-copy
@@ -913,6 +980,47 @@ fn encode_gpu_frame(
                 "gpuconvert bridge initialised for zero-copy DMA-BUF encode"
             );
             slot.bridge = BridgeState::Ready(built);
+
+            // Build the Mitchell downscaler if the client viewport
+            // means we're encoding smaller than the capture. Sharing
+            // the bridge's wgpu device keeps the imported BGRA
+            // texture, the scaler scratch, and the chroma output all
+            // on the same GPU context — no cross-device copies.
+            if slot.capture_width != slot.width || slot.capture_height != slot.height {
+                let BridgeState::Ready(b) = &slot.bridge else {
+                    unreachable!()
+                };
+                let (device, queue) = bridge_device_queue(b);
+                match build_scaler_for_slot(
+                    device,
+                    queue,
+                    (slot.capture_width, slot.capture_height),
+                    (slot.width, slot.height),
+                ) {
+                    Ok((pipelines, scaler)) => {
+                        info!(
+                            capture_w = slot.capture_width,
+                            capture_h = slot.capture_height,
+                            encode_w = slot.width,
+                            encode_h = slot.height,
+                            mip_levels = scaler.mip_levels(),
+                            "Mitchell scaler built for viewport downscale"
+                        );
+                        slot.scaler = Some(scaler);
+                        slot.scaler_pipelines = Some(pipelines);
+                    }
+                    Err(e) => {
+                        return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                            "scaler construction failed for {}x{} -> {}x{}: {e}",
+                            slot.capture_width,
+                            slot.capture_height,
+                            slot.width,
+                            slot.height,
+                        ));
+                    }
+                }
+            }
+
             let BridgeState::Ready(b) = &mut slot.bridge else {
                 unreachable!()
             };
@@ -931,6 +1039,15 @@ fn encode_gpu_frame(
     let _ = fourcc; // PipeWire-side fourcc is informational; the
                     // shader treats input as BGRA regardless.
 
+    // Helper: if the slot has a scaler, run it on the imported BGRA
+    // and return the scaled texture; otherwise return the imported
+    // texture unchanged. The returned reference borrows either from
+    // `imported` (no-scale) or from `scaler.output()` (scaler held by
+    // the slot, lifetime-bound to slot).
+    //
+    // Coded as a `match` not a helper because the borrow checker
+    // doesn't love mixing borrows of `imported` (local) and
+    // `slot.scaler` (caller-owned) through a function boundary.
     let codec_frame = match bridge {
         GpuConvertBridge::Nv12(b) => {
             let imported = match b.import_bgra_dmabuf(fd, modifier, stride, offset) {
@@ -941,7 +1058,11 @@ fn encode_gpu_frame(
                     ));
                 }
             };
-            let nv12 = match b.convert(&imported) {
+            let bridge_input = match scale_if_needed(slot.scaler.as_ref(), &imported) {
+                Ok(t) => t,
+                Err(e) => return GpuEncodeOutcome::DropFrame(e),
+            };
+            let nv12 = match b.convert(bridge_input) {
                 Ok(f) => f,
                 Err(e) => {
                     return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
@@ -961,7 +1082,11 @@ fn encode_gpu_frame(
                     ));
                 }
             };
-            let yuv = match b.convert(&imported) {
+            let bridge_input = match scale_if_needed(slot.scaler.as_ref(), &imported) {
+                Ok(t) => t,
+                Err(e) => return GpuEncodeOutcome::DropFrame(e),
+            };
+            let yuv = match b.convert(bridge_input) {
                 Ok(f) => f,
                 Err(e) => {
                     return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
@@ -981,7 +1106,11 @@ fn encode_gpu_frame(
                     ));
                 }
             };
-            let p010 = match b.convert(&imported) {
+            let bridge_input = match scale_if_needed(slot.scaler.as_ref(), &imported) {
+                Ok(t) => t,
+                Err(e) => return GpuEncodeOutcome::DropFrame(e),
+            };
+            let p010 = match b.convert(bridge_input) {
                 Ok(f) => f,
                 Err(e) => {
                     return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
@@ -1465,18 +1594,19 @@ fn run_capture_and_send(
             let g = latest_viewport.lock().unwrap();
             (g.viewport, g.seq)
         };
-        // Viewport-driven downscale is wired for CPU frames today.
-        // GPU frames (DMA-BUF / IOSurface) would need a wgpu compute
-        // scaler that decouples encode dims from capture dims; until
-        // that lands they encode at capture dims regardless of
-        // viewport. We still bump the seq counter so the encoder
-        // rebuild fires once the source switches to a CPU path.
-        let viewport_applicable = matches!(frame, CapturedFrame::Cpu(_));
-        let (encode_width, encode_height) = if viewport_applicable {
-            encode_dims_for_viewport(frame_width, frame_height, current_viewport)
-        } else {
-            (frame_width, frame_height)
-        };
+        // Viewport-driven downscale applies to every frame source:
+        //   - CPU frames: `resize_bgra_bilinear` does the work below.
+        //   - Linux GPU dma-buf: `tether-scaler` (Mitchell-Netravali
+        //     in linear-light) runs inside `encode_gpu_frame` between
+        //     PipeWire's BGRA import and the chroma bridge.
+        //   - macOS GPU IOSurface: SCK does the scaling at capture
+        //     time via `SCStreamConfiguration.width/height`, plumbed
+        //     in `tether-capture::macos`. The frame already arrives
+        //     at encode dims, so we treat `capture_dims == encode_dims`
+        //     for the IOSurface path — see ARCHITECTURE.md for the
+        //     phase-2 plan to unify on the Mitchell shader.
+        let (encode_width, encode_height) =
+            encode_dims_for_viewport(frame_width, frame_height, current_viewport);
         // viewport_seq isn't part of the rebuild check: only an actual
         // change in encoder dimensions warrants tearing down the
         // encoder + bumping stream_epoch. A viewport change that
@@ -1569,6 +1699,10 @@ fn run_capture_and_send(
                         abr,
                         #[cfg(target_os = "linux")]
                         bridge: BridgeState::NotYetBuilt,
+                        #[cfg(target_os = "linux")]
+                        scaler: None,
+                        #[cfg(target_os = "linux")]
+                        scaler_pipelines: None,
                     })
                 }
                 Err(e) => {

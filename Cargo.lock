@@ -3327,6 +3327,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tether-probe"
+version = "0.0.1"
+dependencies = [
+ "pollster",
+ "tether-capture",
+ "tether-codec",
+ "tether-gpuconvert",
+ "tether-protocol",
+ "tracing",
+]
+
+[[package]]
 name = "tether-protocol"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,29 @@
+[package]
+name = "tether-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Authoritative capability-discovery probe: round-trips the full producer→encoder→decoder chain per VideoProfile."
+
+[dependencies]
+tether-protocol = { workspace = true }
+tether-codec = { workspace = true }
+
+tracing = { workspace = true }
+
+# Linux probes drive a real producer through the gpuconvert bridges,
+# so we depend on gpuconvert here (the whole reason this crate exists
+# — tether-codec can't pull in gpuconvert without a cycle, but the
+# probe needs to).
+[target.'cfg(target_os = "linux")'.dependencies]
+tether-gpuconvert = { workspace = true }
+pollster = "0.4"
+
+# macOS probe folds in the SCK pixel-format capability check that
+# used to live in tether-host as a separate cache.
+[target.'cfg(target_os = "macos")'.dependencies]
+tether-capture = { workspace = true }
+
+[lints]
+workspace = true

@@ -7,6 +7,7 @@ members = [
     "crates/tether-codec",
     "crates/tether-gpuconvert",
     "crates/tether-input",
+    "crates/tether-probe",
     "crates/tether-render",
     "crates/tether-session",
     "crates/tether-vaapi",
@@ -27,6 +28,7 @@ tether-capture = { path = "crates/tether-capture" }
 tether-codec = { path = "crates/tether-codec" }
 tether-gpuconvert = { path = "crates/tether-gpuconvert" }
 tether-input = { path = "crates/tether-input" }
+tether-probe = { path = "crates/tether-probe" }
 tether-render = { path = "crates/tether-render" }
 tether-session = { path = "crates/tether-session" }
 tether-vaapi = { path = "crates/tether-vaapi" }

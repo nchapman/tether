@@ -947,6 +947,60 @@ fn dmabuf_zero_copy_roundtrip_with_scaler_h264_8bit() {
     );
 }
 
+/// Microbench: encode time per frame at production-realistic
+/// resolutions. The headline number this answers is "how much wall-
+/// clock do we save by scaling 4K → 1080p before encoding instead of
+/// encoding at native 4K?". Returns median µs per encode_bgra call
+/// after a 6-frame warmup (VAAPI's rate-control window settles).
+fn bench_encode_one_resolution(profile: VideoProfile, w: u32, h: u32, iters: usize) -> f64 {
+    let bgra = make_test_bgra(w, h);
+    let mut enc = VaapiEncoder::new(profile, w, h, 30, 4_000).expect("encoder");
+    // Warmup — first few frames are non-representative (encoder builds
+    // its rate-control state, the first frame is an IDR which is much
+    // larger than the P-frames that dominate the steady state).
+    for t in 0..6_i64 {
+        let _ = enc.encode_bgra(&bgra, t, t == 0).expect("warmup encode");
+    }
+    let mut samples = Vec::with_capacity(iters);
+    for t in 6..(6 + iters) as i64 {
+        let start = std::time::Instant::now();
+        let _ = enc.encode_bgra(&bgra, t, false).expect("encode");
+        samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    samples[samples.len() / 2]
+}
+
+/// Print encode time at several resolutions so the scaler ROI is
+/// visible: scaler cost (from `bench_scale_realistic_dims`) plus
+/// encode-at-smaller-dims vs encode-at-larger-dims. If
+/// `encode_4k - (encode_1080p + scaler_4k_to_1080p) > 0`, the scaler
+/// is net-positive on time. (It's already net-positive on bandwidth
+/// regardless — encoded bytes scale with pixel count too.)
+#[test]
+#[ignore = "perf microbenchmark; prints encode timings, no assertions"]
+fn bench_encode_by_resolution_h264() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::H264,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+    println!("\nH.264 encode time per frame (median of 20, after 6-frame warmup):");
+    println!("{:<22} {:>10}", "resolution", "med µs");
+    for &(w, h, label) in &[
+        (640u32, 480u32, "VGA"),
+        (1280, 720, "720p"),
+        (1920, 1080, "1080p"),
+        (2560, 1440, "1440p"),
+        (3840, 2160, "4K"),
+    ] {
+        let med = bench_encode_one_resolution(profile, w, h, 20);
+        println!("{label:<22} {med:>10.1}");
+    }
+    println!();
+}
+
 /// H.264 4:2:0 8-bit — the original baseline cell. Universal floor;
 /// every VAAPI box supports it. Catches the 8-bit biplanar import +
 /// `range_kind = LIMITED_8` shader dispatch.

@@ -534,10 +534,22 @@ shader's `range_kind` dispatch handle the 10-bit display side
 (native 10-bit limited-range breakpoints, no intermediate
 `luma_scale` indirection); the encoder/decoder probes handle the
 host side. The negotiator picks the first entry that appears in
-*both* the host's `supported_encode_profiles()` and the client's
-advertised `supported_decode_profiles()` — anything a given
-device's hardware can't deliver gets filtered out by the probe
-layer automatically.
+*both* the host's `tether_probe::host_encode_profiles()` and the
+client's advertised `tether_probe::client_decode_profiles()` —
+anything a given device's hardware can't deliver gets filtered out
+by the probe layer automatically.
+
+**One-call capability discovery.** As of the tether-probe rewrite,
+`host_supported_profiles()` is the authoritative answer for "what
+can this hardware deliver end-to-end." It round-trips every
+preference-list entry through the full production chain (capture →
+bridge → encoder → decoder) and tags each rejection with a
+`PipelineStage` (`Capture` / `Construct` / `Submit` / `Decode`) so
+operators reading the startup log see exactly which stage rejected
+each profile. The Intel iHD Main10 case now reports
+`Unsupported { stage: Submit, reason: "submit_dmabuf: ..." }` rather
+than the layered "codec said yes but gpuconvert said no" of the
+previous three-cache scaffolding.
 
 **Live status by platform pair** (post-10-bit handoff):
 
@@ -564,22 +576,24 @@ changes here.
 
 ## Adding new profiles: the checklist
 
-When adding a new profile to `PROFILE_PREFERENCE`:
+When adding a new profile to `tether_probe::PROFILE_PREFERENCE`:
 
-1. **Does it require new layer-3 (encode) capability?** Add an
-   encoder probe in `tether-codec/src/{vaapi,videotoolbox}/probe.rs`.
-   Probe must do a real encode of a real frame, not just open
-   the codec context.
+1. **Does it require new layer-3 (encode) capability?** Extend the
+   encoder probe in
+   `crates/tether-probe/src/host/{vaapi,videotoolbox}.rs`. Probe
+   must do a real encode of a real frame, not just open the codec
+   context. Tag stage-of-failure with the right `PipelineStage`.
 2. **Does it require new layer-5 (decode) capability?** Add a
    matching decoder probe with a checked-in fixture in
-   `crates/tether-codec/fixtures/probe/`. Probe must consume the
+   `crates/tether-probe/fixtures/probe/`. Probe must consume the
    fixture and assert `Frame::Gpu` (not `Frame::Cpu`) — the
    `Frame::Cpu` discriminator is what catches silent SW fallback.
-3. **Does it require new layer-1 (capture) capability?** Add a
-   capture-side probe in `tether-capture::{macos,linux}` that
-   attempts the format and reports back. Note that SCK in
-   particular silently does the wrong thing for some
-   configurations — the probe must wait for actual frames.
+3. **Does it require new layer-1 (capture) capability?** The Linux
+   probe constructs the real gpuconvert bridge in
+   `probe_10bit_submit` (extend the dispatch for new chromas); the
+   macOS probe consults `sck_pixel_format_for_profile`. If a new
+   capture path is needed, wire its capability into the relevant
+   `host/*.rs` capture-stage check.
 4. **Does it require new layer-6 (renderer) capability?** Add a
    matching `RenderLayout` variant if needed, then a startup
    import probe similar to `importable_dmabuf_modifiers()`.

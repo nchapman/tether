@@ -402,11 +402,12 @@ Forward-compat hooks every feature added later relies on:
 Video profile is negotiated host-authoritatively via two hello
 extensions. The client advertises its decode capabilities under
 `tether.cap.video.decode-profiles` as `Vec<VideoProfile { codec,
-chroma, bit_depth }>`. The host intersects that set with its own
-buildable encode profiles (from a `OnceLock`-cached
-`supported_encode_profiles()` probe that calls the real
-`VaapiEncoder::new` at 128×128 per triple) and picks the best mutual
-match against a fixed preference list:
+chroma, bit_depth }>` (computed by `tether_probe::client_decode_profiles()`).
+The host intersects that set with its own buildable encode profiles
+(from `tether_probe::host_encode_profiles()`, an `OnceLock`-cached
+real-round-trip probe — capture → bridge → encoder → decoder per
+profile) and picks the best mutual match against a fixed preference
+list:
 
 1. HEVC 4:4:4 8-bit (desktop-quality top rung — preserves text and UI
    chroma detail that 4:2:0 visibly smears).
@@ -434,11 +435,13 @@ through the same Y R8 + UV Rg8 shader) and packed XYUV on Linux
 rebuild path as a mid-session resolution change (encoder + bridge +
 render pipeline all reset).
 
-**Per-platform asymmetries.** `supported_profiles()` in
-`tether-codec::probe` does a real encode + decode round trip per
-profile against the live driver (fixture IDRs ship in
-`crates/tether-codec/fixtures/probe/`; the trait is in
-`profile_probe.rs`). Empirical results on M-series Apple Silicon:
+**Per-platform asymmetries.** `tether_probe::host_supported_profiles()`
+does a real encode + decode round trip per profile against the live
+driver (fixture IDRs ship in `crates/tether-probe/fixtures/probe/`;
+the `ProfileProbe` trait is in `crates/tether-probe/src/profile_probe.rs`).
+On Linux the round trip pulls in `tether-gpuconvert` to produce a
+real dma-buf, which is the architectural reason this crate exists —
+the codec layer can't depend on gpuconvert without a cycle. Empirical results on M-series Apple Silicon:
 VideoToolbox has no HEVC Main 4:4:4 *encode* path (so macOS hosts
 never advertise 4:4:4 — the intersection lands on HEVC 4:2:0 or H.264
 4:2:0), but the *decode* path produces a `'444v'` NV24 IOSurface and

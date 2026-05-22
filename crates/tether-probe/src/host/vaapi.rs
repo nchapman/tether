@@ -18,7 +18,8 @@
 //! separate `warm_gpuconvert_capability_cache` used to fill.
 
 use tether_codec::vaapi::{VaapiDecoder, VaapiEncoder};
-use tether_codec::{CodecError, Decoder, Encoder, Frame, Result};
+use tether_codec::{build_p010_dmabuf_frame, CodecError, Decoder, Encoder, Frame, Result};
+use tether_gpuconvert::Bgra2P010DmaBuf;
 use tether_protocol::control::VideoProfile;
 
 use crate::profile_probe::ProfileProbe;
@@ -68,13 +69,14 @@ impl ProfileProbe for VaapiProbe {
             // encoder accepted the input.
             let _ = packets;
         } else {
-            // 10-bit probe is construction-only **in this step**.
-            // Step 3 of the migration grows a real submit_dmabuf
-            // round trip here via `Bgra2P010DmaBuf` — that's the
-            // architectural reason this probe lives in tether-probe
-            // now (so it can pull in gpuconvert) instead of in
-            // tether-codec.
-            let _ = enc;
+            // 10-bit: real submit_dmabuf round trip via the production
+            // `Bgra2P010DmaBuf` bridge. This is the gap that the
+            // codec-internal probe couldn't close (the codec crate
+            // can't depend on gpuconvert), and exactly the gap that
+            // Intel iHD + Mesa + FFmpeg 8.1 hits — `VaapiEncoder::new`
+            // accepts Main10 + P010LE, but `av_hwframe_map(DRM_PRIME →
+            // VAAPI)` rejects the matching dma-buf at submit time.
+            probe_10bit_submit(&mut enc)?;
         }
         Ok(())
     }
@@ -93,4 +95,44 @@ impl ProfileProbe for VaapiProbe {
         }
         Err(CodecError::UnsupportedInputFormat)
     }
+}
+
+/// Build a `Bgra2P010DmaBuf`, convert a flat-grey BGRA buffer through
+/// it, and feed the resulting dma-buf to the encoder. Returns Err
+/// (mapped to `CodecError::NoHardwareCodec`) for the three failures
+/// this round trip is supposed to catch:
+///   * Bridge construction fails (driver doesn't advertise R16/Rg16
+///     storage modifiers on `DRM_FORMAT_MOD_LINEAR`).
+///   * Bridge convert fails (transient GPU-side error).
+///   * `submit_dmabuf` fails (the Intel iHD `av_hwframe_map` rejection
+///     case).
+fn probe_10bit_submit(enc: &mut VaapiEncoder) -> Result<()> {
+    let bridge = match pollster::block_on(Bgra2P010DmaBuf::new(PROBE_DIM, PROBE_DIM)) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(CodecError::NoHardwareCodec(format!(
+                "Bgra2P010DmaBuf::new failed — driver likely lacks R16/Rg16 \
+                 storage support on DRM_FORMAT_MOD_LINEAR: {e}"
+            )));
+        }
+    };
+    let probe_bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
+    let p010 = bridge
+        .convert_bgra_bytes(&probe_bytes)
+        .map_err(|e| CodecError::NoHardwareCodec(format!("P010 bridge convert: {e}")))?;
+    let codec_frame = build_p010_dmabuf_frame(
+        p010.fd,
+        p010.size,
+        p010.modifier,
+        p010.y_offset,
+        p010.y_stride,
+        p010.uv_offset,
+        p010.uv_stride,
+    );
+    // The actual gate: any driver-side rejection of the P010 dma-buf
+    // surfaces here as a CodecError. `submit_dmabuf`'s error path
+    // closes the fd via OwnedFd drop; the encoder never sees it again.
+    enc.submit_dmabuf(&codec_frame, 0, true)
+        .map_err(|e| CodecError::NoHardwareCodec(format!("submit_dmabuf: {e}")))?;
+    Ok(())
 }

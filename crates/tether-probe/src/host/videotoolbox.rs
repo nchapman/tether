@@ -22,6 +22,11 @@
 //! capture capability check (today done at the host layer as a
 //! separate cache).
 
+use std::sync::OnceLock;
+
+use tether_capture::macos::{
+    probe_capture_pixel_formats, sck_pixel_format_for_profile, SckCaptureCapability,
+};
 use tether_codec::bitstream_sps::parse_sps_chroma_bit_depth;
 use tether_codec::videotoolbox::{
     expected_iosurface_fourccs, VideoToolboxDecoder, VideoToolboxEncoder,
@@ -37,8 +42,57 @@ const PROBE_DIM: u32 = 128;
 const PROBE_FPS: u32 = 30;
 const PROBE_BITRATE_KBPS: u32 = 1_000;
 
+/// Process-lifetime cache of the SCK probe result. Folds in what was
+/// previously a separate cache (`SCK_CAPS_CACHE` +
+/// `warm_sck_capture_capability_cache`) in `tether-host`. Same
+/// single-shot per-process semantics: the answer doesn't change at
+/// runtime, so we pay the probe cost once.
+///
+/// Conservative fallback: yuv420_video_range=true on probe error, so
+/// a Mac with a broken SCK setup still negotiates H.264/HEVC 4:2:0
+/// 8-bit (the universal floor) rather than refusing all profiles.
+///
+/// TODO(probe-migration step 5): the tether-host `SCK_CAPS_CACHE` and
+/// `warm_sck_capture_capability_cache` are still alive during the
+/// migration window. After step 5 cuts the host over to call
+/// `tether_probe::host_supported_profiles()` directly, those become
+/// dead code and get deleted; this OnceLock is then the only cache
+/// of the SCK probe result.
+fn sck_capability() -> &'static SckCaptureCapability {
+    static CACHED: OnceLock<SckCaptureCapability> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        match pollster::block_on(probe_capture_pixel_formats()) {
+            Ok(c) => {
+                tracing::info!(?c, "SCK capture capability probed");
+                c
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "SCK capability probe failed; \
+                    falling back to yuv420 video-range only");
+                SckCaptureCapability {
+                    yuv420_video_range: true,
+                    ..Default::default()
+                }
+            }
+        }
+    })
+}
+
 impl ProfileProbe for VideoToolboxProbe {
     fn probe_encode(profile: VideoProfile) -> Result<()> {
+        // Capture-stage gate: if SCK can't deliver the matching pixel
+        // format on this Mac, the host couldn't deliver real frames to
+        // the encoder regardless of whether VT itself accepts the
+        // profile. Folds in the SCK_CAPS_CACHE check that used to live
+        // in tether-host as a separate filter layer.
+        if !sck_pixel_format_for_profile(profile).is_deliverable(sck_capability()) {
+            return Err(CodecError::NoHardwareCodec(format!(
+                "ScreenCaptureKit cannot deliver the pixel format for \
+                 {:?} {:?} {}-bit on this Mac (capture-stage rejection)",
+                profile.codec, profile.chroma, profile.bit_depth
+            )));
+        }
+
         let mut enc = VideoToolboxEncoder::new(
             profile,
             PROBE_DIM,

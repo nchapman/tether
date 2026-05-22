@@ -11,6 +11,9 @@ tether-protocol = { workspace = true }
 tether-codec = { workspace = true }
 
 tracing = { workspace = true }
+# Used to `block_on` the async bridge / SCK constructors from inside
+# the sync ProfileProbe trait. Both Linux and macOS need it.
+pollster = "0.4"
 
 # Linux probes drive a real producer through the gpuconvert bridges,
 # so we depend on gpuconvert here (the whole reason this crate exists
@@ -18,7 +21,6 @@ tracing = { workspace = true }
 # probe needs to).
 [target.'cfg(target_os = "linux")'.dependencies]
 tether-gpuconvert = { workspace = true }
-pollster = "0.4"
 
 # macOS probe folds in the SCK pixel-format capability check that
 # used to live in tether-host as a separate cache.

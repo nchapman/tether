@@ -385,6 +385,73 @@ pub struct DmaBufLayer {
     pub pitch: [u32; 4],
 }
 
+/// Build a `DmaBufFrame` matching the P010 (HEVC Main10 / 4:2:0
+/// 10-bit) descriptor shape FFmpeg's `vaapi_drm_format_map` expects:
+/// one DRM object, two layers — Y as R16 and UV as GR32 (R16G16),
+/// both pointing at `object_index=0` with their offsets within the
+/// shared allocation.
+///
+/// Single source of truth shared by the production send loop in
+/// `tether-host` and the startup probe in `tether-probe`. A previous
+/// version had two copies of this helper; cross-table consistency
+/// tests in `tether-render::dmabuf_test` pin the fourcc family.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn build_p010_dmabuf_frame(
+    fd: std::os::fd::OwnedFd,
+    size: u64,
+    modifier: u64,
+    y_offset: u64,
+    y_stride: u64,
+    uv_offset: u64,
+    uv_stride: u64,
+) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"P010"),
+        objects: vec![DmaBufObject {
+            fd,
+            size,
+            drm_format_modifier: modifier,
+        }],
+        layers: vec![
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"R16 "),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(y_offset).expect("Y plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(y_stride).expect("Y plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+            },
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"GR32"),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(uv_offset).expect("UV plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(uv_stride).expect("UV plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+            },
+        ],
+    }
+}
+
 /// macOS IOSurface descriptor for a captured (encoder input) or
 /// decoded (renderer input) frame. Mirrors what
 /// `tether_capture::CapturedIOSurface` carries on the capture side;

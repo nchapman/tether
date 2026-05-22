@@ -1062,62 +1062,21 @@ fn nv12_dmabuf_to_codec_frame(out: Nv12DmaBufFrame) -> DmaBufFrame {
     }
 }
 
-/// Build a `DmaBufFrame` for the P010 (HEVC Main10 / 4:2:0 10-bit) path:
-/// one DRM object, two layers — Y as R16 and UV as GR32 (R16G16), both
-/// pointing at `object_index=0` with their offsets within the shared
-/// allocation. Mirror of [`nv12_dmabuf_to_codec_frame`]; the encoder
-/// validates the outer P010 fourcc against `(Yuv420, 10)` and FFmpeg
-/// then reads the per-layer fourccs directly out of the descriptor.
-///
-/// Shape must stay in lockstep with [`probe_p010_submit_round_trip`]
-/// (the startup-time backstop) — the cross-table consistency test
-/// asserts both produce the same descriptor.
+/// Build a `DmaBufFrame` for the P010 (HEVC Main10 / 4:2:0 10-bit) path.
+/// Thin adapter over `tether_codec::build_p010_dmabuf_frame` — the
+/// shared helper takes raw fields so tether-codec doesn't need to
+/// depend on tether-gpuconvert just to know about `P010DmaBufFrame`.
 #[cfg(target_os = "linux")]
 fn p010_dmabuf_to_codec_frame(out: P010DmaBufFrame) -> DmaBufFrame {
-    DmaBufFrame {
-        fourcc: u32::from_le_bytes(*b"P010"),
-        objects: vec![DmaBufObject {
-            fd: out.fd,
-            size: out.size,
-            drm_format_modifier: out.modifier,
-        }],
-        layers: vec![
-            DmaBufLayer {
-                drm_format: u32::from_le_bytes(*b"R16 "),
-                num_planes: 1,
-                object_index: [0, 0, 0, 0],
-                offset: [
-                    u32::try_from(out.y_offset).expect("Y plane offset fits in u32"),
-                    0,
-                    0,
-                    0,
-                ],
-                pitch: [
-                    u32::try_from(out.y_stride).expect("Y plane stride fits in u32"),
-                    0,
-                    0,
-                    0,
-                ],
-            },
-            DmaBufLayer {
-                drm_format: u32::from_le_bytes(*b"GR32"),
-                num_planes: 1,
-                object_index: [0, 0, 0, 0],
-                offset: [
-                    u32::try_from(out.uv_offset).expect("UV plane offset fits in u32"),
-                    0,
-                    0,
-                    0,
-                ],
-                pitch: [
-                    u32::try_from(out.uv_stride).expect("UV plane stride fits in u32"),
-                    0,
-                    0,
-                    0,
-                ],
-            },
-        ],
-    }
+    tether_codec::build_p010_dmabuf_frame(
+        out.fd,
+        out.size,
+        out.modifier,
+        out.y_offset,
+        out.y_stride,
+        out.uv_offset,
+        out.uv_stride,
+    )
 }
 
 /// Build a `DmaBufFrame` for the YUV 4:4:4 path: one DRM object, one

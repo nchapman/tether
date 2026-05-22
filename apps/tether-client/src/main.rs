@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // the host's PROFILE_PREFERENCE is authoritative — but the
     // function returns profiles in PROFILE_PREFERENCE order so logs
     // look natural.
-    let client_decode_profiles = tether_codec::supported_decode_profiles();
+    let client_decode_profiles = tether_probe::client_decode_profiles();
     if client_decode_profiles.is_empty() {
         anyhow::bail!(
             "no hardware video decoder is available on this client \
@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
     // actually advertised it could decode. See
     // `tether_codec::probe::validate_chosen_profile` for the rationale
     // (and the unit tests on the same function for the contract).
-    let client_caps = tether_codec::probe::supported_decode_profiles();
+    let client_caps = tether_probe::client_decode_profiles();
     if let Err(e) =
         tether_codec::probe::validate_chosen_profile(negotiated_profile, &client_caps)
     {

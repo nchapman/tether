@@ -3257,6 +3257,7 @@ dependencies = [
  "crossbeam-channel",
  "tether-codec",
  "tether-input",
+ "tether-probe",
  "tether-protocol",
  "tether-render",
  "tether-transport",

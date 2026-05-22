@@ -28,7 +28,9 @@ use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 use tether_gpuconvert::{
     Bgra2P010DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
 };
-use tether_protocol::control::{ChromaSubsampling, CodecKind, ControlMessage, VideoProfile};
+use tether_protocol::control::{
+    ChromaSubsampling, CodecKind, ControlMessage, VideoProfile, Viewport,
+};
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
@@ -69,6 +71,23 @@ const TEST_PATTERN_FPS: u32 = 60;
 /// option-swap; the send thread isn't a tokio worker so we don't need
 /// `tokio::sync::Mutex`.
 type LatestClientStats = Arc<StdMutex<Option<ClientStatsObservation>>>;
+
+/// Latest client viewport, with sequence counter so the send thread
+/// can tell whether anything changed without diffing the whole value.
+/// Set once from `ClientHelloV1::viewport` at session start, then
+/// overwritten by `ControlMessage::SetClientViewport` on each resize.
+type LatestViewport = Arc<StdMutex<ViewportState>>;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ViewportState {
+    /// `None` means "let the host pick native." A valid viewport
+    /// (both dims > 0) is what the encoder targets.
+    viewport: Option<Viewport>,
+    /// Bumped on every write. The send thread reads its last-seen
+    /// sequence and only acts when this advances — saves the slot
+    /// comparison work when nothing changed.
+    seq: u64,
+}
 
 /// One window of client-side telemetry. Mirrors the fields in
 /// [`ControlMessage::ClientStats`] that the ABR controller actually
@@ -282,11 +301,14 @@ async fn handle_client(
     let HostSession {
         channel: _,
         negotiated: chosen_profile,
-        client_hello: _client_hello,
+        client_hello,
         client_decode_profiles: _client_decode_profiles,
         idr_signal: force_idr,
         stream_ready,
     } = session;
+    let initial_viewport = client_hello
+        .viewport
+        .filter(|v| v.is_valid());
 
     // `use_test_pattern` from here on only switches the capture source;
     // the handshake-time profile floor it implied is already baked into
@@ -388,6 +410,12 @@ async fn handle_client(
     // window. Written by the control recv task, drained by the
     // encode-and-send thread on each loop iteration.
     let latest_client_stats: LatestClientStats = Arc::new(StdMutex::new(None));
+    // Latest viewport-target the client has communicated. Seeded
+    // from ClientHello; mutated by SetClientViewport.
+    let latest_viewport: LatestViewport = Arc::new(StdMutex::new(ViewportState {
+        viewport: initial_viewport,
+        seq: if initial_viewport.is_some() { 1 } else { 0 },
+    }));
     // `stream_ready`: gate at the head of the send loop. The client
     // signals it has built its decoders by sending
     // `ControlMessage::StreamReady`; until then we drop captured frames
@@ -399,6 +427,7 @@ async fn handle_client(
     let send_shutdown_for_thread = send_shutdown.clone();
     let stream_ready_for_thread = stream_ready.clone();
     let latest_client_stats_for_send = latest_client_stats.clone();
+    let latest_viewport_for_send = latest_viewport.clone();
     // Keyframes ride a reliable per-IDR QUIC unidirectional stream
     // rather than the unreliable datagram path used for P-frames.
     // The sync send thread is not a tokio worker, so it calls into
@@ -431,6 +460,7 @@ async fn handle_client(
                 runtime_handle_for_send,
                 conn_keyframe,
                 latest_client_stats_for_send,
+                latest_viewport_for_send,
             )
         })?;
 
@@ -463,6 +493,8 @@ async fn handle_client(
         let force_idr = force_idr.clone();
         let stream_ready_ctl = stream_ready.clone();
         let latest_client_stats_for_ctl = latest_client_stats.clone();
+        let latest_viewport_for_ctl = latest_viewport.clone();
+        let force_idr_for_viewport = force_idr.clone();
         tasks.spawn(async move {
             loop {
                 match conn.recv_control().await {
@@ -513,6 +545,22 @@ async fn handle_client(
                                 frames_dropped,
                                 fragments_lost,
                             });
+                    }
+                    Ok(ControlMessage::SetClientViewport(v)) => {
+                        info!(width = v.width, height = v.height, "client viewport changed");
+                        // Latch the new viewport. The send thread
+                        // notices the seq bump on its next iteration
+                        // and rebuilds the encoder (same path as a
+                        // capture-side resolution change). We force
+                        // an IDR so the client sees a clean cut on
+                        // the new dimensions rather than partial-GOP
+                        // garbage during the rebuild's first frame.
+                        let next = if v.is_valid() { Some(v) } else { None };
+                        let mut guard = latest_viewport_for_ctl.lock().unwrap();
+                        guard.viewport = next;
+                        guard.seq = guard.seq.wrapping_add(1);
+                        drop(guard);
+                        force_idr_for_viewport.raise();
                     }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
                         let t1 = MonoNanos::now();
@@ -712,8 +760,22 @@ async fn handle_client(
 /// the encode loop knowing which one it got.
 struct EncoderSlot {
     encoder: Box<dyn Encoder>,
+    /// Capture-side dimensions. Bumping these means PipeWire / SCK
+    /// re-negotiated the source — same rebuild path as a viewport
+    /// change.
+    capture_width: u32,
+    capture_height: u32,
+    /// Encoder output dimensions, i.e. what gets sent over the wire.
+    /// Equals capture dims when no viewport is in play; otherwise
+    /// equals the letterboxed-and-aligned viewport.
     width: u32,
     height: u32,
+    /// `(Viewport, seq)` of the viewport directive that produced
+    /// `width`/`height`. `seq == 0` means "no viewport in effect."
+    /// The send loop compares `seq` against the shared mailbox to
+    /// detect mid-session resize requests without diffing the
+    /// Viewport itself.
+    viewport_seq: u64,
     /// Adaptive bitrate state. `None` if the encoder reports
     /// `supports_changing_bitrate() == false` — we still send video,
     /// we just don't try to retune. A resolution change destroys the
@@ -1103,6 +1165,107 @@ fn yuv444_dmabuf_to_codec_frame(out: Yuv444DmaBufFrame) -> DmaBufFrame {
     }
 }
 
+/// Encoder alignment in pixels. H.264 / HEVC both want even widths
+/// (chroma sampling); HEVC Main444 hardware encoders empirically
+/// reject widths that aren't a multiple of 16. Round to 16 to cover
+/// all cases — the worst-case waste is 15 pixels per side, which is
+/// invisible at any reasonable client window size.
+const ENCODER_ALIGN: u32 = 16;
+
+/// Compute the encoder-output dimensions for a given capture size
+/// and client viewport. The viewport bounds the longest edge; we
+/// preserve aspect ratio (letterbox at the client; never stretch)
+/// and clamp to [`ENCODER_ALIGN`]. `None` returns the capture dims
+/// (with the same alignment guarantee).
+fn encode_dims_for_viewport(
+    capture_w: u32,
+    capture_h: u32,
+    viewport: Option<Viewport>,
+) -> (u32, u32) {
+    // No active viewport → pass capture dims through unchanged. H.264
+    // and HEVC carry crop offsets in SPS for non-16-aligned heights
+    // (e.g. the very common 1920x1080), so the encoder handles it.
+    // Flooring to 16 here would silently drop 8 rows on a 1080p host
+    // for no reason.
+    let Some(v) = viewport.filter(|v| v.is_valid()) else {
+        return (capture_w, capture_h);
+    };
+    // Fit capture inside viewport at fixed aspect ratio: scale by the
+    // smaller of the two ratios. Never upscale — the client renderer
+    // can scale up for cheap; we're not paying the encoder cost to do
+    // it host-side.
+    let scale_w = f64::from(v.width) / f64::from(capture_w);
+    let scale_h = f64::from(v.height) / f64::from(capture_h);
+    let scale = scale_w.min(scale_h).min(1.0);
+    let target_w = (f64::from(capture_w) * scale).round() as u32;
+    let target_h = (f64::from(capture_h) * scale).round() as u32;
+    // When viewport IS in play we floor to 16: the encoder rejects
+    // misaligned dims on HEVC Main444 hardware, and floor (not
+    // nearest) is what keeps us inside the viewport budget.
+    let aligned_w = (target_w / ENCODER_ALIGN) * ENCODER_ALIGN;
+    let aligned_h = (target_h / ENCODER_ALIGN) * ENCODER_ALIGN;
+    (aligned_w.max(ENCODER_ALIGN), aligned_h.max(ENCODER_ALIGN))
+}
+
+/// Pure CPU bilinear BGRA resize. Used on the [`CapturedFrame::Cpu`]
+/// path when a viewport contracts the output below capture dims.
+/// Allocates a fresh `Vec<u8>` per call — the alternative (caller-
+/// owned scratch) would require lifetime gymnastics for a per-frame
+/// cost that's already dominated by encoder time.
+///
+/// Tradeoff: GPU paths (DMA-BUF on Linux, IOSurface on macOS) don't
+/// reach this function. A real GPU compute scaler is the planned
+/// follow-up; for now those paths encode at capture dims regardless
+/// of viewport.
+fn resize_bgra_bilinear(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    debug_assert_eq!((src_w * src_h * 4) as usize, src.len());
+    let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
+    if dst_w == 0 || dst_h == 0 {
+        return out;
+    }
+    // Standard inverse-mapping bilinear. Computes a single
+    // floating-point sample per channel; on a 1920x1200 → 1280x800
+    // resize this lands at ~5 ms on a recent x86 core. Adequate for
+    // the test-pattern / SHM-fallback path. If the GPU scaler ever
+    // lands ahead of schedule, this becomes dead code.
+    let sx_step = f64::from(src_w) / f64::from(dst_w);
+    let sy_step = f64::from(src_h) / f64::from(dst_h);
+    for y in 0..dst_h {
+        let sy = (f64::from(y) + 0.5) * sy_step - 0.5;
+        let y0 = sy.floor().max(0.0) as u32;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let dy = (sy - f64::from(y0)).clamp(0.0, 1.0);
+        for x in 0..dst_w {
+            let sx = (f64::from(x) + 0.5) * sx_step - 0.5;
+            let x0 = sx.floor().max(0.0) as u32;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let dx = (sx - f64::from(x0)).clamp(0.0, 1.0);
+            let i00 = ((y0 * src_w + x0) * 4) as usize;
+            let i01 = ((y0 * src_w + x1) * 4) as usize;
+            let i10 = ((y1 * src_w + x0) * 4) as usize;
+            let i11 = ((y1 * src_w + x1) * 4) as usize;
+            let out_idx = ((y * dst_w + x) * 4) as usize;
+            for c in 0..4 {
+                let p00 = f64::from(src[i00 + c]);
+                let p01 = f64::from(src[i01 + c]);
+                let p10 = f64::from(src[i10 + c]);
+                let p11 = f64::from(src[i11 + c]);
+                let top = p00 * (1.0 - dx) + p01 * dx;
+                let bot = p10 * (1.0 - dx) + p11 * dx;
+                let v = top * (1.0 - dy) + bot * dy;
+                out[out_idx + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
 /// Fold one observation into the encoder's ABR controller and apply
 /// the resulting bitrate target if it changed. No-op when the encoder
 /// reports `supports_changing_bitrate() == false` (slot.abr is None).
@@ -1169,6 +1332,7 @@ fn run_capture_and_send(
     runtime: tokio::runtime::Handle,
     keyframe_conn: Arc<Connection>,
     latest_client_stats: LatestClientStats,
+    latest_viewport: LatestViewport,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
@@ -1239,22 +1403,51 @@ fn run_capture_and_send(
         // Encoder is lazily created on the first frame (we don't know
         // capture resolution at startup) and recreated whenever the
         // capture source changes resolution mid-stream (Linux portal
-        // output switch, future multi-monitor handoff). Bumping the
-        // fragmenter epoch makes the receiver discard any pre-resize
-        // fragments still in flight instead of fusing them with the
-        // first post-resize keyframe — that's exactly what
+        // output switch, future multi-monitor handoff) OR the client
+        // requests a viewport-driven resize. Bumping the fragmenter
+        // epoch makes the receiver discard any pre-resize fragments
+        // still in flight instead of fusing them with the first
+        // post-resize keyframe — that's exactly what
         // `VideoPacket::stream_epoch` exists for.
-        let needs_recreate = slot
-            .as_ref()
-            .is_none_or(|s| s.width != frame_width || s.height != frame_height);
+        let (current_viewport, current_viewport_seq) = {
+            let g = latest_viewport.lock().unwrap();
+            (g.viewport, g.seq)
+        };
+        // Viewport-driven downscale is wired for CPU frames today.
+        // GPU frames (DMA-BUF / IOSurface) would need a wgpu compute
+        // scaler that decouples encode dims from capture dims; until
+        // that lands they encode at capture dims regardless of
+        // viewport. We still bump the seq counter so the encoder
+        // rebuild fires once the source switches to a CPU path.
+        let viewport_applicable = matches!(frame, CapturedFrame::Cpu(_));
+        let (encode_width, encode_height) = if viewport_applicable {
+            encode_dims_for_viewport(frame_width, frame_height, current_viewport)
+        } else {
+            (frame_width, frame_height)
+        };
+        // viewport_seq isn't part of the rebuild check: only an actual
+        // change in encoder dimensions warrants tearing down the
+        // encoder + bumping stream_epoch. A viewport change that
+        // leaves dims unchanged (GPU path while no scaler exists; an
+        // upscale-rejected viewport on any path) shouldn't churn the
+        // session. The seq is tracked for diagnostic logging only.
+        let needs_recreate = slot.as_ref().is_none_or(|s| {
+            s.capture_width != frame_width
+                || s.capture_height != frame_height
+                || s.width != encode_width
+                || s.height != encode_height
+        });
         if needs_recreate {
             if let Some(old) = slot.as_ref() {
                 info!(
-                    old_width = old.width,
-                    old_height = old.height,
-                    new_width = frame_width,
-                    new_height = frame_height,
-                    "capture dimensions changed; recreating encoder, bumping stream epoch"
+                    old_capture = old.capture_width,
+                    new_capture = frame_width,
+                    old_encode_w = old.width,
+                    new_encode_w = encode_width,
+                    old_encode_h = old.height,
+                    new_encode_h = encode_height,
+                    viewport_seq = current_viewport_seq,
+                    "dimensions changed; recreating encoder, bumping stream epoch"
                 );
                 fragmenter.bump_epoch();
             }
@@ -1265,11 +1458,11 @@ fn run_capture_and_send(
             // list-form for API symmetry with the initial handshake
             // probe; per-resize cost is one construction attempt.
             let baseline_kbps =
-                derive_bitrate_kbps(chosen_profile, frame_width, frame_height, ENCODER_FPS);
+                derive_bitrate_kbps(chosen_profile, encode_width, encode_height, ENCODER_FPS);
             slot = match build_encoder(
                 chosen_profile,
-                frame_width,
-                frame_height,
+                encode_width,
+                encode_height,
                 ENCODER_FPS,
                 baseline_kbps,
             ) {
@@ -1280,8 +1473,10 @@ fn run_capture_and_send(
                         codec = ?chosen_profile.codec,
                         chroma = ?chosen_profile.chroma,
                         bit_depth = chosen_profile.bit_depth,
-                        width = frame_width,
-                        height = frame_height,
+                        capture_width = frame_width,
+                        capture_height = frame_height,
+                        encode_width,
+                        encode_height,
                         fps = ENCODER_FPS,
                         baseline_kbps,
                         abr = e.supports_changing_bitrate(),
@@ -1298,8 +1493,11 @@ fn run_capture_and_send(
                     });
                     Some(EncoderSlot {
                         encoder: e,
-                        width: frame_width,
-                        height: frame_height,
+                        capture_width: frame_width,
+                        capture_height: frame_height,
+                        width: encode_width,
+                        height: encode_height,
+                        viewport_seq: current_viewport_seq,
                         abr,
                         #[cfg(target_os = "linux")]
                         bridge: BridgeState::NotYetBuilt,
@@ -1318,14 +1516,14 @@ fn run_capture_and_send(
                         error = %e,
                         codec = ?chosen_profile.codec,
                         chroma = ?chosen_profile.chroma,
-                        width = frame_width,
-                        height = frame_height,
+                        encode_width,
+                        encode_height,
                         "encoder init failed; sending Goodbye(InternalError) and exiting send loop"
                     );
                     let goodbye_conn = conn.clone();
                     let reason = format!(
                         "host could not construct {:?} {:?} encoder for {}x{}: {}",
-                        chosen_profile.codec, chosen_profile.chroma, frame_width, frame_height, e
+                        chosen_profile.codec, chosen_profile.chroma, encode_width, encode_height, e
                     );
                     let _ = runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
                         reason,
@@ -1352,7 +1550,24 @@ fn run_capture_and_send(
         timing.encode_submit();
         let encoded = match frame {
             CapturedFrame::Cpu(ref cpu) => {
-                match slot_mut.encoder.encode_bgra(&cpu.data, pts, force_kf) {
+                // If the encoder is sized below the captured frame
+                // (viewport-driven downscale), bilinear-resize the
+                // BGRA into the encoder's expected dimensions before
+                // handing it off. Capture-size == encode-size avoids
+                // the allocation + copy entirely.
+                let result = if slot_mut.width == cpu.width && slot_mut.height == cpu.height {
+                    slot_mut.encoder.encode_bgra(&cpu.data, pts, force_kf)
+                } else {
+                    let scaled = resize_bgra_bilinear(
+                        &cpu.data,
+                        cpu.width,
+                        cpu.height,
+                        slot_mut.width,
+                        slot_mut.height,
+                    );
+                    slot_mut.encoder.encode_bgra(&scaled, pts, force_kf)
+                };
+                match result {
                     Ok(e) => e,
                     Err(e) => {
                         warn!(error = %e, "encode failed; dropping frame");
@@ -1706,9 +1921,101 @@ mod tests {
     //!
     //! The full subprocess-level integration test is tracked separately;
     //! see the project task list.
+    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::task::JoinSet;
+
+    #[test]
+    fn encode_dims_no_viewport_passes_capture_dims_through() {
+        // No viewport → capture dims pass through unmodified. H.264 /
+        // HEVC SPS carries crop signalling for non-16-aligned heights
+        // like 1080; flooring would silently lose 8 rows. The
+        // alignment floor only kicks in when a viewport budget
+        // requires it.
+        assert_eq!(encode_dims_for_viewport(1920, 1080, None), (1920, 1080));
+        assert_eq!(encode_dims_for_viewport(1366, 768, None), (1366, 768));
+    }
+
+    #[test]
+    fn encode_dims_viewport_smaller_letterboxes() {
+        // 3840x2160 captured, client viewport 1280x720. Aspect
+        // matches (16:9), so we expect 1280x720 exactly (both
+        // 16-aligned).
+        assert_eq!(
+            encode_dims_for_viewport(3840, 2160, Some(Viewport::new(1280, 720))),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn encode_dims_viewport_aspect_mismatch_letterboxes_at_smaller_axis() {
+        // 1920x1080 (16:9) captured, client window 1280x1024 (5:4).
+        // We must fit inside 1280x1024 without stretching: the height
+        // ratio (1024/1080 = 0.948) is smaller than the width ratio
+        // (1280/1920 = 0.667), so width is the binding edge: 1920 *
+        // 0.667 = 1280, height = 1080 * 0.667 = 720. Client letterboxes
+        // the 1280x720 inside its 1280x1024 window.
+        assert_eq!(
+            encode_dims_for_viewport(1920, 1080, Some(Viewport::new(1280, 1024))),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn encode_dims_viewport_larger_does_not_upscale() {
+        // Client window is bigger than the capture. We don't pay
+        // for upscaling — encoder stays at capture dims, client
+        // upscales locally with its renderer.
+        assert_eq!(
+            encode_dims_for_viewport(1280, 720, Some(Viewport::new(3840, 2160))),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn encode_dims_invalid_viewport_falls_back() {
+        // A peer that sends (0, 0) is explicitly opting out. Same
+        // behaviour as `None`: capture dims passed through, no
+        // alignment floor.
+        assert_eq!(
+            encode_dims_for_viewport(1920, 1080, Some(Viewport::new(0, 720))),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn encode_dims_rounds_down_to_alignment() {
+        // Off-aspect viewport that lands the output on non-16-aligned
+        // dims. We must round DOWN — the encoder rejects unaligned
+        // input on hardware Main444 backends, and overshooting would
+        // mean we ship more pixels than the client asked for.
+        let (w, h) = encode_dims_for_viewport(1920, 1080, Some(Viewport::new(1000, 600)));
+        assert_eq!(w % 16, 0);
+        assert_eq!(h % 16, 0);
+        assert!(w <= 1000 && h <= 600);
+    }
+
+    #[test]
+    fn resize_bgra_identity_for_same_dims() {
+        // Same in/out dims should be a faithful bitwise copy. We
+        // route around this case in the encode branch to avoid the
+        // allocation, but the function itself must still be correct
+        // when called.
+        let src = vec![0x11u8, 0x22, 0x33, 0xFF, 0x44, 0x55, 0x66, 0xFF];
+        let out = resize_bgra_bilinear(&src, 2, 1, 2, 1);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn resize_bgra_downscale_preserves_solid_color() {
+        // A solid BGRA fill must come back as the same color at
+        // every output pixel — bilinear must not introduce drift on
+        // a constant image.
+        let src = vec![0x80u8; 64 * 64 * 4];
+        let out = resize_bgra_bilinear(&src, 64, 64, 32, 32);
+        assert!(out.iter().all(|&v| v == 0x80));
+    }
 
     /// Increments a shared counter once, when its sole owner drops it.
     /// Stand-in for the `LibeiInjector` (which we can't construct in a

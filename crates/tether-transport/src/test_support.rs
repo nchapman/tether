@@ -208,6 +208,7 @@ mod tests {
             client_name: "test".into(),
             preferred_codecs: vec![CodecKind::H264],
             max_resolution: None,
+            viewport: None,
             clock_probe_t0: MonoNanos::ZERO,
             extensions: Default::default(),
             resume_token: None,

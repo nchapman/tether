@@ -467,6 +467,14 @@ pub struct ClientHelloV1 {
     pub preferred_codecs: Vec<CodecKind>,
     /// Client's maximum displayable resolution (host decides actual).
     pub max_resolution: Option<(u32, u32)>,
+    /// Client's current viewport — the pixel dimensions of the window
+    /// it will render the remote desktop into. The host uses this as
+    /// the encoder output size (clamped to encoder alignment), which
+    /// avoids paying for full-resolution encode + transport when the
+    /// client window is smaller than the host display. `None` lets
+    /// the host pick native dimensions. Mid-session resizes ride
+    /// [`ControlMessage::SetClientViewport`].
+    pub viewport: Option<Viewport>,
     /// First leg of the handshake clock probe — client's monotonic time at
     /// the moment of send.
     pub clock_probe_t0: MonoNanos,
@@ -618,6 +626,41 @@ pub enum ControlMessage {
         fragments_lost: u32,
         rtt_ewma_us: u32,
     },
+    /// Client → host. The client's viewport changed (window resize,
+    /// monitor switch, fullscreen toggle). The host treats this as a
+    /// request to re-target the encoder at the new dimensions; the
+    /// rebuild reuses the same `stream_epoch` bump path as a
+    /// resolution change on the capture side. Hosts MAY debounce
+    /// rapid sequences (e.g. drag-resize) by latching the latest
+    /// viewport and rebuilding on the next frame rather than on each
+    /// message.
+    SetClientViewport(Viewport),
+}
+
+/// Pixel dimensions of the client's rendering surface. Used to size
+/// the encoder so we don't ship more pixels than the client will
+/// display. Width and height are positive integers — `0` in either
+/// is treated by the host as "ignore this viewport, use native."
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Viewport {
+    #[must_use]
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    /// `true` if both dimensions are non-zero. Hosts must check this
+    /// before using a viewport — a peer that sends `(0, 0)` is
+    /// explicitly opting out of viewport-driven sizing for the
+    /// duration of the connection.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.width > 0 && self.height > 0
+    }
 }
 
 // --- ClockSync ----------------------------------------------------------

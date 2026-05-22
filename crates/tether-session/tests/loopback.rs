@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use tether_protocol::control::{
-    ChromaSubsampling, ClientHello, CodecKind, ServerHello, VideoProfile,
+    ChromaSubsampling, ClientHello, CodecKind, ControlMessage, ServerHello, VideoProfile, Viewport,
 };
 use tether_session::{
     AcceptError, ClientSession, ClientSessionConfig, ConnectError, HostSession, HostSessionConfig,
@@ -30,6 +30,7 @@ fn cfgs() -> (HostSessionConfig, ClientSessionConfig) {
     let client = ClientSessionConfig {
         client_name: "test-client".to_string(),
         client_decode_profiles: vec![VideoProfile::HEVC_8BIT_420, VideoProfile::H264_8BIT_420],
+        viewport: None,
     };
     (host, client)
 }
@@ -166,6 +167,7 @@ async fn double_send_server_hello_corrupts_the_stream() {
                 client_name: "test".into(),
                 preferred_codecs: vec![CodecKind::H264],
                 max_resolution: None,
+                viewport: None,
                 clock_probe_t0: MonoNanos::ZERO,
                 extensions: Default::default(),
                 resume_token: None,
@@ -257,6 +259,7 @@ async fn client_filters_unknown_bit_depth_from_host_advert() {
     let client_cfg = ClientSessionConfig {
         client_name: "test-client".to_string(),
         client_decode_profiles: vec![VideoProfile::HEVC_8BIT_420],
+        viewport: None,
     };
 
     let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
@@ -311,6 +314,7 @@ async fn host_filters_unknown_bit_depths_keeps_known_ones() {
             },
             VideoProfile::HEVC_8BIT_420,
         ],
+        viewport: None,
     };
 
     let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
@@ -355,6 +359,7 @@ async fn client_handshake_decodes_legacy_inline_fields_when_extension_absent() {
         // 8-bit HEVC must be advertised so the post-resolve
         // ProfileNotAdvertised check passes.
         client_decode_profiles: vec![VideoProfile::HEVC_8BIT_420],
+        viewport: None,
     };
 
     let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
@@ -419,5 +424,93 @@ async fn dropped_client_during_handshake_surfaces_as_transport_error() {
         matches!(err, AcceptError::Transport(_)),
         "expected Transport(_), got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn initial_viewport_round_trips_via_client_hello() {
+    // The client config's `viewport` populates `ClientHelloV1::viewport`,
+    // and the host receives it on its session struct. Loopback covers
+    // both sides — guards against a future refactor dropping the
+    // field in either direction.
+    let (host_chan, client_chan) = duplex_pair();
+    let (host_cfg, mut client_cfg) = cfgs();
+    client_cfg.viewport = Some(Viewport::new(1280, 720));
+
+    let host_chan: Arc<dyn ControlChannel> = host_chan;
+    let client_chan: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        HostSession::accept(host_chan, host_cfg, |client_caps| {
+            client_caps.iter().copied().next()
+        })
+        .await
+        .unwrap()
+    });
+    let client_task = tokio::spawn(async move {
+        ClientSession::connect(client_chan, client_cfg).await.unwrap()
+    });
+
+    let host = host_task.await.unwrap();
+    let _client = client_task.await.unwrap();
+    assert_eq!(host.client_hello.viewport, Some(Viewport::new(1280, 720)));
+}
+
+#[tokio::test]
+async fn mid_session_set_viewport_round_trips_on_control_stream() {
+    // After the handshake, the client sending SetClientViewport
+    // arrives on the host's recv_control. This is the wire half of
+    // the production flow; the host binary's send-thread side
+    // (encoder rebuild, force_idr raise) is covered by host-side
+    // unit tests on the dim helper.
+    let (host_chan, client_chan) = duplex_pair();
+    let (host_cfg, client_cfg) = cfgs();
+
+    let host_chan_for_session: Arc<dyn ControlChannel> = host_chan.clone();
+    let client_chan_for_session: Arc<dyn ControlChannel> = client_chan.clone();
+
+    let host_task = tokio::spawn(async move {
+        HostSession::accept(host_chan_for_session, host_cfg, |client_caps| {
+            client_caps.iter().copied().next()
+        })
+        .await
+        .unwrap()
+    });
+    let client_task = tokio::spawn(async move {
+        ClientSession::connect(client_chan_for_session, client_cfg)
+            .await
+            .unwrap()
+    });
+    let _host = host_task.await.unwrap();
+    let _client = client_task.await.unwrap();
+
+    // Now the post-handshake message.
+    let host_chan_recv: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_send: Arc<dyn ControlChannel> = client_chan;
+    let send_task = tokio::spawn(async move {
+        client_chan_send
+            .send_control(&ControlMessage::SetClientViewport(Viewport::new(640, 480)))
+            .await
+            .unwrap();
+    });
+    let recv_task = tokio::spawn(async move {
+        // The client implementation sends a ForceIdr immediately after
+        // a successful handshake (so the host emits a fresh keyframe
+        // for the new decoder); swallow it so the SetClientViewport
+        // is the message we assert on.
+        loop {
+            match host_chan_recv.recv_control().await.unwrap() {
+                ControlMessage::ForceIdr => continue,
+                other => return other,
+            }
+        }
+    });
+    send_task.await.unwrap();
+    let msg = recv_task.await.unwrap();
+    match msg {
+        ControlMessage::SetClientViewport(v) => {
+            assert_eq!(v, Viewport::new(640, 480));
+        }
+        other => panic!("expected SetClientViewport, got {other:?}"),
+    }
 }
 

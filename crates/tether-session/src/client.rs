@@ -39,6 +39,10 @@ pub struct ClientSessionConfig {
     /// retained on the returned session for the post-handshake
     /// validation against whatever profile the host picked.
     pub client_decode_profiles: Vec<VideoProfile>,
+    /// Initial viewport dimensions for pre-encode scaling. `None`
+    /// tells the host to encode at its native resolution. Mid-session
+    /// resizes go through `ControlMessage::SetClientViewport`.
+    pub viewport: Option<tether_protocol::control::Viewport>,
 }
 
 /// Per-connection state produced by a successful [`ClientSession::connect`].
@@ -122,6 +126,7 @@ impl ClientSession {
             // the first they can build.
             preferred_codecs: vec![CodecKind::Hevc, CodecKind::H264],
             max_resolution: None,
+            viewport: cfg.viewport,
             // Stamped by `client_handshake` immediately before the
             // send; the value here is overwritten.
             clock_probe_t0: MonoNanos::ZERO,

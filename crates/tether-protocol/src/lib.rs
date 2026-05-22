@@ -165,6 +165,7 @@ mod tests {
             client_name: "tether-client/0.0.1".into(),
             preferred_codecs: vec![CodecKind::H264, CodecKind::Hevc],
             max_resolution: Some((3840, 2160)),
+            viewport: Some(crate::control::Viewport::new(1280, 720)),
             clock_probe_t0: MonoNanos(123_456_789),
             extensions: Default::default(),
             resume_token: None,
@@ -176,6 +177,7 @@ mod tests {
         assert_eq!(body.client_name, body2.client_name);
         assert_eq!(body.preferred_codecs, body2.preferred_codecs);
         assert_eq!(body.max_resolution, body2.max_resolution);
+        assert_eq!(body.viewport, body2.viewport);
         assert_eq!(body.clock_probe_t0, body2.clock_probe_t0);
         assert!(body2.extensions.is_empty());
         assert!(body2.resume_token.is_none());
@@ -192,6 +194,7 @@ mod tests {
             client_name: "x".into(),
             preferred_codecs: vec![CodecKind::H264],
             max_resolution: None,
+            viewport: None,
             clock_probe_t0: MonoNanos(1),
             extensions: extensions.clone(),
             resume_token: Some(vec![0xde, 0xad, 0xbe, 0xef]),
@@ -242,6 +245,7 @@ mod tests {
             client_name: "x".into(),
             preferred_codecs: vec![CodecKind::H264],
             max_resolution: None,
+            viewport: None,
             clock_probe_t0: MonoNanos(0),
             extensions: Default::default(),
             resume_token: None,
@@ -253,6 +257,30 @@ mod tests {
             result.is_err(),
             "trailing bytes after a valid message must fail decode"
         );
+    }
+
+    #[test]
+    fn round_trip_set_client_viewport() {
+        use crate::control::{ControlMessage, Viewport};
+        let msg = ControlMessage::SetClientViewport(Viewport::new(1280, 800));
+        let bytes = encode(&msg).unwrap();
+        let msg2: ControlMessage = decode(&bytes).unwrap();
+        match msg2 {
+            ControlMessage::SetClientViewport(v) => {
+                assert_eq!(v.width, 1280);
+                assert_eq!(v.height, 800);
+            }
+            other => panic!("expected SetClientViewport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn viewport_is_valid_rejects_zero_dims() {
+        use crate::control::Viewport;
+        assert!(Viewport::new(1, 1).is_valid());
+        assert!(!Viewport::new(0, 1).is_valid());
+        assert!(!Viewport::new(1, 0).is_valid());
+        assert!(!Viewport::new(0, 0).is_valid());
     }
 
     #[test]

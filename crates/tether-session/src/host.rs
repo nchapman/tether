@@ -341,6 +341,7 @@ mod tests {
             client_name: "test".to_string(),
             preferred_codecs: vec![],
             max_resolution: None,
+            viewport: None,
             clock_probe_t0: MonoNanos::ZERO,
             extensions: BTreeMap::new(),
             resume_token: None,

@@ -115,6 +115,7 @@ mod tests {
             client_name: "t".into(),
             preferred_codecs: vec![CodecKind::H264],
             max_resolution: None,
+            viewport: None,
             clock_probe_t0: MonoNanos::now(),
             extensions: BTreeMap::new(),
             resume_token: None,

@@ -111,6 +111,12 @@ async fn main() -> anyhow::Result<()> {
         ClientSessionConfig {
             client_name: "tether-client".to_string(),
             client_decode_profiles: client_decode_profiles.clone(),
+            // Viewport plumbing exists in the protocol; the client
+            // binary doesn't yet observe its render window size at
+            // connect time, so leave None for now and let the host
+            // pick native. Wire-up belongs with the renderer's
+            // resize event surface, tracked separately.
+            viewport: None,
         },
     )
     .await
@@ -213,7 +219,8 @@ async fn main() -> anyhow::Result<()> {
                     Ok(ControlMessage::StreamReady { .. }
                        | ControlMessage::StreamPause { .. }
                        | ControlMessage::StreamResume { .. }
-                       | ControlMessage::ClientStats { .. }) => {
+                       | ControlMessage::ClientStats { .. }
+                       | ControlMessage::SetClientViewport(_)) => {
                         // Client-originated; misrouted if seen on the client side.
                         tracing::debug!("unexpected client→host control message arrived on client; ignoring");
                     }

@@ -17,6 +17,8 @@
 
 use std::sync::Arc;
 
+use std::time::Instant;
+
 use half::f16;
 use tether_scaler::reference;
 use tether_scaler::{ColorSpace, Pipelines, Scaler, ScalerError};
@@ -741,6 +743,121 @@ fn linear_light_solid_color_preserves_color() {
         assert!((chunk[2] - 0.7).abs() < 0.01, "B drift: {}", chunk[2]);
         assert!(chunk[3].is_finite());
     }
+}
+
+/// Time `iterations` scale() calls in wall-clock terms with a fresh
+/// command encoder per call and a `poll(Wait)` afterwards to flush the
+/// GPU. Skips the first 3 calls as warmup (pipeline compilation,
+/// driver allocator warm-up, swapchain prepass). Returns (min, median,
+/// max) in microseconds across the remaining iterations.
+fn time_scale(
+    device: &wgpu::Device,
+    scaler: &Scaler,
+    src: &wgpu::Texture,
+    iterations: usize,
+) -> (f64, f64, f64) {
+    // Warmup.
+    for _ in 0..3 {
+        let _ = scaler.scale(src).expect("scale");
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+    }
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let t = Instant::now();
+        let _ = scaler.scale(src).expect("scale");
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let dt = t.elapsed().as_secs_f64() * 1_000_000.0;
+        samples.push(dt);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let min = samples[0];
+    let max = samples[samples.len() - 1];
+    let median = samples[samples.len() / 2];
+    (min, median, max)
+}
+
+/// Microbench the scaler at production-realistic dims. Not a test
+/// assertion — prints the numbers so the run output answers "how
+/// expensive is this on real hardware?" without spinning up
+/// criterion. Run with:
+///
+///   cargo test -p tether-scaler --test hardware --release \
+///     -- --ignored --nocapture bench_scale
+#[test]
+#[ignore = "perf microbenchmark; prints timings, no assertions"]
+fn bench_scale_realistic_dims() {
+    let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
+    let pipelines = std::sync::Arc::new(Pipelines::build(&device));
+    let info_string = "scaler microbench (Srgb8 / LinearF16, --release recommended)";
+    println!("\n{info_string}\n{}", "-".repeat(info_string.len()));
+    println!("{:<32} {:<14} {:>8} {:>8} {:>8}", "case", "mip levels", "min µs", "med µs", "max µs");
+
+    let cases_srgb: &[((u32, u32), (u32, u32), &str)] = &[
+        ((1920, 1080), (1280, 720),  "1080p → 720p (host downscale)"),
+        ((3840, 2160), (1920, 1080), "4K → 1080p (host downscale)"),
+        ((3840, 2160), (1280, 720),  "4K → 720p (mip + Mitchell)"),
+        ((3840, 2160), (640, 360),   "4K → 360p (heavy mip)"),
+    ];
+    for &(src_dims, dst_dims, label) in cases_srgb {
+        let bytes = quadrant_image(src_dims.0, src_dims.1);
+        let src_tex = upload_rgba8(&device, &queue, &bytes, src_dims.0, src_dims.1);
+        let scaler = Scaler::new_with_color_space(
+            pipelines.clone(),
+            device.clone(),
+            queue.clone(),
+            src_dims,
+            dst_dims,
+            ColorSpace::Srgb8,
+        )
+        .expect("scaler new");
+        let (min, med, max) = time_scale(&device, &scaler, &src_tex, 30);
+        println!(
+            "{:<32} {:<14} {:>8.1} {:>8.1} {:>8.1}",
+            label,
+            format!("{}", scaler.mip_levels()),
+            min,
+            med,
+            max
+        );
+    }
+
+    let cases_linear: &[((u32, u32), (u32, u32), &str)] = &[
+        ((1280, 720), (1920, 1080),  "720p → 1080p (client upscale)"),
+        ((1280, 720), (3840, 2160),  "720p → 4K (client upscale)"),
+        ((640, 360),  (1920, 1080),  "360p → 1080p (3× upscale)"),
+    ];
+    for &(src_dims, dst_dims, label) in cases_linear {
+        // Build a linear-light fp32 source and upload.
+        let n = (src_dims.0 * src_dims.1) as usize;
+        let mut src = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            src.extend_from_slice(&[0.3_f32, 0.5, 0.7, 1.0]);
+        }
+        let src_tex = upload_rgba16f(&device, &queue, &src, src_dims.0, src_dims.1);
+        let scaler = Scaler::new_with_color_space(
+            pipelines.clone(),
+            device.clone(),
+            queue.clone(),
+            src_dims,
+            dst_dims,
+            ColorSpace::LinearF16,
+        )
+        .expect("scaler new");
+        let (min, med, max) = time_scale(&device, &scaler, &src_tex, 30);
+        println!(
+            "{:<32} {:<14} {:>8.1} {:>8.1} {:>8.1}",
+            label,
+            "(linear)",
+            min,
+            med,
+            max
+        );
+    }
+    println!();
 }
 
 #[test]

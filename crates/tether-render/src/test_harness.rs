@@ -132,6 +132,10 @@ pub(crate) enum Capability {
     VulkanDmaBufImport,
     /// `TEXTURE_FORMAT_16BIT_NORM` — required for 10-bit Biplanar16.
     BitDepth10RendererSupport,
+    /// AV1 codec context. No cells use this yet; reserved so a future
+    /// AV1 cell SKIPs with a self-documenting capability label
+    /// instead of a misleading H.264 one.
+    VaapiAv1,
 }
 
 #[derive(Debug)]
@@ -770,10 +774,7 @@ fn capability_for_profile(profile: VideoProfile) -> Capability {
         (CodecKind::Hevc, ChromaSubsampling::Yuv444, _) => Capability::VaapiHevcMain444,
         (CodecKind::Hevc, _, 10) => Capability::VaapiHevcMain10DmaBuf,
         (CodecKind::Hevc, _, _) => Capability::VaapiHevcMain,
-        // AV1 not yet wired into the harness; surface as the closest
-        // existing capability so a future AV1 cell SKIPs loudly with a
-        // recognisable label until proper coverage lands.
-        (CodecKind::Av1, _, _) => Capability::VaapiH264,
+        (CodecKind::Av1, _, _) => Capability::VaapiAv1,
     }
 }
 

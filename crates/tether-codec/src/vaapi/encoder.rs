@@ -12,15 +12,13 @@ use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
 use crate::encoder_common::{drain_encoder, snapshot_extradata};
 use crate::h264::frame_plane_mut;
-use crate::{
-    init_ffmpeg, CodecError, DmaBufFrame, Encoder, EncodedPacket, Result, GOP_SECONDS,
-};
+use crate::{init_ffmpeg, CodecError, DmaBufFrame, EncodedPacket, Encoder, Result, GOP_SECONDS};
 
 use super::ffi::{
     AVDRMFrameDescriptor, AVDRMLayerDescriptor, AVDRMObjectDescriptor, AVDRMPlaneDescriptor,
@@ -150,8 +148,7 @@ impl VaapiEncoder {
         // lets FFmpeg pick — explicit device strings only matter on
         // multi-GPU systems, which we'll handle when a user with that
         // setup hits us up.
-        let hw_device =
-            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_VAAPI, None, None, 0)?;
+        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_VAAPI, None, None, 0)?;
 
         let width_i32 = i32::try_from(width).expect("width fits in i32");
         let height_i32 = i32::try_from(height).expect("height fits in i32");
@@ -169,8 +166,8 @@ impl VaapiEncoder {
         // GOP cadence matches the libx264 fallback so the on-wire
         // worst-case "garbled until next IDR" window is the same
         // regardless of which encoder the probe picked.
-        let gop_frames = fps_i32
-            .saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
+        let gop_frames =
+            fps_i32.saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
         encoder.set_gop_size(gop_frames);
         encoder.set_max_b_frames(0);
 
@@ -225,9 +222,7 @@ impl VaapiEncoder {
             if kind == CodecKind::Hevc {
                 if matches!(chroma, ChromaSubsampling::Yuv444) {
                     raw.profile = ffi::AV_PROFILE_HEVC_REXT as i32;
-                } else if matches!(chroma, ChromaSubsampling::Yuv420)
-                    && bit_depth == 10
-                {
+                } else if matches!(chroma, ChromaSubsampling::Yuv420) && bit_depth == 10 {
                     raw.profile = ffi::AV_PROFILE_HEVC_MAIN_10 as i32;
                 }
             }
@@ -422,9 +417,7 @@ impl VaapiEncoder {
             );
             return Err(CodecError::UnsupportedInputFormat);
         }
-        if frame.objects.len() > AV_DRM_MAX_PLANES
-            || frame.layers.len() > AV_DRM_MAX_PLANES
-        {
+        if frame.objects.len() > AV_DRM_MAX_PLANES || frame.layers.len() > AV_DRM_MAX_PLANES {
             return Err(CodecError::UnsupportedInputFormat);
         }
         // Same upper bound on per-layer planes — otherwise the
@@ -446,8 +439,7 @@ impl VaapiEncoder {
         // hwcontext_drm.h contract is "user-allocated only"), so it
         // returns EINVAL and the whole map fails. With buf[0] set,
         // av_frame_ref takes the simple ref-bump path.
-        let mut desc: Box<AVDRMFrameDescriptor> =
-            Box::new(unsafe { std::mem::zeroed() });
+        let mut desc: Box<AVDRMFrameDescriptor> = Box::new(unsafe { std::mem::zeroed() });
         desc.nb_objects = i32::try_from(frame.objects.len()).expect("<= 4");
         for (i, obj) in frame.objects.iter().enumerate() {
             desc.objects[i] = AVDRMObjectDescriptor {
@@ -467,10 +459,8 @@ impl VaapiEncoder {
                 planes[p] = AVDRMPlaneDescriptor {
                     object_index: i32::try_from(layer.object_index[p])
                         .expect("object_index fits in i32"),
-                    offset: isize::try_from(layer.offset[p])
-                        .expect("offset fits in isize"),
-                    pitch: isize::try_from(layer.pitch[p])
-                        .expect("pitch fits in isize"),
+                    offset: isize::try_from(layer.offset[p]).expect("offset fits in isize"),
+                    pitch: isize::try_from(layer.pitch[p]).expect("pitch fits in isize"),
                 };
             }
             desc.layers[i] = AVDRMLayerDescriptor {
@@ -485,10 +475,7 @@ impl VaapiEncoder {
         // owns the descriptor's heap allocation. av_buffer_create takes
         // ownership of `desc`; we Box::into_raw to surrender the Box.
         let desc_ptr = Box::into_raw(desc);
-        unsafe extern "C" fn drm_desc_free(
-            _opaque: *mut std::ffi::c_void,
-            data: *mut u8,
-        ) {
+        unsafe extern "C" fn drm_desc_free(_opaque: *mut std::ffi::c_void, data: *mut u8) {
             // SAFETY: data was produced by Box::into_raw on a
             // Box<AVDRMFrameDescriptor>; this is the only path that
             // reclaims it.
@@ -512,7 +499,9 @@ impl VaapiEncoder {
             // SAFETY: av_buffer_create didn't take ownership, so we
             // still own desc_ptr and must reclaim it.
             unsafe { drop(Box::from_raw(desc_ptr)) };
-            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(ffi::ENOMEM))));
+            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(
+                ffi::ENOMEM,
+            ))));
         }
 
         // Build the source DRM_PRIME AVFrame. Pointing data[0] +
@@ -575,15 +564,31 @@ impl VaapiEncoder {
             // Map failures here are usually a modifier mismatch
             // between the source DMA-BUF and what the encoder's pool
             // accepts. Log the descriptor shape so field bugs are
-            // tractable without re-running with AV_LOG_DEBUG.
-            warn!(
-                rc,
-                fourcc = format_args!("{:08x}", frame.fourcc),
-                num_objects = frame.objects.len(),
-                num_layers = frame.layers.len(),
-                modifier = frame.objects.first().map(|o| o.drm_format_modifier),
-                "av_hwframe_map(DRM_PRIME -> VAAPI) failed"
-            );
+            // tractable without re-running with AV_LOG_DEBUG. Inside
+            // a probe (e.g. the host startup capability probe that
+            // intentionally exercises P010 on Intel iHD to detect
+            // the documented submit-time rejection) drop to debug so
+            // the expected failure doesn't surface as a scary warning
+            // on every host launch.
+            if crate::av_log::probe_suppression_active() {
+                debug!(
+                    rc,
+                    fourcc = format_args!("{:08x}", frame.fourcc),
+                    num_objects = frame.objects.len(),
+                    num_layers = frame.layers.len(),
+                    modifier = frame.objects.first().map(|o| o.drm_format_modifier),
+                    "av_hwframe_map(DRM_PRIME -> VAAPI) failed (probe; expected on some drivers)"
+                );
+            } else {
+                warn!(
+                    rc,
+                    fourcc = format_args!("{:08x}", frame.fourcc),
+                    num_objects = frame.objects.len(),
+                    num_layers = frame.layers.len(),
+                    modifier = frame.objects.first().map(|o| o.drm_format_modifier),
+                    "av_hwframe_map(DRM_PRIME -> VAAPI) failed"
+                );
+            }
             return Err(CodecError::Ffmpeg(RsmpegError::from(rc)));
         }
 
@@ -814,5 +819,3 @@ fn vaapi_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
         _ => return Err(CodecError::UnsupportedInputFormat),
     })
 }
-
-

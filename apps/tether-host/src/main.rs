@@ -15,15 +15,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
-use tether_capture::{CapturedFrame, PixelFormat};
-use tether_codec::{build_encoder, Encoder};
-use tether_session::{AcceptError, HostSession, HostSessionConfig};
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
-#[cfg(target_os = "linux")]
-use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
+use tether_capture::{CapturedFrame, PixelFormat};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tether_codec::GpuEncoderFrame;
+use tether_codec::{build_encoder, Encoder};
+#[cfg(target_os = "linux")]
+use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{
     Bgra2P010DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
@@ -33,6 +32,7 @@ use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
 use tether_protocol::MonoNanos;
+use tether_session::{AcceptError, HostSession, HostSessionConfig};
 use tether_transport::{Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
@@ -126,22 +126,38 @@ async fn main() -> anyhow::Result<()> {
     // `handle_client` and dropped when it returns; nothing leaks
     // between sessions. Errors from a single session are logged and
     // the loop continues, so a malformed client or a transient
-    // decoder failure can't take the host process down. Ctrl-C (handled
-    // inside `handle_client`'s `tokio::select!`) ends the current
-    // session; the outer loop sees that as a normal session end and
-    // accepts the next client. Process-level shutdown is via SIGTERM
-    // / SIGKILL, not by the loop reaching a natural end.
+    // decoder failure can't take the host process down.
+    //
+    // Ctrl-C is raced at two levels: `handle_client`'s inner select
+    // tears the current session down cleanly (sends Goodbye, closes
+    // the QUIC connection, joins the send thread). The outer races
+    // below catch the same signal so the reconnect loop also exits —
+    // without them, the inner handler suppresses the kernel's default
+    // SIGINT-kills-process behavior (once tokio's signal handler is
+    // installed it stays installed) and subsequent Ctrl-Cs are
+    // silently queued.
     loop {
-        let conn = match server.accept().await {
-            Some(Ok(c)) => Arc::new(c),
-            Some(Err(e)) => {
-                warn!(error = ?e, "server.accept failed; continuing");
-                continue;
-            }
-            None => {
-                warn!("server closed; ending main loop");
+        let conn = tokio::select! {
+            biased;
+            ctrl_c = tokio::signal::ctrl_c() => {
+                if let Err(e) = ctrl_c {
+                    warn!(error = %e, "ctrl-c handler failed; shutting down anyway");
+                } else {
+                    info!("ctrl-c received at main loop; shutting down");
+                }
                 break;
             }
+            accept_res = server.accept() => match accept_res {
+                Some(Ok(c)) => Arc::new(c),
+                Some(Err(e)) => {
+                    warn!(error = ?e, "server.accept failed; continuing");
+                    continue;
+                }
+                None => {
+                    warn!("server closed; ending main loop");
+                    break;
+                }
+            },
         };
         info!(remote = %conn.remote_address(), "client connected");
 
@@ -167,9 +183,7 @@ async fn main() -> anyhow::Result<()> {
         let session = match HostSession::accept(
             conn.clone() as Arc<dyn tether_transport::ControlChannel>,
             cfg,
-            |client_caps| {
-                tether_probe::pick_supported_profile(&host_encode_profiles, client_caps)
-            },
+            |client_caps| tether_probe::pick_supported_profile(&host_encode_profiles, client_caps),
         )
         .await
         {
@@ -192,8 +206,25 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        if let Err(e) = handle_client(session, conn, use_test_pattern).await {
-            warn!(error = ?e, "session ended with error; accepting next client");
+        tokio::select! {
+            biased;
+            ctrl_c = tokio::signal::ctrl_c() => {
+                if let Err(e) = ctrl_c {
+                    warn!(error = %e, "ctrl-c handler failed; shutting down anyway");
+                } else {
+                    info!("ctrl-c received during session; shutting down");
+                }
+                // `handle_client`'s future drops here, which drops the
+                // per-session graph (encoder thread, recv tasks, libei
+                // injector). The connection close on the dropped
+                // `Arc<Connection>` notifies the client.
+                break;
+            }
+            res = handle_client(session, conn, use_test_pattern) => {
+                if let Err(e) = res {
+                    warn!(error = ?e, "session ended with error; accepting next client");
+                }
+            }
         }
     }
 
@@ -319,7 +350,8 @@ async fn handle_client(
     // the dims-follower task reads it and feeds the injector via
     // set_display_size. We use a single-slot watch so the injector
     // always reads the latest known dims even if it polls late.
-    let (display_dims_tx, display_dims_rx) = tokio::sync::watch::channel::<Option<(u32, u32)>>(None);
+    let (display_dims_tx, display_dims_rx) =
+        tokio::sync::watch::channel::<Option<(u32, u32)>>(None);
 
     // Capture + send runs on a dedicated OS thread per the expert review:
     // the hot path doesn't share the tokio runtime with anything else.
@@ -410,7 +442,10 @@ async fn handle_client(
                         force_idr.raise();
                     }
                     Ok(ControlMessage::StreamReady { video, audio }) => {
-                        info!(video, audio, "client signalled StreamReady; opening the gate");
+                        info!(
+                            video,
+                            audio, "client signalled StreamReady; opening the gate"
+                        );
                         stream_ready_ctl.store(true, Ordering::Release);
                     }
                     Ok(ControlMessage::StreamPause { display }) => {
@@ -473,20 +508,29 @@ async fn handle_client(
                             "unknown control extension; ignoring"
                         );
                     }
-                    Ok(ControlMessage::CursorShape { .. } | ControlMessage::CursorUseShape { .. }) => {
+                    Ok(
+                        ControlMessage::CursorShape { .. } | ControlMessage::CursorUseShape { .. },
+                    ) => {
                         // Host-originated; receiving one here means the
                         // client misrouted. Log and drop.
-                        tracing::debug!("unexpected host→client cursor message arrived on host; ignoring");
+                        tracing::debug!(
+                            "unexpected host→client cursor message arrived on host; ignoring"
+                        );
                     }
                     Ok(ControlMessage::DisplayList { .. }) => {
                         // Host-originated; misrouted if seen here.
-                        tracing::debug!("unexpected host→client DisplayList arrived on host; ignoring");
+                        tracing::debug!(
+                            "unexpected host→client DisplayList arrived on host; ignoring"
+                        );
                     }
                     Ok(ControlMessage::SetActiveDisplays { displays }) => {
                         // Single-display host today — log the request
                         // and ignore. The selection mechanic plugs in
                         // when multi-display capture lands.
-                        info!(?displays, "client requested display subset; ignoring (single-display host)");
+                        info!(
+                            ?displays,
+                            "client requested display subset; ignoring (single-display host)"
+                        );
                     }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");
@@ -877,9 +921,11 @@ fn encode_iosurface_frame(
         width: iosurface.width,
         height: iosurface.height,
     };
-    let packets = slot
-        .encoder
-        .encode_gpu(GpuEncoderFrame::IOSurface(&codec_frame), pts, force_keyframe)?;
+    let packets = slot.encoder.encode_gpu(
+        GpuEncoderFrame::IOSurface(&codec_frame),
+        pts,
+        force_keyframe,
+    )?;
     // `gpu` (and its `release_guard`) falls out of scope at function
     // end, releasing the capture-side CMSampleBuffer + IOSurface
     // retains. By that point `submit_iosurface` has already taken its
@@ -1138,12 +1184,10 @@ fn run_capture_and_send(
                         "host could not construct {:?} {:?} encoder for {}x{}: {}",
                         chosen_profile.codec, chosen_profile.chroma, frame_width, frame_height, e
                     );
-                    let _ = runtime.block_on(goodbye_conn.send_control(
-                        &ControlMessage::Goodbye {
-                            reason,
-                            code: tether_protocol::control::GoodbyeCode::InternalError,
-                        },
-                    ));
+                    let _ = runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
+                        reason,
+                        code: tether_protocol::control::GoodbyeCode::InternalError,
+                    }));
                     return;
                 }
             };
@@ -1185,12 +1229,10 @@ fn run_capture_and_send(
                     );
                     let goodbye_conn = conn.clone();
                     let reason = format!("host GPU encode bridge collapsed: {e}");
-                    let _ = runtime.block_on(goodbye_conn.send_control(
-                        &ControlMessage::Goodbye {
-                            reason,
-                            code: tether_protocol::control::GoodbyeCode::InternalError,
-                        },
-                    ));
+                    let _ = runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
+                        reason,
+                        code: tether_protocol::control::GoodbyeCode::InternalError,
+                    }));
                     return;
                 }
             },
@@ -1310,9 +1352,7 @@ fn persistent_cert_dir() -> anyhow::Result<PathBuf> {
         return Ok(PathBuf::from(dir));
     }
     let home = std::env::var_os("HOME").ok_or_else(|| {
-        anyhow::anyhow!(
-            "neither $TETHER_CERT_DIR nor $HOME is set; can't choose a cert directory"
-        )
+        anyhow::anyhow!("neither $TETHER_CERT_DIR nor $HOME is set; can't choose a cert directory")
     })?;
     Ok(PathBuf::from(home).join(".tether"))
 }
@@ -1367,24 +1407,24 @@ async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<Receiver<
     // AR24 (DRM_FORMAT_ARGB8888) and XR24 (DRM_FORMAT_XRGB8888) both map
     // to vk::Format::B8G8R8A8_UNORM on the importer side, so the
     // modifier sets are identical; querying once suffices.
-    let modifiers = match tether_gpuconvert::importable_dmabuf_modifiers(
-        u32::from_le_bytes(*b"AR24"),
-    )
-    .await
-    {
-        Ok(m) if !m.is_empty() => {
-            info!(count = m.len(), "advertised DMA-BUF modifiers to compositor");
-            m
-        }
-        Ok(_) => {
-            warn!("GPU importer reports zero DRM modifiers; DMA-BUF disabled, SHM only");
-            Vec::new()
-        }
-        Err(e) => {
-            warn!(error = %e, "modifier query failed; DMA-BUF disabled, SHM only");
-            Vec::new()
-        }
-    };
+    let modifiers =
+        match tether_gpuconvert::importable_dmabuf_modifiers(u32::from_le_bytes(*b"AR24")).await {
+            Ok(m) if !m.is_empty() => {
+                info!(
+                    count = m.len(),
+                    "advertised DMA-BUF modifiers to compositor"
+                );
+                m
+            }
+            Ok(_) => {
+                warn!("GPU importer reports zero DRM modifiers; DMA-BUF disabled, SHM only");
+                Vec::new()
+            }
+            Err(e) => {
+                warn!(error = %e, "modifier query failed; DMA-BUF disabled, SHM only");
+                Vec::new()
+            }
+        };
     tether_capture::linux::start(modifiers)
         .await
         .map_err(anyhow::Error::from)
@@ -1683,8 +1723,8 @@ mod tests {
     fn macos_iosurface_fourcc_tables_reject_unmodeled_profiles() {
         use tether_codec::videotoolbox::encoder::iosurface_fourcc_matches;
         use tether_codec::videotoolbox::probe::expected_iosurface_fourccs;
-        use tether_render::accepts_iosurface_fourcc;
         use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+        use tether_render::accepts_iosurface_fourcc;
 
         // 12-bit isn't in the model; nor is 4:2:2.
         let bogus = VideoProfile {

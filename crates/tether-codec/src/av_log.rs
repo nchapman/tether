@@ -31,6 +31,44 @@ use std::sync::{Once, OnceLock};
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use rsmpeg::ffi;
 
+// Probe-mode suppression. Thread-local so a single probe (which runs
+// sequentially on one thread inside `host_supported_profiles`) can
+// silence the expected-failure messages — both our own encoder warns
+// and ffmpeg's native error output — without affecting unrelated
+// threads. Counts so nested scopes compose, although today there's
+// only one level.
+thread_local! {
+    static SUPPRESS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `true` if the current thread is inside [`with_probe_suppression`]. The
+/// av_log bridge downgrades warning/error messages to debug while this
+/// is set; the encoder's submit-fail warn does the same. Callers that
+/// emit codec-layer diagnostics during expected-failure probes should
+/// check this and downgrade rather than emitting at warn/error.
+#[must_use]
+pub fn probe_suppression_active() -> bool {
+    SUPPRESS_DEPTH.with(|d| d.get() > 0)
+}
+
+/// Run `f` with codec-layer log suppression enabled on the current
+/// thread. Use around probe attempts that are *expected* to fail on
+/// some hardware (e.g. P010 submit_dmabuf on Intel iHD) so the
+/// driver-side rejection doesn't surface as a scary-looking ERROR on
+/// every host startup. Returns whatever `f` returns; the flag is
+/// cleared even if `f` panics.
+pub fn with_probe_suppression<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SUPPRESS_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    SUPPRESS_DEPTH.with(|d| d.set(d.get() + 1));
+    let _g = Guard;
+    f()
+}
+
 // FFmpeg's logging callback takes a `va_list`, whose concrete Rust
 // type differs per platform (bindgen generates the host C ABI's
 // shape). Linux is a pointer to a `__va_list_tag` struct; macOS
@@ -211,7 +249,9 @@ unsafe extern "C" fn tether_log_callback(
             vl,
             buf.as_mut_ptr().cast::<c_char>(),
             #[allow(clippy::cast_possible_wrap)]
-            { buf.len() as c_int },
+            {
+                buf.len() as c_int
+            },
             &mut print_prefix,
         )
     };
@@ -222,10 +262,7 @@ unsafe extern "C" fn tether_log_callback(
     // larger than the buffer if it truncated. Clamp to what's
     // actually present.
     #[allow(clippy::cast_sign_loss)]
-    let nul_at = buf
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(buf.len());
+    let nul_at = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     let raw = &buf[..nul_at];
     // Trim trailing newline — av_log lines end with '\n' but tracing
     // adds its own.
@@ -267,6 +304,12 @@ unsafe extern "C" fn tether_log_callback(
 
     #[allow(clippy::cast_possible_wrap)]
     let warning_level = ffi::AV_LOG_WARNING as c_int;
+    // Probe-mode suppression: drop warning+ entirely (don't even bump
+    // the counter — these are expected failures inside a probe that
+    // the caller already converts into a typed `ProbeError`).
+    if level <= warning_level && probe_suppression_active() {
+        return;
+    }
     // Bump the counter first so it lands even if the channel send
     // below fails — a missed warning is worse than a missed log
     // line, and the counter is the load-bearing signal for the

@@ -21,6 +21,44 @@ use crate::ScalerError;
 /// an outer Arc.
 pub type PipelineHandle = Arc<Pipelines>;
 
+/// Which colour-space pipeline to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorSpace {
+    /// sRGB-encoded `Rgba8Unorm` input and output. The shader
+    /// applies the piecewise sRGB EOTF on read, filters in linear
+    /// light, applies the OETF on write. Includes the 2× box mipmap
+    /// prefilter for downscale ratios > 2×.
+    ///
+    /// Use this for: host downscale from PipeWire-captured BGRA
+    /// before chroma conversion.
+    Srgb8,
+    /// Linear-light `Rgba16Float` input and output. No transfer
+    /// applied either way — the input texture is *already* in
+    /// linear light and the consumer (e.g. swapchain blit) handles
+    /// the OETF on its own.
+    ///
+    /// No mip prefilter — this mode targets upscale where the
+    /// kernel widening alone is sufficient. Downscale > 2× in this
+    /// mode would alias.
+    ///
+    /// Use this for: client renderer upscale, where the YUV→RGB
+    /// fragment shader already emits linear-light values into an
+    /// `Rgba16Float` intermediate.
+    LinearF16,
+}
+
+impl ColorSpace {
+    fn output_format(self) -> wgpu::TextureFormat {
+        match self {
+            Self::Srgb8 => wgpu::TextureFormat::Rgba8Unorm,
+            Self::LinearF16 => wgpu::TextureFormat::Rgba16Float,
+        }
+    }
+    fn supports_mip_prefilter(self) -> bool {
+        matches!(self, Self::Srgb8)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 struct Params {
@@ -62,6 +100,7 @@ pub struct Scaler {
 
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
+    color_space: ColorSpace,
 }
 
 impl Scaler {
@@ -85,6 +124,27 @@ impl Scaler {
         src_dims: (u32, u32),
         dst_dims: (u32, u32),
     ) -> Result<Self, ScalerError> {
+        Self::new_with_color_space(
+            pipelines,
+            device,
+            queue,
+            src_dims,
+            dst_dims,
+            ColorSpace::Srgb8,
+        )
+    }
+
+    /// Build with an explicit colour space. See [`ColorSpace`] for
+    /// what each variant means; [`Scaler::new`] is a convenience
+    /// alias for `Srgb8` (the host downscale path).
+    pub fn new_with_color_space(
+        pipelines: PipelineHandle,
+        device: Device,
+        queue: Queue,
+        src_dims: (u32, u32),
+        dst_dims: (u32, u32),
+        color_space: ColorSpace,
+    ) -> Result<Self, ScalerError> {
         if src_dims.0 == 0 || src_dims.1 == 0 || dst_dims.0 == 0 || dst_dims.1 == 0 {
             return Err(ScalerError::ZeroDim {
                 src: src_dims,
@@ -96,24 +156,28 @@ impl Scaler {
         }
 
         // Build the mip chain. Each level halves dimensions (round
-        // up); stop when both axes are within 2× of dst.
+        // up); stop when both axes are within 2× of dst. Linear-
+        // light mode skips this — that path is upscale-only and the
+        // mip shader operates on sRGB-encoded values.
         let mut mip_chain = Vec::new();
         let mut cur_w = src_dims.0;
         let mut cur_h = src_dims.1;
-        loop {
-            let scale_x = cur_w as f32 / dst_dims.0 as f32;
-            let scale_y = cur_h as f32 / dst_dims.1 as f32;
-            if scale_x.max(scale_y) <= 2.0 {
-                break;
+        if color_space.supports_mip_prefilter() {
+            loop {
+                let scale_x = cur_w as f32 / dst_dims.0 as f32;
+                let scale_y = cur_h as f32 / dst_dims.1 as f32;
+                if scale_x.max(scale_y) <= 2.0 {
+                    break;
+                }
+                cur_w = cur_w.div_ceil(2);
+                cur_h = cur_h.div_ceil(2);
+                mip_chain.push(make_rgba8_storage(
+                    &device,
+                    "tether-scaler mip",
+                    cur_w,
+                    cur_h,
+                ));
             }
-            cur_w = cur_w.div_ceil(2);
-            cur_h = cur_h.div_ceil(2);
-            mip_chain.push(make_rgba8_storage(
-                &device,
-                "tether-scaler mip",
-                cur_w,
-                cur_h,
-            ));
         }
         let after_mip_w = cur_w;
         let after_mip_h = cur_h;
@@ -135,10 +199,10 @@ impl Scaler {
             view_formats: &[],
         });
 
-        // Output: Rgba8Unorm at dst dims. COPY_SRC so tests / future
-        // callers can read it back; STORAGE_BINDING for the vertical
-        // pass; TEXTURE_BINDING so downstream chroma shaders or
-        // present blits can sample it.
+        // Output texture format follows the colour space — Rgba8Unorm
+        // for sRGB (chroma-converter consumer), Rgba16Float for
+        // linear-light (swapchain-blit consumer). COPY_SRC so tests
+        // can read it back regardless.
         let output = device.create_texture(&TextureDescriptor {
             label: Some("tether-scaler output"),
             size: Extent3d {
@@ -149,7 +213,7 @@ impl Scaler {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
+            format: color_space.output_format(),
             usage: TextureUsages::STORAGE_BINDING
                 | TextureUsages::TEXTURE_BINDING
                 | TextureUsages::COPY_SRC,
@@ -194,6 +258,7 @@ impl Scaler {
             params_v,
             src_dims,
             dst_dims,
+            color_space,
         })
     }
 
@@ -251,7 +316,22 @@ impl Scaler {
             prev_view = tex.create_view(&TextureViewDescriptor::default());
         }
 
-        // Horizontal pass.
+        // Horizontal pass. Same bind-group layout for both colour
+        // spaces (intermediate is Rgba16Float in both); the dispatch
+        // picks the matching shader entry point.
+        let (horizontal_pipeline, vertical_pipeline, vertical_bgl) = match self.color_space {
+            ColorSpace::Srgb8 => (
+                &self.pipelines.horizontal,
+                &self.pipelines.vertical,
+                &self.pipelines.vertical_bgl,
+            ),
+            ColorSpace::LinearF16 => (
+                &self.pipelines.horizontal_linear,
+                &self.pipelines.vertical_linear,
+                &self.pipelines.vertical_linear_bgl,
+            ),
+        };
+
         let h_dst_view = self.intermediate.create_view(&TextureViewDescriptor::default());
         let h_bg = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("tether-scaler horizontal bg"),
@@ -276,7 +356,7 @@ impl Scaler {
                 label: Some("tether-scaler horizontal pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipelines.horizontal);
+            pass.set_pipeline(horizontal_pipeline);
             pass.set_bind_group(0, &h_bg, &[]);
             pass.dispatch_workgroups(
                 self.intermediate.width().div_ceil(8),
@@ -285,12 +365,13 @@ impl Scaler {
             );
         }
 
-        // Vertical pass.
+        // Vertical pass — bind-group layout differs between sRGB
+        // (output Rgba8Unorm) and linear (output Rgba16Float).
         let v_src_view = self.intermediate.create_view(&TextureViewDescriptor::default());
         let v_dst_view = self.output.create_view(&TextureViewDescriptor::default());
         let v_bg = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("tether-scaler vertical bg"),
-            layout: &self.pipelines.vertical_bgl,
+            layout: vertical_bgl,
             entries: &[
                 BindGroupEntry {
                     binding: 0,
@@ -311,7 +392,7 @@ impl Scaler {
                 label: Some("tether-scaler vertical pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipelines.vertical);
+            pass.set_pipeline(vertical_pipeline);
             pass.set_bind_group(0, &v_bg, &[]);
             pass.dispatch_workgroups(
                 self.output.width().div_ceil(8),
@@ -328,7 +409,10 @@ impl Scaler {
         &self.output
     }
     pub fn dst_format(&self) -> TextureFormat {
-        TextureFormat::Rgba8Unorm
+        self.color_space.output_format()
+    }
+    pub fn color_space(&self) -> ColorSpace {
+        self.color_space
     }
     pub fn src_dims(&self) -> (u32, u32) {
         self.src_dims

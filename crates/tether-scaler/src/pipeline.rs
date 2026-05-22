@@ -10,7 +10,17 @@ use wgpu::{
     TextureSampleType, TextureViewDimension,
 };
 
-/// All three pipelines + the bind-group layouts they reference.
+/// All five pipelines + the bind-group layouts they reference.
+///
+/// The sRGB pipelines (`horizontal`, `vertical`) and the mip
+/// prefilter (`mip`) implement the host downscale path: read
+/// sRGB-encoded `Rgba8Unorm`, filter in linear-light, write
+/// sRGB-encoded `Rgba8Unorm`. The linear-light pipelines
+/// (`horizontal_linear`, `vertical_linear`) implement the client
+/// upscale path: read linear-light `Rgba16Float`, filter, write
+/// linear-light `Rgba16Float` — no transfer functions either way,
+/// since the upstream YUV→RGB fragment shader already emits linear
+/// light.
 ///
 /// Shader compilation is non-trivial on Metal and DX12 (50–200ms for
 /// the scaler shader); the host rebuilds its [`crate::Scaler`] on every
@@ -18,12 +28,21 @@ use wgpu::{
 /// rebuilds. Construct once via [`Pipelines::build`], wrap in
 /// [`std::sync::Arc`], and hand to each `Scaler::new` call.
 pub struct Pipelines {
+    // sRGB path: Rgba8Unorm in/out (with Rgba16Float intermediate).
     pub(crate) horizontal: ComputePipeline,
     pub(crate) horizontal_bgl: BindGroupLayout,
     pub(crate) vertical: ComputePipeline,
     pub(crate) vertical_bgl: BindGroupLayout,
     pub(crate) mip: ComputePipeline,
     pub(crate) mip_bgl: BindGroupLayout,
+    // Linear-light path: Rgba16Float throughout. Vertical output
+    // format differs from the sRGB vertical (Rgba16Float vs
+    // Rgba8Unorm) so it needs its own BGL + pipeline; the horizontal
+    // *intermediate* format is the same (Rgba16Float) but the shader
+    // entry point differs, so it also gets its own pipeline.
+    pub(crate) horizontal_linear: ComputePipeline,
+    pub(crate) vertical_linear: ComputePipeline,
+    pub(crate) vertical_linear_bgl: BindGroupLayout,
 }
 
 impl Pipelines {
@@ -74,6 +93,33 @@ impl Pipelines {
             cache: None,
         });
 
+        // Linear-light path. The horizontal_linear shader writes to
+        // Rgba16Float (same as the sRGB horizontal); the
+        // vertical_linear shader also writes to Rgba16Float
+        // (different from the sRGB vertical which writes
+        // Rgba8Unorm) so it needs its own bind-group layout.
+        let horizontal_linear = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("tether-scaler horizontal_linear"),
+            layout: Some(&horizontal_layout),
+            module: &module,
+            entry_point: Some("horizontal_linear"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let (vertical_linear_bgl, vertical_linear_layout) = build_mitchell_layout(
+            device,
+            "tether-scaler vertical_linear bgl",
+            TextureFormat::Rgba16Float,
+        );
+        let vertical_linear = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("tether-scaler vertical_linear"),
+            layout: Some(&vertical_linear_layout),
+            module: &module,
+            entry_point: Some("vertical_linear"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         Self {
             horizontal,
             horizontal_bgl,
@@ -81,6 +127,9 @@ impl Pipelines {
             vertical_bgl,
             mip,
             mip_bgl,
+            horizontal_linear,
+            vertical_linear,
+            vertical_linear_bgl,
         }
     }
 }

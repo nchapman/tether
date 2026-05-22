@@ -46,7 +46,7 @@ pub mod reference;
 mod scaler;
 
 pub use pipeline::Pipelines;
-pub use scaler::Scaler;
+pub use scaler::{ColorSpace, Scaler};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScalerError {

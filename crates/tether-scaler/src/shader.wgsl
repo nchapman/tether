@@ -135,6 +135,69 @@ fn vertical(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(dst_v, vec2<i32>(gid.xy), vec4<f32>(encode_rgb(lin), 1.0));
 }
 
+// === Linear-light variant ===
+//
+// Same algorithm but input/output are already in linear light — no
+// sRGB transfer either way. Used by the client renderer, where the
+// YUV→RGB fragment shader emits linear-light values into an
+// `Rgba16Float` intermediate; Mitchell-upscaling those values
+// directly keeps the math correct (the post-Mitchell swapchain blit
+// applies the surface's OETF on write, same as the original path).
+
+@group(0) @binding(0) var src_h_lin: texture_2d<f32>;
+@group(0) @binding(1) var dst_h_lin: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> params_h_lin: Params;
+
+@compute @workgroup_size(8, 8, 1)
+fn horizontal_linear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params_h_lin.dst_w || gid.y >= params_h_lin.src_h) {
+        return;
+    }
+    let scale = f32(params_h_lin.src_w) / f32(params_h_lin.dst_w);
+    let support = max(scale, 1.0);
+    let center = (f32(gid.x) + 0.5) * scale - 0.5;
+    let half_taps = i32(params_h_lin.n_taps / 2u);
+    let i0 = i32(floor(center)) - half_taps + 1;
+    var sum = vec3<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var k: u32 = 0u; k < params_h_lin.n_taps; k = k + 1u) {
+        let x = i0 + i32(k);
+        let xc = clamp(x, 0, i32(params_h_lin.src_w) - 1);
+        let w = mitchell((f32(x) - center) / support);
+        sum = sum + textureLoad(src_h_lin, vec2<i32>(xc, i32(gid.y)), 0).rgb * w;
+        weight_sum = weight_sum + w;
+    }
+    let ws = select(weight_sum, 1.0, abs(weight_sum) < 1e-6);
+    textureStore(dst_h_lin, vec2<i32>(gid.xy), vec4<f32>(sum / ws, 1.0));
+}
+
+@group(0) @binding(0) var src_v_lin: texture_2d<f32>;
+@group(0) @binding(1) var dst_v_lin: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> params_v_lin: Params;
+
+@compute @workgroup_size(8, 8, 1)
+fn vertical_linear(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params_v_lin.dst_w || gid.y >= params_v_lin.dst_h) {
+        return;
+    }
+    let scale = f32(params_v_lin.src_h) / f32(params_v_lin.dst_h);
+    let support = max(scale, 1.0);
+    let center = (f32(gid.y) + 0.5) * scale - 0.5;
+    let half_taps = i32(params_v_lin.n_taps / 2u);
+    let i0 = i32(floor(center)) - half_taps + 1;
+    var sum = vec3<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var k: u32 = 0u; k < params_v_lin.n_taps; k = k + 1u) {
+        let y = i0 + i32(k);
+        let yc = clamp(y, 0, i32(params_v_lin.src_h) - 1);
+        let w = mitchell((f32(y) - center) / support);
+        sum = sum + textureLoad(src_v_lin, vec2<i32>(i32(gid.x), yc), 0).rgb * w;
+        weight_sum = weight_sum + w;
+    }
+    let ws = select(weight_sum, 1.0, abs(weight_sum) < 1e-6);
+    textureStore(dst_v_lin, vec2<i32>(gid.xy), vec4<f32>(sum / ws, 1.0));
+}
+
 // === Mip prefilter (2× box downsample, linear-light) ===
 // Invoked when the desired downscale ratio exceeds 2×. Produces an
 // sRGB-encoded intermediate (same shape as the original capture) so

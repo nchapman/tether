@@ -72,9 +72,70 @@ pub(crate) enum YuvPlanes {
     Yuv444Packed { packed: wgpu::Texture },
 }
 
+/// Where rendered frames go. The production path owns a swapchain
+/// (`Swapchain`); the round-trip test harness binds an offscreen target
+/// (`Offscreen`) so the same multi-pass `render()` body drives both,
+/// closing the gap that previously kept production-renderer bugs out
+/// of hardware-test coverage. Test renderer is created via
+/// [`GpuState::new_headless`].
+pub(crate) enum RenderTarget {
+    /// Live present path. Owns the wgpu surface + configuration; the
+    /// only path that calls `output.present()`.
+    Swapchain {
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+    },
+    /// Headless target for round-trip tests. The render output is read
+    /// back from this texture, never presented. Same multi-pass body,
+    /// same blit color attachment format, no synthetic differences in
+    /// the GPU command stream. Consumed by the test harness in
+    /// `tether-render/src/test_harness.rs`.
+    #[allow(dead_code)]
+    Offscreen {
+        target: wgpu::Texture,
+        dims: (u32, u32),
+        format: wgpu::TextureFormat,
+    },
+}
+
+impl RenderTarget {
+    fn dimensions(&self) -> (u32, u32) {
+        match self {
+            RenderTarget::Swapchain { config, .. } => (config.width, config.height),
+            RenderTarget::Offscreen { dims, .. } => *dims,
+        }
+    }
+
+    #[allow(dead_code)] // used by the offscreen test harness
+    fn format(&self) -> wgpu::TextureFormat {
+        match self {
+            RenderTarget::Swapchain { config, .. } => config.format,
+            RenderTarget::Offscreen { format, .. } => *format,
+        }
+    }
+
+    /// Resize routes through here so the swapchain variant reconfigures
+    /// while the offscreen variant reallocates its target texture.
+    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        match self {
+            RenderTarget::Swapchain { surface, config } => {
+                config.width = width;
+                config.height = height;
+                surface.configure(device, config);
+            }
+            RenderTarget::Offscreen { target, dims, format } => {
+                *dims = (width, height);
+                *target = make_offscreen_target(device, *format, (width, height));
+            }
+        }
+    }
+}
+
 pub(crate) struct GpuState {
-    surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
+    target: RenderTarget,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
@@ -498,6 +559,116 @@ impl GpuState {
         };
         surface.configure(&device, &surface_config);
 
+        Self::build_state(
+            device,
+            queue,
+            RenderTarget::Swapchain { surface, config: surface_config },
+            format,
+            color_space,
+            chroma,
+            bit_depth,
+            #[cfg(target_os = "linux")]
+            dmabuf_import_supported,
+            #[cfg(target_os = "macos")]
+            metal_import_supported,
+        )
+    }
+
+    /// Headless constructor for the round-trip test harness. Skips
+    /// instance/adapter/surface creation — caller passes a pre-built
+    /// device + queue (typically shared with the gpuconvert bridge, so
+    /// the test runs on the same device the production hot path
+    /// would). Allocates a `Bgra8Unorm` offscreen target with
+    /// `RENDER_ATTACHMENT | COPY_SRC` at `target_dims`; the harness
+    /// reads it back after `render()`. The blit color-attachment
+    /// format matches the typical production swapchain
+    /// (`Bgra8UnormSrgb`) so the render-pipeline cache key and
+    /// fragment-write code path are bit-identical to the live path.
+    #[allow(dead_code)] // consumed by tether-render's test_harness module
+    pub(crate) fn new_headless(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        target_dims: (u32, u32),
+        color_space: VideoColorSpec,
+        chroma: ChromaSubsampling,
+        bit_depth: u8,
+    ) -> Result<Self> {
+        // Match the production swapchain format: production picks an
+        // sRGB-encoded BGRA format from `surface_caps.formats` via
+        // `is_srgb()`. The blit pipeline writes linear values to this
+        // target and wgpu applies the sRGB OETF on store, so the
+        // readback bytes are sRGB-encoded the same way the swapchain
+        // bytes would be. Diverging from this (e.g. `Bgra8Unorm`
+        // non-sRGB) would test a sibling of the production chain, not
+        // production itself.
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        // Mirror production: the device must advertise the same
+        // platform-specific zero-copy import capability the live `new`
+        // path enforces — otherwise the first `apply_gpu` call hits a
+        // `debug_assert!` and the test panics with a confusing
+        // message. Caller passes a device they got from
+        // `try_init_wgpu_for_dmabuf` (or the macOS equivalent), so a
+        // hard error here means the test's adapter setup is broken,
+        // not that the test environment is degraded.
+        #[cfg(target_os = "linux")]
+        let dmabuf_import_supported = {
+            let features = device.features();
+            if !features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF) {
+                return Err(RenderError::DmaBufImport(
+                    "new_headless: device does not advertise \
+                     VULKAN_EXTERNAL_MEMORY_DMA_BUF. The harness must pass a device \
+                     obtained from try_init_wgpu_for_dmabuf with the dma-buf feature \
+                     enabled."
+                        .into(),
+                ));
+            }
+            true
+        };
+        #[cfg(target_os = "macos")]
+        let metal_import_supported = {
+            // SAFETY: as_hal's returned guard is dropped immediately.
+            let supported = unsafe { device.as_hal::<wgpu::hal::api::Metal>().is_some() };
+            if !supported {
+                return Err(RenderError::DmaBufImport(
+                    "new_headless: device is not Metal-backed; macOS IOSurface \
+                     import requires the Metal HAL."
+                        .into(),
+                ));
+            }
+            true
+        };
+        let target_tex = make_offscreen_target(&device, format, target_dims);
+        Self::build_state(
+            device,
+            queue,
+            RenderTarget::Offscreen { target: target_tex, dims: target_dims, format },
+            format,
+            color_space,
+            chroma,
+            bit_depth,
+            #[cfg(target_os = "linux")]
+            dmabuf_import_supported,
+            #[cfg(target_os = "macos")]
+            metal_import_supported,
+        )
+    }
+
+    /// Pipeline + upscale-stage setup shared between [`new`] and
+    /// [`new_headless`]. Takes a pre-built `target` and the resolved
+    /// final color-attachment `format`; the swapchain vs offscreen
+    /// distinction is invisible from here down.
+    #[allow(clippy::too_many_arguments)]
+    fn build_state(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        target: RenderTarget,
+        format: wgpu::TextureFormat,
+        color_space: VideoColorSpec,
+        chroma: ChromaSubsampling,
+        bit_depth: u8,
+        #[cfg(target_os = "linux")] dmabuf_import_supported: bool,
+        #[cfg(target_os = "macos")] metal_import_supported: bool,
+    ) -> Result<Self> {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("tether-render sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -811,8 +982,7 @@ impl GpuState {
         };
 
         Ok(Self {
-            surface,
-            surface_config,
+            target,
             device,
             queue,
             pipeline,
@@ -837,24 +1007,15 @@ impl GpuState {
     /// Current video texture size and surface size. Returned together
     /// because the cursor-normalisation math in `lib.rs` needs both.
     pub(crate) fn dimensions(&self) -> ((u32, u32), (u32, u32)) {
-        (
-            self.textures.size,
-            (self.surface_config.width, self.surface_config.height),
-        )
+        (self.textures.size, self.target.dimensions())
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
+        self.target.resize(&self.device, width, height);
         // The video textures are at decoded resolution and don't change
-        // on window resize. `render()` recomputes the letterbox scale
-        // uniform every frame from `surface_config`, so the next redraw
-        // automatically fits the new window without re-uploading or
-        // re-importing.
+        // on window resize. `render_to_view` recomputes the letterbox
+        // scale uniform every frame, so the next redraw automatically
+        // fits the new window without re-uploading or re-importing.
     }
 
     /// Take ownership of a new frame and either upload it (Cpu) or
@@ -992,13 +1153,25 @@ impl GpuState {
     }
 
     pub(crate) fn render(&mut self) -> std::result::Result<(), String> {
+        match &mut self.target {
+            RenderTarget::Swapchain { .. } => self.render_swapchain(),
+            RenderTarget::Offscreen { .. } => self.render_offscreen(),
+        }
+    }
+
+    /// Swapchain present path. Acquires a backbuffer, calls
+    /// [`render_to_view`], presents.
+    fn render_swapchain(&mut self) -> std::result::Result<(), String> {
         use wgpu::CurrentSurfaceTexture::*;
         // Handle all seven variants from wgpu 29 deliberately. Defaults
         // matter: Outdated/Lost without reconfigure leaves the window
         // permanently black; Occluded without silencing spams logs while
         // the window is minimised; Suboptimal still has a valid texture
         // that should be presented for this frame.
-        let (output, reconfigure_after) = match self.surface.get_current_texture() {
+        let RenderTarget::Swapchain { surface, config } = &self.target else {
+            unreachable!("render_swapchain dispatched on non-swapchain target");
+        };
+        let (output, reconfigure_after) = match surface.get_current_texture() {
             Success(f) => (f, false),
             Suboptimal(f) => {
                 tracing::debug!("wgpu surface suboptimal; reconfigure after present");
@@ -1006,12 +1179,12 @@ impl GpuState {
             }
             Outdated => {
                 tracing::debug!("wgpu surface outdated; reconfiguring");
-                self.surface.configure(&self.device, &self.surface_config);
+                surface.configure(&self.device, config);
                 return Ok(());
             }
             Lost => {
                 tracing::warn!("wgpu surface lost; attempting best-effort reconfigure");
-                self.surface.configure(&self.device, &self.surface_config);
+                surface.configure(&self.device, config);
                 return Ok(());
             }
             Timeout | Occluded => {
@@ -1021,9 +1194,57 @@ impl GpuState {
                 return Err("wgpu surface validation error".into());
             }
         };
+        let target_dims = (config.width, config.height);
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
+        self.render_to_view(&view, target_dims)?;
+        output.present();
+
+        if reconfigure_after {
+            let RenderTarget::Swapchain { surface, config } = &self.target else {
+                unreachable!();
+            };
+            surface.configure(&self.device, config);
+        }
+        Ok(())
+    }
+
+    /// Headless render path. Builds a view of the offscreen target and
+    /// calls [`render_to_view`] — no surface acquire, no `present`. The
+    /// round-trip harness reads the target back after this returns.
+    fn render_offscreen(&mut self) -> std::result::Result<(), String> {
+        // Materialise `view` + `target_dims` in their own scope so the
+        // borrow of `self.target` ends before `render_to_view` takes
+        // `&mut self`. The view holds an internal Arc on the texture,
+        // so dropping the destructure binding is fine — the GPU
+        // resource stays alive for the render. Mirrors the swapchain
+        // pattern (acquire output, drop the &self.target borrow, then
+        // call render_to_view).
+        let (view, target_dims) = {
+            let RenderTarget::Offscreen { target, dims, .. } = &self.target else {
+                unreachable!("render_offscreen dispatched on non-offscreen target");
+            };
+            (
+                target.create_view(&wgpu::TextureViewDescriptor::default()),
+                *dims,
+            )
+        };
+        self.render_to_view(&view, target_dims)
+    }
+
+    /// Multi-pass renderer body — production code path. Same function
+    /// drives both [`render_swapchain`] (present) and [`render_offscreen`]
+    /// (test readback) so any bug in the multi-pass chain shows up in
+    /// hardware tests.
+    fn render_to_view(
+        &mut self,
+        target_view: &wgpu::TextureView,
+        target_dims: (u32, u32),
+    ) -> std::result::Result<(), String> {
         let video_dims = self.textures.size;
-        let surface_dims = (self.surface_config.width, self.surface_config.height);
+        let surface_dims = target_dims;
 
         // Make sure the intermediate exists at the right dims. If
         // the decoded video changed size between frames, also rebuild
@@ -1093,10 +1314,6 @@ impl GpuState {
         let (sx, sy) = letterbox_scale(blit_source_dims, surface_dims);
         self.queue
             .write_buffer(&self.scale_buffer, 0, &bytes_of_f32x4(&[sx, sy, 0.0, 0.0]));
-
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self
             .device
@@ -1181,7 +1398,7 @@ impl GpuState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tether-render blit pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: target_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -1200,7 +1417,6 @@ impl GpuState {
             pass.draw(0..6, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
 
         // Drop the previously-retired textures after the *next* submit
         // completes the previous frame's read. Conservative: this drops
@@ -1211,15 +1427,33 @@ impl GpuState {
         // dma-buf memory held across one frame matters.
         self.retired = None;
 
-        if reconfigure_after {
-            self.surface.configure(&self.device, &self.surface_config);
-        }
         Ok(())
     }
 }
 
+/// Build the offscreen render target used by [`GpuState::new_headless`].
+/// `RENDER_ATTACHMENT` for the blit pass to write to; `COPY_SRC` so the
+/// harness can read it back into a CPU buffer for metric comparison.
+fn make_offscreen_target(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    dims: (u32, u32),
+) -> wgpu::Texture {
+    let (w, h) = (dims.0.max(1), dims.1.max(1));
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tether-render offscreen target"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
 /// Build the Rgba16Float intermediate that the YUV→RGB pass renders
-/// into. RENDER_ATTACHMENT for pass 1 writes, TEXTURE_BINDING so
+/// into. `RENDER_ATTACHMENT` for pass 1 writes, `TEXTURE_BINDING` so
 /// pass 2 (Mitchell) or pass 3 (direct blit) can sample it.
 fn make_rgb_intermediate(device: &wgpu::Device, dims: (u32, u32)) -> wgpu::Texture {
     let (w, h) = (dims.0.max(1), dims.1.max(1));

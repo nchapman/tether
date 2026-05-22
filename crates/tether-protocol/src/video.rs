@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::MonoNanos;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 /// Timing fields populated by the host as a frame moves through its pipeline.
@@ -175,14 +176,21 @@ pub enum VideoPacket {
         frame_seq: u32,
         fragment_count: u16,
         meta: VideoFrameMetaEnvelope,
-        payload: Vec<u8>,
+        /// Encoded payload slice. `Bytes` (refcounted) rather than
+        /// `Vec<u8>` so the fragmenter can produce per-fragment
+        /// payloads via `Bytes::slice` (refcount bump, no copy) and
+        /// the host can pass the encoder's output straight through to
+        /// the QUIC `send_datagram` path without a per-fragment
+        /// `to_vec()`. Wire shape under bincode is identical to the
+        /// previous `Vec<u8>` encoding (length-prefixed bytes).
+        payload: Bytes,
     },
     Continuation {
         display: u8,
         stream_epoch: u32,
         frame_seq: u32,
         fragment_index: u16,
-        payload: Vec<u8>,
+        payload: Bytes,
     },
 }
 
@@ -231,7 +239,7 @@ impl FrameFragmenter {
     /// handles segmentation so we don't need to chunk into datagram-
     /// sized pieces. Advances `next_frame_seq` so subsequent P-frame
     /// fragments still reference correct sequence numbers.
-    pub fn single_packet(&mut self, meta: VideoFrameMeta, body: Vec<u8>) -> VideoPacket {
+    pub fn single_packet(&mut self, meta: VideoFrameMeta, body: Bytes) -> VideoPacket {
         let frame_seq = self.next_frame_seq;
         self.next_frame_seq = self.next_frame_seq.wrapping_add(1);
         VideoPacket::First {
@@ -248,7 +256,11 @@ impl FrameFragmenter {
     /// fragment 0 only, wrapped in the current `VideoFrameMetaEnvelope`
     /// variant. An empty body still produces a single
     /// [`VideoPacket::First`] with `fragment_count = 1`.
-    pub fn fragment(&mut self, meta: VideoFrameMeta, body: &[u8]) -> Vec<VideoPacket> {
+    ///
+    /// Per-fragment payloads are produced via `Bytes::slice` — a
+    /// refcount bump on the underlying buffer, not a copy. The whole
+    /// frame stays in a single allocation owned by `body`.
+    pub fn fragment(&mut self, meta: VideoFrameMeta, body: Bytes) -> Vec<VideoPacket> {
         let frame_seq = self.next_frame_seq;
         self.next_frame_seq = self.next_frame_seq.wrapping_add(1);
 
@@ -265,7 +277,7 @@ impl FrameFragmenter {
             frame_seq,
             fragment_count,
             meta: VideoFrameMetaEnvelope::V1(meta),
-            payload: body[..first_len].to_vec(),
+            payload: body.slice(..first_len),
         });
 
         let mut offset = first_len;
@@ -277,7 +289,7 @@ impl FrameFragmenter {
                 stream_epoch: self.stream_epoch,
                 frame_seq,
                 fragment_index: idx,
-                payload: body[offset..end].to_vec(),
+                payload: body.slice(offset..end),
             });
             offset = end;
             idx += 1;
@@ -288,13 +300,20 @@ impl FrameFragmenter {
 }
 
 /// Reassembled frame produced by [`FrameReassembler::handle`].
+///
+/// `body` is `Bytes` rather than `Vec<u8>` so the decoder side can
+/// slice / clone it without copying when forwarding to a worker
+/// thread. The reassembler still performs one final
+/// `BytesMut::with_capacity(total_len)` + per-fragment
+/// `extend_from_slice` to land the body contiguously — most decoder
+/// APIs (libavcodec's `avcodec_send_packet`) require a single `&[u8]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReassembledFrame {
     pub display: u8,
     pub stream_epoch: u32,
     pub frame_seq: u32,
     pub meta: VideoFrameMeta,
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }
 
 /// Buffers in-flight fragments by `(display, stream_epoch, frame_seq)`
@@ -332,7 +351,7 @@ type StreamKey = (u8, u32);
 struct Pending {
     fragment_count: u16,
     received_count: u16,
-    fragments: Vec<Option<Vec<u8>>>,
+    fragments: Vec<Option<Bytes>>,
     meta: Option<VideoFrameMeta>,
     /// When the first fragment for this frame arrived. Used by the
     /// wall-clock timeout in `prune_old`.
@@ -479,12 +498,21 @@ impl FrameReassembler {
                 .remove(&key)
                 .expect("entry exists, we just inserted into it");
             let meta = pending.meta.expect("checked Some above");
-            let body: Vec<u8> = pending
+            // Pre-size to the exact total so reassembly is one
+            // allocation + one memcpy pass — rather than the growth-
+            // doubling churn `Iterator::collect::<Vec<u8>>` would
+            // incur, and rather than the per-fragment `flatten()`
+            // chain materializing intermediate slices.
+            let total_len: usize = pending
                 .fragments
-                .into_iter()
-                .flatten()
-                .flatten()
-                .collect();
+                .iter()
+                .filter_map(|f| f.as_ref().map(bytes::Bytes::len))
+                .sum();
+            let mut buf = BytesMut::with_capacity(total_len);
+            for fragment in pending.fragments.into_iter().flatten() {
+                buf.extend_from_slice(&fragment);
+            }
+            let body = buf.freeze();
             return Some(ReassembledFrame {
                 display,
                 stream_epoch,
@@ -527,7 +555,7 @@ impl FrameReassembler {
     }
 }
 
-fn ensure_capacity(v: &mut Vec<Option<Vec<u8>>>, len: usize) {
+fn ensure_capacity(v: &mut Vec<Option<Bytes>>, len: usize) {
     if v.len() < len {
         v.resize_with(len, || None);
     }

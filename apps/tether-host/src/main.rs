@@ -1311,20 +1311,35 @@ fn run_capture_and_send(
 
         // Concatenate all packets the encoder spat out for this input
         // frame into one wire payload. With tune=zerolatency this is
-        // usually 1:1; the first few frames may produce 0 (encoder
-        // setup latency) which we silently skip.
+        // almost always exactly one packet, so the common case moves
+        // the encoder's `Bytes` straight through — no copy. Multi-
+        // packet frames (rare; happens when the encoder emits SPS/PPS
+        // + IDR as separate AVPackets) coalesce into a single
+        // pre-sized `BytesMut`.
         let mut keyframe = false;
-        let mut combined = Vec::new();
-        for pkt in encoded {
-            if pkt.keyframe {
-                keyframe = true;
+        let body: tether_codec::bytes::Bytes = match encoded.len() {
+            0 => continue,
+            1 => {
+                let pkt = encoded.into_iter().next().expect("len == 1");
+                keyframe = pkt.keyframe;
+                pkt.data
             }
-            combined.extend_from_slice(&pkt.data);
-        }
-        if combined.is_empty() {
+            _ => {
+                let total_len: usize = encoded.iter().map(|p| p.data.len()).sum();
+                let mut buf = tether_codec::bytes::BytesMut::with_capacity(total_len);
+                for pkt in encoded {
+                    if pkt.keyframe {
+                        keyframe = true;
+                    }
+                    buf.extend_from_slice(&pkt.data);
+                }
+                buf.freeze()
+            }
+        };
+        if body.is_empty() {
             continue;
         }
-        stats.record_frame(encode_delta_ns, combined.len() as u64, keyframe);
+        stats.record_frame(encode_delta_ns, body.len() as u64, keyframe);
 
         let meta = VideoFrameMeta {
             timing: timing.finish(),
@@ -1346,13 +1361,13 @@ fn run_capture_and_send(
             // task) keeps strict ordering between the IDR and the
             // P-frames that follow — see the comment on the spawn
             // site for the epoch-race rationale.
-            let packet = fragmenter.single_packet(meta, combined);
+            let packet = fragmenter.single_packet(meta, body);
             if let Err(e) = runtime.block_on(keyframe_conn.send_video_keyframe(&packet)) {
                 warn!(error = ?e, "send_video_keyframe failed, terminating send loop");
                 return;
             }
         } else {
-            let packets = fragmenter.fragment(meta, &combined);
+            let packets = fragmenter.fragment(meta, body);
             for packet in packets {
                 if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
                     warn!(error = ?e, "send_datagram failed, terminating send loop");

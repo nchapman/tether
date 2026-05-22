@@ -208,7 +208,7 @@ fn bench_decode(
     };
     let warmup = 4i64;
     let total_frames = warmup + iters as i64;
-    let mut packets: Vec<Vec<u8>> = Vec::with_capacity(total_frames as usize);
+    let mut packets: Vec<bytes::Bytes> = Vec::with_capacity(total_frames as usize);
     for t in 0..total_frames {
         let bgra = make_test_bgra(width, height, t as u32);
         match enc.encode_bgra(&bgra, t, t == 0) {
@@ -238,7 +238,7 @@ fn bench_decode(
     let mut times_ms = Vec::with_capacity(iters);
     for (i, pkt) in packets.iter().enumerate() {
         let start = Instant::now();
-        if dec.submit(pkt).is_err() {
+        if dec.submit(pkt.as_ref()).is_err() {
             continue;
         }
         while let Ok(Some(_)) = dec.next_frame() {
@@ -282,7 +282,7 @@ fn build_dmabuf_source(width: u32, height: u32) -> Result<GpuFrame, String> {
             .map_err(|e| format!("source encode at frame {t} failed: {e}"))?;
         for p in packets {
             src_dec
-                .submit(&p.data)
+                .submit(p.data.as_ref())
                 .map_err(|e| format!("source decoder submit failed: {e}"))?;
             while let Some(f) = src_dec
                 .next_frame()

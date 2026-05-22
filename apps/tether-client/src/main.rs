@@ -739,7 +739,7 @@ async fn say_goodbye(conn: &tether_transport::Connection, reason: &str) {
 /// decode thread stamp each rendered frame without having to know
 /// anything about the clock-sync handshake.
 struct DecodeJob {
-    body: Vec<u8>,
+    body: tether_codec::bytes::Bytes,
     host_in_client_clock: MonoNanos,
 }
 
@@ -827,7 +827,7 @@ fn run_decode_thread(
         // when `decoder.submit` / `next_frame` reported Ok.
         let avlog_before = tether_codec::av_log::warning_or_above_count();
         let mut decoded: Vec<CodecFrame> = Vec::new();
-        let mut decode_err: Option<tether_codec::CodecError> = decoder.submit(&job.body).err();
+        let mut decode_err: Option<tether_codec::CodecError> = decoder.submit(job.body.as_ref()).err();
         if decode_err.is_none() {
             loop {
                 match decoder.next_frame() {

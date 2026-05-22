@@ -11,6 +11,12 @@ serde = { workspace = true }
 # Pinned to a specific version: bincode 3.0 just released and we haven't
 # vetted the API changes. Revisit when we're ready to migrate.
 bincode = { version = "=2.0.1", features = ["serde"] }
+# `bytes` is the payload type for video fragments — refcounted byte
+# slices so the fragmenter can slice a frame body without copying, and
+# the host send loop can hand encoded packets straight through to
+# QUIC. The `serde` feature serializes `Bytes` as a byte sequence,
+# wire-compatible with the prior `Vec<u8>` shape under bincode.
+bytes = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

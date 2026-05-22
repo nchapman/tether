@@ -647,7 +647,7 @@ mod tests {
                 },
                 dimensions: (320, 240),
             }),
-            payload: vec![0xAA; 1100],
+            payload: bytes::Bytes::from(vec![0xAA; 1100]),
         };
         let bytes = encode(&p).unwrap();
         let p2: VideoPacket = decode(&bytes).unwrap();
@@ -709,7 +709,7 @@ mod tests {
                 input_echo: InputEchoBatch::default(),
                 dimensions: (1, 1),
             }),
-            payload: vec![],
+            payload: bytes::Bytes::new(),
         };
         let bytes = encode(&p).unwrap();
         let p2: VideoPacket = decode(&bytes).unwrap();
@@ -793,7 +793,7 @@ mod tests {
                 },
                 dimensions: (u32::MAX, u32::MAX),
             }),
-            payload: vec![0; 1080],
+            payload: bytes::Bytes::from(vec![0u8; 1080]),
         };
         let bytes = encode(&p).unwrap();
         assert!(
@@ -815,7 +815,7 @@ mod tests {
         };
 
         let mut fragmenter = FrameFragmenter::new(0);
-        let packets = fragmenter.fragment(meta.clone(), &body);
+        let packets = fragmenter.fragment(meta.clone(), bytes::Bytes::from(body.clone()));
 
         // First fragment carries FIRST_PAYLOAD_BUDGET, remainder split into
         // CONTINUATION_PAYLOAD_BUDGET chunks.
@@ -839,7 +839,7 @@ mod tests {
             }
         }
         let frame = got.expect("reassembled frame");
-        assert_eq!(frame.body, body);
+        assert_eq!(frame.body.as_ref(), body.as_slice());
         assert_eq!(frame.frame_seq, 0);
         assert_eq!(frame.display, 0);
         assert!(frame.meta.keyframe);
@@ -855,7 +855,7 @@ mod tests {
             dimensions: (320, 240),
         };
         let mut fragmenter = FrameFragmenter::new(2);
-        let mut packets = fragmenter.fragment(meta, &body);
+        let mut packets = fragmenter.fragment(meta, bytes::Bytes::from(body.clone()));
         // Reverse the order — reassembler should still produce the frame.
         packets.reverse();
 
@@ -867,7 +867,7 @@ mod tests {
             }
         }
         let frame = got.expect("reassembled out-of-order frame");
-        assert_eq!(frame.body, body);
+        assert_eq!(frame.body.as_ref(), body.as_slice());
         assert_eq!(frame.display, 2);
     }
 
@@ -886,7 +886,7 @@ mod tests {
         // Advance latest_seq on the reassembler to 5 by feeding it 6
         // fully-assembled tiny frames (seqs 0..=5).
         for _ in 0..6 {
-            for p in fragmenter.fragment(meta.clone(), &[0u8; 100]) {
+            for p in fragmenter.fragment(meta.clone(), bytes::Bytes::from_static(&[0u8; 100])) {
                 reassembler.handle(p);
             }
         }
@@ -899,7 +899,7 @@ mod tests {
             stream_epoch: 0,
             frame_seq: 0,
             fragment_index: 1,
-            payload: vec![0u8; 10],
+            payload: bytes::Bytes::from_static(&[0u8; 10]),
         };
         assert!(reassembler.handle(stale).is_none());
     }
@@ -928,7 +928,7 @@ mod tests {
             frame_seq: 0,
             fragment_count: 2,
             meta: VideoFrameMetaEnvelope::V1(meta.clone()),
-            payload: vec![0u8; 100],
+            payload: bytes::Bytes::from_static(&[0u8; 100]),
         };
         assert!(reassembler.handle(first).is_none());
         let (dropped_before, _) = reassembler.loss_counters();
@@ -944,7 +944,7 @@ mod tests {
             frame_seq: 1,
             fragment_count: 1,
             meta: VideoFrameMetaEnvelope::V1(meta),
-            payload: vec![0u8; 10],
+            payload: bytes::Bytes::from_static(&[0u8; 10]),
         };
         let _ = reassembler.handle(unrelated);
         let (dropped_after, _) = reassembler.loss_counters();
@@ -961,7 +961,7 @@ mod tests {
             stream_epoch: u32::MAX,
             frame_seq: u32::MAX,
             fragment_index: u16::MAX,
-            payload: vec![0; 1180],
+            payload: bytes::Bytes::from(vec![0u8; 1180]),
         };
         let bytes = encode(&p).unwrap();
         assert!(
@@ -1027,7 +1027,7 @@ mod tests {
 
         // Deliver a complete frame under epoch 0.
         let mut fragmenter_epoch0 = FrameFragmenter::new(0);
-        let packets_e0 = fragmenter_epoch0.fragment(meta.clone(), &[1u8; 200]);
+        let packets_e0 = fragmenter_epoch0.fragment(meta.clone(), bytes::Bytes::from_static(&[1u8; 200]));
         let mut out0 = None;
         for p in packets_e0 {
             if let Some(f) = reassembler.handle(p) {
@@ -1044,7 +1044,7 @@ mod tests {
         let mut fragmenter_epoch1 = FrameFragmenter::new(0);
         fragmenter_epoch1.bump_epoch();
         assert_eq!(fragmenter_epoch1.stream_epoch(), 1);
-        let packets_e1 = fragmenter_epoch1.fragment(meta, &[2u8; 200]);
+        let packets_e1 = fragmenter_epoch1.fragment(meta, bytes::Bytes::from_static(&[2u8; 200]));
         let mut out1 = None;
         for p in packets_e1 {
             if let Some(f) = reassembler.handle(p) {
@@ -1071,7 +1071,7 @@ mod tests {
             dimensions: (1920, 1080),
         };
         let body: Vec<u8> = (0..50_000).map(|i| (i & 0xff) as u8).collect();
-        let packet = fragmenter.single_packet(meta.clone(), body.clone());
+        let packet = fragmenter.single_packet(meta.clone(), bytes::Bytes::from(body.clone()));
         match &packet {
             VideoPacket::First { fragment_count, payload, .. } => {
                 assert_eq!(*fragment_count, 1, "single_packet must produce fragment_count=1");
@@ -1081,7 +1081,7 @@ mod tests {
         }
 
         // Also advances the seq counter so subsequent P-frames slot in.
-        let next = fragmenter.fragment(meta, &[0u8; 100]);
+        let next = fragmenter.fragment(meta, bytes::Bytes::from_static(&[0u8; 100]));
         match &next[0] {
             VideoPacket::First { frame_seq, .. } => {
                 assert_eq!(*frame_seq, 1, "next frame_seq must be 1 after single_packet");
@@ -1093,7 +1093,7 @@ mod tests {
         let frame = reassembler
             .handle(packet)
             .expect("single_packet must complete reassembly on first fragment");
-        assert_eq!(frame.body, body);
+        assert_eq!(frame.body.as_ref(), body.as_slice());
         assert_eq!(frame.display, 3);
     }
 
@@ -1111,7 +1111,7 @@ mod tests {
             dimensions: (320, 240),
         };
         let body = vec![0xabu8; 2_500];
-        let packets = fragmenter.fragment(meta, &body);
+        let packets = fragmenter.fragment(meta, bytes::Bytes::from(body.clone()));
         assert!(packets.len() >= 2, "test needs a multi-fragment frame");
 
         let mut reassembler = FrameReassembler::new();
@@ -1129,7 +1129,7 @@ mod tests {
             }
         }
         let frame = out.expect("frame should reassemble after duplicates");
-        assert_eq!(frame.body, body);
+        assert_eq!(frame.body.as_ref(), body.as_slice());
     }
 
     #[test]
@@ -1145,7 +1145,7 @@ mod tests {
             dimensions: (320, 240),
         };
         let body = vec![0x5au8; 3_000];
-        let packets = fragmenter.fragment(meta, &body);
+        let packets = fragmenter.fragment(meta, bytes::Bytes::from(body.clone()));
         assert!(packets.len() >= 2);
 
         let mut reassembler = FrameReassembler::new();
@@ -1158,6 +1158,6 @@ mod tests {
         let frame = reassembler
             .handle(packets[0].clone())
             .expect("frame should complete after First arrives");
-        assert_eq!(frame.body, body);
+        assert_eq!(frame.body.as_ref(), body.as_slice());
     }
 }

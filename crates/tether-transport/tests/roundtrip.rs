@@ -76,7 +76,7 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
             input_echo: InputEchoBatch::default(),
             dimensions: (320, 240),
         }),
-        payload: vec![0u8; 100],
+        payload: bytes::Bytes::from(vec![0u8; 100]),
     };
     conn.send_datagram(&Datagram::Video(video))?;
 
@@ -232,7 +232,7 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
             input_echo: InputEchoBatch::default(),
             dimensions: (320, 240),
         }),
-        payload: vec![0u8; 4096],
+        payload: bytes::Bytes::from(vec![0u8; 4096]),
     };
     let err = conn.send_datagram(&Datagram::Video(oversized));
     assert!(
@@ -273,7 +273,7 @@ async fn video_keyframe_stream_roundtrips() -> anyhow::Result<()> {
                 input_echo: InputEchoBatch::default(),
                 dimensions: (1920, 1080),
             }),
-            payload: body_for_server,
+            payload: bytes::Bytes::from(body_for_server),
         };
         conn.send_video_keyframe(&packet).await?;
         // Wait for the client to confirm receipt by sending a
@@ -300,7 +300,7 @@ async fn video_keyframe_stream_roundtrips() -> anyhow::Result<()> {
             assert_eq!(stream_epoch, 7);
             assert_eq!(frame_seq, 42);
             assert_eq!(fragment_count, 1);
-            assert_eq!(payload, body);
+            assert_eq!(payload.as_ref(), body.as_slice());
         }
         other => panic!("expected First, got {other:?}"),
     }
@@ -347,7 +347,7 @@ async fn oversize_video_keyframe_is_rejected_on_send() -> anyhow::Result<()> {
             input_echo: InputEchoBatch::default(),
             dimensions: (3840, 2160),
         }),
-        payload: vec![0u8; tether_transport::MAX_VIDEO_STREAM_MESSAGE + 1],
+        payload: bytes::Bytes::from(vec![0u8; tether_transport::MAX_VIDEO_STREAM_MESSAGE + 1]),
     };
     let err = conn.send_video_keyframe(&oversized).await;
     assert!(

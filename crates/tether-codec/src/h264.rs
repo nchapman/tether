@@ -327,7 +327,9 @@ impl Encoder for H264Encoder {
             // SAFETY: `packet.data` points to `packet.size` valid bytes
             // owned by the AVPacket; we copy them out before the packet
             // is dropped at end-of-iteration.
-            let data = unsafe { slice::from_raw_parts(packet.data, size) }.to_vec();
+            let data = bytes::Bytes::copy_from_slice(unsafe {
+                slice::from_raw_parts(packet.data, size)
+            });
             let keyframe = (packet.flags & ffi::AV_PKT_FLAG_KEY as i32) != 0;
             let pts_out = if packet.pts == ffi::AV_NOPTS_VALUE {
                 None

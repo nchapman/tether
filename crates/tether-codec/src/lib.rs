@@ -25,6 +25,11 @@ pub mod videotoolbox;
 
 pub use probe::{build_decoder, build_encoder, validate_chosen_profile};
 
+// Re-exported so downstream crates can name the payload type on
+// [`EncodedPacket::data`] without independently depending on `bytes`
+// (and without having to track our pinned version).
+pub use bytes;
+
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. The decoder
 /// stashes whatever ref-counted handles it needs alive while the
 /// renderer reads the surface (typically an `AVFrame` whose `Drop`
@@ -83,9 +88,16 @@ pub type Result<T> = std::result::Result<T, CodecError>;
 /// One encoded video packet (in our case a sequence of one or more
 /// concatenated Annex-B-framed NAL units). The wire layer carries this
 /// in `VideoPacket::*::payload`.
+///
+/// `data` is `bytes::Bytes` so the encoder's output can flow through
+/// the fragmenter and into QUIC without per-fragment copies — the
+/// fragmenter produces fragment payloads via `Bytes::slice` (refcount
+/// bump only). Allocation cost is still one per packet inside
+/// `drain_encoder` (libavcodec's `AVPacket::data` is not directly
+/// re-exposable as a `Bytes`), but downstream copies are eliminated.
 #[derive(Clone, Debug)]
 pub struct EncodedPacket {
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     /// The encoder's output PTS for this packet, in the time_base it was
     /// configured with. `None` when the encoder didn't set one (rare; mostly
     /// SPS/PPS-only packets before the first frame is fully buffered).

@@ -14,6 +14,7 @@
 
 use std::slice;
 
+use bytes::{Bytes, BytesMut};
 use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
@@ -37,13 +38,13 @@ pub(crate) fn drain_encoder(
         // by the AVPacket; we copy them before drop.
         let raw = unsafe { slice::from_raw_parts(packet.data, size) };
         let keyframe = (packet.flags & ffi::AV_PKT_FLAG_KEY as i32) != 0;
-        let data = if keyframe && !extradata.is_empty() {
-            let mut buf = Vec::with_capacity(extradata.len() + raw.len());
+        let data: Bytes = if keyframe && !extradata.is_empty() {
+            let mut buf = BytesMut::with_capacity(extradata.len() + raw.len());
             buf.extend_from_slice(extradata);
             buf.extend_from_slice(raw);
-            buf
+            buf.freeze()
         } else {
-            raw.to_vec()
+            Bytes::copy_from_slice(raw)
         };
         let pts_out = if packet.pts == ffi::AV_NOPTS_VALUE {
             None

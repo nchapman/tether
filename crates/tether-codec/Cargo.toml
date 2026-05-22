@@ -12,6 +12,7 @@ tether-protocol = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
+bytes = { workspace = true }
 
 # rsmpeg restores the originally-planned stack — safe wrappers around
 # AVHWDeviceContext / AVHWFramesContext / hwframe_transfer_data are the

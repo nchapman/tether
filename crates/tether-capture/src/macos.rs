@@ -184,6 +184,23 @@ fn build_and_start_stream(
         .with_display(&primary)
         .with_excluding_windows(&[])
         .build();
+    // SCK does its own scaling driven by `SCStreamConfiguration.
+    // width/height` and `scalesToFit` (default true). To unify on the
+    // Mitchell shader the way Linux host does, we'd need one of:
+    //   (a) feed SCK BGRA at native dims, add a Metal BGRA→NV12 stage
+    //       with the Mitchell pre-pass between them, and hand the
+    //       result to VideoToolbox. SCK→VT today bypasses any
+    //       gpuconvert step — adding one is a real chunk of code.
+    //   (b) extend `start()` to accept a viewport hint and either
+    //       restart the SCStream on viewport changes or call
+    //       `SCStream::updateConfiguration` to live-resize.
+    //
+    // Neither lands in this phase. The unified-shader Mac host path
+    // is the phase-2 follow-up in ARCHITECTURE.md; until then, Mac
+    // host always captures (and therefore encodes) at native display
+    // dims regardless of the client viewport. The host's GPU encode
+    // path on macOS keeps `encode_dims = capture_dims` for that
+    // reason — see the cfg-gated branch in `apps/tether-host/src/main.rs`.
     let config = SCStreamConfiguration::new()
         .with_pixel_format(pixel_format)
         .with_width(width)

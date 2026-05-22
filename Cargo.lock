@@ -3391,6 +3391,7 @@ version = "0.0.1"
 dependencies = [
  "ash",
  "pollster",
+ "tether-scaler",
  "thiserror 2.0.18",
  "tracing",
  "wgpu",

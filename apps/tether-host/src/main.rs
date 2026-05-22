@@ -1054,7 +1054,14 @@ fn encode_gpu_frame(
     // `slot.scaler` (caller-owned) through a function boundary.
     let codec_frame = match bridge {
         GpuConvertBridge::Nv12(b) => {
-            let imported = match b.import_bgra_dmabuf(fd, modifier, stride, offset) {
+            let imported = match b.import_bgra_dmabuf(
+                fd,
+                modifier,
+                stride,
+                offset,
+                slot.capture_width,
+                slot.capture_height,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
@@ -1078,7 +1085,14 @@ fn encode_gpu_frame(
             nv12_dmabuf_to_codec_frame(nv12)
         }
         GpuConvertBridge::Yuv444(b) => {
-            let imported = match b.import_bgra_dmabuf(fd, modifier, stride, offset) {
+            let imported = match b.import_bgra_dmabuf(
+                fd,
+                modifier,
+                stride,
+                offset,
+                slot.capture_width,
+                slot.capture_height,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
@@ -1102,7 +1116,14 @@ fn encode_gpu_frame(
             yuv444_dmabuf_to_codec_frame(yuv)
         }
         GpuConvertBridge::P010(b) => {
-            let imported = match b.import_bgra_dmabuf(fd, modifier, stride, offset) {
+            let imported = match b.import_bgra_dmabuf(
+                fd,
+                modifier,
+                stride,
+                offset,
+                slot.capture_width,
+                slot.capture_height,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(

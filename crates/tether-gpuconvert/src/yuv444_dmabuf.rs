@@ -179,12 +179,14 @@ impl Yuv444DmaBuf {
         modifier: u64,
         stride: u64,
         offset: u64,
+        width: u32,
+        height: u32,
     ) -> Result<wgpu::Texture> {
         let hal_desc = wgpu::hal::TextureDescriptor {
             label: Some("imported bgra"),
             size: wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -214,8 +216,8 @@ impl Yuv444DmaBuf {
         let wgpu_desc = wgpu::TextureDescriptor {
             label: Some("imported bgra"),
             size: wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,

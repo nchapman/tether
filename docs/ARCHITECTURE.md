@@ -86,11 +86,14 @@ to VideoToolbox — no gpuconvert step); the rest of the pipeline from
 │     • damage classifier (HashDamage, CPU frames only — GPU frames   │
 │       report Unknown and pass through; skip predicate is gated      │
 │       additionally by IdrSignal::peek so forced IDRs always go)     │
-│     • viewport rebuild check: encode dims = letterbox-fit of        │
+│     • viewport rebuild check: encode dims = letterbox-fit of       │
 │       capture inside the latest ControlMessage::SetClientViewport   │
-│       directive, clamped to 16-pixel alignment. GPU paths keep      │
-│       encode dims == capture dims (wgpu compute scaler is the       │
-│       next step); CPU paths bilinear-resize before encode_bgra.     │
+│       directive, clamped to 16-pixel alignment. Linux GPU paths     │
+│       run tether-scaler (Mitchell-Netravali in linear-light)        │
+│       between PipeWire's BGRA dma-buf import and the chroma         │
+│       bridge; CPU paths bilinear-resize before encode_bgra.         │
+│       macOS GPU paths keep encode == capture pending phase-2 SCK    │
+│       plumbing (see "Mac host scaler" below).                       │
 │     • ABR tick: drains the latest ClientStats + quinn path stats    │
 │       into AbrController; calls set_bitrate_kbps when the           │
 │       controller crosses a hysteresis boundary.                     │
@@ -598,13 +601,22 @@ Listed to set expectations; each is a real follow-up, not a "never":
 - **NAT traversal.** LAN direct only. QUIC's pluggable transport makes
   adding ICE later straightforward; today the user runs the client
   binary with a host IP.
-- **GPU-side viewport scaler.** Viewport-driven pre-encode scaling
-  ships for `CapturedFrame::Cpu` via a CPU bilinear in the host send
-  loop. GPU frames (DMA-BUF, IOSurface) encode at capture dims even
-  when the client requests a smaller viewport — a wgpu compute
-  scaler that decouples encode dims from capture dims on the GPU
-  path is the next step. The protocol + control-task plumbing is in
-  place (`ControlMessage::SetClientViewport`, `ClientHelloV1::viewport`).
+- **Mac host scaler (phase-2).** The Linux host runs `tether-scaler`
+  (Mitchell-Netravali bicubic in linear-light, with a 2× box mipmap
+  prefilter for ratios > 2×) between PipeWire's BGRA dma-buf import
+  and the chroma bridge — host downscale wired. The client renderer
+  runs the same shader in `ColorSpace::LinearF16` mode between
+  YUV→RGB conversion and the present blit when the window is larger
+  than the encoded video — client upscale wired. The macOS host
+  path (SCK → IOSurface NV12 → VideoToolbox) is *not* yet on the
+  unified shader: SCK does its own opaque-kernel scaling driven by
+  `SCStreamConfiguration.width/height`. Unifying would require
+  either (a) asking SCK for BGRA capture and inserting a Metal
+  BGRA→NV12 stage with the Mitchell pre-pass, or (b) adding an
+  NV12-native scaler variant (Y and UV scaled separately, chroma
+  siting accounted for). For now the host's macOS GPU branch holds
+  `encode_dims = capture_dims` so VideoToolbox isn't fed mis-sized
+  pixel buffers — see the cfg-gated check in `apps/tether-host/src/main.rs`.
 - **Real cursor sprite capture.** `tether-capture::cursor::CursorSource`
   trait + `PlaceholderCursorSource` are in place; per-platform
   backends (Wayland `SPA_META_Cursor` parser, macOS `NSCursor` or

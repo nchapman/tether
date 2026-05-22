@@ -225,18 +225,27 @@ impl Nv12DmaBuf {
     /// Returns [`Nv12DmaBufError::Poll`] if wgpu-hal rejects the
     /// import — typically a stride/modifier mismatch with what the
     /// driver expects, or an unsupported DMA-BUF source.
+    /// Import an externally-allocated BGRA dma-buf as a wgpu texture.
+    ///
+    /// `width` and `height` describe the *source's* dimensions, which
+    /// may differ from the bridge's own width/height when a scaler
+    /// sits between the import and `convert()`. For the direct
+    /// (no-scaler) path, callers pass the bridge's `width()` /
+    /// `height()` here.
     pub fn import_bgra_dmabuf(
         &self,
         fd: OwnedFd,
         modifier: u64,
         stride: u64,
         offset: u64,
+        width: u32,
+        height: u32,
     ) -> Result<wgpu::Texture> {
         let hal_desc = wgpu::hal::TextureDescriptor {
             label: Some("imported bgra"),
             size: wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -267,8 +276,8 @@ impl Nv12DmaBuf {
         let wgpu_desc = wgpu::TextureDescriptor {
             label: Some("imported bgra"),
             size: wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -634,6 +643,8 @@ mod tests {
                 src_export.drm_format_modifier,
                 src_export.stride,
                 src_export.offset,
+                width,
+                height,
             )
             .expect("import_bgra_dmabuf");
 

@@ -23,5 +23,12 @@ wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["
 ash = "0.38"
 pollster = "0.4"
 
+[dev-dependencies]
+# Test-only: the scaler-to-encoder round-trip test runs `tether-scaler`
+# in front of the chroma bridge to verify the bridge accepts Rgba8Unorm
+# scaler output. Production code in this crate doesn't depend on the
+# scaler — the host wires them together at the binary layer.
+tether-scaler = { workspace = true }
+
 [lints]
 workspace = true

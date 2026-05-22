@@ -376,6 +376,45 @@ fn roundtrip_h264_8bit_client_upscale() {
     assert_outcome(&case, run_roundtrip(&case));
 }
 
+/// **H.264 client-upscale matching the manual-session repro shape.**
+/// surface (2560×1440) > video (2160×1440), but `letterbox_fit_dims`
+/// of the video into the surface returns exactly video_dims back —
+/// because the surface is taller-aspect than the video, the fit is
+/// width-unlimited and height-limited at 1.0× scale. That makes
+/// `Scaler::new(2160×1440 → 2160×1440)` return `NoScaleNeeded`, so
+/// `self.upscale.scaler` stays None even though `need_upscale=true`.
+///
+/// The blit pass then samples the intermediate at video_dims and
+/// writes to the swapchain with a non-identity `letterbox_scale =
+/// (0.84375, 1.0)`. None of the other cells exercise this exact
+/// branch — `h264_8bit_client_upscale` above has a video aspect that
+/// *does* differ from surface so Mitchell runs; `h264_8bit_full_chain`
+/// has surface > video > letterbox_fit so Mitchell also runs.
+///
+/// If the steady-state 4-overlapping-copies bug observed in manual
+/// sessions lives in this branch (need_upscale=true + scaler=None),
+/// this cell catches it; if the bug is swapchain-specific
+/// (back-buffer rotation, present-time sync), this cell still passes
+/// and that tells us where to look next.
+#[test]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+fn roundtrip_h264_8bit_upscale_no_scaler_branch() {
+    let case = RoundtripCase {
+        name: "h264_8bit_upscale_no_scaler_branch",
+        profile: H264_8BIT_420,
+        fixture: Fixture::CoordEncoded,
+        capture_dims: (2160, 1440),
+        encode_dims: (2160, 1440),
+        surface_dims: (2560, 1440),
+        frames_encoded: 6,
+        assert_steady_state_eps: Some(2.0),
+        color_space: VideoColorSpec::sdr_desktop(),
+        requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
+        floors: FLOOR_CLIENT_UPSCALE,
+    };
+    assert_outcome(&case, run_roundtrip(&case));
+}
+
 /// **H.264 full chain**: capture > encode < surface, surface aspect ≠
 /// encode aspect so letterbox bars appear in the surface. Exercises
 /// both Mitchell stages plus letterbox padding. 3360×2100 (aspect

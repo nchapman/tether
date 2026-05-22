@@ -72,11 +72,13 @@ pub fn export_p010_shared_dmabuf(
     // aligned to 32. Non-32-aligned widths (e.g. 2180, 2340) would
     // produce the same left-edge row-aliasing corruption HEVC Main10
     // sessions saw in the NV12 path. See the NV12 fix's comment for
-    // the mechanism; this is the same fix with a 2 byte/px constant.
+    // the permanence rationale and the AMD-VCN height alignment.
     const VAAPI_LUMA_STRIDE_ALIGN_P010: u32 = 32;
+    const VAAPI_HEIGHT_ALIGN: u32 = 16;
     let aligned_w = width.next_multiple_of(VAAPI_LUMA_STRIDE_ALIGN_P010);
+    let aligned_h = height.next_multiple_of(VAAPI_HEIGHT_ALIGN);
     let chroma_w = aligned_w.div_ceil(2);
-    let chroma_h = height.div_ceil(2);
+    let chroma_h = aligned_h.div_ceil(2);
     let vk_usage = wgpu_usage_to_vk(usage);
 
     // SAFETY: hal escape hatch — Vulkan backend verified below; raw
@@ -122,7 +124,7 @@ pub fn export_p010_shared_dmabuf(
                 .map_err(|e| ExportError::Vk(e, "vkCreateImage (P010 shared)"))
         };
 
-        let y_image = create_image_with(vk::Format::R16_UNORM, aligned_w, height)?;
+        let y_image = create_image_with(vk::Format::R16_UNORM, aligned_w, aligned_h)?;
         let uv_image = match create_image_with(vk::Format::R16G16_UNORM, chroma_w, chroma_h) {
             Ok(i) => i,
             Err(e) => {
@@ -191,6 +193,10 @@ pub fn export_p010_shared_dmabuf(
                     .map_err(|e| {
                         ExportError::Vk(e, "vkGetImageDrmFormatModifierPropertiesEXT (P010 Y)")
                     })?;
+                debug_assert_eq!(
+                    y_mod_props.drm_format_modifier, DRM_FORMAT_MOD_LINEAR,
+                    "driver picked a non-LINEAR modifier despite single-element LINEAR list",
+                );
 
                 let y_subres = vk::ImageSubresource::default()
                     .aspect_mask(vk::ImageAspectFlags::MEMORY_PLANE_0_EXT)
@@ -217,6 +223,11 @@ pub fn export_p010_shared_dmabuf(
                     uv_layout.offset, 0,
                     "DRM_FORMAT_MOD_LINEAR UV layout.offset should be 0"
                 );
+                // `uv_bind_offset` is already aligned to the driver-
+                // reported `max(y_req.alignment, uv_req.alignment)`
+                // upstream. The 4 KiB dma-buf page rule holds in
+                // practice at production sizes but doesn't hold for
+                // small allocations, so no explicit assertion here.
 
                 let mem_arc = Arc::new(SharedDeviceMemory {
                     device: raw_device.clone(),
@@ -234,7 +245,7 @@ pub fn export_p010_shared_dmabuf(
                     y_image,
                     wgpu::TextureFormat::R16Unorm,
                     aligned_w,
-                    height,
+                    aligned_h,
                     usage,
                     "p010-shared y",
                     mem_arc.clone(),

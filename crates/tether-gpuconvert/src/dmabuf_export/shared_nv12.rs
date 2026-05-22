@@ -85,10 +85,22 @@ pub fn export_nv12_shared_dmabuf(
     // edge padding columns undefined (the encoder crops to the
     // declared frame width and ignores them). UV is half-resolution
     // so `aligned_width / 2` is automatically aligned too.
+    //
+    // **This is a permanent workaround.** The bug lives in
+    // libva-intel-driver's DRM_PRIME importer (the hardware demands
+    // its own pitch alignment without re-walking the dma-buf
+    // descriptor); RADV/NVK already report ≥128–256-byte pitch so
+    // the alignment is a no-op there. No upstream fix is expected
+    // — do not delete this code on the assumption "iHD will catch
+    // up". The 16-row height alignment defends against AMD VCN
+    // reading past visible_height when the dma-buf is tight; cost
+    // is at most 15 rows per plane.
     const VAAPI_LUMA_STRIDE_ALIGN: u32 = 64;
+    const VAAPI_HEIGHT_ALIGN: u32 = 16;
     let aligned_w = width.next_multiple_of(VAAPI_LUMA_STRIDE_ALIGN);
+    let aligned_h = height.next_multiple_of(VAAPI_HEIGHT_ALIGN);
     let chroma_w = aligned_w.div_ceil(2);
-    let chroma_h = height.div_ceil(2);
+    let chroma_h = aligned_h.div_ceil(2);
     let vk_usage = wgpu_usage_to_vk(usage);
 
     // SAFETY: hal escape hatch — verified Vulkan backend below; raw
@@ -133,7 +145,7 @@ pub fn export_nv12_shared_dmabuf(
                 .map_err(|e| ExportError::Vk(e, "vkCreateImage (NV12 shared)"))
         };
 
-        let y_image = create_image_with(vk::Format::R8_UNORM, aligned_w, height)?;
+        let y_image = create_image_with(vk::Format::R8_UNORM, aligned_w, aligned_h)?;
         let uv_image = match create_image_with(vk::Format::R8G8_UNORM, chroma_w, chroma_h) {
             Ok(i) => i,
             Err(e) => {
@@ -213,6 +225,15 @@ pub fn export_nv12_shared_dmabuf(
                     .map_err(|e| {
                         ExportError::Vk(e, "vkGetImageDrmFormatModifierPropertiesEXT (Y)")
                     })?;
+                // We asked the driver for LINEAR by passing a single-
+                // element modifier list; verify it actually picked
+                // LINEAR. A future driver that secretly substitutes a
+                // tiled modifier would silently break dma-buf plane
+                // layout assumptions downstream.
+                debug_assert_eq!(
+                    y_mod_props.drm_format_modifier, DRM_FORMAT_MOD_LINEAR,
+                    "driver picked a non-LINEAR modifier despite single-element LINEAR list",
+                );
 
                 let y_subres = vk::ImageSubresource::default()
                     .aspect_mask(vk::ImageAspectFlags::MEMORY_PLANE_0_EXT)
@@ -224,6 +245,30 @@ pub fn export_nv12_shared_dmabuf(
                     .mip_level(0)
                     .array_layer(0);
                 let uv_layout = raw_device.get_image_subresource_layout(uv_image, uv_subres);
+                // For LINEAR-modifier single-plane images, plane-0 sits
+                // at the start of its bound memory. The Y image is
+                // bound at memory offset 0, so y_layout.offset must be
+                // 0 — and the encoder/importer assumes this. P010 has
+                // the same assertion; mirror here so a future driver
+                // change that returns a non-zero plane-0 offset is
+                // loud rather than silent.
+                debug_assert_eq!(
+                    y_layout.offset, 0,
+                    "Y plane subresource offset must be 0 for LINEAR-modifier single-plane image",
+                );
+                debug_assert_eq!(
+                    uv_layout.offset, 0,
+                    "UV plane subresource offset must be 0 for LINEAR-modifier single-plane image",
+                );
+                // `uv_bind_offset` is computed as
+                // `align_up(y_req.size, max(y_req.alignment,
+                // uv_req.alignment))` upstream, so the driver-
+                // reported alignment is already enforced. At
+                // production image sizes Intel reports ≥4 KiB here
+                // (matching the kernel's dma-buf page-pin grain); at
+                // small sizes the alignment can be smaller and the
+                // 4 KiB rule doesn't apply. No additional assertion
+                // adds safety beyond what `uv_align` already gives us.
 
                 // Shared lifetime for the single VkDeviceMemory: both
                 // plane textures hand a clone of `mem_arc` to their hal
@@ -248,7 +293,7 @@ pub fn export_nv12_shared_dmabuf(
                     y_image,
                     wgpu::TextureFormat::R8Unorm,
                     aligned_w,
-                    height,
+                    aligned_h,
                     usage,
                     "nv12-shared y",
                     mem_arc.clone(),

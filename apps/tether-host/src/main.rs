@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
-use tether_codec::{probe_encoder, Encoder};
+use tether_codec::{build_encoder, Encoder};
 use tether_probe::pick_supported_profile;
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
@@ -1186,7 +1186,7 @@ fn run_capture_and_send(
             // require coordinated client decoder rebuild. We pass the
             // list-form for API symmetry with the initial handshake
             // probe; per-resize cost is one construction attempt.
-            slot = match probe_encoder(
+            slot = match build_encoder(
                 chosen_profile,
                 frame_width,
                 frame_height,

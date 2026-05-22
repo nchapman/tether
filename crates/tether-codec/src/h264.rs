@@ -129,7 +129,7 @@ pub(crate) fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
 }
 
 // Software H.264 encoder. Tether requires GPU acceleration in
-// production — see `crate::probe::probe_encoder` for the
+// production — see `crate::probe::build_encoder` for the
 // rationale — so this is gated to tests only. It's the round-trip
 // fixture for the SW decoder (also test-only) and for VAAPI's
 // decoder smoke test, which needs a valid Annex-B bitstream to
@@ -354,7 +354,7 @@ impl Encoder for H264Encoder {
 
 // Software H.264 decoder. Same test-only gating as `H264Encoder`:
 // production builds hard-require the VAAPI hardware path via
-// `crate::probe::probe_decoder`, so this struct exists only to keep
+// `crate::probe::build_decoder`, so this struct exists only to keep
 // the round-trip fixture in this file working.
 #[cfg(test)]
 pub(crate) struct H264Decoder {

@@ -23,7 +23,7 @@ pub mod vaapi;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
 
-pub use probe::{probe_decoder, probe_encoder, validate_chosen_profile};
+pub use probe::{build_decoder, build_encoder, validate_chosen_profile};
 
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. The decoder
 /// stashes whatever ref-counted handles it needs alive while the
@@ -60,8 +60,8 @@ pub enum CodecError {
     #[error("ffmpeg swscale init failed ({0})")]
     ScalerInit(&'static str),
     /// No GPU codec available — Tether hard-requires hardware
-    /// encode/decode. Returned from [`probe_encoder`] /
-    /// [`probe_decoder`] when no hardware backend constructs
+    /// encode/decode. Returned from [`build_encoder`] /
+    /// [`build_decoder`] when no hardware backend constructs
     /// successfully. The string carries the user-actionable
     /// diagnostics (which call to `vainfo` to run, which kernel
     /// module to check, etc.).

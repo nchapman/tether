@@ -15,10 +15,9 @@
 //! `tether_probe::client_decode_profiles()`.
 //!
 //! What stays in tether-codec:
-//!   * [`probe_encoder`] / [`probe_decoder`] — per-session construction
-//!     helpers. Not probes despite the historical name: they build
-//!     the real session objects at real dimensions and return them
-//!     for the host send loop / client decode thread.
+//!   * [`build_encoder`] / [`build_decoder`] — per-session construction
+//!     helpers. They build the real session objects at real dimensions
+//!     and return them for the host send loop / client decode thread.
 //!   * [`validate_chosen_profile`] — handshake-time check that the
 //!     host's chosen profile is one this client actually advertised.
 //!     Pure validation, no probing.
@@ -51,11 +50,11 @@ pub fn validate_chosen_profile(
     )))
 }
 
-/// Construct an encoder for the negotiated session. Not a probe —
-/// this builds the real session encoder at real dimensions and
-/// returns it for the host send loop. Errors with a diagnostics-friendly
-/// message if construction fails.
-pub fn probe_encoder(
+/// Construct an encoder for the negotiated session. Builds the real
+/// session encoder at real dimensions and returns it for the host
+/// send loop. Errors with a diagnostics-friendly message if
+/// construction fails.
+pub fn build_encoder(
     profile: VideoProfile,
     width: u32,
     height: u32,
@@ -111,10 +110,18 @@ pub fn probe_encoder(
     }
 }
 
-/// Construct the decoder for the codec the host chose in its
-/// `ServerHelloV1::chosen_codec`. Errors if no GPU decoder is
-/// available for that codec on this client.
-pub fn probe_decoder(kind: CodecKind) -> Result<Box<dyn Decoder>> {
+/// Construct the decoder for the host's negotiated `VideoProfile`.
+/// Takes the full profile (not just `CodecKind`) for symmetry with
+/// [`build_encoder`] and the bridge/renderer constructors: chroma and
+/// bit-depth are part of session identity even when a particular
+/// backend (today: FFmpeg HEVC) reads them from the bitstream and
+/// doesn't need them at construction. Future chroma-aware decoder
+/// backends won't require a signature change.
+///
+/// Errors if no GPU decoder is available for `profile.codec` on this
+/// client.
+pub fn build_decoder(profile: VideoProfile) -> Result<Box<dyn Decoder>> {
+    let kind = profile.codec;
     #[cfg(target_os = "linux")]
     {
         match crate::vaapi::VaapiDecoder::new(kind) {
@@ -123,6 +130,8 @@ pub fn probe_decoder(kind: CodecKind) -> Result<Box<dyn Decoder>> {
                 tracing::error!(
                     backend = "vaapi",
                     codec = ?kind,
+                    chroma = ?profile.chroma,
+                    bit_depth = profile.bit_depth,
                     error = %e,
                     "VAAPI decoder construction failed"
                 );
@@ -139,6 +148,8 @@ pub fn probe_decoder(kind: CodecKind) -> Result<Box<dyn Decoder>> {
                 tracing::error!(
                     backend = "videotoolbox",
                     codec = ?kind,
+                    chroma = ?profile.chroma,
+                    bit_depth = profile.bit_depth,
                     error = %e,
                     "VideoToolbox decoder construction failed"
                 );
@@ -149,7 +160,7 @@ pub fn probe_decoder(kind: CodecKind) -> Result<Box<dyn Decoder>> {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = kind;
+        let _ = profile;
         Err(no_hw_decoder_for_platform())
     }
 }

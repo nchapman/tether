@@ -232,8 +232,9 @@ fn hevc_main444_dmabuf_roundtrip() {
     use tether_protocol::control::VideoProfile;
 
     // 128×128 is the encoder's minimum-block floor (the same number
-    // probe_encoder_kind uses). Small enough for the test to be
-    // cheap, large enough that the encoder doesn't reject dims.
+    // `tether_probe::host_supported_profiles` uses during its
+    // startup round-trip). Small enough for the test to be cheap,
+    // large enough that the encoder doesn't reject dims.
     let w = 128u32;
     let h = 128u32;
 

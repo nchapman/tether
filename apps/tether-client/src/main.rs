@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver as XbReceiver, Sender as XbSender};
-use tether_codec::{probe_decoder, Frame as CodecFrame};
+use tether_codec::{build_decoder, Frame as CodecFrame};
 use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame, LatestFrame};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{
@@ -189,9 +189,8 @@ async fn main() -> anyhow::Result<()> {
     // actually advertised it could decode. See
     // `tether_codec::probe::validate_chosen_profile` for the rationale
     // (and the unit tests on the same function for the contract).
-    let client_caps = tether_probe::client_decode_profiles();
     if let Err(e) =
-        tether_codec::probe::validate_chosen_profile(negotiated_profile, &client_caps)
+        tether_codec::probe::validate_chosen_profile(negotiated_profile, &client_decode_profiles)
     {
         anyhow::bail!("{e}");
     }
@@ -308,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
 
     let conn_recv = conn.clone();
     let recv_clock_sync = clock_sync;
-    let chosen_codec = negotiated_profile.codec;
+    let decode_profile = negotiated_profile;
     let conn_ready = conn.clone();
 
     // Decode runs on a dedicated std::thread so a GPU-driver stall
@@ -333,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
         .name("tether-decode".into())
         .spawn(move || {
             run_decode_thread(
-                chosen_codec,
+                decode_profile,
                 decode_job_rx,
                 decode_completion_tx,
                 frames_for_decode,
@@ -767,7 +766,7 @@ struct DecodeCompletion {
 /// reference) because this thread is not itself a tokio worker.
 #[allow(clippy::too_many_arguments)]
 fn run_decode_thread(
-    chosen_codec: tether_protocol::control::CodecKind,
+    profile: tether_protocol::control::VideoProfile,
     job_rx: XbReceiver<DecodeJob>,
     completion_tx: XbSender<DecodeCompletion>,
     frames: LatestFrame,
@@ -775,18 +774,20 @@ fn run_decode_thread(
     conn: Arc<Connection>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
 ) {
-    let mut decoder: Box<dyn tether_codec::Decoder> = match probe_decoder(chosen_codec) {
+    let mut decoder: Box<dyn tether_codec::Decoder> = match build_decoder(profile) {
         Ok(d) => {
             info!(
                 backend = d.name(),
                 hardware = d.is_hardware(),
-                codec = ?chosen_codec,
+                codec = ?profile.codec,
+                chroma = ?profile.chroma,
+                bit_depth = profile.bit_depth,
                 "decoder initialised"
             );
             d
         }
         Err(e) => {
-            error!(error = %e, codec = ?chosen_codec, "decoder init failed; aborting decode thread");
+            error!(error = %e, codec = ?profile.codec, "decoder init failed; aborting decode thread");
             // Dropping ready_tx without sending signals the recv task
             // that decoder construction failed; it tears the session
             // down rather than streaming into a sink-hole.

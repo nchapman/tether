@@ -161,11 +161,12 @@ pub enum PipelineStage {
 /// binds but before the listener accepts, so the probe doesn't
 /// straddle a handshake's clock-sync measurement.
 ///
-/// Stub implementation note (Step 1 of the migration): the
-/// orchestration currently delegates to
-/// [`tether_codec::probe::supported_profiles`]. The full producer
-/// round trip (capture-stage bridge probe, real `submit_dmabuf`)
-/// lands in Step 3 of the migration plan.
+/// Per profile, the probe runs the full production chain end-to-end:
+/// capture-stage bridge construction (Linux gpuconvert / macOS SCK
+/// capability), encoder construction, real `submit_dmabuf` /
+/// `submit_iosurface` of a synthesised frame, and decoder round trip.
+/// `SupportStatus::Unsupported` carries a [`PipelineStage`] naming the
+/// first stage that rejected the profile.
 #[must_use]
 pub fn host_supported_profiles() -> &'static [ProfileSupport] {
     static CACHED: OnceLock<Vec<ProfileSupport>> = OnceLock::new();

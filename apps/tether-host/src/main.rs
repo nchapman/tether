@@ -799,12 +799,6 @@ struct EncoderSlot {
     /// phase-2 follow-up tracked in ARCHITECTURE.md.
     #[cfg(target_os = "linux")]
     scaler: Option<Scaler>,
-    /// Shared scaler shader compilation. Held alongside the slot so
-    /// it's destroyed when the slot is (a resolution change destroys
-    /// the bridge's device too, so caching across rebuilds would
-    /// dangle).
-    #[cfg(target_os = "linux")]
-    scaler_pipelines: Option<Arc<ScalerPipelines>>,
 }
 
 /// Per-encoder adaptive bitrate state.
@@ -865,19 +859,21 @@ fn bridge_device_queue(b: &GpuConvertBridge) -> (wgpu::Device, wgpu::Queue) {
 }
 
 /// Compile scaler pipelines + construct a Scaler for the given (src,
-/// dst). Returns the shared pipelines so the slot owns them across
-/// any future per-frame scaler rebuilds (none today; placeholder for
-/// the renderer-side path where the device is long-lived).
+/// dst). The Scaler holds the pipelines internally via Arc, so we
+/// don't need to retain a separate handle in the slot — when the
+/// slot is destroyed (on resolution change) the pipelines drop with
+/// it. Future "rebuild scaler with new dims but keep the pipelines"
+/// fast-path would expose `pipelines.clone()` here for the caller to
+/// stash; today there's no such caller.
 #[cfg(target_os = "linux")]
 fn build_scaler_for_slot(
     device: wgpu::Device,
     queue: wgpu::Queue,
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
-) -> Result<(Arc<ScalerPipelines>, Scaler), ScalerError> {
+) -> Result<Scaler, ScalerError> {
     let pipelines = Arc::new(ScalerPipelines::build(&device));
-    let scaler = Scaler::new(pipelines.clone(), device, queue, src_dims, dst_dims)?;
-    Ok((pipelines, scaler))
+    Scaler::new(pipelines, device, queue, src_dims, dst_dims)
 }
 
 /// If `scaler` is `Some`, run it on `imported` and return a reference
@@ -889,9 +885,18 @@ fn scale_if_needed<'a>(
     imported: &'a wgpu::Texture,
 ) -> Result<&'a wgpu::Texture, anyhow::Error> {
     match scaler {
-        Some(s) => s
-            .scale(imported)
-            .map_err(|e| anyhow::anyhow!("Scaler::scale: {e}")),
+        Some(s) => s.scale(imported).map_err(|e| {
+            // DimMismatch is the resize-race signal — capture
+            // changed dims before the slot rebuilt. One frame drop
+            // is acceptable; a persistent stream of these points at
+            // a bookkeeping bug (slot.capture_width drifting off
+            // live capture dims) that the next slot rebuild won't
+            // fix. Log every occurrence so the pattern is visible.
+            if matches!(e, ScalerError::DimMismatch { .. }) {
+                warn!(error = %e, "scaler dim mismatch on encode; dropping frame");
+            }
+            anyhow::anyhow!("Scaler::scale: {e}")
+        }),
         None => Ok(imported),
     }
 }
@@ -997,7 +1002,7 @@ fn encode_gpu_frame(
                     (slot.capture_width, slot.capture_height),
                     (slot.width, slot.height),
                 ) {
-                    Ok((pipelines, scaler)) => {
+                    Ok(scaler) => {
                         info!(
                             capture_w = slot.capture_width,
                             capture_h = slot.capture_height,
@@ -1007,7 +1012,6 @@ fn encode_gpu_frame(
                             "Mitchell scaler built for viewport downscale"
                         );
                         slot.scaler = Some(scaler);
-                        slot.scaler_pipelines = Some(pipelines);
                     }
                     Err(e) => {
                         return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
@@ -1594,19 +1598,25 @@ fn run_capture_and_send(
             let g = latest_viewport.lock().unwrap();
             (g.viewport, g.seq)
         };
-        // Viewport-driven downscale applies to every frame source:
+        // Viewport-driven downscale applies per frame source:
         //   - CPU frames: `resize_bgra_bilinear` does the work below.
         //   - Linux GPU dma-buf: `tether-scaler` (Mitchell-Netravali
         //     in linear-light) runs inside `encode_gpu_frame` between
         //     PipeWire's BGRA import and the chroma bridge.
-        //   - macOS GPU IOSurface: SCK does the scaling at capture
-        //     time via `SCStreamConfiguration.width/height`, plumbed
-        //     in `tether-capture::macos`. The frame already arrives
-        //     at encode dims, so we treat `capture_dims == encode_dims`
-        //     for the IOSurface path — see ARCHITECTURE.md for the
-        //     phase-2 plan to unify on the Mitchell shader.
-        let (encode_width, encode_height) =
-            encode_dims_for_viewport(frame_width, frame_height, current_viewport);
+        //   - macOS GPU IOSurface: until SCK's `SCStreamConfiguration.
+        //     width/height` is plumbed (phase-2), the IOSurface
+        //     arrives at capture dims; the encoder + VideoToolbox
+        //     session expect frames at their configured dims, so we
+        //     hold `encode_dims = capture_dims` here. Removing this
+        //     branch without the SCK plumbing would feed mis-sized
+        //     pixel buffers to VT and produce encoder rejection or
+        //     silently wrong output.
+        let viewport_applies = !matches!(frame, CapturedFrame::Gpu(_)) || cfg!(target_os = "linux");
+        let (encode_width, encode_height) = if viewport_applies {
+            encode_dims_for_viewport(frame_width, frame_height, current_viewport)
+        } else {
+            (frame_width, frame_height)
+        };
         // viewport_seq isn't part of the rebuild check: only an actual
         // change in encoder dimensions warrants tearing down the
         // encoder + bumping stream_epoch. A viewport change that
@@ -1701,8 +1711,6 @@ fn run_capture_and_send(
                         bridge: BridgeState::NotYetBuilt,
                         #[cfg(target_os = "linux")]
                         scaler: None,
-                        #[cfg(target_os = "linux")]
-                        scaler_pipelines: None,
                     })
                 }
                 Err(e) => {

@@ -30,14 +30,48 @@
 mod decoder;
 pub mod encoder;
 mod ffi;
-pub mod probe;
 
 #[cfg(test)]
 mod tests;
 
 pub use decoder::VideoToolboxDecoder;
 pub use encoder::VideoToolboxEncoder;
-pub use probe::expected_iosurface_fourccs;
+
+use tether_protocol::control::{ChromaSubsampling, VideoProfile};
+
+/// The set of IOSurface fourccs a VT decoder may emit for `profile`'s
+/// bitstream, when the encoder *actually* produced that profile's
+/// chroma + bit-depth (vs. silently downsampled). Per-profile range
+/// variants (`'420v'` vs `'420f'`, etc.) both count — range is a VUI
+/// signal, not a chroma-resolution one, and we deliberately don't
+/// gate on it.
+///
+/// Exposed at `pub` so cross-crate consistency tests can confirm the
+/// renderer's IOSurface accept set (`tether-render::gpu::metal`) is a
+/// superset of this — i.e. that the renderer can import everything
+/// the encode probe (in `tether-probe`) expects the decoder to
+/// produce. A subset mismatch is what bit us in commit `621badc`
+/// (renderer rejected `'x420'` even though the probe correctly
+/// listed it).
+#[must_use]
+pub fn expected_iosurface_fourccs(profile: VideoProfile) -> &'static [u32] {
+    const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
+    const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
+    const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
+    const NV24_FULL: u32 = u32::from_be_bytes(*b"444f");
+    const P010: u32 = u32::from_be_bytes(*b"P010");
+    const XF20: u32 = u32::from_be_bytes(*b"xf20");
+    const X420: u32 = u32::from_be_bytes(*b"x420");
+    const XF44: u32 = u32::from_be_bytes(*b"xf44");
+    const P410: u32 = u32::from_be_bytes(*b"P410");
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => &[NV12_VIDEO, NV12_FULL],
+        (ChromaSubsampling::Yuv420, 10) => &[P010, XF20, X420],
+        (ChromaSubsampling::Yuv444, 8) => &[NV24_VIDEO, NV24_FULL],
+        (ChromaSubsampling::Yuv444, 10) => &[XF44, P410],
+        _ => &[],
+    }
+}
 
 /// Surfaces beyond what the decoder needs for its own reference
 /// picture list. Same rationale as the VAAPI sibling: the renderer's

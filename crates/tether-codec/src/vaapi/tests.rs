@@ -177,21 +177,6 @@ fn vaapi_encoder_dmabuf_import() {
 }
 
 #[test]
-#[ignore = "requires VAAPI; one-shot probe check"]
-fn supported_profiles_smoke() {
-    // Diagnostic dump of the per-profile capability matrix on this
-    // box. Useful when investigating "why isn't HEVC 4:4:4 lighting
-    // up?" — the probe runs a real encode + decode round trip per
-    // profile and the output here shows which half failed.
-    for cap in crate::supported_profiles() {
-        println!(
-            "{:?} encode={} decode={}",
-            cap.profile, cap.encode, cap.decode
-        );
-    }
-}
-
-#[test]
 #[ignore = "requires VAAPI HEVC Main444 (Intel Tiger Lake+ / AMD VCN3+)"]
 fn hevc_main444_encoder_constructs() {
     // The desktop-quality top rung. If this fails on a known-good
@@ -384,18 +369,5 @@ fn hevc_main444_dmabuf_roundtrip() {
     );
 }
 
-#[test]
-#[ignore = "requires VAAPI device; exercises supported_encode_profiles"]
-fn supported_encode_profiles_includes_baseline() {
-    // Floor contract: on any working VAAPI box, the H.264 4:2:0
-    // profile must be in the cache. Without it, no client could
-    // negotiate at all. The probe result is OnceLock-cached, so
-    // running this after other VAAPI tests in the same process
-    // returns the same list — the determinism is the point.
-    let profiles = crate::supported_encode_profiles();
-    println!("supported encode profiles: {profiles:?}");
-    assert!(
-        profiles.contains(&tether_protocol::control::VideoProfile::H264_8BIT_420),
-        "H.264 4:2:0 8-bit must be available on any VAAPI driver this build supports"
-    );
-}
+// supported_encode_profiles is gone from tether-codec — the equivalent
+// is `tether_probe::host_encode_profiles()`, tested in that crate.

@@ -45,7 +45,6 @@
 mod decoder;
 mod encoder;
 mod ffi;
-pub(crate) mod probe;
 
 #[cfg(test)]
 mod bench;

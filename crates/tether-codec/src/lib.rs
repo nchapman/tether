@@ -16,7 +16,6 @@ pub mod probe;
 pub mod bitstream_sps;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod encoder_common;
-mod profile_probe;
 
 #[cfg(target_os = "linux")]
 pub mod vaapi;
@@ -24,11 +23,7 @@ pub mod vaapi;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
 
-pub use probe::{
-    pick_supported_profile, probe_decoder, probe_encoder, supported_decode_profiles,
-    supported_encode_profiles, supported_profiles, PROFILE_PREFERENCE,
-};
-pub use profile_probe::ProfileCapability;
+pub use probe::{probe_decoder, probe_encoder, validate_chosen_profile};
 
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. The decoder
 /// stashes whatever ref-counted handles it needs alive while the

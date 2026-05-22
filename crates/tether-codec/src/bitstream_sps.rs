@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn hevc_yuv420_8bit_fixture_parses_as_420_8() {
-        let bytes = include_bytes!("../fixtures/probe/hevc_yuv420_8bit.idr");
+        let bytes = include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv420_8bit.idr");
         let sps = parse_sps_chroma_bit_depth(bytes, CodecKind::Hevc)
             .expect("hevc 4:2:0 8-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 1, "chroma_format_idc 1 = 4:2:0");
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn hevc_yuv444_8bit_fixture_parses_as_444_8() {
-        let bytes = include_bytes!("../fixtures/probe/hevc_yuv444_8bit.idr");
+        let bytes = include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_8bit.idr");
         let sps = parse_sps_chroma_bit_depth(bytes, CodecKind::Hevc)
             .expect("hevc 4:4:4 8-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 3, "chroma_format_idc 3 = 4:4:4");
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn hevc_yuv420_10bit_fixture_parses_as_420_10() {
-        let bytes = include_bytes!("../fixtures/probe/hevc_yuv420_10bit.idr");
+        let bytes = include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv420_10bit.idr");
         let sps = parse_sps_chroma_bit_depth(bytes, CodecKind::Hevc)
             .expect("hevc 4:2:0 10-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 1);
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn hevc_yuv444_10bit_fixture_parses_as_444_10() {
-        let bytes = include_bytes!("../fixtures/probe/hevc_yuv444_10bit.idr");
+        let bytes = include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_10bit.idr");
         let sps = parse_sps_chroma_bit_depth(bytes, CodecKind::Hevc)
             .expect("hevc 4:4:4 10-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 3);
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn h264_yuv420_8bit_fixture_parses_as_420_8() {
-        let bytes = include_bytes!("../fixtures/probe/h264_yuv420_8bit.idr");
+        let bytes = include_bytes!("../../tether-probe/fixtures/probe/h264_yuv420_8bit.idr");
         let sps = parse_sps_chroma_bit_depth(bytes, CodecKind::H264)
             .expect("h264 4:2:0 8-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 1);

@@ -1702,9 +1702,9 @@ mod tests {
     fn macos_iosurface_fourcc_tables_agree_across_crates() {
         use tether_capture::macos::sck_pixel_format_for_profile;
         use tether_codec::videotoolbox::encoder::iosurface_fourcc_matches;
-        use tether_codec::videotoolbox::probe::expected_iosurface_fourccs;
+        use tether_codec::videotoolbox::expected_iosurface_fourccs;
+        use tether_probe::PROFILE_PREFERENCE;
         use tether_render::accepts_iosurface_fourcc;
-        use tether_codec::PROFILE_PREFERENCE;
 
         // Walk every profile the negotiator could pick.
         for profile in PROFILE_PREFERENCE {

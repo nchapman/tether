@@ -1010,6 +1010,27 @@ impl GpuState {
         (self.textures.size, self.target.dimensions())
     }
 
+    /// Borrow the offscreen target so the round-trip harness can copy
+    /// it into a readback buffer. Panics on the swapchain variant —
+    /// production never reads back through this accessor.
+    #[allow(dead_code)] // consumed by tether-render's test_harness module
+    pub(crate) fn offscreen_target_for_readback(&self) -> &wgpu::Texture {
+        match &self.target {
+            RenderTarget::Offscreen { target, .. } => target,
+            RenderTarget::Swapchain { .. } => {
+                panic!("offscreen_target_for_readback called on swapchain target")
+            }
+        }
+    }
+
+    /// Borrow the queue so the harness can submit its readback copy on
+    /// the same queue the production renderer just submitted the blit
+    /// pass on (so the readback orders-after the render).
+    #[allow(dead_code)] // consumed by tether-render's test_harness module
+    pub(crate) fn queue_for_readback(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         self.target.resize(&self.device, width, height);
         // The video textures are at decoded resolution and don't change

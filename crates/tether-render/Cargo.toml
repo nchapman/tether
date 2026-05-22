@@ -59,6 +59,14 @@ objc2-io-surface = { version = "0.3.2", default-features = false, features = ["s
 [dev-dependencies]
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Round-trip test harness pulls metrics, the Mitchell CPU reference,
+# the coordinate-encoded fixture, and the chroma-roundtrip model from
+# tether-scaler's test_util module — feature-gated to keep the
+# production crate slim.
+tether-scaler = { workspace = true, features = ["test-util"] }
+# Load PNG fixtures for the photometric round-trip cells (the
+# coordinate-encoded cells generate their fixture procedurally).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Linux-only test dep: the dmabuf renderer round-trip test for HEVC
 # Main10 needs the production gpuconvert P010 bridge to produce a

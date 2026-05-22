@@ -12,6 +12,9 @@ mod dmabuf_test;
 #[cfg(test)]
 mod iosurface_test;
 
+#[cfg(all(test, target_os = "linux"))]
+mod test_harness;
+
 use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};

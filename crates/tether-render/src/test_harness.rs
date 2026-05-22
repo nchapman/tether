@@ -444,12 +444,13 @@ fn encode_chain(
 
 /// Encode at `dims == capture_dims == encode_dims` through the
 /// **gpuconvert NV12 bridge** (compute BGRA→NV12) and `encode_gpu`
-/// via DMA-BUF. Skips the Mitchell scaler. Currently unused by the
-/// matrix — kept as a regression-bisect entry point for "is the
+/// via DMA-BUF. Skips the Mitchell scaler. Intentionally unused by
+/// the matrix — kept as a regression-bisect entry point for "is the
 /// bridge or the scaler at fault" investigations: switch a failing
 /// `capture==encode` cell from `encode_via_cpu_upload` to this and
-/// re-run.
-#[cfg_attr(not(test), allow(dead_code))]
+/// re-run. The `dead_code` allow is intentional and must stay until
+/// a test or the matrix wires it in.
+#[allow(dead_code)]
 fn encode_via_bridge_no_scaler(
     profile: VideoProfile,
     dims: (u32, u32),

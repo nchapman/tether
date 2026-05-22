@@ -351,6 +351,17 @@ impl Nv12DmaBuf {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bg, &[]);
+            // Dispatch covers the **visible** chroma region (derived
+            // from `self.width`), not the texture's actual chroma
+            // dimensions. Since `shared_nv12.rs` allocates the Y/UV
+            // images at `align_up(width, 64)` for Intel iHD VAAPI's
+            // sake, the wgpu textures are wider than the visible
+            // region; the shader's `textureDimensions(uv_dst)` guard
+            // returns the aligned dims, but we deliberately dispatch
+            // fewer workgroups so the right-edge padding stays
+            // undefined and VAAPI crops it via the declared frame
+            // width. Aligning the dispatch to `textureDimensions`
+            // would write padding columns and confuse the encoder.
             let chroma_w = self.width.div_ceil(2);
             let chroma_h = self.height.div_ceil(2);
             pass.dispatch_workgroups(chroma_w.div_ceil(8), chroma_h.div_ceil(8), 1);
@@ -761,5 +772,101 @@ mod tests {
                 "Y[{x},{y}] (blue via import) = {got}, expected ~{expected_y} (diff {diff})",
             );
         }
+    }
+
+    /// Structural regression for the iHD-VAAPI alignment fix in
+    /// `shared_nv12.rs`: at unaligned widths, the bridge must report
+    /// a Y-plane row pitch that's a multiple of 64 bytes (Intel iHD's
+    /// hardcoded NV12 import expectation). Pre-fix, the Vulkan driver
+    /// picked tight `row_pitch == width` for LINEAR R8 images at e.g.
+    /// 2160-px width, which VAAPI then mis-read as 64-aligned and
+    /// produced left-edge row aliasing in every encoded frame. The
+    /// fix forces the underlying image's allocated width to
+    /// `align_up(visible_width, 64)`, so `row_pitch` falls out at the
+    /// aligned value by construction. A reintroduction of the tight-
+    /// stride behaviour fails this assertion before any
+    /// encoder/decoder/renderer runs.
+    ///
+    /// Picking 2160×1440: 2160 is the smallest non-64-aligned width
+    /// production hits on HiDPI 2× displays and it's the exact width
+    /// the end-to-end roundtrip-harness `repro_shape` cell uses.
+    #[test]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    fn convert_reports_64_aligned_y_stride_at_unaligned_width() {
+        let width = 2160u32;
+        let height = 1440u32;
+        debug_assert_ne!(
+            width % 64,
+            0,
+            "the test point must be a non-64-aligned width to exercise the alignment fix",
+        );
+
+        let bridge = match pollster::block_on(Nv12DmaBuf::new(width, height)) {
+            Ok(b) => b,
+            Err(Nv12DmaBufError::NoAdapter | Nv12DmaBufError::FeatureUnsupported) => {
+                eprintln!("SKIP: no wgpu adapter with DMA-BUF export feature");
+                return;
+            }
+            Err(e) => panic!("Nv12DmaBuf::new: {e}"),
+        };
+        let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("alignment-test bgra src"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // Content doesn't matter for the alignment check — we only
+        // inspect the returned metadata. Still write something so the
+        // bridge actually exercises its dispatch path at this width.
+        let bgra = vec![0u8; (width * height * 4) as usize];
+        bridge.queue().write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bgra,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let out = bridge.convert(&src).expect("convert");
+        assert!(
+            out.y_stride >= u64::from(width),
+            "y_stride {} must be at least the visible width {width}",
+            out.y_stride
+        );
+        assert_eq!(
+            out.y_stride % 64,
+            0,
+            "y_stride {} is not 64-aligned at width {width} — Intel iHD VAAPI will mis-read the dma-buf and corrupt the left edge",
+            out.y_stride
+        );
+        // UV pitch is the same byte count as Y at full-resolution
+        // (each chroma sample is 2 bytes, chroma width is half luma,
+        // so 2 * (aligned_luma/2) == aligned_luma bytes). Catches a
+        // future change that aligns Y but forgets UV.
+        assert_eq!(
+            out.uv_stride % 64,
+            0,
+            "uv_stride {} must be 64-aligned for the same reason as y_stride",
+            out.uv_stride,
+        );
     }
 }

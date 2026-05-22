@@ -64,6 +64,14 @@ pub fn export_yuv444_shared_dmabuf(
     {
         return Err(ExportError::FeatureUnsupported);
     }
+    // Same Intel iHD VAAPI 64-byte row-pitch alignment requirement as
+    // the NV12 sibling. XYUV is 4 bytes/luma-pixel, so 64-byte rows
+    // mean luma-pixel width aligned to 16. Common widths (1920, 2160,
+    // 2560) are already 16-aligned; this defends against the rarer
+    // non-16-aligned widths (e.g. 2180) that would otherwise produce
+    // the same left-edge row-aliasing corruption.
+    const VAAPI_LUMA_STRIDE_ALIGN_XYUV: u32 = 16;
+    let aligned_w = width.next_multiple_of(VAAPI_LUMA_STRIDE_ALIGN_XYUV);
     let vk_usage = wgpu_usage_to_vk(usage);
 
     // SAFETY: hal escape hatch — Vulkan backend verified below; raw
@@ -88,7 +96,7 @@ pub fn export_yuv444_shared_dmabuf(
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
-            .extent(vk::Extent3D { width, height, depth: 1 })
+            .extent(vk::Extent3D { width: aligned_w, height, depth: 1 })
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -170,7 +178,7 @@ pub fn export_yuv444_shared_dmabuf(
 
                 let hal_desc = wgpu::hal::TextureDescriptor {
                     label: Some("yuv444-xyuv shared"),
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d { width: aligned_w, height, depth_or_array_layers: 1 },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -193,7 +201,7 @@ pub fn export_yuv444_shared_dmabuf(
 
                 let wgpu_desc = wgpu::TextureDescriptor {
                     label: Some("yuv444-xyuv shared"),
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d { width: aligned_w, height, depth_or_array_layers: 1 },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,

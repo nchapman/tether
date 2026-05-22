@@ -66,7 +66,16 @@ pub fn export_p010_shared_dmabuf(
     {
         return Err(ExportError::FeatureUnsupported);
     }
-    let chroma_w = width.div_ceil(2);
+    // Same Intel iHD VAAPI 64-byte row-pitch alignment requirement as
+    // the NV12 sibling (`shared_nv12.rs`). P010's Y plane is R16Unorm
+    // = 2 bytes/pixel, so the 64-byte rule means luma-pixel width
+    // aligned to 32. Non-32-aligned widths (e.g. 2180, 2340) would
+    // produce the same left-edge row-aliasing corruption HEVC Main10
+    // sessions saw in the NV12 path. See the NV12 fix's comment for
+    // the mechanism; this is the same fix with a 2 byte/px constant.
+    const VAAPI_LUMA_STRIDE_ALIGN_P010: u32 = 32;
+    let aligned_w = width.next_multiple_of(VAAPI_LUMA_STRIDE_ALIGN_P010);
+    let chroma_w = aligned_w.div_ceil(2);
     let chroma_h = height.div_ceil(2);
     let vk_usage = wgpu_usage_to_vk(usage);
 
@@ -113,7 +122,7 @@ pub fn export_p010_shared_dmabuf(
                 .map_err(|e| ExportError::Vk(e, "vkCreateImage (P010 shared)"))
         };
 
-        let y_image = create_image_with(vk::Format::R16_UNORM, width, height)?;
+        let y_image = create_image_with(vk::Format::R16_UNORM, aligned_w, height)?;
         let uv_image = match create_image_with(vk::Format::R16G16_UNORM, chroma_w, chroma_h) {
             Ok(i) => i,
             Err(e) => {
@@ -214,12 +223,17 @@ pub fn export_p010_shared_dmabuf(
                     memory,
                 });
 
+                // wgpu texture wraps the aligned Vulkan image (see the
+                // NV12 sibling for the dispatch-vs-textureDimensions
+                // mismatch this introduces — the compute pass uses the
+                // bridge's visible width for dispatch so padding stays
+                // undefined and the encoder crops it).
                 let y_texture = import_shared_image_into_wgpu(
                     device,
                     raw_device,
                     y_image,
                     wgpu::TextureFormat::R16Unorm,
-                    width,
+                    aligned_w,
                     height,
                     usage,
                     "p010-shared y",

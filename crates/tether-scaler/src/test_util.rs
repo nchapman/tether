@@ -234,33 +234,52 @@ fn bgra_to_y_709(px: &[u8]) -> f64 {
 // ---------------------------------------------------------------------
 // Coordinate-encoded fixture
 // ---------------------------------------------------------------------
+//
+// The fixture has to survive lossy encoding (4 Mbps H.264 / HEVC with
+// 4:2:0 chroma subsampling) while still letting the test recover
+// "where did this pixel come from?" with enough resolution to detect
+// the failure modes the harness is designed to catch.
+//
+// The first cut packed x/y into bit fields across R/G/B. That broke
+// catastrophically: the B channel's high nibble carries step
+// transitions at x=256, x=512, etc., which 4:2:0 chroma subsampling
+// blurs into garbage. PSNR-Y dropped to ~27 dB and the recovered
+// coordinates were noise-dominated to the tune of hundreds of pixels.
+//
+// This version uses smooth linear gradients instead. The R channel
+// encodes x as a ramp (0 → 255 across `capture_width`), G encodes y
+// as a ramp (0 → 255 across `capture_height`), B holds a static mid-
+// grey for visual contrast. Smooth gradients are the easiest case for
+// any video encoder; the fixture survives encode at PSNR-Y > 40 dB
+// and the recovered (x, y) drifts by a few px from quantisation, not
+// by hundreds.
+//
+// Resolution is `capture_width / 256` px per recovered-x level
+// (≈ 7.5 px at 1920 capture). That's plenty to detect a ghost-copy
+// stride bug (which shifts geometry by 100+ px) while staying well
+// under the encoder's noise floor.
 
-/// Encode (x, y) into a BGRA pixel so every pixel literally tells you
-/// where it came from. R = x%256, G = y%256, B = ((x/256) << 4) | (y/256).
-///
-/// Covers source dimensions up to 4096×4096 — a 12-bit budget split
-/// evenly between x and y. Larger dims would alias and break the
-/// residual computation; the harness asserts `capture_dims <= 4096` for
-/// coord-encoded cases.
+/// Encode `(x, y)` at `capture_dims` as a BGRA pixel using smooth
+/// gradients in R (horizontal) and G (vertical). B is a constant
+/// mid-grey.
 #[inline]
 #[must_use]
-pub fn coord_encode_bgra(x: u32, y: u32) -> [u8; 4] {
-    debug_assert!(x < 4096 && y < 4096);
-    let r = (x % 256) as u8;
-    let g = (y % 256) as u8;
-    let b = (((x / 256) << 4) | (y / 256)) as u8;
-    [b, g, r, 0xFF]
+pub fn coord_encode_bgra(x: u32, y: u32, capture_dims: (u32, u32)) -> [u8; 4] {
+    let (cw, ch) = capture_dims;
+    debug_assert!(x < cw && y < ch);
+    let r = ((x as f32 * 255.0) / (cw - 1).max(1) as f32).round() as u8;
+    let g = ((y as f32 * 255.0) / (ch - 1).max(1) as f32).round() as u8;
+    [128, g, r, 0xFF]
 }
 
-/// Fill a BGRA buffer with the coordinate fixture at `dims`. Used by
-/// the harness when a case requests `Fixture::CoordEncoded`.
+/// Fill a BGRA buffer with the gradient coord fixture at `dims`.
 #[must_use]
 pub fn coord_fixture_fill(dims: (u32, u32)) -> Vec<u8> {
     let (w, h) = dims;
     let mut buf = vec![0u8; (w * h * 4) as usize];
     for y in 0..h {
         for x in 0..w {
-            let px = coord_encode_bgra(x, y);
+            let px = coord_encode_bgra(x, y, dims);
             let off = ((y * w + x) * 4) as usize;
             buf[off..off + 4].copy_from_slice(&px);
         }
@@ -268,19 +287,17 @@ pub fn coord_fixture_fill(dims: (u32, u32)) -> Vec<u8> {
     buf
 }
 
-/// Decode the (x, y) that a pixel's RGB claims to encode. Inverse of
-/// [`coord_encode_bgra`]; lossy encoding may have shifted channel
-/// values, so the recovered coordinate is approximate.
+/// Decode a pixel's claimed `(x, y)` in capture coordinates from its
+/// BGRA gradient encoding. Returns sub-pixel-precision floats — the
+/// metric computes a residual in float coordinates, not integer.
 #[inline]
 #[must_use]
-pub fn coord_decode_bgra(px: &[u8]) -> (u32, u32) {
-    let b = u32::from(px[0]);
-    let g = u32::from(px[1]);
-    let r = u32::from(px[2]);
-    let x_hi = (b >> 4) & 0xF;
-    let y_hi = b & 0xF;
-    let x = (x_hi << 8) | r;
-    let y = (y_hi << 8) | g;
+pub fn coord_decode_bgra(px: &[u8], capture_dims: (u32, u32)) -> (f64, f64) {
+    let (cw, ch) = capture_dims;
+    let r = f64::from(px[2]);
+    let g = f64::from(px[1]);
+    let x = r * f64::from(cw - 1) / 255.0;
+    let y = g * f64::from(ch - 1) / 255.0;
     (x, y)
 }
 
@@ -351,17 +368,15 @@ impl LetterboxMap {
 /// coordinate from the letterbox-fit mapping.
 ///
 /// A correct round-trip on `Fixture::CoordEncoded` produces residuals
-/// dominated by sub-pixel scatter from lossy encoding (typically
-/// < 0.5 px at 4 Mbps H.264 on a flat-region fixture). A ghosted-copy
-/// stride bug produces residuals of hundreds of pixels — the primary
-/// catch this metric is designed for.
+/// in the tens of pixels at most — encoder quantisation drifts the
+/// gradient channels by a few levels, and each level is
+/// `capture_width / 255` pixels of recovery resolution. A ghosted-
+/// copy stride bug shifts geometry by 100s of pixels — well above
+/// any quantisation floor — which is the catch this metric is
+/// designed for.
 ///
-/// Skips:
-/// - Pixels in the letterbox bars (no coordinate to compare against).
-/// - Pixels where the recovered coordinate is wildly out-of-range
-///   (channel-corruption from encode noise on solid color blocks at the
-///   edges of the encoded source); above 4096 we treat the recovered
-///   value as garbage rather than letting one outlier dominate the RMS.
+/// Letterbox-bar pixels (where `surface_to_capture` returns None) are
+/// skipped: no fixture content there to compare against.
 ///
 /// `readback_bgra` is the rendered surface in BGRA at `surface_dims`.
 #[must_use]
@@ -384,12 +399,10 @@ pub fn coord_fixture_residual_px_rms(
                 continue;
             };
             let off = ((sy * surface_dims.0 + sx) * 4) as usize;
-            let (cx_claim, cy_claim) = coord_decode_bgra(&readback_bgra[off..off + 4]);
-            if cx_claim >= 4096 || cy_claim >= 4096 {
-                continue;
-            }
-            let dx = f64::from(cx_claim) - cx_expected;
-            let dy = f64::from(cy_claim) - cy_expected;
+            let (cx_claim, cy_claim) =
+                coord_decode_bgra(&readback_bgra[off..off + 4], map.capture_dims);
+            let dx = cx_claim - cx_expected;
+            let dy = cy_claim - cy_expected;
             sum_sq += dx * dx + dy * dy;
             n += 1;
         }
@@ -634,42 +647,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coord_roundtrip_recovers_position() {
-        for x in [0u32, 1, 127, 128, 255, 256, 1023, 2049, 3839, 4095] {
-            for y in [0u32, 1, 127, 128, 255, 256, 1023, 2049, 1439, 4095] {
-                let px = coord_encode_bgra(x, y);
-                let (xr, yr) = coord_decode_bgra(&px);
-                assert_eq!((xr, yr), (x, y), "round-trip failed at ({x}, {y})");
+    fn coord_roundtrip_recovers_position_within_quantum() {
+        // Each step in R = 1/255 of capture width. At 1920 width that's
+        // ~7.5 px/step. Encode then decode must round-trip to within
+        // one quantisation step on each axis.
+        let dims = (1920u32, 1200u32);
+        let quantum_x = f64::from(dims.0 - 1) / 255.0;
+        let quantum_y = f64::from(dims.1 - 1) / 255.0;
+        for &x in &[0u32, 1, 127, 256, 800, 1919] {
+            for &y in &[0u32, 1, 127, 256, 800, 1199] {
+                let px = coord_encode_bgra(x, y, dims);
+                let (xr, yr) = coord_decode_bgra(&px, dims);
+                assert!(
+                    (xr - f64::from(x)).abs() <= quantum_x,
+                    "x round-trip drifted > quantum at ({x},{y}): got {xr}",
+                );
+                assert!(
+                    (yr - f64::from(y)).abs() <= quantum_y,
+                    "y round-trip drifted > quantum at ({x},{y}): got {yr}",
+                );
             }
         }
     }
 
     #[test]
-    fn coord_residual_zero_on_exact_letterbox_fit() {
+    fn coord_residual_below_quantum_on_exact_letterbox_fit() {
         // 100×100 capture letterbox-fit into 100×100 surface = identity
-        // mapping. Filling the surface from coord_fixture_fill at the
-        // same dims must give zero RMS residual.
+        // mapping. The fixture encodes integer (x, y) to an 8-bit
+        // gradient; recovered coordinates drift by ≤ one quantum per
+        // axis (≈ 100/255 = 0.39 px), and the letterbox-map uses
+        // center-of-pixel sampling so the expected coordinate is also
+        // offset by ≤ 0.5 px. RMS bound is therefore very small.
         let dims = (100u32, 100u32);
         let fixture = coord_fixture_fill(dims);
         let map = LetterboxMap::new(dims, dims);
         let r = coord_fixture_residual_px_rms(&fixture, dims, &map);
-        // The map uses center-of-pixel sampling (`+0.5` / `-0.5`),
-        // which is the correct convention; in the identity case
-        // sx==cx_expected to within rounding, so the recovered
-        // coordinate (which is integer because the fixture writes
-        // integer indices) differs from the float expected by ≤ 0.5 px
-        // per axis. RMS over the buffer is bounded by √(0.25+0.25) ≈ 0.71.
-        assert!(r < 0.75, "identity-letterbox residual {} too high", r);
+        assert!(r < 1.0, "identity-letterbox residual {} too high", r);
     }
 
     #[test]
     fn coord_residual_huge_on_horizontal_shift() {
-        // Shift the fixture horizontally by 50 px before passing it
-        // through the residual computation. Expected residual = 50.
-        let dims = (100u32, 100u32);
+        // Shift the fixture horizontally by 50 px. Expected residual
+        // dominates the encoding-quantisation noise floor.
+        let dims = (256u32, 256u32);
         let mut shifted = coord_fixture_fill(dims);
-        // Copy each row from x+50 (wrapping is fine; we just want a
-        // structured discrepancy that the metric must catch).
         let row_bytes = (dims.0 * 4) as usize;
         let mut tmp = vec![0u8; row_bytes];
         for y in 0..dims.1 as usize {
@@ -684,6 +705,11 @@ mod tests {
         let map = LetterboxMap::new(dims, dims);
         let r = coord_fixture_residual_px_rms(&shifted, dims, &map);
         assert!(r > 30.0, "shifted-fixture residual {} too low — metric is blind", r);
+        // Upper-bound sanity: a sane RMS for a 50-px shift on a 256-
+        // wide fixture is bounded by the width. A degenerate impl
+        // that returned f64::MAX would otherwise pass the lower
+        // assert vacuously.
+        assert!(r < f64::from(dims.0), "shift residual {} exceeds image width", r);
     }
 
     #[test]

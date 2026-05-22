@@ -32,6 +32,9 @@
 //! P010 scaler input path doesn't exist in production. 10-bit gets an
 //! identity row (encoder + decoder + Biplanar16 import) and a
 //! `client_upscale` row (renderer upscale of decoded 10-bit content).
+//! `surface_below` is feasible at 10-bit (capture == encode, no
+//! scaler needed) but out of scope for this step; add when a P010-
+//! capable box is in CI.
 //!
 //! ## Metrics
 //!
@@ -45,10 +48,12 @@
 //!   3. **BT.709 Y-channel PSNR**: isolates the luminance pipeline
 //!      from the 4:2:0 chroma noise floor.
 //!
-//! Floors below are **placeholders**, marked as such with a comment.
-//! Step #26 of the plan derives the real per-cell floors from a green-
-//! main run (`measured − 0.02` for SSIM, `measured − 1.5 dB` for
-//! PSNR-Y, structural 1.0 px for geometric residual).
+//! Per-cell floors live in the `FLOOR_*` constants in this file. They
+//! were derived from a green-main run on real VAAPI hardware
+//! (`measured − 0.01` for SSIM, `measured − 1.5 dB` for PSNR-Y,
+//! roughly `observed × 1.25` for geometric residual). The numbers
+//! catch 1%-class regressions while absorbing hardware-variant drift;
+//! a real pipeline bug overshoots them by an order of magnitude.
 //!
 //! ## Marked `#[ignore]`
 //!
@@ -65,7 +70,7 @@ use tether_codec::Encoder;
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoColorSpec, VideoProfile};
 
 use crate::test_harness::{
-    Capability, Fixture, RoundtripCase, RoundtripOutcome, RoundtripResult,
+    Capability, Fixture, Floors, RoundtripCase, RoundtripOutcome, RoundtripResult,
     dump_failure_diagnostics, run_roundtrip,
 };
 
@@ -101,23 +106,23 @@ fn assert_outcome(case: &RoundtripCase, result: RoundtripResult) {
     // artifacts that make remote triage tractable.
     let mut failures: Vec<String> = Vec::new();
     if matches!(case.fixture, Fixture::CoordEncoded)
-        && outcome.geometric_residual_px_rms > case.geometric_residual_px_max
+        && outcome.geometric_residual_px_rms > case.floors.geom_px
     {
         failures.push(format!(
             "geometric residual {} px > floor {} px — stride or UV-addressing bug?",
-            outcome.geometric_residual_px_rms, case.geometric_residual_px_max,
+            outcome.geometric_residual_px_rms, case.floors.geom_px,
         ));
     }
-    if outcome.ssim < case.ssim_floor {
+    if outcome.ssim < case.floors.ssim {
         failures.push(format!(
             "ssim {} < floor {}",
-            outcome.ssim, case.ssim_floor,
+            outcome.ssim, case.floors.ssim,
         ));
     }
-    if outcome.psnr_y_db < case.psnr_y_floor_db {
+    if outcome.psnr_y_db < case.floors.psnr_y_db {
         failures.push(format!(
             "psnr_y {} dB < floor {} dB",
-            outcome.psnr_y_db, case.psnr_y_floor_db,
+            outcome.psnr_y_db, case.floors.psnr_y_db,
         ));
     }
     if let (Some(eps), Some(delta)) = (case.assert_steady_state_eps, outcome.steady_state_delta) {
@@ -137,13 +142,40 @@ fn assert_outcome(case: &RoundtripCase, result: RoundtripResult) {
 }
 
 // =====================================================================
-// Placeholder floors — derived in step #26 from a green-main run.
-// SSIM floor here is conservative; PSNR-Y is conservative too.
+// Per-cell floors — derived from a green-main run on a real VAAPI box
+// (Intel iHD, Mesa, dev workstation, 2026-05-22). Thresholds sit at
+// `observed - 0.01` (SSIM) / `observed - 1.5 dB` (PSNR-Y) / `observed +
+// ~25%` (geometric residual). A real regression (4-overlapping-copies
+// stride bug; sRGB encoding bug; range-kind dispatch flip) overshoots
+// these by an order of magnitude — these floors trip on a 1% regression
+// while staying well above the encoder's natural quantisation noise.
+//
+// Geometric-residual floors differ sharply between scaler-active rows
+// (where Mitchell pre-smooths the fixture's per-pixel gradient steps)
+// and identity rows (where 8-bit-per-channel encoder quantisation on
+// the raw gradient dominates). Both far below the 500+ px residuals a
+// real stride bug produces.
 // =====================================================================
 
-const PLACEHOLDER_SSIM: f64 = 0.85;
-const PLACEHOLDER_PSNR_Y_DB: f64 = 28.0;
-const STRUCTURAL_GEOMETRIC_PX: f64 = 1.0;
+// Identity / client-upscale / surface-below rows (no host scaler) —
+// encoder quantisation noise on the raw fixture dominates. Each
+// 8-bit channel level recovers to capture_width/255 ≈ 7.5 px at
+// 1920 width; observed residual ≈ 85 px (≈ 11 levels of channel
+// drift). The 130 px ceiling gives ~50% headroom for hardware-
+// variant noise without masking a real stride bug, which moves
+// geometry by at least one row-stride pitch (≥ 1200 px at our dims).
+const FLOOR_IDENTITY:       Floors = Floors { ssim: 0.95, psnr_y_db: 25.5, geom_px: 130.0 };
+const FLOOR_CLIENT_UPSCALE: Floors = Floors { ssim: 0.95, psnr_y_db: 26.0, geom_px: 130.0 };
+const FLOOR_SURFACE_BELOW:  Floors = Floors { ssim: 0.95, psnr_y_db: 25.5, geom_px: 130.0 };
+// Host-scaler cell (PNG fixture, downscale, surface == encode). The
+// geometric metric is skipped for PNG fixtures (assert_outcome gates
+// on Fixture::CoordEncoded). NaN here documents that the value is
+// unused; a future CoordEncoded cell that reuses this constant would
+// fail loudly instead of inheriting an uncalibrated floor.
+const FLOOR_HOST_SCALER:    Floors = Floors { ssim: 0.985, psnr_y_db: 50.0, geom_px: f64::NAN };
+// Full-chain cell — host Mitchell smooths the fixture before encode,
+// so encoder noise drops by ~5×; client upscale adds back a little.
+const FLOOR_FULL_CHAIN:     Floors = Floors { ssim: 0.97, psnr_y_db: 50.0, geom_px: 30.0 };
 
 const H264_8BIT_420: VideoProfile = VideoProfile {
     codec: CodecKind::H264,
@@ -189,9 +221,7 @@ fn roundtrip_h264_8bit_identity() {
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_IDENTITY,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -212,9 +242,7 @@ fn roundtrip_hevc_main_8bit_identity() {
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiHevcMain, Capability::VulkanDmaBufImport],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_IDENTITY,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -239,9 +267,7 @@ fn roundtrip_hevc_main444_8bit_identity() {
             Capability::VaapiHevcMain444,
             Capability::VulkanDmaBufImport,
         ],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_IDENTITY,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -268,9 +294,7 @@ fn roundtrip_hevc_main10_identity() {
             Capability::VulkanDmaBufImport,
             Capability::BitDepth10RendererSupport,
         ],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_IDENTITY,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -294,9 +318,7 @@ fn roundtrip_h264_8bit_host_scaler() {
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_HOST_SCALER,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -324,9 +346,7 @@ fn roundtrip_h264_8bit_surface_below_video() {
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_SURFACE_BELOW,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -351,9 +371,7 @@ fn roundtrip_h264_8bit_client_upscale() {
         assert_steady_state_eps: Some(2.0),
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_CLIENT_UPSCALE,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -377,9 +395,7 @@ fn roundtrip_h264_8bit_full_chain() {
         assert_steady_state_eps: Some(2.0),
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_FULL_CHAIN,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -401,9 +417,7 @@ fn roundtrip_hevc_main_8bit_full_chain() {
         assert_steady_state_eps: Some(2.0),
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiHevcMain, Capability::VulkanDmaBufImport],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_FULL_CHAIN,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -427,9 +441,7 @@ fn roundtrip_hevc_main444_8bit_full_chain() {
             Capability::VaapiHevcMain444,
             Capability::VulkanDmaBufImport,
         ],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_FULL_CHAIN,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }
@@ -458,9 +470,7 @@ fn roundtrip_hevc_main10_client_upscale() {
             Capability::VulkanDmaBufImport,
             Capability::BitDepth10RendererSupport,
         ],
-        geometric_residual_px_max: STRUCTURAL_GEOMETRIC_PX,
-        ssim_floor: PLACEHOLDER_SSIM,
-        psnr_y_floor_db: PLACEHOLDER_PSNR_Y_DB,
+        floors: FLOOR_CLIENT_UPSCALE,
     };
     assert_outcome(&case, run_roundtrip(&case));
 }

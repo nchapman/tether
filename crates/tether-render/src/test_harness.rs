@@ -50,10 +50,9 @@ use tether_codec::vaapi::{VaapiDecoder, VaapiEncoder};
 use tether_codec::{Decoder, Encoder, Frame as CodecFrame};
 use tether_protocol::control::{ChromaSubsampling, VideoColorSpec, VideoProfile};
 use tether_scaler::test_util::{
-    ChromaSiting, LetterboxMap, coord_fixture_fill,
-    coord_fixture_residual_px_rms, cpu_chroma_roundtrip_bgra,
-    cpu_letterbox_to_surface_bgra, cpu_mitchell_resize_bgra,
-    psnr_db_y_bgra, ssim_heatmap_l8, ssim_rgb,
+    LetterboxMap, coord_fixture_fill, coord_fixture_residual_px_rms,
+    cpu_letterbox_to_surface_bgra, cpu_mitchell_resize_bgra, psnr_db_y_bgra,
+    ssim_heatmap_l8, ssim_rgb,
 };
 
 use crate::gpu::GpuState;
@@ -89,16 +88,25 @@ pub(crate) struct RoundtripCase {
     /// Explicit prereqs; missing capability → loud SKIP with named
     /// capability, not silent pass.
     pub requires: &'static [Capability],
-    /// Primary metric. Lossy encode moves recovered coordinates by
-    /// < 1 px; stride bugs move them by hundreds. Only meaningful on
-    /// `Fixture::CoordEncoded`; ignored on PNG fixtures.
-    pub geometric_residual_px_max: f64,
-    /// Secondary metric. Derived from green-main measurement, not
-    /// hardcoded — see the threshold-derivation step in the plan.
-    pub ssim_floor: f64,
-    /// BT.709 Y-channel PSNR. Isolates the luminance pipeline from
-    /// the chroma noise floor 4:2:0 dominates.
-    pub psnr_y_floor_db: f64,
+    pub floors: Floors,
+}
+
+/// Per-cell metric floors. Pre-computed shared constants per cell
+/// shape live in `dmabuf_test.rs` so a new case picks the right one
+/// without copy-pasting three numbers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Floors {
+    /// Primary metric: per-pixel coordinate residual in capture-pixel
+    /// units. Lossy encode moves recovered coords by tens of px on
+    /// the raw fixture; the renderer's stride/UV-addressing bug class
+    /// moves them by 500+ px. Only meaningful on `Fixture::CoordEncoded`;
+    /// PNG fixtures skip this check.
+    pub geom_px: f64,
+    /// SSIM floor against the CPU reference.
+    pub ssim: f64,
+    /// BT.709 Y-channel PSNR floor. Isolates the luminance pipeline
+    /// from the chroma noise floor 4:2:0 dominates.
+    pub psnr_y_db: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -840,24 +848,36 @@ fn readback_offscreen(renderer: &GpuState, device: &wgpu::Device) -> Vec<u8> {
 // =====================================================================
 
 fn build_reference(case: &RoundtripCase, capture_bgra: &[u8]) -> Vec<u8> {
-    // 1. Apply chroma roundtrip at capture dims. Models the codec's
-    // subsample/upsample step with codec-correct siting.
-    use tether_protocol::control::CodecKind;
-    let siting = match (case.profile.codec, case.profile.chroma) {
-        (_, ChromaSubsampling::Yuv444) => ChromaSiting::None,
-        (CodecKind::H264, _) => ChromaSiting::H264LeftInterstitial,
-        // HEVC and AV1 default to centered 4:2:0 siting; we treat AV1
-        // here identically to HEVC. If/when AV1 actually lands in the
-        // pipeline, the matrix should grow a real cell to verify.
-        (CodecKind::Hevc | CodecKind::Av1, _) => ChromaSiting::HevcCentered,
-    };
-    let after_chroma = cpu_chroma_roundtrip_bgra(capture_bgra, case.capture_dims, siting);
+    // The CPU reference omits an explicit chroma roundtrip step:
+    // empirically, the textbook BT.709 full-range model in
+    // `cpu_chroma_roundtrip_bgra` diverges from libavcodec's
+    // limited-range swscale path by enough to inflate the per-cell
+    // residual floor to the tune of 10 R/G levels (≈ 75 px in 1920-
+    // wide capture). The SME plan review called modelling chroma
+    // correctly a fairness improvement *in principle*; in practice
+    // the version currently available is a net negative for floor
+    // calibration on the identity / client-upscale rows. Skipped
+    // here; documented in the plan's follow-ups as the next-step
+    // metric-fidelity improvement once swscale parity is in.
+    //
+    // SAFETY-OF-OMISSION caveat: the current matrix only uses the
+    // `Fixture::CoordEncoded` gradient (B channel constant 128) and
+    // a single PNG with no high-frequency chroma. Constant-B keeps
+    // the disable invisible because there's no chroma detail to
+    // shift. A *future* PNG fixture with high-frequency chroma
+    // (e.g. a real desktop screenshot) needs the chroma roundtrip
+    // step re-enabled — otherwise the H.264-vs-HEVC siting drift
+    // will inflate one codec's floor relative to the other in a way
+    // that's invisible in the numbers but real in the reference.
+    let _ = case.profile.codec;
+    let _ = case.profile.chroma;
+    let after_chroma = capture_bgra;
 
-    // 2. Apply Mitchell host downscale to encode dims if engaged.
+    // 1. Apply Mitchell host downscale to encode dims if engaged.
     let after_scale = if case.encode_dims == case.capture_dims {
-        after_chroma
+        after_chroma.to_vec()
     } else {
-        cpu_mitchell_resize_bgra(&after_chroma, case.capture_dims, case.encode_dims)
+        cpu_mitchell_resize_bgra(after_chroma, case.capture_dims, case.encode_dims)
     };
 
     // 3. Letterbox-fit upscale + black-bar pad to surface dims.
@@ -959,11 +979,11 @@ pub(crate) fn dump_failure_diagnostics(case: &RoundtripCase, outcome: &Roundtrip
         color = case.color_space,
         req = case.requires,
         ssim = outcome.ssim,
-        ssim_floor = case.ssim_floor,
+        ssim_floor = case.floors.ssim,
         psnr_y = outcome.psnr_y_db,
-        psnr_y_floor = case.psnr_y_floor_db,
+        psnr_y_floor = case.floors.psnr_y_db,
         geo = outcome.geometric_residual_px_rms,
-        geo_max = case.geometric_residual_px_max,
+        geo_max = case.floors.geom_px,
         steady = outcome.steady_state_delta,
         steady_eps = case.assert_steady_state_eps,
     );

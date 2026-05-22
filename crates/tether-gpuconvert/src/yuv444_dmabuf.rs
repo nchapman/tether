@@ -59,7 +59,10 @@ pub enum Yuv444DmaBufError {
     FeatureUnsupported,
     #[error("dma-buf export: {0}")]
     Export(#[from] ExportError),
-    #[error("input texture format must be Bgra8Unorm, got {0:?}")]
+    /// Source view must be Bgra8Unorm (capture path) or Rgba8Unorm
+    /// (tether-scaler output). Both present as shader-visible RGBA so
+    /// the chroma shader's `.rgb` swizzle is format-agnostic.
+    #[error("input texture format must be Bgra8Unorm or Rgba8Unorm, got {0:?}")]
     InputFormat(wgpu::TextureFormat),
     #[error(
         "input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}"
@@ -238,7 +241,10 @@ impl Yuv444DmaBuf {
     /// [`crate::nv12_dmabuf`] module comment for why we don't yet use
     /// an explicit sync_file fence.
     pub fn convert(&self, src_bgra: &wgpu::Texture) -> Result<Yuv444DmaBufFrame> {
-        if src_bgra.format() != wgpu::TextureFormat::Bgra8Unorm {
+        if !matches!(
+            src_bgra.format(),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+        ) {
             return Err(Yuv444DmaBufError::InputFormat(src_bgra.format()));
         }
         if src_bgra.width() != self.width || src_bgra.height() != self.height {

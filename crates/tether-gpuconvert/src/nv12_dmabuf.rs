@@ -73,7 +73,13 @@ pub enum Nv12DmaBufError {
     FeatureUnsupported,
     #[error("dma-buf export: {0}")]
     Export(#[from] ExportError),
-    #[error("input texture format must be Bgra8Unorm, got {0:?}")]
+    /// Source view must be Bgra8Unorm (the capture-side DMA-BUF
+    /// import) or Rgba8Unorm (the tether-scaler output). wgpu
+    /// presents both as shader-visible RGBA so the chroma shader's
+    /// `.rgb` swizzle works against either; the runtime check exists
+    /// only to catch genuinely wrong formats (sRGB views, fp16, etc.)
+    /// before the bind-group binding fails opaquely.
+    #[error("input texture format must be Bgra8Unorm or Rgba8Unorm, got {0:?}")]
     InputFormat(wgpu::TextureFormat),
     #[error(
         "input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}"
@@ -289,7 +295,10 @@ impl Nv12DmaBuf {
     /// finished compute write. See module-level comment for the
     /// rationale and the path to an explicit-fence-based version.
     pub fn convert(&self, src_bgra: &wgpu::Texture) -> Result<Nv12DmaBufFrame> {
-        if src_bgra.format() != wgpu::TextureFormat::Bgra8Unorm {
+        if !matches!(
+            src_bgra.format(),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+        ) {
             return Err(Nv12DmaBufError::InputFormat(src_bgra.format()));
         }
         if src_bgra.width() != self.width || src_bgra.height() != self.height {

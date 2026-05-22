@@ -18,11 +18,12 @@
 //! separate `warm_gpuconvert_capability_cache` used to fill.
 
 use tether_codec::vaapi::{VaapiDecoder, VaapiEncoder};
-use tether_codec::{build_p010_dmabuf_frame, CodecError, Decoder, Encoder, Frame, Result};
+use tether_codec::{build_p010_dmabuf_frame, Decoder, Encoder, Frame};
 use tether_gpuconvert::Bgra2P010DmaBuf;
 use tether_protocol::control::VideoProfile;
 
-use crate::profile_probe::ProfileProbe;
+use crate::profile_probe::{ProbeError, ProfileProbe, Result};
+use crate::PipelineStage;
 
 pub(crate) struct VaapiProbe;
 
@@ -46,23 +47,25 @@ impl ProfileProbe for VaapiProbe {
         if profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv444
             && profile.bit_depth == 10
         {
-            return Err(CodecError::NoHardwareCodec(
+            return Err(ProbeError::new(
+                PipelineStage::Capture,
                 "HEVC 4:4:4 10-bit (XV30 input) — VAAPI accepts packed XV30 \
                  input but no gpuconvert bridge produces it yet. Profile \
-                 will become available when Bgra2Xv30DmaBuf ships."
-                    .into(),
+                 will become available when Bgra2Xv30DmaBuf ships.",
             ));
         }
 
-        let mut enc =
-            VaapiEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)?;
+        let mut enc = VaapiEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
         if profile.bit_depth == 8 {
             // Drive a single BGRA frame through the encoder so any
             // driver rejection that only fires at submit time (not
             // construction) surfaces here. The CPU-upload path is
             // 8-bit-only by design — see `encode_bgra`'s comment.
             let bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
-            let packets = enc.encode_bgra(&bytes, 0, true)?;
+            let packets = enc
+                .encode_bgra(&bytes, 0, true)
+                .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
             // Some encoders buffer the first frame and don't return a
             // packet until the second. The contract we care about is
             // "no error" — the empty-packet case still means the
@@ -82,18 +85,32 @@ impl ProfileProbe for VaapiProbe {
     }
 
     fn probe_decode(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
-        let mut dec = VaapiDecoder::new(profile.codec)?;
-        dec.submit(fixture)?;
+        let mut dec = VaapiDecoder::new(profile.codec)
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
+        dec.submit(fixture)
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
         // Loop a few times — VAAPI sometimes needs a couple of
         // `receive_frame` polls before a single-IDR submit emits.
         for _ in 0..4 {
-            match dec.next_frame()? {
+            match dec
+                .next_frame()
+                .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
+            {
                 Some(Frame::Gpu(_)) => return Ok(()),
-                Some(Frame::Cpu(_)) => return Err(CodecError::UnsupportedInputFormat),
+                Some(Frame::Cpu(_)) => {
+                    return Err(ProbeError::new(
+                        PipelineStage::Decode,
+                        "decoder fell back to software (Frame::Cpu) — \
+                         hardware decode unavailable for this profile",
+                    ))
+                }
                 None => continue,
             }
         }
-        Err(CodecError::UnsupportedInputFormat)
+        Err(ProbeError::new(
+            PipelineStage::Decode,
+            "decoder produced no frames after submit + 4 polls",
+        ))
     }
 }
 
@@ -107,19 +124,23 @@ impl ProfileProbe for VaapiProbe {
 ///   * `submit_dmabuf` fails (the Intel iHD `av_hwframe_map` rejection
 ///     case).
 fn probe_10bit_submit(enc: &mut VaapiEncoder) -> Result<()> {
-    let bridge = match pollster::block_on(Bgra2P010DmaBuf::new(PROBE_DIM, PROBE_DIM)) {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(CodecError::NoHardwareCodec(format!(
+    // Bridge construction failure → Capture stage. The driver
+    // doesn't expose R16/Rg16 storage modifiers on DRM_FORMAT_MOD_LINEAR,
+    // i.e. the producer side can't make a P010 dma-buf at all.
+    let bridge = pollster::block_on(Bgra2P010DmaBuf::new(PROBE_DIM, PROBE_DIM)).map_err(|e| {
+        ProbeError::new(
+            PipelineStage::Capture,
+            format!(
                 "Bgra2P010DmaBuf::new failed — driver likely lacks R16/Rg16 \
                  storage support on DRM_FORMAT_MOD_LINEAR: {e}"
-            )));
-        }
-    };
+            ),
+        )
+    })?;
     let probe_bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
-    let p010 = bridge
-        .convert_bgra_bytes(&probe_bytes)
-        .map_err(|e| CodecError::NoHardwareCodec(format!("P010 bridge convert: {e}")))?;
+    // Convert failure → Capture stage (the producer pipeline broke).
+    let p010 = bridge.convert_bgra_bytes(&probe_bytes).map_err(|e| {
+        ProbeError::new(PipelineStage::Capture, format!("P010 bridge convert: {e}"))
+    })?;
     let codec_frame = build_p010_dmabuf_frame(
         p010.fd,
         p010.size,
@@ -129,10 +150,10 @@ fn probe_10bit_submit(enc: &mut VaapiEncoder) -> Result<()> {
         p010.uv_offset,
         p010.uv_stride,
     );
-    // The actual gate: any driver-side rejection of the P010 dma-buf
-    // surfaces here as a CodecError. `submit_dmabuf`'s error path
-    // closes the fd via OwnedFd drop; the encoder never sees it again.
+    // Submit failure → Submit stage. This is the Intel iHD case: the
+    // encoder constructed fine but `av_hwframe_map(DRM_PRIME → VAAPI)`
+    // rejects the P010 descriptor at submit time.
     enc.submit_dmabuf(&codec_frame, 0, true)
-        .map_err(|e| CodecError::NoHardwareCodec(format!("submit_dmabuf: {e}")))?;
+        .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
     Ok(())
 }

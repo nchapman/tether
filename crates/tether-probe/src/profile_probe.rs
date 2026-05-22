@@ -26,7 +26,41 @@
 
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
-use tether_codec::Result;
+use crate::PipelineStage;
+
+/// Backend probe error: a per-stage tag + a human-readable reason.
+/// The trait returns this instead of `tether_codec::CodecError` so
+/// each backend can name *which* stage rejected the probe (capture
+/// vs encoder construct vs encoder submit vs decode round trip).
+/// The orchestration in [`crate::host_supported_profiles`] /
+/// [`crate::client_supported_profiles`] surfaces the tag verbatim in
+/// the [`crate::SupportStatus::Unsupported`] verdict.
+#[derive(Debug)]
+pub(crate) struct ProbeError {
+    pub stage: PipelineStage,
+    pub reason: String,
+}
+
+impl ProbeError {
+    pub(crate) fn new(stage: PipelineStage, reason: impl Into<String>) -> Self {
+        Self {
+            stage,
+            reason: reason.into(),
+        }
+    }
+
+    /// Adapter for backend code that already produces a
+    /// `tether_codec::CodecError`. Tags it with `stage` and formats
+    /// the message into a string for the SupportStatus.
+    pub(crate) fn from_codec(stage: PipelineStage, e: tether_codec::CodecError) -> Self {
+        Self {
+            stage,
+            reason: format!("{e}"),
+        }
+    }
+}
+
+pub(crate) type Result<T> = std::result::Result<T, ProbeError>;
 
 /// Backend-specific probe contract. One impl per hardware codec
 /// pipeline (VAAPI, VideoToolbox, …). The orchestration in

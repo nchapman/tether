@@ -204,12 +204,10 @@ pub fn client_decode_profiles() -> Vec<VideoProfile> {
 }
 
 /// Run the per-profile encode + decode round trip and roll the
-/// results up into [`ProfileSupport`].
-///
-/// Step 2 of the migration: this is the real probe now (no longer
-/// delegating to tether-codec). Step 3 will extend the encode-side
-/// probe with a real `Bgra2P010DmaBuf` → `submit_dmabuf` round trip
-/// for 10-bit; step 4 introduces structured per-stage error tagging.
+/// results up into [`ProfileSupport`]. The backend's
+/// [`profile_probe::ProbeError`] carries the [`PipelineStage`] tag
+/// for each rejection, so a log dump names exactly which stage
+/// rejected each profile.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn probe_host() -> Vec<ProfileSupport> {
     use host::ActiveProbe;
@@ -221,22 +219,34 @@ fn probe_host() -> Vec<ProfileSupport> {
         .map(|profile| {
             let encode = match ActiveProbe::probe_encode(profile) {
                 Ok(()) => SupportStatus::Supported,
-                Err(e) => SupportStatus::Unsupported {
-                    // TODO(step4): distinguish Construct (encoder
-                    // couldn't be built) vs Submit (encoder built but
-                    // rejected a real frame). Today the trait collapses
-                    // both into one Result.
-                    stage: PipelineStage::Construct,
-                    reason: format!("{e}"),
-                },
+                Err(e) => {
+                    tracing::debug!(
+                        ?profile,
+                        stage = ?e.stage,
+                        reason = %e.reason,
+                        "encode probe rejected profile"
+                    );
+                    SupportStatus::Unsupported {
+                        stage: e.stage,
+                        reason: e.reason,
+                    }
+                }
             };
             let decode = match fixture_for(profile) {
                 Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
                     Ok(()) => SupportStatus::Supported,
-                    Err(e) => SupportStatus::Unsupported {
-                        stage: PipelineStage::Decode,
-                        reason: format!("{e}"),
-                    },
+                    Err(e) => {
+                        tracing::debug!(
+                            ?profile,
+                            stage = ?e.stage,
+                            reason = %e.reason,
+                            "decode probe rejected profile"
+                        );
+                        SupportStatus::Unsupported {
+                            stage: e.stage,
+                            reason: e.reason,
+                        }
+                    }
                 },
                 None => SupportStatus::Unsupported {
                     stage: PipelineStage::Decode,
@@ -294,8 +304,8 @@ fn probe_client() -> Vec<ProfileSupport> {
                 Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
                     Ok(()) => SupportStatus::Supported,
                     Err(e) => SupportStatus::Unsupported {
-                        stage: PipelineStage::Decode,
-                        reason: format!("{e}"),
+                        stage: e.stage,
+                        reason: e.reason,
                     },
                 },
                 None => SupportStatus::Unsupported {

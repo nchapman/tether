@@ -31,10 +31,11 @@ use tether_codec::bitstream_sps::parse_sps_chroma_bit_depth;
 use tether_codec::videotoolbox::{
     expected_iosurface_fourccs, VideoToolboxDecoder, VideoToolboxEncoder,
 };
-use tether_codec::{CodecError, Decoder, Encoder, Frame, GpuFrameSource, Result};
+use tether_codec::{Decoder, Encoder, Frame, GpuFrameSource};
 use tether_protocol::control::VideoProfile;
 
-use crate::profile_probe::ProfileProbe;
+use crate::profile_probe::{ProbeError, ProfileProbe, Result};
+use crate::PipelineStage;
 
 pub(crate) struct VideoToolboxProbe;
 
@@ -86,33 +87,40 @@ impl ProfileProbe for VideoToolboxProbe {
         // profile. Folds in the SCK_CAPS_CACHE check that used to live
         // in tether-host as a separate filter layer.
         if !sck_pixel_format_for_profile(profile).is_deliverable(sck_capability()) {
-            return Err(CodecError::NoHardwareCodec(format!(
-                "ScreenCaptureKit cannot deliver the pixel format for \
-                 {:?} {:?} {}-bit on this Mac (capture-stage rejection)",
-                profile.codec, profile.chroma, profile.bit_depth
-            )));
+            return Err(ProbeError::new(
+                PipelineStage::Capture,
+                format!(
+                    "ScreenCaptureKit cannot deliver the pixel format for \
+                     {:?} {:?} {}-bit on this Mac",
+                    profile.codec, profile.chroma, profile.bit_depth
+                ),
+            ));
         }
 
-        let mut enc = VideoToolboxEncoder::new(
-            profile,
-            PROBE_DIM,
-            PROBE_DIM,
-            PROBE_FPS,
-            PROBE_BITRATE_KBPS,
-        )?;
+        let mut enc =
+            VideoToolboxEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)
+                .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
         // Use a non-uniform BGRA pattern so VT has actual chroma
         // content to encode — a flat grey buffer would produce a
         // bitstream where 4:4:4 vs 4:2:0 are indistinguishable at the
         // decoder, defeating the round-trip check.
         let bytes = probe_bgra_with_chroma_detail();
-        let mut packets = enc.encode_bgra(&bytes, 0, true)?;
+        let mut packets = enc
+            .encode_bgra(&bytes, 0, true)
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
         // VT typically buffers the first frame; flush to make sure we
         // have at least one packet before round-tripping.
         if packets.is_empty() {
-            packets.extend(enc.flush()?);
+            packets.extend(
+                enc.flush()
+                    .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?,
+            );
         }
         if packets.is_empty() {
-            return Err(CodecError::UnsupportedInputFormat);
+            return Err(ProbeError::new(
+                PipelineStage::Submit,
+                "encoder produced no packets after encode + flush",
+            ));
         }
 
         // Second signal: parse the SPS NAL the encoder emitted and
@@ -137,26 +145,50 @@ impl ProfileProbe for VideoToolboxProbe {
                     "VT encoder emitted an SPS declaring a different chroma / \
                      bit-depth than the profile requested — silent transform"
                 );
-                return Err(CodecError::UnsupportedInputFormat);
+                return Err(ProbeError::new(
+                    PipelineStage::Submit,
+                    format!(
+                        "VT encoder silently transformed the bitstream: \
+                         requested {:?} {}-bit, SPS declares {:?} {}-bit",
+                        expected.0, expected.1, parsed.0, parsed.1
+                    ),
+                ));
             }
         }
 
         // Round-trip through a fresh VT decoder and check the output
         // IOSurface fourcc actually matches what we asked the encoder
         // for. This is the "did the encoder silently downsample?" gate.
-        let mut dec = VideoToolboxDecoder::new(profile.codec)?;
+        let mut dec = VideoToolboxDecoder::new(profile.codec)
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
         for packet in &packets {
-            dec.submit(&packet.data)?;
+            dec.submit(&packet.data)
+                .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
         }
-        dec.signal_eof()?;
+        dec.signal_eof()
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
         let observed = loop {
-            match dec.next_frame()? {
+            match dec
+                .next_frame()
+                .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
+            {
                 Some(Frame::Gpu(gpu)) => {
                     let GpuFrameSource::IOSurface(io) = gpu.source;
                     break io.pixel_format;
                 }
-                Some(Frame::Cpu(_)) => return Err(CodecError::UnsupportedInputFormat),
-                None => return Err(CodecError::UnsupportedInputFormat),
+                Some(Frame::Cpu(_)) => {
+                    return Err(ProbeError::new(
+                        PipelineStage::Decode,
+                        "VT decoder fell back to software (Frame::Cpu) — \
+                         silent SW fallback",
+                    ))
+                }
+                None => {
+                    return Err(ProbeError::new(
+                        PipelineStage::Decode,
+                        "VT decoder produced no frames after EOF signal",
+                    ))
+                }
             }
         };
         let expected = expected_iosurface_fourccs(profile);
@@ -169,7 +201,14 @@ impl ProfileProbe for VideoToolboxProbe {
                  doesn't match the requested chroma/bit-depth — likely silent \
                  downsample"
             );
-            return Err(CodecError::UnsupportedInputFormat);
+            return Err(ProbeError::new(
+                PipelineStage::Submit,
+                format!(
+                    "VT encode produced an unexpected IOSurface fourcc \
+                     (observed 0x{observed:08x}, expected one of {expected:?}) \
+                     — likely silent downsample"
+                ),
+            ));
         }
         Ok(())
     }
@@ -181,17 +220,33 @@ impl ProfileProbe for VideoToolboxProbe {
         // `profile` in the signature for symmetry with `probe_encode`
         // and so log lines have the requested profile to anchor to.
         let _ = profile;
-        let mut dec = VideoToolboxDecoder::new(profile.codec)?;
-        dec.submit(fixture)?;
+        let mut dec = VideoToolboxDecoder::new(profile.codec)
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
+        dec.submit(fixture)
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
         // VT's wrapper buffers the first packet pending either a
         // second packet or EOF before emitting; the probe only has
         // one IDR, so signal EOF to force the drain.
-        dec.signal_eof()?;
+        dec.signal_eof()
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
         loop {
-            match dec.next_frame()? {
+            match dec
+                .next_frame()
+                .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
+            {
                 Some(Frame::Gpu(_)) => return Ok(()),
-                Some(Frame::Cpu(_)) => return Err(CodecError::UnsupportedInputFormat),
-                None => return Err(CodecError::UnsupportedInputFormat),
+                Some(Frame::Cpu(_)) => {
+                    return Err(ProbeError::new(
+                        PipelineStage::Decode,
+                        "VT decoder fell back to software (Frame::Cpu)",
+                    ))
+                }
+                None => {
+                    return Err(ProbeError::new(
+                        PipelineStage::Decode,
+                        "VT decoder produced no frames after EOF signal",
+                    ))
+                }
             }
         }
     }

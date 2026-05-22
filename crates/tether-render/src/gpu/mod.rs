@@ -125,6 +125,55 @@ pub(crate) struct GpuState {
     /// MoltenVK) surfaces here instead of as a first-frame error.
     #[cfg(target_os = "macos")]
     metal_import_supported: bool,
+    /// Mitchell upscale stage. The renderer is a multi-pass pipeline:
+    ///   pass 1: YUV → linear-light RGB into `rgb_intermediate`.
+    ///   pass 2 (optional): Mitchell upscale `rgb_intermediate` → `scaler.output()`.
+    ///   pass 3: blit (`rgb_intermediate` or `scaler.output()`) to the
+    ///           swapchain with letterbox.
+    /// Building the intermediate + blit pipeline up-front avoids
+    /// per-frame allocation; the Mitchell scaler is built lazily on
+    /// the first frame that calls for upscale and rebuilt on window
+    /// resize (or video-dims change).
+    upscale: UpscaleStage,
+}
+
+/// Holds the resources for the multi-pass present pipeline.
+pub(crate) struct UpscaleStage {
+    /// Rgba16Float texture at video dims. Render target of pass 1,
+    /// sample source of pass 2 (Mitchell) or pass 3 (direct blit).
+    /// `None` until the first frame's video dims are known.
+    rgb_intermediate: Option<wgpu::Texture>,
+    /// Cached video dims of the intermediate; lets us detect when
+    /// the decoded frame changes shape and rebuild.
+    intermediate_dims: (u32, u32),
+    /// Shared Mitchell shader compilation. Built once on the device,
+    /// reused across scaler rebuilds. Lazily constructed on first
+    /// need so a session that never upscales never pays for shader
+    /// compilation.
+    scaler_pipelines: Option<Arc<tether_scaler::Pipelines>>,
+    /// Mitchell upscale stage. `Some` only when `window > video`
+    /// in at least one axis. Rebuilt on window resize or video
+    /// dims change.
+    scaler: Option<tether_scaler::Scaler>,
+    /// Blit pipeline + bind-group layout for the swapchain pass.
+    /// Samples an Rgba16Float texture with the project-standard
+    /// bilinear letterbox. Bind groups are rebuilt per render
+    /// because the source texture (intermediate vs scaler output)
+    /// can change.
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bgl: wgpu::BindGroupLayout,
+    blit_sampler: wgpu::Sampler,
+    /// Scratch (1,1,0,0) and letterbox (sx,sy,0,0) uniform buffers
+    /// share the layout but need two separate writes per frame —
+    /// pass 1 wants identity coverage, pass 3 wants the letterbox
+    /// scale. Two buffers + two bind groups avoids the ordering
+    /// hazard of writing the same buffer twice in one encoder.
+    /// Retained to keep the bind group's referenced buffer alive
+    /// (the bind group only borrows the binding handle, not the
+    /// underlying allocation).
+    #[allow(dead_code)]
+    identity_scale_buffer: wgpu::Buffer,
+    identity_scale_bind_group: wgpu::BindGroup,
 }
 
 /// Renderer plane layout — decoupled from `ChromaSubsampling` because
@@ -614,8 +663,17 @@ impl GpuState {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some(fragment_entry),
+                // The YUV→RGB pass now writes to an Rgba16Float
+                // intermediate, not directly to the swapchain. The
+                // shader emits linear-light values; Rgba16Float
+                // stores them verbatim (no OETF), so the Mitchell
+                // upscale stage (or the direct blit when no upscale)
+                // consumes them in linear light. The swapchain blit
+                // pipeline (built below) targets the surface format
+                // and lets wgpu apply the sRGB OETF on write, same
+                // as the pre-refactor single-pass behaviour.
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -630,6 +688,116 @@ impl GpuState {
 
         let textures =
             make_yuv_textures(&device, &yuv_bgl, &sampler, chroma, bit_depth, 1, 1);
+
+        // === UpscaleStage construction ===
+        //
+        // The blit pipeline samples an Rgba16Float texture (either the
+        // YUV→RGB intermediate at video dims, or the Mitchell scaler's
+        // output at letterbox-fit window dims) and writes to the
+        // swapchain. The sampler is `Linear` magnification — when
+        // Mitchell didn't run (window ≤ video, or scaler-disabled
+        // path) this gives the previous-behaviour bilinear blit; when
+        // Mitchell did run, the sampler operates on already-Mitchell-
+        // filtered values and the bilinear here is a marginal smooth.
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tether-render blit sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tether-render blit bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tether-render blit shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../blit.wgsl").into()),
+        });
+        let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tether-render blit pipeline layout"),
+            bind_group_layouts: &[Some(&blit_bgl), Some(&scale_bgl)],
+            immediate_size: 0,
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tether-render blit pipeline"),
+            layout: Some(&blit_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Identity-scale uniform for pass 1 (YUV → intermediate).
+        // The YUV shader's vertex applies `pos * scale.xy` for
+        // letterbox; in the multi-pass model we always want full
+        // coverage in pass 1 and letterbox only in pass 3 (blit),
+        // so we use a dedicated `(1,1,0,0)` buffer that never
+        // changes.
+        let identity_scale_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tether-render identity-scale uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &identity_scale_buffer,
+            0,
+            &bytes_of_f32x4(&[1.0, 1.0, 0.0, 0.0]),
+        );
+        let identity_scale_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tether-render identity-scale bind group"),
+            layout: &scale_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: identity_scale_buffer.as_entire_binding(),
+            }],
+        });
+
+        let upscale = UpscaleStage {
+            rgb_intermediate: None,
+            intermediate_dims: (0, 0),
+            scaler_pipelines: None,
+            scaler: None,
+            blit_pipeline,
+            blit_bgl,
+            blit_sampler,
+            identity_scale_buffer,
+            identity_scale_bind_group,
+        };
 
         Ok(Self {
             surface,
@@ -651,6 +819,7 @@ impl GpuState {
             dmabuf_import_supported,
             #[cfg(target_os = "macos")]
             metal_import_supported,
+            upscale,
         })
     }
 
@@ -842,14 +1011,54 @@ impl GpuState {
             }
         };
 
-        // Update the aspect-correction uniform before kicking off the
-        // render pass. Costs a single 16-byte buffer write per frame.
-        let (sx, sy) = letterbox_scale(self.textures.size, (
-            self.surface_config.width,
-            self.surface_config.height,
-        ));
+        let video_dims = self.textures.size;
+        let surface_dims = (self.surface_config.width, self.surface_config.height);
+
+        // Letterbox scale for the final blit. The YUV pass writes
+        // its intermediate at video dims with identity scale; the
+        // blit pass below applies aspect correction when writing
+        // to the swapchain.
+        let (sx, sy) = letterbox_scale(video_dims, surface_dims);
         self.queue
             .write_buffer(&self.scale_buffer, 0, &bytes_of_f32x4(&[sx, sy, 0.0, 0.0]));
+
+        // Make sure the intermediate exists at the right dims. If
+        // the decoded video changed size between frames, also rebuild
+        // the Mitchell scaler.
+        let video_changed = self.upscale.intermediate_dims != video_dims;
+        if self.upscale.rgb_intermediate.is_none() || video_changed {
+            self.upscale.rgb_intermediate = Some(make_rgb_intermediate(&self.device, video_dims));
+            self.upscale.intermediate_dims = video_dims;
+            self.upscale.scaler = None;
+        }
+        // Decide if we need to (re)build the Mitchell scaler:
+        // upscale only, never for window ≤ video. Skipping the
+        // scaler then is the previous-behaviour single-pass bilinear
+        // (now spread across two passes — YUV→intermediate then
+        // sampled blit).
+        let need_upscale = surface_dims.0 > video_dims.0 || surface_dims.1 > video_dims.1;
+        let upscale_dims = if need_upscale {
+            letterbox_fit_dims(video_dims, surface_dims)
+        } else {
+            video_dims
+        };
+        let scaler_needs_rebuild = need_upscale
+            && self
+                .upscale
+                .scaler
+                .as_ref()
+                .map_or(true, |s| s.dst_dims() != upscale_dims || s.src_dims() != video_dims);
+        if scaler_needs_rebuild {
+            self.upscale.scaler = build_upscale_scaler(
+                &self.device,
+                &self.queue,
+                &mut self.upscale.scaler_pipelines,
+                video_dims,
+                upscale_dims,
+            );
+        } else if !need_upscale {
+            self.upscale.scaler = None;
+        }
 
         let view = output
             .texture
@@ -860,11 +1069,21 @@ impl GpuState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tether-render encoder"),
             });
+
+        // Pass 1: YUV → linear-light RGB into the intermediate. The
+        // YUV shader is unchanged; only the render target and scale
+        // uniform differ from the pre-refactor single-pass form.
+        let intermediate = self
+            .upscale
+            .rgb_intermediate
+            .as_ref()
+            .expect("intermediate built above");
+        let inter_view = intermediate.create_view(&wgpu::TextureViewDescriptor::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("tether-render pass"),
+                label: Some("tether-render YUV->RGB pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &inter_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -879,8 +1098,71 @@ impl GpuState {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.textures.bind_group, &[]);
-            pass.set_bind_group(1, &self.scale_bind_group, &[]);
+            pass.set_bind_group(1, &self.upscale.identity_scale_bind_group, &[]);
             pass.set_bind_group(2, &self.color_params_bind_group, &[]);
+            pass.draw(0..6, 0..1);
+        }
+
+        // Pass 2 (optional): Mitchell upscale → scaler.output().
+        // Skipped when window ≤ video; the blit pass below then
+        // samples the intermediate directly.
+        if let Some(scaler) = self.upscale.scaler.as_ref() {
+            // Submit pass 1 first so the scaler's read of the
+            // intermediate sees the YUV pass's write. The Mitchell
+            // scaler's scale() submits internally too.
+            self.queue.submit(std::iter::once(encoder.finish()));
+            if let Err(e) = scaler.scale(intermediate) {
+                tracing::warn!(error = %e, "Mitchell upscale failed; falling back to direct blit");
+                self.upscale.scaler = None;
+            }
+            encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tether-render blit encoder"),
+                });
+        }
+
+        // Pass 3: blit (scaler output or intermediate) → swapchain
+        // with letterbox.
+        let blit_source = match self.upscale.scaler.as_ref() {
+            Some(s) => s.output(),
+            None => intermediate,
+        };
+        let blit_source_view = blit_source.create_view(&wgpu::TextureViewDescriptor::default());
+        let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tether-render blit bind group"),
+            layout: &self.upscale.blit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&blit_source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.upscale.blit_sampler),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("tether-render blit pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.upscale.blit_pipeline);
+            pass.set_bind_group(0, &blit_bg, &[]);
+            pass.set_bind_group(1, &self.scale_bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -899,6 +1181,84 @@ impl GpuState {
             self.surface.configure(&self.device, &self.surface_config);
         }
         Ok(())
+    }
+}
+
+/// Build the Rgba16Float intermediate that the YUV→RGB pass renders
+/// into. RENDER_ATTACHMENT for pass 1 writes, TEXTURE_BINDING so
+/// pass 2 (Mitchell) or pass 3 (direct blit) can sample it.
+fn make_rgb_intermediate(device: &wgpu::Device, dims: (u32, u32)) -> wgpu::Texture {
+    let (w, h) = (dims.0.max(1), dims.1.max(1));
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tether-render rgb intermediate"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+/// Compute the *target* dimensions for the Mitchell upscale: the
+/// letterbox-fit rect inside the window. The Mitchell pass produces
+/// at this size and the blit pass stretches a centered quad at the
+/// same aspect ratio — the letterbox bars become the swapchain's
+/// cleared-black margin.
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn letterbox_fit_dims(video: (u32, u32), window: (u32, u32)) -> (u32, u32) {
+    if video.0 == 0 || video.1 == 0 || window.0 == 0 || window.1 == 0 {
+        return video;
+    }
+    let video_aspect = video.0 as f32 / video.1 as f32;
+    let window_aspect = window.0 as f32 / window.1 as f32;
+    if video_aspect > window_aspect {
+        // Width-bound: fit to window width, derive height.
+        let w = window.0;
+        let h = (w as f32 / video_aspect).round().max(1.0) as u32;
+        (w, h)
+    } else {
+        let h = window.1;
+        let w = (h as f32 * video_aspect).round().max(1.0) as u32;
+        (w, h)
+    }
+}
+
+/// Build (or lazily compile) the Mitchell scaler pipelines and a
+/// scaler instance for the given dims. Returns `None` if the
+/// requested scale is a no-op or otherwise fails — caller treats
+/// that as "skip Mitchell, do direct bilinear blit".
+fn build_upscale_scaler(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cached_pipelines: &mut Option<Arc<tether_scaler::Pipelines>>,
+    src_dims: (u32, u32),
+    dst_dims: (u32, u32),
+) -> Option<tether_scaler::Scaler> {
+    if src_dims == dst_dims {
+        return None;
+    }
+    let pipelines = cached_pipelines
+        .get_or_insert_with(|| Arc::new(tether_scaler::Pipelines::build(device)))
+        .clone();
+    match tether_scaler::Scaler::new_with_color_space(
+        pipelines,
+        device.clone(),
+        queue.clone(),
+        src_dims,
+        dst_dims,
+        tether_scaler::ColorSpace::LinearF16,
+    ) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "Mitchell upscale scaler construction failed; falling back to bilinear blit");
+            None
+        }
     }
 }
 

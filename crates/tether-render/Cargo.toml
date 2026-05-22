@@ -13,6 +13,12 @@ tether-protocol = { workspace = true }
 # surface back to the hwframes pool). It only reads tether-codec's
 # data shapes, never invokes the decoder.
 tether-codec = { workspace = true }
+# Mitchell-Netravali upscaler used when the client window is larger
+# than the encoded video stream. Same shader the host uses on its
+# downscale path, configured with the LinearF16 color space so it
+# can consume the YUV→RGB pass's linear-light output directly
+# without double-applying the sRGB transfer.
+tether-scaler = { workspace = true }
 
 thiserror = { workspace = true }
 tracing = { workspace = true }

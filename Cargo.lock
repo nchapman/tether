@@ -3470,6 +3470,7 @@ dependencies = [
  "tether-codec",
  "tether-gpuconvert",
  "tether-protocol",
+ "tether-scaler",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",

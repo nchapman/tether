@@ -181,6 +181,12 @@ impl WinitTranslator {
                     modifiers: self.modifiers,
                 }]
             }
+            // Resize events flow on a separate viewport channel in the
+            // client binary (see `tether-client/src/main.rs`); they
+            // never reach the input translator. Keep the arm
+            // exhaustive so a future variant addition is a compile
+            // error here rather than a silent ignore.
+            RenderEvent::Resized { .. } => Vec::new(),
         };
         self.wrap(kinds)
     }

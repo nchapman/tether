@@ -19,7 +19,7 @@ use crossbeam_channel::{bounded, Receiver as XbReceiver, Sender as XbSender};
 use tether_codec::{build_decoder, Frame as CodecFrame};
 use tether_render::{CpuFrame, GpuFrame as RenderGpuFrame, LatestFrame};
 use tether_input::{WinitTranslator, WireEvent};
-use tether_protocol::control::{ControlMessage, GoodbyeCode};
+use tether_protocol::control::{ControlMessage, GoodbyeCode, Viewport};
 use tether_session::{ClientSession, ClientSessionConfig, ConnectError};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
@@ -111,12 +111,16 @@ async fn main() -> anyhow::Result<()> {
         ClientSessionConfig {
             client_name: "tether-client".to_string(),
             client_decode_profiles: client_decode_profiles.clone(),
-            // Viewport plumbing exists in the protocol; the client
-            // binary doesn't yet observe its render window size at
-            // connect time, so leave None for now and let the host
-            // pick native. Wire-up belongs with the renderer's
-            // resize event surface, tracked separately.
-            viewport: None,
+            // Initial viewport = the window's logical size at connect
+            // time. The renderer's first WindowEvent::Resized will fire
+            // shortly after the window is created (the WM sizes it to
+            // the actual physical pixels for the display's scale
+            // factor) and the viewport debouncer task below will follow
+            // up with a SetClientViewport reflecting the physical dims.
+            // Sending an initial guess here means the first encoded
+            // frame is already at roughly-the-right size instead of
+            // wasting one frame at native capture dims.
+            viewport: Some(Viewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)),
         },
     )
     .await
@@ -563,6 +567,7 @@ async fn main() -> anyhow::Result<()> {
     // unreliable datagram channel; everything else on the reliable
     // input stream.
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<RenderEvent>();
+    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
     let conn_input = conn.clone();
     tokio::spawn(async move {
         let mut translator = WinitTranslator::new();
@@ -592,10 +597,77 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Viewport debouncer task. Drag-resizing fires
+    // `WindowEvent::Resized` continuously (often >100 events/second);
+    // sending a `SetClientViewport` per event would have the host
+    // rebuild its encoder on every pixel of drag — expensive on
+    // Metal/DX12 where pipeline compile is hundreds of ms, and produces
+    // a stream of one-frame DimMismatch drops in the scaler. Coalesce
+    // by waiting for ~150 ms of quiescence before forwarding the most
+    // recent size. 150 ms is the standard UI-debounce floor — fast
+    // enough to feel live, slow enough to filter drag noise. Zero-dim
+    // sizes (minimised window) are dropped — encoding at 0×0 would
+    // panic, and the host's current dims are still appropriate for
+    // when the window comes back.
+    let conn_viewport = conn.clone();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        let debounce = Duration::from_millis(150);
+        let mut pending: Option<(u32, u32)> = None;
+        loop {
+            // Either receive a new size, or fire the pending one after
+            // the debounce window elapses with no new event.
+            let next = match pending {
+                Some(_) => tokio::time::timeout(debounce, viewport_rx.recv()).await,
+                None => Ok(viewport_rx.recv().await),
+            };
+            match next {
+                Ok(Some(size)) => {
+                    pending = Some(size);
+                }
+                Ok(None) => {
+                    // Sender dropped. Fire any pending before exiting
+                    // so the last resize event still makes it.
+                    if let Some((w, h)) = pending {
+                        let viewport = Viewport::new(w, h);
+                        if viewport.is_valid() {
+                            let _ = conn_viewport
+                                .send_control(&ControlMessage::SetClientViewport(viewport))
+                                .await;
+                        }
+                    }
+                    return;
+                }
+                Err(_) => {
+                    if let Some((w, h)) = pending.take() {
+                        let viewport = Viewport::new(w, h);
+                        if !viewport.is_valid() {
+                            continue;
+                        }
+                        if let Err(e) = conn_viewport
+                            .send_control(&ControlMessage::SetClientViewport(viewport))
+                            .await
+                        {
+                            warn!(error = ?e, "SetClientViewport send failed; viewport task exiting");
+                            return;
+                        }
+                        info!(width = w, height = h, "sent SetClientViewport to host");
+                    }
+                }
+            }
+        }
+    });
+
     let on_event: tether_render::EventSink = Box::new(move |evt| {
-        // Render must not block on a slow consumer. UnboundedSender drops
-        // its message on send-after-close, which is exactly what we want
-        // when the input task has exited.
+        // Resize events fork off to the viewport debouncer; everything
+        // else (input, cursor, focus) goes to the existing input task.
+        // Render must not block on a slow consumer — UnboundedSender
+        // drops on send-after-close, which is what we want when either
+        // consumer task has exited.
+        if let RenderEvent::Resized { width, height } = evt {
+            let _ = viewport_tx.send((width, height));
+            return;
+        }
         let _ = events_tx.send(evt);
     });
 

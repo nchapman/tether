@@ -173,6 +173,16 @@ pub enum RenderEvent {
         by_line: bool,
     },
     Focused(bool),
+    /// Window resized to `(width, height)` physical pixels. The client
+    /// binary forwards this to the host as `ControlMessage::SetClientViewport`
+    /// (after debouncing) so the host can re-encode at the new dims —
+    /// without this hook, the host stays at the original capture
+    /// resolution regardless of how small the client window is, wasting
+    /// encode time and bandwidth.
+    Resized {
+        width: u32,
+        height: u32,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -354,7 +364,13 @@ impl ApplicationHandler for App {
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                gpu.resize(size.width, size.height);
+                self.emit(RenderEvent::Resized {
+                    width: size.width,
+                    height: size.height,
+                });
+            }
             WindowEvent::RedrawRequested => {
                 // Apply a new frame at most once per redraw. GpuState
                 // holds the imported/uploaded textures across redraws,

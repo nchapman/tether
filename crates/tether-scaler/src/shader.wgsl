@@ -23,6 +23,18 @@
 // textures require the `BGRA8UNORM_STORAGE` wgpu feature which is not
 // portable across backends; Rgba8Unorm storage is core. Downstream
 // chroma shaders read .rgb regardless of source format.
+//
+// **Don't add workgroup-shared-memory tiling for the Mitchell passes.**
+// Measured and reverted: on Intel iGPU (the production target floor)
+// the tiled version was 1.5–2.8× *slower* across every realistic
+// (src, dst) pair. The naive `textureLoad` loop already hits the
+// hardware L1/L2 texture cache hard — 64 threads in an 8×8 workgroup
+// produce a tight access cluster the cache exploits in hardware.
+// Adding a workgroupBarrier + manual cache layer pays synchronization
+// cost without bandwidth savings. The theoretical reuse argument
+// (`8 * n_taps` reads collapsed to `8 + n_taps - 1`) assumes the
+// underlying texture cache is doing nothing; it isn't. Don't re-add
+// without an updated benchmark.
 
 const B: f32 = 1.0 / 3.0;
 const C: f32 = 1.0 / 3.0;

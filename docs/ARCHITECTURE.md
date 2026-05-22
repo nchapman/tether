@@ -104,6 +104,13 @@ to VideoToolbox — no gpuconvert step); the rest of the pipeline from
 │     • compute pass writes BGRA→NV12 (BT.709 limited range) into     │
 │       a *shared* VkDeviceMemory: R8 (Y) + Rg8 (UV) at distinct      │
 │       offsets, exported as ONE dma-buf fd                           │
+│     • underlying Vulkan image is allocated at                        │
+│       align_up(width, 64 / bytes_per_luma_px) × align_up(height,    │
+│       16) — libva-intel-driver mis-reads the dma-buf if luma row   │
+│       pitch isn't 64-byte aligned; the compute dispatch covers     │
+│       only the visible region and the encoder crops the padding   │
+│       via declared frame width. See shared_nv12.rs for the         │
+│       permanence rationale.                                         │
 │         │                                                           │
 │         ▼                                                           │
 │   tether-codec::vaapi::VaapiEncoder                                 │

@@ -14,8 +14,9 @@ each layer covers, and how to extend it.
 | `tether-probe` | 10 default + 0 `#[ignore]` (today) | `PipelineStage` exhaustiveness, `ProfileSupport` helper accessors, preference order (5-entry list, 10-bit-first), `pick_supported_profile` (best mutual / fallback / disjoint / empty / forward-compat unknown bit_depth), `probe_client_does_not_mirror_encode_bit_into_decode_field` (the Mac 4:4:4 decode-without-encode invariant). |
 | `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |
 | `tether-session` | 15 unit + 7 integration in `tests/loopback.rs` | Unit: `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate; `HostSession::accept` decode-profile-extension parsing (missing / oversize / malformed / well-formed / unknown bit_depth filter / no-match server-hello shape / chosen-profile echo); `ClientSession::connect` resolve_negotiated_profile (extension absent → 8-bit synth, present + decodes → authoritative, undecodable → error, unknown bit_depth → reject). Integration (via `tether-transport`'s `test-support` feature `DuplexControlChannel`): happy-path handshake with RTT/offset bounds, no-mutual-profile sends Goodbye after placeholder hello, host picks unadvertised profile → client `ProfileNotAdvertised`, host picks unknown bit_depth → client `UnknownBitDepth`, host filters unknown depths from advert keeping known ones, legacy host with no encode-profile extension synthesizes 8-bit profile from inline fields, dropped client during handshake → `Transport(_)`. |
-| `tether-render` | 16 + 1 `#[ignore]` (Linux); + 4 `#[ignore]` (macOS) | Cursor letterbox clipping, aspect ratio; `LatestFrame` Send+Sync + drop-oldest displacement; transfer_kind dispatch table pin; `range_kind_for(bit_depth, layout)` dispatch table pin + algebraic check that 10-bit limited-range breakpoints land white at 1.0 and black at 0.0; `render_layout_for(chroma, bit_depth)` dispatch table pin (incl. Yuv420 10-bit → Biplanar16 which the import path relies on for UV dimensioning); dma-buf zero-copy round-trip on Linux hardware (H.264 + HEVC 4:2:0 8-bit, HEVC 4:4:4 8-bit); IOSurface zero-copy on macOS hardware (HEVC 4:2:0 8-bit + 10-bit via encode→decode→render; HEVC 4:4:4 8-bit + 10-bit via fixture-decode→render since VT lacks Main444 encode). |
-| `tether-gpuconvert` | 3 default + 11 `#[ignore]` | `drm_fourcc_to_vk_format` table coverage incl. 10-bit biplanar plane fourccs (R16/GR32 → R16_UNORM/R16G16_UNORM) + 8-bit family regression + unknown-fourcc rejection; BGRA→NV12 + DMA-BUF round-trip with real Vulkan adapter. |
+| `tether-render` | 23 default + 14 `#[ignore]` (Linux); + 4 `#[ignore]` (macOS) | Cursor letterbox clipping, aspect ratio; `LatestFrame` Send+Sync + drop-oldest displacement; transfer_kind dispatch table pin; `range_kind_for(bit_depth, layout)` dispatch table pin + algebraic check that 10-bit limited-range breakpoints land white at 1.0 and black at 0.0; `render_layout_for(chroma, bit_depth)` dispatch table pin (incl. Yuv420 10-bit → Biplanar16 which the import path relies on for UV dimensioning); the **end-to-end roundtrip harness** (`test_harness.rs` + `dmabuf_test.rs`) drives the production multi-pass renderer (`Gpu::new_headless`) through 13 hardware cells covering identity / host-scaler / client-upscale / surface-below-video / full-chain / repro-shape rows at H.264 4:2:0, HEVC Main, HEVC Main 4:4:4, and HEVC Main 10 (10-bit cells SKIP on Intel iHD + Meteor Lake driver gap). Primary metric is **geometric residual on a coordinate-encoded fixture** (`Fixture::CoordEncoded`); SSIM and BT.709 Y-PSNR are the secondary catch-net. On failure the harness dumps readback/reference/diff/SSIM-heatmap PNGs + `metrics.txt` to `target/roundtrip-diagnostics/<case>/`. IOSurface zero-copy on macOS hardware (HEVC 4:2:0 8-bit + 10-bit via encode→decode→render; HEVC 4:4:4 8-bit + 10-bit via fixture-decode→render since VT lacks Main444 encode). |
+| `tether-gpuconvert` | 4 default + 15 `#[ignore]` lib + 7 `#[ignore]` integration (`tests/scaler_roundtrip.rs`) | `drm_fourcc_to_vk_format` table coverage incl. 10-bit biplanar plane fourccs (R16/GR32 → R16_UNORM/R16G16_UNORM) + 8-bit family regression + unknown-fourcc rejection; BGRA→NV12 + DMA-BUF round-trip with real Vulkan adapter; structural alignment-regression `convert_reports_64_aligned_y_stride_at_unaligned_width` (lib unit test in `src/nv12_dmabuf.rs`) asserts the iHD-VAAPI 64-byte luma row pitch fix at 2160×1440 without needing encoder/decoder/renderer in the loop. Integration tests `bgra_dmabuf_roundtrip_{1920×1200,2880×1920}` and `imported_bgra_then_scaler_2880×1920_to_2160×1440` are bisect entry points: split a failing roundtrip into (scaler isolation) ↔ (BGRA dma-buf import/export) ↔ (scaler-on-dma-buf) without running the full chain. |
+| `tether-scaler` | 18 default lib + 12 `#[ignore]` (hardware) + 6 `quality` integration | Mitchell-Netravali reference vs CPU implementation parity, fp16 linear-light path, mip prefilter, asymmetric scale; `matches_reference_coord_encoded_left_edge` (the harness-companion left-edge regression at 2880×1920 → 2160×1440 — bottom of the bisect stack for any future left-edge-corruption bug). |
 | `tether-capture` | 1 default + 1 `#[ignore]` macOS | SCK pixel-format probe records `420v`/`420f`/`'444v'`/`'444f'`/`xf44` acceptance via real `start_capture` + frame-arrival check for the Unknown-fourcc cases. |
 
 ## Test categories
@@ -33,12 +34,14 @@ with an explanatory string:
   etc.) so the next person can see at a glance whether their box
   should run them.
 
-Today there are **~22 ignored tests** (count varies by platform-cfg):
-`tether-codec/vaapi` (8 — 5 correctness, plus 4 cells of the `bench`
-matrix that each exercise encode_bgra + encode_dmabuf + decode),
-`tether-codec/videotoolbox` (2 — encoder smoke + HEVC constructs),
-`tether-gpuconvert` (11), and `tether-render` (1). They are real and
-load-bearing on hardware; they are not abandoned.
+Today there are **~58 ignored tests** (count varies by platform-cfg):
+`tether-codec` (10 — VAAPI + VideoToolbox correctness, plus the
+`bench` matrix cells), `tether-gpuconvert` (15 lib + 7 integration —
+includes the BGRA dma-buf import/export bisect helpers + the
+structural alignment-regression test), `tether-render` (14 — the
+roundtrip-harness matrix in `dmabuf_test.rs`), and `tether-scaler`
+(12 — Mitchell reference parity at production dims). They are real
+and load-bearing on hardware; they are not abandoned.
 
 The benchmark cells (one per codec × resolution) live in
 `crates/tether-codec/src/vaapi/bench.rs`. Run with:
@@ -73,12 +76,16 @@ See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
 
 ## CI shape
 
-- Default: `cargo build --workspace && cargo test --workspace`.
+- Default: `cargo build --workspace --all-targets && cargo test --workspace`.
+  `cargo build --workspace --all-targets` is warning-free today —
+  treat any new warning as a gate.
 - Hardware runner (separate job, when one exists): same plus
   `cargo test --workspace -- --ignored`.
 - `cargo clippy --workspace --all-targets` is currently advisory
-  (40 pre-existing warnings, mostly in `tether-gpuconvert` cast
-  sites with documented `#[allow]`s pending).
+  (pre-existing cast warnings in `tether-codec` and
+  `tether-scaler/src/reference.rs`; `#[allow]`s pending). New
+  clippy warnings in files under active edit should be addressed
+  in the same change.
 
 ## What's deliberately untested today
 
@@ -97,10 +104,17 @@ See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
   remaining glass-to-glass gap is everything past `StreamReady`:
   fragmenter under loss, IDR signalling latency, decoder restart
   recovery, render-thread drop-oldest under backpressure.
-- **The actual rendered pixels.** `tether-render`'s shader output
-  is validated by eye, not by image-diff. A headless `wgpu::Surface`
-  + image diff against a checked-in fixture is a worthwhile
-  follow-up but not load-bearing today.
+- ~~**The actual rendered pixels.**~~ As of the
+  `test_harness.rs` + `dmabuf_test.rs` work, the production
+  multi-pass renderer (`Gpu::new_headless`) is exercised against a
+  coordinate-encoded fixture across a 13-cell `(capture × encode ×
+  surface)` matrix and compared to a CPU Mitchell reference with
+  three metrics (geometric residual, SSIM, BT.709 Y-PSNR). On-
+  failure diagnostic dumps land in `target/roundtrip-diagnostics/`.
+  Gap that remains: the **macOS** harness sibling (`iosurface_test.rs`
+  uses fixed dims and asserts the IOSurface→Metal→wgpu import, but
+  doesn't drive the full multi-pass renderer across a (capture ×
+  encode × surface) matrix yet).
 - **`tether-vaapi` directly.** The hand-rolled libva FFI bindings
   are tested transitively through `tether-codec/vaapi/tests.rs`.
   Direct tests would just exercise libva itself.

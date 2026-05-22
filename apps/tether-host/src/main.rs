@@ -527,16 +527,28 @@ async fn handle_client(
                         info!(width = v.width, height = v.height, "client viewport changed");
                         // Latch the new viewport. The send thread
                         // notices the seq bump on its next iteration
-                        // and rebuilds the encoder (same path as a
-                        // capture-side resolution change). We force
-                        // an IDR so the client sees a clean cut on
-                        // the new dimensions rather than partial-GOP
-                        // garbage during the rebuild's first frame.
+                        // and rebuilds the encoder ONLY if encode
+                        // dims actually change — on a GPU session the
+                        // dims stay at capture and the rebuild is
+                        // skipped (no GPU scaler yet). We force an
+                        // IDR regardless so the client sees a clean
+                        // cut on whatever the new dimensions turn
+                        // out to be. On a GPU session that means the
+                        // IDR fires mid-GOP with no epoch bump —
+                        // harmless to the client (a normal IDR), but
+                        // worth a debug breadcrumb in traces.
                         let next = if v.is_valid() { Some(v) } else { None };
                         let mut guard = latest_viewport_for_ctl.lock().unwrap();
                         guard.viewport = next;
                         guard.seq = guard.seq.wrapping_add(1);
                         drop(guard);
+                        tracing::debug!(
+                            width = v.width,
+                            height = v.height,
+                            "SetClientViewport: forcing IDR; encoder rebuild fires only if \
+                             encode dims change (GPU sessions stay at capture dims until the \
+                             wgpu scaler lands)"
+                        );
                         force_idr_for_viewport.raise();
                     }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
@@ -1321,6 +1333,15 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
     abr.last_quinn = quinn;
     abr.last_observed_at = now;
     let decision = abr.controller.observe(dt, sample);
+    // The controller also publishes `target_fps`, but no capture
+    // backend takes an FPS hint at runtime yet — capture rates are
+    // fixed at startup. The FPS gear runs anyway because client
+    // `frames_dropped` is the signal that distinguishes
+    // network-side stress from decoder-side stress (the former
+    // should drop bitrate, the latter should drop FPS). When a
+    // capture backend grows a `set_target_fps`, this is where it
+    // gets wired.
+    let _ = decision.target_fps;
     if decision.target_kbps != abr.last_applied_kbps {
         match slot.encoder.set_bitrate_kbps(decision.target_kbps) {
             Ok(()) => {
@@ -1522,6 +1543,22 @@ fn run_capture_and_send(
                         last_observed_at: Instant::now(),
                         last_applied_kbps: baseline_kbps,
                     });
+                    // Diagnostic: if the controller's floor equals the
+                    // baseline (true for very small encode sizes —
+                    // 320x240 test pattern, or an aggressive
+                    // viewport) the bitrate gear has zero working
+                    // range. Surface it once at encoder init so a
+                    // future "ABR isn't doing anything" investigation
+                    // finds the cause in the logs.
+                    if abr.is_some()
+                        && AbrConfig::new(baseline_kbps, ENCODER_FPS).floor_kbps == baseline_kbps
+                    {
+                        info!(
+                            baseline_kbps,
+                            "ABR enabled but floor == baseline; bitrate control range is zero \
+                             (encode dims too small for the configured floor)"
+                        );
+                    }
                     Some(EncoderSlot {
                         encoder: e,
                         capture_width: frame_width,

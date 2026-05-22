@@ -113,9 +113,12 @@ impl HashDamage {
         let len = frame.data.len();
         let stride = (len / HASH_SAMPLE_BYTES).max(1);
         // Gather the strided sample into a small scratch buffer and
-        // feed SipHash in one `write` rather than 1024 single-byte
-        // writes — same hash quality, one mixing round per 8 bytes
-        // instead of one per byte.
+        // feed the hasher in one `write` rather than 1024 single-byte
+        // writes — one mixing round per 8 bytes instead of one per
+        // byte. The algorithm is whatever std::hash::DefaultHasher
+        // uses (currently SipHash, but the std lib does not guarantee
+        // this across Rust versions); we only need session-scoped
+        // identity so non-stable hashes are fine.
         let mut scratch = Vec::with_capacity(len.div_ceil(stride));
         for &b in frame.data.iter().step_by(stride) {
             scratch.push(b);

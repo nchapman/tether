@@ -82,6 +82,20 @@ to VideoToolbox — no gpuconvert step); the rest of the pipeline from
 │     CapturedFrame::Gpu { DmaBuf { fd, modifier, stride, offset } }  │
 │         │                                                           │
 │         ▼                                                           │
+│   send loop pre-encode gates (apps/tether-host)                     │
+│     • damage classifier (HashDamage, CPU frames only — GPU frames   │
+│       report Unknown and pass through; skip predicate is gated      │
+│       additionally by IdrSignal::peek so forced IDRs always go)     │
+│     • viewport rebuild check: encode dims = letterbox-fit of        │
+│       capture inside the latest ControlMessage::SetClientViewport   │
+│       directive, clamped to 16-pixel alignment. GPU paths keep      │
+│       encode dims == capture dims (wgpu compute scaler is the       │
+│       next step); CPU paths bilinear-resize before encode_bgra.     │
+│     • ABR tick: drains the latest ClientStats + quinn path stats    │
+│       into AbrController; calls set_bitrate_kbps when the           │
+│       controller crosses a hysteresis boundary.                     │
+│         │                                                           │
+│         ▼                                                           │
 │   tether-gpuconvert::Nv12DmaBuf                                     │
 │     • imports BGRA dma-buf as wgpu::Texture (Vulkan hal escape)     │
 │     • compute pass writes BGRA→NV12 (BT.709 limited range) into     │
@@ -584,11 +598,21 @@ Listed to set expectations; each is a real follow-up, not a "never":
 - **NAT traversal.** LAN direct only. QUIC's pluggable transport makes
   adding ICE later straightforward; today the user runs the client
   binary with a host IP.
-- **Adaptive bitrate.** Default scales with resolution + fps + codec
-  via `derive_bitrate_kbps` in the host (1080p60 H.264 = 8 Mbps;
-  HEVC × 0.7). The trait exposes `supports_changing_bitrate` /
-  `set_bitrate_kbps` so a closed-loop QoS controller can drive this
-  per-window — not yet wired up.
+- **GPU-side viewport scaler.** Viewport-driven pre-encode scaling
+  ships for `CapturedFrame::Cpu` via a CPU bilinear in the host send
+  loop. GPU frames (DMA-BUF, IOSurface) encode at capture dims even
+  when the client requests a smaller viewport — a wgpu compute
+  scaler that decouples encode dims from capture dims on the GPU
+  path is the next step. The protocol + control-task plumbing is in
+  place (`ControlMessage::SetClientViewport`, `ClientHelloV1::viewport`).
+- **Real cursor sprite capture.** `tether-capture::cursor::CursorSource`
+  trait + `PlaceholderCursorSource` are in place; per-platform
+  backends (Wayland `SPA_META_Cursor` parser, macOS `NSCursor` or
+  SCK Sonoma+ cursor metadata) are not. The current host sends one
+  16×16 checkerboard at session start and the cursor remains burned
+  into the captured frame (`CursorMode::Embedded` on the portal).
+  The seam is genuine — when a real backend lands, it drops into
+  `cursor.rs` without touching `handle_client`.
 - **Profile + rate-control probe (VAAPI).** Today we hard-code
   `profile=main` and `rc_mode=VBR`. Apollo carries an AMD-specific
   CBR/VBR probe and Sunshine probes the profile table via

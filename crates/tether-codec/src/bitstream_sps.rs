@@ -26,9 +26,9 @@ use tether_protocol::control::{ChromaSubsampling, CodecKind};
 /// Result of parsing an SPS NAL. Both fields directly reflect the
 /// bitstream — no decoder-side rendering choices muddied in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SpsChromaAndBitDepth {
-    pub chroma_format_idc: u8,
-    pub bit_depth_luma: u8,
+pub struct SpsChromaAndBitDepth {
+    pub(crate) chroma_format_idc: u8,
+    pub(crate) bit_depth_luma: u8,
 }
 
 impl SpsChromaAndBitDepth {
@@ -37,7 +37,7 @@ impl SpsChromaAndBitDepth {
     /// directly. Returns `None` for combinations Tether doesn't model
     /// today (e.g. 4:2:2, 12-bit) — the probe layer treats those as
     /// "second signal couldn't agree" and falls back to fourcc-only.
-    pub(crate) fn to_profile_chroma_bit_depth(self) -> Option<(ChromaSubsampling, u8)> {
+    pub fn to_profile_chroma_bit_depth(self) -> Option<(ChromaSubsampling, u8)> {
         let chroma = match self.chroma_format_idc {
             1 => ChromaSubsampling::Yuv420,
             3 => ChromaSubsampling::Yuv444,
@@ -54,7 +54,7 @@ impl SpsChromaAndBitDepth {
 /// of the given codec and parse out `(chroma_format_idc, bit_depth)`.
 /// Returns `None` if no SPS is found, the SPS is truncated, or any
 /// field is outside the values this parser models.
-pub(crate) fn parse_sps_chroma_bit_depth(
+pub fn parse_sps_chroma_bit_depth(
     annexb: &[u8],
     codec: CodecKind,
 ) -> Option<SpsChromaAndBitDepth> {

@@ -51,7 +51,11 @@ use std::sync::OnceLock;
 
 use tether_protocol::control::VideoProfile;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod host;
 mod preference;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod profile_probe;
 
 pub use preference::{pick_supported_profile, PROFILE_PREFERENCE};
 
@@ -199,72 +203,141 @@ pub fn client_decode_profiles() -> Vec<VideoProfile> {
         .collect()
 }
 
-/// Step 1 stub. Wraps `tether-codec`'s existing per-profile probe
-/// results into `ProfileSupport`. The mapping is intentionally narrow:
-/// `encode=true` → `Supported`; `encode=false` → `Unsupported` with a
-/// stage tag of [`PipelineStage::Construct`] because the codec
-/// probe is construction-centric today. Step 3 of the migration plan
-/// replaces this with real per-stage diagnostics.
+/// Run the per-profile encode + decode round trip and roll the
+/// results up into [`ProfileSupport`].
+///
+/// Step 2 of the migration: this is the real probe now (no longer
+/// delegating to tether-codec). Step 3 will extend the encode-side
+/// probe with a real `Bgra2P010DmaBuf` → `submit_dmabuf` round trip
+/// for 10-bit; step 4 introduces structured per-stage error tagging.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn probe_host() -> Vec<ProfileSupport> {
-    tether_codec::probe::supported_profiles()
-        .into_iter()
-        .map(|c| ProfileSupport {
-            profile: c.profile,
-            encode: if c.encode {
-                SupportStatus::Supported
-            } else {
-                SupportStatus::Unsupported {
-                    // TODO(step4): distinguish Construct (driver doesn't
-                    // claim profile) vs Submit (driver claimed it but
-                    // rejected a real frame). The codec-internal probe
-                    // can't make that distinction today.
+    use host::ActiveProbe;
+    use profile_probe::{fixture_for, ProfileProbe};
+
+    PROFILE_PREFERENCE
+        .iter()
+        .copied()
+        .map(|profile| {
+            let encode = match ActiveProbe::probe_encode(profile) {
+                Ok(()) => SupportStatus::Supported,
+                Err(e) => SupportStatus::Unsupported {
+                    // TODO(step4): distinguish Construct (encoder
+                    // couldn't be built) vs Submit (encoder built but
+                    // rejected a real frame). Today the trait collapses
+                    // both into one Result.
                     stage: PipelineStage::Construct,
-                    reason: "tether-codec probe rejected encode \
-                             (stage tagging awaits migration step 4)"
-                        .into(),
-                }
+                    reason: format!("{e}"),
+                },
+            };
+            let decode = match fixture_for(profile) {
+                Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
+                    Ok(()) => SupportStatus::Supported,
+                    Err(e) => SupportStatus::Unsupported {
+                        stage: PipelineStage::Decode,
+                        reason: format!("{e}"),
+                    },
+                },
+                None => SupportStatus::Unsupported {
+                    stage: PipelineStage::Decode,
+                    reason: format!(
+                        "no decode fixture shipped for {profile:?}; \
+                         add a fixture and extend fixture_for"
+                    ),
+                },
+            };
+            ProfileSupport {
+                profile,
+                encode,
+                decode,
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn probe_host() -> Vec<ProfileSupport> {
+    PROFILE_PREFERENCE
+        .iter()
+        .copied()
+        .map(|profile| ProfileSupport {
+            profile,
+            encode: SupportStatus::Unsupported {
+                stage: PipelineStage::Construct,
+                reason: "no hardware backend on this platform".into(),
             },
-            decode: if c.decode {
-                SupportStatus::Supported
-            } else {
-                SupportStatus::Unsupported {
-                    // TODO(step4): same Construct-vs-Decode distinction.
-                    stage: PipelineStage::Construct,
-                    reason: "tether-codec probe rejected decode \
-                             (stage tagging awaits migration step 4)"
-                        .into(),
-                }
+            decode: SupportStatus::Unsupported {
+                stage: PipelineStage::Construct,
+                reason: "no hardware backend on this platform".into(),
             },
         })
         .collect()
 }
 
-/// Step 1 stub for the client side. **Does not alias `probe_host`** —
-/// the Mac 4:4:4 decode asymmetry (M-series silicon decodes HEVC 4:4:4
-/// even though VideoToolbox can't encode it) means encode-false on the
-/// codec probe must not poison the decode advertisement. So we read
-/// the `c.decode` bit specifically, and report encode as
-/// `Unsupported{Construct, "client-side encode not probed"}` —
-/// callers asking the client about encode are asking the wrong
-/// question.
+/// Client-side probe. **Does not alias `probe_host`** — the Mac 4:4:4
+/// decode asymmetry (M-series silicon decodes HEVC 4:4:4 even though
+/// VideoToolbox can't encode it) means encode-false on the host probe
+/// must not poison the decode advertisement. So we drive only the
+/// decode half of the trait per profile, and report encode as
+/// `Unsupported{Construct, "client-side encode not probed"}` — callers
+/// asking the client about encode are asking the wrong question.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn probe_client() -> Vec<ProfileSupport> {
-    tether_codec::probe::supported_profiles()
-        .into_iter()
-        .map(|c| ProfileSupport {
-            profile: c.profile,
+    use host::ActiveProbe;
+    use profile_probe::{fixture_for, ProfileProbe};
+
+    PROFILE_PREFERENCE
+        .iter()
+        .copied()
+        .map(|profile| {
+            let decode = match fixture_for(profile) {
+                Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
+                    Ok(()) => SupportStatus::Supported,
+                    Err(e) => SupportStatus::Unsupported {
+                        stage: PipelineStage::Decode,
+                        reason: format!("{e}"),
+                    },
+                },
+                None => SupportStatus::Unsupported {
+                    stage: PipelineStage::Decode,
+                    reason: format!(
+                        "no decode fixture shipped for {profile:?}; \
+                         add a fixture and extend fixture_for"
+                    ),
+                },
+            };
+            ProfileSupport {
+                profile,
+                encode: SupportStatus::Unsupported {
+                    stage: PipelineStage::Construct,
+                    reason: "client-side encode not probed".into(),
+                },
+                decode,
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn probe_client() -> Vec<ProfileSupport> {
+    // Independent of the platform stub for `probe_host` — the Mac
+    // 4:4:4 invariant says encode bits must not be inherited from the
+    // host probe. The two stubs happen to return the same shape today,
+    // but expressing them independently makes the contract
+    // self-documenting and immune to a future hypothetical-platform
+    // backend that grew encode capability without growing decode.
+    PROFILE_PREFERENCE
+        .iter()
+        .copied()
+        .map(|profile| ProfileSupport {
+            profile,
             encode: SupportStatus::Unsupported {
                 stage: PipelineStage::Construct,
                 reason: "client-side encode not probed".into(),
             },
-            decode: if c.decode {
-                SupportStatus::Supported
-            } else {
-                SupportStatus::Unsupported {
-                    stage: PipelineStage::Construct,
-                    reason: "tether-codec probe rejected decode \
-                             (stage tagging awaits migration step 4)"
-                        .into(),
-                }
+            decode: SupportStatus::Unsupported {
+                stage: PipelineStage::Construct,
+                reason: "no hardware backend on this platform".into(),
             },
         })
         .collect()

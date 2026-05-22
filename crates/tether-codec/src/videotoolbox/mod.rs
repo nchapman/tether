@@ -37,6 +37,7 @@ mod tests;
 
 pub use decoder::VideoToolboxDecoder;
 pub use encoder::VideoToolboxEncoder;
+pub use probe::expected_iosurface_fourccs;
 
 /// Surfaces beyond what the decoder needs for its own reference
 /// picture list. Same rationale as the VAAPI sibling: the renderer's

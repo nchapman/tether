@@ -13,7 +13,7 @@ pub mod h264;
 pub mod probe;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-mod bitstream_sps;
+pub mod bitstream_sps;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod encoder_common;
 mod profile_probe;

@@ -18,7 +18,7 @@ use std::time::Instant;
 use crossbeam_channel::Receiver;
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
-use tether_capture::{CapturedFrame, PixelFormat};
+use tether_capture::{CapturedFrame, DamageHint, DamageSignal, HashDamage, PixelFormat};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tether_codec::GpuEncoderFrame;
 use tether_codec::{build_encoder, Encoder};
@@ -1174,6 +1174,11 @@ fn run_capture_and_send(
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
     let mut slot: Option<EncoderSlot> = None;
     let mut pts: i64 = 0;
+    // Frame-change classifier. CPU frames get a strided hash; GPU
+    // frames bypass it (zero-copy path mustn't read back). Resolution
+    // changes are caught by the fingerprint's (w, h, format) tuple,
+    // so we don't need to reset this alongside the slot rebuild.
+    let mut damage: Box<dyn DamageSignal> = Box::new(HashDamage::new());
 
     // Poll the capture channel on a short tick so a quiet desktop
     // (PipeWire stops delivering frames when nothing changes on screen)
@@ -1217,6 +1222,18 @@ fn run_capture_and_send(
                 warn!(?cpu.format, "h264 encoder only accepts BGRA; skipping frame");
                 continue;
             }
+        }
+
+        // Damage-skip gate. If the classifier says the frame is
+        // bit-identical to the previous one AND nobody is waiting on
+        // a forced IDR, drop it on the floor — the client's
+        // renderer is already showing this image. The IdrSignal peek
+        // here is non-consuming; the take() further down still owns
+        // the clear. Forced IDRs win over the damage skip
+        // unconditionally: a client mid-reconnect requests an IDR to
+        // bootstrap, and swallowing it would deadlock the session.
+        if matches!(damage.classify(&frame), DamageHint::Unchanged) && !force_idr.peek() {
+            continue;
         }
 
         // Encoder is lazily created on the first frame (we don't know

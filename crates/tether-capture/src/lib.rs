@@ -14,7 +14,10 @@
 //! at a fixed cadence. It exists so the walking skeleton and headless
 //! tests can exercise the pipeline without a display server.
 
+pub mod damage;
 pub mod test_pattern;
+
+pub use damage::{DamageHint, DamageSignal, HashDamage};
 
 #[cfg(target_os = "linux")]
 pub mod linux;

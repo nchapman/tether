@@ -53,7 +53,7 @@ use tether_scaler::test_util::{
     ChromaSiting, LetterboxMap, coord_fixture_fill,
     coord_fixture_residual_px_rms, cpu_chroma_roundtrip_bgra,
     cpu_letterbox_to_surface_bgra, cpu_mitchell_resize_bgra,
-    psnr_db_y_bgra, ssim_rgb,
+    psnr_db_y_bgra, ssim_heatmap_l8, ssim_rgb,
 };
 
 use crate::gpu::GpuState;
@@ -886,4 +886,182 @@ fn mae_bgra(a: &[u8], b: &[u8]) -> f64 {
         }
     }
     if n == 0 { 0.0 } else { sum / (n as f64) }
+}
+
+// =====================================================================
+// On-failure diagnostics dump
+// =====================================================================
+
+/// Write per-cell diagnostics to `target/roundtrip-diagnostics/<case.name>/`
+/// when a metric assertion would fail. Hardware-test failures from a
+/// CI runner you can't reproduce locally are catastrophically
+/// expensive without these artifacts.
+///
+/// Writes (best-effort — IO errors are warned, not propagated, so a
+/// disk issue doesn't mask the real test failure):
+/// - `readback.png` + `reference.png` — rendered surface vs CPU
+///   reference, both as sRGB PNGs.
+/// - `diff.png` — `|readback - reference|` per channel, gamma-
+///   stretched by `*= 8` so single-step errors are visible.
+/// - `ssim_heatmap.png` — per-16×16 SSIM rendered as an L8 image.
+/// - `metrics.txt` — every metric value, every threshold, the case
+///   itself. Greppable; one fact per line.
+pub(crate) fn dump_failure_diagnostics(case: &RoundtripCase, outcome: &RoundtripOutcome) {
+    // Allow CI workflows (and local runs) to redirect the artifacts
+    // by setting TETHER_DIAGNOSTICS_DIR. Without the env-var the
+    // default is `<workspace>/target/roundtrip-diagnostics` —
+    // CARGO_MANIFEST_DIR is `.../crates/tether-render` so the
+    // workspace root is two parent()s up.
+    let target_root = std::env::var_os("TETHER_DIAGNOSTICS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            manifest
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or(manifest)
+                .join("target")
+                .join("roundtrip-diagnostics")
+        })
+        .join(case.name);
+
+    // Build metrics first so we can print them to stderr even if
+    // mkdir or image saves fail — the numeric values are the
+    // single most useful diagnostic in a CI log where uploading
+    // PNGs back to the developer is awkward.
+    let metrics = format!(
+        "name = {name}\n\
+         profile = {profile:?}\n\
+         capture_dims = {capture:?}\n\
+         encode_dims = {encode:?}\n\
+         surface_dims = {surface:?}\n\
+         fixture = {fixture:?}\n\
+         frames_encoded = {frames}\n\
+         color_space = {color:?}\n\
+         requires = {req:?}\n\
+         \n\
+         [metrics]\n\
+         ssim                       = {ssim:.6}\n\
+         ssim_floor                 = {ssim_floor:.6}\n\
+         psnr_y_db                  = {psnr_y:.4}\n\
+         psnr_y_floor_db            = {psnr_y_floor:.4}\n\
+         geometric_residual_px_rms  = {geo:.4}\n\
+         geometric_residual_px_max  = {geo_max:.4}\n\
+         steady_state_delta         = {steady:?}\n\
+         steady_state_eps           = {steady_eps:?}\n",
+        name = case.name,
+        profile = case.profile,
+        capture = case.capture_dims,
+        encode = case.encode_dims,
+        surface = case.surface_dims,
+        fixture = case.fixture,
+        frames = case.frames_encoded,
+        color = case.color_space,
+        req = case.requires,
+        ssim = outcome.ssim,
+        ssim_floor = case.ssim_floor,
+        psnr_y = outcome.psnr_y_db,
+        psnr_y_floor = case.psnr_y_floor_db,
+        geo = outcome.geometric_residual_px_rms,
+        geo_max = case.geometric_residual_px_max,
+        steady = outcome.steady_state_delta,
+        steady_eps = case.assert_steady_state_eps,
+    );
+
+    if let Err(e) = std::fs::create_dir_all(&target_root) {
+        eprintln!(
+            "dump_failure_diagnostics: mkdir({}) failed: {e}; metrics follow:\n{metrics}",
+            target_root.display()
+        );
+        return;
+    }
+
+    let (sw, sh) = case.surface_dims;
+    save_bgra_as_png(&target_root.join("readback.png"), &outcome.readback_bgra, sw, sh);
+    save_bgra_as_png(&target_root.join("reference.png"), &outcome.reference_bgra, sw, sh);
+    save_diff_png(
+        &target_root.join("diff.png"),
+        &outcome.readback_bgra,
+        &outcome.reference_bgra,
+        sw,
+        sh,
+    );
+
+    let (hw, hh, heatmap) =
+        ssim_heatmap_l8(&outcome.readback_bgra, &outcome.reference_bgra, sw, sh);
+    save_l8_as_png(&target_root.join("ssim_heatmap.png"), &heatmap, hw, hh);
+
+    let metrics_path = target_root.join("metrics.txt");
+    if let Err(e) = std::fs::write(&metrics_path, &metrics) {
+        eprintln!(
+            "dump_failure_diagnostics: write metrics failed: {e}; metrics follow:\n{metrics}"
+        );
+    }
+    eprintln!("dump_failure_diagnostics: wrote {}", target_root.display());
+}
+
+fn save_bgra_as_png(path: &std::path::Path, bgra: &[u8], w: u32, h: u32) {
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for chunk in bgra.chunks_exact(4) {
+        rgba.push(chunk[2]);
+        rgba.push(chunk[1]);
+        rgba.push(chunk[0]);
+        rgba.push(chunk[3]);
+    }
+    let buf = match image::RgbaImage::from_raw(w, h, rgba) {
+        Some(b) => b,
+        None => {
+            eprintln!("save_bgra_as_png: RgbaImage::from_raw rejected dims/length");
+            return;
+        }
+    };
+    if let Err(e) = buf.save(path) {
+        eprintln!("save_bgra_as_png({}): {e}", path.display());
+    }
+}
+
+fn save_l8_as_png(path: &std::path::Path, l8: &[u8], w: u32, h: u32) {
+    let buf = match image::GrayImage::from_raw(w, h, l8.to_vec()) {
+        Some(b) => b,
+        None => {
+            eprintln!("save_l8_as_png: GrayImage::from_raw rejected dims/length");
+            return;
+        }
+    };
+    if let Err(e) = buf.save(path) {
+        eprintln!("save_l8_as_png({}): {e}", path.display());
+    }
+}
+
+fn save_diff_png(
+    path: &std::path::Path,
+    a_bgra: &[u8],
+    b_bgra: &[u8],
+    w: u32,
+    h: u32,
+) {
+    assert_eq!(a_bgra.len(), b_bgra.len());
+    let mut rgba = Vec::with_capacity(a_bgra.len());
+    for (ca, cb) in a_bgra.chunks_exact(4).zip(b_bgra.chunks_exact(4)) {
+        // Stretch by ×8 so single-step errors are visible to the eye.
+        // Saturates rather than wraps. RGB channel order in the
+        // output (image::RgbaImage expects RGBA), input is BGRA.
+        let dr = (i32::from(ca[2]).abs_diff(i32::from(cb[2])) * 8).min(255) as u8;
+        let dg = (i32::from(ca[1]).abs_diff(i32::from(cb[1])) * 8).min(255) as u8;
+        let db = (i32::from(ca[0]).abs_diff(i32::from(cb[0])) * 8).min(255) as u8;
+        rgba.push(dr);
+        rgba.push(dg);
+        rgba.push(db);
+        rgba.push(0xFF);
+    }
+    let buf = match image::RgbaImage::from_raw(w, h, rgba) {
+        Some(b) => b,
+        None => {
+            eprintln!("save_diff_png: RgbaImage::from_raw rejected dims/length");
+            return;
+        }
+    };
+    if let Err(e) = buf.save(path) {
+        eprintln!("save_diff_png({}): {e}", path.display());
+    }
 }

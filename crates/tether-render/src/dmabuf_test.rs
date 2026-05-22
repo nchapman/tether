@@ -65,7 +65,8 @@ use tether_codec::Encoder;
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoColorSpec, VideoProfile};
 
 use crate::test_harness::{
-    Capability, Fixture, RoundtripCase, RoundtripOutcome, RoundtripResult, run_roundtrip,
+    Capability, Fixture, RoundtripCase, RoundtripOutcome, RoundtripResult,
+    dump_failure_diagnostics, run_roundtrip,
 };
 
 // =====================================================================
@@ -92,37 +93,46 @@ fn assert_outcome(case: &RoundtripCase, result: RoundtripResult) {
         outcome.geometric_residual_px_rms,
         outcome.steady_state_delta,
     );
-    if matches!(case.fixture, Fixture::CoordEncoded) {
-        assert!(
-            outcome.geometric_residual_px_rms <= case.geometric_residual_px_max,
-            "[{}] geometric residual {} px > floor {} px — stride or UV-addressing bug?",
-            case.name,
-            outcome.geometric_residual_px_rms,
-            case.geometric_residual_px_max,
-        );
+
+    // Collect every failed assertion before panicking. Without this,
+    // the first failing assert hides the others, and (more
+    // importantly) it would skip the diagnostics dump so a CI failure
+    // would land without the readback/reference/diff/heatmap
+    // artifacts that make remote triage tractable.
+    let mut failures: Vec<String> = Vec::new();
+    if matches!(case.fixture, Fixture::CoordEncoded)
+        && outcome.geometric_residual_px_rms > case.geometric_residual_px_max
+    {
+        failures.push(format!(
+            "geometric residual {} px > floor {} px — stride or UV-addressing bug?",
+            outcome.geometric_residual_px_rms, case.geometric_residual_px_max,
+        ));
     }
-    assert!(
-        outcome.ssim >= case.ssim_floor,
-        "[{}] ssim {} < floor {}",
-        case.name,
-        outcome.ssim,
-        case.ssim_floor,
-    );
-    assert!(
-        outcome.psnr_y_db >= case.psnr_y_floor_db,
-        "[{}] psnr_y {} dB < floor {} dB",
-        case.name,
-        outcome.psnr_y_db,
-        case.psnr_y_floor_db,
-    );
+    if outcome.ssim < case.ssim_floor {
+        failures.push(format!(
+            "ssim {} < floor {}",
+            outcome.ssim, case.ssim_floor,
+        ));
+    }
+    if outcome.psnr_y_db < case.psnr_y_floor_db {
+        failures.push(format!(
+            "psnr_y {} dB < floor {} dB",
+            outcome.psnr_y_db, case.psnr_y_floor_db,
+        ));
+    }
     if let (Some(eps), Some(delta)) = (case.assert_steady_state_eps, outcome.steady_state_delta) {
-        assert!(
-            delta <= eps,
-            "[{}] steady-state MAE {} > {} between last two rendered frames",
-            case.name,
-            delta,
-            eps,
-        );
+        if delta > eps {
+            failures.push(format!(
+                "steady-state MAE {} > {} between last two rendered frames",
+                delta, eps,
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        dump_failure_diagnostics(case, &outcome);
+        panic!("[{}] {} metric(s) failed:\n  - {}",
+               case.name, failures.len(), failures.join("\n  - "));
     }
 }
 

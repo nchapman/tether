@@ -92,6 +92,82 @@ pub fn ssim_rgb(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
     total / (n_windows as f64)
 }
 
+/// Per-tile SSIM rendered as a luminance heatmap. Returns the heatmap
+/// dimensions and a `Vec<u8>` of single-channel L8 values, one byte
+/// per tile, mapping SSIM ∈ [-1, 1] → [0, 255] (255 = perfect).
+///
+/// Used by the round-trip harness's on-failure diagnostics dump: the
+/// SME review specifically called per-window SSIM heatmap "the single
+/// most useful debugging affordance" — a picture of *where* a
+/// regression lives (UI region vs video region vs letterbox bar) is
+/// worth a thousand log lines.
+///
+/// Tile size is fixed at 16×16. Heatmap dims are
+/// `(width / 16, height / 16)` (integer division). Pixels in the
+/// trailing partial tile, if any, are ignored.
+#[must_use]
+pub fn ssim_heatmap_l8(a: &[u8], b: &[u8], width: u32, height: u32) -> (u32, u32, Vec<u8>) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), (width * height * 4) as usize);
+    const TILE: i32 = 16;
+    let c1 = (0.01_f64 * 255.0).powi(2);
+    let c2 = (0.03_f64 * 255.0).powi(2);
+    // Tiles that extend past the image boundary are skipped (they'd
+    // read out of bounds otherwise — relevant for any future small-
+    // dims cell that reuses this helper).
+    let hw = ((width as i32) / TILE).max(1) as u32;
+    let hh = ((height as i32) / TILE).max(1) as u32;
+    let mut out = Vec::with_capacity((hw * hh) as usize);
+    let w = width as i32;
+    for ty in 0..hh as i32 {
+        for tx in 0..hw as i32 {
+            let tile_x1 = (tx + 1) * TILE;
+            let tile_y1 = (ty + 1) * TILE;
+            if tile_x1 > width as i32 || tile_y1 > height as i32 {
+                // Partial tile — emit neutral grey instead of reading
+                // past the buffer.
+                out.push(127);
+                continue;
+            }
+            // Average per-channel SSIM over the tile.
+            let mut tile_ssim = 0.0_f64;
+            for ch in 0..3 {
+                let mut sa = 0.0_f64;
+                let mut sb = 0.0_f64;
+                let mut saa = 0.0_f64;
+                let mut sbb = 0.0_f64;
+                let mut sab = 0.0_f64;
+                let n_pix = (TILE * TILE) as f64;
+                for dy in 0..TILE {
+                    for dx in 0..TILE {
+                        let off = (((ty * TILE + dy) * w + (tx * TILE + dx)) * 4 + ch) as usize;
+                        let pa = f64::from(a[off]);
+                        let pb = f64::from(b[off]);
+                        sa += pa;
+                        sb += pb;
+                        saa += pa * pa;
+                        sbb += pb * pb;
+                        sab += pa * pb;
+                    }
+                }
+                let mu_a = sa / n_pix;
+                let mu_b = sb / n_pix;
+                let var_a = (saa / n_pix) - mu_a * mu_a;
+                let var_b = (sbb / n_pix) - mu_b * mu_b;
+                let cov = (sab / n_pix) - mu_a * mu_b;
+                let num = (2.0 * mu_a * mu_b + c1) * (2.0 * cov + c2);
+                let den = (mu_a * mu_a + mu_b * mu_b + c1) * (var_a + var_b + c2);
+                tile_ssim += num / den;
+            }
+            tile_ssim /= 3.0;
+            // Map [-1, 1] → [0, 255] so 1.0 = white = good.
+            let v = (((tile_ssim + 1.0) * 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
+            out.push(v);
+        }
+    }
+    (hw, hh, out)
+}
+
 /// Mean-squared error over RGB channels (alpha ignored). Operates on
 /// 4-byte-stride buffers; channel order is irrelevant.
 #[must_use]

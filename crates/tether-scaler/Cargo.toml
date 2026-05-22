@@ -24,6 +24,13 @@ half = { version = "2", features = ["bytemuck"] }
 wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9" }
 pollster = "0.4"
 
+[features]
+# Public test utilities (metrics, CPU references, coordinate-encoded
+# fixture helpers) used by hardware round-trip tests across the
+# workspace. Mirrors `tether-transport`'s `test-support` feature.
+# Tests gate the module with `#[cfg(feature = "test-util")]`.
+test-util = []
+
 [dev-dependencies]
 # Used in tests/quality.rs to cross-check our Mitchell reference
 # against a known-good resampler. `image`'s CatmullRom is close-but-

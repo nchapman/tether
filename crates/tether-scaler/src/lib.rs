@@ -44,6 +44,8 @@
 mod pipeline;
 pub mod reference;
 mod scaler;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 
 pub use pipeline::Pipelines;
 pub use scaler::{ColorSpace, Scaler};

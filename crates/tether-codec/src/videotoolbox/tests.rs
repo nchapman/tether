@@ -344,19 +344,19 @@ fn videotoolbox_round_trip() {
 ///    expected family for the profile) or `Unsupported` (any step
 ///    failed — encoder open, no packets, decoder error, or
 ///    fourcc mismatch indicating silent downsample).
-/// 3. Cross-checks the result against `supported_profiles()`. The
-///    probe and the explicit round-trip must agree: if the probe
-///    says `encode=true` the round-trip must succeed, and if the
-///    probe says `encode=false` the round-trip must fail. A
-///    disagreement is the bug — either the probe is over-claiming
-///    (silent downsample slips through) or under-claiming (a
-///    capability is being hidden).
+/// 3. Verifies that the 4:4:4 profile families produce IOSurfaces in
+///    the expected 4:4:4 fourcc family — the original silent-downsample
+///    bug had VT accepting NV24/P410LE input then encoding 4:2:0 in
+///    the bitstream. A `'420v'`/`'x420'` IOSurface coming out for a
+///    4:4:4 round-trip would be that regression.
 ///
-/// This is the primary regression test for the audit's "silent
-/// downsample" risk: the probe layer was over-claiming HEVC 4:4:4
-/// encode on M4 Max before commit history added the round-trip
-/// fourcc check, and an independent test pinning the agreement
-/// stops that regression from coming back.
+/// (Historical context: this test used to cross-check against
+/// `tether-codec::probe::supported_profiles()`, retired in commit
+/// 255289a when probe orchestration moved exclusively to
+/// `tether-probe`. The dual-table agreement check now lives in
+/// `tether-probe`'s own integration tests, which can depend on both
+/// crates; here we keep just the round-trip + fourcc-family invariants
+/// that don't need the probe layer.)
 #[test]
 #[ignore = "requires macOS + VideoToolbox"]
 fn videotoolbox_round_trip_chroma_matrix() {
@@ -370,40 +370,34 @@ fn videotoolbox_round_trip_chroma_matrix() {
         VideoProfile::H264_8BIT_420,
     ];
     let bgra = make_chroma_detail_bgra(W, H);
-    let caps = crate::probe::supported_profiles();
 
     for &profile in profiles {
         let round_trip = try_round_trip(profile, &bgra, W, H);
-        let probe_says = caps
-            .iter()
-            .find(|c| c.profile == profile)
-            .map(|c| c.encode)
-            .unwrap_or(false);
-
-        match (&round_trip, probe_says) {
-            (Ok(fourcc), true) => {
+        match (&round_trip, profile.chroma) {
+            (Ok(fourcc), ChromaSubsampling::Yuv444) => {
+                // If the round-trip succeeded for a 4:4:4 profile, the
+                // decoded IOSurface fourcc must be in the 4:4:4 family —
+                // a 4:2:0 fourcc here would be the silent-downsample
+                // regression this test exists to catch.
+                let expected = expected_iosurface_fourccs_for(profile);
+                assert!(
+                    expected.contains(fourcc),
+                    "{profile:?} round-trip succeeded but IOSurface fourcc \
+                     0x{fourcc:08x} is not in the 4:4:4 family — VT likely \
+                     silently downsampled to 4:2:0 in the bitstream"
+                );
                 eprintln!(
-                    "round-trip matrix: {profile:?} OK (IOSurface 0x{fourcc:08x}); \
-                     probe agrees encode=true"
+                    "round-trip matrix: {profile:?} OK (IOSurface 0x{fourcc:08x})"
                 );
             }
-            (Err(reason), false) => {
+            (Ok(fourcc), _) => {
                 eprintln!(
-                    "round-trip matrix: {profile:?} unsupported ({reason}); \
-                     probe agrees encode=false"
+                    "round-trip matrix: {profile:?} OK (IOSurface 0x{fourcc:08x})"
                 );
             }
-            (Ok(fourcc), false) => panic!(
-                "{profile:?} disagreement: explicit round-trip succeeded \
-                 (IOSurface 0x{fourcc:08x}) but probe reports encode=false — \
-                 probe is under-claiming, the profile should be advertised"
-            ),
-            (Err(reason), true) => panic!(
-                "{profile:?} disagreement: probe reports encode=true but explicit \
-                 round-trip failed ({reason}) — probe is over-claiming (likely \
-                 silent downsample slipping past the probe's fourcc check), \
-                 the profile must not be advertised"
-            ),
+            (Err(reason), _) => {
+                eprintln!("round-trip matrix: {profile:?} unsupported ({reason})");
+            }
         }
     }
 }

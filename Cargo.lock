@@ -3376,6 +3376,9 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "objc2 0.6.4",
+ "objc2-io-surface",
+ "objc2-metal 0.3.2",
  "pollster",
  "rsmpeg",
  "tether-gpuconvert",

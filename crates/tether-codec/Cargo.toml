@@ -30,6 +30,28 @@ rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a2002567
 [target.'cfg(target_os = "linux")'.dependencies]
 tether-vaapi = { workspace = true }
 
+# macOS-only IOSurface→MTLTexture→wgpu interop helpers. Shared by
+# `tether-render` (client decode-side import) and `tether-gpuconvert`
+# (host scaler-output import + destination allocation), so the
+# IOSurface→wgpu plumbing has exactly one home. Moved here from
+# `tether-render::gpu::metal` to avoid forcing the host bridge to
+# depend on the renderer. Pinned versions match `tether-render`'s
+# Cargo.toml so the workspace doesn't end up with two incompatible
+# copies of `Retained` / `ProtocolObject`.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["metal"] }
+objc2 = "0.6.3"
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+    "objc2-io-surface",
+] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef"] }
+
 # Hardware-gated round-trip tests need a real gpuconvert bridge to
 # produce the dma-buf descriptor shape the encoder expects (XYUV for
 # 4:4:4, NV12 for 4:2:0). Test-only — production code paths don't

@@ -15,8 +15,12 @@ pub(crate) use import::import_dmabuf_textures;
 mod metal;
 #[cfg(target_os = "macos")]
 pub(crate) use metal::import_iosurface_textures;
+// Re-export from tether-codec's shared interop module. Lived in
+// `metal.rs` historically; moved to `tether-codec::macos_interop` so
+// `tether-gpuconvert::nv12_iosurface` (host scaler bridge) can share
+// the same table without depending on the renderer.
 #[cfg(target_os = "macos")]
-pub use metal::accepts_iosurface_fourcc;
+pub use tether_codec::macos_interop::accepts_iosurface_fourcc;
 
 /// One frame's worth of YUV plane textures plus the bind group that
 /// points at them. The variant matches the negotiated chroma — NV12

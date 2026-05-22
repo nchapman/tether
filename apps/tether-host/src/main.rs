@@ -2420,7 +2420,7 @@ mod tests {
     #[test]
     fn macos_iosurface_fourcc_tables_reject_unmodeled_profiles() {
         use tether_codec::videotoolbox::encoder::iosurface_fourcc_matches;
-        use tether_codec::videotoolbox::probe::expected_iosurface_fourccs;
+        use tether_codec::videotoolbox::expected_iosurface_fourccs;
         use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
         use tether_render::accepts_iosurface_fourcc;
 

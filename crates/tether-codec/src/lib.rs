@@ -23,6 +23,9 @@ pub mod vaapi;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
 
+#[cfg(target_os = "macos")]
+pub mod macos_interop;
+
 pub use probe::{build_decoder, build_encoder, validate_chosen_profile};
 
 // Re-exported so downstream crates can name the payload type on

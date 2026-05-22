@@ -155,6 +155,11 @@ pub(crate) struct UpscaleStage {
     /// in at least one axis. Rebuilt on window resize or video
     /// dims change.
     scaler: Option<tether_scaler::Scaler>,
+    /// Sticky flag set when scaler construction fails for the
+    /// current (video, window) pair. Without this we'd retry every
+    /// frame, logging a warn at video frame rate. Cleared whenever
+    /// video dims change (a device reset can become valid again).
+    scaler_failed: bool,
     /// Blit pipeline + bind-group layout for the swapchain pass.
     /// Samples an Rgba16Float texture with the project-standard
     /// bilinear letterbox. Bind groups are rebuilt per render
@@ -792,6 +797,7 @@ impl GpuState {
             intermediate_dims: (0, 0),
             scaler_pipelines: None,
             scaler: None,
+            scaler_failed: false,
             blit_pipeline,
             blit_bgl,
             blit_sampler,
@@ -1014,22 +1020,16 @@ impl GpuState {
         let video_dims = self.textures.size;
         let surface_dims = (self.surface_config.width, self.surface_config.height);
 
-        // Letterbox scale for the final blit. The YUV pass writes
-        // its intermediate at video dims with identity scale; the
-        // blit pass below applies aspect correction when writing
-        // to the swapchain.
-        let (sx, sy) = letterbox_scale(video_dims, surface_dims);
-        self.queue
-            .write_buffer(&self.scale_buffer, 0, &bytes_of_f32x4(&[sx, sy, 0.0, 0.0]));
-
         // Make sure the intermediate exists at the right dims. If
         // the decoded video changed size between frames, also rebuild
-        // the Mitchell scaler.
+        // the Mitchell scaler and clear the sticky failure flag (a
+        // device reset accompanying the resize can become valid).
         let video_changed = self.upscale.intermediate_dims != video_dims;
         if self.upscale.rgb_intermediate.is_none() || video_changed {
             self.upscale.rgb_intermediate = Some(make_rgb_intermediate(&self.device, video_dims));
             self.upscale.intermediate_dims = video_dims;
             self.upscale.scaler = None;
+            self.upscale.scaler_failed = false;
         }
         // Decide if we need to (re)build the Mitchell scaler:
         // upscale only, never for window ≤ video. Skipping the
@@ -1043,22 +1043,51 @@ impl GpuState {
             video_dims
         };
         let scaler_needs_rebuild = need_upscale
+            && !self.upscale.scaler_failed
             && self
                 .upscale
                 .scaler
                 .as_ref()
                 .map_or(true, |s| s.dst_dims() != upscale_dims || s.src_dims() != video_dims);
         if scaler_needs_rebuild {
-            self.upscale.scaler = build_upscale_scaler(
+            match build_upscale_scaler(
                 &self.device,
                 &self.queue,
                 &mut self.upscale.scaler_pipelines,
                 video_dims,
                 upscale_dims,
-            );
+            ) {
+                Ok(Some(s)) => self.upscale.scaler = Some(s),
+                Ok(None) => self.upscale.scaler = None,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        src = ?video_dims, dst = ?upscale_dims,
+                        "Mitchell upscale scaler construction failed; falling back to bilinear blit for this (video, window) pair"
+                    );
+                    self.upscale.scaler = None;
+                    self.upscale.scaler_failed = true;
+                }
+            }
         } else if !need_upscale {
             self.upscale.scaler = None;
         }
+
+        // Letterbox scale for the blit pass — computed from the
+        // *blit source's* dims, not the original video dims. When
+        // Mitchell ran, the source is its output at `letterbox_fit_dims`
+        // (already aspect-matched); the blit scale is then (1, 1) or
+        // very close. When Mitchell didn't run, the source is the
+        // intermediate at video dims and the blit scale does the
+        // aspect correction. Using the source's actual dims here
+        // avoids sub-pixel aspect drift on unusual ratios.
+        let blit_source_dims = match self.upscale.scaler.as_ref() {
+            Some(s) => s.dst_dims(),
+            None => video_dims,
+        };
+        let (sx, sy) = letterbox_scale(blit_source_dims, surface_dims);
+        self.queue
+            .write_buffer(&self.scale_buffer, 0, &bytes_of_f32x4(&[sx, sy, 0.0, 0.0]));
 
         let view = output
             .texture
@@ -1230,36 +1259,36 @@ fn letterbox_fit_dims(video: (u32, u32), window: (u32, u32)) -> (u32, u32) {
 }
 
 /// Build (or lazily compile) the Mitchell scaler pipelines and a
-/// scaler instance for the given dims. Returns `None` if the
-/// requested scale is a no-op or otherwise fails — caller treats
-/// that as "skip Mitchell, do direct bilinear blit".
+/// scaler instance for the given dims.
+///
+/// Returns:
+/// - `Ok(Some(scaler))` — normal upscale case.
+/// - `Ok(None)` — `src_dims == dst_dims`; no scaler needed, blit
+///    samples the intermediate directly.
+/// - `Err(_)` — construction genuinely failed. Caller logs once and
+///    sets a sticky failure flag to avoid per-frame retries.
 fn build_upscale_scaler(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     cached_pipelines: &mut Option<Arc<tether_scaler::Pipelines>>,
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
-) -> Option<tether_scaler::Scaler> {
+) -> std::result::Result<Option<tether_scaler::Scaler>, tether_scaler::ScalerError> {
     if src_dims == dst_dims {
-        return None;
+        return Ok(None);
     }
     let pipelines = cached_pipelines
         .get_or_insert_with(|| Arc::new(tether_scaler::Pipelines::build(device)))
         .clone();
-    match tether_scaler::Scaler::new_with_color_space(
+    tether_scaler::Scaler::new_with_color_space(
         pipelines,
         device.clone(),
         queue.clone(),
         src_dims,
         dst_dims,
         tether_scaler::ColorSpace::LinearF16,
-    ) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(error = %e, "Mitchell upscale scaler construction failed; falling back to bilinear blit");
-            None
-        }
-    }
+    )
+    .map(Some)
 }
 
 /// Compute the (x, y) NDC scale factors that letterbox / pillarbox the
@@ -1515,10 +1544,43 @@ fn write_plane(
 #[cfg(test)]
 mod tests {
     use super::{
-        range_kind_for, render_layout_for, transfer_kind_for, RenderLayout,
+        letterbox_fit_dims, range_kind_for, render_layout_for, transfer_kind_for, RenderLayout,
         RANGE_KIND_LIMITED_10, RANGE_KIND_LIMITED_8, TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB,
     };
     use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
+
+    /// 16:9 video in a 4:3 window: width-bound. Mitchell upscale
+    /// produces 800×450 with letterbox bars top and bottom.
+    #[test]
+    fn letterbox_fit_landscape_in_landscape_window() {
+        assert_eq!(letterbox_fit_dims((1920, 1080), (800, 600)), (800, 450));
+    }
+
+    /// 9:16 video in a 16:9 window: height-bound. Pillarbox bars
+    /// left and right, content fills the height.
+    #[test]
+    fn letterbox_fit_portrait_in_landscape_window() {
+        let (w, h) = letterbox_fit_dims((1080, 1920), (1920, 1080));
+        assert_eq!(h, 1080);
+        // Aspect preserved to within rounding.
+        assert!((w as f32 / h as f32 - 1080.0 / 1920.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn letterbox_fit_matching_aspect_is_full_window() {
+        // 16:9 video in 16:9 window: scaler output exactly fills.
+        assert_eq!(letterbox_fit_dims((1920, 1080), (1280, 720)), (1280, 720));
+    }
+
+    #[test]
+    fn letterbox_fit_zero_dim_returns_video() {
+        // Defensive: window zero in either axis (transient on resize)
+        // shouldn't divide-by-zero. Returning the source dims is a
+        // safe pass-through.
+        assert_eq!(letterbox_fit_dims((1920, 1080), (0, 600)), (1920, 1080));
+        assert_eq!(letterbox_fit_dims((1920, 1080), (800, 0)), (1920, 1080));
+        assert_eq!(letterbox_fit_dims((0, 1080), (800, 600)), (0, 1080));
+    }
 
     /// Pin the Rust → shader range-kind constants so a renumber in
     /// either side surfaces here, not as a silent miscoloured 10-bit

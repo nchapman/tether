@@ -18,7 +18,10 @@ use std::time::Instant;
 use crossbeam_channel::Receiver;
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
-use tether_capture::{CapturedFrame, DamageHint, DamageSignal, HashDamage, PixelFormat};
+use tether_capture::{
+    CapturedFrame, CursorEvent, CursorSource, DamageHint, DamageSignal, HashDamage,
+    PixelFormat, PlaceholderCursorSource,
+};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tether_codec::GpuEncoderFrame;
 use tether_codec::{build_encoder, Encoder};
@@ -314,38 +317,12 @@ async fn handle_client(
     // the handshake-time profile floor it implied is already baked into
     // the negotiated profile.
 
-    // Send a single placeholder cursor shape so the client's receive
-    // path is exercised end-to-end. Real cursor-shape capture (querying
-    // the compositor's current cursor sprite, sending Shape on change,
-    // UseShape on switch) is its own future workstream. A 16×16 opaque
-    // checkerboard is enough to prove the wire shape and the client's
-    // log line — replace with the real pointer texture later.
-    {
-        let pixels: Vec<u8> = (0..16 * 16)
-            .flat_map(|i| {
-                let on = ((i / 16) + (i % 16)) % 2 == 0;
-                let v = if on { 0xFFu8 } else { 0x00 };
-                [v, v, v, 0xFF]
-            })
-            .collect();
-        let shape = ControlMessage::CursorShape {
-            id: 0,
-            hotspot: (0, 0),
-            width: 16,
-            height: 16,
-            format: tether_protocol::cursor::CursorPixelFormat::Rgba8,
-            pixels,
-        };
-        if let Err(e) = conn.send_control(&shape).await {
-            warn!(error = ?e, "initial CursorShape send failed; continuing anyway");
-        }
-        if let Err(e) = conn
-            .send_control(&ControlMessage::CursorUseShape { id: 0 })
-            .await
-        {
-            warn!(error = ?e, "CursorUseShape send failed; continuing anyway");
-        }
-    }
+    // Cursor source. Behind the [`CursorSource`] trait so a future
+    // per-platform impl (Wayland SPA_META_Cursor parser, macOS NSCursor
+    // poller) can drop in without touching this block. The placeholder
+    // emits one 16×16 checkerboard at startup so the wire is
+    // exercised — that's the same shape the previous inline code sent.
+    drain_initial_cursor(&conn, &mut PlaceholderCursorSource::new()).await;
 
     // DisplayList: one entry, single-monitor placeholder. Real values
     // (refresh rate from the PipeWire stream, scale + position from
@@ -1162,6 +1139,60 @@ fn yuv444_dmabuf_to_codec_frame(out: Yuv444DmaBufFrame) -> DmaBufFrame {
                 0,
             ],
         }],
+    }
+}
+
+/// Drain any pending events from the cursor source and forward them
+/// to the client on the reliable control stream. Called at session
+/// start so the placeholder's one-shot shape lands before the client
+/// gets its first video frame; when a real cursor source replaces
+/// the placeholder this same call covers initial-state delivery.
+///
+/// Per-session sprite cache keeps `CursorShape` (pixels) from re-
+/// sending when the platform reports the same id twice in a row —
+/// the second hit becomes `CursorUseShape { id }`.
+async fn drain_initial_cursor<S: CursorSource>(conn: &Connection, source: &mut S) {
+    // Forward-looking cache: a future real cursor source emits the
+    // same arrow id every time the pointer enters the desktop, so a
+    // `Shape` -> `UseShape` dedup pays off. The placeholder emits a
+    // single unique id so this cache is empty-allocated overhead
+    // today — kept because the real impl will need it.
+    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    loop {
+        match source.next_event() {
+            CursorEvent::Idle => break,
+            CursorEvent::Shape(shape) => {
+                let id = shape.id;
+                let already_sent = !seen_ids.insert(id);
+                if !already_sent {
+                    // Deposit the pixels into the client's cache.
+                    // `CursorShape` defines but does NOT activate; the
+                    // protocol pairs it with `CursorUseShape` so the
+                    // host can swap between cached cursors without
+                    // resending pixels.
+                    let msg = ControlMessage::CursorShape {
+                        id,
+                        hotspot: shape.hotspot,
+                        width: shape.width,
+                        height: shape.height,
+                        format: shape.format,
+                        pixels: shape.pixels,
+                    };
+                    if let Err(e) = conn.send_control(&msg).await {
+                        warn!(error = ?e, id, "CursorShape send failed; continuing anyway");
+                    }
+                }
+                // Always activate — applies to both first-send and
+                // cached-switch cases. Without this, defining a shape
+                // never becomes the visible cursor on the client.
+                if let Err(e) = conn
+                    .send_control(&ControlMessage::CursorUseShape { id })
+                    .await
+                {
+                    warn!(error = ?e, id, "CursorUseShape send failed; continuing anyway");
+                }
+            }
+        }
     }
 }
 

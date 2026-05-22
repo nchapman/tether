@@ -12,7 +12,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 #[cfg(target_os = "linux")]
@@ -32,8 +33,10 @@ use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
 use tether_protocol::MonoNanos;
-use tether_session::{AcceptError, HostSession, HostSessionConfig};
-use tether_transport::{Connection, Datagram, Server};
+use tether_session::{
+    AbrConfig, AbrController, AbrSample, AcceptError, HostSession, HostSessionConfig,
+};
+use tether_transport::{AbrSnapshot, Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -58,6 +61,25 @@ const ENCODER_BITRATE_KBPS: u32 = 8_000;
 const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
 const TEST_PATTERN_FPS: u32 = 60;
+
+/// Latest `ClientStats` observation, drained by the encode-and-send
+/// thread on each loop iteration. The control recv task writes here
+/// every time `ControlMessage::ClientStats` arrives (~1 Hz). A
+/// `std::sync::Mutex` is fine because the lock is held for a single
+/// option-swap; the send thread isn't a tokio worker so we don't need
+/// `tokio::sync::Mutex`.
+type LatestClientStats = Arc<StdMutex<Option<ClientStatsObservation>>>;
+
+/// One window of client-side telemetry. Mirrors the fields in
+/// [`ControlMessage::ClientStats`] that the ABR controller actually
+/// consumes; `interval_ms` and `frames_received` are dropped at the
+/// boundary because the controller takes wall-clock dt itself and
+/// doesn't need the success-count.
+#[derive(Debug, Clone, Copy)]
+struct ClientStatsObservation {
+    frames_dropped: u32,
+    fragments_lost: u32,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -362,6 +384,10 @@ async fn handle_client(
     // flag breaks the send loop out of its idle wait on a quiet desktop,
     // where `frames.recv` would otherwise block past disconnect detection.
     let send_shutdown = Arc::new(AtomicBool::new(false));
+    // Drop-oldest single-slot mailbox for the most recent `ClientStats`
+    // window. Written by the control recv task, drained by the
+    // encode-and-send thread on each loop iteration.
+    let latest_client_stats: LatestClientStats = Arc::new(StdMutex::new(None));
     // `stream_ready`: gate at the head of the send loop. The client
     // signals it has built its decoders by sending
     // `ControlMessage::StreamReady`; until then we drop captured frames
@@ -372,6 +398,7 @@ async fn handle_client(
     let force_idr_for_send = force_idr.clone();
     let send_shutdown_for_thread = send_shutdown.clone();
     let stream_ready_for_thread = stream_ready.clone();
+    let latest_client_stats_for_send = latest_client_stats.clone();
     // Keyframes ride a reliable per-IDR QUIC unidirectional stream
     // rather than the unreliable datagram path used for P-frames.
     // The sync send thread is not a tokio worker, so it calls into
@@ -403,6 +430,7 @@ async fn handle_client(
                 stream_ready_for_thread,
                 runtime_handle_for_send,
                 conn_keyframe,
+                latest_client_stats_for_send,
             )
         })?;
 
@@ -434,6 +462,7 @@ async fn handle_client(
         let conn = conn.clone();
         let force_idr = force_idr.clone();
         let stream_ready_ctl = stream_ready.clone();
+        let latest_client_stats_for_ctl = latest_client_stats.clone();
         tasks.spawn(async move {
             loop {
                 match conn.recv_control().await {
@@ -466,9 +495,6 @@ async fn handle_client(
                         fragments_lost,
                         rtt_ewma_us,
                     }) => {
-                        // No adaptive policy yet — log only. When the
-                        // host learns to act on these, it consumes the
-                        // counters here and feeds the rate controller.
                         info!(
                             interval_ms,
                             frames_received,
@@ -477,6 +503,16 @@ async fn handle_client(
                             rtt_ewma_us,
                             "client stats"
                         );
+                        // Drop-oldest: the ABR controller only needs
+                        // the most recent window. If the send thread
+                        // hasn't drained yet (slow encoder loop), the
+                        // older sample is discarded — we'd rather act
+                        // on fresh telemetry than queue stale data.
+                        *latest_client_stats_for_ctl.lock().unwrap() =
+                            Some(ClientStatsObservation {
+                                frames_dropped,
+                                fragments_lost,
+                            });
                     }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
                         let t1 = MonoNanos::now();
@@ -678,6 +714,13 @@ struct EncoderSlot {
     encoder: Box<dyn Encoder>,
     width: u32,
     height: u32,
+    /// Adaptive bitrate state. `None` if the encoder reports
+    /// `supports_changing_bitrate() == false` — we still send video,
+    /// we just don't try to retune. A resolution change destroys the
+    /// whole slot (and the controller along with it), which is the
+    /// right reset point: the cumulative quinn counters keep ticking
+    /// but a freshly-built encoder starts at its own baseline.
+    abr: Option<AbrState>,
     /// Lazily-built BGRA→NV12 + DMA-BUF bridge for the zero-copy
     /// capture→encode path. `NotYetBuilt` while the stream is SHM-only
     /// or before any Gpu frame has been seen; `Ready` after the first
@@ -689,6 +732,19 @@ struct EncoderSlot {
     /// silent per-frame drop.
     #[cfg(target_os = "linux")]
     bridge: BridgeState,
+}
+
+/// Per-encoder adaptive bitrate state.
+struct AbrState {
+    controller: AbrController,
+    /// Snapshot of quinn's cumulative path counters at the previous
+    /// `observe` call. The controller takes deltas itself.
+    last_quinn: AbrSnapshot,
+    /// Wall-clock instant of the previous `observe` call.
+    last_observed_at: Instant,
+    /// Bitrate currently programmed into the encoder. Lets us skip
+    /// the syscall when the controller hasn't moved.
+    last_applied_kbps: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -1047,6 +1103,61 @@ fn yuv444_dmabuf_to_codec_frame(out: Yuv444DmaBufFrame) -> DmaBufFrame {
     }
 }
 
+/// Fold one observation into the encoder's ABR controller and apply
+/// the resulting bitrate target if it changed. No-op when the encoder
+/// reports `supports_changing_bitrate() == false` (slot.abr is None).
+fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObservation) {
+    let Some(abr) = slot.abr.as_mut() else {
+        return;
+    };
+    let now = Instant::now();
+    let dt = now.saturating_duration_since(abr.last_observed_at);
+    let quinn = conn.quinn_stats();
+    let sample = AbrSample {
+        rtt: quinn.rtt,
+        congestion_events_delta: quinn
+            .congestion_events
+            .saturating_sub(abr.last_quinn.congestion_events),
+        lost_packets_delta: quinn
+            .lost_packets
+            .saturating_sub(abr.last_quinn.lost_packets),
+        client_fragments_lost: stats.fragments_lost,
+        client_frames_dropped: stats.frames_dropped,
+    };
+    abr.last_quinn = quinn;
+    abr.last_observed_at = now;
+    let decision = abr.controller.observe(dt, sample);
+    if decision.target_kbps != abr.last_applied_kbps {
+        match slot.encoder.set_bitrate_kbps(decision.target_kbps) {
+            Ok(()) => {
+                info!(
+                    from_kbps = abr.last_applied_kbps,
+                    to_kbps = decision.target_kbps,
+                    rtt_ms = sample.rtt.as_millis() as u64,
+                    congestion_events_delta = sample.congestion_events_delta,
+                    lost_packets_delta = sample.lost_packets_delta,
+                    client_fragments_lost = sample.client_fragments_lost,
+                    client_frames_dropped = sample.client_frames_dropped,
+                    "abr: bitrate retuned"
+                );
+                abr.last_applied_kbps = decision.target_kbps;
+            }
+            Err(e) => {
+                // The controller already advanced its internal gear
+                // (cooldown reset, current = target). Sync our
+                // tracking variable to that so the controller and
+                // the integrator agree on "current" — otherwise the
+                // next loop tries the *same* failing target again
+                // each iteration while the controller has already
+                // moved on. The encoder stays at whatever bitrate it
+                // last accepted, which is the safest fallback.
+                warn!(error = %e, target_kbps = decision.target_kbps, "abr: set_bitrate_kbps failed; reconciling tracking with controller state");
+                abr.last_applied_kbps = decision.target_kbps;
+            }
+        }
+    }
+}
+
 fn run_capture_and_send(
     conn: Arc<Connection>,
     frames: Receiver<CapturedFrame>,
@@ -1057,6 +1168,7 @@ fn run_capture_and_send(
     stream_ready: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
     keyframe_conn: Arc<Connection>,
+    latest_client_stats: LatestClientStats,
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
@@ -1135,12 +1247,14 @@ fn run_capture_and_send(
             // require coordinated client decoder rebuild. We pass the
             // list-form for API symmetry with the initial handshake
             // probe; per-resize cost is one construction attempt.
+            let baseline_kbps =
+                derive_bitrate_kbps(chosen_profile, frame_width, frame_height, ENCODER_FPS);
             slot = match build_encoder(
                 chosen_profile,
                 frame_width,
                 frame_height,
                 ENCODER_FPS,
-                derive_bitrate_kbps(chosen_profile, frame_width, frame_height, ENCODER_FPS),
+                baseline_kbps,
             ) {
                 Ok((_profile, e)) => {
                     info!(
@@ -1152,12 +1266,24 @@ fn run_capture_and_send(
                         width = frame_width,
                         height = frame_height,
                         fps = ENCODER_FPS,
+                        baseline_kbps,
+                        abr = e.supports_changing_bitrate(),
                         "encoder initialised"
                     );
+                    let abr = e.supports_changing_bitrate().then(|| AbrState {
+                        controller: AbrController::new(AbrConfig::new(
+                            baseline_kbps,
+                            ENCODER_FPS,
+                        )),
+                        last_quinn: conn.quinn_stats(),
+                        last_observed_at: Instant::now(),
+                        last_applied_kbps: baseline_kbps,
+                    });
                     Some(EncoderSlot {
                         encoder: e,
                         width: frame_width,
                         height: frame_height,
+                        abr,
                         #[cfg(target_os = "linux")]
                         bridge: BridgeState::NotYetBuilt,
                     })
@@ -1193,6 +1319,15 @@ fn run_capture_and_send(
             };
         }
         let slot_mut = slot.as_mut().expect("slot populated above");
+
+        // ABR tick. Only fires when the client has reported a fresh
+        // window; ClientStats arrives at ~1 Hz, the encode loop runs at
+        // ~60 Hz, so most iterations bypass this entirely. Quinn's
+        // cumulative counters are read here so the controller sees a
+        // snapshot that's coherent with the client's window.
+        if let Some(stats) = latest_client_stats.lock().unwrap().take() {
+            tick_abr(slot_mut, &conn, stats);
+        }
 
         // Swap-and-zero: at most one forced keyframe per request, even
         // if multiple ForceIdr messages arrive between encode calls.

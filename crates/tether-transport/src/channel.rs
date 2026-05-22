@@ -168,4 +168,26 @@ pub trait ConnectionInfo: Send + Sync {
     fn rtt(&self) -> Duration;
     fn max_datagram_size(&self) -> Option<usize>;
     fn remote_address(&self) -> SocketAddr;
+    /// Path-level transport stats relevant to adaptive bitrate. Kept
+    /// behind a small `Copy` struct so the trait doesn't leak
+    /// `quinn::ConnectionStats` — that would force every implementer
+    /// (including the duplex test fake) to construct a quinn type
+    /// they have no underlying state for. The fields are cumulative
+    /// counters; the ABR controller takes deltas itself.
+    fn quinn_stats(&self) -> AbrSnapshot;
+}
+
+/// Cumulative path-level transport counters for the ABR controller.
+///
+/// All fields are monotonic from connection start. The caller takes
+/// deltas against the previous snapshot before feeding the controller.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AbrSnapshot {
+    /// Quinn's current RTT estimate.
+    pub rtt: Duration,
+    /// Cumulative count of congestion events on the active path.
+    pub congestion_events: u64,
+    /// Cumulative count of packets quinn has marked lost on the
+    /// active path.
+    pub lost_packets: u64,
 }

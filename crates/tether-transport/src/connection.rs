@@ -14,7 +14,7 @@ use tether_protocol::{
 };
 use tether_protocol::MonoNanos;
 
-use crate::channel::{ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
+use crate::channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
 use crate::{Result, TransportError, MAX_FRAMED_MESSAGE, MAX_VIDEO_STREAM_MESSAGE};
 
 /// Length of the per-stream preamble written by the client and consumed by
@@ -99,6 +99,17 @@ impl Connection {
 
     pub fn remote_address(&self) -> SocketAddr {
         self.conn.remote_address()
+    }
+
+    /// Snapshot of the quinn path stats relevant to adaptive bitrate.
+    /// Cumulative counters; the ABR controller takes deltas itself.
+    pub fn quinn_stats(&self) -> AbrSnapshot {
+        let path = self.conn.stats().path;
+        AbrSnapshot {
+            rtt: path.rtt,
+            congestion_events: path.congestion_events,
+            lost_packets: path.lost_packets,
+        }
     }
 
     /// Send a datagram. Sync: quinn buffers datagrams without yielding,
@@ -347,6 +358,9 @@ impl ConnectionInfo for Connection {
     }
     fn remote_address(&self) -> SocketAddr {
         Connection::remote_address(self)
+    }
+    fn quinn_stats(&self) -> AbrSnapshot {
+        Connection::quinn_stats(self)
     }
 }
 

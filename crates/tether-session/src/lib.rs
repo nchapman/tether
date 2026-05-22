@@ -11,11 +11,13 @@
 //! orchestration (handshake, fragmenter ownership, the recv-task
 //! JoinSet) will move in here too.
 
+pub mod abr;
 pub mod client;
 pub mod host;
 mod idr;
 mod stats;
 
+pub use abr::{AbrConfig, AbrController, AbrDecision, AbrSample};
 pub use client::{ClientSession, ClientSessionConfig, ConnectError};
 pub use host::{AcceptError, HostSession, HostSessionConfig};
 pub use idr::IdrSignal;

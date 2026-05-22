@@ -31,6 +31,54 @@ fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
     data
 }
 
+/// macOS sibling of `vaapi_set_bitrate_live_continues_to_encode`.
+/// Verifies that `Encoder::set_bitrate_kbps` succeeds mid-stream on
+/// VideoToolbox and the encoder keeps producing decodable packets
+/// afterwards. The ABR controller relies on this property.
+#[test]
+#[ignore = "requires macOS + VideoToolbox (run on Apple Silicon / Intel mac with: cargo test -p tether-codec --ignored videotoolbox_set_bitrate_live_continues_to_encode)"]
+fn videotoolbox_set_bitrate_live_continues_to_encode() {
+    let w = 640;
+    let h = 480;
+    let mut enc = VideoToolboxEncoder::new(yuv420_8bit(CodecKind::H264), w, h, 30, 4_000)
+        .expect("VideoToolbox encoder");
+    assert!(
+        enc.supports_changing_bitrate(),
+        "VideoToolbox encoder is expected to advertise bitrate-change support"
+    );
+    let mut dec =
+        VideoToolboxDecoder::new(CodecKind::H264).expect("VideoToolbox decoder");
+
+    for t in 0..4i64 {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_test_bgra(w, h, t as u32);
+        let packets = enc.encode_bgra(&bgra, t, t == 0).expect("encode pre");
+        for p in packets {
+            dec.submit(&p.data).expect("decode pre");
+            while dec.next_frame().expect("next_frame pre").is_some() {}
+        }
+    }
+
+    enc.set_bitrate_kbps(1_500).expect("live retune");
+
+    let mut got_post: Option<Frame> = None;
+    for t in 4..10i64 {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_test_bgra(w, h, t as u32);
+        let packets = enc.encode_bgra(&bgra, t, t == 4).expect("encode post");
+        for p in packets {
+            dec.submit(&p.data).expect("decode post");
+            while let Some(f) = dec.next_frame().expect("next_frame post") {
+                got_post = Some(f);
+            }
+        }
+    }
+    assert!(
+        got_post.is_some(),
+        "decoder produced no frames after live bitrate change"
+    );
+}
+
 #[test]
 #[ignore = "requires macOS + VideoToolbox (run on Apple Silicon / Intel mac with: cargo test -p tether-codec --ignored videotoolbox)"]
 fn videotoolbox_encoder_smoke() {

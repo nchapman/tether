@@ -3,6 +3,67 @@ use crate::{Decoder, Encoder, Frame, GpuFrame, GpuFrameSource};
 
 use super::{VaapiDecoder, VaapiEncoder};
 
+/// Confirms that `Encoder::set_bitrate_kbps` succeeds mid-stream and
+/// the encoder keeps emitting decodable packets afterwards. ABR relies
+/// on this — if a live retune broke the stream, the controller would
+/// strand the session on whatever bitrate it last picked. Encode N
+/// frames at the baseline, change bitrate, encode N more, decode
+/// through VAAPI and assert the decoder produced a frame.
+#[test]
+#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_set_bitrate_live_continues_to_encode)"]
+fn vaapi_set_bitrate_live_continues_to_encode() {
+    let w = 640;
+    let h = 480;
+    let mut enc = VaapiEncoder::new(
+        tether_protocol::control::VideoProfile::H264_8BIT_420,
+        w,
+        h,
+        30,
+        4_000,
+    )
+    .expect("VAAPI encoder");
+    assert!(
+        enc.supports_changing_bitrate(),
+        "VAAPI encoder is expected to advertise bitrate-change support"
+    );
+    let mut dec =
+        VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
+
+    // Pre-retune: a few frames at baseline.
+    for t in 0..4i64 {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_test_bgra(w, h, t as u32);
+        let packets = enc.encode_bgra(&bgra, t, t == 0).expect("encode pre");
+        for p in packets {
+            dec.submit(&p.data).expect("decode pre");
+            while dec.next_frame().expect("next_frame pre").is_some() {}
+        }
+    }
+
+    // Mid-stream retune — the new value is intentionally far from the
+    // initial so the encoder visibly changes character.
+    enc.set_bitrate_kbps(1_500).expect("live retune");
+
+    // Post-retune: keep encoding + decoding, force one IDR so the
+    // decoder picks up the new parameter set cleanly.
+    let mut got_post: Option<crate::Frame> = None;
+    for t in 4..10i64 {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_test_bgra(w, h, t as u32);
+        let packets = enc.encode_bgra(&bgra, t, t == 4).expect("encode post");
+        for p in packets {
+            dec.submit(&p.data).expect("decode post");
+            while let Some(f) = dec.next_frame().expect("next_frame post") {
+                got_post = Some(f);
+            }
+        }
+    }
+    assert!(
+        got_post.is_some(),
+        "decoder produced no frames after live bitrate change"
+    );
+}
+
 #[test]
 #[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi)"]
 fn vaapi_encoder_smoke() {

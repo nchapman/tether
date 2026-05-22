@@ -31,7 +31,7 @@ pub mod tls;
 #[doc(hidden)]
 pub mod test_support;
 
-pub use channel::{ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
+pub use channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
 pub use client::Client;
 pub use connection::{Connection, Datagram};
 pub use handshake::{ClientHelloReceived, HostHandshake};

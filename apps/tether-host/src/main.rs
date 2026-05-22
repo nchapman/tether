@@ -761,12 +761,6 @@ struct EncoderSlot {
     /// equals the letterboxed-and-aligned viewport.
     width: u32,
     height: u32,
-    /// `(Viewport, seq)` of the viewport directive that produced
-    /// `width`/`height`. `seq == 0` means "no viewport in effect."
-    /// The send loop compares `seq` against the shared mailbox to
-    /// detect mid-session resize requests without diffing the
-    /// Viewport itself.
-    viewport_seq: u64,
     /// Adaptive bitrate state. `None` if the encoder reports
     /// `supports_changing_bitrate() == false` — we still send video,
     /// we just don't try to retune. A resolution change destroys the
@@ -1739,7 +1733,6 @@ fn run_capture_and_send(
                         capture_height: frame_height,
                         width: encode_width,
                         height: encode_height,
-                        viewport_seq: current_viewport_seq,
                         abr,
                         #[cfg(target_os = "linux")]
                         bridge: BridgeState::NotYetBuilt,

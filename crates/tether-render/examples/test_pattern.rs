@@ -4,13 +4,14 @@
 
 use std::time::Duration;
 
-use crossbeam_channel::bounded;
-use tether_render::{CpuFrame, Frame};
+use tether_protocol::control::{ChromaSubsampling, VideoColorSpec};
+use tether_render::{CpuFrame, Frame, LatestFrame};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let (tx, rx) = bounded::<Frame>(2);
+    let frames = LatestFrame::new();
+    let producer = frames.clone();
 
     std::thread::spawn(move || {
         let (w, h) = (800u32, 600u32);
@@ -18,14 +19,23 @@ fn main() -> anyhow::Result<()> {
         loop {
             let frame = test_pattern(w, h, t);
             t = t.wrapping_add(1);
-            if tx.send(frame).is_err() {
-                break;
-            }
+            // Drop-oldest: the renderer always pulls the freshest
+            // frame. Displaced frames are discarded since this is a
+            // synthetic source with no drop accounting.
+            let _ = producer.set(frame);
             std::thread::sleep(Duration::from_millis(16));
         }
     });
 
-    tether_render::run("tether-render test pattern", (800, 600), rx, None)?;
+    tether_render::run(
+        "tether-render test pattern",
+        (800, 600),
+        VideoColorSpec::sdr_desktop(),
+        ChromaSubsampling::Yuv420,
+        8,
+        frames,
+        None,
+    )?;
     Ok(())
 }
 

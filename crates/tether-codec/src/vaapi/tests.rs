@@ -122,9 +122,13 @@ fn vaapi_decoder_smoke() {
     let frame = got.expect("decoder produced a frame within six input frames");
     assert_eq!(frame.width, w);
     assert_eq!(frame.height, h);
-    let GpuFrameSource::DmaBuf(dmabuf) = frame.source else {
-        panic!("expected DmaBuf source on Linux VAAPI");
-    };
+    // `GpuFrameSource` only has the `DmaBuf` variant on Linux (the
+    // `IOSurface` variant is `cfg(target_os = "macos")`), so this
+    // destructure is irrefutable here. Kept as a single binding
+    // rather than a `match` so the test focuses on the assertions
+    // below; if a future Linux-side variant lands, the compiler
+    // will force a refactor.
+    let GpuFrameSource::DmaBuf(dmabuf) = frame.source;
     // SEPARATE_LAYERS gives NV12 two planes (Y, UV). Each layer
     // points at one object (might be the same fd with different
     // offsets, or two distinct fds) so we expect 2 layers and at

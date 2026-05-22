@@ -34,7 +34,7 @@ use tether_protocol::control::{
     SERVER_ENCODE_PROFILE_EXTENSION_KEY,
 };
 use tether_protocol::MonoNanos;
-use tether_transport::{ControlChannel, TransportError};
+use tether_transport::{ControlChannel, HostHandshake, TransportError};
 use tracing::{info, warn};
 
 use crate::idr::IdrSignal;
@@ -141,12 +141,13 @@ impl HostSession {
     where
         S: FnOnce(&[VideoProfile]) -> Option<VideoProfile>,
     {
-        // Step 1: receive the ClientHello and capture t1_server_recv.
-        // The trait stamps t1 internally so the timing is consistent
-        // across real and test implementations.
-        let (client_hello, t1) = channel.recv_client_hello().await?;
+        // Step 1: receive the ClientHello. The typestate wrapper owns
+        // the channel across the handshake and captures `t1_server_recv`
+        // internally — there is no syntactic path to call
+        // `send_server_hello` without first reaching the `received`
+        // state, and no path to call either method twice.
+        let (client_hello, pending) = HostHandshake::new(channel).recv_client_hello().await?;
         let ClientHello::V1(client_body) = client_hello;
-        let client_t0 = client_body.clock_probe_t0;
 
         let client_decode_profiles = parse_client_decode_profiles(&client_body);
         info!(
@@ -164,12 +165,11 @@ impl HostSession {
         // send a syntactically valid ServerHello (with the H.264
         // floor as placeholder) so the client's wire parser doesn't
         // trip on a future variant before it processes the Goodbye
-        // we're about to send. The trait stamps t0_echo + t1 + t2
-        // immediately before serialize+write.
+        // we're about to send. The typestate stamps t0_echo + t1 + t2
+        // immediately before serialize+write, then returns the channel
+        // back for post-handshake use.
         let server_hello = ServerHello::V1(build_server_hello(&cfg, chosen_profile));
-        channel
-            .send_server_hello(server_hello, client_t0, t1)
-            .await?;
+        let channel = pending.send_server_hello(server_hello).await?;
 
         // Step 4: on no-match, send Goodbye and bail.
         let Some(chosen_profile) = chosen_profile else {

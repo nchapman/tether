@@ -57,10 +57,13 @@ use crate::{Datagram, Result};
 ///
 /// **Ordering contract** on the host side: [`recv_client_hello`] must
 /// be called exactly once before [`send_server_hello`] is called. The
-/// trait does not enforce this — the orchestrator wraps the channel in
-/// a typestate inside `tether_session` so callers can't misuse the
-/// trait. Test doubles are free to assume the contract holds and
-/// panic if it doesn't.
+/// trait does not enforce this on its own — orchestration code must
+/// route through [`crate::HostHandshake`] / [`crate::ClientHelloReceived`],
+/// which encode the ordering as a typestate that makes the misuse
+/// uncompilable. The trait methods stay public because the
+/// [`crate::Connection`] impl is public; the runtime regression test
+/// `double_send_server_hello_corrupts_the_stream` covers the
+/// trait-direct path that a misbehaving impl could still hit.
 ///
 /// [`recv_client_hello`]: ControlChannel::recv_client_hello
 /// [`send_server_hello`]: ControlChannel::send_server_hello

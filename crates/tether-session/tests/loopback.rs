@@ -13,8 +13,7 @@
 use std::sync::Arc;
 
 use tether_protocol::control::{
-    ChromaSubsampling, ClientHello, CodecKind, ControlMessage, GoodbyeCode, ServerHello,
-    VideoProfile,
+    ChromaSubsampling, ClientHello, CodecKind, ServerHello, VideoProfile,
 };
 use tether_session::{
     AcceptError, ClientSession, ClientSessionConfig, ConnectError, HostSession, HostSessionConfig,

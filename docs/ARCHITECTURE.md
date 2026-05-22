@@ -419,7 +419,14 @@ The handshake is split across two `ControlChannel` methods —
 Splitting at that seam keeps the clock-sync stamps inside the wire
 layer (so a slow `HostSession` orchestration step still produces a
 late `t2`) while profile-negotiation policy stays in the session
-layer. App binaries hold an `Arc<Connection>` for the recv tasks
+layer. The trait methods carry an unenforced ordering invariant (recv
+once before send once); orchestration code routes through the
+`HostHandshake` → `ClientHelloReceived` typestate in
+`tether-transport::handshake`, which owns the `Arc<dyn ControlChannel>`
+across the two transitions and consumes itself on each step — making
+double-send and send-before-recv uncompilable rather than runtime
+bugs. The channel is returned out of `send_server_hello` so the
+caller can resume post-handshake control-message exchange. App binaries hold an `Arc<Connection>` for the recv tasks
 (video / input / datagram are outside the `ControlChannel` surface)
 and pass a coerced `Arc<dyn ControlChannel>` into the session call
 only.

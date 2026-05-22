@@ -23,6 +23,7 @@
 mod channel;
 mod client;
 mod connection;
+mod handshake;
 mod server;
 pub mod tls;
 
@@ -33,6 +34,7 @@ pub mod test_support;
 pub use channel::{ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
 pub use client::Client;
 pub use connection::{Connection, Datagram};
+pub use handshake::{ClientHelloReceived, HostHandshake};
 pub use server::Server;
 pub use tls::CertFingerprint;
 

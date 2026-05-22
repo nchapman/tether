@@ -70,10 +70,12 @@ pub fn linear_to_srgb(c: f32) -> f32 {
     }
 }
 
-/// Hard ceiling on the per-axis tap count. Mirrors `MAX_TAPS` in
-/// `shader.wgsl`. At downscale ratios where `4 * scale > MAX_TAPS`, the
-/// scaler routes through additional mipmap prefilter levels instead of
-/// stretching the kernel further.
+/// Hard ceiling on the per-axis tap count. Enforced in
+/// [`crate::scaler`] before pipeline dispatch — at downscale ratios
+/// where `4 * scale > MAX_TAPS`, the scaler routes through additional
+/// mipmap prefilter levels instead of stretching the kernel further.
+/// The shader receives `n_taps` as a uniform and has no compile-time
+/// bound of its own.
 pub const MAX_TAPS: u32 = 32;
 
 /// Tap count for a given downscale ratio (`scale >= 1` means

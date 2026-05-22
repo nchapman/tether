@@ -172,7 +172,8 @@ fn import_biplanar(
 /// ffmpeg's `vaapi_drm_format_map` has no DRM_PRIME entry for
 /// planar 4:4:4 8-bit, so libavcodec returns the packed XYUV form
 /// regardless of how the driver allocated the surface internally.
-/// (See `bgra_to_yuv444.wgsl` for the matching encoder-side rationale.)
+/// (See `tether-gpuconvert/src/bgra_to_yuv444.wgsl` for the matching
+/// encoder-side rationale.)
 fn import_yuv444_packed(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,

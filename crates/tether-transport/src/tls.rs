@@ -1,6 +1,6 @@
 //! Self-signed certificate generation + fingerprint-pinning verifier.
 //!
-//! v0 security model: the host generates a fresh self-signed cert at
+//! Trust model: the host generates a fresh self-signed cert at
 //! startup. Its SHA-256 fingerprint is exchanged out of band (user pastes
 //! it into the client, scans a QR code, etc.). The client pins that
 //! fingerprint via [`PinnedCertVerifier`] and accepts no other cert.

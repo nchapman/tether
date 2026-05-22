@@ -49,7 +49,7 @@ impl VaError {
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
-        Self { status: status as i32, message: msg }
+        Self { status, message: msg }
     }
 }
 

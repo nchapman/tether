@@ -82,7 +82,7 @@ impl Client {
 
     /// Connect to a server. `server_name` is the SNI / TLS server name —
     /// our self-signed cert is issued with SANs `["tether-host",
-    /// "localhost"]` so either works in v0. `expected_fingerprint` is the
+    /// "localhost"]` so either works. `expected_fingerprint` is the
     /// SHA-256 of the server's DER cert, exchanged out of band.
     pub async fn connect(
         &self,
@@ -152,12 +152,13 @@ fn transport_config() -> quinn::TransportConfig {
             .try_into()
             .expect("30s fits in IdleTimeout"),
     ));
-    // Match the server's headroom; see server.rs for rationale. The send
-    // buffer is currently unused on the client (v0 only sends control
-    // stream traffic; no client→host datagrams yet) but is pre-provisioned
-    // for the input + cursor datagram channels that land with
-    // tether-input. Total budget is ~12 MiB per connection — fine on
-    // desktop targets, would need trimming on embedded.
+    // Match the server's headroom; see server.rs for rationale. The
+    // datagram send buffer is currently unused on the client (control
+    // and input both ride reliable streams today; no client→host
+    // datagrams) but is pre-provisioned for the cursor datagram channel
+    // that lands with tether-input. Total budget is ~12 MiB per
+    // connection — fine on desktop targets, would need trimming on
+    // embedded.
     t.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     t.datagram_send_buffer_size(4 * 1024 * 1024);
     // Cap host→client uni streams. The client accepts these for the

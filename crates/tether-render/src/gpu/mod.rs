@@ -264,9 +264,10 @@ pub(crate) struct UpscaleStage {
 ///   4:4:4 from VT HEVC Main 4:4:4 10-bit decode), `'xf44'` (same
 ///   shape via SCK capture), and Linux's `DRM_FORMAT_P010`/`P410`
 ///   dma-bufs all land here. Same bind-group layout + same shader
-///   as Biplanar8 — the `luma_scale` uniform in `color_params`
-///   compensates the MSB-align so max-value samples normalise to
-///   1.0 instead of `≈0.999`.
+///   as Biplanar8 — the `range_kind` uniform in `color_params`
+///   selects the 10-bit limited-range branch, which compensates the
+///   MSB-align so max-value samples normalise to 1.0 instead of
+///   `≈0.999`.
 /// - **PackedXYUV** = one Rgba8 texture with byte order V/U/Y/X.
 ///   Only the Linux dma-buf path for Yuv444 8-bit — VAAPI's 4:4:4
 ///   8-bit surfaces are exposed this way and the shader pulls Y

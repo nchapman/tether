@@ -1,15 +1,18 @@
 //! Linux screen capture via the xdg-desktop-portal ScreenCast portal +
 //! PipeWire.
 //!
-//! v0: CPU-side BGRA / BGRx readback only. DMA-BUF zero-copy into a VAAPI
-//! surface lands later and will let the encoder consume the frame without
-//! a memory copy.
+//! Frames arrive as either DMA-BUF (zero-copy into wgpu / VAAPI via the
+//! [`crate::GpuCapturedSource::DmaBuf`] path) or CPU-side BGRA / BGRx
+//! when the compositor falls back to SHM.
 //!
 //! Calling [`start`] performs the portal handshake (which triggers a
 //! permission dialog on the user's desktop) and then spawns a dedicated
 //! thread running PipeWire's main loop. Frames are pushed into a bounded
-//! crossbeam channel. The thread currently has no clean shutdown path
-//! when the receiver is dropped; this is a documented v0 limitation.
+//! crossbeam channel. The thread has no graceful shutdown signal when
+//! the receiver is dropped — it waits until the process exits. Wiring
+//! `mainloop.quit()` through a clone of `MainLoopRc` in `UserData` would
+//! fix that; deferred because we don't yet have a host shutdown path
+//! that needs it (capture stays up for the process lifetime today).
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -291,10 +294,11 @@ fn run_pipewire(
                     tracing::trace!("capture consumer slow, dropping frame");
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    // TODO(linux-capture): signal mainloop.quit() so the
-                    // thread exits when the receiver drops. Requires
-                    // cloning MainLoopRc into UserData. v0 lets the thread
-                    // run until process exit.
+                    // Receiver is gone but the PipeWire mainloop has no
+                    // graceful-quit signal from here. Hooking
+                    // `mainloop.quit()` in needs a `MainLoopRc` clone
+                    // captured in `UserData`; not done yet because
+                    // capture lives for the process lifetime today.
                     tracing::debug!("capture receiver dropped; thread will exit on process exit");
                 }
             }

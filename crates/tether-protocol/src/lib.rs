@@ -1039,6 +1039,14 @@ mod tests {
     }
 
     #[test]
+    fn unknown_audio_packet_variant_fails_decode() {
+        // Opus is discriminator 0 (the only defined variant).
+        // Discriminator 1 is unknown.
+        let bytes = [1u8, 0, 0, 0, 0];
+        assert!(decode::<crate::audio::AudioPacket>(&bytes).is_err());
+    }
+
+    #[test]
     fn reassembler_drops_cross_epoch_fragments() {
         // ARCHITECTURE.md invariant: "stream_epoch bumped on encoder
         // restart; defragmenter drops cross-epoch fragments." Without

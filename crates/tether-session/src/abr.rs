@@ -186,6 +186,19 @@ impl Gear {
         true
     }
 
+    /// Halve toward floor in one coarse step. Used by the FPS gear on a
+    /// client-side dropped-frame signal: a renderer that can't keep up
+    /// at 60 isn't going to recover from a 10% nudge.
+    fn halve_toward_floor(&mut self) -> bool {
+        let next = (self.current / 2).max(self.floor);
+        if next == self.current {
+            return false;
+        }
+        self.current = next;
+        self.elapsed_since_change = Duration::ZERO;
+        true
+    }
+
     fn tick(&mut self, dt: Duration) {
         self.elapsed_since_change = self.elapsed_since_change.saturating_add(dt);
     }
@@ -288,14 +301,7 @@ impl AbrController {
         // client is *also* dropping frames, which means encoding
         // faster wouldn't help.
         if sample.client_frames_dropped > 0 && cooled(&self.fps) {
-            // Halve toward the floor in coarse steps. A renderer that
-            // can't keep up at 60 isn't going to recover from a 10%
-            // nudge.
-            let next = (self.fps.current / 2).max(self.fps.floor);
-            if next != self.fps.current {
-                self.fps.current = next;
-                self.fps.elapsed_since_change = Duration::ZERO;
-            }
+            self.fps.halve_toward_floor();
         } else if healthy
             && cooled(&self.fps)
             && self.healthy_run.consecutive >= self.cfg.healthy_samples_for_step_up

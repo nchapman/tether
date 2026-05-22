@@ -9,12 +9,15 @@
 //! [`super::enigo_backend::EnigoBackend`] and is shared with the
 //! macOS (CGEvent) backend.
 //!
-//! v0 limitations:
+//! Known gaps (acceptable for the current input contract, both need
+//! protocol additions to fix):
 //!   - Display size is sampled once at connect time and never refreshed,
 //!     so a monitor hot-plug or scale change between sessions will
-//!     misplace the cursor until the operator reconnects.
-//!   - Scroll is forwarded as integer ticks; the precise pixel-delta
-//!     mode used by trackpads is rounded.
+//!     misplace the cursor until the operator reconnects. Fixing this
+//!     needs a `ServerNotifyDisplayChange` control-message variant.
+//!   - Scroll is forwarded as integer ticks; trackpad sub-tick precision
+//!     is quantised. Fixing this needs libei's high-resolution-scroll
+//!     axis carried through `ScrollKind` on the wire.
 
 use std::ffi::CString;
 use std::os::fd::RawFd;

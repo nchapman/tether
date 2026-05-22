@@ -62,8 +62,9 @@ use crate::{Datagram, Result};
 /// which encode the ordering as a typestate that makes the misuse
 /// uncompilable. The trait methods stay public because the
 /// [`crate::Connection`] impl is public; the runtime regression test
-/// `double_send_server_hello_corrupts_the_stream` covers the
-/// trait-direct path that a misbehaving impl could still hit.
+/// `double_send_server_hello_corrupts_the_stream` (in
+/// `tether-session/tests/loopback.rs`) covers the trait-direct path
+/// that a misbehaving impl could still hit.
 ///
 /// [`recv_client_hello`]: ControlChannel::recv_client_hello
 /// [`send_server_hello`]: ControlChannel::send_server_hello
@@ -98,7 +99,8 @@ pub trait ControlChannel: Send + Sync {
     /// box, or hitting a not-yet-warmed probe cache) produces ~5 ms
     /// of phantom — detectable in the
     /// `happy_path_handshake_completes_with_negotiated_profile`
-    /// loopback test, which asserts `offset_nanos.abs() < 10ms`.
+    /// loopback test (in `tether-session/tests/loopback.rs`), which
+    /// asserts `offset_nanos.abs() < 10ms`.
     /// Sleep / async I/O between the two calls is now syntactically
     /// permitted by the trait shape (the old single-method
     /// `host_handshake` took a sync `FnOnce` closure that couldn't

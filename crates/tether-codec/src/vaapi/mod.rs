@@ -28,19 +28,15 @@
 //! ---
 //!
 //! Spike result, kept here so the next person doesn't redo the experiment:
-//!
-//! We tested whether `h264_vaapi` accepts a `sw_format=BGR0` hwframes
-//! pool, hoping the driver would do implicit BGRA→NV12 at encode time
-//! (which would let the PipeWire DMA-BUF capture path skip an explicit
-//! conversion step). On Intel iHD / Meteor Lake / Mesa 26.1.5,
-//! `encoder.open()` returned EINVAL with the log line
-//! "No usable encoding profile found" — the H.264 encoder entrypoint is
-//! YUV-only across Intel, AMD, and NVIDIA's nvidia-vaapi-driver shim
-//! (NVENC is YUV-only under the hood). So capture-side BGRA→NV12
-//! conversion must be explicit. The plan: wgpu compute shader that
-//! writes Y (R8) + UV (Rg8) storage textures, exported as DMA-BUFs and
-//! re-imported into VAAPI via the same `submit_dmabuf` path the test
-//! below already exercises.
+//! `h264_vaapi` does *not* accept a `sw_format=BGR0` hwframes pool. We
+//! tried that hoping the driver would do implicit BGRA→NV12 at encode
+//! time, but on Intel iHD / Meteor Lake / Mesa 26.1.5, `encoder.open()`
+//! returns EINVAL with "No usable encoding profile found"; the H.264
+//! encoder entrypoint is YUV-only across Intel, AMD, and NVIDIA's
+//! nvidia-vaapi-driver shim (NVENC is YUV-only under the hood). The
+//! explicit BGRA→NV12 wgpu compute pass in `tether-gpuconvert` is the
+//! resulting design: it writes Y (R8) + UV (Rg8) into a shared DMA-BUF
+//! that `submit_dmabuf` re-imports via DRM_PRIME → VAAPI.
 
 mod decoder;
 mod encoder;

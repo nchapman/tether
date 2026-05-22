@@ -5,14 +5,14 @@
 //! receiver shuts the producer down. A `Capturer` trait will land once
 //! we have multiple real backends that need runtime selection.
 //!
-//! Backends planned but not yet implemented:
-//! - `linux` — PipeWire + xdg-desktop-portal (DMA-BUF zero-copy aim)
-//! - `macos` — type seam in place ([`CapturedIOSurface`]);
-//!   ScreenCaptureKit backend lands in the next phase.
-//!
-//! [`test_pattern`] is always available and produces synthetic frames
-//! at a fixed cadence. It exists so the walking skeleton and headless
-//! tests can exercise the pipeline without a display server.
+//! Backends:
+//! - [`linux`] — PipeWire + xdg-desktop-portal; advertises DMA-BUF and
+//!   SHM alternatives and produces zero-copy DMA-BUF frames when the
+//!   compositor agrees.
+//! - [`macos`] — ScreenCaptureKit producing zero-copy IOSurface frames.
+//! - [`test_pattern`] is always available and produces synthetic frames
+//!   at a fixed cadence so the walking skeleton and headless tests can
+//!   exercise the pipeline without a display server.
 
 pub mod cursor;
 pub mod damage;

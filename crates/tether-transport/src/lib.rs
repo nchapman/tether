@@ -15,7 +15,7 @@
 //! - A **unidirectional input stream** (reliable, ordered) for
 //!   [`tether_protocol::input::InputEvent`] from client to host.
 //!
-//! **v0 security model:** the host generates a fresh self-signed cert at
+//! **Trust model:** the host generates a fresh self-signed cert at
 //! startup; its SHA-256 fingerprint must be exchanged with the client out
 //! of band. The client pins that fingerprint via
 //! [`tls::PinnedCertVerifier`]. See [`tls`] for the rationale.

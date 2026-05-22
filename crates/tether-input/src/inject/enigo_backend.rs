@@ -91,8 +91,9 @@ pub(super) struct EnigoBackend {
     held_buttons: HashSet<ProtoButton>,
     /// Highest cursor seq we've applied. Cursor datagrams reorder; we
     /// drop any incoming packet whose seq is older. `None` until the
-    /// first cursor arrives. u32 wraps; a 4-billion-event reset is
-    /// effectively never in v0.
+    /// first cursor arrives. u32 wraps; at 1 kHz cursor packets it
+    /// takes ~50 days of continuous session to roll over, so plain
+    /// `<` comparison is fine in practice.
     last_cursor_seq: Option<u32>,
 }
 
@@ -239,8 +240,11 @@ impl EnigoBackend {
                 modifiers,
             } => {
                 self.reconcile_modifiers(*modifiers, None)?;
-                // libei wants discrete ticks. For pixel-mode trackpads
-                // we lose sub-tick precision — acceptable for v0.
+                // libei wants discrete ticks. Pixel-mode trackpad
+                // deltas get quantised to whole ticks via the
+                // 1/16-px scale below; smoother sub-tick scroll
+                // would need libei's high-resolution-scroll axis,
+                // which our wire format doesn't carry yet.
                 let scale = match kind {
                     ScrollKind::Line => 1.0,
                     ScrollKind::Pixel => 1.0 / 16.0,
@@ -488,6 +492,14 @@ fn hid_to_enigo(usage: HidUsage) -> Option<Key> {
         0xE3 => Key::Meta,
         0xE4 => Key::RControl,
         0xE5 => Key::RShift,
+        // Right-Alt. On macOS enigo distinguishes left/right Option;
+        // on Linux/Windows enigo's `Key` has no right-Alt variant, so
+        // both sides collapse to the same wire bit (the modifier-bit
+        // reconciliation in `modifier_bit_of` already keeps held-key
+        // state consistent across the collapse).
+        #[cfg(target_os = "macos")]
+        0xE6 => Key::ROption,
+        #[cfg(not(target_os = "macos"))]
         0xE6 => Key::Alt,
         0xE7 => Key::Meta,
         _ => {

@@ -155,9 +155,10 @@ impl VideoFrameMetaEnvelope {
 /// size are sliced into multiple packets sharing
 /// `(display, stream_epoch, frame_seq)`.
 ///
-/// `display` identifies which host display the frame came from. v0 is
-/// single-monitor and always uses `display = 0`, but the field is present
-/// so multi-monitor support can land later as a pure additive change.
+/// `display` identifies which host display the frame came from. The
+/// current host always uses `display = 0` (single-monitor capture), but
+/// the field is present so multi-monitor support can land later as a
+/// pure additive change.
 /// Each display gets its own encoder thread and therefore its own
 /// `stream_epoch` + `frame_seq` counters (cribbed from RustDesk's
 /// `video_threads: HashMap<usize, _>` pattern).

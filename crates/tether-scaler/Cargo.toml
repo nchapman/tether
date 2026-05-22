@@ -1,0 +1,28 @@
+[package]
+name = "tether-scaler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Mitchell-Netravali bicubic image scaler in linear-light, shared between host (downscale) and client (upscale)."
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }
+
+# Same wgpu trunk pin as tether-render / tether-gpuconvert. The shader
+# uses Rgba16Float storage textures + textureLoad on Bgra8Unorm /
+# Rgba8Unorm sampled views — all in wgpu/WebGPU core, no extensions
+# required.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9" }
+pollster = "0.4"
+
+[dev-dependencies]
+# Used in tests/quality.rs to cross-check our Mitchell reference
+# against a known-good resampler. `image`'s CatmullRom is close-but-
+# not-identical to Mitchell — bounds the per-pixel error.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[lints]
+workspace = true

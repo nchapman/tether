@@ -9,6 +9,7 @@ members = [
     "crates/tether-input",
     "crates/tether-probe",
     "crates/tether-render",
+    "crates/tether-scaler",
     "crates/tether-session",
     "crates/tether-vaapi",
     "apps/tether-host",
@@ -30,6 +31,7 @@ tether-gpuconvert = { path = "crates/tether-gpuconvert" }
 tether-input = { path = "crates/tether-input" }
 tether-probe = { path = "crates/tether-probe" }
 tether-render = { path = "crates/tether-render" }
+tether-scaler = { path = "crates/tether-scaler" }
 tether-session = { path = "crates/tether-session" }
 tether-vaapi = { path = "crates/tether-vaapi" }
 

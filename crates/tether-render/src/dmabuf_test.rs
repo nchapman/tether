@@ -415,6 +415,48 @@ fn roundtrip_h264_8bit_upscale_no_scaler_branch() {
     assert_outcome(&case, run_roundtrip(&case));
 }
 
+/// **H.264 host-scaler + client-no-scaler + letterbox blit**. This is
+/// the exact shape the manual-session 4-overlapping-copies repro hit
+/// (capture 2880×1920 → encode 2160×1440 → surface 2560×1440), with
+/// all three of:
+///   1. Host Mitchell downscale engaged (capture > encode)
+///   2. Client `need_upscale = true` (surface > encode)
+///   3. Client `scaler = None` because letterbox_fit_dims(encode,
+///      surface) returns encode_dims when surface aspect > encode
+///      aspect (here 1.778 > 1.5, fit is height-limited at 1.0× scale)
+///   4. Blit pass with non-identity letterbox_scale = (0.84375, 1.0)
+///
+/// None of the other cells combine these — full_chain has Mitchell
+/// upscale running because its encode aspect differs from surface
+/// just enough; upscale_no_scaler_branch above has no host scaler.
+/// This cell is the intersection the bug needs.
+///
+/// The pre-scaler-integration session was clean (host encoded at
+/// native capture dims, client surface < video, no upscale branch).
+/// Post-integration sessions hit this exact path on the user's 2×
+/// HiDPI display.
+#[test]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+fn roundtrip_h264_8bit_repro_shape() {
+    let case = RoundtripCase {
+        name: "h264_8bit_repro_shape",
+        profile: H264_8BIT_420,
+        fixture: Fixture::CoordEncoded,
+        capture_dims: (2880, 1920),
+        encode_dims:  (2160, 1440),
+        surface_dims: (2560, 1440),
+        frames_encoded: 6,
+        assert_steady_state_eps: Some(2.0),
+        color_space: VideoColorSpec::sdr_desktop(),
+        requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
+        // Use the full_chain floor: host scaler smooths the gradient
+        // fixture before encode, so encoder quantisation drops by 5×
+        // — same envelope as the full_chain cell.
+        floors: FLOOR_FULL_CHAIN,
+    };
+    assert_outcome(&case, run_roundtrip(&case));
+}
+
 /// **H.264 full chain**: capture > encode < surface, surface aspect ≠
 /// encode aspect so letterbox bars appear in the surface. Exercises
 /// both Mitchell stages plus letterbox padding. 3360×2100 (aspect

@@ -167,6 +167,47 @@ fn checkerboard(width: u32, height: u32, cell: u32) -> Vec<u8> {
     v
 }
 
+/// Coordinate-encoded BGRA fixture used by the round-trip harness:
+/// `R = x / width * 256`, `G = y / height * 256`, `B = 128`. Smooth
+/// gradients let a reference compare bound per-region error directly
+/// rather than rely on chunked SSIM. Identical math to
+/// `tether_scaler::test_util::coord_fixture_fill` — duplicated here
+/// because the hardware integration test does not pull in the
+/// `test-util` feature (mirrors the existing `ssim_rgb` / `psnr_db`
+/// duplications above).
+fn coord_encoded(width: u32, height: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let r = ((x as f64 / width as f64) * 256.0).clamp(0.0, 255.0) as u8;
+            let g = ((y as f64 / height as f64) * 256.0).clamp(0.0, 255.0) as u8;
+            v.extend_from_slice(&[r, g, 128, 255]);
+        }
+    }
+    v
+}
+
+/// Per-column MAE across all rows and RGB channels. The harness saw
+/// a left-edge artifact (first ~16 columns at MAE ≈ 74 against a CPU
+/// Mitchell reference) that the existing solid-quadrant fixtures
+/// can't surface — the gradient is what makes the error visible.
+fn column_mae_rgb(a: &[u8], b: &[u8], width: u32, height: u32) -> Vec<f64> {
+    let w = width as usize;
+    let h = height as usize;
+    let mut out = vec![0.0; w];
+    for col in 0..w {
+        let mut acc = 0.0_f64;
+        for row in 0..h {
+            let off = (row * w + col) * 4;
+            for ch in 0..3 {
+                acc += (a[off + ch] as f64 - b[off + ch] as f64).abs();
+            }
+        }
+        out[col] = acc / (h as f64 * 3.0);
+    }
+    out
+}
+
 /// 256×256 RGB-quadrant test pattern. Each quadrant solid colour:
 /// top-left red, top-right green, bottom-left blue, bottom-right white.
 fn quadrant_image(width: u32, height: u32) -> Vec<u8> {
@@ -422,6 +463,56 @@ fn matches_reference_realistic_screen_dim() {
     let pipelines = Arc::new(Pipelines::build(&device));
     let src = quadrant_image(1920, 1080);
     assert_matches_reference(&device, &queue, &pipelines, 1920, 1080, 1280, 720, &src, "1080p→720p");
+}
+
+/// Repro-shape regression: 2880×1920 → 2160×1440 (1.333× downscale,
+/// aspect-preserving) on a coord-encoded gradient. The end-to-end
+/// harness in tether-render isolated a left-edge artifact (first ~16
+/// columns at MAE ≈ 74) to the host scaler path; this drives the
+/// scaler in isolation so a regression here means the scaler shader
+/// or its compute-dispatch wiring, not the BGRA→NV12 bridge or the
+/// dma-buf import/export round-trip.
+///
+/// Asserts both the global PSNR/SSIM/max-diff bounds and a hard
+/// left-edge bound: no first-32-column MAE may exceed 4.0 vs interior.
+#[test]
+#[ignore = "requires wgpu adapter"]
+fn matches_reference_coord_encoded_left_edge() {
+    let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
+    let pipelines = Arc::new(Pipelines::build(&device));
+    let (src_w, src_h, dst_w, dst_h) = (2880u32, 1920u32, 2160u32, 1440u32);
+    let src = coord_encoded(src_w, src_h);
+    let src_tex = upload_rgba8(&device, &queue, &src, src_w, src_h);
+    let scaler = Scaler::new(
+        pipelines.clone(),
+        device.clone(),
+        queue.clone(),
+        (src_w, src_h),
+        (dst_w, dst_h),
+    )
+    .expect("scaler new");
+    let out_tex = scaler.scale(&src_tex).expect("scale");
+    let gpu_out = read_texture(&device, &queue, out_tex);
+    let ref_out = reference::mitchell_filter_default(&src, src_w, src_h, dst_w, dst_h);
+    let col_mae = column_mae_rgb(&gpu_out, &ref_out, dst_w, dst_h);
+    let interior_mean: f64 = col_mae[64..(dst_w as usize - 64)].iter().sum::<f64>()
+        / (dst_w as usize - 128) as f64;
+    let left_edge_max = col_mae[..32].iter().cloned().fold(0.0_f64, f64::max);
+    let right_edge_max = col_mae[(dst_w as usize - 32)..]
+        .iter()
+        .cloned()
+        .fold(0.0_f64, f64::max);
+    println!(
+        "coord-encoded 2880×1920 → 2160×1440: interior mean MAE {interior_mean:.2}, left-edge max {left_edge_max:.2}, right-edge max {right_edge_max:.2}"
+    );
+    assert!(
+        left_edge_max <= interior_mean + 4.0,
+        "left-edge max MAE {left_edge_max:.2} significantly above interior mean {interior_mean:.2} — likely a left-edge boundary bug in the scaler"
+    );
+    assert!(
+        right_edge_max <= interior_mean + 4.0,
+        "right-edge max MAE {right_edge_max:.2} significantly above interior mean {interior_mean:.2}"
+    );
 }
 
 #[test]

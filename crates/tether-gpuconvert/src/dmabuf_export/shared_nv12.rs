@@ -71,7 +71,23 @@ pub fn export_nv12_shared_dmabuf(
     {
         return Err(ExportError::FeatureUnsupported);
     }
-    let chroma_w = width.div_ceil(2);
+    // Intel iHD's VAAPI NV12 import expects the Y-plane row pitch to
+    // be aligned to 64 bytes (luma pixels — R8 is 1 byte/pixel).
+    // When the Vulkan driver picks a tight `row_pitch == width` for
+    // LINEAR-modifier R8 images at non-64-aligned widths (e.g. 2160),
+    // VAAPI reads as if the pitch were `align_up(width, 64)` — each
+    // row's leftmost 16 luma columns alias into the previous row's
+    // padding, producing visible left-edge corruption in every
+    // encoded frame. Allocating the underlying images at the aligned
+    // width forces the driver to report a 64-aligned `row_pitch`;
+    // the bridge's caller still sees the original `width` and the
+    // shader only writes to the visible region, leaving the right-
+    // edge padding columns undefined (the encoder crops to the
+    // declared frame width and ignores them). UV is half-resolution
+    // so `aligned_width / 2` is automatically aligned too.
+    const VAAPI_LUMA_STRIDE_ALIGN: u32 = 64;
+    let aligned_w = width.next_multiple_of(VAAPI_LUMA_STRIDE_ALIGN);
+    let chroma_w = aligned_w.div_ceil(2);
     let chroma_h = height.div_ceil(2);
     let vk_usage = wgpu_usage_to_vk(usage);
 
@@ -117,7 +133,7 @@ pub fn export_nv12_shared_dmabuf(
                 .map_err(|e| ExportError::Vk(e, "vkCreateImage (NV12 shared)"))
         };
 
-        let y_image = create_image_with(vk::Format::R8_UNORM, width, height)?;
+        let y_image = create_image_with(vk::Format::R8_UNORM, aligned_w, height)?;
         let uv_image = match create_image_with(vk::Format::R8G8_UNORM, chroma_w, chroma_h) {
             Ok(i) => i,
             Err(e) => {
@@ -218,12 +234,20 @@ pub fn export_nv12_shared_dmabuf(
                     memory,
                 });
 
+                // The wgpu textures wrap the Vulkan images, so their
+                // descriptor dimensions must match the image's
+                // (aligned) dimensions, not the visible ones. The
+                // bridge's compute dispatch (in `nv12_dmabuf::convert`)
+                // is keyed off the bridge's stored visible width/height
+                // so it only writes to `[0, width) × [0, height)` — the
+                // right-edge padding columns stay undefined and the
+                // encoder crops them off via the declared frame width.
                 let y_texture = import_shared_image_into_wgpu(
                     device,
                     raw_device,
                     y_image,
                     wgpu::TextureFormat::R8Unorm,
-                    width,
+                    aligned_w,
                     height,
                     usage,
                     "nv12-shared y",

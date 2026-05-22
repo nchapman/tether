@@ -442,6 +442,89 @@ fn encode_chain(
     }
 }
 
+/// Encode at `dims == capture_dims == encode_dims` through the
+/// **gpuconvert NV12 bridge** (compute BGRA→NV12) and `encode_gpu`
+/// via DMA-BUF. Skips the Mitchell scaler. Currently unused by the
+/// matrix — kept as a regression-bisect entry point for "is the
+/// bridge or the scaler at fault" investigations: switch a failing
+/// `capture==encode` cell from `encode_via_cpu_upload` to this and
+/// re-run.
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_via_bridge_no_scaler(
+    profile: VideoProfile,
+    dims: (u32, u32),
+    bgra: &[u8],
+    frames: usize,
+) -> Vec<tether_codec::EncodedPacket> {
+    let mut enc = match VaapiEncoder::new(profile, dims.0, dims.1, 30, 4_000) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("SKIP: encoder construction failed: {e}");
+            return Vec::new();
+        }
+    };
+    let bridge = match pollster::block_on(tether_gpuconvert::Nv12DmaBuf::new(dims.0, dims.1)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP: Nv12DmaBuf::new failed: {e}");
+            return Vec::new();
+        }
+    };
+    let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("bridge-only bgra src"),
+        size: wgpu::Extent3d {
+            width: dims.0,
+            height: dims.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    bridge.queue().write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &src,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bgra,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(dims.0 * 4),
+            rows_per_image: Some(dims.1),
+        },
+        wgpu::Extent3d {
+            width: dims.0,
+            height: dims.1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let mut packets = Vec::new();
+    for t in 0..frames as i64 {
+        let nv12 = match bridge.convert(&src) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("SKIP: bridge.convert failed: {e}");
+                return Vec::new();
+            }
+        };
+        let codec_frame = build_codec_dmabuf_frame_nv12(&nv12);
+        let gpu_frame = tether_codec::GpuEncoderFrame::DmaBuf(&codec_frame);
+        match enc.encode_gpu(gpu_frame, t, t == 0) {
+            Ok(p) => packets.extend(p),
+            Err(e) => {
+                eprintln!("SKIP: encode_gpu via bridge-only failed: {e}");
+                return Vec::new();
+            }
+        }
+    }
+    packets
+}
+
 fn encode_via_cpu_upload(
     profile: VideoProfile,
     dims: (u32, u32),

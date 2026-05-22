@@ -45,6 +45,7 @@ mod pipeline;
 pub mod reference;
 mod scaler;
 
+pub use pipeline::Pipelines;
 pub use scaler::Scaler;
 
 #[derive(Debug, thiserror::Error)]
@@ -53,11 +54,21 @@ pub enum ScalerError {
     #[error("source or destination dimension is zero (src={src:?}, dst={dst:?})")]
     ZeroDim { src: (u32, u32), dst: (u32, u32) },
 
-    /// Destination is `>=` source in both axes. Host callers treat
-    /// this as "skip the scaler entirely" (we only downscale on the
-    /// host); client callers don't see it (they only construct a
-    /// scaler when window > video, i.e. upscale, which is *not* this
-    /// case).
-    #[error("destination >= source in both axes; no scaling required")]
+    /// Destination is *exactly equal* to source. Callers treat this
+    /// as "skip the scaler entirely". (We don't return this for
+    /// general "dst > src in both axes" upscale-into-larger cases —
+    /// that's a legitimate upscale, which the client path uses.)
+    #[error("destination equals source; no scaling required")]
     NoScaleNeeded,
+
+    /// The source texture handed to [`Scaler::scale`] doesn't match
+    /// the dimensions the scaler was constructed for. Caller bug —
+    /// usually a resize race where the new scaler isn't built yet.
+    /// Returned as a typed error rather than silently scaling against
+    /// stale parameters (which would produce visibly corrupt frames).
+    #[error("scaler dim mismatch: expected {expected:?}, got {got:?}")]
+    DimMismatch {
+        expected: (u32, u32),
+        got: (u32, u32),
+    },
 }

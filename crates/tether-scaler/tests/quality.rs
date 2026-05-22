@@ -165,6 +165,25 @@ fn linear_light_visibly_differs_from_naive_on_dark_to_light() {
 }
 
 #[test]
+fn asymmetric_scale_handles_independent_axes() {
+    // Aspect-changing downscale: 256×128 → 64×96 (4× horizontal,
+    // 0.75× vertical → actually a vertical *upscale*). Tests that
+    // scale_x and scale_y are computed independently and the right
+    // tap counts are used per axis. Output must be correct dims, no
+    // NaN-ish (Mitchell's negative lobes can produce small overshoot
+    // but encode_u8 clamps), and solid-colour preserved.
+    let src: Vec<u8> = (0..256 * 128).flat_map(|_| [80u8, 160, 40, 255]).collect();
+    let dst = mitchell_filter_default(&src, 256, 128, 64, 96);
+    assert_eq!(dst.len(), 64 * 96 * 4);
+    for (i, chunk) in dst.chunks_exact(4).enumerate() {
+        assert!((chunk[0] as i32 - 80).abs() <= 2, "px {i} R drift: {}", chunk[0]);
+        assert!((chunk[1] as i32 - 160).abs() <= 2, "px {i} G drift: {}", chunk[1]);
+        assert!((chunk[2] as i32 - 40).abs() <= 2, "px {i} B drift: {}", chunk[2]);
+        assert_eq!(chunk[3], 0xFF);
+    }
+}
+
+#[test]
 fn srgb_transfer_is_accurate_at_known_points() {
     // Spot-check the piecewise transfer at the breakpoint (0.04045
     // / 12.92 = ~0.00313) and at a few intermediate values. Use

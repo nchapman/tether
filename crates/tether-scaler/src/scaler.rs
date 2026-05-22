@@ -15,6 +15,9 @@ use crate::pipeline::Pipelines;
 use crate::reference::{tap_count, MAX_TAPS};
 use crate::ScalerError;
 
+// Re-use the shader compilation across Scaler rebuilds.
+type PipelineHandle = Arc<Pipelines>;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 struct Params {
@@ -33,7 +36,7 @@ struct Params {
 pub struct Scaler {
     device: Arc<Device>,
     queue: Arc<Queue>,
-    pipelines: Pipelines,
+    pipelines: PipelineHandle,
 
     /// Box-filter mip outputs. Length = number of mip passes; level 0
     /// halves the source, level 1 halves level 0, etc. The first
@@ -59,14 +62,21 @@ pub struct Scaler {
 }
 
 impl Scaler {
-    /// Build a scaler for the given source/destination dimensions.
+    /// Build a scaler for the given source/destination dimensions,
+    /// reusing pre-compiled pipelines.
     ///
-    /// Returns [`ScalerError::ZeroDim`] if any dimension is zero;
-    /// [`ScalerError::NoScaleNeeded`] if `dst_dims` is `>=` `src_dims`
-    /// in both axes. Callers handle `NoScaleNeeded` by bypassing the
-    /// scaler entirely (host downscale path) or by never constructing
-    /// a scaler at 1:1 in the first place (client upscale path).
+    /// Construct [`Pipelines`] once with [`Pipelines::build`], wrap in
+    /// `Arc`, then call this for each `(src, dst)` you need. The host
+    /// rebuilds scalers on resolution change; sharing the compiled
+    /// shader avoids a 50–200ms recompile per rebuild on Metal/DX12.
+    ///
+    /// Errors:
+    /// - [`ScalerError::ZeroDim`]: any dimension is zero.
+    /// - [`ScalerError::NoScaleNeeded`]: `dst_dims == src_dims` exactly.
+    ///   Pure upscale (`dst > src` in both axes) is supported and
+    ///   doesn't trip this error — that's the client path.
     pub fn new(
+        pipelines: PipelineHandle,
         device: Arc<Device>,
         queue: Arc<Queue>,
         src_dims: (u32, u32),
@@ -78,16 +88,9 @@ impl Scaler {
                 dst: dst_dims,
             });
         }
-        if dst_dims.0 >= src_dims.0 && dst_dims.1 >= src_dims.1 && dst_dims != src_dims {
-            // Pure upscale (and not 1:1) is supported — this is the
-            // client path. Only return NoScaleNeeded when the
-            // destination strictly is the source.
-        }
         if dst_dims == src_dims {
             return Err(ScalerError::NoScaleNeeded);
         }
-
-        let pipelines = Pipelines::build(&device);
 
         // Build the mip chain. Each level halves dimensions (round
         // up); stop when both axes are within 2× of dst.
@@ -197,19 +200,13 @@ impl Scaler {
     /// [`Self::output`].
     pub fn scale(&self, src: &Texture) -> Result<&Texture, ScalerError> {
         if src.width() != self.src_dims.0 || src.height() != self.src_dims.1 {
-            // Mismatched source vs configured dims — caller error.
-            // We could return a typed error variant, but in practice
-            // the host pairs scaler creation with capture-dim probe
-            // so this would only happen on a code change. Debug-assert
-            // and proceed; texel-clamping in the shader will keep
-            // sampling in-bounds.
-            debug_assert!(
-                false,
-                "Scaler::scale dim mismatch: src is {}x{}, configured {:?}",
-                src.width(),
-                src.height(),
-                self.src_dims,
-            );
+            // Returning rather than running the shader with stale
+            // params: a resize race or wiring bug would otherwise
+            // silently corrupt every frame until the next rebuild.
+            return Err(ScalerError::DimMismatch {
+                expected: self.src_dims,
+                got: (src.width(), src.height()),
+            });
         }
 
         let mut encoder = self

@@ -11,17 +11,26 @@ use wgpu::{
 };
 
 /// All three pipelines + the bind-group layouts they reference.
-pub(crate) struct Pipelines {
-    pub horizontal: ComputePipeline,
-    pub horizontal_bgl: BindGroupLayout,
-    pub vertical: ComputePipeline,
-    pub vertical_bgl: BindGroupLayout,
-    pub mip: ComputePipeline,
-    pub mip_bgl: BindGroupLayout,
+///
+/// Shader compilation is non-trivial on Metal and DX12 (50–200ms for
+/// the scaler shader); the host rebuilds its [`crate::Scaler`] on every
+/// resolution change, so the pipelines need to be reusable across
+/// rebuilds. Construct once via [`Pipelines::build`], wrap in
+/// [`std::sync::Arc`], and hand to each `Scaler::new` call.
+pub struct Pipelines {
+    pub(crate) horizontal: ComputePipeline,
+    pub(crate) horizontal_bgl: BindGroupLayout,
+    pub(crate) vertical: ComputePipeline,
+    pub(crate) vertical_bgl: BindGroupLayout,
+    pub(crate) mip: ComputePipeline,
+    pub(crate) mip_bgl: BindGroupLayout,
 }
 
 impl Pipelines {
-    pub(crate) fn build(device: &Device) -> Self {
+    /// Compile the shader and build all three pipelines + their bind-
+    /// group layouts. Caller wraps in `Arc` and reuses across
+    /// `Scaler::new` calls — see crate-level docs.
+    pub fn build(device: &Device) -> Self {
         let module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("tether-scaler shader"),
             source: ShaderSource::Wgsl(include_str!("shader.wgsl").into()),

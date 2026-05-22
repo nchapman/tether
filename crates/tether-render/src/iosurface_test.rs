@@ -24,10 +24,15 @@
 //! Mac with:
 //!   `cargo test -p tether-render --release -- --ignored iosurface`
 //!
-//! Coverage today: HEVC 4:2:0 8-bit and 10-bit. The 4:4:4 paths are
-//! gated upstream by VT's silent-downsample limitation (the encoder
-//! probe rejects them), so a renderer round-trip for 4:4:4 would
-//! never run in a real session — not worth the fixture wiring yet.
+//! Coverage today: HEVC 4:2:0 8-bit, HEVC 4:2:0 10-bit (encode →
+//! decode → render), and HEVC 4:4:4 8-bit + 10-bit (fixture-decode →
+//! render). VideoToolbox has no Main444 encode path so the 4:4:4
+//! cells can't go through the local encoder, but a Linux→Mac session
+//! *does* negotiate 4:4:4 (M-series VT decodes Main444 to a `'444v'`
+//! / `'xf44'` NV24 IOSurface) — the import side is real production
+//! code that the 4:2:0 cells don't reach because NV24 has full-res UV
+//! stride. We drive the import path from a bundled HEVC 4:4:4 IDR
+//! fixture (128×128 grey from `tether-probe`).
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
@@ -570,4 +575,253 @@ fn iosurface_zero_copy_roundtrip_hevc_main10() {
         right.2 > 130 && right.0 < 80 && right.1 < 80,
         "right region should be blueish; got {right:?}"
     );
+}
+
+/// Decode-only render path. Used by the 4:4:4 cells: VideoToolbox has
+/// no Main444 encode, but it decodes Main444 fine to an NV24 IOSurface,
+/// so we feed it a Linux-encoded HEVC 4:4:4 IDR fixture and exercise
+/// the import + render half. The fixture is grey, so the assertion is
+/// "rendered output is approximately neutral grey" — R≈G≈B with both
+/// near a sane luminance midpoint — rather than the red/blue check the
+/// encode-roundtrip cells use.
+fn run_fixture_render(
+    profile: VideoProfile,
+    bitstream: &[u8],
+) -> Option<((u8, u8, u8), (u8, u8, u8))> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (device, queue, adapter) =
+        match pollster::block_on(try_init_wgpu_for_iosurface(profile.bit_depth)) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "SKIPPED: no Metal adapter with required features for {profile:?} \
+                     (10-bit needs TEXTURE_FORMAT_16BIT_NORM)"
+                );
+                return None;
+            }
+        };
+    let info = adapter.get_info();
+    eprintln!(
+        "[{profile:?}] wgpu adapter: {} (driver: {}, backend: {:?})",
+        info.name, info.driver, info.backend
+    );
+
+    // Fixture geometry is fixed at 128×128 by the probe regenerator.
+    let w: u32 = 128;
+    let h: u32 = 128;
+
+    let mut dec = VideoToolboxDecoder::new(profile.codec).expect("VT decoder construction");
+    dec.submit(bitstream).expect("decoder submit fixture IDR");
+    dec.signal_eof().expect("decoder signal_eof");
+    let mut codec_gpu: Option<tether_codec::GpuFrame> = None;
+    while let Some(f) = dec.next_frame().expect("decoder next_frame after EOF") {
+        if let CodecFrame::Gpu(g) = f {
+            codec_gpu = Some(g);
+            break;
+        }
+    }
+    let codec_gpu = codec_gpu.expect("decoder must produce at least one Frame::Gpu");
+    let (gw, gh, _pts, source, guard) = codec_gpu.into_parts();
+    assert_eq!((gw, gh), (w, h), "decoded dims must match fixture dims");
+    let iosurface = match source {
+        GpuFrameSource::IOSurface(io) => io,
+    };
+    eprintln!(
+        "[{profile:?}] decoded IOSurface fourcc: 0x{:08x}",
+        iosurface.pixel_format
+    );
+
+    let target_format = wgpu::TextureFormat::Rgba8Unorm;
+    let pipeline = build_test_pipeline(&device, &queue, target_format, profile.bit_depth);
+
+    let textures = gpu::import_iosurface_textures(
+        &device,
+        &pipeline.yuv_bgl,
+        &pipeline.sampler,
+        profile.chroma,
+        profile.bit_depth,
+        &iosurface,
+        guard,
+    )
+    .expect("IOSurface import for 4:4:4 (NV24 / full-res UV)");
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen target (fixture)"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: target_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let unpadded_bpr = u64::from(w * 4);
+    let padded_bpr = unpadded_bpr.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback (fixture)"),
+        size: padded_bpr * u64::from(h),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("fixture test encoder"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("fixture test pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_bind_group(0, &textures.bind_group, &[]);
+        pass.set_bind_group(1, &pipeline.scale_bind_group, &[]);
+        pass.set_bind_group(2, &pipeline.color_params_bind_group, &[]);
+        pass.draw(0..6, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bpr as u32),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let (tx, rx) = mpsc::channel();
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).expect("send map result");
+        });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("device poll");
+    rx.recv().expect("map callback").expect("map ok");
+
+    let mapped = readback
+        .slice(..)
+        .get_mapped_range()
+        .expect("get mapped range");
+    let mut rgba: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h as usize {
+        let start = row * padded_bpr as usize;
+        let end = start + unpadded_bpr as usize;
+        rgba.extend_from_slice(&mapped[start..end]);
+    }
+    drop(mapped);
+    readback.unmap();
+
+    let left = region_average_rgb(&rgba, w, w / 8, h / 4, w / 4, h / 2);
+    let right = region_average_rgb(&rgba, w, 5 * w / 8, h / 4, w / 4, h / 2);
+    eprintln!("[{profile:?}] left avg RGB  = {left:?}");
+    eprintln!("[{profile:?}] right avg RGB = {right:?}");
+    Some((left, right))
+}
+
+/// Assert that a region average looks like neutral grey near the
+/// fixture's input level. The probe fixtures are generated from
+/// ffmpeg's `color=c=gray` filter, which produces sRGB (128, 128, 128)
+/// — Y'=126 in BT.709 limited-range, Cb=Cr=128. After our shader's
+/// limited-range expansion this should reconstruct to roughly
+/// RGB(128, 128, 128) per channel.
+///
+/// Tolerances:
+///   * `spread <= 24` rejects a wrong-matrix bug that lands a colour
+///     cast (high G, low R/B; or chroma swap producing pink/cyan).
+///   * `avg ∈ 90..=170` rejects "stuck black" / "stuck white" import
+///     failures and gross wrong-range expansion. Loose enough to
+///     absorb HEVC quantisation noise on a 128×128 source.
+fn assert_grey(label: &str, rgb: (u8, u8, u8)) {
+    let (r, g, b) = rgb;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let spread = max - min;
+    assert!(
+        spread <= 24,
+        "{label}: R/G/B spread too wide for grey input — got {rgb:?} (spread {spread})"
+    );
+    let avg = (u32::from(r) + u32::from(g) + u32::from(b)) / 3;
+    assert!(
+        (90..=170).contains(&avg),
+        "{label}: average channel value {avg} not near grey midpoint (expected ~128) — got {rgb:?}"
+    );
+}
+
+/// HEVC 4:4:4 8-bit (Main 4:4:4). Renderer-side coverage for the
+/// Linux-host → Mac-client path: NV24 IOSurface fourcc `'444v'`,
+/// full-res UV stride, biplanar path with the same R8 Y + Rg8 UV
+/// shader as NV12. No local encode — VT can't produce Main444 — so
+/// the fixture is a Linux-encoded HEVC 4:4:4 IDR (128×128 grey).
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal Main444; run with: cargo test -p tether-render --release -- --ignored iosurface"]
+fn iosurface_zero_copy_roundtrip_hevc_main_444_8bit() {
+    const FIXTURE: &[u8] =
+        include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_8bit.idr");
+    let Some((left, right)) = run_fixture_render(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 8,
+        },
+        FIXTURE,
+    ) else {
+        return;
+    };
+    assert_grey("4:4:4 8-bit left", left);
+    assert_grey("4:4:4 8-bit right", right);
+}
+
+/// HEVC 4:4:4 10-bit (Main 4:4:4 10). The matrix cell that depends on
+/// both `TEXTURE_FORMAT_16BIT_NORM` (R16/Rg16) and the full-res UV
+/// stride of NV24. Same fixture-decode path as the 8-bit cell.
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal Main444 10-bit; run with: cargo test -p tether-render --release -- --ignored iosurface"]
+fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit() {
+    const FIXTURE: &[u8] =
+        include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_10bit.idr");
+    let Some((left, right)) = run_fixture_render(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 10,
+        },
+        FIXTURE,
+    ) else {
+        return;
+    };
+    assert_grey("4:4:4 10-bit left", left);
+    assert_grey("4:4:4 10-bit right", right);
 }

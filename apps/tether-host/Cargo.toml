@@ -19,6 +19,7 @@ tether-transport = { workspace = true }
 tether-capture = { workspace = true }
 tether-codec = { workspace = true }
 tether-input = { workspace = true }
+tether-probe = { workspace = true }
 tether-session = { workspace = true }
 # Linux-only: BGRA→NV12 + DMA-BUF bridge for the zero-copy
 # capture→encode path. The non-Linux build does CPU-side encode only.

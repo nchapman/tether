@@ -16,9 +16,8 @@ use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use tether_capture::{CapturedFrame, PixelFormat};
-use tether_codec::{
-    pick_supported_profile, probe_encoder, supported_encode_profiles, Encoder,
-};
+use tether_codec::{probe_encoder, Encoder};
+use tether_probe::pick_supported_profile;
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
 #[cfg(target_os = "linux")]
@@ -99,50 +98,31 @@ async fn main() -> anyhow::Result<()> {
     // prompt also fires on host launch (better UX than on first
     // remote connect).
     //
-    // Test-pattern mode skips the warm-up — there's no SCK in that
-    // path, so the prompt would be gratuitous.
-    #[cfg(target_os = "macos")]
+    // Warm the unified capability probe. `tether_probe::host_supported_profiles`
+    // round-trips every `PROFILE_PREFERENCE` entry through the full
+    // production chain (capture → bridge → encoder → decoder) and
+    // OnceLock-caches the result for process lifetime. This is one
+    // call that replaces what used to be three caches:
+    //   - tether-codec's supported_profiles
+    //   - tether-host's SCK_CAPS_CACHE (macOS)
+    //   - tether-host's LINUX_P010_DELIVERABLE_CACHE
+    // Running it here keeps the probe off the handshake's critical
+    // path — see the historical comment about clock-sync offset bias.
+    //
+    // Test-pattern mode skips the probe entirely: no real capture
+    // backend runs (no PipeWire portal, no SCK), and on macOS
+    // probing SCK would trigger an unnecessary screen-recording
+    // permission prompt. In test-pattern mode `handle_client` uses
+    // a hardcoded conservative profile set (the H.264 4:2:0 8-bit
+    // floor) — the encoder still constructs lazily for that single
+    // profile, so a broken-encoder host still fails loud.
     if !use_test_pattern {
-        warm_sck_capture_capability_cache().await;
+        tokio::task::spawn_blocking(|| {
+            let _ = tether_probe::host_supported_profiles();
+        })
+        .await
+        .ok();
     }
-
-    // Linux equivalent: probe gpuconvert's 10-bit deliverability
-    // (storage-modifier probe + real submit_dmabuf round-trip) once
-    // at startup so per-connection `capture_filtered_encode_profiles`
-    // reads the cache instead of re-running. Same handshake-critical
-    // -path rationale as the macOS warm-up above. Unlike the macOS
-    // case, we run this even in test-pattern mode — the negotiation
-    // path still consults the cache and a debug_assert fires if it's
-    // unpopulated; the probe is cheap (~tens of ms) so the
-    // unconditional warm-up is the simpler invariant.
-    #[cfg(target_os = "linux")]
-    warm_gpuconvert_capability_cache().await;
-
-    // Warm the codec-probe cache for the same reason. The probe builds
-    // each `VideoProfile` in `PROFILE_PREFERENCE` through a real VT (or
-    // VAAPI) encoder, runs a frame through, decodes it back, and checks
-    // the result — five profiles × (encoder + decoder + round-trip) is
-    // tens to hundreds of milliseconds the *first* time it runs. The
-    // result is `OnceLock`-cached for process lifetime, so subsequent
-    // reads are free.
-    //
-    // Without this warm-up, the first client's handshake straddles the
-    // probe and the application-layer clock-sync's t1/t2 stamps bracket
-    // it. The offset formula `((t1 - t0) + (t2 - t3)) / 2` assumes
-    // symmetric one-way latency; any work between t1 and t2 biases the
-    // offset by half that work's duration. Half of "all five codec
-    // probes" is non-trivial. RTT is unaffected (the formula
-    // explicitly subtracts t2 - t1), but per-frame `latency_ms` would
-    // pick up the bias from the offset alone.
-    //
-    // The probe is sync today (uses `Encoder::new` / `Decoder::new`,
-    // which are blocking FFmpeg constructions). `spawn_blocking` keeps
-    // the runtime healthy while the probe runs.
-    tokio::task::spawn_blocking(|| {
-        let _ = tether_codec::probe::supported_profiles();
-    })
-    .await
-    .ok();
 
     let conn = match server.accept().await {
         Some(Ok(c)) => Arc::new(c),
@@ -191,20 +171,19 @@ async fn handle_client(
     // caps don't change at runtime), so per-connection cost is just a
     // clone. Logged at debug because every reconnect would otherwise
     // repeat the same line; the per-session negotiated result below
-    // is the operator-relevant signal.
-    // What VT / VAAPI's encode probe layer says we can produce
-    // (encoder + round-trip verified). Then filter that down to what
-    // the *live capture → encoder* bridge can actually deliver
-    // today — on macOS the live SCK stream is hardcoded to NV12
-    // (420v) 8-bit and the IOSurface fast path errors for any other
-    // input, so e.g. HEVC Main10 — which the encoder probe correctly
-    // confirms VT supports via the CPU swscale path — can't ride
-    // the live pipeline yet. The capture-aware filter prevents the
-    // negotiator from picking a profile that would crash at first
-    // frame. The filter is a no-op on Linux today (the VAAPI probe
-    // already gates 10-bit at the encoder layer pending the
-    // gpuconvert P010/P410 bridge wiring).
-    let host_encode_profiles = capture_filtered_encode_profiles(supported_encode_profiles());
+    // Host encode capabilities — what the live pipeline can actually
+    // deliver, end-to-end. `tether_probe::host_encode_profiles`
+    // round-trips capture → bridge → encoder → decoder per profile
+    // and returns only the ones where every stage succeeded. Cached
+    // process-wide (warmed in main).
+    //
+    // Test-pattern mode bypasses the probe (see the warm-up site for
+    // why) and advertises the conservative H.264 4:2:0 8-bit floor.
+    let host_encode_profiles: Vec<VideoProfile> = if use_test_pattern {
+        vec![VideoProfile::H264_8BIT_420]
+    } else {
+        tether_probe::host_encode_profiles()
+    };
     tracing::debug!(
         host_encode_profiles = ?host_encode_profiles,
         "host video encode capabilities (capture-bridge filtered)"
@@ -858,15 +837,16 @@ fn encode_gpu_frame(
                         }
                     }
                 }
-                // Yuv444 10-bit (XV30) has no bridge; capture_filtered_encode_profiles
-                // is supposed to keep it out of the negotiated set. Reaching this arm
-                // is a contract violation — fail loud rather than silently dropping
+                // Yuv444 10-bit (XV30) has no bridge; tether-probe's
+                // capture-stage check is supposed to keep it out of the
+                // negotiated set. Reaching this arm is a contract
+                // violation — fail loud rather than silently dropping
                 // every frame.
                 (chroma, bit_depth) => {
                     return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
                         "no gpuconvert bridge for negotiated profile chroma={:?} \
-                         bit_depth={} — capture_filtered_encode_profiles failed to \
-                         filter this profile out before negotiation",
+                         bit_depth={} — tether_probe::host_supported_profiles \
+                         should have filtered this profile out before negotiation",
                         chroma,
                         bit_depth,
                     ));
@@ -1548,287 +1528,6 @@ fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
 /// chroma in the same budget that was sized for subsampled video.
 /// Clamped to a sane band so a tiny test pattern doesn't get a
 /// starvation-tier bitrate and a huge display doesn't blow the LAN.
-/// Filter the encoder-probe-supported profile list down to what the
-/// host's live capture → encoder bridge can actually deliver today.
-/// The encoder probe verifies the encoder *can produce* a given
-/// profile; this is a separate question from whether the live
-/// capture path can feed it. On macOS, the SCK stream is hardcoded
-/// dispatches to the SCK pixel format the encoder needs based on the
-/// negotiated profile, so the advertised set tracks what this Mac's
-/// SCK actually accepts (probed once at process startup) intersected
-/// with what `vt_sw_format` / `iosurface_fourcc_matches` can ingest.
-///
-/// On Linux the gpuconvert bridge (Nv12DmaBuf / Yuv444DmaBuf) is
-/// 8-bit only; the VAAPI encode probe already gates 10-bit at the
-/// encoder layer, so this filter is a no-op on Linux today. When
-/// the gpuconvert P010/P410 bridges are wired (and the VAAPI probe
-/// gate lifted) the Linux filter should similarly tighten to what
-/// the bridge can deliver.
-#[cfg(target_os = "macos")]
-fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfile> {
-    let caps = sck_capture_capability();
-    probed
-        .into_iter()
-        .filter(|p| {
-            let mapping = tether_capture::macos::sck_pixel_format_for_profile(*p);
-            let deliverable = mapping.is_deliverable(&caps);
-            if !deliverable {
-                tracing::info!(
-                    profile = ?p,
-                    "encoder probe accepted profile but live SCK capture cannot deliver \
-                     the matching pixel format on this Mac; filtering out"
-                );
-            }
-            deliverable
-        })
-        .collect()
-}
-
-/// Process-lifetime cache for the SCK probe result. Populated by
-/// [`warm_sck_capture_capability_cache`] at process startup (before
-/// the first client connects) — see the call site in [`main`] for
-/// why the warm-up has to land outside `handle_client`. Reads are
-/// `Copy` since [`SckCaptureCapability`] is small and `Copy`.
-///
-/// If the cache hasn't been populated (warm-up was skipped — e.g.
-/// `--test-pattern` mode, or a future code path that forgets to
-/// call the warm-up) reads fall back to a conservative
-/// `yuv420_video_range`-only capability that's safe to advertise
-/// against on every Mac.
-///
-/// [`SckCaptureCapability`]: tether_capture::macos::SckCaptureCapability
-#[cfg(target_os = "macos")]
-static SCK_CAPS_CACHE: std::sync::OnceLock<tether_capture::macos::SckCaptureCapability> =
-    std::sync::OnceLock::new();
-
-/// Run the SCK probe and store the result in `SCK_CAPS_CACHE`.
-/// Idempotent: subsequent calls see the cache populated and return
-/// without re-running. Call once from `main` after the server is
-/// bound but before the first `accept().await` so the probe doesn't
-/// straddle a connection-time handshake's clock-probe measurement.
-#[cfg(target_os = "macos")]
-async fn warm_sck_capture_capability_cache() {
-    if SCK_CAPS_CACHE.get().is_some() {
-        return;
-    }
-    let caps = match tether_capture::macos::probe_capture_pixel_formats().await {
-        Ok(caps) => {
-            tracing::info!(?caps, "SCK capture capability (cached for process lifetime)");
-            caps
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "SCK probe failed; assuming only 420v deliverable");
-            tether_capture::macos::SckCaptureCapability {
-                yuv420_video_range: true,
-                ..Default::default()
-            }
-        }
-    };
-    // Ignore the `Err(_)` case where another caller raced us in:
-    // both values would be the same probe result and either is
-    // fine to keep. `set` returns `Err(received_value)` to signal
-    // "already populated"; we drop that and continue.
-    let _ = SCK_CAPS_CACHE.set(caps);
-}
-
-/// Read the cached SCK capability. Panics if the cache wasn't warmed
-/// — callers on the macOS path go through `handle_client` which only
-/// runs after `main` has either called `warm_sck_capture_capability_cache`
-/// (real-capture mode) or selected test-pattern mode (which never
-/// touches `capture_filtered_encode_profiles`). A panic here is a
-/// programming error: a new entry point bypassed the warm-up.
-#[cfg(target_os = "macos")]
-fn sck_capture_capability() -> tether_capture::macos::SckCaptureCapability {
-    *SCK_CAPS_CACHE.get().unwrap_or_else(|| {
-        // Conservative fallback rather than panic in production —
-        // hosts a warning to make the bug visible. The negotiator
-        // will fall back to HEVC 4:2:0 8-bit which every macOS
-        // capture path supports.
-        tracing::error!(
-            "SCK capability cache read before warm-up; falling back to 420v-only. \
-             This indicates a code path that reached handle_client without \
-             going through warm_sck_capture_capability_cache."
-        );
-        static FALLBACK: std::sync::OnceLock<tether_capture::macos::SckCaptureCapability> =
-            std::sync::OnceLock::new();
-        FALLBACK.get_or_init(|| tether_capture::macos::SckCaptureCapability {
-            yuv420_video_range: true,
-            ..Default::default()
-        })
-    })
-}
-
-/// Process-lifetime cache for the Linux gpuconvert 10-bit
-/// deliverability probe — `true` iff R16 + GR32 both advertise
-/// STORAGE_IMAGE for `DRM_FORMAT_MOD_LINEAR` (the requirement for the
-/// BGRA→P010 compute shader). Populated by
-/// [`warm_gpuconvert_capability_cache`] at process startup; same
-/// rationale as the macOS [`SCK_CAPS_CACHE`].
-///
-/// 8-bit profiles (NV12, XYUV) aren't gated through this cache — they
-/// only need SAMPLED + 8-bit storage which the existing
-/// `importable_dmabuf_modifiers` startup probe already verifies, and
-/// the Nv12DmaBuf / Yuv444DmaBuf constructors fail loudly if the
-/// adapter doesn't host them. The cache exists specifically for the
-/// 10-bit gate.
-#[cfg(target_os = "linux")]
-static LINUX_P010_DELIVERABLE_CACHE: std::sync::OnceLock<bool> =
-    std::sync::OnceLock::new();
-
-/// Run the gpuconvert P010 deliverability probe and store the result
-/// in [`LINUX_P010_DELIVERABLE_CACHE`]. Idempotent. Call from `main`
-/// after the server binds but before the first `accept().await` so the
-/// probe doesn't straddle a connection-time handshake.
-#[cfg(target_os = "linux")]
-async fn warm_gpuconvert_capability_cache() {
-    if LINUX_P010_DELIVERABLE_CACHE.get().is_some() {
-        return;
-    }
-    // Single-shot probe. `probe_p010_submit_round_trip` builds the
-    // real `Bgra2P010DmaBuf` bridge (which internally runs the
-    // R16+GR32 storage-modifier check via its `new()`) and then
-    // round-trips a real `submit_dmabuf` against a Main10 VaapiEncoder.
-    // Any failure — missing storage support, missing Vulkan features,
-    // or driver-layer rejection of the P010 dma-buf descriptor by
-    // `av_hwframe_map` — surfaces as an Err here and we degrade to
-    // 8-bit-only advertisement. Splitting this into a storage
-    // precheck + submit probe used to mean two extra transient wgpu
-    // device opens for the same answer the bridge constructor would
-    // give us anyway.
-    let p010 = match probe_p010_submit_round_trip().await {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::info!(
-                error = %e,
-                "Main10 gpuconvert round-trip probe failed; falling back to \
-                 8-bit-only advertisement"
-            );
-            false
-        }
-    };
-    tracing::info!(p010, "Linux gpuconvert capability (cached for process lifetime)");
-    let _ = LINUX_P010_DELIVERABLE_CACHE.set(p010);
-}
-
-/// One-shot end-to-end test: build a Bgra2P010DmaBuf bridge, build a
-/// VaapiEncoder for Main10, run a single submit_dmabuf. Success means
-/// the full producer chain works on this driver; failure means the
-/// codec-level construction probe was over-claiming (typical signature
-/// is `av_hwframe_map` rejecting the P010 descriptor).
-///
-/// Smallest viable: 128×128 (matches the codec layer's PROBE_DIM) so
-/// the probe is cheap (~tens of ms once at startup).
-#[cfg(target_os = "linux")]
-async fn probe_p010_submit_round_trip() -> anyhow::Result<()> {
-    const PROBE_DIM: u32 = 128;
-    let bridge = tether_gpuconvert::Bgra2P010DmaBuf::new(PROBE_DIM, PROBE_DIM).await?;
-    let probe_bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
-    let p010 = bridge.convert_bgra_bytes(&probe_bytes)?;
-
-    // Route the probe frame through the same helper the production
-    // hot path uses (`p010_dmabuf_to_codec_frame`). That way the
-    // startup probe and the per-frame send loop agree on descriptor
-    // shape by construction — there is no second table to drift.
-    let codec_frame = p010_dmabuf_to_codec_frame(p010);
-
-    let mut enc = tether_codec::vaapi::VaapiEncoder::new(
-        VideoProfile {
-            codec: tether_protocol::control::CodecKind::Hevc,
-            chroma: tether_protocol::control::ChromaSubsampling::Yuv420,
-            bit_depth: 10,
-        },
-        PROBE_DIM,
-        PROBE_DIM,
-        30,
-        1_000,
-    )?;
-    // The first submit either succeeds (everything works) or surfaces
-    // the driver-layer rejection (e.g. "DRM format not supported by
-    // VAAPI"). Either way the answer is captured in the Result.
-    enc.submit_dmabuf(&codec_frame, 0, true)?;
-    Ok(())
-}
-
-/// Read the cached gpuconvert capability. Falls back to `false`
-/// (conservative — filter out 10-bit) with a logged error if the
-/// cache wasn't warmed; same rationale as
-/// [`sck_capture_capability`]'s fallback. Debug builds also assert —
-/// reaching this fallback means a `handle_client` path bypassed
-/// `warm_gpuconvert_capability_cache` in `main`, and silent fallback
-/// would mean a Main10-capable host advertises only 8-bit with no
-/// signal beyond an `error!` log that might scroll past unnoticed.
-#[cfg(target_os = "linux")]
-fn linux_p010_deliverable() -> bool {
-    *LINUX_P010_DELIVERABLE_CACHE.get().unwrap_or_else(|| {
-        tracing::error!(
-            "gpuconvert capability cache read before warm-up; assuming P010 \
-             undeliverable. This indicates a code path that reached \
-             handle_client without going through warm_gpuconvert_capability_cache."
-        );
-        debug_assert!(
-            false,
-            "gpuconvert capability cache read before warm-up — a new \
-             handle_client entry point skipped warm_gpuconvert_capability_cache",
-        );
-        &false
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfile> {
-    let p010_ok = linux_p010_deliverable();
-    probed
-        .into_iter()
-        .filter(|p| {
-            // Linux gpuconvert deliverability today:
-            //   - Yuv420 8-bit (NV12)   — always (Nv12DmaBuf)
-            //   - Yuv444 8-bit (XYUV)   — always (Yuv444DmaBuf)
-            //   - Yuv420 10-bit (P010)  — gated by storage-modifier probe
-            //   - Yuv444 10-bit (XV30)  — never (no bridge); gated upstream
-            //                             at the encoder probe, won't reach
-            //                             here under normal flow
-            let deliverable = match (p.chroma, p.bit_depth) {
-                (
-                    tether_protocol::control::ChromaSubsampling::Yuv420
-                    | tether_protocol::control::ChromaSubsampling::Yuv444,
-                    8,
-                ) => true,
-                (tether_protocol::control::ChromaSubsampling::Yuv420, 10) => p010_ok,
-                // Yuv444 10-bit (XV30) and any future shape: no bridge
-                // yet. Add an explicit arm here when adding a bridge —
-                // exhaustiveness on `ChromaSubsampling` doesn't fire on
-                // this expression because the bit_depth axis is `u8`.
-                _ => false,
-            };
-            if !deliverable {
-                tracing::info!(
-                    profile = ?p,
-                    p010_supported = p010_ok,
-                    "encoder probe accepted profile but Linux gpuconvert cannot deliver \
-                     the matching dma-buf shape on this host; filtering out"
-                );
-            }
-            deliverable
-        })
-        .collect()
-}
-
-// Catch-all stub for any future non-Linux non-macOS host platform
-// (Windows host backend, BSDs, etc.). The encoder-side probe is the
-// only gate until a platform-specific bridge-deliverability layer
-// lands.
-//
-// TODO(windows-host): when the Windows DXGI / Media Foundation
-// capture path lands, it MUST add its own filter here. The current
-// pass-through is structurally identical to the no-op Linux arm this
-// commit replaces — a Windows host backed by it would advertise
-// profiles its bridge can't deliver and the send loop would crash
-// mid-session on the first frame. Add a deliverability gate next to
-// the bridge in the same change.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn capture_filtered_encode_profiles(probed: Vec<VideoProfile>) -> Vec<VideoProfile> {
-    probed
-}
 
 fn derive_bitrate_kbps(profile: VideoProfile, width: u32, height: u32, fps: u32) -> u32 {
     const REFERENCE_PIXELS: u64 = 1920 * 1080;

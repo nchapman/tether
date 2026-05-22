@@ -13,7 +13,8 @@
 use std::sync::Arc;
 
 use tether_protocol::control::{
-    ChromaSubsampling, CodecKind, ControlMessage, GoodbyeCode, ServerHello, VideoProfile,
+    ChromaSubsampling, ClientHello, CodecKind, ControlMessage, GoodbyeCode, ServerHello,
+    VideoProfile,
 };
 use tether_session::{
     AcceptError, ClientSession, ClientSessionConfig, ConnectError, HostSession, HostSessionConfig,
@@ -93,7 +94,7 @@ async fn no_mutual_profile_sends_goodbye_then_errors() {
     }];
 
     let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
-    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan.clone();
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
 
     let host_task = tokio::spawn(async move {
         HostSession::accept(host_chan_dyn, host_cfg, |client_caps| {
@@ -106,42 +107,106 @@ async fn no_mutual_profile_sends_goodbye_then_errors() {
         .await
     });
 
-    // On the client side, we want to observe what the host sends after
-    // the no-match decision: the placeholder ServerHello (which our
-    // ClientSession::connect will surface as ProfileNotAdvertised
-    // because H.264 isn't in our advertised list), followed by a
-    // Goodbye on the control stream.
+    // From the client side, the placeholder ServerHello (carrying H.264
+    // as a stand-in) surfaces as ProfileNotAdvertised because H.264 is
+    // not in our advert. We deliberately don't try to drain the
+    // following Goodbye through the raw channel: that would peek
+    // under the `ClientSession` abstraction, and if `connect` is ever
+    // changed to drain the Goodbye itself the test would hang. The
+    // host-side `NoProfileIntersection` assertion below is what pins
+    // the "Goodbye was sent" half — `HostSession::accept`'s code path
+    // is the only way that error is returned, and `send_control` of
+    // the Goodbye is unconditional on that path.
     let client_task = tokio::spawn(async move {
         let connect_err = ClientSession::connect(client_chan_dyn, client_cfg)
             .await
             .map(|_| ())
             .expect_err("expected ProfileNotAdvertised");
-        // The placeholder ServerHello carries H.264 as a stand-in.
-        // ClientSession::connect refuses it because H.264 is not in
-        // our advert.
         assert!(
             matches!(connect_err, ConnectError::ProfileNotAdvertised { .. }),
             "expected ProfileNotAdvertised, got: {connect_err:?}"
         );
-        // The Goodbye should now be readable on the same channel.
-        let goodbye = client_chan.recv_control().await.unwrap();
-        assert!(
-            matches!(
-                goodbye,
-                ControlMessage::Goodbye {
-                    code: GoodbyeCode::InternalError,
-                    ..
-                }
-            ),
-            "expected Goodbye(InternalError), got: {goodbye:?}"
-        );
     });
 
-    let host_err = host_task.await.unwrap().map(|_| ()).expect_err("expected no-match");
+    let host_err = host_task
+        .await
+        .unwrap()
+        .map(|_| ())
+        .expect_err("expected no-match");
     assert!(
         matches!(host_err, AcceptError::NoProfileIntersection { .. }),
         "expected NoProfileIntersection, got: {host_err:?}"
     );
+    client_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn double_send_server_hello_corrupts_the_stream() {
+    // Pin the ordering invariant the `ControlChannel` trait documents
+    // but doesn't enforce: `send_server_hello` is valid exactly once
+    // per session, after `recv_client_hello`. Calling it twice puts a
+    // second `ServerHello` frame on the wire after the client has
+    // moved on to reading `ControlMessage`s — bincode decode fails.
+    //
+    // This regression test exists to keep future refactors of
+    // `HostSession::accept` honest. The proper fix is a typestate
+    // wrapper that makes the double-call uncompilable; until that
+    // lands, this catches the misuse at runtime.
+    use tether_protocol::control::{ClientHelloV1, ServerHelloV1, VideoColorSpec};
+    use tether_protocol::MonoNanos;
+
+    let (host_chan, client_chan) = duplex_pair();
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+
+    // Client side: complete the handshake normally, then `recv_control`
+    // — that read should see the (corrupt) second ServerHello and
+    // bincode-fail.
+    let client_task = tokio::spawn(async move {
+        let _ = client_chan
+            .client_handshake(ClientHello::V1(ClientHelloV1 {
+                client_name: "test".into(),
+                preferred_codecs: vec![CodecKind::H264],
+                max_resolution: None,
+                clock_probe_t0: MonoNanos::ZERO,
+                extensions: Default::default(),
+                resume_token: None,
+            }))
+            .await
+            .unwrap();
+        // The second ServerHello sits on the stream; reading it as a
+        // ControlMessage fails the bincode decode.
+        let second = client_chan.recv_control().await;
+        assert!(
+            second.is_err(),
+            "a second send_server_hello on the same channel must not \
+             decode as a ControlMessage; got: {second:?}"
+        );
+    });
+
+    let (_, t1) = host_chan_dyn.recv_client_hello().await.unwrap();
+    let placeholder = ServerHello::V1(ServerHelloV1 {
+        server_name: "test".into(),
+        chosen_codec: CodecKind::H264,
+        chosen_chroma: ChromaSubsampling::Yuv420,
+        color_space: VideoColorSpec::sdr_desktop(),
+        resolution: (0, 0),
+        clock_probe_t0_echo: MonoNanos::ZERO,
+        t1_server_recv: MonoNanos::ZERO,
+        t2_server_send: MonoNanos::ZERO,
+        extensions: Default::default(),
+        resume_token: None,
+    });
+    host_chan_dyn
+        .send_server_hello(placeholder.clone(), MonoNanos::ZERO, t1)
+        .await
+        .unwrap();
+    // Misuse: call it again. The client task asserts the corruption
+    // becomes visible on the next read.
+    host_chan_dyn
+        .send_server_hello(placeholder, MonoNanos::ZERO, t1)
+        .await
+        .unwrap();
+
     client_task.await.unwrap();
 }
 

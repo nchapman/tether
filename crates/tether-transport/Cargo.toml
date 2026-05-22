@@ -23,9 +23,16 @@ sha2 = "0.11"
 
 [features]
 # Exposes `test_support::DuplexControlChannel` for downstream crates'
-# integration tests. Strictly additive — only adds items inside the
-# `test_support` module; never modifies the public API of anything else
-# in this crate. Downstream crates enable it under `[dev-dependencies]`.
+# integration tests. The feature gates only the items inside the
+# `test_support` module — never modifies the public API of anything
+# else in this crate. Downstream crates enable it under
+# `[dev-dependencies]`.
+#
+# `async-trait` itself ships unconditionally: the real `Connection`'s
+# `ControlChannel` / `InputChannel` / `VideoChannel` impls use it, so
+# it has to be in `[dependencies]` (not gated behind this feature).
+# That's fine — `async-trait` is a proc-macro that emits ordinary
+# code; there's no runtime cost in release builds.
 test-support = []
 
 [dev-dependencies]

@@ -9,11 +9,11 @@ each layer covers, and how to extend it.
 | Crate | Tests | Covers |
 | --- | --- | --- |
 | `tether-protocol` | 50 | Wire round-trips for every control variant (handshake, codec negotiation incl. 10-bit `VideoProfile` constants + forward-compat `u8` bit_depth probe, video packets + `stream_epoch>u16` widening, `VideoFrameMetaEnvelope`, cursor position + control-stream cursor shapes, multi-monitor `DisplayList`, stream lifecycle, `ClientStats`, `ControlMessage::Extension`, audio `Opus`, `PixelFormat` hello extension incl. `P010` / `P410`, `InputEvent::device_id`), fragmenter / reassembler invariants (out-of-order, stale eviction, wall-clock-timeout eviction, cross-epoch rejection, duplicate-fragment idempotency, continuation-before-First, `single_packet` reliable-IDR path), `HostFrameTimingBuilder` typestate, forward-compat probes for every wire-serialised tagged enum (`ClientHello`, `ServerHello`, `ControlMessage`, `VideoPacket`, `VideoFrameMetaEnvelope`), clock-sync edges (zero-RTT, negative-processing, near-i64::MAX offset). |
-| `tether-transport` | 6 integration tests in `tests/roundtrip.rs` | QUIC handshake, control + datagram round-trip, fingerprint pinning, oversized-datagram local reject, video-keyframe-stream round-trip, oversized-keyframe local reject. |
+| `tether-transport` | 6 integration tests in `tests/roundtrip.rs` + 3 in `test_support` (under the `test-support` feature) | QUIC handshake, control + datagram round-trip, fingerprint pinning, oversized-datagram local reject, video-keyframe-stream round-trip, oversized-keyframe local reject. `test_support`: `DuplexControlChannel` handshake round-trip, post-handshake control message exchange, dropped-peer surfaces `StreamClosed`. |
 | `tether-codec` | (count) | `validate_chosen_profile` accept/reject/empty-advertised paths; SW H264 round-trip (test-only); VT `codec_name` map; VAAPI encoder/decoder/dma-buf-import on Linux hardware; per-codec × per-resolution benchmarks (`vaapi::bench`, 4 cells × 3 paths); VideoToolbox: encoder construct, H.264 BGRA round-trip, HEVC 10-bit / 4:4:4 probe matrix, `videotoolbox_round_trip_chroma_matrix` cross-checks the encode side against an independent encode→decode→IOSurface-fourcc check (catches silent downsample regressions), self-decodable-IDR mid-session recovery. Capability discovery and preference-list negotiation tests live in `tether-probe`. |
 | `tether-probe` | 10 default + 0 `#[ignore]` (today) | `PipelineStage` exhaustiveness, `ProfileSupport` helper accessors, preference order (5-entry list, 10-bit-first), `pick_supported_profile` (best mutual / fallback / disjoint / empty / forward-compat unknown bit_depth), `probe_client_does_not_mirror_encode_bit_into_decode_field` (the Mac 4:4:4 decode-without-encode invariant). |
 | `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |
-| `tether-session` | 5 | `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate. |
+| `tether-session` | 15 unit + 7 integration in `tests/loopback.rs` | Unit: `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate; `HostSession::accept` decode-profile-extension parsing (missing / oversize / malformed / well-formed / unknown bit_depth filter / no-match server-hello shape / chosen-profile echo); `ClientSession::connect` resolve_negotiated_profile (extension absent → 8-bit synth, present + decodes → authoritative, undecodable → error, unknown bit_depth → reject). Integration (via `tether-transport`'s `test-support` feature `DuplexControlChannel`): happy-path handshake with RTT/offset bounds, no-mutual-profile sends Goodbye after placeholder hello, host picks unadvertised profile → client `ProfileNotAdvertised`, host picks unknown bit_depth → client `UnknownBitDepth`, host filters unknown depths from advert keeping known ones, legacy host with no encode-profile extension synthesizes 8-bit profile from inline fields, dropped client during handshake → `Transport(_)`. |
 | `tether-render` | 16 + 1 `#[ignore]` (Linux); + 4 `#[ignore]` (macOS) | Cursor letterbox clipping, aspect ratio; `LatestFrame` Send+Sync + drop-oldest displacement; transfer_kind dispatch table pin; `range_kind_for(bit_depth, layout)` dispatch table pin + algebraic check that 10-bit limited-range breakpoints land white at 1.0 and black at 0.0; `render_layout_for(chroma, bit_depth)` dispatch table pin (incl. Yuv420 10-bit → Biplanar16 which the import path relies on for UV dimensioning); dma-buf zero-copy round-trip on Linux hardware (H.264 + HEVC 4:2:0 8-bit, HEVC 4:4:4 8-bit); IOSurface zero-copy on macOS hardware (HEVC 4:2:0 8-bit + 10-bit via encode→decode→render; HEVC 4:4:4 8-bit + 10-bit via fixture-decode→render since VT lacks Main444 encode). |
 | `tether-gpuconvert` | 3 default + 11 `#[ignore]` | `drm_fourcc_to_vk_format` table coverage incl. 10-bit biplanar plane fourccs (R16/GR32 → R16_UNORM/R16G16_UNORM) + 8-bit family regression + unknown-fourcc rejection; BGRA→NV12 + DMA-BUF round-trip with real Vulkan adapter. |
 | `tether-capture` | 1 default + 1 `#[ignore]` macOS | SCK pixel-format probe records `420v`/`420f`/`'444v'`/`'444f'`/`xf44` acceptance via real `start_capture` + frame-arrival check for the Unknown-fourcc cases. |
@@ -83,10 +83,20 @@ See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
 ## What's deliberately untested today
 
 - **End-to-end host↔client glass-to-glass.** Validated by hand on a
-  Linux↔Linux LAN and Mac→Linux LAN; no automation. A `tether-session`
-  loopback integration test that runs `HostSession` and
-  `ClientSession` over a `tokio::io::duplex` shim is the natural next
-  addition once those session-level scaffolds exist.
+  Linux↔Linux LAN and Mac→Linux LAN; no automation. The handshake
+  layer is now loopback-tested in-process via
+  `tether-transport::test_support::DuplexControlChannel` —
+  `crates/tether-session/tests/loopback.rs` runs `HostSession::accept`
+  and `ClientSession::connect` against each other through a
+  `tokio::io::duplex` pair, covering the clock-sync RTT/offset math,
+  Goodbye-on-no-match, unknown bit-depth refusal, and the host-
+  lenient / client-strict bit-depth asymmetry. The video / input /
+  datagram layers don't yet have duplex fakes — `InputChannel` and
+  `VideoChannel` traits are defined in `tether-transport` but
+  duplex impls land when the first test that needs one does. The
+  remaining glass-to-glass gap is everything past `StreamReady`:
+  fragmenter under loss, IDR signalling latency, decoder restart
+  recovery, render-thread drop-oldest under backpressure.
 - **The actual rendered pixels.** `tether-render`'s shader output
   is validated by eye, not by image-diff. A headless `wgpu::Surface`
   + image diff against a checked-in fixture is a worthwhile

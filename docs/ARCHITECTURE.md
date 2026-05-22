@@ -39,13 +39,13 @@ tether/
 │   └── tether-client        # the computer doing the viewing
 └── crates/
     ├── tether-protocol      # wire format, no I/O. Pure types + framing.
-    ├── tether-transport     # QUIC server + client (quinn-backed)
+    ├── tether-transport     # QUIC server + client (quinn-backed) + role traits (ControlChannel etc.) for loopback testing
     ├── tether-capture       # screen capture: PipeWire (Linux), test pattern
     ├── tether-codec         # Encoder + Decoder traits; H.264 SW + VAAPI
     ├── tether-gpuconvert    # host-side BGRA→NV12 compute + DMA-BUF export
     ├── tether-render        # client-side wgpu renderer (NV12 → window)
     ├── tether-input         # keyboard/mouse capture (client) + injection (host)
-    ├── tether-session       # cross-platform session helpers (IDR coalescing, stats)
+    ├── tether-session       # HostSession/ClientSession handshake + IDR coalescing + stats
     └── tether-vaapi         # hand-rolled libva FFI (vaExportSurfaceHandle etc.)
 ```
 
@@ -396,6 +396,39 @@ Forward-compat hooks every feature added later relies on:
   any new control message that doesn't fit the typed variants.
 - **`VideoFrameMetaEnvelope`** so per-frame metadata grows by enum
   variant rather than struct field.
+
+### Session orchestration and the channel-trait abstraction
+
+The application-layer handshake (post-QUIC: extension parsing, profile
+negotiation, `Goodbye(InternalError)` on no-match, initial `ForceIdr`)
+lives in `tether-session::{HostSession, ClientSession}`, not inline in
+the app binaries. `tether-transport` defines four role-shaped traits —
+`ControlChannel`, `InputChannel`, `VideoChannel`, `ConnectionInfo` —
+each mirroring how a specific consumer uses the connection; the
+concrete `Connection` impls all four. `HostSession::accept` and
+`ClientSession::connect` take `Arc<dyn ControlChannel>` so the
+handshake is loopback-testable through
+`tether_transport::test_support::DuplexControlChannel` (a
+`tokio::io::duplex`-backed impl gated behind the `test-support`
+feature, used by `crates/tether-session/tests/loopback.rs`).
+
+The handshake is split across two `ControlChannel` methods —
+`recv_client_hello` returning `(ClientHello, t1_server_recv)`, then
+`send_server_hello(server, client_t0, t1)` which stamps `t0_echo` /
+`t1` / `t2_server_send` immediately before serializing the wire bytes.
+Splitting at that seam keeps the clock-sync stamps inside the wire
+layer (so a slow `HostSession` orchestration step still produces a
+late `t2`) while profile-negotiation policy stays in the session
+layer. App binaries hold an `Arc<Connection>` for the recv tasks
+(video / input / datagram are outside the `ControlChannel` surface)
+and pass a coerced `Arc<dyn ControlChannel>` into the session call
+only.
+
+`tether-host`'s `main` runs a reconnect loop: per-session errors log
+and continue; only a server close ends the process. The whole
+per-connection graph (encoder thread, libei injector, recv tasks)
+lives inside `handle_client` and drops when it returns, so nothing
+leaks across reconnects.
 
 ### Codec / chroma / depth negotiation
 

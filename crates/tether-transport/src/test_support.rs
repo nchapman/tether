@@ -106,10 +106,16 @@ impl DuplexControlChannel {
             size: bytes.len(),
             max: MAX_FRAMED_MESSAGE,
         })?;
+        // Note: no `flush()` here. The real `Connection::write_framed`
+        // doesn't flush either — QUIC streams send as soon as bytes
+        // are written. Adding `flush` here would make the fake able
+        // to surface back-pressure errors the real transport never
+        // produces, and a future test that shrinks the duplex buffer
+        // to deliberately force back-pressure would see fake-only
+        // failures.
         let mut s = self.send.lock().await;
         s.write_all(&len.to_le_bytes()).await?;
         s.write_all(&bytes).await?;
-        s.flush().await?;
         Ok(())
     }
 

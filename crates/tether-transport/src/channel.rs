@@ -89,8 +89,17 @@ pub trait ControlChannel: Send + Sync {
     /// **Performance contract**: the duration between this returning
     /// and [`Self::send_server_hello`] being called biases the
     /// `ClockSync` offset estimator by exactly half its wall-clock
-    /// length. Keep the work in between fast (sub-millisecond);
-    /// cache anything expensive at process startup.
+    /// length (NTP-style: `offset = ((t1 - t0) + (t2 - t3)) / 2`).
+    /// Concretely: a 1 ms orchestration step produces a ~500 µs
+    /// phantom offset; a 10 ms step (e.g., a cold mutex on a busy
+    /// box, or hitting a not-yet-warmed probe cache) produces ~5 ms
+    /// of phantom — detectable in the
+    /// `happy_path_handshake_completes_with_negotiated_profile`
+    /// loopback test, which asserts `offset_nanos.abs() < 10ms`.
+    /// Sleep / async I/O between the two calls is now syntactically
+    /// permitted by the trait shape (the old single-method
+    /// `host_handshake` took a sync `FnOnce` closure that couldn't
+    /// `.await`). Don't.
     async fn recv_client_hello(&self) -> Result<(ClientHello, MonoNanos)>;
 
     /// Host side of the handshake, second half. Stamps `t0_echo`

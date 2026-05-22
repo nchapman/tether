@@ -20,11 +20,17 @@
 //! of band. The client pins that fingerprint via
 //! [`tls::PinnedCertVerifier`]. See [`tls`] for the rationale.
 
+mod channel;
 mod client;
 mod connection;
 mod server;
 pub mod tls;
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
+
+pub use channel::{ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
 pub use client::Client;
 pub use connection::{Connection, Datagram};
 pub use server::Server;

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -13,6 +14,7 @@ use tether_protocol::{
 };
 use tether_protocol::MonoNanos;
 
+use crate::channel::{ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
 use crate::{Result, TransportError, MAX_FRAMED_MESSAGE, MAX_VIDEO_STREAM_MESSAGE};
 
 /// Length of the per-stream preamble written by the client and consumed by
@@ -187,50 +189,37 @@ impl Connection {
         Ok((server, sync))
     }
 
-    /// Host side of the post-QUIC application handshake. Awaits the
-    /// `ClientHello`, captures the receive time, hands the parsed Hello
-    /// to the caller's `build` closure (which picks the codec, chooses a
-    /// resolution, etc.), then stamps the probe timestamps inside the
-    /// returned ServerHello body immediately before sending the response.
-    /// Returns the parsed `ClientHello` so the caller can also inspect
-    /// what it agreed to.
-    ///
-    /// **Performance contract for `build`**: the closure runs between
-    /// `t1_server_recv` and `t2_server_send`, both of which the
-    /// `ClockSync::from_probe` estimator uses. The RTT half of that
-    /// formula explicitly subtracts `t2 - t1` and is unaffected by
-    /// the closure's wall-clock duration. The *offset* half is the
-    /// standard NTP-style estimator `((t1 - t0) + (t2 - t3)) / 2`,
-    /// which assumes symmetric one-way latency — and any work the
-    /// closure does biases the resulting offset by exactly half its
-    /// duration. A 100 ms closure produces a 50 ms phantom in every
-    /// subsequent `host_send_time + offset` computation for that
-    /// session.
-    ///
-    /// Keep `build` fast (sub-millisecond). Cache anything expensive
-    /// — codec probes, capture-format probes, GPU adapter queries —
-    /// at process startup before calling `host_handshake`.
-    pub async fn host_handshake<F>(&self, build: F) -> Result<ClientHello>
-    where
-        F: FnOnce(&ClientHello) -> ServerHello,
-    {
+    /// Host side of the handshake, first half. Awaits the
+    /// [`ClientHello`] and captures the receive timestamp.
+    /// Paired with [`Self::send_server_hello`]; see [`ControlChannel`]
+    /// for the full split rationale and the performance contract.
+    pub async fn recv_client_hello(&self) -> Result<(ClientHello, MonoNanos)> {
         let hello: ClientHello = self.recv_control_raw().await?;
         let t1 = MonoNanos::now();
-        let mut server = build(&hello);
-        let client_t0 = match &hello {
-            ClientHello::V1(body) => body.clock_probe_t0,
-        };
+        Ok((hello, t1))
+    }
+
+    /// Host side of the handshake, second half. Stamps the three
+    /// probe timestamps into the [`ServerHello`] body and sends it.
+    /// `t2_server_send` is stamped immediately before the
+    /// serialize+write so the wire-time stamp is as close to the
+    /// actual write as possible.
+    pub async fn send_server_hello(
+        &self,
+        mut server: ServerHello,
+        client_t0: MonoNanos,
+        t1_server_recv: MonoNanos,
+    ) -> Result<()> {
         // Patch the probe stamps into the body the caller built. Match
         // exhaustively so a future V2 forces a code update here.
         match &mut server {
             ServerHello::V1(body) => {
                 body.clock_probe_t0_echo = client_t0;
-                body.t1_server_recv = t1;
+                body.t1_server_recv = t1_server_recv;
                 body.t2_server_send = MonoNanos::now();
             }
         }
-        self.send_control_raw(&server).await?;
-        Ok(hello)
+        self.send_control_raw(&server).await
     }
 
     pub async fn send_control(&self, msg: &ControlMessage) -> Result<()> {
@@ -290,6 +279,74 @@ impl std::fmt::Debug for Connection {
             .field("remote", &self.remote_address())
             .field("rtt", &self.rtt())
             .finish_non_exhaustive()
+    }
+}
+
+// Role-trait impls. Each method just forwards to the inherent method
+// of the same name. The inherent methods stay because production code
+// holds `Arc<Connection>` and uses them directly; the trait impls
+// exist so test doubles (and future consumers that want to be generic)
+// can stand in via `Arc<dyn ControlChannel>` etc.
+
+#[async_trait]
+impl ControlChannel for Connection {
+    async fn send_control(&self, msg: &ControlMessage) -> Result<()> {
+        Connection::send_control(self, msg).await
+    }
+    async fn recv_control(&self) -> Result<ControlMessage> {
+        Connection::recv_control(self).await
+    }
+    async fn client_handshake(&self, hello: ClientHello) -> Result<(ServerHello, ClockSync)> {
+        Connection::client_handshake(self, hello).await
+    }
+    async fn recv_client_hello(&self) -> Result<(ClientHello, MonoNanos)> {
+        Connection::recv_client_hello(self).await
+    }
+    async fn send_server_hello(
+        &self,
+        server: ServerHello,
+        client_t0: MonoNanos,
+        t1_server_recv: MonoNanos,
+    ) -> Result<()> {
+        Connection::send_server_hello(self, server, client_t0, t1_server_recv).await
+    }
+}
+
+#[async_trait]
+impl InputChannel for Connection {
+    async fn send_input(&self, evt: &InputEvent) -> Result<()> {
+        Connection::send_input(self, evt).await
+    }
+    async fn recv_input(&self) -> Result<InputEvent> {
+        Connection::recv_input(self).await
+    }
+}
+
+#[async_trait]
+impl VideoChannel for Connection {
+    fn send_datagram(&self, d: &Datagram) -> Result<()> {
+        Connection::send_datagram(self, d)
+    }
+    async fn recv_datagram(&self) -> Result<Datagram> {
+        Connection::recv_datagram(self).await
+    }
+    async fn send_video_keyframe(&self, packet: &VideoPacket) -> Result<()> {
+        Connection::send_video_keyframe(self, packet).await
+    }
+    async fn accept_video_keyframe(&self) -> Result<VideoPacket> {
+        Connection::accept_video_keyframe(self).await
+    }
+}
+
+impl ConnectionInfo for Connection {
+    fn rtt(&self) -> Duration {
+        Connection::rtt(self)
+    }
+    fn max_datagram_size(&self) -> Option<usize> {
+        Connection::max_datagram_size(self)
+    }
+    fn remote_address(&self) -> SocketAddr {
+        Connection::remote_address(self)
     }
 }
 

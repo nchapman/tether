@@ -13,3 +13,8 @@ tether-protocol = { workspace = true }
 tether-transport = { workspace = true }
 tracing.workspace = true
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tether-transport = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-test = "0.4"

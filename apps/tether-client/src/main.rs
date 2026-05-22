@@ -101,8 +101,13 @@ async fn main() -> anyhow::Result<()> {
     // the host with a `ForceIdr` so the next frame is a keyframe.
     // The clock-sync probe round-trip happens inside `client_handshake`
     // so latency logs are wall-clock-accurate from the first frame.
+    // ClientSession takes the channel through the `ControlChannel`
+    // trait object so it's mockable in tests. The original
+    // `Arc<Connection>` stays in `conn` for the rest of `main` — the
+    // recv tasks below use concrete-`Connection` methods (datagram,
+    // keyframe-stream accept, input send) that aren't on the trait.
     let session = ClientSession::connect(
-        conn.clone(),
+        conn.clone() as Arc<dyn tether_transport::ControlChannel>,
         ClientSessionConfig {
             client_name: "tether-client".to_string(),
             client_decode_profiles: client_decode_profiles.clone(),
@@ -116,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         ConnectError::Transport(t) => anyhow::Error::from(t),
     })?;
     let ClientSession {
-        conn: _,
+        channel: _,
         negotiated: negotiated_profile,
         server_hello,
         clock_sync,

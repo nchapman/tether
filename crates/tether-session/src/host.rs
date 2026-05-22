@@ -34,7 +34,7 @@ use tether_protocol::control::{
     SERVER_ENCODE_PROFILE_EXTENSION_KEY,
 };
 use tether_protocol::MonoNanos;
-use tether_transport::{Connection, TransportError};
+use tether_transport::{ControlChannel, TransportError};
 use tracing::{info, warn};
 
 use crate::idr::IdrSignal;
@@ -64,8 +64,11 @@ pub struct HostSessionConfig {
 /// the workspace and accessors would just be noise. Each field maps 1:1
 /// to a piece of state the host orchestration code already needed:
 ///
-/// - `conn`: same `Arc<Connection>` the caller handed in. Cheap to clone
-///   into the spawned recv/send tasks.
+/// - `channel`: `Arc<dyn ControlChannel>` — the handshake + control
+///   stream. Production code passes a quinn-backed
+///   `tether_transport::Connection`; tests pass an in-memory
+///   `tether_transport::test_support::DuplexControlChannel`. Cheap to
+///   clone into the spawned recv tasks.
 /// - `negotiated`: the chosen [`VideoProfile`]. Drives encoder build,
 ///   gpuconvert bridge selection, and per-frame metadata.
 /// - `client_hello` / `client_decode_profiles`: the structured client
@@ -79,7 +82,7 @@ pub struct HostSessionConfig {
 ///   first ~hundreds of ms of frames don't race the client's decoder
 ///   construction.
 pub struct HostSession {
-    pub conn: Arc<Connection>,
+    pub channel: Arc<dyn ControlChannel>,
     pub negotiated: VideoProfile,
     pub client_hello: ClientHelloV1,
     pub client_decode_profiles: Vec<VideoProfile>,
@@ -109,86 +112,83 @@ pub enum AcceptError {
 impl HostSession {
     /// Run the application-layer handshake and produce a [`HostSession`].
     ///
-    /// The `selector` closure is called inside the handshake's `build`
-    /// step with the client's advertised decode profiles and must return
-    /// the host's chosen profile (or `None` for no match). Keep it
-    /// **fast** (sub-millisecond) — the `host_handshake` performance
-    /// contract documents how slow work in `build` biases the
-    /// `ClockSync` offset. `pick_supported_profile` is fine; anything
-    /// that touches hardware is not.
+    /// The `selector` closure receives the client's advertised decode
+    /// profiles and returns the host's chosen profile (or `None` for
+    /// no match). Keep it **fast** (sub-millisecond) — work done
+    /// between [`ControlChannel::recv_client_hello`] returning and
+    /// [`ControlChannel::send_server_hello`] firing biases the
+    /// `ClockSync` offset estimator by half its wall-clock duration.
+    /// `tether_probe::pick_supported_profile` is fine; anything that
+    /// touches hardware is not.
     ///
-    /// On `Err(NoProfileIntersection)` this function has already sent a
-    /// clean `Goodbye(InternalError)` to the client. On
-    /// `Err(Transport(_))` no goodbye was sent (the connection is the
-    /// problem). On `Ok`, the QUIC connection is alive, the handshake
-    /// is complete, and the caller can wire up capture / encode / recv
-    /// tasks against the returned session.
+    /// Async selector signature (`FnOnce` over `&[VideoProfile]`)
+    /// means the caller can be generic without exposing trait
+    /// objects. Static dispatch — no heap allocation, the closure
+    /// monomorphizes per call site.
+    ///
+    /// On `Err(NoProfileIntersection)` this function has already sent
+    /// a clean `Goodbye(InternalError)` to the client (after a
+    /// syntactically valid `ServerHello` placeholder, so legacy
+    /// clients don't trip on an unparseable wire shape). On
+    /// `Err(Transport(_))` no goodbye was sent. On `Ok`, the channel
+    /// is alive, the handshake is complete, and the caller can wire
+    /// up capture / encode / recv tasks against the returned session.
     pub async fn accept<S>(
-        conn: Arc<Connection>,
+        channel: Arc<dyn ControlChannel>,
         cfg: HostSessionConfig,
         selector: S,
     ) -> Result<Self, AcceptError>
     where
         S: FnOnce(&[VideoProfile]) -> Option<VideoProfile>,
     {
-        // The handshake closure isn't async, so we stash its outputs
-        // through `Option`s captured by `&mut`. The closure runs exactly
-        // once (`host_handshake` takes `FnOnce`), so the `Option::take`
-        // pattern here can't drop work on the floor.
-        let mut chosen_profile_out: Option<VideoProfile> = None;
-        let mut client_decode_profiles_out: Option<Vec<VideoProfile>> = None;
-        let mut selector_slot = Some(selector);
+        // Step 1: receive the ClientHello and capture t1_server_recv.
+        // The trait stamps t1 internally so the timing is consistent
+        // across real and test implementations.
+        let (client_hello, t1) = channel.recv_client_hello().await?;
+        let ClientHello::V1(client_body) = client_hello;
+        let client_t0 = client_body.clock_probe_t0;
 
-        let client_hello = conn
-            .host_handshake(|hello| {
-                let ClientHello::V1(body) = hello;
-                let client_caps = parse_client_decode_profiles(body);
-                info!(
-                    client_decode_profiles = ?client_caps,
-                    legacy_preferred_codecs = ?body.preferred_codecs,
-                    "client video decode capabilities (parsed from hello)"
-                );
+        let client_decode_profiles = parse_client_decode_profiles(&client_body);
+        info!(
+            client_decode_profiles = ?client_decode_profiles,
+            legacy_preferred_codecs = ?client_body.preferred_codecs,
+            "client video decode capabilities (parsed from hello)"
+        );
 
-                // Hand the caller's selector exactly the inputs it needs.
-                // Take the closure out of the slot so we don't violate
-                // FnOnce; `host_handshake` itself only invokes `build`
-                // once, so the slot is guaranteed populated here.
-                let selector = selector_slot
-                    .take()
-                    .expect("host_handshake invokes build exactly once");
-                let chosen = selector(&client_caps);
-                chosen_profile_out = chosen;
-                client_decode_profiles_out = Some(client_caps);
+        // Step 2: application-layer policy. Run the selector to pick
+        // a profile. This is the only point in `accept` where domain
+        // logic lives — everything else is wire shape.
+        let chosen_profile = selector(&client_decode_profiles);
 
-                ServerHello::V1(build_server_hello(&cfg, chosen))
-            })
+        // Step 3: build + send the ServerHello. Even on no-match we
+        // send a syntactically valid ServerHello (with the H.264
+        // floor as placeholder) so the client's wire parser doesn't
+        // trip on a future variant before it processes the Goodbye
+        // we're about to send. The trait stamps t0_echo + t1 + t2
+        // immediately before serialize+write.
+        let server_hello = ServerHello::V1(build_server_hello(&cfg, chosen_profile));
+        channel
+            .send_server_hello(server_hello, client_t0, t1)
             .await?;
 
-        let ClientHello::V1(client_body) = client_hello;
-        let client_decode_profiles = client_decode_profiles_out
-            .expect("host_handshake build closure populates client_decode_profiles_out");
-
-        let chosen_profile = match chosen_profile_out {
-            Some(p) => p,
-            None => {
-                warn!(
-                    client_decode_profiles = ?client_decode_profiles,
-                    "no video profile intersects host encode + client decode capabilities; \
-                     sending Goodbye(InternalError) and ending session"
-                );
-                // Best-effort goodbye. If this fails the connection is
-                // already gone — either way we're returning an error
-                // and the caller drops `conn`.
-                let _ = conn
-                    .send_control(&ControlMessage::Goodbye {
-                        reason: "host and client video capabilities do not intersect".to_string(),
-                        code: GoodbyeCode::InternalError,
-                    })
-                    .await;
-                return Err(AcceptError::NoProfileIntersection {
-                    client: client_decode_profiles,
-                });
-            }
+        // Step 4: on no-match, send Goodbye and bail.
+        let Some(chosen_profile) = chosen_profile else {
+            warn!(
+                client_decode_profiles = ?client_decode_profiles,
+                "no video profile intersects host encode + client decode capabilities; \
+                 sending Goodbye(InternalError) and ending session"
+            );
+            // Best-effort. If this fails the connection is already
+            // gone — either way we're returning an error.
+            let _ = channel
+                .send_control(&ControlMessage::Goodbye {
+                    reason: "host and client video capabilities do not intersect".to_string(),
+                    code: GoodbyeCode::InternalError,
+                })
+                .await;
+            return Err(AcceptError::NoProfileIntersection {
+                client: client_decode_profiles,
+            });
         };
 
         info!(
@@ -201,7 +201,7 @@ impl HostSession {
         );
 
         Ok(Self {
-            conn,
+            channel,
             negotiated: chosen_profile,
             client_hello: client_body,
             client_decode_profiles,

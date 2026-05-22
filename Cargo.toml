@@ -40,10 +40,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 serde = { version = "1", features = ["derive"] }
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal", "io-util"] }
 crossbeam-channel = "0.5"
 socket2 = "0.5"
 winit = "0.30"
+async-trait = "0.1"
 
 # Keep every wgpu sub-crate on the same trunk SHA as the top-level pin
 # in tether-render. Without this, any future workspace member that

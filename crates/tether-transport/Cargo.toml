@@ -14,11 +14,19 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+async-trait = { workspace = true }
 quinn = "0.11"
 socket2 = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rcgen = "0.14"
 sha2 = "0.11"
+
+[features]
+# Exposes `test_support::DuplexControlChannel` for downstream crates'
+# integration tests. Strictly additive — only adds items inside the
+# `test_support` module; never modifies the public API of anything else
+# in this crate. Downstream crates enable it under `[dev-dependencies]`.
+test-support = []
 
 [dev-dependencies]
 anyhow = { workspace = true }

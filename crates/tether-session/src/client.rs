@@ -27,7 +27,7 @@ use tether_protocol::control::{
     SERVER_ENCODE_PROFILE_EXTENSION_KEY,
 };
 use tether_protocol::MonoNanos;
-use tether_transport::{Connection, TransportError};
+use tether_transport::{ControlChannel, TransportError};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
@@ -45,7 +45,7 @@ pub struct ClientSessionConfig {
 ///
 /// Public fields by design — see the rationale on `HostSession`.
 pub struct ClientSession {
-    pub conn: Arc<Connection>,
+    pub channel: Arc<dyn ControlChannel>,
     pub negotiated: VideoProfile,
     pub server_hello: ServerHelloV1,
     pub clock_sync: ClockSync,
@@ -100,7 +100,7 @@ impl ClientSession {
     /// On any error from this function the connection is left to the
     /// caller to close.
     pub async fn connect(
-        conn: Arc<Connection>,
+        channel: Arc<dyn ControlChannel>,
         cfg: ClientSessionConfig,
     ) -> Result<Self, ConnectError> {
         let mut extensions = BTreeMap::new();
@@ -129,7 +129,7 @@ impl ClientSession {
             resume_token: None,
         });
 
-        let (server_hello, clock_sync) = conn.client_handshake(hello).await?;
+        let (server_hello, clock_sync) = channel.client_handshake(hello).await?;
         // Newer hosts may send a future ServerHello variant we don't
         // know; bincode's enum-variant decode catches that as an error
         // upstream. Reaching here means the variant decoded; match
@@ -180,12 +180,12 @@ impl ClientSession {
         // capture-gated hosts (portal prompt, TCC dialog) still produce
         // a keyframe on first delivered frame instead of dropping the
         // client into a partial GOP.
-        if let Err(e) = conn.send_control(&ControlMessage::ForceIdr).await {
+        if let Err(e) = channel.send_control(&ControlMessage::ForceIdr).await {
             warn!(error = ?e, "initial ForceIdr send failed; continuing anyway");
         }
 
         Ok(Self {
-            conn,
+            channel,
             negotiated,
             server_hello: server_body,
             clock_sync,

@@ -158,9 +158,19 @@ async fn main() -> anyhow::Result<()> {
         let cfg = HostSessionConfig {
             server_name: "tether-host".to_string(),
         };
-        let session = match HostSession::accept(conn, cfg, |client_caps| {
-            tether_probe::pick_supported_profile(&host_encode_profiles, client_caps)
-        })
+        // `HostSession::accept` takes the channel through the
+        // `ControlChannel` trait object so it's mockable in tests.
+        // We keep the original `Arc<Connection>` in scope for the rest
+        // of `handle_client`, which uses concrete-type methods
+        // (video keyframe streams, datagram send, input recv) that
+        // are outside the `ControlChannel` surface.
+        let session = match HostSession::accept(
+            conn.clone() as Arc<dyn tether_transport::ControlChannel>,
+            cfg,
+            |client_caps| {
+                tether_probe::pick_supported_profile(&host_encode_profiles, client_caps)
+            },
+        )
         .await
         {
             Ok(s) => s,
@@ -182,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        if let Err(e) = handle_client(session, use_test_pattern).await {
+        if let Err(e) = handle_client(session, conn, use_test_pattern).await {
             warn!(error = ?e, "session ended with error; accepting next client");
         }
     }
@@ -198,18 +208,26 @@ async fn main() -> anyhow::Result<()> {
 /// reconnects must live in `main`, not here.
 async fn handle_client(
     session: HostSession,
+    conn: Arc<Connection>,
     use_test_pattern: bool,
 ) -> anyhow::Result<()> {
     // The handshake (decode-profile negotiation, pixel-format advert,
     // Goodbye-on-no-match) ran in `HostSession::accept`. Unpack the
     // per-connection state it produced.
     //
+    // `session.channel` is dropped here: it's an `Arc<dyn ControlChannel>`
+    // pointing to the same `Connection` that `conn` holds, just
+    // type-erased for the session-level abstraction. The recv tasks
+    // and send thread below need concrete-`Connection` methods
+    // (video keyframe streams, datagram send, input recv), so we use
+    // `conn` directly.
+    //
     // Bind `_client_decode_profiles` and `_client_hello` because the
     // immediate orchestration below doesn't read them — they're kept on
     // the session for callers (logs, diagnostics, future adaptive
     // policy) and accessible via the field names if needed.
     let HostSession {
-        conn,
+        channel: _,
         negotiated: chosen_profile,
         client_hello: _client_hello,
         client_decode_profiles: _client_decode_profiles,

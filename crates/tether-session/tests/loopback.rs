@@ -1,0 +1,359 @@
+//! End-to-end session loopback. Wires `HostSession::accept` and
+//! `ClientSession::connect` together through a `DuplexControlChannel`
+//! pair so the handshake's clock-sync math, profile negotiation,
+//! Goodbye-on-no-match flow, and bit-depth validation get exercised
+//! in CI without a real QUIC pair (or any UDP socket at all).
+//!
+//! These tests close the "no end-to-end session loopback" gap that
+//! used to mean session-level bugs only surfaced in live sessions.
+//! The phantom-latency bug (slow build closure biasing the
+//! `ClockSync` offset by ~50ms) lived entirely in this gap before
+//! the trait abstraction made loopback testable.
+
+use std::sync::Arc;
+
+use tether_protocol::control::{
+    ChromaSubsampling, CodecKind, ControlMessage, GoodbyeCode, ServerHello, VideoProfile,
+};
+use tether_session::{
+    AcceptError, ClientSession, ClientSessionConfig, ConnectError, HostSession, HostSessionConfig,
+};
+use tether_transport::test_support::duplex_pair;
+use tether_transport::ControlChannel;
+
+/// Construct a paired host + client session config used by most
+/// happy-path tests.
+fn cfgs() -> (HostSessionConfig, ClientSessionConfig) {
+    let host = HostSessionConfig {
+        server_name: "test-host".to_string(),
+    };
+    let client = ClientSessionConfig {
+        client_name: "test-client".to_string(),
+        client_decode_profiles: vec![VideoProfile::HEVC_8BIT_420, VideoProfile::H264_8BIT_420],
+    };
+    (host, client)
+}
+
+#[tokio::test]
+async fn happy_path_handshake_completes_with_negotiated_profile() {
+    let (host_chan, client_chan) = duplex_pair();
+    let (host_cfg, client_cfg) = cfgs();
+
+    let host_chan: Arc<dyn ControlChannel> = host_chan;
+    let client_chan: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        HostSession::accept(host_chan, host_cfg, |client_caps| {
+            // Trivial selector: prefer HEVC if mutually supported,
+            // else H.264 — mirrors the production `pick_supported_profile`
+            // preference order minus the tether-probe dep.
+            [VideoProfile::HEVC_8BIT_420, VideoProfile::H264_8BIT_420]
+                .into_iter()
+                .find(|p| client_caps.contains(p))
+        })
+        .await
+    });
+    let client_task = tokio::spawn(async move {
+        ClientSession::connect(client_chan, client_cfg).await
+    });
+
+    let host = host_task.await.unwrap().unwrap();
+    let client = client_task.await.unwrap().unwrap();
+
+    assert_eq!(host.negotiated, VideoProfile::HEVC_8BIT_420);
+    assert_eq!(client.negotiated, VideoProfile::HEVC_8BIT_420);
+
+    // Loopback RTT is in-memory — should be tiny. Use a generous
+    // bound so a slow CI runner doesn't flake.
+    assert!(
+        client.clock_sync.rtt_nanos < 200_000_000,
+        "expected sub-200ms RTT on loopback, got {} ns",
+        client.clock_sync.rtt_nanos
+    );
+    // Offset on loopback should be near zero — both stamps come from
+    // the same monotonic clock. Anything more than ~10ms means the
+    // handshake closure is doing too much work.
+    assert!(
+        client.clock_sync.offset_nanos.unsigned_abs() < 10_000_000,
+        "expected sub-10ms clock offset on loopback, got {} ns",
+        client.clock_sync.offset_nanos
+    );
+}
+
+#[tokio::test]
+async fn no_mutual_profile_sends_goodbye_then_errors() {
+    let (host_chan, client_chan) = duplex_pair();
+    let (host_cfg, mut client_cfg) = cfgs();
+    // Client advertises only Av1 (which the test selector ignores) —
+    // forces no-match.
+    client_cfg.client_decode_profiles = vec![VideoProfile {
+        codec: CodecKind::Av1,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    }];
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan.clone();
+
+    let host_task = tokio::spawn(async move {
+        HostSession::accept(host_chan_dyn, host_cfg, |client_caps| {
+            // Selector only ever picks HEVC/H264 — the client's Av1
+            // never matches.
+            [VideoProfile::HEVC_8BIT_420, VideoProfile::H264_8BIT_420]
+                .into_iter()
+                .find(|p| client_caps.contains(p))
+        })
+        .await
+    });
+
+    // On the client side, we want to observe what the host sends after
+    // the no-match decision: the placeholder ServerHello (which our
+    // ClientSession::connect will surface as ProfileNotAdvertised
+    // because H.264 isn't in our advertised list), followed by a
+    // Goodbye on the control stream.
+    let client_task = tokio::spawn(async move {
+        let connect_err = ClientSession::connect(client_chan_dyn, client_cfg)
+            .await
+            .map(|_| ())
+            .expect_err("expected ProfileNotAdvertised");
+        // The placeholder ServerHello carries H.264 as a stand-in.
+        // ClientSession::connect refuses it because H.264 is not in
+        // our advert.
+        assert!(
+            matches!(connect_err, ConnectError::ProfileNotAdvertised { .. }),
+            "expected ProfileNotAdvertised, got: {connect_err:?}"
+        );
+        // The Goodbye should now be readable on the same channel.
+        let goodbye = client_chan.recv_control().await.unwrap();
+        assert!(
+            matches!(
+                goodbye,
+                ControlMessage::Goodbye {
+                    code: GoodbyeCode::InternalError,
+                    ..
+                }
+            ),
+            "expected Goodbye(InternalError), got: {goodbye:?}"
+        );
+    });
+
+    let host_err = host_task.await.unwrap().map(|_| ()).expect_err("expected no-match");
+    assert!(
+        matches!(host_err, AcceptError::NoProfileIntersection { .. }),
+        "expected NoProfileIntersection, got: {host_err:?}"
+    );
+    client_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn host_picks_unadvertised_profile_client_refuses() {
+    let (host_chan, client_chan) = duplex_pair();
+    let (host_cfg, mut client_cfg) = cfgs();
+    // Client advertises only H264. The selector (closure below) is
+    // adversarial: it ignores the client's list and picks HEVC anyway.
+    client_cfg.client_decode_profiles = vec![VideoProfile::H264_8BIT_420];
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        HostSession::accept(host_chan_dyn, host_cfg, |_client_caps| {
+            // Buggy host: picks something the client didn't advertise.
+            Some(VideoProfile::HEVC_8BIT_420)
+        })
+        .await
+    });
+    let client_task = tokio::spawn(async move {
+        let err = ClientSession::connect(client_chan_dyn, client_cfg)
+            .await
+            .map(|_| ())
+            .expect_err("client should refuse unadvertised profile");
+        assert!(
+            matches!(err, ConnectError::ProfileNotAdvertised { chosen, .. }
+                if chosen == VideoProfile::HEVC_8BIT_420),
+            "expected ProfileNotAdvertised(HEVC), got: {err:?}"
+        );
+    });
+
+    // Host side reports success — it has no way to know the client
+    // refused. The Goodbye(InternalError) flows from the *client*
+    // back to the host via the regular session-end path, not via
+    // HostSession::accept.
+    let host_session = host_task.await.unwrap().unwrap();
+    assert_eq!(host_session.negotiated, VideoProfile::HEVC_8BIT_420);
+    client_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_filters_unknown_bit_depth_from_host_advert() {
+    let (host_chan, client_chan) = duplex_pair();
+    let host_cfg = HostSessionConfig {
+        server_name: "buggy-host".to_string(),
+    };
+    let client_cfg = ClientSessionConfig {
+        client_name: "test-client".to_string(),
+        client_decode_profiles: vec![VideoProfile::HEVC_8BIT_420],
+    };
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        HostSession::accept(host_chan_dyn, host_cfg, |_client_caps| {
+            // Adversarial host picks a profile with a bit_depth this
+            // build doesn't know — a hypothetical 12-bit future profile
+            // or a malformed peer.
+            Some(VideoProfile {
+                codec: CodecKind::Hevc,
+                chroma: ChromaSubsampling::Yuv420,
+                bit_depth: 12,
+            })
+        })
+        .await
+    });
+    let client_task = tokio::spawn(async move {
+        let err = ClientSession::connect(client_chan_dyn, client_cfg)
+            .await
+            .map(|_| ())
+            .expect_err("client should refuse unknown bit_depth");
+        assert!(
+            matches!(err, ConnectError::UnknownBitDepth(12, _)),
+            "expected UnknownBitDepth(12, _), got: {err:?}"
+        );
+    });
+
+    // Host doesn't see the refusal (it succeeds on its side); the
+    // client is the gate for unknown depths.
+    let _host = host_task.await.unwrap().unwrap();
+    client_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn host_filters_unknown_bit_depths_keeps_known_ones() {
+    let (host_chan, client_chan) = duplex_pair();
+    let host_cfg = HostSessionConfig {
+        server_name: "test-host".to_string(),
+    };
+    // Client advertises a 12-bit profile (unknown) and a real
+    // 8-bit HEVC profile. The host should filter the unknown depth
+    // out and still find a mutual 8-bit match.
+    let client_cfg = ClientSessionConfig {
+        client_name: "future-client".to_string(),
+        client_decode_profiles: vec![
+            VideoProfile {
+                codec: CodecKind::Hevc,
+                chroma: ChromaSubsampling::Yuv444,
+                bit_depth: 12,
+            },
+            VideoProfile::HEVC_8BIT_420,
+        ],
+    };
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        HostSession::accept(host_chan_dyn, host_cfg, |client_caps| {
+            // Selector receives the filtered list — assert it does
+            // NOT contain the 12-bit profile.
+            assert!(
+                !client_caps
+                    .iter()
+                    .any(|p| p.bit_depth == 12),
+                "selector should not see 12-bit profile after host-side filter; saw: {client_caps:?}"
+            );
+            client_caps
+                .iter()
+                .find(|p| **p == VideoProfile::HEVC_8BIT_420)
+                .copied()
+        })
+        .await
+    });
+    let client_task = tokio::spawn(async move {
+        ClientSession::connect(client_chan_dyn, client_cfg).await
+    });
+
+    let host = host_task.await.unwrap().unwrap();
+    let client = client_task.await.unwrap().unwrap();
+    assert_eq!(host.negotiated, VideoProfile::HEVC_8BIT_420);
+    assert_eq!(client.negotiated, VideoProfile::HEVC_8BIT_420);
+}
+
+#[tokio::test]
+async fn client_handshake_decodes_legacy_inline_fields_when_extension_absent() {
+    // A "legacy host" that doesn't emit the structured encode-profile
+    // extension. Hand-build the ServerHello so it has only the inline
+    // chosen_codec / chosen_chroma fields populated; the client must
+    // synthesize an 8-bit VideoProfile.
+    let (host_chan, client_chan) = duplex_pair();
+    let client_cfg = ClientSessionConfig {
+        client_name: "test-client".to_string(),
+        // 8-bit HEVC must be advertised so the post-resolve
+        // ProfileNotAdvertised check passes.
+        client_decode_profiles: vec![VideoProfile::HEVC_8BIT_420],
+    };
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
+
+    // Drive the host side manually so we can build a "no-extension"
+    // ServerHello — `HostSession::accept` always inserts the
+    // pixel-format and encode-profile extensions, so we don't go
+    // through it here.
+    let host_task = tokio::spawn(async move {
+        let (_hello, t1) = host_chan_dyn.recv_client_hello().await.unwrap();
+        let server = ServerHello::V1(tether_protocol::control::ServerHelloV1 {
+            server_name: "legacy".into(),
+            chosen_codec: CodecKind::Hevc,
+            chosen_chroma: ChromaSubsampling::Yuv420,
+            color_space: tether_protocol::control::VideoColorSpec::sdr_desktop(),
+            resolution: (1920, 1080),
+            clock_probe_t0_echo: tether_protocol::MonoNanos::ZERO,
+            t1_server_recv: tether_protocol::MonoNanos::ZERO,
+            t2_server_send: tether_protocol::MonoNanos::ZERO,
+            // No extension map — emulates a host predating the
+            // structured advert.
+            extensions: Default::default(),
+            resume_token: None,
+        });
+        host_chan_dyn
+            .send_server_hello(server, tether_protocol::MonoNanos::ZERO, t1)
+            .await
+            .unwrap();
+        // Swallow the ForceIdr the client sends right after the
+        // handshake completes.
+        let _ = host_chan_dyn.recv_control().await.unwrap();
+    });
+    let client = ClientSession::connect(client_chan_dyn, client_cfg)
+        .await
+        .unwrap();
+    host_task.await.unwrap();
+
+    // Synthesized from inline fields with bit_depth = 8.
+    assert_eq!(client.negotiated, VideoProfile::HEVC_8BIT_420);
+}
+
+// Convenience: a malformed peer (truncated or garbage on the wire)
+// shouldn't deadlock the test — if it ever did, this test would time
+// out and surface that.
+#[tokio::test]
+async fn dropped_client_during_handshake_surfaces_as_transport_error() {
+    let (host_chan, client_chan) = duplex_pair();
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    drop(client_chan); // client dies before sending ClientHello
+
+    let res = HostSession::accept(
+        host_chan_dyn,
+        HostSessionConfig {
+            server_name: "test".into(),
+        },
+        |_| Some(VideoProfile::H264_8BIT_420),
+    )
+    .await;
+    let err = res.map(|_| ()).expect_err("dropped client should produce transport error");
+    assert!(
+        matches!(err, AcceptError::Transport(_)),
+        "expected Transport(_), got: {err:?}"
+    );
+}
+

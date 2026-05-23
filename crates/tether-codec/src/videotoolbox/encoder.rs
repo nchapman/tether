@@ -562,12 +562,22 @@ impl Encoder for VideoToolboxEncoder {
 
 /// FFmpeg codec name for `find_encoder_by_name`. Errors for codecs we
 /// don't ship a VideoToolbox path for yet.
+///
+/// AV1: FFmpeg 8.1 has no `av1_videotoolbox` encoder — verified by
+/// `ffmpeg -encoders | grep videotoolbox` (only h264 / hevc / prores
+/// appear) and by searching ffmpeg-devel archives for a submitted
+/// wrapper (none found as of 2026-05). Whether any currently-shipped
+/// Apple Silicon exposes hardware AV1 encode at all is independently
+/// unconfirmed in public sources; either way, this codepath needs a
+/// direct `VTCompressionSession` integration to reach it. Paired
+/// with the matching `decoder.rs` arm so macOS reports AV1 as
+/// unsupported in both directions today.
 fn vt_codec_cname(kind: CodecKind) -> Result<&'static std::ffi::CStr> {
     match kind {
         CodecKind::H264 => Ok(c"h264_videotoolbox"),
         CodecKind::Hevc => Ok(c"hevc_videotoolbox"),
         CodecKind::Av1 => Err(CodecError::CodecNotFound(
-            "av1_videotoolbox (not yet supported)",
+            "av1_videotoolbox (no FFmpeg wrapper exists)",
         )),
     }
 }

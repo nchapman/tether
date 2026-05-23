@@ -267,12 +267,21 @@ fn vt_av_codec_id(kind: CodecKind) -> Result<ffi::AVCodecID> {
     match kind {
         CodecKind::H264 => Ok(ffi::AV_CODEC_ID_H264),
         CodecKind::Hevc => Ok(ffi::AV_CODEC_ID_HEVC),
-        // Apple Silicon decode AV1 starting at M3 (and later iGPUs);
-        // older Macs surface the rejection through the `get_format`
-        // callback at `avcodec_open2`, which the probe classifies as
-        // Decode-stage Unsupported. No encode arm: VT has no AV1
-        // encoder at any silicon generation as of this build.
-        CodecKind::Av1 => Ok(ffi::AV_CODEC_ID_AV1),
+        // AV1 is held out of the macOS path on both sides until we
+        // can hardware-verify decode end-to-end. M3 and M4 generation
+        // silicon ships AV1 hardware decode and FFmpeg has the
+        // `videotoolbox_av1` hwaccel (`libavcodec/videotoolbox_av1.c`)
+        // to drive it, but tether ships no hardware test for the
+        // path — advertising decode-only would negotiate AV1 against
+        // a Linux encoder host and route a codepath we haven't
+        // validated. Return `CodecNotFound` here so the probe marks
+        // AV1 as `Decode`-stage Unsupported on macOS; pair with the
+        // matching encoder.rs arm so AV1 disappears from both
+        // `host_decode_profiles()` and `host_encode_profiles()` on
+        // this platform.
+        CodecKind::Av1 => Err(CodecError::CodecNotFound(
+            "av1 VideoToolbox decode (held out pending hardware verification)",
+        )),
     }
 }
 
@@ -281,7 +290,10 @@ fn vt_decoder_name(kind: CodecKind) -> &'static str {
     match kind {
         CodecKind::H264 => "h264 (VideoToolbox hw)",
         CodecKind::Hevc => "hevc (VideoToolbox hw)",
-        CodecKind::Av1 => "av1 (VideoToolbox hw)",
+        // Unreachable: `vt_av_codec_id(Av1)` errors before this is
+        // consulted. Kept exhaustive so a future re-enable only
+        // needs the codec-id arm + a hardware test.
+        CodecKind::Av1 => "av1 (VideoToolbox hw — disabled)",
     }
 }
 

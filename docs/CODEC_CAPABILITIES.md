@@ -520,12 +520,24 @@ should add:
 
 M1 / M2 / M3 / M4 are all identical for HEVC decode capability
 per Softron's documentation and Jellyfin's empirical results.
-AV1 hardware decode is M3+ only; VideoToolbox AV1 *encode* does
-not exist on any current Apple Silicon generation. AV1 on macOS is
-therefore decode-only — `apps/tether-host` running on a Mac cannot
-produce AV1; the probe layer will surface VT AV1 encode as
-`Construct`-stage Unsupported and the negotiator will pick another
-profile.
+
+AV1 on macOS is held out **in both directions** today. Hardware
+decode exists on M3 and M4 generation silicon and FFmpeg ships a
+working `videotoolbox_av1` hwaccel, but tether has no hardware
+test exercising that path, so we don't advertise decode either.
+On the encode side, FFmpeg 8.1 has no `av1_videotoolbox` encoder
+(verified: `ffmpeg -encoders | grep videotoolbox` returns only
+H.264 / HEVC / ProRes; no patch in ffmpeg-devel as of 2026-05).
+Whether any currently-shipped Apple Silicon exposes hardware AV1
+encode at all is independently unconfirmed in public sources.
+
+Both `vt_av_codec_id(Av1)` and `vt_codec_cname(Av1)` return
+`CodecNotFound`, so the probe surfaces AV1 as Unsupported at the
+codec-construction stage on both encode and decode, and AV1
+disappears from `host_encode_profiles()` and
+`host_decode_profiles()` on this platform. To re-enable decode,
+land a `videotoolbox_av1_decode_smoke` hardware test using the
+existing `tether-probe` fixtures and flip the decoder.rs arm.
 
 ---
 

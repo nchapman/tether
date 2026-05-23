@@ -236,6 +236,13 @@ pub trait Encoder: Send {
 /// is the only callable path.
 #[derive(Debug)]
 pub enum GpuEncoderFrame<'a> {
+    /// DRM_PRIME / DMA-BUF input. Today consumed by [`crate::vaapi`]
+    /// via `av_hwframe_map` into a VAAPI surface; the variant is
+    /// deliberately not named after the consumer because the same
+    /// DMA-BUF can be imported by any Linux GPU-encoder backend
+    /// (NVENC via FFmpeg's `hwcontext_cuda` + `cuMemImportFromFd`,
+    /// AMF, future Vulkan-video encoders). Capture stays one backend
+    /// per OS; the encoder picks how to import.
     #[cfg(target_os = "linux")]
     DmaBuf(&'a DmaBufFrame),
     /// macOS IOSurface from a ScreenCaptureKit-captured `CMSampleBuffer`,

@@ -65,10 +65,16 @@ impl AbrSample {
 
 /// What the controller wants right now. The host debounces against the
 /// last applied decision before reconfiguring the encoder.
+///
+/// **FPS not yet exposed.** An FPS gear was scaffolded earlier in the
+/// session, but no real capture backend honours runtime FPS
+/// renegotiation today (PipeWire format-renegotiation and SCK
+/// `minimumFrameInterval` updates are per-backend follow-up work).
+/// Re-add `target_fps` here once at least one production backend
+/// observes [`crate::CaptureHandle::set_target_fps`] writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbrDecision {
     pub target_kbps: u32,
-    pub target_fps: u32,
 }
 
 /// Tunables. The defaults reflect what RustDesk's `video_qos`
@@ -83,11 +89,6 @@ pub struct AbrConfig {
     /// Picking a sane floor prevents the controller from starving the
     /// session into unreadability.
     pub floor_kbps: u32,
-    /// FPS the capture loop was built with. Ceiling + starting point
-    /// for the FPS gear.
-    pub baseline_fps: u32,
-    /// Floor for the FPS gear.
-    pub floor_fps: u32,
     /// RTT above which we treat the path as congested.
     pub rtt_high: Duration,
     /// RTT below which we treat the path as healthy.
@@ -111,21 +112,20 @@ pub struct AbrConfig {
     /// collapse before switching to the steady-state percentage.
     /// Any loss / step-down resets the budget.
     pub fast_climb_steps: u32,
-    /// FPS step-up size, expressed the same way. Separate from
-    /// `bitrate_step_pct` because the FPS fall is a halving (sharp),
-    /// so the recovery climb needs to be sharp too — a 10% step from
-    /// FPS=15 only adds 1 FPS per healthy streak, which never makes
-    /// it back to 60 inside a reasonable session. 25% gets from 15
-    /// to baseline 60 in ~7 cooldown windows.
-    pub fps_step_up_pct: u32,
     /// Cooldown after a step in either direction. Prevents thrash if
     /// samples arrive faster than the encoder can settle.
     pub cooldown: Duration,
 }
 
 impl AbrConfig {
+    /// Construct with defaults. `baseline_kbps` is the encoder's
+    /// initial bitrate and the climb ceiling. FPS gear was scaffolded
+    /// earlier in the session but removed when it became clear no
+    /// production capture backend honours runtime FPS retunes today
+    /// — re-add a `baseline_fps` parameter when the first backend
+    /// does.
     #[must_use]
-    pub fn new(baseline_kbps: u32, baseline_fps: u32) -> Self {
+    pub fn new(baseline_kbps: u32) -> Self {
         Self {
             baseline_kbps,
             // 1.5 Mbps is the absolute minimum for a desktop stream
@@ -134,15 +134,12 @@ impl AbrConfig {
             // configured a baseline below this — the floor must never
             // exceed the ceiling.
             floor_kbps: 1_500.min(baseline_kbps),
-            baseline_fps,
-            floor_fps: 15.min(baseline_fps),
             rtt_high: Duration::from_millis(150),
             rtt_low: Duration::from_millis(60),
             healthy_samples_for_step_up: 3,
             bitrate_step_pct: 10,
             bitrate_fast_step_pct: 25,
             fast_climb_steps: 4,
-            fps_step_up_pct: 25,
             cooldown: Duration::from_secs(3),
         }
     }
@@ -201,19 +198,6 @@ impl Gear {
         true
     }
 
-    /// Halve toward floor in one coarse step. Used by the FPS gear on a
-    /// client-side dropped-frame signal: a renderer that can't keep up
-    /// at 60 isn't going to recover from a 10% nudge.
-    fn halve_toward_floor(&mut self) -> bool {
-        let next = (self.current / 2).max(self.floor);
-        if next == self.current {
-            return false;
-        }
-        self.current = next;
-        self.elapsed_since_change = Duration::ZERO;
-        true
-    }
-
     fn tick(&mut self, dt: Duration) {
         self.elapsed_since_change = self.elapsed_since_change.saturating_add(dt);
     }
@@ -246,7 +230,6 @@ impl HealthyRun {
 pub struct AbrController {
     cfg: AbrConfig,
     bitrate: Gear,
-    fps: Gear,
     healthy_run: HealthyRun,
     /// Remaining fast-climb step-ups after a collapse. Decremented
     /// on each step-up; reset to `cfg.fast_climb_steps` on every
@@ -261,7 +244,6 @@ impl AbrController {
     pub fn new(cfg: AbrConfig) -> Self {
         Self {
             bitrate: Gear::new(cfg.baseline_kbps, cfg.floor_kbps, cfg.baseline_kbps),
-            fps: Gear::new(cfg.baseline_fps, cfg.floor_fps, cfg.baseline_fps),
             healthy_run: HealthyRun::default(),
             fast_climb_budget: 0,
             cfg,
@@ -274,7 +256,6 @@ impl AbrController {
     pub fn current(&self) -> AbrDecision {
         AbrDecision {
             target_kbps: self.bitrate.current,
-            target_fps: self.fps.current,
         }
     }
 
@@ -286,7 +267,6 @@ impl AbrController {
     /// testable.
     pub fn observe(&mut self, dt: Duration, sample: AbrSample) -> AbrDecision {
         self.bitrate.tick(dt);
-        self.fps.tick(dt);
         // `observe` resets the streak counter to zero on any loss /
         // high-RTT sample, so the counter is inherently correct for
         // the gate below: a streak can only accumulate starting from
@@ -331,22 +311,6 @@ impl AbrController {
             self.bitrate.step_up_pct(pct);
         }
 
-        // --- FPS gear ---
-        // FPS is the renderer-side knob: it tracks the client's
-        // ability to keep up with what we're already sending, not
-        // network capacity. A network-side fall doesn't immediately
-        // drop FPS — we lower bitrate first and only touch FPS if the
-        // client is *also* dropping frames, which means encoding
-        // faster wouldn't help.
-        if sample.client_frames_dropped > 0 && cooled(&self.fps) {
-            self.fps.halve_toward_floor();
-        } else if healthy
-            && cooled(&self.fps)
-            && self.healthy_run.consecutive >= self.cfg.healthy_samples_for_step_up
-        {
-            self.fps.step_up_pct(self.cfg.fps_step_up_pct);
-        }
-
         self.current()
     }
 }
@@ -386,7 +350,7 @@ mod tests {
     }
 
     fn ctl() -> AbrController {
-        AbrController::new(AbrConfig::new(8_000, 60))
+        AbrController::new(AbrConfig::new(8_000))
     }
 
     #[test]
@@ -394,7 +358,6 @@ mod tests {
         let c = ctl();
         let d = c.current();
         assert_eq!(d.target_kbps, 8_000);
-        assert_eq!(d.target_fps, 60);
     }
 
     #[test]
@@ -490,7 +453,7 @@ mod tests {
 
     #[test]
     fn step_up_clamped_to_baseline_ceiling() {
-        let mut c = AbrController::new(AbrConfig::new(2_000, 60));
+        let mut c = AbrController::new(AbrConfig::new(2_000));
         // Drive a fall, then a sustained healthy stretch. The ceiling
         // is 2000; we should not exceed it no matter how long we run.
         c.observe(Duration::from_secs(1), loss_burst());
@@ -504,63 +467,8 @@ mod tests {
     fn floor_never_exceeds_baseline() {
         // If baseline is below the configured floor default, the
         // floor must clamp to baseline so floor <= ceiling.
-        let cfg = AbrConfig::new(1_000, 60);
+        let cfg = AbrConfig::new(1_000);
         assert!(cfg.floor_kbps <= cfg.baseline_kbps);
-    }
-
-    #[test]
-    fn frames_dropped_halves_fps() {
-        let mut c = ctl();
-        let mut s = healthy();
-        s.client_frames_dropped = 4;
-        let d = c.observe(Duration::from_secs(1), s);
-        assert_eq!(d.target_fps, 30);
-    }
-
-    #[test]
-    fn fps_floor_respected() {
-        let mut c = ctl();
-        let mut s = healthy();
-        s.client_frames_dropped = 4;
-        // Repeated halvings should stop at the floor (15) — and stay
-        // there if frames_dropped keeps firing. Verify the floor
-        // exactly, not just `>= floor`: an unbounded saturating_sub
-        // would still satisfy `>= floor`.
-        for _ in 0..6 {
-            c.observe(Duration::from_secs(4), s);
-        }
-        assert_eq!(c.current().target_fps, 15);
-        // One more tick at the floor should be a no-op, not a wrap.
-        c.observe(Duration::from_secs(4), s);
-        assert_eq!(c.current().target_fps, 15);
-    }
-
-    #[test]
-    fn fps_recovers_to_baseline_in_bounded_steps() {
-        // Drive FPS to the floor (15) via two halvings, then run a
-        // long healthy streak. The recovery must reach the baseline
-        // (60) in a bounded number of steps — 25% step up means
-        // 15 → 18 → 22 → 27 → 33 → 41 → 51 → 63 (clamped 60), so
-        // 7 step-up samples past the cooldown. The bitrate gear
-        // (10% steps) was the source of the original asymmetry bug;
-        // assert the corrected FPS gear actually climbs.
-        let mut c = ctl();
-        let mut bad = healthy();
-        bad.client_frames_dropped = 4;
-        c.observe(Duration::from_secs(4), bad);
-        c.observe(Duration::from_secs(4), bad);
-        assert_eq!(c.current().target_fps, 15);
-
-        // The healthy_run counter resets on the bad samples above. We
-        // need 3 healthy samples before the first step fires, then
-        // one per cooldown after that.
-        for _ in 0..40 {
-            c.observe(Duration::from_secs(4), healthy());
-            if c.current().target_fps == 60 {
-                return;
-            }
-        }
-        panic!("FPS failed to reach baseline within 40 healthy ticks");
     }
 
     #[test]

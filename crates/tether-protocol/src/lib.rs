@@ -704,52 +704,6 @@ mod tests {
     }
 
     #[test]
-    fn videoframe_meta_envelope_v2_round_trip_carries_reference_id() {
-        // V2 must round-trip and surface reference_id via the
-        // accessor; V1 returns None for the same accessor (forward-
-        // compat hatch — clients on the V1-only wire still parse
-        // and ignore the new field).
-        let v2 = VideoFrameMetaEnvelope::V2 {
-            meta: default_meta(),
-            reference_id: 7777,
-        };
-        let bytes = encode(&v2).unwrap();
-        let v2b: VideoFrameMetaEnvelope = decode(&bytes).unwrap();
-        assert_eq!(v2b.reference_id(), Some(7777));
-        assert_eq!(v2b.clone().into_meta().dimensions, (640, 480));
-        let v1 = VideoFrameMetaEnvelope::V1(default_meta());
-        assert_eq!(v1.reference_id(), None);
-    }
-
-    #[test]
-    fn video_packet_first_with_v2_meta_round_trips() {
-        // VideoPacket::First carries the envelope verbatim; a V2
-        // envelope must serialize/deserialize as part of a complete
-        // First packet, including the reference_id reaching the
-        // reassembler.
-        let env = VideoFrameMetaEnvelope::V2 {
-            meta: default_meta(),
-            reference_id: 5555,
-        };
-        let p = VideoPacket::First {
-            display: 0,
-            stream_epoch: 0,
-            frame_seq: 1,
-            fragment_count: 1,
-            meta: env,
-            payload: bytes::Bytes::from(vec![0xaa; 128]),
-        };
-        let bytes = encode(&p).unwrap();
-        let p2: VideoPacket = decode(&bytes).unwrap();
-        match p2 {
-            VideoPacket::First { meta, .. } => {
-                assert_eq!(meta.reference_id(), Some(5555));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn relative_mouse_move_input_event_round_trips() {
         let e = InputEvent {
             event_id: 7,
@@ -782,6 +736,54 @@ mod tests {
         let m2: ControlMessage = decode(&bytes).unwrap();
         match m2 {
             ControlMessage::SetCursorMode { mode } => assert_eq!(mode, CursorMode::Relative),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn video_packet_parity_round_trips_all_fields() {
+        // Every field on VideoPacket::Parity must round-trip: the
+        // shard math depends on data_shards, parity_shards, and
+        // shard_index agreeing wire-to-receiver, and total_body_len
+        // sizes the reassembler's BytesMut. Bincode positional
+        // encoding makes any field reordering a silent data
+        // corruption — assert each value individually.
+        let p = VideoPacket::Parity {
+            display: 3,
+            stream_epoch: 42,
+            frame_seq: 1001,
+            data_shards: 8,
+            parity_shards: 2,
+            shard_index: 1,
+            total_body_len: 9000,
+            meta: VideoFrameMetaEnvelope::V1(default_meta()),
+            payload: bytes::Bytes::from(vec![0xee; 128]),
+        };
+        let bytes = encode(&p).unwrap();
+        let p2: VideoPacket = decode(&bytes).unwrap();
+        match p2 {
+            VideoPacket::Parity {
+                display,
+                stream_epoch,
+                frame_seq,
+                data_shards,
+                parity_shards,
+                shard_index,
+                total_body_len,
+                meta,
+                payload,
+            } => {
+                assert_eq!(display, 3);
+                assert_eq!(stream_epoch, 42);
+                assert_eq!(frame_seq, 1001);
+                assert_eq!(data_shards, 8);
+                assert_eq!(parity_shards, 2);
+                assert_eq!(shard_index, 1);
+                assert_eq!(total_body_len, 9000);
+                assert_eq!(meta.into_meta().dimensions, (640, 480));
+                assert_eq!(payload.len(), 128);
+                assert!(payload.iter().all(|&b| b == 0xee));
+            }
             _ => panic!("wrong variant"),
         }
     }

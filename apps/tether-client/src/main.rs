@@ -338,9 +338,10 @@ async fn main() -> anyhow::Result<()> {
         let mut last_fragments_lost: u64 = 0;
         // Most-recent successfully-reassembled frame_seq. Quoted in
         // RequestRecovery when the reassembler observes a stale
-        // drop, so the host knows the earliest reference we still
-        // trust. `frame_seq` (wire counter) stands in for the V2
-        // envelope's `reference_id` until the host stamps it.
+        // drop. The host currently logs the value for diagnostics
+        // and collapses to a forced IDR; an encoder-side LTR
+        // backend (GH #16) would use it to select a still-trusted
+        // reference for re-prediction.
         let mut last_known_good_frame_seq: Option<u32> = None;
         // Last time we emitted a RequestRecovery. Rate-limits the
         // signal to one every IDR_RATE_LIMIT (500 ms) so a burst
@@ -493,13 +494,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let Some(frame) = result else { continue };
-            // TODO(LTR Phase 2): once the host stamps `reference_id`
-            // in VideoFrameMetaEnvelope::V2, replace `frame.frame_seq`
-            // with `frame.meta.reference_id().unwrap_or(frame_seq)`
-            // so the RequestRecovery field carries the encoder's
-            // stable reference number (the wire frame_seq counter
-            // restarts on every stream-epoch bump, which would
-            // confuse the host's LTR invalidate logic).
             last_known_good_frame_seq = Some(frame.frame_seq);
             let now = MonoNanos::now();
             // Host timestamps -> client clock via the handshake

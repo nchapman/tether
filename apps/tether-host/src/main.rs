@@ -364,16 +364,15 @@ async fn handle_client(
     // portal handshake awaits a user permission dialog); test pattern is
     // sync. Both end up as a `Receiver<CapturedFrame>` so the send loop
     // is identical.
-    // Destructure the capture handle: `frames` is what the send loop
-    // pulls from; `_capture_fps_ctrl` is what the ABR / quality-tier
-    // controller will write to when it wants to throttle capture FPS.
-    // Retained here so the Arc stays alive past the receiver split;
-    // the leading underscore silences the unused-variable warning
-    // without losing grep-ability. Backend honouring of the FPS knob
-    // is per-backend — see `tether_capture::CaptureHandle` docs.
-    let capture_handle = pick_capture_source(use_test_pattern, chosen_profile).await?;
-    let _capture_fps_ctrl = capture_handle.fps_handle();
-    let frames = capture_handle.into_rx();
+    // Drop the CaptureHandle's FPS-control side: no production
+    // backend honours runtime FPS retunes today (PipeWire format
+    // renegotiation and SCK `minimumFrameInterval` updates are
+    // per-backend follow-up work). Re-grab the Arc clone via
+    // `capture_handle.fps_handle()` when the first backend wires
+    // through. See `tether_capture::CaptureHandle` docs.
+    let frames = pick_capture_source(use_test_pattern, chosen_profile)
+        .await?
+        .into_rx();
 
     // Force-IDR signal + stream-readiness gate were created by
     // `HostSession::accept` and destructured at the top of this fn.
@@ -416,14 +415,8 @@ async fn handle_client(
     // construction and render as garbage. Bound to the session in
     // `HostSession::accept`.
     // Loss-recovery signal: client's RequestRecovery raises this with
-    // the lowest still-trusted frame_id; the send loop takes it per
-    // tick and (Phase 1) collapses to a forced IDR. Phase 2 replaces
-    // the IDR fallback with VAAPI LTR re-prediction against the
-    // pessimistic id.
-    let recovery_signal = tether_session::RecoverySignal::new();
     let conn_send = conn.clone();
     let force_idr_for_send = force_idr.clone();
-    let recovery_signal_for_send = recovery_signal.clone();
     let send_shutdown_for_thread = send_shutdown.clone();
     let stream_ready_for_thread = stream_ready.clone();
     let latest_client_stats_for_send = latest_client_stats.clone();
@@ -453,7 +446,6 @@ async fn handle_client(
                 conn_send,
                 frames,
                 force_idr_for_send,
-                recovery_signal_for_send,
                 display_dims_tx,
                 send_shutdown_for_thread,
                 chosen_profile,
@@ -492,7 +484,6 @@ async fn handle_client(
     {
         let conn = conn.clone();
         let force_idr = force_idr.clone();
-        let recovery_signal = recovery_signal.clone();
         let stream_ready_ctl = stream_ready.clone();
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
@@ -554,21 +545,19 @@ async fn handle_client(
                             continue;
                         }
                         last_idr_request = Some(now);
-                        // Phase 1: record the report on the recovery
-                        // signal (lowest-id wins) and fall back to a
-                        // forced IDR. Phase 2 will replace the IDR
-                        // raise with VAAPI LTR re-prediction against
-                        // the take()'d pessimistic id; until then
-                        // the fallback is strictly a latency win
-                        // over waiting for the decoder thread's
-                        // auto-IDR — the client signals the moment
-                        // the reassembler sees a drop, well before
-                        // the decoder fails.
+                        // Without LTR plumbing, recovery means a full
+                        // IDR — same response as ForceIdr. The
+                        // client's `last_known_good_frame_id` is
+                        // logged for diagnostics but isn't actionable
+                        // until an encoder backend supports
+                        // long-term-reference re-prediction (see GH
+                        // #11 for the upstream blocker on VAAPI;
+                        // NVENC in #16 is the most plausible first
+                        // backend to wire end-to-end).
                         tracing::info!(
                             last_known_good_frame_id,
-                            "client requested recovery; falling back to IDR (LTR is Phase 2)"
+                            "client requested recovery; falling back to forced IDR"
                         );
-                        recovery_signal.raise(last_known_good_frame_id);
                         force_idr.raise();
                     }
                     Ok(ControlMessage::StreamReady { video, audio }) => {
@@ -1863,15 +1852,6 @@ fn tick_abr(
     abr.last_quinn = quinn;
     abr.last_observed_at = now;
     let decision = abr.controller.observe(dt, sample);
-    // The controller also publishes `target_fps`, but no capture
-    // backend takes an FPS hint at runtime yet — capture rates are
-    // fixed at startup. The FPS gear runs anyway because client
-    // `frames_dropped` is the signal that distinguishes
-    // network-side stress from decoder-side stress (the former
-    // should drop bitrate, the latter should drop FPS). When a
-    // capture backend grows a `set_target_fps`, this is where it
-    // gets wired.
-    let _ = decision.target_fps;
     if decision.target_kbps != abr.last_applied_kbps {
         match slot.encoder.set_bitrate_kbps(decision.target_kbps) {
             Ok(()) => {
@@ -1914,7 +1894,6 @@ fn run_capture_and_send(
     conn: Arc<Connection>,
     frames: Receiver<CapturedFrame>,
     force_idr: tether_session::IdrSignal,
-    recovery_signal: tether_session::RecoverySignal,
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
     shutdown: Arc<AtomicBool>,
     chosen_profile: VideoProfile,
@@ -2095,10 +2074,7 @@ fn run_capture_and_send(
                         "encoder initialised"
                     );
                     let abr = e.supports_changing_bitrate().then(|| AbrState {
-                        controller: AbrController::new(AbrConfig::new(
-                            baseline_kbps,
-                            ENCODER_FPS,
-                        )),
+                        controller: AbrController::new(AbrConfig::new(baseline_kbps)),
                         last_quinn: conn.quinn_stats(),
                         last_observed_at: Instant::now(),
                         last_applied_kbps: baseline_kbps,
@@ -2119,7 +2095,7 @@ fn run_capture_and_send(
                     // future "ABR isn't doing anything" investigation
                     // finds the cause in the logs.
                     if abr.is_some()
-                        && AbrConfig::new(baseline_kbps, ENCODER_FPS).floor_kbps == baseline_kbps
+                        && AbrConfig::new(baseline_kbps).floor_kbps == baseline_kbps
                     {
                         info!(
                             baseline_kbps,
@@ -2185,18 +2161,6 @@ fn run_capture_and_send(
         // snapshot that's coherent with the client's window.
         if let Some(stats) = latest_client_stats.lock().unwrap().take() {
             tick_abr(slot_mut, &conn, stats, &pacer);
-        }
-
-        // Take the recovery signal. Phase 1: log the pessimistic id
-        // for diagnostics; the actual IDR-or-LTR decision is still
-        // gated on force_idr.take(). Phase 2 will branch here on
-        // `recovery.is_some()` and call into the encoder's LTR
-        // invalidate path instead of forcing a full IDR.
-        if let Some(id) = recovery_signal.take() {
-            tracing::debug!(
-                last_known_good_frame_id = id,
-                "consumed recovery request (Phase 1 collapses to IDR via force_idr)"
-            );
         }
 
         // Swap-and-zero: at most one forced keyframe per request, even

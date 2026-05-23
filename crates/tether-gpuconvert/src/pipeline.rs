@@ -5,20 +5,33 @@
 //! - [`build_pipeline`] — BGRA→NV12 (4:2:0 8-bit). Two consumers:
 //!   [`crate::Bgra2Nv12`] (CPU↔CPU API, test/fallback) and
 //!   [`crate::nv12_dmabuf::Nv12DmaBuf`] (production DMA-BUF path).
-//! - [`build_yuv444_pipeline`] — BGRA→XYUV packed (4:4:4 8-bit), via
-//!   [`crate::Yuv444DmaBuf`].
-//! - [`build_p010_pipeline`] — BGRA→P010 biplanar (4:2:0 10-bit), via
-//!   [`crate::Bgra2P010DmaBuf`].
-//! - [`build_xv30_pipeline`] — BGRA→XV30 packed (4:4:4 10-bit), via
-//!   [`crate::Bgra2Xv30DmaBuf`].
+//! - `build_yuv444_pipeline` — BGRA→XYUV packed (4:4:4 8-bit), via
+//!   `crate::Yuv444DmaBuf`. **Linux only.**
+//! - `build_p010_pipeline` — BGRA→P010 biplanar (4:2:0 10-bit), via
+//!   `crate::Bgra2P010DmaBuf`. **Linux only.**
+//! - `build_xv30_pipeline` — BGRA→XV30 packed (4:4:4 10-bit), via
+//!   `crate::Bgra2Xv30DmaBuf`. **Linux only.**
+//!
+//! macOS reaches all four encoder inputs without these builders —
+//! SCK delivers `420v` / `x420` / `444v` / `xf44` IOSurfaces straight
+//! to VideoToolbox.
 //!
 //! Per-pipeline bind-group layouts live alongside their builder so a
 //! binding-order change in a WGSL file only needs one matching Rust
 //! edit.
 
 pub(crate) const SHADER_SRC: &str = include_str!("bgra_to_nv12.wgsl");
+// The YUV444 / P010 / XV30 builders only have consumers in the Linux
+// DMA-BUF bridges (`yuv444_dmabuf`, `bgra_to_p010_dmabuf`, `xv30_dmabuf`).
+// macOS reaches the same encoder inputs via SCK-delivered IOSurfaces
+// (`444v`, `x420`, `xf44`) handed straight to VideoToolbox — no
+// host-side BGRA→YUV conversion exists or is wanted. Cfg-gating to
+// linux keeps the macOS build warning-free without `#[allow(dead_code)]`.
+#[cfg(target_os = "linux")]
 pub(crate) const YUV444_SHADER_SRC: &str = include_str!("bgra_to_yuv444.wgsl");
+#[cfg(target_os = "linux")]
 pub(crate) const P010_SHADER_SRC: &str = include_str!("bgra_to_p010.wgsl");
+#[cfg(target_os = "linux")]
 pub(crate) const XV30_SHADER_SRC: &str = include_str!("bgra_to_xv30.wgsl");
 
 /// Build the BGRA→NV12 compute pipeline and its bind-group layout.
@@ -94,6 +107,7 @@ pub(crate) fn build_pipeline(
 /// `vaapi_map_from_drm` recognises as VA_FOURCC_XYUV. See the comment
 /// at the top of `bgra_to_yuv444.wgsl` for why packed instead of
 /// planar.
+#[cfg(target_os = "linux")]
 pub(crate) fn build_yuv444_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
@@ -159,6 +173,7 @@ pub(crate) fn build_yuv444_pipeline(
 /// [`crate::storable_dmabuf_modifiers`] probe is the gate — callers
 /// invoke it before constructing the bridge (see
 /// [`crate::Bgra2P010DmaBuf::new`] for the live wiring).
+#[cfg(target_os = "linux")]
 pub(crate) fn build_p010_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
@@ -232,6 +247,7 @@ pub(crate) fn build_p010_pipeline(
 /// which isn't in WebGPU's portable storage set. Callers must gate on
 /// the adapter's format features before invoking — see
 /// [`crate::Bgra2Xv30DmaBuf::new`].
+#[cfg(target_os = "linux")]
 pub(crate) fn build_xv30_pipeline(
     device: &wgpu::Device,
 ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {

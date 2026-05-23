@@ -833,6 +833,29 @@ mod tests {
     }
 
     #[test]
+    fn wire_size_matches_serialized_length() {
+        // The pacer relies on `wire_size()` for byte accounting.
+        // Must equal the exact `encode().len()` for every packet
+        // shape the fragmenter produces.
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (1920, 1080),
+        };
+        let body: bytes::Bytes = vec![0u8; 8 * 1024].into();
+        let mut frag = FrameFragmenter::new(0);
+        let packets = frag.fragment(meta, body);
+        for p in &packets {
+            assert_eq!(
+                p.wire_size(),
+                encode(p).unwrap().len(),
+                "wire_size must equal actual serialized length"
+            );
+        }
+    }
+
+    #[test]
     fn fragment_then_reassemble_round_trips() {
         let body: Vec<u8> = (0..10_000u32).map(|i| (i & 0xFF) as u8).collect();
         let meta = VideoFrameMeta {

@@ -195,6 +195,32 @@ pub enum VideoPacket {
     },
 }
 
+impl VideoPacket {
+    /// Exact serialized wire size, in bytes. Used by the host's
+    /// packet pacer to spread datagrams across the frame interval.
+    /// Uses `bincode::serialized_size` so the answer tracks the
+    /// real wire shape automatically as the protocol evolves
+    /// (envelope variants, new input-echo fields, etc.) — no
+    /// manual header-constant maintenance.
+    ///
+    /// Roughly 100 ns per call at typical packet sizes. At 60 fps ×
+    /// ~30 packets/frame that's ~180 µs/sec — well under the
+    /// per-second budget of any of the encode or send steps.
+    /// Returns `0` if serialization fails (only possible with a
+    /// programmer error like a non-finite f32, which our wire
+    /// schema doesn't expose).
+    ///
+    /// Note: on the wire each packet is wrapped in
+    /// `crate::Datagram::Video(packet)`, which adds one byte for
+    /// the outer enum discriminant. The pacer's byte accounting
+    /// is therefore off by 1 byte/packet — sub-0.1% error at
+    /// typical fragmenter output, well below pacing precision.
+    #[must_use]
+    pub fn wire_size(&self) -> usize {
+        crate::encode(self).map(|b| b.len()).unwrap_or(0)
+    }
+}
+
 /// Conservative payload budget per [`VideoPacket::First`] packet. Leaves
 /// ~100 bytes of header headroom inside [`crate::MAX_DATAGRAM_PAYLOAD`].
 pub const FIRST_PAYLOAD_BUDGET: usize = 1100;

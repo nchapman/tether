@@ -1752,7 +1752,12 @@ fn resize_bgra_bilinear(
 /// Fold one observation into the encoder's ABR controller and apply
 /// the resulting bitrate target if it changed. No-op when the encoder
 /// reports `supports_changing_bitrate() == false` (slot.abr is None).
-fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObservation) {
+fn tick_abr(
+    slot: &mut EncoderSlot,
+    conn: &Connection,
+    stats: ClientStatsObservation,
+    pacer: &tether_session::PacedSender,
+) {
     let Some(abr) = slot.abr.as_mut() else {
         return;
     };
@@ -1796,6 +1801,7 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
                     "abr: bitrate retuned"
                 );
                 abr.last_applied_kbps = decision.target_kbps;
+                pacer.set_target_bitrate_kbps(decision.target_kbps);
             }
             Err(e) => {
                 // The controller already advanced its internal gear
@@ -1808,6 +1814,12 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
                 // last accepted, which is the safest fallback.
                 warn!(error = %e, target_kbps = decision.target_kbps, "abr: set_bitrate_kbps failed; reconciling tracking with controller state");
                 abr.last_applied_kbps = decision.target_kbps;
+                // Keep the pacer in sync with the controller's
+                // current target even when the encoder rejected the
+                // change — the controller will be pushing decisions
+                // at the new rate, and a stale pacer rate would
+                // cause noticeably-wrong spread on the next frame.
+                pacer.set_target_bitrate_kbps(decision.target_kbps);
             }
         }
     }
@@ -1828,6 +1840,16 @@ fn run_capture_and_send(
 ) {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
+    // Per-frame packet pacer. Smooths the natural sub-millisecond
+    // burst of P-frame datagrams across the frame interval, sized
+    // by the ABR controller's current target bitrate. Seeded from
+    // the encoder's `baseline_kbps` at first-slot construction so
+    // pacing engages from the very first frame; updated by
+    // `tick_abr` on every ABR retune. Bps=0 (pre-seed window
+    // before the first encoder builds) disables pacing.
+    let pacer_bitrate: tether_session::TargetBitrateBps =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut pacer = tether_session::PacedSender::new(pacer_bitrate.clone());
     let mut slot: Option<EncoderSlot> = None;
     // macOS-only host GPU state: shared wgpu Metal device + queue for
     // the NV12 IOSurface scaler bridge. Lazily initialised on the
@@ -1989,6 +2011,14 @@ fn run_capture_and_send(
                         last_observed_at: Instant::now(),
                         last_applied_kbps: baseline_kbps,
                     });
+                    // Seed the pacer from the encoder's baseline so
+                    // P-frame fragments are smoothed from the very
+                    // first frame — without this seed the pacer
+                    // sits at bps=0 (disabled) until the first
+                    // ClientStats sample arrives (~1 s in), and that
+                    // first second of unpaced bursts is exactly the
+                    // failure mode pacing exists to prevent.
+                    pacer.set_target_bitrate_kbps(baseline_kbps);
                     // Diagnostic: if the controller's floor equals the
                     // baseline (true for very small encode sizes —
                     // 320x240 test pattern, or an aggressive
@@ -2062,7 +2092,7 @@ fn run_capture_and_send(
         // cumulative counters are read here so the controller sees a
         // snapshot that's coherent with the client's window.
         if let Some(stats) = latest_client_stats.lock().unwrap().take() {
-            tick_abr(slot_mut, &conn, stats);
+            tick_abr(slot_mut, &conn, stats, &pacer);
         }
 
         // Swap-and-zero: at most one forced keyframe per request, even
@@ -2257,8 +2287,27 @@ fn run_capture_and_send(
                 return;
             }
         } else {
+            // P-frame fragments. Pace the send across the frame
+            // interval so small-buffer switches don't see all 30+
+            // datagrams arrive in <1 ms — that burst shape is the
+            // single biggest source of clustered loss on commodity
+            // LAN gear and the one any future FEC scheme is least
+            // equipped to repair (every shard lost together).
+            //
+            // The pacer's target bitrate is the ABR controller's
+            // current target; we read it lazily on each
+            // `wait_for_slot`. If the ABR has not yet decided
+            // (target bps = 0), the pacer no-ops and we burst — the
+            // session-startup window before the first ClientStats
+            // sample is the only place that happens.
             let packets = fragmenter.fragment(meta, body);
+            pacer.begin_frame(Instant::now());
             for packet in packets {
+                // Wire size of the encoded VideoPacket. The pacer
+                // accounts on serialized bytes, not payload-only,
+                // because the network sees the full datagram.
+                let packet_bytes = packet.wire_size();
+                pacer.wait_for_slot(packet_bytes);
                 if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
                     warn!(error = ?e, "send_datagram failed, terminating send loop");
                     return;

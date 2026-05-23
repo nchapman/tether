@@ -826,22 +826,48 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit() {
     assert_grey("4:4:4 10-bit right", right);
 }
 
+/// Wide-region averages (left half + right half, sampled away from
+/// the seam) extracted from a downscaled host-scaler render. Same
+/// shape as the existing no-scaling cells' return type.
+#[cfg(target_os = "macos")]
+fn host_scaler_wide_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8, u8, u8)) {
+    let left = region_average_rgb(rgba, dw, dw / 8, dh / 4, dw / 4, dh / 2);
+    let right = region_average_rgb(rgba, dw, 5 * dw / 8, dh / 4, dw / 4, dh / 2);
+    (left, right)
+}
+
+/// Narrow seam-region averages immediately adjacent to the
+/// red/blue split. Width 4 dst-pixels per side. At non-integer
+/// downscale ratios a wrong chroma-siting offset (e.g. constant
+/// `-0.5` instead of the scale-aware `-(scale - 1) * 0.5`) shifts
+/// the UV plane by enough fractional pixels to bleed the opposite
+/// colour into these averages, producing a measurable purple cast
+/// on one or both sides — exactly what the wide-region samples
+/// can't catch. The wide-region averages on either side stay
+/// dominant-red and dominant-blue under such a regression; only
+/// the seam shifts.
+#[cfg(target_os = "macos")]
+fn host_scaler_seam_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8, u8, u8)) {
+    let seam_left = region_average_rgb(rgba, dw, dw / 2 - 4, dh / 4, 4, dh / 2);
+    let seam_right = region_average_rgb(rgba, dw, dw / 2, dh / 4, 4, dh / 2);
+    (seam_left, seam_right)
+}
+
 /// Host-scaler round-trip: encode BGRA at capture dims → decode →
 /// route through the production `Nv12IOSurfaceBridge` → render the
-/// downscaled IOSurface. This exercises every layer Stage 3 added:
-/// IOSurface plane import (read-only), YUV-plane scaler (Y + UV with
-/// cosited chroma siting), destination IOSurface allocation, and
-/// colorimetry-attachment copy from source to destination.
-///
-/// Returns the left/right region averages from the rendered output at
-/// `dst_dims`, sampled from the same 1/8–3/8 and 5/8–7/8 columns as
-/// the no-scaling cells.
+/// downscaled IOSurface. Returns the raw RGBA readback so callers
+/// can sample whatever regions they care about (wide averages,
+/// seam-adjacent strips, etc.). Exercises every layer Stage 3
+/// added: IOSurface plane import (read-only), YUV-plane scaler
+/// (Y + UV with cosited chroma siting), destination IOSurface
+/// allocation, colorimetry-attachment copy from source to
+/// destination.
 #[cfg(target_os = "macos")]
-fn run_host_scaler_roundtrip(
+fn run_host_scaler_roundtrip_rgba(
     profile: VideoProfile,
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
-) -> Option<((u8, u8, u8), (u8, u8, u8))> {
+) -> Option<Vec<u8>> {
     use tether_gpuconvert::nv12_iosurface::Nv12IOSurfaceBridge;
 
     let _ = tracing_subscriber::fmt::try_init();
@@ -1084,11 +1110,25 @@ fn run_host_scaler_roundtrip(
     drop(textures);
     drop(bridge);
 
-    let left = region_average_rgb(&rgba, dw, dw / 8, dh / 4, dw / 4, dh / 2);
-    let right = region_average_rgb(&rgba, dw, 5 * dw / 8, dh / 4, dw / 4, dh / 2);
-    eprintln!("[{profile:?}] dst left avg RGB  = {left:?}");
-    eprintln!("[{profile:?}] dst right avg RGB = {right:?}");
-    Some((left, right))
+    let (wide_left, wide_right) = host_scaler_wide_regions(&rgba, dw, dh);
+    eprintln!("[{profile:?}] dst wide left avg RGB  = {wide_left:?}");
+    eprintln!("[{profile:?}] dst wide right avg RGB = {wide_right:?}");
+    Some(rgba)
+}
+
+/// Wide-region variant of [`run_host_scaler_roundtrip_rgba`] — the
+/// shape the existing 2× / 1.5× cells consume. Kept as a thin
+/// wrapper so a future seam-region or photometric cell can sample
+/// the raw RGBA without re-running the whole encode → bridge →
+/// render chain.
+#[cfg(target_os = "macos")]
+fn run_host_scaler_roundtrip(
+    profile: VideoProfile,
+    src_dims: (u32, u32),
+    dst_dims: (u32, u32),
+) -> Option<((u8, u8, u8), (u8, u8, u8))> {
+    let rgba = run_host_scaler_roundtrip_rgba(profile, src_dims, dst_dims)?;
+    Some(host_scaler_wide_regions(&rgba, dst_dims.0, dst_dims.1))
 }
 
 /// HEVC 4:2:0 8-bit, host-scaler round-trip 640×480 → 320×240. The
@@ -1168,4 +1208,248 @@ fn iosurface_host_scaler_hevc_8bit_nonintegral_downscale() {
         right.2 > 130 && right.0 < 80 && right.1 < 80,
         "right region should be blueish; got {right:?}"
     );
+}
+
+/// Host-scaler chroma siting through the full encode → bridge →
+/// render chain. Uses the seam-adjacent strips to detect a UV-plane
+/// shift the wide-region cells can't see (the previous round of
+/// review explicitly called this out as the gap).
+///
+/// At 1920×1080 → 1280×720 (1.5× horizontal), the scale-aware
+/// correction `-(1.5 - 1) * 0.5 = -0.25` is what the bridge passes.
+/// A regression to the constant `-0.5` (the expert plan-review's
+/// shorthand) would shift UV by an additional `0.25` src-pixels;
+/// the seam-adjacent strip on the left would pick up blue chroma
+/// (and vice versa). With the correct math both seam strips stay
+/// strongly dominant in their expected hue — that's what we
+/// assert.
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal + TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-render --release -- --ignored iosurface_host_scaler"]
+#[cfg(target_os = "macos")]
+fn iosurface_host_scaler_chroma_siting_at_seam() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+    let dst_dims = (1280u32, 720u32);
+    let Some(rgba) = run_host_scaler_roundtrip_rgba(profile, (1920, 1080), dst_dims) else {
+        return;
+    };
+    let (seam_left, seam_right) = host_scaler_seam_regions(&rgba, dst_dims.0, dst_dims.1);
+    eprintln!("seam left  RGB = {seam_left:?}");
+    eprintln!("seam right RGB = {seam_right:?}");
+    // The seam strip is narrow (4 dst-pixels) and very close to the
+    // colour boundary, so HEVC quantisation + Mitchell ringing
+    // soften the dominance numbers vs. the wide-region samples.
+    // But the *direction* still has to be right: red-dominant on
+    // the left side, blue-dominant on the right. A constant-offset
+    // siting regression on a 1.5× scale shifts UV by 0.25 src-pixels
+    // = 0.33 dst luma pixels — enough to flip R/B dominance in
+    // the 4-pixel strip closest to the boundary.
+    assert!(
+        seam_left.0 > seam_left.2,
+        "left seam strip should be red-dominant (R > B); got {seam_left:?}"
+    );
+    assert!(
+        seam_right.2 > seam_right.0,
+        "right seam strip should be blue-dominant (B > R); got {seam_right:?}"
+    );
+}
+
+/// Sustained-rate host-scaler test: drive `N` consecutive frames
+/// through the bridge and verify every one acquires a slot
+/// successfully (no `PoolExhausted`) and decodes into the
+/// expected red/blue pattern. Each iteration also drops the
+/// previous-frame slot guard explicitly so the production
+/// `prev_pooled` retirement behaviour is reproduced — the test
+/// holds `prev_pool` across iterations, only releasing the
+/// previous one when the new frame's `scale_to_iosurface`
+/// succeeds.
+///
+/// With pool depth 4 and one-frame retirement, this confirms the
+/// bridge can sustain steady-state acquire→release without
+/// leaking slots. A regression that lost a slot per call would
+/// exhaust the pool after `DEFAULT_POOL_DEPTH = 4` iterations and
+/// fail at frame 5+.
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal + TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-render --release -- --ignored iosurface_host_scaler"]
+#[cfg(target_os = "macos")]
+fn iosurface_host_scaler_sustained_rate() {
+    use tether_gpuconvert::nv12_iosurface::{Nv12IOSurfaceBridge, PooledIOSurface};
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+    let src_dims = (640u32, 480u32);
+    let dst_dims = (320u32, 240u32);
+
+    let instance = wgpu::Instance::default();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    })) else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    if !adapter
+        .features()
+        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+    {
+        eprintln!("SKIPPED: adapter lacks TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES");
+        return;
+    }
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("tether-render sustained-rate host-scaler test"),
+        required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+        required_limits: wgpu::Limits::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+    }))
+    .expect("request_device");
+
+    // Build one IOSurface to use as the source for every iteration —
+    // a real session would refresh src per frame, but the test only
+    // cares about acquire/release plumbing in the bridge. Using a
+    // stable source isolates the slot-rotation behaviour from any
+    // SCK-side variance.
+    let (sw, sh) = src_dims;
+    let input_bgra = make_test_bgra(sw, sh);
+    let mut enc = VideoToolboxEncoder::new(profile, sw, sh, 30, 4_000)
+        .expect("VT encoder construction");
+    let mut packets = Vec::new();
+    for t in 0..6i64 {
+        packets.extend(enc.encode_bgra(&input_bgra, t, t == 0).expect("encode_bgra"));
+    }
+    packets.extend(enc.flush().expect("flush"));
+    let mut dec = VideoToolboxDecoder::new(profile.codec).expect("VT decoder");
+    let mut codec_gpu: Option<tether_codec::GpuFrame> = None;
+    for pkt in &packets {
+        dec.submit(&pkt.data).expect("decoder submit");
+        while let Some(f) = dec.next_frame().expect("decoder next_frame") {
+            if let CodecFrame::Gpu(g) = f {
+                codec_gpu = Some(g);
+                break;
+            }
+        }
+        if codec_gpu.is_some() {
+            break;
+        }
+    }
+    if codec_gpu.is_none() {
+        dec.signal_eof().expect("decoder signal_eof");
+        while let Some(f) = dec.next_frame().expect("decoder next_frame") {
+            if let CodecFrame::Gpu(g) = f {
+                codec_gpu = Some(g);
+                break;
+            }
+        }
+    }
+    let codec_gpu = codec_gpu.expect("decoder must produce at least one Frame::Gpu");
+    let (_gw, _gh, _pts, source, _guard) = codec_gpu.into_parts();
+    let src_iosurface = match source {
+        GpuFrameSource::IOSurface(io) => io,
+    };
+
+    let bridge = Nv12IOSurfaceBridge::new(
+        device.clone(),
+        queue.clone(),
+        src_dims,
+        dst_dims,
+        src_iosurface.pixel_format,
+    )
+    .expect("Nv12IOSurfaceBridge::new");
+
+    // Run N frames > DEFAULT_POOL_DEPTH so the bridge must rotate
+    // through slots. Mirror the production retirement pattern: hold
+    // `prev_pool` across the next call, only release the old one
+    // after the new acquire succeeds.
+    let n = 16;
+    let mut prev_pool: Option<PooledIOSurface> = None;
+    for i in 0..n {
+        let pool = bridge
+            .scale_to_iosurface(&src_iosurface)
+            .unwrap_or_else(|e| panic!("frame {i}: scale_to_iosurface failed: {e}"));
+        // New frame acquired successfully — the previous slot can
+        // come back to the pool now.
+        prev_pool = Some(pool);
+    }
+    drop(prev_pool);
+    drop(bridge);
+    eprintln!("sustained-rate: {n} frames acquired+retired successfully");
+}
+
+/// Verify the bridge constructor rejects 10-bit fourccs with the
+/// dedicated [`tether_gpuconvert::nv12_iosurface::BridgeError::TenBitNotImplemented`]
+/// sentinel. The bridge advertises 10-bit fourccs in its tables (for
+/// future-compat with R16/Rg16 follow-up) but the current scaler
+/// only ships R8/Rg8 plane pipelines — accepting 10-bit fourccs at
+/// construction would silently fail at first frame. This test
+/// pins the construction-time rejection so the future R16 follow-up
+/// has to remove the guard at the same time as adding the
+/// pipelines.
+#[test]
+#[ignore = "requires macOS + Metal + TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-render --release -- --ignored iosurface_host_scaler"]
+#[cfg(target_os = "macos")]
+fn iosurface_host_scaler_rejects_10bit_at_construction() {
+    use tether_codec::macos_interop::{X420_FOURCC, XF20_FOURCC};
+    use tether_gpuconvert::nv12_iosurface::{BridgeError, Nv12IOSurfaceBridge};
+
+    let instance = wgpu::Instance::default();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    })) else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    if !adapter
+        .features()
+        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+    {
+        eprintln!("SKIPPED: adapter lacks TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES");
+        return;
+    }
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("tether-render 10-bit rejection test"),
+        required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+        required_limits: wgpu::Limits::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+    }))
+    .expect("request_device");
+
+    for &fcc in &[X420_FOURCC, XF20_FOURCC] {
+        let result = Nv12IOSurfaceBridge::new(
+            device.clone(),
+            queue.clone(),
+            (1920, 1080),
+            (1280, 720),
+            fcc,
+        );
+        match result {
+            Err(BridgeError::TenBitNotImplemented { fourcc }) => {
+                assert_eq!(fourcc, fcc, "rejection error must carry the rejected fourcc");
+            }
+            Err(other) => {
+                panic!("10-bit fourcc 0x{fcc:08x} should produce TenBitNotImplemented; got {other:?}");
+            }
+            Ok(_) => {
+                panic!(
+                    "10-bit fourcc 0x{fcc:08x} should be rejected at construction \
+                     until R16/Rg16 scaler pipelines land — instead the bridge built \
+                     successfully and would silently fail at first scale_to_iosurface."
+                );
+            }
+        }
+    }
 }

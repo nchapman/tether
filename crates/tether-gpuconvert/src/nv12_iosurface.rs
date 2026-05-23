@@ -89,6 +89,20 @@ pub enum BridgeError {
     #[error("destination fourcc 0x{fourcc:08x} is not recognised as any NV12-family fourcc")]
     UnknownFourcc { fourcc: u32 },
 
+    /// 10-bit NV12 (`'x420'`/`'xf20'`) hosting was requested, but the
+    /// bridge's scaler currently only ships R8Unorm / Rg8Unorm plane
+    /// pipelines — R16Unorm / Rg16Unorm variants are a deferred
+    /// follow-up. The macOS host should refuse 10-bit profiles at
+    /// negotiation when the scaler bridge would be in the loop;
+    /// reaching this error means the negotiator advertised 10-bit
+    /// encode on a session that also needs viewport scaling.
+    #[error(
+        "10-bit NV12 host scaling is not yet implemented (fourcc 0x{fourcc:08x}); \
+         scaler bridge ships R8/Rg8 plane pipelines only. Either disable viewport \
+         scaling for 10-bit sessions or land the R16/Rg16 follow-up."
+    )]
+    TenBitNotImplemented { fourcc: u32 },
+
     /// `IOSurfaceCreate` returned null. The properties dictionary is
     /// rejected: typically a zero dimension or an unsupported
     /// `kIOSurfacePixelFormat`.
@@ -410,6 +424,19 @@ impl Nv12IOSurfaceBridge {
                 bit_depth,
                 fourcc: dst_fourcc,
             });
+        }
+        // 10-bit guard: `plane_wgpu_formats` returns R16Unorm /
+        // Rg16Unorm for the x420/xf20/P010 family, but
+        // `Pipelines::build_with_plane_storage` only emits R8 / Rg8
+        // vertical pipelines. If we let construction proceed, the
+        // pool would allocate R16 textures, the scaler dispatch
+        // would create a bind group with an R8-format storage entry
+        // pointing at an R16 texture, and wgpu would validation-
+        // error per frame. Reject up front with a clear message —
+        // the macOS host's probe should refuse 10-bit profiles when
+        // the scaler is in the loop until the R16 follow-up lands.
+        if bit_depth == 10 {
+            return Err(BridgeError::TenBitNotImplemented { fourcc: dst_fourcc });
         }
 
         // Build the scaler pipelines with plane storage (R8 / Rg8
@@ -933,6 +960,36 @@ mod tests {
             !iosurface_fourcc_matches(ChromaSubsampling::Yuv420, 10, P010_FOURCC),
             "encoder must NOT accept 'P010' as input fourcc — that path is decode-only"
         );
+    }
+
+    /// The 10-bit fourccs (`'x420'`, `'xf20'`) are valid in every
+    /// other layer's tables but the bridge's scaler currently only
+    /// has R8 / Rg8 plane pipelines. Verify the construction-time
+    /// guard rejects them with the dedicated
+    /// [`BridgeError::TenBitNotImplemented`] sentinel — without it
+    /// every 10-bit session that needs viewport scaling would build
+    /// the bridge successfully and then fail validation on the first
+    /// scale_to_iosurface call.
+    ///
+    /// No wgpu device required: the guard fires before
+    /// `Pipelines::build_with_plane_storage`. We can't actually
+    /// construct a `Nv12IOSurfaceBridge` here (that needs a real
+    /// device), so this test verifies the rejection logic via the
+    /// helper tables instead — `chroma_bit_depth_for_fourcc`
+    /// returns `Some((_, 10))` for both fourccs, which is what the
+    /// constructor branches on.
+    #[test]
+    fn ten_bit_fourccs_route_through_dedicated_guard() {
+        use tether_codec::macos_interop::{X420_FOURCC, XF20_FOURCC};
+        for &fcc in &[X420_FOURCC, XF20_FOURCC] {
+            let (_chroma, bd) = chroma_bit_depth_for_fourcc(fcc)
+                .expect("10-bit fourcc must be in the table");
+            assert_eq!(
+                bd, 10,
+                "fourcc 0x{fcc:08x} must report bit_depth=10 so the constructor's \
+                 `if bit_depth == 10` guard fires"
+            );
+        }
     }
 
     /// Verify the cosited-NV12 horizontal chroma offset formula

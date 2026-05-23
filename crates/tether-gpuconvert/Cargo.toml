@@ -9,19 +9,48 @@ description = "Host-side GPU colour-space conversions (BGRA → NV12) for the ze
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
+pollster = "0.4"
 
-# Same wgpu trunk pin as tether-render. We need
-# VULKAN_EXTERNAL_MEMORY_DMA_BUF for both the eventual import (PipeWire
-# capture as Bgra8Unorm) and export (NV12 storage textures handed to
-# VAAPI). Workspace-level [patch.crates-io] keeps the wgpu sub-crates
-# consistent across both consumers.
+# wgpu features differ per platform: Linux needs the Vulkan backend +
+# DMA-BUF export plumbing; macOS needs the Metal backend for the
+# IOSurface scaler bridge. The workspace-level [patch.crates-io]
+# keeps every sub-crate on the same trunk SHA across consumers.
+[target.'cfg(target_os = "linux")'.dependencies]
 wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["vulkan"] }
 # Raw Vulkan calls for the DMA-BUF export path. wgpu-hal pins ash
 # 0.38; matching here keeps a single resolved version across the
 # workspace so types (vk::Image, vk::DeviceMemory, etc.) are
 # pointer-compatible with wgpu's internals.
 ash = "0.38"
-pollster = "0.4"
+
+# macOS host NV12 IOSurface scaler bridge. Pulls in the shared
+# IOSurface import primitives from tether-codec and the YUV plane
+# scaler from tether-scaler. objc2 versions are pinned to match
+# tether-codec / tether-render so the workspace doesn't end up with
+# two incompatible copies of Retained / ProtocolObject.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["metal"] }
+tether-codec = { workspace = true }
+tether-scaler = { workspace = true }
+tether-protocol = { workspace = true }
+objc2 = "0.6.3"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSDictionary",
+    "NSValue",
+] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+    "objc2-io-surface",
+] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef"] }
+core-foundation = "0.10"
 
 [dev-dependencies]
 # Test-only: the scaler-to-encoder round-trip test runs `tether-scaler`

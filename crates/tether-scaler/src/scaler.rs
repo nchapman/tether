@@ -345,10 +345,37 @@ impl Scaler {
     }
 
     /// Run mip chain (if any) + horizontal + vertical Mitchell passes.
-    /// Borrowed reference to the output texture is returned for
-    /// convenience; the same texture can be obtained from
-    /// [`Self::output`].
+    /// Writes into the scaler's owned output texture; returns a
+    /// borrowed reference (also obtainable via [`Self::output`]).
+    ///
+    /// For callers that need to write into an externally-allocated
+    /// destination (e.g. the macOS NV12 IOSurface bridge, which wraps
+    /// an IOSurface-backed `MTLTexture` as the scaler destination),
+    /// use [`Self::scale_into`] instead.
     pub fn scale(&self, src: &Texture) -> Result<&Texture, ScalerError> {
+        // Borrow-checker: scale_into takes `&self.output` (immutable
+        // borrow) and returns `()`; then we return `&self.output`
+        // again. Two non-overlapping immutable borrows, fine.
+        self.scale_into(src, &self.output)?;
+        Ok(&self.output)
+    }
+
+    /// Run the scaler with an explicit destination texture. The
+    /// destination must have format == [`Self::dst_format`] and
+    /// dimensions == [`Self::dst_dims`]; mismatched destinations
+    /// return [`ScalerError::DimMismatch`] (dims) or are caught at
+    /// the wgpu bind-group level (format).
+    ///
+    /// Use this when the destination is externally owned — the macOS
+    /// NV12 IOSurface bridge wraps an `MTLTexture` (which borrows
+    /// storage from a pooled IOSurface) as the scaler output, so the
+    /// scaler writes directly into the surface VideoToolbox encodes
+    /// from, no intermediate copy.
+    pub fn scale_into(
+        &self,
+        src: &Texture,
+        dst: &Texture,
+    ) -> Result<(), ScalerError> {
         if src.width() != self.src_dims.0 || src.height() != self.src_dims.1 {
             // Returning rather than running the shader with stale
             // params: a resize race or wiring bug would otherwise
@@ -356,6 +383,12 @@ impl Scaler {
             return Err(ScalerError::DimMismatch {
                 expected: self.src_dims,
                 got: (src.width(), src.height()),
+            });
+        }
+        if dst.width() != self.dst_dims.0 || dst.height() != self.dst_dims.1 {
+            return Err(ScalerError::DimMismatch {
+                expected: self.dst_dims,
+                got: (dst.width(), dst.height()),
             });
         }
 
@@ -484,8 +517,12 @@ impl Scaler {
 
         // Vertical pass — bind-group layout differs between sRGB
         // (output Rgba8Unorm) and linear (output Rgba16Float).
+        // `dst` is the caller-supplied destination (or `&self.output`
+        // when entered via `scale()`); its format must match the
+        // vertical_bgl picked above. wgpu's bind-group validation
+        // catches the mismatch.
         let v_src_view = self.intermediate.create_view(&TextureViewDescriptor::default());
-        let v_dst_view = self.output.create_view(&TextureViewDescriptor::default());
+        let v_dst_view = dst.create_view(&TextureViewDescriptor::default());
         let v_bg = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("tether-scaler vertical bg"),
             layout: vertical_bgl,
@@ -512,14 +549,14 @@ impl Scaler {
             pass.set_pipeline(vertical_pipeline);
             pass.set_bind_group(0, &v_bg, &[]);
             pass.dispatch_workgroups(
-                self.output.width().div_ceil(8),
-                self.output.height().div_ceil(8),
+                dst.width().div_ceil(8),
+                dst.height().div_ceil(8),
                 1,
             );
         }
 
         self.queue.submit([encoder.finish()]);
-        Ok(&self.output)
+        Ok(())
     }
 
     pub fn output(&self) -> &Texture {

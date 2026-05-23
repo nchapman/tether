@@ -38,6 +38,14 @@ pub mod modifier_query;
 pub mod nv12_dmabuf;
 #[cfg(target_os = "linux")]
 pub mod yuv444_dmabuf;
+
+/// macOS NV12 IOSurface scaler bridge — the host-side equivalent of
+/// `nv12_dmabuf` (Linux DMA-BUF NV12 bridge), driving the
+/// `tether-scaler` YUV-plane paths to produce a downscaled
+/// IOSurface ready for VideoToolbox.
+#[cfg(target_os = "macos")]
+pub mod nv12_iosurface;
+
 mod pipeline;
 
 #[cfg(target_os = "linux")]

@@ -22,7 +22,8 @@ pub mod test_pattern;
 pub mod test_support;
 
 pub use cursor::{
-    CursorEvent, CursorPosition, CursorShapeEvent, CursorSource, PlaceholderCursorSource,
+    rescale_shape_to_frame, CursorEvent, CursorPosition, CursorShapeEvent, CursorSource,
+    PlaceholderCursorSource,
 };
 pub use damage::{DamageHint, DamageSignal, HashDamage, NativeDamage};
 
@@ -135,6 +136,9 @@ pub mod linux;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+
+#[cfg(target_os = "macos")]
+pub mod cursor_macos;
 
 use tether_protocol::MonoNanos;
 

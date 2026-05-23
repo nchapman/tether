@@ -51,7 +51,7 @@ use tether_session::{
 use tether_transport::{AbrSnapshot, Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default target frame rate. Sunshine and Apollo run desktop / game
 /// streaming at 60 fps by default; tether matches. The host's encoder
@@ -394,6 +394,16 @@ async fn handle_client(
     let (display_dims_tx, display_dims_rx) =
         tokio::sync::watch::channel::<Option<(u32, u32)>>(None);
 
+    // Cursor coordinate-frame watch: the encode loop posts
+    // `(capture_w, capture_h, encode_w, encode_h)` on every encoder
+    // slot rebuild so the cursor pump can rescale positions + sprite
+    // dims into the encode-pixel space the client actually renders
+    // against. Without this, a Retina macOS host (capture 3024×1952)
+    // negotiated down to a 1104×720 encode would send a sprite at
+    // 2.74× the correct visual size and a position 2.74× off.
+    let (cursor_frame_tx, cursor_frame_rx) =
+        tokio::sync::watch::channel::<Option<CursorFrameDims>>(None);
+
     // Capture + send runs on a dedicated OS thread per the expert review:
     // the hot path doesn't share the tokio runtime with anything else.
     // We keep the JoinHandle so the disconnect path can wait for the
@@ -452,6 +462,7 @@ async fn handle_client(
                 frames,
                 force_idr_for_send,
                 display_dims_tx,
+                cursor_frame_tx,
                 send_shutdown_for_thread,
                 chosen_profile,
                 stream_ready_for_thread,
@@ -789,8 +800,9 @@ async fn handle_client(
     // like the other recv tasks.
     {
         let conn = conn.clone();
+        let cursor_frame_rx = cursor_frame_rx.clone();
         tasks.spawn(async move {
-            pump_cursor(conn, cursor_source).await;
+            pump_cursor(conn, cursor_source, cursor_frame_rx).await;
         });
     }
 
@@ -1705,10 +1717,22 @@ fn xv30_dmabuf_to_codec_frame(out: Xv30DmaBufFrame) -> DmaBufFrame {
 /// Returning from this function ends the JoinSet task and tears down
 /// the session. The match arms below treat a send error as fatal
 /// because there's no useful retry — the connection is already gone.
+/// Dims the cursor pump needs to translate from the cursor source's
+/// native coordinate frame (capture pixels) into the encode-pixel
+/// frame the client renders against. Updated by the encode loop on
+/// each encoder slot rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CursorFrameDims {
+    capture_w: u32,
+    capture_h: u32,
+    encode_w: u32,
+    encode_h: u32,
+}
+
 /// Dedup + debounce state carried across cursor-pump ticks. Pulled
 /// out so the decision logic in [`cursor_tick`] is a pure function
-/// of `(state, source) -> effects` and can be unit-tested without
-/// the async runtime + Connection wired in.
+/// of `(state, source, dims) -> effects` and can be unit-tested
+/// without the async runtime + Connection wired in.
 #[derive(Default)]
 struct CursorPumpState {
     seen_ids: std::collections::HashSet<u64>,
@@ -1735,19 +1759,34 @@ enum CursorEffect {
 /// `Position` if the latest snapshot differs from what was sent
 /// last tick.
 ///
-/// Pure function — no I/O, no clock side effects beyond
-/// `t_capture` on the position packet. The `now` parameter is
-/// injected so tests can pin it.
+/// When `dims` is `Some`, both the shape and the position are
+/// rescaled from capture-pixel space into encode-pixel space (Linux
+/// has capture==encode so callers there pass `None`; macOS Retina
+/// can run capture/encode ~2.7×). Re-hashing inside
+/// `rescale_shape_to_frame` keeps the wire id tied to the rescaled
+/// pixels so a viewport change can't surface a stale cached bitmap.
+///
+/// Pure function — no I/O, no clock side effects beyond `t_capture`
+/// on the position packet. The `now` parameter is injected so tests
+/// can pin it.
 fn cursor_tick(
     state: &mut CursorPumpState,
     source: &mut dyn CursorSource,
+    dims: Option<CursorFrameDims>,
     now: MonoNanos,
 ) -> Vec<CursorEffect> {
     let mut effects = Vec::new();
     loop {
         match source.next_event() {
             CursorEvent::Idle => break,
-            CursorEvent::Shape(shape) => {
+            CursorEvent::Shape(mut shape) => {
+                if let Some(frame) = dims {
+                    shape = tether_capture::rescale_shape_to_frame(
+                        shape,
+                        (frame.capture_w, frame.capture_h),
+                        (frame.encode_w, frame.encode_h),
+                    );
+                }
                 let id = shape.id;
                 if state.seen_ids.insert(id) {
                     effects.push(CursorEffect::Shape(ControlMessage::CursorShape {
@@ -1767,11 +1806,28 @@ fn cursor_tick(
     if let Some(pos) = source.poll_position() {
         if state.last_pos != Some(pos) {
             state.last_pos = Some(pos);
+            // Rescale position into encode-pixel space (same reason
+            // as the sprite). Per-axis ratios because
+            // `encode_dims_for_viewport` happens to preserve aspect
+            // today (rx ≈ ry) but that's not a wire contract the
+            // client enforces — scaling per-axis stays correct if a
+            // future path drops uniform-scale.
+            let (px, py) = match dims {
+                Some(frame) if frame.capture_w > 0 && frame.capture_h > 0 => {
+                    let rx = f64::from(frame.encode_w) / f64::from(frame.capture_w);
+                    let ry = f64::from(frame.encode_h) / f64::from(frame.capture_h);
+                    (
+                        (f64::from(pos.x) * rx).round() as i32,
+                        (f64::from(pos.y) * ry).round() as i32,
+                    )
+                }
+                _ => (pos.x, pos.y),
+            };
             effects.push(CursorEffect::Position(
                 tether_protocol::cursor::HostCursorPacket::Position {
                     t_capture: now,
-                    x: pos.x,
-                    y: pos.y,
+                    x: px,
+                    y: py,
                     visible: pos.visible,
                 },
             ));
@@ -1781,8 +1837,45 @@ fn cursor_tick(
     effects
 }
 
-async fn pump_cursor(conn: Arc<Connection>, mut source: Box<dyn CursorSource>) {
-    info!("cursor pump started");
+/// Classify a control-send error so the cursor pump can distinguish
+/// "connection is gone, give up" from "this one message couldn't be
+/// serialized/sent, skip it." Treating every error as fatal would
+/// collapse the entire session over a single oversize cursor sprite
+/// (see `MAX_FRAMED_MESSAGE` — macOS can return cursors larger than
+/// the control-stream cap when the user has the accessibility cursor
+/// size enlarged).
+fn is_fatal_send_error(err: &tether_transport::TransportError) -> bool {
+    use tether_transport::TransportError as E;
+    match err {
+        // Local errors — connection is fine, just this message failed.
+        E::FrameTooLarge { .. } | E::Codec(_) => false,
+        // Anything that touches the QUIC connection state is fatal —
+        // no point trying further sends.
+        _ => true,
+    }
+}
+
+async fn pump_cursor(
+    conn: Arc<Connection>,
+    mut source: Box<dyn CursorSource>,
+    mut cursor_frame_rx: tokio::sync::watch::Receiver<Option<CursorFrameDims>>,
+) {
+    info!("cursor pump started; waiting for first encoder slot rebuild to learn capture/encode dims");
+    // Block until the encode loop publishes its first dims. Sending
+    // anything before that races against the encoder setup: the
+    // cursor source produces in capture-pixel space, the client
+    // renders against decoded-video pixel space, and without the
+    // dims we'd emit at the wrong scale. The very first sprite would
+    // then poison the client's shape cache (see id-derived-from-
+    // pixels in `cursor::rescale_shape_to_frame`) — `CursorUseShape`
+    // dedup would keep referring to the un-rescaled bitmap forever.
+    if cursor_frame_rx.borrow().is_none() {
+        if let Err(e) = cursor_frame_rx.changed().await {
+            warn!(error = ?e, "cursor frame-dims watch closed before first publish; ending cursor pump");
+            return;
+        }
+    }
+    info!(dims = ?*cursor_frame_rx.borrow(), "cursor pump unblocked with encoder dims");
     let mut state = CursorPumpState::default();
     let mut last_log = std::time::Instant::now();
     // 120 Hz is the upper bound a typical desktop generates pointer
@@ -1794,7 +1887,8 @@ async fn pump_cursor(conn: Arc<Connection>, mut source: Box<dyn CursorSource>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        let effects = cursor_tick(&mut state, source.as_mut(), MonoNanos::now());
+        let dims = *cursor_frame_rx.borrow();
+        let effects = cursor_tick(&mut state, source.as_mut(), dims, MonoNanos::now());
         for effect in effects {
             match effect {
                 CursorEffect::Shape(msg) => {
@@ -1808,19 +1902,39 @@ async fn pump_cursor(conn: Arc<Connection>, mut source: Box<dyn CursorSource>) {
                         } => (*id, *width, *height, pixels.len()),
                         _ => unreachable!("CursorEffect::Shape always carries CursorShape"),
                     };
-                    if let Err(e) = conn.send_control(&msg).await {
-                        warn!(error = ?e, id, "CursorShape send failed; ending cursor pump");
-                        return;
+                    match conn.send_control(&msg).await {
+                        Ok(()) => debug!(id, w, h, bytes = n, "sent CursorShape"),
+                        Err(e) if is_fatal_send_error(&e) => {
+                            warn!(error = ?e, id, "CursorShape send failed on a fatal connection error; ending cursor pump");
+                            return;
+                        }
+                        Err(e) => {
+                            // Local serialization error (e.g. sprite
+                            // larger than the control-stream cap).
+                            // Drop the shape from `seen_ids` so a
+                            // future re-fetch can try again, but
+                            // keep the pump alive — collapsing the
+                            // session over one weird cursor would
+                            // be way worse than missing it.
+                            warn!(error = ?e, id, w, h, bytes = n, "CursorShape send failed (non-fatal); skipping shape and continuing");
+                            state.seen_ids.remove(&id);
+                            continue;
+                        }
                     }
-                    info!(id, w, h, bytes = n, "sent CursorShape");
                 }
                 CursorEffect::UseShape(id) => {
-                    if let Err(e) = conn
+                    match conn
                         .send_control(&ControlMessage::CursorUseShape { id })
                         .await
                     {
-                        warn!(error = ?e, id, "CursorUseShape send failed; ending cursor pump");
-                        return;
+                        Ok(()) => {}
+                        Err(e) if is_fatal_send_error(&e) => {
+                            warn!(error = ?e, id, "CursorUseShape send failed on a fatal connection error; ending cursor pump");
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(error = ?e, id, "CursorUseShape send failed (non-fatal); continuing");
+                        }
                     }
                 }
                 CursorEffect::Position(pkt) => {
@@ -1887,7 +2001,7 @@ mod cursor_pump_tests {
             events: Default::default(),
             position: None,
         };
-        assert!(cursor_tick(&mut state, &mut src, now()).is_empty());
+        assert!(cursor_tick(&mut state, &mut src, None, now()).is_empty());
     }
 
     #[test]
@@ -1897,7 +2011,7 @@ mod cursor_pump_tests {
             events: vec![CursorEvent::Shape(shape(42))].into(),
             position: None,
         };
-        let effects = cursor_tick(&mut state, &mut src, now());
+        let effects = cursor_tick(&mut state, &mut src, None, now());
         assert_eq!(effects.len(), 2);
         assert!(matches!(
             effects[0],
@@ -1916,7 +2030,7 @@ mod cursor_pump_tests {
             events: vec![CursorEvent::Shape(shape(42))].into(),
             position: None,
         };
-        let effects = cursor_tick(&mut state, &mut src, now());
+        let effects = cursor_tick(&mut state, &mut src, None, now());
         assert_eq!(effects, vec![CursorEffect::UseShape(42)]);
     }
 
@@ -1931,7 +2045,7 @@ mod cursor_pump_tests {
                 visible: true,
             }),
         };
-        let effects = cursor_tick(&mut state, &mut src, now());
+        let effects = cursor_tick(&mut state, &mut src, None, now());
         assert_eq!(effects.len(), 1);
         match &effects[0] {
             CursorEffect::Position(HostCursorPacket::Position {
@@ -1962,10 +2076,10 @@ mod cursor_pump_tests {
             position: Some(pos),
         };
         // First tick: position changed (from None to Some) → emit.
-        let first = cursor_tick(&mut state, &mut src, now());
+        let first = cursor_tick(&mut state, &mut src, None, now());
         assert_eq!(first.len(), 1);
         // Second tick with the same snapshot: debounce → no emit.
-        let second = cursor_tick(&mut state, &mut src, now());
+        let second = cursor_tick(&mut state, &mut src, None, now());
         assert!(
             second.is_empty(),
             "identical position must not produce a second datagram (got {second:?})"
@@ -1990,7 +2104,7 @@ mod cursor_pump_tests {
                 visible: false,
             }),
         };
-        let effects = cursor_tick(&mut state, &mut src, now());
+        let effects = cursor_tick(&mut state, &mut src, None, now());
         assert_eq!(effects.len(), 1, "visibility flip must emit a datagram");
         let CursorEffect::Position(HostCursorPacket::Position { visible, .. }) = effects[0] else {
             panic!("expected Position effect");
@@ -2010,7 +2124,7 @@ mod cursor_pump_tests {
             .into(),
             position: None,
         };
-        let effects = cursor_tick(&mut state, &mut src, now());
+        let effects = cursor_tick(&mut state, &mut src, None, now());
         // 1 → Shape + UseShape; 2 → Shape + UseShape; 1 again → UseShape only
         assert_eq!(effects.len(), 5);
         assert_eq!(state.shapes_sent, 3);
@@ -2191,6 +2305,7 @@ fn run_capture_and_send(
     frames: Receiver<CapturedFrame>,
     force_idr: tether_session::IdrSignal,
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
+    cursor_frame_tx: tokio::sync::watch::Sender<Option<CursorFrameDims>>,
     shutdown: Arc<AtomicBool>,
     chosen_profile: VideoProfile,
     stream_ready: Arc<AtomicBool>,
@@ -2339,6 +2454,12 @@ fn run_capture_and_send(
                 fragmenter.bump_epoch();
             }
             let _ = display_dims_tx.send(Some((frame_width, frame_height)));
+            let _ = cursor_frame_tx.send(Some(CursorFrameDims {
+                capture_w: frame_width,
+                capture_h: frame_height,
+                encode_w: encode_width,
+                encode_h: encode_height,
+            }));
             // Single-element preference list: the handshake already
             // picked one codec, and a mid-session codec switch would
             // require coordinated client decoder rebuild. We pass the

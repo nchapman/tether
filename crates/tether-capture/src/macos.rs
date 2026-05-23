@@ -100,7 +100,7 @@ pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
     }
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
-    let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
+    let (ready_tx, ready_rx) = bounded::<Result<CaptureGeometry>>(1);
     let stop = Arc::new(AtomicBool::new(false));
 
     let stop_thread = Arc::clone(&stop);
@@ -110,11 +110,10 @@ pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
 
     // Block on the readiness signal from the capture thread without
     // tying up the async runtime.
-    let ready = tokio::task::spawn_blocking(move || ready_rx.recv())
+    let geom = tokio::task::spawn_blocking(move || ready_rx.recv())
         .await
         .map_err(|e| CaptureError::Sck(format!("capture thread join: {e}")))?
-        .map_err(|_| CaptureError::Sck("capture thread exited before signaling ready".into()))?;
-    ready?;
+        .map_err(|_| CaptureError::Sck("capture thread exited before signaling ready".into()))??;
 
     // Drop wakes the capture thread. The receiver is what the caller
     // observes for live frames; the `Stop` handle lives inside the
@@ -127,7 +126,24 @@ pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
     // observable via `CaptureHandle::target_fps` but don't change
     // the actual SCK cadence — see `CaptureHandle` docs.
     let target_fps = Arc::new(AtomicU32::new(CAPTURE_FPS));
-    Ok(CaptureHandle::from_parts(rx, target_fps))
+    let cursor_source = crate::cursor_macos::start(crate::cursor_macos::CaptureGeometry {
+        logical_point_w: geom.logical_point_w,
+        logical_point_h: geom.logical_point_h,
+        capture_pixel_w: geom.capture_pixel_w,
+        capture_pixel_h: geom.capture_pixel_h,
+    });
+    Ok(CaptureHandle::from_parts(rx, target_fps).with_cursor_source(cursor_source))
+}
+
+/// Geometry of the live capture stream, plumbed from the capture
+/// thread back to `start` so it can hand the cursor source the
+/// point-to-pixel scale.
+#[derive(Clone, Copy, Debug)]
+struct CaptureGeometry {
+    logical_point_w: f64,
+    logical_point_h: f64,
+    capture_pixel_w: u32,
+    capture_pixel_h: u32,
 }
 
 /// Drive the SCStream lifecycle on a dedicated thread.
@@ -140,19 +156,19 @@ pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
 /// 4. Stops the stream and lets it drop.
 fn run_capture_thread(
     tx: Sender<CapturedFrame>,
-    ready_tx: Sender<Result<()>>,
+    ready_tx: Sender<Result<CaptureGeometry>>,
     stop: Arc<AtomicBool>,
     pixel_format: PixelFormat,
 ) {
     let stop_handler = Arc::clone(&stop);
-    let stream = match build_and_start_stream(tx, stop_handler, pixel_format) {
+    let (stream, geom) = match build_and_start_stream(tx, stop_handler, pixel_format) {
         Ok(s) => s,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
-    let _ = ready_tx.send(Ok(()));
+    let _ = ready_tx.send(Ok(geom));
 
     // Park until the frame handler signals shutdown. SCK delivers
     // samples on its own dispatch queue, so this thread has nothing to
@@ -171,7 +187,7 @@ fn build_and_start_stream(
     tx: Sender<CapturedFrame>,
     stop: Arc<AtomicBool>,
     pixel_format: PixelFormat,
-) -> Result<SCStream> {
+) -> Result<(SCStream, CaptureGeometry)> {
     let content = SCShareableContent::get()?;
     let primary = content
         .displays()
@@ -279,7 +295,10 @@ fn build_and_start_stream(
         // window under one frame at 60 Hz while absorbing the
         // 1-2 frame stalls we see in practice.
         .with_queue_depth(5)
-        .with_shows_cursor(true);
+        // Cursor is extracted out-of-band by `cursor_macos` and
+        // overlay-rendered on the client at sub-frame latency. Leaving
+        // SCK's in-frame cursor on would double-draw it.
+        .with_shows_cursor(false);
 
     let mut stream = SCStream::new(&filter, &config);
     let thread_handle = std::thread::current();
@@ -292,7 +311,13 @@ fn build_and_start_stream(
     };
     stream.add_output_handler(handler, SCStreamOutputType::Screen);
     stream.start_capture()?;
-    Ok(stream)
+    let geom = CaptureGeometry {
+        logical_point_w: logical_w as f64,
+        logical_point_h: logical_h as f64,
+        capture_pixel_w: width,
+        capture_pixel_h: height,
+    };
+    Ok((stream, geom))
 }
 
 struct FrameHandler {
@@ -850,7 +875,7 @@ impl SCStreamOutputTrait for ProbeFrameSink {
 }
 
 #[cfg(test)]
-mod tests {
+mod sck_tests {
     use super::*;
 
     /// Hardware probe — runs SCK and records what this Mac accepts.

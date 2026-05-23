@@ -353,6 +353,13 @@ pub(crate) struct CursorOverlay {
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
+    /// Caches the last logged
+    /// (sprite_w, sprite_h, vw, vh, surf_w, surf_h, fit_w, fit_h)
+    /// so the cursor-render-params line only fires when something
+    /// the user can act on actually changed. Without dedup, the line
+    /// would fire every frame at 60 Hz. Plain field — `render` takes
+    /// `&mut self`, no concurrent access.
+    last_logged_dims: Option<(u32, u32, u32, u32, u32, u32, u32, u32)>,
 }
 
 impl CursorOverlay {
@@ -464,6 +471,7 @@ impl CursorOverlay {
             bgl,
             sampler,
             uniform,
+            last_logged_dims: None,
         }
     }
 
@@ -472,7 +480,7 @@ impl CursorOverlay {
     /// one mutex lock + one HashMap lookup in those cases, which is
     /// cheap relative to the rest of the frame.
     pub fn render(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -496,6 +504,7 @@ impl CursorOverlay {
         // ordering, a follow-up `enqueue_shape` that races eviction
         // could drop the texture between snapshot and submit, leaving
         // the bind group dangling.
+        let last_logged_dims = &mut self.last_logged_dims;
         let bind_group = channel.with(|state| {
             state.drain_pending(device, queue);
             let snap = state.snapshot_for_render()?;
@@ -506,6 +515,30 @@ impl CursorOverlay {
             let rect_x = (surf_w as f32 - fit_w as f32) * 0.5;
             #[allow(clippy::cast_precision_loss)]
             let rect_y = (surf_h as f32 - fit_h as f32) * 0.5;
+            // Diagnostic: every input to the shader's
+            // `sprite_size = cursor_wh * fit_wh / video_wh` formula, so
+            // a "cursor too big / too small" complaint can be debugged
+            // from logs alone. Dedup'd on the tuple of dims so a static
+            // cursor doesn't spam the log.
+            let key = (snap.width, snap.height, vw, vh, surf_w, surf_h, fit_w, fit_h);
+            if *last_logged_dims != Some(key) {
+                #[allow(clippy::cast_precision_loss)]
+                let sprite_px = (
+                    (snap.width as f32) * (fit_w as f32) / (vw as f32),
+                    (snap.height as f32) * (fit_h as f32) / (vh as f32),
+                );
+                tracing::info!(
+                    sprite_wh = ?(snap.width, snap.height),
+                    video_wh = ?(vw, vh),
+                    surface_wh = ?(surf_w, surf_h),
+                    fit_wh = ?(fit_w, fit_h),
+                    position = ?(snap.position_x, snap.position_y),
+                    hotspot = ?(snap.hotspot_x, snap.hotspot_y),
+                    rendered_sprite_px = ?(sprite_px.0.round() as i32, sprite_px.1.round() as i32),
+                    "cursor overlay render params changed"
+                );
+                *last_logged_dims = Some(key);
+            }
             #[allow(clippy::cast_precision_loss)]
             let rows = [
                 [rect_x, rect_y, fit_w as f32, fit_h as f32],

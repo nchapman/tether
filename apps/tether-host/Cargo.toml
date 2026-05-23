@@ -40,6 +40,22 @@ wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9" }
 # tether-gpuconvert; declared directly here to make the use explicit.
 pollster = "0.4"
 
+# macOS-only: NV12 IOSurface scaler bridge for the zero-copy
+# capture→encode path when the client viewport asks for a smaller
+# encode than SCK captures. Mirrors the Linux gpuconvert dep above;
+# the bridge owns its own wgpu Metal device.
+[target.'cfg(target_os = "macos")'.dependencies]
+tether-gpuconvert = { workspace = true }
+# Direct wgpu types in the bridge glue (`wgpu::Instance`,
+# `wgpu::DeviceDescriptor`, `wgpu::Features`). Metal feature on macOS;
+# same trunk pin as tether-render / tether-gpuconvert via workspace
+# [patch.crates-io].
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["metal"] }
+# pollster::block_on lets us drive the wgpu device-request future from
+# the synchronous send-thread context, same pattern as the Linux
+# Nv12DmaBuf::new path.
+pollster = "0.4"
+
 # dev-dep on tether-render so the macOS fourcc-table cross-check unit
 # test (`macos_iosurface_fourcc_tables_agree_across_crates`) can call
 # `tether_render::accepts_iosurface_fourcc` alongside the encoder /

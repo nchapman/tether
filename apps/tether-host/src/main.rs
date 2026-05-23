@@ -33,6 +33,10 @@ use tether_gpuconvert::{
 };
 #[cfg(target_os = "linux")]
 use tether_scaler::{Pipelines as ScalerPipelines, Scaler, ScalerError};
+#[cfg(target_os = "macos")]
+use tether_gpuconvert::nv12_iosurface::{
+    BridgeError as IOSurfaceBridgeError, Nv12IOSurfaceBridge, PooledIOSurface,
+};
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ControlMessage, VideoProfile, Viewport,
 };
@@ -786,11 +790,6 @@ struct EncoderSlot {
     /// the bridge consumes the imported texture directly). Lazily
     /// built alongside the bridge so it can reuse the bridge's wgpu
     /// device — see `build_scaler_for_slot`.
-    ///
-    /// macOS host has no equivalent here: SCK already does the
-    /// scaling at capture time via `SCStreamConfiguration.width/
-    /// height`. Unifying the Mac host path on this shader is the
-    /// phase-2 follow-up tracked in ARCHITECTURE.md.
     #[cfg(target_os = "linux")]
     scaler: Option<Scaler>,
     /// Compiled Mitchell shader pipelines, cached across scaler
@@ -804,6 +803,22 @@ struct EncoderSlot {
     /// through `ScalerPipelines::build` again.
     #[cfg(target_os = "linux")]
     scaler_pipelines: Option<Arc<ScalerPipelines>>,
+    /// macOS NV12 IOSurface scaler bridge. Lazily built on the first
+    /// GPU frame after a slot rebuild when capture_dims != encode_dims
+    /// (i.e. the client viewport asks for a smaller encode than SCK
+    /// captures). `None` for 1:1 pass-through, where the SCK IOSurface
+    /// goes directly to the encoder. Built per resolution; rebuilt
+    /// when the slot is recreated.
+    #[cfg(target_os = "macos")]
+    iosurface_bridge: Option<Nv12IOSurfaceBridge>,
+    /// The PooledIOSurface used by the *previous* macOS frame. Held
+    /// across one frame so VideoToolbox's async encode can drain the
+    /// CVPixelBuffer that wraps the IOSurface before the bridge
+    /// recycles the slot. With a pool depth of 4 and one slot
+    /// retired per frame, two slots stay free for the next acquire —
+    /// plenty of headroom even at sustained high frame rates.
+    #[cfg(target_os = "macos")]
+    prev_pooled: Option<PooledIOSurface>,
 }
 
 /// Per-encoder adaptive bitrate state.
@@ -843,7 +858,7 @@ enum GpuConvertBridge {
 /// after the startup probe succeeded indicates device loss or OOM and
 /// the client would just freeze if we silently dropped every subsequent
 /// frame.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 enum GpuEncodeOutcome {
     Packets(Vec<tether_codec::EncodedPacket>),
     DropFrame(anyhow::Error),
@@ -1175,32 +1190,233 @@ fn encode_gpu_frame(
 /// `submit_iosurface` performs a fresh CFRetain on the wrapping
 /// CVPixelBuffer so the surface stays valid for the encoder's
 /// async work after we return.
+/// 1:1 pass-through path for macOS GPU frames where capture dims
+/// match encode dims. Bypasses the NV12 IOSurface bridge entirely;
+/// the SCK IOSurface goes straight to the encoder. Lives in its own
+/// function so the send loop can call it without needing a
+/// [`MacosGpuState`] handle for the no-scaling case.
 #[cfg(target_os = "macos")]
-fn encode_iosurface_frame(
+fn encode_iosurface_frame_no_bridge(
     slot: &mut EncoderSlot,
     gpu: tether_capture::GpuCapturedFrame,
     pts: i64,
     force_keyframe: bool,
-) -> anyhow::Result<Vec<tether_codec::EncodedPacket>> {
+) -> GpuEncodeOutcome {
     let tether_capture::GpuCapturedSource::IOSurface(iosurface) = gpu.source;
-    let codec_frame = tether_codec::IOSurfaceFrame {
+    let src_frame = tether_codec::IOSurfaceFrame {
         surface: iosurface.surface,
         pixel_format: iosurface.pixel_format,
         width: iosurface.width,
         height: iosurface.height,
     };
-    let packets = slot.encoder.encode_gpu(
-        GpuEncoderFrame::IOSurface(&codec_frame),
-        pts,
-        force_keyframe,
-    )?;
-    // `gpu` (and its `release_guard`) falls out of scope at function
-    // end, releasing the capture-side CMSampleBuffer + IOSurface
-    // retains. By that point `submit_iosurface` has already taken its
-    // own CFRetain on the wrapping CVPixelBuffer, so the surface
-    // outlives this scope as needed by the encoder. Ordering here is
-    // not load-bearing — no explicit `drop` needed.
-    Ok(packets)
+    // Drop any retained pooled slot from a prior downscaled session
+    // — we don't need it anymore.
+    slot.prev_pooled = None;
+    match slot
+        .encoder
+        .encode_gpu(GpuEncoderFrame::IOSurface(&src_frame), pts, force_keyframe)
+    {
+        Ok(p) => GpuEncodeOutcome::Packets(p),
+        Err(e) => GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn encode_iosurface_frame(
+    slot: &mut EncoderSlot,
+    macos_gpu: &mut MacosGpuState,
+    gpu: tether_capture::GpuCapturedFrame,
+    pts: i64,
+    force_keyframe: bool,
+) -> GpuEncodeOutcome {
+    let tether_capture::GpuCapturedSource::IOSurface(iosurface) = gpu.source;
+    let src_frame = tether_codec::IOSurfaceFrame {
+        surface: iosurface.surface,
+        pixel_format: iosurface.pixel_format,
+        width: iosurface.width,
+        height: iosurface.height,
+    };
+
+    // Two paths through the macOS GPU encode:
+    //   - capture_dims == encode_dims: feed the SCK IOSurface
+    //     straight to the encoder. No bridge, no scaler.
+    //   - capture_dims != encode_dims: build (or reuse) the
+    //     `Nv12IOSurfaceBridge`, scale into a pooled destination
+    //     IOSurface, feed *that* to the encoder.
+    let needs_bridge = (slot.capture_width, slot.capture_height) != (slot.width, slot.height);
+
+    if needs_bridge {
+        // Lazy-build the bridge. The slot is rebuilt on any dim
+        // change (see the recreate path in the send loop), so a
+        // None here means this is the first GPU frame for this slot.
+        // The bridge borrows the host's shared wgpu device + queue;
+        // creating a fresh Metal device per resolution change would
+        // waste a kernel object and contend for scheduler slots with
+        // the capture and renderer paths.
+        if slot.iosurface_bridge.is_none() {
+            // `submit_iosurface` validates the destination fourcc
+            // matches its `sw_format` family, so the destination
+            // here must come from the encoder's own table — not the
+            // source surface's fourcc. For NV12 sessions today the
+            // two families coincide, but a future range mismatch
+            // (e.g. capture 'f' / encode 'v') would silently allocate
+            // the wrong pool without this derivation.
+            let bridge = match macos_gpu.build_bridge(
+                (slot.capture_width, slot.capture_height),
+                (slot.width, slot.height),
+                src_frame.pixel_format,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                        "nv12_iosurface bridge construction failed for {}x{} -> {}x{}: {e}",
+                        slot.capture_width,
+                        slot.capture_height,
+                        slot.width,
+                        slot.height,
+                    ));
+                }
+            };
+            info!(
+                capture_w = slot.capture_width,
+                capture_h = slot.capture_height,
+                encode_w = slot.width,
+                encode_h = slot.height,
+                fourcc = format_args!("0x{:08x}", src_frame.pixel_format),
+                "NV12 IOSurface bridge built for macOS host downscale"
+            );
+            slot.iosurface_bridge = Some(bridge);
+        }
+
+        let bridge = slot.iosurface_bridge.as_ref().expect("just built");
+        let pooled = match bridge.scale_to_iosurface(&src_frame) {
+            Ok(p) => p,
+            Err(e) => {
+                // Per-frame transient — typically PoolExhausted under
+                // a brief encoder stall. Caller drops this frame.
+                return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                    "nv12_iosurface scale: {e}"
+                ));
+            }
+        };
+
+        // The bridge has run the scaler against the pool slot's
+        // destination textures. Feed the pool slot's IOSurface to
+        // the encoder; `submit_iosurface` will CF-retain the wrapping
+        // CVPixelBuffer.
+        let packets = match slot.encoder.encode_gpu(
+            GpuEncoderFrame::IOSurface(&pooled.frame),
+            pts,
+            force_keyframe,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}"));
+            }
+        };
+
+        // Retire the *previous* frame's PooledIOSurface here (after
+        // VT has had a chance to drain it via this frame's
+        // encode_gpu), keeping the current one alive for one more
+        // frame. With pool depth 4 and the encoder in low-latency
+        // mode (`MaxFrameDelayCount` defaults to 0), this gives 3
+        // slots in rotation — enough for the typical single-frame
+        // VT latency. A future change that bumps `MaxFrameDelayCount`
+        // must also bump `pool_depth` to match.
+        slot.prev_pooled = Some(pooled);
+        GpuEncodeOutcome::Packets(packets)
+    } else {
+        // Capture dims match encode dims: no scaler, no bridge. The
+        // SCK IOSurface goes straight to the encoder. `gpu`'s
+        // `release_guard` keeps the CMSampleBuffer-wrapped IOSurface
+        // alive across the encode call; `submit_iosurface` takes a
+        // fresh CF retain on the wrapping CVPixelBuffer so the surface
+        // outlives this scope as the encoder needs.
+        let packets = match slot.encoder.encode_gpu(
+            GpuEncoderFrame::IOSurface(&src_frame),
+            pts,
+            force_keyframe,
+        ) {
+            Ok(p) => p,
+            Err(e) => return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}")),
+        };
+        // If we were previously using the bridge (different viewport)
+        // and now hit a 1:1 frame, the prev_pooled from then is
+        // still pinned here — drop it explicitly. The bridge itself
+        // stays cached (cheap to keep; will be reused if the
+        // viewport changes back).
+        slot.prev_pooled = None;
+        GpuEncodeOutcome::Packets(packets)
+    }
+}
+
+/// macOS host-side GPU state: one wgpu Metal device + queue, shared
+/// across the lifetime of the session. The NV12 IOSurface scaler
+/// bridge borrows handles from here on each (re)build, instead of
+/// constructing a fresh Metal device per viewport change (which would
+/// waste a kernel object and prevent cross-bridge IOSurface sharing).
+///
+/// Lazily initialised on the first downscaled GPU frame — a session
+/// that never asks for a viewport smaller than the capture pays
+/// nothing for the device handle.
+#[cfg(target_os = "macos")]
+struct MacosGpuState {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosGpuState {
+    /// Construct the shared wgpu Metal device + queue. Called at
+    /// most once per session; the result lives until the send loop
+    /// exits. Hard-fails on any adapter problem so a bridge attempt
+    /// in `encode_iosurface_frame` can rely on `MacosGpuState`
+    /// already being valid (or the host has already exited via
+    /// `Goodbye(InternalError)` at slot construction).
+    fn new() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .map_err(|_| anyhow::anyhow!("no wgpu adapter for macOS NV12 IOSurface bridge"))?;
+        let features = adapter.features();
+        if !features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+            anyhow::bail!(
+                "wgpu adapter does not advertise TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES \
+                 (required for R8Unorm / Rg8Unorm storage); macOS NV12 IOSurface bridge \
+                 cannot initialise. Adapter features = {features:?}"
+            );
+        }
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("tether-host nv12 iosurface bridge"),
+                required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            }))?;
+        Ok(Self { device, queue })
+    }
+
+    fn build_bridge(
+        &self,
+        src_dims: (u32, u32),
+        dst_dims: (u32, u32),
+        fourcc: u32,
+    ) -> anyhow::Result<Nv12IOSurfaceBridge> {
+        Nv12IOSurfaceBridge::new(self.device.clone(), self.queue.clone(), src_dims, dst_dims, fourcc)
+            .map_err(|e| match e {
+                IOSurfaceBridgeError::NoScaleNeeded { dims } => anyhow::anyhow!(
+                    "bridge construction got NoScaleNeeded for dims {dims:?} — caller \
+                     should have skipped the bridge path"
+                ),
+                other => anyhow::anyhow!("Nv12IOSurfaceBridge::new: {other}"),
+            })
+    }
 }
 
 /// Build a `DmaBufFrame` (NV12, one object, two layers — Y as R8 and
@@ -1550,6 +1766,13 @@ fn run_capture_and_send(
     let mut fragmenter = FrameFragmenter::new(0);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
     let mut slot: Option<EncoderSlot> = None;
+    // macOS-only host GPU state: shared wgpu Metal device + queue for
+    // the NV12 IOSurface scaler bridge. Lazily initialised on the
+    // first downscaled GPU frame; a session that never asks for a
+    // viewport smaller than the capture stays at `None` and pays
+    // nothing for the Metal device.
+    #[cfg(target_os = "macos")]
+    let mut macos_gpu: Option<MacosGpuState> = None;
     let mut pts: i64 = 0;
     // Frame-change classifier. CPU frames get a strided hash; GPU
     // frames bypass it (zero-copy path mustn't read back). Resolution
@@ -1631,20 +1854,12 @@ fn run_capture_and_send(
         //   - Linux GPU dma-buf: `tether-scaler` (Mitchell-Netravali
         //     in linear-light) runs inside `encode_gpu_frame` between
         //     PipeWire's BGRA import and the chroma bridge.
-        //   - macOS GPU IOSurface: until SCK's `SCStreamConfiguration.
-        //     width/height` is plumbed (phase-2), the IOSurface
-        //     arrives at capture dims; the encoder + VideoToolbox
-        //     session expect frames at their configured dims, so we
-        //     hold `encode_dims = capture_dims` here. Removing this
-        //     branch without the SCK plumbing would feed mis-sized
-        //     pixel buffers to VT and produce encoder rejection or
-        //     silently wrong output.
-        let viewport_applies = !matches!(frame, CapturedFrame::Gpu(_)) || cfg!(target_os = "linux");
-        let (encode_width, encode_height) = if viewport_applies {
-            encode_dims_for_viewport(frame_width, frame_height, current_viewport)
-        } else {
-            (frame_width, frame_height)
-        };
+        //   - macOS GPU IOSurface: `tether-gpuconvert::nv12_iosurface`
+        //     (Mitchell-Netravali in YUV space with cosited UV
+        //     siting) runs inside `encode_iosurface_frame` between
+        //     SCK's NV12 IOSurface and `submit_iosurface`.
+        let (encode_width, encode_height) =
+            encode_dims_for_viewport(frame_width, frame_height, current_viewport);
         // viewport_seq isn't part of the rebuild check: only an actual
         // change in encoder dimensions warrants tearing down the
         // encoder + bumping stream_epoch. A viewport change that
@@ -1740,6 +1955,10 @@ fn run_capture_and_send(
                         scaler: None,
                         #[cfg(target_os = "linux")]
                         scaler_pipelines: None,
+                        #[cfg(target_os = "macos")]
+                        iosurface_bridge: None,
+                        #[cfg(target_os = "macos")]
+                        prev_pooled: None,
                     })
                 }
                 Err(e) => {
@@ -1843,13 +2062,70 @@ fn run_capture_and_send(
                 }
             },
             #[cfg(target_os = "macos")]
-            CapturedFrame::Gpu(gpu) => match encode_iosurface_frame(slot_mut, gpu, pts, force_kf) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(error = %e, "IOSurface encode failed; dropping frame");
-                    continue;
+            CapturedFrame::Gpu(gpu) => {
+                // Lazy-init the host-shared wgpu Metal device on the
+                // first downscaled GPU frame. A startup-time
+                // construction would force the cost on sessions that
+                // never need scaling; this defers it until we know
+                // the bridge will actually be built.
+                if macos_gpu.is_none()
+                    && (slot_mut.capture_width, slot_mut.capture_height)
+                        != (slot_mut.width, slot_mut.height)
+                {
+                    match MacosGpuState::new() {
+                        Ok(s) => {
+                            info!("macOS GPU state initialised for NV12 IOSurface bridge");
+                            macos_gpu = Some(s);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "macOS GPU state init failed; sending Goodbye(InternalError) and exiting send loop"
+                            );
+                            let goodbye_conn = conn.clone();
+                            let reason = format!("host macOS GPU state init failed: {e}");
+                            let _ = runtime.block_on(goodbye_conn.send_control(
+                                &ControlMessage::Goodbye {
+                                    reason,
+                                    code: tether_protocol::control::GoodbyeCode::InternalError,
+                                },
+                            ));
+                            return;
+                        }
+                    }
                 }
-            },
+                let outcome = if let Some(state) = macos_gpu.as_mut() {
+                    encode_iosurface_frame(slot_mut, state, gpu, pts, force_kf)
+                } else {
+                    // 1:1 pass-through path doesn't need MacosGpuState.
+                    // encode_iosurface_frame takes &mut MacosGpuState
+                    // unconditionally, so route through a synthetic
+                    // path that bypasses the bridge entirely.
+                    encode_iosurface_frame_no_bridge(slot_mut, gpu, pts, force_kf)
+                };
+                match outcome {
+                    GpuEncodeOutcome::Packets(p) => p,
+                    GpuEncodeOutcome::DropFrame(e) => {
+                        warn!(error = %e, "IOSurface encode failed; dropping frame");
+                        continue;
+                    }
+                    GpuEncodeOutcome::Fatal(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "macOS GPU encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
+                        );
+                        let goodbye_conn = conn.clone();
+                        let reason = format!("host macOS GPU encode bridge collapsed: {e}");
+                        let _ = runtime.block_on(goodbye_conn.send_control(
+                            &ControlMessage::Goodbye {
+                                reason,
+                                code: tether_protocol::control::GoodbyeCode::InternalError,
+                            },
+                        ));
+                        return;
+                    }
+                }
+            }
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             CapturedFrame::Gpu(_) => {
                 warn!("Gpu CapturedFrame on an unsupported build; dropping");

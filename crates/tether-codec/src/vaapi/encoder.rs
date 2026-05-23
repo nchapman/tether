@@ -73,6 +73,12 @@ pub struct VaapiEncoder {
     width: u32,
     height: u32,
     bgra_row_bytes: usize,
+    /// AVOption keys that `encoder.open()` left in the dict because the
+    /// driver/encoder didn't recognise them. Empty when every requested
+    /// option was accepted. Exposed via [`Self::unused_avoptions`] so
+    /// tests can confirm an opt-in setting (e.g. `intra_refresh`) was
+    /// actually consumed by the driver, not silently ignored.
+    unused_avoptions: Vec<String>,
 }
 
 // SAFETY: ffmpeg HW codec context, VAAPI device, and per-encoder frames
@@ -312,21 +318,27 @@ impl VaapiEncoder {
         // Intra refresh: spreads intra-coded macroblocks across a
         // refresh period instead of one oversized IDR. Reads
         // `TETHER_INTRA_REFRESH_PERIOD` (frame count) on every
-        // encoder construction. Off by default — VAAPI driver
-        // support is uneven (Intel iHD, Mesa, AMD all differ) and
-        // we don't have a capability probe yet, so the safe
-        // default is "stay on the current IDR-only path." A user
-        // with the right hardware sets the env var to opt in.
+        // encoder construction. Off by default.
         //
-        // libavcodec's encoder-private names: `intra_refresh` (h264
-        // / hevc VAAPI). The option is silently ignored when the
-        // driver doesn't recognise it — `open()` returns the
-        // leftover dict entries via the warn-on-unused-keys path
-        // below, so a typo or missing driver support surfaces
-        // loudly in the logs.
+        // **Observed driver gap.** On Intel iHD (Meteor Lake), the
+        // `intra_refresh` option appears in `open()`'s leftover dict
+        // — the `h264_vaapi` encoder did not consume it, and the
+        // bitstream stays IDR-paced at the default GOP. Whether the
+        // gap is in ffmpeg's VAAPI encoder wrapper (option not
+        // registered as a private AVOption for this encoder) or in
+        // the underlying VAEntrypoint (driver did not advertise a
+        // gradual-refresh capability) is unconfirmed; resolving it
+        // means reading `libavcodec/vaapi_encode.c` /
+        // `vaapi_encode_h264.c` against the FFmpeg version in use.
+        // The hardware test `vaapi_intra_refresh_round_trip` SKIPs
+        // when the option lands in `unused_avoptions()`, and asserts
+        // the full bitstream-shape contract the moment a driver +
+        // ffmpeg combination consumes the option.
         //
-        // SEI recovery-point emission and hardware round-trip
-        // tests are deferred to the Phase 2 follow-up.
+        // Kept env-var-gated and live so (a) the seam exists for
+        // drivers that *do* land support, and (b) the diagnostic
+        // path through `unused_avoptions` keeps surfacing the gap
+        // loudly in logs rather than silently degrading.
         if let Ok(period_str) = std::env::var("TETHER_INTRA_REFRESH_PERIOD") {
             if let Ok(period) = period_str.parse::<u32>() {
                 if period > 0 {
@@ -362,23 +374,28 @@ impl VaapiEncoder {
         #[allow(clippy::cast_possible_wrap)]
         encoder.set_flags(encoder.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
         let leftover = encoder.open(Some(dict))?;
+        let mut unused_avoptions: Vec<String> = Vec::new();
         if let Some(unused) = leftover {
             // Driver/encoder didn't recognise one or more opts. Not
             // fatal — the encoder will still work, just with the
             // unrecognised setting at its default. Surfacing the keys
             // helps diagnose "why is latency higher than expected?"
-            let mut unused_keys: Vec<String> = Vec::new();
+            //
+            // Stored as bare option keys (not `key=value` pairs) so
+            // callers can do straightforward presence checks; the
+            // values still appear in the warn! log below for full
+            // diagnostic context.
+            let mut unused_pairs: Vec<(String, String)> = Vec::new();
             for entry in unused.iter() {
-                unused_keys.push(format!(
-                    "{}={}",
-                    entry.key().to_string_lossy(),
-                    entry.value().to_string_lossy()
-                ));
+                let key = entry.key().to_string_lossy().into_owned();
+                let value = entry.value().to_string_lossy().into_owned();
+                unused_avoptions.push(key.clone());
+                unused_pairs.push((key, value));
             }
-            if !unused_keys.is_empty() {
+            if !unused_pairs.is_empty() {
                 warn!(
                     codec = vaapi_codec_name(kind),
-                    unused = ?unused_keys,
+                    unused = ?unused_pairs,
                     "VAAPI encoder ignored some private options; latency knobs may not be applied"
                 );
             }
@@ -433,7 +450,18 @@ impl VaapiEncoder {
             width,
             height,
             bgra_row_bytes,
+            unused_avoptions,
         })
+    }
+
+    /// AVOption keys that the driver did not consume at `open()`. A
+    /// non-empty list means the corresponding latency knobs (intra
+    /// refresh, qmin, etc.) silently fell back to encoder defaults —
+    /// useful for tests that need to assert an opt-in setting actually
+    /// took effect on the current driver.
+    #[must_use]
+    pub fn unused_avoptions(&self) -> &[String] {
+        &self.unused_avoptions
     }
 
     /// Encode one DMA-BUF-backed frame without a CPU upload. The fds

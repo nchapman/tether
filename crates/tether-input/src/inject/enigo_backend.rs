@@ -235,6 +235,20 @@ impl EnigoBackend {
             }
             InputEventKind::RelativeMouseMove { dx, dy, modifiers } => {
                 self.reconcile_modifiers(*modifiers, None)?;
+                // Per-event sanity clamp. i16 wire values are
+                // bounded to ±32_767; without clamping, a malicious
+                // client at high event rate could move the host
+                // cursor across multiple displays per event. macOS's
+                // CGEvent path applies large deltas before the
+                // screen-edge guard, so values like i16::MAX can
+                // reach hot corners / Mission Control / Dock /
+                // Terminal windows the user never intended to
+                // target. ±1000 px per event covers any legitimate
+                // gaming-mouse flick (a 1600 DPI mouse moved 1
+                // inch in 1 frame is ~1600 dots, but the OS scales
+                // for pointer-acceleration before delivery so the
+                // post-scale value is well under this cap).
+                let (dx_clamped, dy_clamped) = clamp_relative_delta(*dx, *dy);
                 // Coordinate::Rel routes through the OS's native
                 // delta injection path: EV_REL/REL_X+REL_Y on Linux
                 // uinput, CGEventCreateMouseEvent's delta fields on
@@ -243,7 +257,7 @@ impl EnigoBackend {
                 // games — synthetic SetCursorPos-style warps are
                 // filtered out by every OS by design.
                 self.enigo
-                    .move_mouse(i32::from(*dx), i32::from(*dy), Coordinate::Rel)
+                    .move_mouse(dx_clamped, dy_clamped, Coordinate::Rel)
                     .map_err(|e| InjectError::Inject(format!("relative move: {e:?}")))?;
                 Ok(())
             }
@@ -522,4 +536,43 @@ fn hid_to_enigo(usage: HidUsage) -> Option<Key> {
         }
     };
     Some(key)
+}
+
+/// Clamp i16 wire deltas to ±1000 px per event before handing them
+/// to enigo's relative-move path. See the call site in
+/// `RelativeMouseMove` for the motivation; pure helper extracted so
+/// the bounds are unit-testable without needing a live display.
+const MAX_REL_DELTA_PX: i32 = 1000;
+fn clamp_relative_delta(dx: i16, dy: i16) -> (i32, i32) {
+    (
+        i32::from(dx).clamp(-MAX_REL_DELTA_PX, MAX_REL_DELTA_PX),
+        i32::from(dy).clamp(-MAX_REL_DELTA_PX, MAX_REL_DELTA_PX),
+    )
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+
+    #[test]
+    fn small_deltas_pass_through() {
+        assert_eq!(clamp_relative_delta(5, -3), (5, -3));
+        assert_eq!(clamp_relative_delta(1000, -1000), (1000, -1000));
+    }
+
+    #[test]
+    fn extreme_positive_saturates() {
+        assert_eq!(clamp_relative_delta(i16::MAX, i16::MAX), (1000, 1000));
+    }
+
+    #[test]
+    fn extreme_negative_saturates() {
+        assert_eq!(clamp_relative_delta(i16::MIN, i16::MIN), (-1000, -1000));
+    }
+
+    #[test]
+    fn asymmetric_clamp_per_axis() {
+        assert_eq!(clamp_relative_delta(i16::MAX, 50), (1000, 50));
+        assert_eq!(clamp_relative_delta(-50, i16::MIN), (-50, -1000));
+    }
 }

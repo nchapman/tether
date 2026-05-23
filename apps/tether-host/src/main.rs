@@ -498,9 +498,28 @@ async fn handle_client(
         let latest_viewport_for_ctl = latest_viewport.clone();
         let force_idr_for_viewport = force_idr.clone();
         tasks.spawn(async move {
+            // Per-message rate limit for IDR-triggering control messages.
+            // A client flooding ForceIdr / RequestRecovery on the
+            // reliable control stream could otherwise pin the encoder
+            // into perpetual-keyframe mode (bitrate explodes,
+            // session degrades to a slideshow). 250 ms floor matches
+            // the minimum useful keyframe cadence — faster bursts
+            // are coalesced through IdrSignal anyway, so the cap
+            // costs nothing in normal operation.
+            let mut last_idr_request: Option<std::time::Instant> = None;
+            const IDR_REQUEST_MIN_INTERVAL: std::time::Duration =
+                std::time::Duration::from_millis(250);
             loop {
                 match conn.recv_control().await {
                     Ok(ControlMessage::ForceIdr) => {
+                        let now = std::time::Instant::now();
+                        if last_idr_request
+                            .is_some_and(|t| now.duration_since(t) < IDR_REQUEST_MIN_INTERVAL)
+                        {
+                            tracing::trace!("ForceIdr rate-limited");
+                            continue;
+                        }
+                        last_idr_request = Some(now);
                         tracing::debug!("client requested IDR");
                         force_idr.raise();
                     }
@@ -510,17 +529,31 @@ async fn handle_client(
                         // transition + echo the ack so the client
                         // knows the host saw it.
                         tracing::info!(?mode, "client switched cursor mode");
-                        let echo_conn = conn.clone();
+                        // Ack inline rather than tokio::spawn per
+                        // message: a client that flaps cursor mode
+                        // would otherwise grow the task queue
+                        // unboundedly. The control recv loop is
+                        // single-threaded; brief send blocking on
+                        // backpressure is fine and self-limiting.
                         let ack = ControlMessage::SetCursorMode { mode };
-                        tokio::spawn(async move {
-                            if let Err(e) = echo_conn.send_control(&ack).await {
-                                tracing::debug!(error = ?e, "SetCursorMode ack send failed");
-                            }
-                        });
+                        if let Err(e) = conn.send_control(&ack).await {
+                            tracing::debug!(error = ?e, "SetCursorMode ack send failed");
+                        }
                     }
                     Ok(ControlMessage::RequestRecovery {
                         last_known_good_frame_id,
                     }) => {
+                        let now = std::time::Instant::now();
+                        if last_idr_request
+                            .is_some_and(|t| now.duration_since(t) < IDR_REQUEST_MIN_INTERVAL)
+                        {
+                            tracing::trace!(
+                                last_known_good_frame_id,
+                                "RequestRecovery rate-limited"
+                            );
+                            continue;
+                        }
+                        last_idr_request = Some(now);
                         // Phase 1: record the report on the recovery
                         // signal (lowest-id wins) and fall back to a
                         // forced IDR. Phase 2 will replace the IDR

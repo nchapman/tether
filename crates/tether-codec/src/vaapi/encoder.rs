@@ -820,6 +820,23 @@ impl Encoder for VaapiEncoder {
         true
     }
 
+    // `supports_changing_bitrate` and `set_bitrate_kbps` deliberately
+    // not overridden. The trait defaults (`false` / Ok-no-op) are
+    // load-bearing: FFmpeg's `h264_vaapi` / `hevc_vaapi` wrappers do
+    // not propagate post-open `AVCodecContext.bit_rate` writes to the
+    // VAAPI rate-control machinery — verified on Intel iHD Meteor
+    // Lake via `vaapi_bitrate_retune_changes_bitstream_size`, which
+    // observes a 1.13× ratio when retuning between 1 Mbps and
+    // 20 Mbps (would be 5-10× if honoured). Effective retunes would
+    // require either an upstream FFmpeg fix that emits
+    // `VAEncMiscParameterTypeRateControl` on `bit_rate` change, or a
+    // direct libva call bypassing the FFmpeg wrapper. Until then the
+    // host (`apps/tether-host/src/main.rs:2064`) reads this predicate
+    // and disables ABR entirely on VAAPI hosts — which is correct,
+    // not a bug. A future driver/wrapper that plumbs live retune
+    // through end-to-end can override this pair; the hw test
+    // becomes the green-light gate.
+
     fn codec_kind(&self) -> CodecKind {
         self.kind
     }

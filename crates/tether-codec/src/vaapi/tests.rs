@@ -3,12 +3,17 @@ use crate::{Decoder, Encoder, Frame, GpuFrame, GpuFrameSource};
 
 use super::{VaapiDecoder, VaapiEncoder};
 
-/// Confirms that `Encoder::set_bitrate_kbps` succeeds mid-stream and
-/// the encoder keeps emitting decodable packets afterwards. ABR relies
-/// on this — if a live retune broke the stream, the controller would
-/// strand the session on whatever bitrate it last picked. Encode N
-/// frames at the baseline, change bitrate, encode N more, decode
-/// through VAAPI and assert the decoder produced a frame.
+/// Confirms `set_bitrate_kbps` is callable mid-stream without
+/// breaking the encoder's output, even when the implementation is the
+/// trait's Ok-no-op default. This is the structural guarantee the ABR
+/// controller relies on for backends that *do* support live retune:
+/// the call returns cleanly, the stream stays decodable.
+///
+/// Effective retune (the bitstream actually changes character) is a
+/// separate property covered by
+/// `vaapi_bitrate_retune_changes_bitstream_size`, which SKIPs on
+/// drivers where the retune is silently ignored — currently the case
+/// on Intel iHD Meteor Lake.
 #[test]
 #[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_set_bitrate_live_continues_to_encode)"]
 fn vaapi_set_bitrate_live_continues_to_encode() {
@@ -22,10 +27,6 @@ fn vaapi_set_bitrate_live_continues_to_encode() {
         4_000,
     )
     .expect("VAAPI encoder");
-    assert!(
-        enc.supports_changing_bitrate(),
-        "VAAPI encoder is expected to advertise bitrate-change support"
-    );
     let mut dec =
         VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
 
@@ -40,9 +41,10 @@ fn vaapi_set_bitrate_live_continues_to_encode() {
         }
     }
 
-    // Mid-stream retune — the new value is intentionally far from the
-    // initial so the encoder visibly changes character.
-    enc.set_bitrate_kbps(1_500).expect("live retune");
+    // Mid-stream retune. The trait default is Ok-no-op; an
+    // overriding impl that actually retunes must also return Ok
+    // here. Either way, the call must not break subsequent encoding.
+    enc.set_bitrate_kbps(1_500).expect("live retune call");
 
     // Post-retune: keep encoding + decoding, force one IDR so the
     // decoder picks up the new parameter set cleanly.
@@ -60,7 +62,7 @@ fn vaapi_set_bitrate_live_continues_to_encode() {
     }
     assert!(
         got_post.is_some(),
-        "decoder produced no frames after live bitrate change"
+        "decoder produced no frames after live bitrate change call"
     );
 }
 
@@ -572,6 +574,112 @@ fn hevc_main444_10bit_xv30_dmabuf_roundtrip() {
 
 // supported_encode_profiles is gone from tether-codec — the equivalent
 // is `tether_probe::host_encode_profiles()`, tested in that crate.
+
+/// Verifies live `set_bitrate_kbps` actually retunes the VAAPI
+/// rate-control pathway end-to-end. Same shape as
+/// `vaapi_min_qp_floor_reduces_bitstream`: encode the same high-
+/// entropy content at two well-separated bitrate targets and check
+/// the byte-count ratio.
+///
+/// **Verified-negative on Intel iHD Meteor Lake** as of this writing:
+/// `AVCodecContext.bit_rate` writes post-open do not propagate to
+/// VAAPI's rate-control machinery (FFmpeg's `vaapi_encode.c` doesn't
+/// emit `VAEncMiscParameterTypeRateControl` on bit_rate change), so
+/// the retune is a silent no-op — the test SKIPs when the
+/// observed ratio is too small. This is *correct system behaviour*
+/// for now: `VaapiEncoder` deliberately leaves
+/// `supports_changing_bitrate` at the trait default `false`, so the
+/// host disables ABR entirely on VAAPI hosts rather than running it
+/// blind. The test exists as the green-light gate for any future
+/// driver/wrapper combination that does plumb live retune through.
+#[test]
+#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_bitrate_retune_changes_bitstream_size)"]
+fn vaapi_bitrate_retune_changes_bitstream_size() {
+    use tether_protocol::control::VideoProfile;
+
+    const W: u32 = 640;
+    const H: u32 = 480;
+    const FRAMES: i64 = 30;
+
+    // Two well-separated bitrate targets. 1 Mbps is a tight cap for
+    // 640×480 noisy content at 30 fps; 20 Mbps is far above what the
+    // encoder needs. The byte-count ratio between the two should be
+    // ~5-10× if the retune is honoured.
+    const LOW_KBPS: u32 = 1_000;
+    const HIGH_KBPS: u32 = 20_000;
+
+    let mut enc = VaapiEncoder::new(VideoProfile::H264_8BIT_420, W, H, 30, LOW_KBPS)
+        .expect("VAAPI encoder");
+
+    // Phase A: encode at LOW_KBPS. Warm up first so rate-control
+    // converges; only count bytes from the second half.
+    for t in 0..(FRAMES / 2) {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_noisy_bgra(W, H, t as u32);
+        let _ = enc.encode_bgra(&bgra, t, t == 0).expect("encode warmup low");
+    }
+    let mut low_bytes: usize = 0;
+    for t in (FRAMES / 2)..FRAMES {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_noisy_bgra(W, H, t as u32);
+        let packets = enc.encode_bgra(&bgra, t, false).expect("encode low");
+        for p in packets {
+            low_bytes += p.data.len();
+        }
+    }
+
+    // Live retune.
+    enc.set_bitrate_kbps(HIGH_KBPS).expect("retune to high");
+
+    // Phase B: encode at HIGH_KBPS. Same warm-up-then-measure pattern.
+    // Continue PTS past phase A so the encoder treats this as a
+    // continuation, not a restart.
+    for t in FRAMES..(FRAMES + FRAMES / 2) {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_noisy_bgra(W, H, t as u32);
+        let _ = enc.encode_bgra(&bgra, t, false).expect("encode warmup high");
+    }
+    let mut high_bytes: usize = 0;
+    for t in (FRAMES + FRAMES / 2)..(FRAMES * 2) {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_noisy_bgra(W, H, t as u32);
+        let packets = enc.encode_bgra(&bgra, t, false).expect("encode high");
+        for p in packets {
+            high_bytes += p.data.len();
+        }
+    }
+
+    // The HIGH window should produce meaningfully more bytes than
+    // the LOW window. Threshold ratio 2× is generous: a true retune
+    // at 20× the budget will produce far more than that on noisy
+    // content, but encoder rate-control convergence + GOP boundary
+    // effects make tight thresholds flaky.
+    let ratio = high_bytes as f64 / low_bytes as f64;
+    // Three regimes — same shape as the qmin / intra-refresh tests.
+    //  - ratio > 2.0 → retune honoured, bitstream visibly grew.
+    //  - 1.5 < ratio ≤ 2.0 → ambiguous: partial enforcement or
+    //    rate-control convergence effects. Fail with a diagnostic.
+    //  - ratio ≤ 1.5 → driver silently ignored the retune. SKIP
+    //    (confirmed-negative on Intel iHD Meteor Lake; ratio is
+    //    typically 1.0-1.2). The test starts asserting the moment
+    //    any driver/wrapper combo plumbs live retune through.
+    if ratio <= 1.5 {
+        eprintln!(
+            "SKIP: VAAPI rate-control did not honour live bit_rate retune \
+             ({LOW_KBPS} kbps → {low_bytes} bytes, {HIGH_KBPS} kbps → {high_bytes} bytes, ratio {ratio:.3}). \
+             FFmpeg's wrapper does not emit VAEncMiscParameterTypeRateControl on bit_rate change — see encoder.rs comment."
+        );
+        return;
+    }
+    assert!(
+        ratio > 2.0,
+        "live retune from {LOW_KBPS} kbps to {HIGH_KBPS} kbps produced low={low_bytes} bytes vs high={high_bytes} bytes (ratio {ratio:.3}); expected > 2.0 (honoured) or ≤ 1.5 (silently ignored). \
+         Intermediate ratio suggests partial enforcement worth investigating."
+    );
+    eprintln!(
+        "live bitrate retune verified: {LOW_KBPS} kbps → {low_bytes} bytes, {HIGH_KBPS} kbps → {high_bytes} bytes, ratio {ratio:.3}"
+    );
+}
 
 /// Iterate H.264 Annex-B NAL units in a byte slice, yielding the
 /// 5-bit `nal_unit_type` for each. Tolerates both 3- and 4-byte start

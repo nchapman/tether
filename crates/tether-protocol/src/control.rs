@@ -551,6 +551,25 @@ pub enum GoodbyeCode {
     InternalError,
 }
 
+/// Cursor input model. Carried by
+/// [`ControlMessage::SetCursorMode`]; default is `Absolute`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CursorMode {
+    /// Today's behavior: client sends normalized pointer
+    /// coordinates via `ClientCursorPacket`; host does
+    /// `enigo::move_mouse(_, _, Coordinate::Abs)`. Correct for
+    /// productivity apps; broken for games that recenter the
+    /// cursor every frame or read raw HID deltas.
+    #[default]
+    Absolute,
+    /// Client grabs/hides the cursor and emits device-level
+    /// deltas via `InputEventKind::RelativeMouseMove`. Host
+    /// dispatches via `enigo::move_mouse(_, _, Coordinate::Rel)`
+    /// which routes through the OS's native delta API (the only
+    /// path raw-input games can observe).
+    Relative,
+}
+
 /// Messages exchanged on the reliable control stream after handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMessage {
@@ -642,6 +661,14 @@ pub enum ControlMessage {
         fragments_lost: u32,
         rtt_ewma_us: u32,
     },
+    /// Either side → other. Switch the cursor input model. Toggles
+    /// mid-session without renegotiating; the receiver echoes the
+    /// same message back as ack. While [`CursorMode::Relative`] is
+    /// active the client stops emitting `ClientCursorPacket` and
+    /// instead emits `InputEventKind::RelativeMouseMove` on the
+    /// reliable input stream — the only path that survives
+    /// recenter-loop games and raw-input HID readers.
+    SetCursorMode { mode: CursorMode },
     /// Client → host. The client's viewport changed (window resize,
     /// monitor switch, fullscreen toggle). The host treats this as a
     /// request to re-target the encoder at the new dimensions; the

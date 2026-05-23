@@ -233,6 +233,20 @@ impl EnigoBackend {
                 }
                 Ok(())
             }
+            InputEventKind::RelativeMouseMove { dx, dy, modifiers } => {
+                self.reconcile_modifiers(*modifiers, None)?;
+                // Coordinate::Rel routes through the OS's native
+                // delta injection path: EV_REL/REL_X+REL_Y on Linux
+                // uinput, CGEventCreateMouseEvent's delta fields on
+                // macOS, SendInput-without-ABSOLUTE on Windows. Only
+                // events from that path are observable to raw-input
+                // games — synthetic SetCursorPos-style warps are
+                // filtered out by every OS by design.
+                self.enigo
+                    .move_mouse(i32::from(*dx), i32::from(*dy), Coordinate::Rel)
+                    .map_err(|e| InjectError::Inject(format!("relative move: {e:?}")))?;
+                Ok(())
+            }
             InputEventKind::MouseScroll {
                 dx,
                 dy,

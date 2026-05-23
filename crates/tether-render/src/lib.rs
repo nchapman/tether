@@ -6,6 +6,7 @@
 pub mod color;
 mod gpu;
 pub mod present_policy;
+pub mod relative_mouse;
 
 #[cfg(test)]
 mod dmabuf_test;
@@ -20,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
+use tether_protocol::control::CursorMode;
 use tether_protocol::MonoNanos;
 use tracing::warn;
 use winit::application::ApplicationHandler;
@@ -177,6 +179,20 @@ pub enum RenderEvent {
         by_line: bool,
     },
     Focused(bool),
+    /// Device-level pointer delta (after sub-pixel accumulation),
+    /// emitted only while [`crate::present_policy`] is mostly
+    /// unrelated — see [`relative_mouse`]. Translated to
+    /// `InputEventKind::RelativeMouseMove` on the wire while
+    /// `CursorMode::Relative` is active.
+    RelativeMouseMove {
+        dx: i16,
+        dy: i16,
+    },
+    /// User toggled cursor mode (e.g. via the relative-mode
+    /// hotkey). Client binary forwards this as
+    /// `ControlMessage::SetCursorMode`; consumer-side decision to
+    /// actually grab the pointer happens inside the renderer.
+    CursorModeChanged(CursorMode),
     /// Window resized to `(width, height)` physical pixels. The client
     /// binary forwards this to the host as `ControlMessage::SetClientViewport`
     /// (after debouncing) so the host can re-encode at the new dims —

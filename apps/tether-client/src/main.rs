@@ -162,6 +162,13 @@ async fn main() -> anyhow::Result<()> {
                         // it is misbehaving; log and ignore.
                         tracing::warn!("host sent RequestRecovery (wrong direction); ignoring");
                     }
+                    Ok(ControlMessage::SetCursorMode { mode }) => {
+                        // The host echoes our SetCursorMode on every
+                        // toggle. No client-side action needed beyond
+                        // a trace log — the client already changed
+                        // its cursor-grab state to drive the send.
+                        tracing::debug!(?mode, "host echoed cursor mode");
+                    }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
                         let t1 = MonoNanos::now();
                         let response = ControlMessage::ClockProbeResponse(

@@ -750,6 +750,43 @@ mod tests {
     }
 
     #[test]
+    fn relative_mouse_move_input_event_round_trips() {
+        let e = InputEvent {
+            event_id: 7,
+            t_client: MonoNanos(42),
+            device_id: 0,
+            kind: InputEventKind::RelativeMouseMove {
+                dx: -120,
+                dy: 250,
+                modifiers: Modifiers::default(),
+            },
+        };
+        let bytes = encode(&e).unwrap();
+        let e2: InputEvent = decode(&bytes).unwrap();
+        match e2.kind {
+            InputEventKind::RelativeMouseMove { dx, dy, .. } => {
+                assert_eq!(dx, -120);
+                assert_eq!(dy, 250);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn set_cursor_mode_round_trips_and_defaults_to_absolute() {
+        assert_eq!(CursorMode::default(), CursorMode::Absolute);
+        let m = ControlMessage::SetCursorMode {
+            mode: CursorMode::Relative,
+        };
+        let bytes = encode(&m).unwrap();
+        let m2: ControlMessage = decode(&bytes).unwrap();
+        match m2 {
+            ControlMessage::SetCursorMode { mode } => assert_eq!(mode, CursorMode::Relative),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn request_recovery_control_message_round_trips() {
         let m = ControlMessage::RequestRecovery {
             last_known_good_frame_id: 12345,

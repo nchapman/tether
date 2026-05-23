@@ -77,6 +77,22 @@ pub enum InputEventKind {
         kind: ScrollKind,
         modifiers: Modifiers,
     },
+    /// Device-level mouse delta in pixels. Rides on the reliable
+    /// input stream (not the cursor datagram channel) so deltas
+    /// can't be dropped or reordered relative to button events,
+    /// which breaks every recenter-loop / raw-input game otherwise.
+    ///
+    /// The client emits these only while
+    /// [`crate::control::CursorMode::Relative`] is active; the
+    /// host dispatches them via `enigo::move_mouse(_, _, Rel)`
+    /// which routes through the OS's native delta API (uinput
+    /// EV_REL on Linux, CGEvent delta fields on macOS,
+    /// SendInput-without-ABSOLUTE on Windows).
+    RelativeMouseMove {
+        dx: i16,
+        dy: i16,
+        modifiers: Modifiers,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

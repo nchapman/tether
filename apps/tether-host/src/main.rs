@@ -495,6 +495,20 @@ async fn handle_client(
                         tracing::debug!("client requested IDR");
                         force_idr.raise();
                     }
+                    Ok(ControlMessage::SetCursorMode { mode }) => {
+                        // Host-side state is advisory: dispatch on
+                        // whichever input variant arrives. Log the
+                        // transition + echo the ack so the client
+                        // knows the host saw it.
+                        tracing::info!(?mode, "client switched cursor mode");
+                        let echo_conn = conn.clone();
+                        let ack = ControlMessage::SetCursorMode { mode };
+                        tokio::spawn(async move {
+                            if let Err(e) = echo_conn.send_control(&ack).await {
+                                tracing::debug!(error = ?e, "SetCursorMode ack send failed");
+                            }
+                        });
+                    }
                     Ok(ControlMessage::RequestRecovery {
                         last_known_good_frame_id,
                     }) => {

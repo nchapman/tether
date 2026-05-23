@@ -3393,6 +3393,7 @@ dependencies = [
 name = "tether-gpuconvert"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "ash",
  "core-foundation 0.10.1",
  "objc2 0.6.4",

@@ -48,6 +48,71 @@ use tether_codec::macos_interop::{
 use tether_codec::IOSurfaceFrame;
 use tether_scaler::{ColorSpace, Pipelines, Scaler, ScalerError};
 
+/// Construct a wgpu Metal device + queue suitable for driving the
+/// [`Nv12IOSurfaceBridge`]. Opts into
+/// `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` (mandatory for the R8 /
+/// Rg8 plane pipelines) and also `TEXTURE_FORMAT_16BIT_NORM` when the
+/// adapter advertises it (required for the R16 / Rg16 plane pipelines
+/// the bridge needs for HEVC Main10 sessions).
+///
+/// Single source of truth for the device-features contract: the host
+/// binary calls this at session start; the iosurface_test hardware
+/// suite calls it for parity, so the production and test code paths
+/// can't drift. A future change to the bridge's feature requirements
+/// updates one function and both sides pick it up.
+///
+/// Fails with `anyhow::Error` if no adapter is present or the
+/// adapter doesn't advertise the mandatory format-features set. The
+/// 16-bit feature is best-effort — its absence is logged but doesn't
+/// fail construction; the bridge will then refuse 10-bit sessions
+/// via [`BridgeError::TenBitNotImplemented`] when those come up.
+pub async fn build_bridge_device(
+) -> anyhow::Result<(wgpu::Device, wgpu::Queue, BridgeDeviceCapabilities)> {
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("no wgpu adapter for macOS NV12 IOSurface bridge"))?;
+    let features = adapter.features();
+    if !features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+        anyhow::bail!(
+            "wgpu adapter does not advertise TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES \
+             (required for R8Unorm / Rg8Unorm storage); NV12 IOSurface bridge cannot \
+             initialise. Adapter features = {features:?}"
+        );
+    }
+    let has_16bit = features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+    let mut required = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+    if has_16bit {
+        required |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+    }
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("tether nv12 iosurface bridge"),
+            required_features: required,
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        })
+        .await?;
+    Ok((device, queue, BridgeDeviceCapabilities { supports_10bit: has_16bit }))
+}
+
+/// Capability summary returned alongside the wgpu device by
+/// [`build_bridge_device`]. Callers use `supports_10bit` to decide
+/// whether to advertise 10-bit profiles up the stack or fall back
+/// to 8-bit at probe / negotiation time.
+#[derive(Debug, Clone, Copy)]
+pub struct BridgeDeviceCapabilities {
+    pub supports_10bit: bool,
+}
+
 /// Default pool depth used by [`Nv12IOSurfaceBridge::new`]. Sized for
 /// VideoToolbox's typical in-flight count
 /// (`kVTCompressionPropertyKey_MaxFrameDelayCount` ≈ 3 in low-latency

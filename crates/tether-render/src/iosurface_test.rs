@@ -924,55 +924,31 @@ fn run_host_scaler_roundtrip_with_input(
     dst_dims: (u32, u32),
     input_bgra: &[u8],
 ) -> Option<Vec<u8>> {
-    use tether_gpuconvert::nv12_iosurface::Nv12IOSurfaceBridge;
+    use tether_gpuconvert::nv12_iosurface::{build_bridge_device, Nv12IOSurfaceBridge};
 
     let _ = tracing_subscriber::fmt::try_init();
 
-    // The renderer device opt-ins (16BIT_NORM for 10-bit) cover
-    // *renderer* texture allocation. The bridge additionally needs
-    // TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES for its R8/Rg8 storage.
-    // We build one device that satisfies *both* sets so the imported
-    // source-IOSurface textures (renderer-side), the bridge's scaler
-    // pipelines, and the rendered destination all live on one Metal
-    // device — same constraint the production host pipeline lives
-    // under.
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-    }))
-    .ok()?;
-    let have = adapter.features();
-    if !have.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+    // Build the wgpu Metal device through the production helper —
+    // same function the host binary's `MacosGpuState::new` calls.
+    // This pins the test's device feature set to the host's, so a
+    // future change to the bridge's feature requirements catches
+    // here too. The earlier "tests pass but the host crashes"
+    // failure mode (host opted into fewer features than the test
+    // configured) cannot recur.
+    let (device, queue, caps) = match pollster::block_on(build_bridge_device()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SKIPPED: build_bridge_device failed: {e}");
+            return None;
+        }
+    };
+    if profile.bit_depth == 10 && !caps.supports_10bit {
         eprintln!(
-            "SKIPPED: adapter does not advertise \
-             TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES (host bridge requirement) — \
-             features = {have:?}"
+            "SKIPPED: 10-bit profile needs TEXTURE_FORMAT_16BIT_NORM and the \
+             adapter does not advertise it"
         );
         return None;
     }
-    let mut required = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-    if profile.bit_depth == 10 {
-        if !have.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
-            eprintln!(
-                "SKIPPED: 10-bit profile needs TEXTURE_FORMAT_16BIT_NORM and adapter \
-                 does not advertise it"
-            );
-            return None;
-        }
-        required |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
-    }
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("tether-render iosurface host-scaler roundtrip test"),
-        required_features: required,
-        required_limits: wgpu::Limits::default(),
-        memory_hints: wgpu::MemoryHints::Performance,
-        trace: wgpu::Trace::Off,
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-    }))
-    .ok()?;
     eprintln!(
         "[{profile:?}] host-scaler roundtrip {}x{} -> {}x{}",
         src_dims.0, src_dims.1, dst_dims.0, dst_dims.1
@@ -1439,32 +1415,15 @@ fn iosurface_host_scaler_sustained_rate() {
     let src_dims = (640u32, 480u32);
     let dst_dims = (320u32, 240u32);
 
-    let instance = wgpu::Instance::default();
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-    })) else {
-        eprintln!("SKIPPED: no wgpu adapter");
-        return;
+    let (device, queue, _caps) = match pollster::block_on(
+        tether_gpuconvert::nv12_iosurface::build_bridge_device(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SKIPPED: build_bridge_device failed: {e}");
+            return;
+        }
     };
-    if !adapter
-        .features()
-        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
-    {
-        eprintln!("SKIPPED: adapter lacks TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES");
-        return;
-    }
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("tether-render sustained-rate host-scaler test"),
-        required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-        required_limits: wgpu::Limits::default(),
-        memory_hints: wgpu::MemoryHints::Performance,
-        trace: wgpu::Trace::Off,
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-    }))
-    .expect("request_device");
 
     // Build one IOSurface to use as the source for every iteration —
     // a real session would refresh src per frame, but the test only
@@ -1549,41 +1508,16 @@ fn iosurface_host_scaler_sustained_rate() {
 #[cfg(target_os = "macos")]
 fn iosurface_host_scaler_10bit_construction() {
     use tether_codec::macos_interop::{X420_FOURCC, XF20_FOURCC};
-    use tether_gpuconvert::nv12_iosurface::{BridgeError, Nv12IOSurfaceBridge};
+    use tether_gpuconvert::nv12_iosurface::{build_bridge_device, BridgeError, Nv12IOSurfaceBridge};
 
-    let instance = wgpu::Instance::default();
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-    })) else {
-        eprintln!("SKIPPED: no wgpu adapter");
-        return;
+    let (device, queue, caps) = match pollster::block_on(build_bridge_device()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SKIPPED: build_bridge_device failed: {e}");
+            return;
+        }
     };
-    if !adapter
-        .features()
-        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
-    {
-        eprintln!("SKIPPED: adapter lacks TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES");
-        return;
-    }
-    let has_16bit = adapter
-        .features()
-        .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
-    let mut required = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-    if has_16bit {
-        required |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
-    }
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("tether-render 10-bit construction test"),
-        required_features: required,
-        required_limits: wgpu::Limits::default(),
-        memory_hints: wgpu::MemoryHints::Performance,
-        trace: wgpu::Trace::Off,
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-    }))
-    .expect("request_device");
+    let has_16bit = caps.supports_10bit;
 
     for &fcc in &[X420_FOURCC, XF20_FOURCC] {
         let result = Nv12IOSurfaceBridge::new(

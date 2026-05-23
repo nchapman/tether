@@ -1386,31 +1386,16 @@ impl MacosGpuState {
     /// already being valid (or the host has already exited via
     /// `Goodbye(InternalError)` at slot construction).
     fn new() -> anyhow::Result<Self> {
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .map_err(|_| anyhow::anyhow!("no wgpu adapter for macOS NV12 IOSurface bridge"))?;
-        let features = adapter.features();
-        if !features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
-            anyhow::bail!(
-                "wgpu adapter does not advertise TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES \
-                 (required for R8Unorm / Rg8Unorm storage); macOS NV12 IOSurface bridge \
-                 cannot initialise. Adapter features = {features:?}"
-            );
-        }
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("tether-host nv12 iosurface bridge"),
-                required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            }))?;
+        // Delegate to the shared helper in tether-gpuconvert so the
+        // device-features contract has exactly one source of truth.
+        // The iosurface_test hardware suite uses the same helper, so
+        // production and test paths can't drift.
+        let (device, queue, caps) =
+            pollster::block_on(tether_gpuconvert::nv12_iosurface::build_bridge_device())?;
+        tracing::info!(
+            supports_10bit = caps.supports_10bit,
+            "macOS NV12 IOSurface bridge wgpu device built"
+        );
         Ok(Self { device, queue })
     }
 

@@ -51,6 +51,10 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
 ] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef"] }
 core-foundation = "0.10"
+# `build_bridge_device` returns anyhow::Error so callers (the host
+# binary and the iosurface_test hardware suite) can wrap setup
+# failures without inventing a bridge-specific error type.
+anyhow = { workspace = true }
 
 [dev-dependencies]
 # Test-only: the scaler-to-encoder round-trip test runs `tether-scaler`

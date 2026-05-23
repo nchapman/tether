@@ -24,7 +24,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use std::sync::atomic::AtomicU32;
+
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
 use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::prelude::{
@@ -36,8 +38,8 @@ use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 use tether_protocol::MonoNanos;
 
 use crate::{
-    damage::NativeDamage, CaptureError, CapturedFrame, CapturedIOSurface, GpuCapturedFrame,
-    GpuCapturedGuard, GpuCapturedSource, Result,
+    damage::NativeDamage, CaptureError, CaptureHandle, CapturedFrame, CapturedIOSurface,
+    GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, Result,
 };
 
 /// Channel depth matches the Linux path's `CAPTURE_CHANNEL_DEPTH` — small,
@@ -66,7 +68,7 @@ const CAPTURE_FPS: u32 = 60;
 /// Runs [`probe_capture_pixel_formats`] first and logs the result, so
 /// every host startup leaves an empirical "what could this Mac do?"
 /// alongside "what are we asking it for?" record.
-pub async fn start(pixel_format: PixelFormat) -> Result<Receiver<CapturedFrame>> {
+pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
     // The capability probe shares the SCK TCC prompt with the real
     // session — first attempt to start a stream triggers ScreenRecording
     // permission once per process. Whether the prompt fires from a
@@ -118,7 +120,14 @@ pub async fn start(pixel_format: PixelFormat) -> Result<Receiver<CapturedFrame>>
     // observes for live frames; the `Stop` handle lives inside the
     // thread itself until the channel disconnects.
     let _ = stop;
-    Ok(rx)
+    // FPS atomic surfaced for the ABR controller. SCK exposes
+    // `SCStreamConfiguration.minimumFrameInterval` as a runtime
+    // setter, but plumbing the live update from this atomic to the
+    // running SCStream lands per-backend; until then writes are
+    // observable via `CaptureHandle::target_fps` but don't change
+    // the actual SCK cadence — see `CaptureHandle` docs.
+    let target_fps = Arc::new(AtomicU32::new(CAPTURE_FPS));
+    Ok(CaptureHandle::from_parts(rx, target_fps))
 }
 
 /// Drive the SCStream lifecycle on a dedicated thread.

@@ -364,7 +364,16 @@ async fn handle_client(
     // portal handshake awaits a user permission dialog); test pattern is
     // sync. Both end up as a `Receiver<CapturedFrame>` so the send loop
     // is identical.
-    let frames = pick_capture_source(use_test_pattern, chosen_profile).await?;
+    // Destructure the capture handle: `frames` is what the send loop
+    // pulls from; `_capture_fps_ctrl` is what the ABR / quality-tier
+    // controller will write to when it wants to throttle capture FPS.
+    // Retained here so the Arc stays alive past the receiver split;
+    // the leading underscore silences the unused-variable warning
+    // without losing grep-ability. Backend honouring of the FPS knob
+    // is per-backend — see `tether_capture::CaptureHandle` docs.
+    let capture_handle = pick_capture_source(use_test_pattern, chosen_profile).await?;
+    let _capture_fps_ctrl = capture_handle.fps_handle();
+    let frames = capture_handle.into_rx();
 
     // Force-IDR signal + stream-readiness gate were created by
     // `HostSession::accept` and destructured at the top of this fn.
@@ -2432,7 +2441,7 @@ fn parse_args() -> anyhow::Result<(SocketAddr, bool)> {
 async fn pick_capture_source(
     force_test_pattern: bool,
     chosen_profile: VideoProfile,
-) -> anyhow::Result<Receiver<CapturedFrame>> {
+) -> anyhow::Result<tether_capture::CaptureHandle> {
     if force_test_pattern {
         info!(
             width = TEST_PATTERN_WIDTH,
@@ -2450,7 +2459,7 @@ async fn pick_capture_source(
 }
 
 #[cfg(target_os = "linux")]
-async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<Receiver<CapturedFrame>> {
+async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
     info!("capture source: linux (PipeWire + xdg-desktop-portal)");
     // Query which DRM modifiers our wgpu/Vulkan importer can consume for
     // the BGRA-family capture formats PipeWire emits. PipeWire then
@@ -2487,7 +2496,7 @@ async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<Receiver<
 }
 
 #[cfg(target_os = "macos")]
-async fn real_capture(chosen_profile: VideoProfile) -> anyhow::Result<Receiver<CapturedFrame>> {
+async fn real_capture(chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
     // Pick the SCK pixel format that matches the negotiated encoder
     // profile. The encoder's `submit_iosurface` cross-checks the
     // delivered IOSurface fourcc against this; a mismatch would refuse
@@ -2511,7 +2520,7 @@ async fn real_capture(chosen_profile: VideoProfile) -> anyhow::Result<Receiver<C
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<Receiver<CapturedFrame>> {
+async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
     warn!("no real capture backend on this platform yet; falling back to test-pattern");
     Ok(tether_capture::test_pattern::start(
         TEST_PATTERN_WIDTH,

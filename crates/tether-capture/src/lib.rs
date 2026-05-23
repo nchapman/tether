@@ -24,6 +24,86 @@ pub mod test_support;
 pub use cursor::{CursorEvent, CursorShapeEvent, CursorSource, PlaceholderCursorSource};
 pub use damage::{DamageHint, DamageSignal, HashDamage, NativeDamage};
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+use crossbeam_channel::Receiver;
+
+/// Capture-source handle returned by every backend's `start()`. Bundles
+/// the [`CapturedFrame`] receiver with a runtime-mutable target-FPS
+/// atomic so the ABR / quality-tier controller can throttle capture
+/// without rebuilding the backend.
+///
+/// **Per-backend honouring is uneven.** [`test_pattern::start`] reads
+/// the atomic on every produced frame and adjusts its sleep period
+/// immediately. The Linux PipeWire and macOS ScreenCaptureKit backends
+/// currently *accept* the atomic so the seam is end-to-end live, but
+/// renegotiating the stream's actual frame interval requires backend-
+/// specific work (PipeWire format renegotiation; SCK
+/// `SCStreamConfiguration.minimumFrameInterval` update) that lands
+/// per backend. Until then, `set_target_fps` updates the atomic
+/// silently — readers see the new value but the produced cadence
+/// does not change. The honouring matrix lands per-backend; check
+/// the backend's module docs before assuming a write took effect.
+pub struct CaptureHandle {
+    /// Frame receiver. Take ownership via [`Self::into_rx`] or borrow
+    /// via [`Self::rx`].
+    rx: Receiver<CapturedFrame>,
+    /// Target FPS the backend should aim for. `Arc` so the ABR
+    /// controller can hold a clone and update it from a different
+    /// thread.
+    target_fps: Arc<AtomicU32>,
+}
+
+impl CaptureHandle {
+    /// Build a handle owning the receiver and seeded at `initial_fps`.
+    /// Backends construct the atomic up front (so they can also read
+    /// it from their producer thread) and pass it through.
+    #[must_use]
+    pub fn from_parts(rx: Receiver<CapturedFrame>, target_fps: Arc<AtomicU32>) -> Self {
+        Self { rx, target_fps }
+    }
+
+    /// Borrow the frame receiver — for callers that need to interleave
+    /// receiving with shutdown checks.
+    #[must_use]
+    pub fn rx(&self) -> &Receiver<CapturedFrame> {
+        &self.rx
+    }
+
+    /// Consume the handle, returning the receiver. The FPS atomic is
+    /// dropped from the handle's side; clone via [`Self::fps_handle`]
+    /// before calling this if the ABR controller needs to keep
+    /// writing.
+    #[must_use]
+    pub fn into_rx(self) -> Receiver<CapturedFrame> {
+        self.rx
+    }
+
+    /// Current target FPS as observed by the backend's producer
+    /// thread. Reads are `Relaxed` — the value is advisory, not a
+    /// synchronization primitive.
+    #[must_use]
+    pub fn target_fps(&self) -> u32 {
+        self.target_fps.load(Ordering::Relaxed)
+    }
+
+    /// Update the target FPS. Backends pick up the new value on their
+    /// next loop iteration (test_pattern) or via renegotiation
+    /// (real backends — currently unimplemented; see struct docs).
+    /// Values < 1 are clamped to 1.
+    pub fn set_target_fps(&self, fps: u32) {
+        self.target_fps.store(fps.max(1), Ordering::Relaxed);
+    }
+
+    /// Cheap clone of the atomic for the ABR controller to retain
+    /// across the `into_rx` boundary.
+    #[must_use]
+    pub fn fps_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.target_fps)
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 

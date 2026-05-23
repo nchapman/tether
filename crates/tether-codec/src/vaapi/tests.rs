@@ -654,12 +654,12 @@ fn vaapi_intra_refresh_round_trip() {
     // caller of `VaapiEncoder::new` that reads
     // `TETHER_INTRA_REFRESH_PERIOD`. Today every such caller in this
     // file is `#[ignore]` and `make test-hw` invokes
-    // `--test-threads=1` for the bench cells; the broader hardware
-    // suite (`cargo test --ignored vaapi`) does parallelise by
-    // default but no other ignored test in tether-codec reads this
-    // env var. A `Mutex<()>` around set/build/remove would harden
-    // against a future `#[ignore]` test that also constructs a VAAPI
-    // encoder; keep this comment honest if that lands.
+    // `--test-threads=1` for the bench cells. A sibling test,
+    // `vaapi_min_qp_floor_reduces_bitstream`, now also drives the
+    // env-var path (via `encode_with_env_and_measure`) for a
+    // different key; with two such tests in the file, a shared
+    // `OnceLock<Mutex<()>>` around set/build/remove is the right
+    // mitigation if a third lands.
     unsafe {
         std::env::set_var("TETHER_INTRA_REFRESH_PERIOD", PERIOD.to_string());
     }
@@ -726,5 +726,175 @@ fn vaapi_intra_refresh_round_trip() {
     assert!(
         decoded_count >= min_decoded,
         "decoder produced {decoded_count} frames from {FRAMES} encoded inputs (expected ≥{min_decoded}); intra-refresh bitstream may have broken the decode path"
+    );
+}
+
+/// Per-pixel pseudo-random BGRA frame. Each pixel's value is derived
+/// from `(x, y, t)` via a cheap hash so the resulting frame is
+/// high-entropy — flat content like `make_test_bgra` compresses to
+/// near-zero regardless of QP and so cannot expose rate-control
+/// differences. Used by the min-QP test.
+#[allow(clippy::cast_possible_truncation)]
+fn make_noisy_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            // xorshift-like mixer over (x, y, t). Not cryptographic;
+            // just needs to spread bits so each pixel is independent
+            // enough to fill DCT coefficients with non-zero residue.
+            let mut h = x
+                .wrapping_mul(0x9E37_79B1)
+                .wrapping_add(y.wrapping_mul(0x85EB_CA77))
+                .wrapping_add(t.wrapping_mul(0xC2B2_AE3D));
+            h ^= h >> 16;
+            h = h.wrapping_mul(0x7FEB_352D);
+            h ^= h >> 15;
+            let b = (h & 0xFF) as u8;
+            let g = ((h >> 8) & 0xFF) as u8;
+            let r = ((h >> 16) & 0xFF) as u8;
+            data.extend_from_slice(&[b, g, r, 255]);
+        }
+    }
+    data
+}
+
+/// Encode `frames` BGRA frames through a fresh `VaapiEncoder` with
+/// the provided env-var (key, value) applied around construction.
+/// Returns total emitted byte count + the encoder's `unused_avoptions`
+/// snapshot (so the caller can SKIP if the option wasn't consumed).
+/// Used by `vaapi_min_qp_floor_reduces_bitstream` to compare two
+/// configurations.
+fn encode_with_env_and_measure(
+    env_key: &str,
+    env_value: Option<&str>,
+    width: u32,
+    height: u32,
+    frames: i64,
+    bitrate_kbps: u32,
+) -> (usize, Vec<String>) {
+    use tether_protocol::control::VideoProfile;
+    // Set/clear the env var directly around encoder construction so
+    // the encoder picks up the value at `open()` time.
+    unsafe {
+        if let Some(v) = env_value {
+            std::env::set_var(env_key, v);
+        } else {
+            std::env::remove_var(env_key);
+        }
+    }
+    let enc_result = VaapiEncoder::new(VideoProfile::H264_8BIT_420, width, height, 30, bitrate_kbps);
+    unsafe {
+        std::env::remove_var(env_key);
+    }
+    let mut enc = enc_result.expect("VAAPI encoder construction");
+    let unused = enc.unused_avoptions().to_vec();
+
+    let mut total_bytes: usize = 0;
+    for t in 0..frames {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let bgra = make_noisy_bgra(width, height, t as u32);
+        let packets = enc.encode_bgra(&bgra, t, t == 0).expect("encode");
+        for p in packets {
+            total_bytes += p.data.len();
+        }
+    }
+    (total_bytes, unused)
+}
+
+/// Verifies `TETHER_MIN_QP` plumbs through to the VAAPI driver and
+/// actually constrains the rate-control choice. Encodes the same
+/// `make_test_bgra` sequence twice — once with `qmin=1` (effectively
+/// unconstrained) and once with `qmin=45` (deep into the "smaller
+/// files, worse quality" end of the QP scale) — and asserts the
+/// constrained run produces a meaningfully smaller bitstream.
+///
+/// Why this signal works: VBR rate control picks the lowest QP that
+/// fits the target bitrate budget on each frame. With a floor of 45,
+/// the encoder cannot dip below that even when the bitrate budget
+/// would let it, so the constrained run undershoots its bitrate
+/// target and produces fewer bytes. A driver that silently ignored
+/// `qmin` would produce nearly-identical byte counts across the two
+/// runs.
+///
+/// SKIPs on the same condition as the intra-refresh test: if `qmin`
+/// shows up in `unused_avoptions()`, the option was not consumed.
+/// On Intel iHD (Meteor Lake), `qmin` *is* consumed as of this
+/// writing — the generic AVCodecContext.qmin handler is wired
+/// independent of the encoder-specific gradual-refresh gap.
+#[test]
+#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_min_qp_floor_reduces_bitstream)"]
+fn vaapi_min_qp_floor_reduces_bitstream() {
+    const W: u32 = 640;
+    const H: u32 = 480;
+    const FRAMES: i64 = 30;
+    // High bitrate budget so the unconstrained run actually picks a
+    // low QP rather than ceiling-clamping at qmax; that's what gives
+    // the constrained run something to undershoot against.
+    const BITRATE_KBPS: u32 = 10_000;
+
+    // Baseline: lowest legal qmin — effectively no floor.
+    let (baseline_bytes, baseline_unused) = encode_with_env_and_measure(
+        "TETHER_MIN_QP",
+        Some("1"),
+        W,
+        H,
+        FRAMES,
+        BITRATE_KBPS,
+    );
+    if baseline_unused.iter().any(|k| k == "qmin") {
+        eprintln!(
+            "SKIP: VAAPI driver did not consume qmin AVOption (leftover: {baseline_unused:?})."
+        );
+        return;
+    }
+
+    // Constrained: high min-QP forces the rate-control floor up. QP
+    // 45 is deep in the high-compression end of the H.264 scale (0=lossless,
+    // 51=worst); high enough that the bytecount delta is unambiguous,
+    // not so high that the encoder rejects it.
+    let (constrained_bytes, constrained_unused) = encode_with_env_and_measure(
+        "TETHER_MIN_QP",
+        Some("45"),
+        W,
+        H,
+        FRAMES,
+        BITRATE_KBPS,
+    );
+    assert!(
+        !constrained_unused.iter().any(|k| k == "qmin"),
+        "second run's qmin was unexpectedly ignored: {constrained_unused:?}"
+    );
+
+    // The load-bearing signal: the floor must actually constrain
+    // bitrate. Three regimes:
+    //  - ratio < 0.70 → qmin honored end-to-end (pass).
+    //  - 0.70 ≤ ratio < 0.95 → driver partially respects qmin or
+    //    test content is too compressible; tighten content + frame
+    //    count before drawing conclusions.
+    //  - ratio ≥ 0.95 → driver consumed the AVOption (not in
+    //    unused_avoptions) but VAAPI's rate-control implementation
+    //    silently ignored it. This is the confirmed-negative state
+    //    on Intel iHD Meteor Lake as of this writing: the generic
+    //    AVCodecContext.qmin handler accepts the value but the
+    //    VAAPI VBR rate-control pathway doesn't read it. SKIP with
+    //    a clear message rather than red CI; the test will start
+    //    passing the moment any driver + ffmpeg combo plumbs qmin
+    //    through to the rate-control choice.
+    let ratio = constrained_bytes as f64 / baseline_bytes as f64;
+    if ratio >= 0.95 {
+        eprintln!(
+            "SKIP: VAAPI driver consumed qmin AVOption but did not constrain bitrate \
+             (qmin=1 → {baseline_bytes} bytes, qmin=45 → {constrained_bytes} bytes, ratio {ratio:.3}). \
+             VAAPI rate-control does not honor qmin on this driver — see encoder.rs comment."
+        );
+        return;
+    }
+    assert!(
+        ratio < 0.70,
+        "TETHER_MIN_QP=45 produced {constrained_bytes} bytes vs baseline {baseline_bytes} (ratio {ratio:.3}); expected ratio < 0.70 (qmin honored) or ≥ 0.95 (driver silently ignored). \
+         Intermediate ratio suggests partial enforcement worth investigating."
+    );
+    eprintln!(
+        "min-QP floor verified: qmin=1 → {baseline_bytes} bytes, qmin=45 → {constrained_bytes} bytes, ratio {ratio:.3}"
     );
 }

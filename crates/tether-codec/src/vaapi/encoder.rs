@@ -280,6 +280,17 @@ impl VaapiEncoder {
         // where VBR alone over-compresses. Surfaced via env var so a
         // hardware test session can validate before we bake it into
         // the default config; production stays unset until verified.
+        //
+        // **Observed driver gap.** On Intel iHD (Meteor Lake), the
+        // `qmin` AVOption is consumed by the generic AVCodecContext
+        // handler (so it does NOT appear in `unused_avoptions()`),
+        // but the VAAPI VBR rate-control pathway silently ignores
+        // it — encoding the same content with qmin=1 vs qmin=45
+        // produces byte-identical bitstreams. The hardware test
+        // `vaapi_min_qp_floor_reduces_bitstream` SKIPs on the
+        // byte-count-ratio signal and will start asserting the floor
+        // the moment any driver + ffmpeg combo plumbs qmin through
+        // to the rate-control choice.
         let default_min_qp_c = match kind {
             CodecKind::H264 => c"19",
             CodecKind::Hevc => c"23",

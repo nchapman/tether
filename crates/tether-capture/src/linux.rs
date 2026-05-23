@@ -20,7 +20,10 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
     PersistMode,
 };
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
+
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use enumflags2::BitFlags;
 use pipewire as pw;
 use pw::properties::properties;
@@ -28,9 +31,17 @@ use pw::spa;
 use tether_protocol::MonoNanos;
 
 use crate::{
-    damage::NativeDamage, CaptureError, CapturedDmaBuf, CapturedFrame, CpuFrame, GpuCapturedFrame,
-    GpuCapturedGuard, GpuCapturedSource, PixelFormat, Result,
+    damage::NativeDamage, CaptureError, CaptureHandle, CapturedDmaBuf, CapturedFrame, CpuFrame,
+    GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, PixelFormat, Result,
 };
+
+/// Initial target FPS the Linux backend reports. Real cadence is
+/// dictated by the PipeWire-negotiated framerate; the atomic is
+/// surfaced so the ABR controller can request a renegotiation in the
+/// future. Picked at 60 to match the typical compositor default; ABR
+/// writes are accepted but currently log-only (see `CaptureHandle`
+/// docs).
+const LINUX_INITIAL_TARGET_FPS: u32 = 60;
 
 // Single-slot hand-off: combined with the drain loop in the `process`
 // callback, this keeps the freshest frame at every stage. A deeper
@@ -50,7 +61,7 @@ const CAPTURE_CHANNEL_DEPTH: usize = 1;
 /// **Side effect:** triggers an xdg-desktop-portal permission dialog on
 /// the user's desktop session. The call blocks (asynchronously) until the
 /// user grants or denies access.
-pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<Receiver<CapturedFrame>> {
+pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
     let (node_id, fd) = open_portal().await?;
     tracing::info!(
         node_id,
@@ -59,6 +70,12 @@ pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<Receiver<CapturedFrame>
     );
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
+    let target_fps = Arc::new(AtomicU32::new(LINUX_INITIAL_TARGET_FPS));
+    // PipeWire-side FPS renegotiation is not yet wired; stash the
+    // atomic on the handle so callers (the ABR controller) can
+    // observe / set it, and document the no-op in `CaptureHandle`'s
+    // crate-level doc. Threading the atomic into `run_pipewire`
+    // proper lands when the format-renegotiation code does.
     std::thread::Builder::new()
         .name("tether-capture-pipewire".into())
         .spawn(move || {
@@ -66,7 +83,7 @@ pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<Receiver<CapturedFrame>
                 tracing::error!(error = %e, "pipewire capture thread failed");
             }
         })?;
-    Ok(rx)
+    Ok(CaptureHandle::from_parts(rx, target_fps))
 }
 
 async fn open_portal() -> Result<(u32, OwnedFd)> {

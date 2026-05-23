@@ -250,6 +250,15 @@ impl Decoder for VideoToolboxDecoder {
     fn name(&self) -> &'static str {
         vt_decoder_name(self.kind)
     }
+
+    fn flush(&mut self) -> Result<()> {
+        // Same contract as VAAPI: drop reorder queue + pending
+        // output, keep the codec context alive. The VT
+        // CVPixelBufferPool stays allocated; refs to its surfaces
+        // are released by the flush.
+        self.decoder.flush_buffers();
+        Ok(())
+    }
 }
 
 /// FFmpeg `AVCodecID` for the given codec kind. Errors for codecs we

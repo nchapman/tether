@@ -21,5 +21,6 @@ pub mod run;
 pub mod test_support;
 
 pub use run::{
-    run_thread, run_thread_with_init, DecodeCompletion, DecodeJob, Worker, IDR_RATE_LIMIT,
+    run_thread, run_thread_with_init, DecodeCompletion, DecodeJob, RecoveryAction, Worker,
+    IDR_RATE_LIMIT, NO_OUTPUT_WATCHDOG, REBUILD_BUDGET, TRANSIENT_FAILURE_THRESHOLD,
 };

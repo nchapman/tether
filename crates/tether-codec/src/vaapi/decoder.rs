@@ -295,6 +295,17 @@ impl Decoder for VaapiDecoder {
     fn name(&self) -> &'static str {
         vaapi_decoder_name(self.kind)
     }
+
+    fn flush(&mut self) -> Result<()> {
+        // avcodec_flush_buffers drops the reorder queue, releases
+        // pending output, and resets internal state without tearing
+        // the codec context down — the decoder is ready to accept
+        // a fresh IDR + subsequent packets after this call. VAAPI's
+        // surface pool stays allocated; only references are
+        // released. Cheap (~µs) and idempotent.
+        self.decoder.flush_buffers();
+        Ok(())
+    }
 }
 
 /// FFmpeg `AVCodecID` for the given codec kind. Errors for codecs we

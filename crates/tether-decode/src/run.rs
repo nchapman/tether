@@ -26,6 +26,31 @@ use tracing::{error, info, warn};
 /// hard-coding 500.
 pub const IDR_RATE_LIMIT: Duration = Duration::from_millis(500);
 
+/// Consecutive transient decode failures the worker tolerates with
+/// `decoder.flush()` between attempts before escalating to a full
+/// rebuild. Three matches Moonlight's classification: a single
+/// hiccup, a quick second, and one last benefit-of-the-doubt before
+/// declaring the codec context wedged. The loop is responsible for
+/// honouring `RecoveryAction::Rebuild` (calling `build_decoder` +
+/// `replace_decoder`) and for tracking the per-session rebuild
+/// budget.
+pub const TRANSIENT_FAILURE_THRESHOLD: u32 = 3;
+
+/// Hard cap on full decoder rebuilds in one session. Beyond this we
+/// classify the failure as fatal — driver crash or persistent
+/// bitstream corruption that no amount of restart can paper over —
+/// and the thread exits cleanly via the Goodbye path rather than
+/// looping forever.
+pub const REBUILD_BUDGET: u32 = 10;
+
+/// No-output watchdog window. If submits keep arriving but no
+/// frame has been produced for this long, the decoder is wedged
+/// — typical cause is HEVC RPS reconstruction silently skipping
+/// every NALU because a key reference was lost on the wire. The
+/// worker requests a flush + IDR on the first window expiry and
+/// escalates to a rebuild on the second.
+pub const NO_OUTPUT_WATCHDOG: Duration = Duration::from_millis(1500);
+
 /// One frame's worth of work handed from the recv (tokio) task to the
 /// decode (std::thread) worker. Keeping `host_in_client_clock` here
 /// (already translated through clock_sync on the recv side) lets the
@@ -48,6 +73,25 @@ pub struct DecodeCompletion {
     pub soft_failure: bool,
     pub render_drops: u32,
     pub idr_request_fired: bool,
+    /// Recovery escalation the run-thread should take after this job.
+    /// `None` means "carry on"; `Some(Rebuild)` instructs the loop to
+    /// tear the decoder down and call `build_decoder` again (subject
+    /// to the rebuild budget).
+    pub recovery: Option<RecoveryAction>,
+}
+
+/// What the worker is asking the run-thread to do beyond the
+/// per-job rate-limited `request_idr` callback. Carried back inside
+/// [`DecodeCompletion::recovery`] so the loop can branch on it
+/// without inspecting the worker's private counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// Consecutive transient failures crossed [`TRANSIENT_FAILURE_THRESHOLD`].
+    /// `Worker::flush()` did not unwedge the codec context; the loop
+    /// should call `build_decoder(profile)` and hand the new
+    /// instance back via [`Worker::replace_decoder`]. Subject to
+    /// [`REBUILD_BUDGET`].
+    Rebuild,
 }
 
 /// Per-thread mutable state plus its injected dependencies.
@@ -70,6 +114,18 @@ pub struct Worker {
     request_idr: Arc<dyn Fn() + Send + Sync + 'static>,
     warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static>,
     last_idr_request: Option<MonoNanos>,
+    /// Consecutive failures (hard `decode_err` OR soft warning bump)
+    /// since the last successfully-rendered frame. Resets to 0 on
+    /// any job that produces ≥1 frame and triggers no warning bump.
+    consecutive_failures: u32,
+    /// Wall-clock instant of the most recent successful render-side
+    /// frame. Drives the no-output watchdog; `None` until the very
+    /// first frame lands.
+    last_successful_decode: Option<MonoNanos>,
+    /// Has the watchdog already fired in the current "no output"
+    /// window? Prevents a stuck decoder from triggering a flush +
+    /// IDR on every job — one shot per window, then escalate.
+    watchdog_armed: bool,
 }
 
 impl Worker {
@@ -89,7 +145,23 @@ impl Worker {
             request_idr,
             warnings,
             last_idr_request: None,
+            consecutive_failures: 0,
+            last_successful_decode: None,
+            watchdog_armed: false,
         }
+    }
+
+    /// Swap in a freshly-built decoder after a recovery rebuild.
+    /// Resets failure counters so the new instance starts with a
+    /// clean slate.
+    pub fn replace_decoder(&mut self, new_decoder: Box<dyn tether_codec::Decoder>) {
+        self.decoder = new_decoder;
+        self.consecutive_failures = 0;
+        self.watchdog_armed = false;
+        // `last_successful_decode` stays as-is: the watchdog clock
+        // shouldn't reset just because we rebuilt; if the rebuild
+        // doesn't produce a frame either, we want the *original*
+        // wedge window to escalate to fatal promptly.
     }
 
     /// Decode one job and update the rendering / IDR state.
@@ -137,6 +209,7 @@ impl Worker {
         // this is almost always 0 or 1 frames; the loop is here so a
         // mid-drain failure doesn't silently throw away good output.
         let mut render_drops: u32 = 0;
+        let produced_frame = !decoded.is_empty();
         for dec in decoded {
             let raw = match dec {
                 CodecFrame::Cpu(c) => Frame::Cpu(CpuFrame {
@@ -199,13 +272,99 @@ impl Worker {
             }
         }
 
+        // Update failure / watchdog tracking. If the decoder emitted
+        // at least one frame this packet, count it as success even
+        // when libavcodec also logged a warning during the decode
+        // (RPS reconstruction skipped one NALU but the rest of the
+        // GOP still came through). Flushing on a partially-good
+        // packet would discard the decoder's reference-frame pool
+        // and turn one imperfect frame into a guaranteed cascade
+        // of failures. The IDR request is already queued above —
+        // the next IDR will rebuild the reference set cleanly.
+        if produced_frame {
+            self.consecutive_failures = 0;
+            self.last_successful_decode = Some(now);
+            self.watchdog_armed = false;
+        } else if decode_err.is_some() || soft_failure {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            // Transient recovery: flush the codec context between
+            // failures so a wedged state (lost SPS reference, stale
+            // RPS) doesn't carry across packets. flush() is cheap
+            // and idempotent; ignore its error.
+            if let Err(e) = self.decoder.flush() {
+                tracing::warn!(error = %e, "decoder flush failed during transient recovery");
+            }
+        }
+
+        // No-output watchdog. If the most recent successful frame
+        // is older than the watchdog window AND submits keep
+        // arriving (we're in process_job, so yes), fire an extra
+        // request_idr + flush — one-shot per window — and escalate
+        // to a rebuild if the wedge persists past two windows.
+        let recovery = self.evaluate_recovery(now);
+
         DecodeCompletion {
             decode_duration_ns,
             decode_err: decode_err.is_some(),
             soft_failure,
             render_drops,
             idr_request_fired,
+            recovery,
         }
+    }
+
+    fn evaluate_recovery(&mut self, now: MonoNanos) -> Option<RecoveryAction> {
+        // Transient threshold crossed → ask the loop to rebuild.
+        if self.consecutive_failures >= TRANSIENT_FAILURE_THRESHOLD {
+            return Some(RecoveryAction::Rebuild);
+        }
+
+        // Watchdog: only meaningful once we've decoded at least one
+        // frame and have a baseline. The first IDR after connect
+        // hasn't landed yet otherwise; no-output is expected.
+        let Some(last) = self.last_successful_decode else {
+            return None;
+        };
+        let elapsed_ns = now.saturating_sub(last);
+        let window_ns = NO_OUTPUT_WATCHDOG.as_nanos() as u64;
+        if elapsed_ns < window_ns {
+            return None;
+        }
+
+        if !self.watchdog_armed {
+            // First window expiry: flush + IDR, arm the watchdog
+            // so we don't re-fire on the very next packet. The IDR
+            // rate-limit still applies; if it just fired we skip
+            // here too.
+            self.watchdog_armed = true;
+            if let Err(e) = self.decoder.flush() {
+                tracing::warn!(error = %e, "decoder flush failed during watchdog recovery");
+            }
+            let rate_limit_ns = IDR_RATE_LIMIT.as_nanos() as u64;
+            let fire = self
+                .last_idr_request
+                .is_none_or(|t| now.saturating_sub(t) > rate_limit_ns);
+            if fire {
+                (self.request_idr)();
+                self.last_idr_request = Some(now);
+            }
+            tracing::warn!(
+                elapsed_ms = elapsed_ns / 1_000_000,
+                "decoder produced no output for {NO_OUTPUT_WATCHDOG:?}; flushed and requested IDR"
+            );
+            return None;
+        }
+
+        // Watchdog already armed, still no output one window
+        // later → escalate.
+        if elapsed_ns >= window_ns.saturating_mul(2) {
+            tracing::warn!(
+                elapsed_ms = elapsed_ns / 1_000_000,
+                "decoder still produced no output after watchdog flush; requesting rebuild"
+            );
+            return Some(RecoveryAction::Rebuild);
+        }
+        None
     }
 }
 
@@ -289,13 +448,50 @@ pub fn run_thread_with_init(
             let _ = ready_tx.send(());
 
             let mut worker = Worker::new(decoder, frames, request_idr, warnings);
+            let mut rebuilds_used: u32 = 0;
             while let Ok(job) = job_rx.recv() {
                 let now = MonoNanos::now();
                 let completion = worker.process_job(job, now);
+                let recovery = completion.recovery;
                 // Send completion. If the recv loop has exited, the
                 // receiver is dropped — that's expected at session
                 // end; ignore.
                 let _ = completion_tx.send(completion);
+
+                if matches!(recovery, Some(RecoveryAction::Rebuild)) {
+                    if rebuilds_used >= REBUILD_BUDGET {
+                        error!(
+                            rebuilds_used,
+                            budget = REBUILD_BUDGET,
+                            "decoder rebuild budget exhausted; exiting decode thread"
+                        );
+                        break;
+                    }
+                    rebuilds_used = rebuilds_used.saturating_add(1);
+                    // `profile` is fixed for the session lifetime
+                    // today; any future per-session renegotiation
+                    // requires a full session restart (the
+                    // surrounding QUIC session is torn down when
+                    // the decode thread exits).
+                    match build_decoder(profile) {
+                        Ok(new) => {
+                            info!(
+                                rebuilds_used,
+                                backend = new.name(),
+                                "decoder rebuilt after persistent failure"
+                            );
+                            worker.replace_decoder(new);
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                rebuilds_used,
+                                "decoder rebuild failed; exiting decode thread"
+                            );
+                            break;
+                        }
+                    }
+                }
             }
             info!("decode thread exiting");
         })

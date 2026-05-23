@@ -354,3 +354,277 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
         .unwrap();
     joined.expect("decode thread exits on sender drop");
 }
+
+// --- Error-concealment paths (#10) ----------------------------------
+
+#[test]
+fn flush_called_after_hard_submit_error() {
+    // A single transient failure should trigger flush(); the
+    // FakeDecoder's `flush_count` proves the worker honoured the
+    // transient-recovery contract.
+    let decoder = FakeDecoder::new(vec![FakeOutcome::SubmitError]);
+    // We need to peek at flush_count after the fact. Borrow the
+    // fake through the worker via a pointer-trick: hold a raw
+    // *mut and de-ref after process_job. Simpler: build the fake,
+    // then box it; reach the box through Worker. Since the trait
+    // object hides the type, we use a `Arc<Mutex<...>>` indirection
+    // pattern by parking the count separately.
+    //
+    // Cleanest path: put a count in the FakeDecoder, then access
+    // via downcasting — but the trait isn't Any. Easier still:
+    // construct the fake on the stack, observe via interior
+    // mutability through a shared counter.
+    use std::sync::Mutex;
+    let inspect: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    // Trick: build a wrapper decoder that bumps the shared counter
+    // on flush. Avoids the downcast problem entirely.
+    struct FlushSpy {
+        inner: FakeDecoder,
+        last_seen_flushes: Arc<Mutex<Option<u32>>>,
+    }
+    impl tether_codec::Decoder for FlushSpy {
+        fn submit(&mut self, b: &[u8]) -> Result<(), CodecError> {
+            self.inner.submit(b)
+        }
+        fn next_frame(&mut self) -> Result<Option<tether_codec::Frame>, CodecError> {
+            self.inner.next_frame()
+        }
+        fn codec_kind(&self) -> tether_protocol::control::CodecKind {
+            self.inner.codec_kind()
+        }
+        fn name(&self) -> &'static str {
+            "flush-spy"
+        }
+        fn flush(&mut self) -> Result<(), CodecError> {
+            let r = self.inner.flush();
+            *self.last_seen_flushes.lock().unwrap() = Some(self.inner.flush_count);
+            r
+        }
+    }
+    let inspect_for_spy = Arc::clone(&inspect);
+    let spy = FlushSpy {
+        inner: decoder,
+        last_seen_flushes: inspect_for_spy,
+    };
+    let idr_calls = Arc::new(AtomicU32::new(0));
+    let warnings = Arc::new(AtomicU64::new(0));
+    let frames = LatestFrame::new();
+    let idr_cb = Arc::clone(&idr_calls);
+    let warnings_cb = Arc::clone(&warnings);
+    let mut worker = Worker::new(
+        Box::new(spy),
+        frames.clone(),
+        Arc::new(move || {
+            idr_cb.fetch_add(1, Ordering::Relaxed);
+        }),
+        Arc::new(move || warnings_cb.load(Ordering::Relaxed)),
+    );
+    let c = worker.process_job(job(), MonoNanos::now());
+    assert!(c.decode_err);
+    assert!(c.idr_request_fired, "hard error must fire IDR");
+    assert_eq!(
+        *inspect.lock().unwrap(),
+        Some(1),
+        "flush must be called once after a hard decode error"
+    );
+}
+
+#[test]
+fn three_consecutive_failures_request_rebuild() {
+    let decoder = FakeDecoder::new(vec![
+        FakeOutcome::SubmitError,
+        FakeOutcome::SubmitError,
+        FakeOutcome::SubmitError,
+    ]);
+    let (mut worker, _idr, _warn, _frames) = make_worker(decoder);
+    let base = MonoNanos::now();
+    let mut last = None;
+    for i in 0..3 {
+        let c = worker.process_job(job(), at(base, Duration::from_millis(10 * (i as u64 + 1))));
+        last = Some(c);
+    }
+    assert_eq!(
+        last.unwrap().recovery,
+        Some(tether_decode::RecoveryAction::Rebuild),
+        "3 transient failures must escalate to Rebuild"
+    );
+}
+
+#[test]
+fn rebuild_request_clears_after_replace_decoder() {
+    let decoder = FakeDecoder::new(vec![
+        FakeOutcome::SubmitError,
+        FakeOutcome::SubmitError,
+        FakeOutcome::SubmitError,
+    ]);
+    let (mut worker, _idr, _warn, _frames) = make_worker(decoder);
+    let base = MonoNanos::now();
+    for i in 0..3 {
+        let _ = worker.process_job(job(), at(base, Duration::from_millis(10 * (i as u64 + 1))));
+    }
+    // Swap in a fresh, healthy decoder. The next job must not
+    // re-trigger Rebuild — counter must have been reset.
+    let healthy = FakeDecoder::new(vec![FakeOutcome::Solid {
+        width: 8,
+        height: 8,
+        luma: 7,
+    }]);
+    worker.replace_decoder(Box::new(healthy));
+    let c = worker.process_job(job(), at(base, Duration::from_millis(100)));
+    assert!(
+        !c.decode_err && !c.soft_failure,
+        "post-rebuild job must succeed against the fresh decoder"
+    );
+    assert_eq!(
+        c.recovery, None,
+        "replace_decoder must reset failure counters"
+    );
+}
+
+#[test]
+fn watchdog_fires_after_no_output_window() {
+    // Land one success to set last_successful_decode. Then drive
+    // soft-failure jobs (warnings bumped) past the watchdog
+    // window — the watchdog should request an extra IDR + flush
+    // even though the soft-failure IDR rate-limit is in effect.
+    // Phased warnings closure: returns 0 for the first two reads
+    // (job 0's before/after pair → no soft failure → clean
+    // success), then strictly increasing thereafter so every
+    // subsequent job sees `after > before` and classifies as a
+    // soft failure. Use AtomicU64 to track call count.
+    let call_idx = Arc::new(AtomicU64::new(0));
+    let call_idx_cb = Arc::clone(&call_idx);
+    let phased_warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static> =
+        Arc::new(move || {
+            let n = call_idx_cb.fetch_add(1, Ordering::Relaxed);
+            if n < 2 {
+                0
+            } else {
+                n - 1
+            }
+        });
+
+    let decoder = FakeDecoder::new(vec![
+        // Job 0: solid frame → success.
+        FakeOutcome::Solid {
+            width: 4,
+            height: 4,
+            luma: 1,
+        },
+        // Jobs 1..: empty outcomes — no frames decoded.
+        FakeOutcome::Frames(vec![]),
+        FakeOutcome::Frames(vec![]),
+        FakeOutcome::Frames(vec![]),
+        FakeOutcome::Frames(vec![]),
+    ]);
+    let idr_calls = Arc::new(AtomicU32::new(0));
+    let idr_cb = Arc::clone(&idr_calls);
+    let frames = LatestFrame::new();
+    let mut worker = Worker::new(
+        Box::new(decoder),
+        frames.clone(),
+        Arc::new(move || {
+            idr_cb.fetch_add(1, Ordering::Relaxed);
+        }),
+        phased_warnings,
+    );
+
+    let base = MonoNanos::now();
+    // Job 0: success. Sets last_successful_decode = base.
+    let c0 = worker.process_job(job(), base);
+    assert!(!c0.decode_err && !c0.soft_failure, "job 0 should succeed");
+    assert!(frames.take().is_some(), "job 0 should land a frame");
+    assert_eq!(idr_calls.load(Ordering::Relaxed), 0);
+
+    // Job 1: soft failure, but inside watchdog window. The
+    // rate-limited soft-failure IDR fires (counter += 1).
+    let c1 = worker.process_job(job(), at(base, Duration::from_millis(100)));
+    assert!(c1.soft_failure, "job 1 must be soft failure");
+    assert!(c1.idr_request_fired);
+    let after_first_soft = idr_calls.load(Ordering::Relaxed);
+
+    // Job 2: soft failure, past the watchdog window. The watchdog
+    // attempts a flush + IDR — the IDR rate-limit may swallow the
+    // second IDR call, but the recovery path ran.
+    let elapsed = NO_OUTPUT_WATCHDOG + Duration::from_millis(50);
+    let _c2 = worker.process_job(job(), at(base, elapsed));
+    let after_watchdog = idr_calls.load(Ordering::Relaxed);
+    assert!(after_watchdog >= after_first_soft);
+
+    // Job 3: third consecutive soft failure → hits
+    // REBUILD_AFTER_TRANSIENTS and escalates to Rebuild.
+    let c3 = worker.process_job(job(), at(base, elapsed + Duration::from_millis(10)));
+    assert_eq!(
+        c3.recovery,
+        Some(tether_decode::RecoveryAction::Rebuild),
+        "three consecutive failures must escalate to Rebuild"
+    );
+}
+
+use tether_decode::NO_OUTPUT_WATCHDOG;
+
+#[test]
+fn watchdog_alone_escalates_after_two_silent_windows() {
+    // Exercise the watchdog path in isolation from the
+    // transient-failure threshold: feed jobs that succeed
+    // (decoder doesn't error, doesn't bump warnings) but produce
+    // *no frame* — the worker sees no failure to increment
+    // consecutive_failures, only the no-output watchdog elapsing
+    // can drive Rebuild. The "no warnings" closure returns 0
+    // unchanged so `soft_failure = false` everywhere.
+    let decoder = FakeDecoder::new(vec![
+        FakeOutcome::Solid {
+            width: 4,
+            height: 4,
+            luma: 9,
+        },
+        FakeOutcome::Frames(vec![]),
+        FakeOutcome::Frames(vec![]),
+        FakeOutcome::Frames(vec![]),
+    ]);
+    let idr_calls = Arc::new(AtomicU32::new(0));
+    let idr_cb = Arc::clone(&idr_calls);
+    let frames = LatestFrame::new();
+    let mut worker = Worker::new(
+        Box::new(decoder),
+        frames.clone(),
+        Arc::new(move || {
+            idr_cb.fetch_add(1, Ordering::Relaxed);
+        }),
+        Arc::new(|| 0u64), // never bumps → no soft failure
+    );
+    let base = MonoNanos::now();
+    // Job 0: success → last_successful_decode set.
+    let c0 = worker.process_job(job(), base);
+    assert!(!c0.decode_err && !c0.soft_failure);
+    let _ = frames.take();
+
+    // Job 1: silent (no frame, no warning bump). No failure
+    // counter increment, but produced_frame = false so the
+    // watchdog clock is still running.
+    let _ = worker.process_job(job(), at(base, Duration::from_millis(200)));
+    assert_eq!(idr_calls.load(Ordering::Relaxed), 0);
+
+    // Job 2: past one watchdog window. Watchdog arms + requests
+    // IDR.
+    let c2 = worker.process_job(
+        job(),
+        at(base, NO_OUTPUT_WATCHDOG + Duration::from_millis(10)),
+    );
+    assert_eq!(c2.recovery, None, "first window expiry must not rebuild");
+    assert!(
+        idr_calls.load(Ordering::Relaxed) >= 1,
+        "watchdog must request IDR on first window expiry"
+    );
+
+    // Job 3: past two windows. Watchdog escalates.
+    let c3 = worker.process_job(
+        job(),
+        at(base, NO_OUTPUT_WATCHDOG * 2 + Duration::from_millis(10)),
+    );
+    assert_eq!(
+        c3.recovery,
+        Some(tether_decode::RecoveryAction::Rebuild),
+        "two silent watchdog windows must escalate to Rebuild"
+    );
+}

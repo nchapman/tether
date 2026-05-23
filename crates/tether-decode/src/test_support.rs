@@ -42,6 +42,10 @@ pub struct FakeDecoder {
     queue: VecDeque<FakeOutcome>,
     pending_frames: VecDeque<Frame>,
     next_frame_returns_error: bool,
+    /// Count of `flush()` calls. Exposed so tests can assert the
+    /// worker actually flushed between failures (transient recovery
+    /// path) or during watchdog escalation.
+    pub flush_count: u32,
 }
 
 impl FakeDecoder {
@@ -50,6 +54,7 @@ impl FakeDecoder {
             queue: queue.into(),
             pending_frames: VecDeque::new(),
             next_frame_returns_error: false,
+            flush_count: 0,
         }
     }
 
@@ -60,6 +65,7 @@ impl FakeDecoder {
             queue: VecDeque::new(),
             pending_frames: VecDeque::new(),
             next_frame_returns_error: false,
+            flush_count: 0,
         }
         .with_default_solid(width, height)
     }
@@ -113,6 +119,16 @@ impl Decoder for FakeDecoder {
 
     fn name(&self) -> &'static str {
         "FakeDecoder"
+    }
+
+    fn flush(&mut self) -> Result<(), CodecError> {
+        self.flush_count = self.flush_count.saturating_add(1);
+        // Drop any pending frames + state so post-flush behavior
+        // mirrors the production semantics ("decoder ready to
+        // accept a fresh IDR").
+        self.pending_frames.clear();
+        self.next_frame_returns_error = false;
+        Ok(())
     }
 }
 

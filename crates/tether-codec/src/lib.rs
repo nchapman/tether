@@ -582,6 +582,19 @@ pub trait Decoder: Send {
     /// `codec_kind` so the client log can show which backend it
     /// actually picked.
     fn name(&self) -> &'static str;
+
+    /// Drain the codec's internal state without tearing the context
+    /// down. After `flush`, the decoder is ready to accept a fresh
+    /// IDR + subsequent packets as if it had just been constructed —
+    /// reference frames, B-frame reorder queue, and pending output
+    /// are all discarded.
+    ///
+    /// Default impl is a no-op so backends that don't need it (and
+    /// the test `FakeDecoder`) compile unchanged. Production VAAPI
+    /// and VideoToolbox override.
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// First-call hook for any cross-crate ffmpeg setup we want to run

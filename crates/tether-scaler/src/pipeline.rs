@@ -59,13 +59,25 @@ pub struct Pipelines {
 /// YUV-plane vertical pipelines + bind-group layouts. Constructed
 /// only when [`Pipelines::build_with_plane_storage`] is used. The
 /// horizontal pass for YUV planes reuses `Pipelines::horizontal_linear`
-/// — texture sampling treats R8/Rg8 sources transparently, only the
-/// destination storage format forces a new vertical entry point.
+/// — texture sampling treats R8/Rg8/R16/Rg16 sources transparently,
+/// only the destination storage format forces a new vertical entry
+/// point.
+///
+/// The 16-bit-plane fields are populated only when the device opted
+/// into `TEXTURE_FORMAT_16BIT_NORM` at construction time
+/// ([`Pipelines::build_with_plane_storage_16bit`]); otherwise they
+/// stay `None` and the scaler rejects [`crate::ColorSpace::LumaR16`]
+/// / [`crate::ColorSpace::ChromaRg16`] at construction with
+/// `MissingPlanePipelines`.
 pub(crate) struct PlanePipelines {
     pub(crate) vertical_plane_r: ComputePipeline,
     pub(crate) vertical_plane_r_bgl: BindGroupLayout,
     pub(crate) vertical_plane_rg: ComputePipeline,
     pub(crate) vertical_plane_rg_bgl: BindGroupLayout,
+    pub(crate) vertical_plane_r16: Option<ComputePipeline>,
+    pub(crate) vertical_plane_r16_bgl: Option<BindGroupLayout>,
+    pub(crate) vertical_plane_rg16: Option<ComputePipeline>,
+    pub(crate) vertical_plane_rg16_bgl: Option<BindGroupLayout>,
 }
 
 impl Pipelines {
@@ -78,7 +90,7 @@ impl Pipelines {
     /// [`Pipelines::build_with_plane_storage`] instead — that adds the
     /// R8Unorm / Rg8Unorm vertical pipelines this constructor omits.
     pub fn build(device: &Device) -> Self {
-        Self::build_internal(device, false)
+        Self::build_internal(device, false, false)
     }
 
     /// Like [`Pipelines::build`] but also constructs the YUV-plane
@@ -89,10 +101,20 @@ impl Pipelines {
     /// R8Unorm/Rg8Unorm (Metal always; Vulkan depends on the ICD) —
     /// otherwise bind-group-layout creation will validation-error.
     pub fn build_with_plane_storage(device: &Device) -> Self {
-        Self::build_internal(device, true)
+        Self::build_internal(device, true, false)
     }
 
-    fn build_internal(device: &Device, with_plane_storage: bool) -> Self {
+    /// Like [`Pipelines::build_with_plane_storage`] but also
+    /// constructs the 16-bit-storage plane pipelines used by
+    /// [`crate::ColorSpace::LumaR16`] / [`crate::ColorSpace::ChromaRg16`]
+    /// for HEVC Main10 4:2:0 host scaling. The device must have
+    /// opted into `Features::TEXTURE_FORMAT_16BIT_NORM` in addition
+    /// to the 8-bit-plane prerequisites.
+    pub fn build_with_plane_storage_16bit(device: &Device) -> Self {
+        Self::build_internal(device, true, true)
+    }
+
+    fn build_internal(device: &Device, with_plane_storage: bool, with_16bit_planes: bool) -> Self {
         let module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("tether-scaler shader"),
             source: ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -194,11 +216,70 @@ impl Pipelines {
                 compilation_options: Default::default(),
                 cache: None,
             });
+            // 16-bit plane pipelines (R16Unorm / Rg16Unorm) sit
+            // behind both `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`
+            // and `TEXTURE_FORMAT_16BIT_NORM`. Caller signals the
+            // latter via `with_16bit_planes`; the device must have
+            // opted into the feature too, or the storage BGL build
+            // will validation-error.
+            //
+            // The 16-bit entry points live in a separate WGSL module
+            // (`shader_16bit.wgsl`). wgpu/naga records
+            // `STORAGE_TEXTURE_16BIT_NORM_FORMATS` as a module-level
+            // required capability rather than per-entry-point, so
+            // bundling the r16unorm/rg16unorm shaders into the
+            // primary `shader.wgsl` would force every caller's
+            // device to opt into 16BIT_NORM — including pure 8-bit
+            // sessions on adapters that lack the feature.
+            let (
+                vertical_plane_r16,
+                vertical_plane_r16_bgl,
+                vertical_plane_rg16,
+                vertical_plane_rg16_bgl,
+            ) = if with_16bit_planes {
+                let module_16 = device.create_shader_module(ShaderModuleDescriptor {
+                    label: Some("tether-scaler 16-bit plane shader"),
+                    source: ShaderSource::Wgsl(include_str!("shader_16bit.wgsl").into()),
+                });
+                let (bgl_r, layout_r) = build_mitchell_layout(
+                    device,
+                    "tether-scaler vertical_plane_r16 bgl",
+                    TextureFormat::R16Unorm,
+                );
+                let pipeline_r = device.create_compute_pipeline(&ComputePipelineDescriptor {
+                    label: Some("tether-scaler vertical_plane_r16"),
+                    layout: Some(&layout_r),
+                    module: &module_16,
+                    entry_point: Some("vertical_plane_r16"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+                let (bgl_rg, layout_rg) = build_mitchell_layout(
+                    device,
+                    "tether-scaler vertical_plane_rg16 bgl",
+                    TextureFormat::Rg16Unorm,
+                );
+                let pipeline_rg = device.create_compute_pipeline(&ComputePipelineDescriptor {
+                    label: Some("tether-scaler vertical_plane_rg16"),
+                    layout: Some(&layout_rg),
+                    module: &module_16,
+                    entry_point: Some("vertical_plane_rg16"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+                (Some(pipeline_r), Some(bgl_r), Some(pipeline_rg), Some(bgl_rg))
+            } else {
+                (None, None, None, None)
+            };
             Some(PlanePipelines {
                 vertical_plane_r,
                 vertical_plane_r_bgl,
                 vertical_plane_rg,
                 vertical_plane_rg_bgl,
+                vertical_plane_r16,
+                vertical_plane_r16_bgl,
+                vertical_plane_rg16,
+                vertical_plane_rg16_bgl,
             })
         } else {
             None

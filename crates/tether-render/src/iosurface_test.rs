@@ -1537,19 +1537,17 @@ fn iosurface_host_scaler_sustained_rate() {
     eprintln!("sustained-rate: {n} frames acquired+retired successfully");
 }
 
-/// Verify the bridge constructor rejects 10-bit fourccs with the
-/// dedicated [`tether_gpuconvert::nv12_iosurface::BridgeError::TenBitNotImplemented`]
-/// sentinel. The bridge advertises 10-bit fourccs in its tables (for
-/// future-compat with R16/Rg16 follow-up) but the current scaler
-/// only ships R8/Rg8 plane pipelines — accepting 10-bit fourccs at
-/// construction would silently fail at first frame. This test
-/// pins the construction-time rejection so the future R16 follow-up
-/// has to remove the guard at the same time as adding the
-/// pipelines.
+/// Verify the bridge constructs successfully for 10-bit fourccs
+/// on a device that has both `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`
+/// and `TEXTURE_FORMAT_16BIT_NORM`, and falls back to
+/// `TenBitNotImplemented` on a device that has only the 8-bit
+/// feature opt-in. The R16/Rg16 plane pipelines (added in the
+/// follow-up that retired the original guard) only build on a
+/// 16BIT_NORM-equipped device.
 #[test]
 #[ignore = "requires macOS + Metal + TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-render --release -- --ignored iosurface_host_scaler"]
 #[cfg(target_os = "macos")]
-fn iosurface_host_scaler_rejects_10bit_at_construction() {
+fn iosurface_host_scaler_10bit_construction() {
     use tether_codec::macos_interop::{X420_FOURCC, XF20_FOURCC};
     use tether_gpuconvert::nv12_iosurface::{BridgeError, Nv12IOSurfaceBridge};
 
@@ -1570,9 +1568,16 @@ fn iosurface_host_scaler_rejects_10bit_at_construction() {
         eprintln!("SKIPPED: adapter lacks TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES");
         return;
     }
+    let has_16bit = adapter
+        .features()
+        .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+    let mut required = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+    if has_16bit {
+        required |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+    }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("tether-render 10-bit rejection test"),
-        required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+        label: Some("tether-render 10-bit construction test"),
+        required_features: required,
         required_limits: wgpu::Limits::default(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
@@ -1588,18 +1593,36 @@ fn iosurface_host_scaler_rejects_10bit_at_construction() {
             (1280, 720),
             fcc,
         );
-        match result {
-            Err(BridgeError::TenBitNotImplemented { fourcc }) => {
-                assert_eq!(fourcc, fcc, "rejection error must carry the rejected fourcc");
+        match (has_16bit, result) {
+            (true, Ok(bridge)) => {
+                eprintln!(
+                    "10-bit fourcc 0x{fcc:08x}: bridge built successfully \
+                     (has_16bit=true; R16/Rg16 pipelines wired)"
+                );
+                drop(bridge);
             }
-            Err(other) => {
-                panic!("10-bit fourcc 0x{fcc:08x} should produce TenBitNotImplemented; got {other:?}");
+            (false, Err(BridgeError::TenBitNotImplemented { fourcc })) => {
+                assert_eq!(fourcc, fcc, "TenBitNotImplemented error must carry the rejected fourcc");
+                eprintln!(
+                    "10-bit fourcc 0x{fcc:08x}: bridge correctly refused — adapter lacks 16BIT_NORM"
+                );
             }
-            Ok(_) => {
+            (true, Err(e)) => {
                 panic!(
-                    "10-bit fourcc 0x{fcc:08x} should be rejected at construction \
-                     until R16/Rg16 scaler pipelines land — instead the bridge built \
-                     successfully and would silently fail at first scale_to_iosurface."
+                    "10-bit fourcc 0x{fcc:08x}: device opted into 16BIT_NORM but bridge \
+                     construction failed: {e}"
+                );
+            }
+            (false, Ok(_)) => {
+                panic!(
+                    "10-bit fourcc 0x{fcc:08x}: device lacks 16BIT_NORM but bridge built \
+                     successfully — should have refused with TenBitNotImplemented"
+                );
+            }
+            (false, Err(other)) => {
+                panic!(
+                    "10-bit fourcc 0x{fcc:08x}: expected TenBitNotImplemented on \
+                     a non-16BIT_NORM device; got {other}"
                 );
             }
         }
@@ -1706,5 +1729,42 @@ fn iosurface_host_scaler_hevc_8bit_coord_encoded_smoke() {
     assert!(
         g_range >= 100,
         "G-channel gradient collapsed; range {g_min}..{g_max} (Δ={g_range}) — chain may be black or wrong colour"
+    );
+}
+
+/// HEVC 4:2:0 10-bit (Main10) host-scaler round-trip. Drives the
+/// new R16Unorm / Rg16Unorm plane scaler pipelines end-to-end:
+/// encode BGRA at 640×480 → decode → bridge (10-bit IOSurface +
+/// R16/Rg16 scaler) → render. This is the cell the original Stage
+/// 5 deferred, now that the R16 follow-up has landed.
+///
+/// The region-average bounds match the 8-bit cell — 10-bit's added
+/// precision doesn't shift the reconstructed flat colours, only how
+/// cleanly they're hit, so a working chain produces the same
+/// reddish/blueish dominance. A regression (R16 storage wired wrong,
+/// 10-bit IOSurface tagged wrong, chroma-siting offset miscomputed
+/// for the half-res UV plane) would collapse the colour dominance.
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal + TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES + TEXTURE_FORMAT_16BIT_NORM; run with: cargo test -p tether-render --release -- --ignored iosurface_host_scaler"]
+#[cfg(target_os = "macos")]
+fn iosurface_host_scaler_hevc_10bit_downscale() {
+    let Some((left, right)) = run_host_scaler_roundtrip(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        },
+        (640, 480),
+        (320, 240),
+    ) else {
+        return;
+    };
+    assert!(
+        left.0 > 130 && left.1 < 80 && left.2 < 80,
+        "left region should be reddish; got {left:?}"
+    );
+    assert!(
+        right.2 > 130 && right.0 < 80 && right.1 < 80,
+        "right region should be blueish; got {right:?}"
     );
 }

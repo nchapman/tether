@@ -425,24 +425,24 @@ impl Nv12IOSurfaceBridge {
                 fourcc: dst_fourcc,
             });
         }
-        // 10-bit guard: `plane_wgpu_formats` returns R16Unorm /
-        // Rg16Unorm for the x420/xf20/P010 family, but
-        // `Pipelines::build_with_plane_storage` only emits R8 / Rg8
-        // vertical pipelines. If we let construction proceed, the
-        // pool would allocate R16 textures, the scaler dispatch
-        // would create a bind group with an R8-format storage entry
-        // pointing at an R16 texture, and wgpu would validation-
-        // error per frame. Reject up front with a clear message —
-        // the macOS host's probe should refuse 10-bit profiles when
-        // the scaler is in the loop until the R16 follow-up lands.
-        if bit_depth == 10 {
-            return Err(BridgeError::TenBitNotImplemented { fourcc: dst_fourcc });
-        }
-
-        // Build the scaler pipelines with plane storage (R8 / Rg8
-        // vertical passes). The device feature opt-in lives on the
-        // caller side; this is the load-bearing check.
-        let pipelines = Arc::new(Pipelines::build_with_plane_storage(&device));
+        // Pick the scaler pipeline set based on bit depth. 8-bit
+        // uses the R8 / Rg8 plane pipelines (always available when
+        // `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` is on). 10-bit
+        // additionally needs the R16 / Rg16 pipelines, which in turn
+        // require `TEXTURE_FORMAT_16BIT_NORM` on the device. If the
+        // caller's device didn't opt into the 16-bit feature, the
+        // 16-bit BGL construction inside
+        // `build_with_plane_storage_16bit` will validation-error —
+        // probe the device features here and surface a clearer
+        // error if so.
+        let pipelines = if bit_depth == 10 {
+            if !device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+                return Err(BridgeError::TenBitNotImplemented { fourcc: dst_fourcc });
+            }
+            Arc::new(Pipelines::build_with_plane_storage_16bit(&device))
+        } else {
+            Arc::new(Pipelines::build_with_plane_storage(&device))
+        };
 
         // Horizontal scale ratio in source-pixel units (src_w /
         // dst_w). The chroma plane scaler operates at half
@@ -453,13 +453,33 @@ impl Nv12IOSurfaceBridge {
         let scale_x = src_dims.0 as f32 / dst_dims.0 as f32;
         let chroma_offset_x = -(scale_x - 1.0) * 0.5;
 
+        // Bit-depth-specific ColorSpace variants. 8-bit picks the
+        // R8 / Rg8 plane shaders; 10-bit picks the R16 / Rg16
+        // shaders with identical Mitchell math but 16-bit storage
+        // cells (10 bits MSB-aligned per NV12 P010-family
+        // convention).
+        let (y_space, uv_space) = if bit_depth == 10 {
+            (
+                ColorSpace::LumaR16,
+                ColorSpace::ChromaRg16 {
+                    chroma_offset: (chroma_offset_x, 0.0),
+                },
+            )
+        } else {
+            (
+                ColorSpace::LumaR8,
+                ColorSpace::ChromaRg8 {
+                    chroma_offset: (chroma_offset_x, 0.0),
+                },
+            )
+        };
         let y_scaler = Scaler::new_with_color_space(
             pipelines.clone(),
             device.clone(),
             queue.clone(),
             src_dims,
             dst_dims,
-            ColorSpace::LumaR8,
+            y_space,
         )?;
         // Vertical chroma offset is 0: MPEG-2 left-cosited NV12
         // (`chroma_sample_loc_type_top_field = 0`, what VT/SCK tag)
@@ -474,9 +494,7 @@ impl Nv12IOSurfaceBridge {
             queue.clone(),
             (src_dims.0 / 2, src_dims.1 / 2),
             (dst_dims.0 / 2, dst_dims.1 / 2),
-            ColorSpace::ChromaRg8 {
-                chroma_offset: (chroma_offset_x, 0.0),
-            },
+            uv_space,
         )?;
 
         // Allocate the pool. Each slot owns one IOSurface + the

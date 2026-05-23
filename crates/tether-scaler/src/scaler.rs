@@ -75,6 +75,19 @@ pub enum ColorSpace {
     /// Output format: `Rg8Unorm` storage. Same wgpu feature
     /// caveats as [`LumaR8`].
     ChromaRg8 { chroma_offset: (f32, f32) },
+    /// 10-bit (R16Unorm) single-channel plane scaling — the
+    /// macOS NV12 `'x420'` / `'xf20'` / `'P010'` luma plane.
+    /// Symmetric to [`LumaR8`] but the storage format is 16-bit-
+    /// per-channel; the Mitchell math is identical. The host
+    /// device must opt into BOTH
+    /// `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` and
+    /// `Features::TEXTURE_FORMAT_16BIT_NORM`.
+    LumaR16,
+    /// 10-bit (Rg16Unorm) two-channel plane scaling — the
+    /// macOS NV12 10-bit interleaved UV plane. Cosited-NV12
+    /// chroma offset has identical math at 8-bit and 10-bit;
+    /// caller passes the same `-(scale - 1) * 0.5` correction.
+    ChromaRg16 { chroma_offset: (f32, f32) },
 }
 
 impl ColorSpace {
@@ -84,6 +97,8 @@ impl ColorSpace {
             Self::LinearF16 => wgpu::TextureFormat::Rgba16Float,
             Self::LumaR8 => wgpu::TextureFormat::R8Unorm,
             Self::ChromaRg8 { .. } => wgpu::TextureFormat::Rg8Unorm,
+            Self::LumaR16 => wgpu::TextureFormat::R16Unorm,
+            Self::ChromaRg16 { .. } => wgpu::TextureFormat::Rg16Unorm,
         }
     }
     fn supports_mip_prefilter(self) -> bool {
@@ -94,12 +109,28 @@ impl ColorSpace {
     /// caller computes the cosited NV12 chroma correction for UV.
     fn chroma_offset(self) -> (f32, f32) {
         match self {
-            Self::Srgb8 | Self::LinearF16 | Self::LumaR8 => (0.0, 0.0),
-            Self::ChromaRg8 { chroma_offset } => chroma_offset,
+            Self::Srgb8 | Self::LinearF16 | Self::LumaR8 | Self::LumaR16 => (0.0, 0.0),
+            Self::ChromaRg8 { chroma_offset } | Self::ChromaRg16 { chroma_offset } => {
+                chroma_offset
+            }
         }
     }
     fn needs_plane_pipelines(self) -> bool {
-        matches!(self, Self::LumaR8 | Self::ChromaRg8 { .. })
+        matches!(
+            self,
+            Self::LumaR8 | Self::ChromaRg8 { .. } | Self::LumaR16 | Self::ChromaRg16 { .. }
+        )
+    }
+    /// True for the 16-bit-storage plane variants. Used by the
+    /// pipeline builder to gate the `R16Unorm`/`Rg16Unorm` BGLs +
+    /// pipelines behind the `TEXTURE_FORMAT_16BIT_NORM` feature opt-
+    /// in: a device that has `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`
+    /// but not 16BIT_NORM (rare on Metal, more common on older
+    /// Vulkan ICDs) gets the 8-bit pipelines and refuses 10-bit
+    /// scaling via [`ScalerError::MissingPlanePipelines`].
+    #[allow(dead_code)] // referenced once we expose it to PlanePipelines below
+    fn is_16bit_plane(self) -> bool {
+        matches!(self, Self::LumaR16 | Self::ChromaRg16 { .. })
     }
 }
 
@@ -471,6 +502,30 @@ impl Scaler {
                     &plane.vertical_plane_rg,
                     &plane.vertical_plane_rg_bgl,
                 )
+            }
+            ColorSpace::LumaR16 { .. } => {
+                let plane = self.pipelines.plane.as_ref().ok_or(
+                    ScalerError::MissingPlanePipelines,
+                )?;
+                let pipeline = plane.vertical_plane_r16.as_ref().ok_or(
+                    ScalerError::MissingPlanePipelines,
+                )?;
+                let bgl = plane.vertical_plane_r16_bgl.as_ref().ok_or(
+                    ScalerError::MissingPlanePipelines,
+                )?;
+                (&self.pipelines.horizontal_linear, pipeline, bgl)
+            }
+            ColorSpace::ChromaRg16 { .. } => {
+                let plane = self.pipelines.plane.as_ref().ok_or(
+                    ScalerError::MissingPlanePipelines,
+                )?;
+                let pipeline = plane.vertical_plane_rg16.as_ref().ok_or(
+                    ScalerError::MissingPlanePipelines,
+                )?;
+                let bgl = plane.vertical_plane_rg16_bgl.as_ref().ok_or(
+                    ScalerError::MissingPlanePipelines,
+                )?;
+                (&self.pipelines.horizontal_linear, pipeline, bgl)
             }
         };
 

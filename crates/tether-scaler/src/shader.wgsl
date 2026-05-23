@@ -291,6 +291,13 @@ fn vertical_plane_rg(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(dst_v_plane_rg, vec2<i32>(gid.xy), vec4<f32>(v.x, v.y, 0.0, 1.0));
 }
 
+// (10-bit YUV plane variants live in shader_16bit.wgsl — wgpu/naga
+// records storage-format capabilities at module-compile time, not
+// per-entry-point dispatch, so the r16unorm / rg16unorm shaders are
+// kept in a sibling module loaded only when the device has opted
+// into `TEXTURE_FORMAT_16BIT_NORM`. Otherwise an 8-bit-only session
+// would fail compilation here on adapters that lack the feature.)
+
 // === Mip prefilter (2× box downsample, linear-light) ===
 // Invoked when the desired downscale ratio exceeds 2×. Produces an
 // sRGB-encoded intermediate (same shape as the original capture) so

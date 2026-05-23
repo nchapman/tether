@@ -302,18 +302,37 @@ pub const CONTINUATION_PAYLOAD_BUDGET: usize = 1180;
 /// is the cost of the uniform-shard requirement.
 pub const FEC_SHARD_SIZE: usize = FIRST_PAYLOAD_BUDGET;
 
-/// Maximum primary shards per FEC block. Single-block FEC today (no
-/// multi-block split), so this is also the per-frame primary cap when
-/// FEC is on. Caps at the GF(2^8) Reed-Solomon ceiling of 255 total
-/// shards (primary + parity); the formula
-/// `(255 * 100) / (100 + fec_pct)` floors as `fec_pct` rises.
+/// Hard ceiling on primary shards per FEC block, regardless of parity
+/// ratio. Single-block FEC today (no multi-block split). Caps at the
+/// GF(2^8) Reed-Solomon ceiling of 255 total shards (primary + parity);
+/// `(255 * 100) / (100 + fec_pct)` floors as `fec_pct` rises — see
+/// [`max_primary_shards_for_pct`].
 ///
-/// At the default 20% parity, this lands at 212 primaries — ~233 KB
-/// of frame body, comfortably above any P-frame at 25 Mbps / 60 fps
-/// and large enough for typical IDRs too. Frames that exceed it fall
+/// 212 is the value at the default 20% parity (~233 KB of frame body,
+/// comfortably above any P-frame at 25 Mbps / 60 fps and large enough
+/// for typical IDRs). Higher parity ratios use a lower per-call
+/// ceiling computed at fragment time; this constant is the *upper*
+/// bound regardless. Frames that exceed the effective ceiling fall
 /// back to no-FEC fragmentation; multi-block split is a future
 /// addition for sustained >100 Mbps streams.
 pub const FEC_MAX_PRIMARY_SHARDS: usize = 212;
+
+/// Per-`fec_percentage` ceiling on primary shards before a frame must
+/// fall back to no-FEC fragmentation. Beyond this, Reed-Solomon's
+/// GF(2^8) limit of 255 total shards (primary + parity) is exceeded
+/// and `ReedSolomon::new` rejects the request.
+///
+/// Capped at [`FEC_MAX_PRIMARY_SHARDS`] so the default 20% case
+/// remains the historical 212 and the legacy `FrameFragmenter::new`
+/// path is unchanged.
+#[must_use]
+pub fn max_primary_shards_for_pct(fec_percentage: u8) -> usize {
+    if fec_percentage == 0 {
+        return FEC_MAX_PRIMARY_SHARDS;
+    }
+    let dynamic = (255usize * 100) / (100 + fec_percentage as usize);
+    dynamic.min(FEC_MAX_PRIMARY_SHARDS)
+}
 
 /// Hard ceiling on the per-frame fragment count enforced by
 /// [`FrameReassembler`]. The legitimate sender produces at most
@@ -347,6 +366,15 @@ pub struct FrameFragmenter {
     /// fragments stay byte-identical to the pre-FEC output for the
     /// same body — wire-compat with older clients).
     fec_percentage: u8,
+    /// Count of frames since construction that exceeded the
+    /// per-`fec_percentage` primary-shard ceiling and were shipped
+    /// without FEC. Surface via [`Self::no_fec_fallback_count`] into
+    /// the send-loop stats; sustained non-zero values mean the
+    /// configured FEC isn't actually protecting the highest-motion
+    /// frames and the ABR controller's loss-tolerance calibration is
+    /// optimistic. A zero count throughout a session is the
+    /// happy-path expectation at the default 20% / 25 Mbps budget.
+    no_fec_fallback_count: u64,
 }
 
 impl FrameFragmenter {
@@ -365,7 +393,16 @@ impl FrameFragmenter {
             stream_epoch: 0,
             next_frame_seq: 0,
             fec_percentage,
+            no_fec_fallback_count: 0,
         }
+    }
+
+    /// Cumulative count of frames that exceeded
+    /// [`max_primary_shards_for_pct`] and were shipped without FEC.
+    /// Monotonic per fragmenter; cheap to snapshot for stats.
+    #[must_use]
+    pub fn no_fec_fallback_count(&self) -> u64 {
+        self.no_fec_fallback_count
     }
 
     /// Current parity ratio.
@@ -421,8 +458,9 @@ impl FrameFragmenter {
         // same-length-shard requirement is satisfied without
         // per-shard padding bookkeeping. Falls back to the
         // pre-FEC mixed-budget shape when fec_percentage = 0 OR
-        // the body would need more than FEC_MAX_PRIMARY_SHARDS
-        // shards (multi-block FEC is a future addition).
+        // the body would need more shards than RS can handle at
+        // the configured parity ratio (multi-block FEC is a future
+        // addition).
         let fec_on = self.fec_percentage > 0;
         let body_len = body.len();
         let primary_shards_needed = if body_len == 0 {
@@ -430,9 +468,21 @@ impl FrameFragmenter {
         } else {
             body_len.div_ceil(FEC_SHARD_SIZE)
         };
-        let use_fec = fec_on && primary_shards_needed <= FEC_MAX_PRIMARY_SHARDS;
+        let ceiling = max_primary_shards_for_pct(self.fec_percentage);
+        let use_fec = fec_on && primary_shards_needed <= ceiling;
 
         if !use_fec {
+            if fec_on {
+                self.no_fec_fallback_count =
+                    self.no_fec_fallback_count.saturating_add(1);
+                tracing::debug!(
+                    primary_shards_needed,
+                    ceiling,
+                    fec_percentage = self.fec_percentage,
+                    body_len,
+                    "frame exceeds per-pct FEC primary ceiling; sending without FEC"
+                );
+            }
             return self.fragment_legacy(meta, body, frame_seq);
         }
 
@@ -442,7 +492,7 @@ impl FrameFragmenter {
         // FEC_SHARD_SIZE on the wire, but its conceptual length for
         // RS math is the full FEC_SHARD_SIZE (zero-padded).
         let fragment_count = u16::try_from(primary_shards_needed)
-            .expect("primary count fits in u16; capped at FEC_MAX_PRIMARY_SHARDS");
+            .expect("primary count fits in u16; capped by max_primary_shards_for_pct");
         let parity_count = compute_parity_count(primary_shards_needed, self.fec_percentage);
 
         let mut packets =
@@ -494,8 +544,9 @@ impl FrameFragmenter {
             ) {
                 packets.extend(parity_packets);
             } else {
-                // RS construction failure is unreachable for the
-                // (data, parity) sizes we permit, but the crate
+                // RS construction failure is unreachable now that
+                // `max_primary_shards_for_pct` gates the call to
+                // keep `primary + parity <= 255`, but the crate
                 // returns Result so log and ship without parity if
                 // we ever hit it.
                 tracing::warn!(

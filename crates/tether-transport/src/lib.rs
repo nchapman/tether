@@ -67,6 +67,14 @@ pub const MAX_VIDEO_STREAM_MESSAGE: usize = 2 * 1024 * 1024;
 /// the receive-side allocations.
 pub const MAX_CONCURRENT_UNI_STREAMS: u32 = 4;
 
+/// Cap on concurrent peer-initiated bidirectional streams. Tether
+/// opens exactly one bidi stream per connection (the control stream
+/// at handshake time); a cap of 1 closes a low-grade resource-
+/// exhaustion surface where a hostile peer could open the QUIC
+/// default of 100 half-open bidi streams and pin connection-table
+/// state until the idle timeout fires.
+pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 1;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("io: {0}")]

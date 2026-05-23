@@ -646,6 +646,15 @@ async fn handle_client(
     // flag breaks the send loop out of its idle wait on a quiet desktop,
     // where `frames.recv` would otherwise block past disconnect detection.
     let send_shutdown = Arc::new(AtomicBool::new(false));
+    // Notified when the send thread exits for any reason — fatal encoder
+    // init failure, GPU bridge collapse, capture-channel disconnect, or
+    // a clean shutdown response. Lets `handle_client`'s `select!`
+    // unblock immediately on a fatal send-side exit instead of waiting
+    // for the client to process Goodbye and drop the QUIC connection.
+    // Notify is idempotent — a benign notify during clean shutdown is a
+    // no-op.
+    let send_exited = Arc::new(tokio::sync::Notify::new());
+    let send_exited_for_thread = send_exited.clone();
     // Drop-oldest single-slot mailbox for the most recent `ClientStats`
     // window. Written by the control recv task, drained by the
     // encode-and-send thread on each loop iteration.
@@ -703,6 +712,7 @@ async fn handle_client(
                 conn_keyframe,
                 latest_client_stats_for_send,
                 latest_viewport_for_send,
+                send_exited_for_thread,
             )
         })?;
 
@@ -1057,6 +1067,16 @@ async fn handle_client(
                 Some(Err(e)) => warn!(error = ?e, "per-connection task failed; tearing down"),
                 None => warn!("joined empty task set; tearing down"),
             }
+        }
+        () = send_exited.notified() => {
+            // Send thread exited (fatal encoder init failure, GPU
+            // bridge collapse, capture-channel disconnect, etc.).
+            // On fatal exits the Goodbye is already in flight; on a
+            // clean capture-channel disconnect the connection close
+            // below serves as the implicit goodbye. Either way, tear
+            // down immediately rather than waiting for the client to
+            // ack-by-disconnect.
+            info!("send thread exited; tearing down");
         }
     }
 
@@ -2579,7 +2599,21 @@ fn run_capture_and_send(
     keyframe_conn: Arc<Connection>,
     latest_client_stats: LatestClientStats,
     latest_viewport: LatestViewport,
+    send_exited: Arc<tokio::sync::Notify>,
 ) {
+    // RAII: notify handle_client on *any* exit from this function —
+    // including the six fatal-return sites below, a panic that's
+    // caught by the JoinHandle, or the clean loop-end on
+    // capture-channel disconnect. Putting this on a guard means a
+    // future fatal-return site doesn't have to remember to call
+    // notify itself.
+    struct ExitNotifier(Arc<tokio::sync::Notify>);
+    impl Drop for ExitNotifier {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+    let _exit_notifier = ExitNotifier(send_exited);
     // FEC parity ratio applied to P-frame datagrams. 20% is the
     // default — enough to absorb single-digit packet loss without
     // a bandwidth penalty most LANs will notice. Disable by

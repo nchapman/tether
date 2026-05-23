@@ -620,6 +620,11 @@ fn watchdog_alone_escalates_after_two_silent_windows() {
         idr_calls.load(Ordering::Relaxed) >= 1,
         "watchdog must request IDR on first window expiry"
     );
+    assert!(
+        c2.idr_request_fired,
+        "DecodeCompletion must report the watchdog IDR so per-second \
+         stats account for IDRs from both failure and watchdog paths"
+    );
 
     // Job 3: past two windows. Watchdog escalates.
     let c3 = worker.process_job(

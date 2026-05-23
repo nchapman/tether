@@ -100,10 +100,13 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
 }
 
 // TODO(security): decode of untrusted input can allocate large Vec<u8> from
-// a forged length prefix. Transport caps incoming datagrams at the network
-// boundary, which mitigates this, but defense in depth says the decoder
-// should also refuse oversize payloads. Wire bincode's Limit config or wrap
-// here once the transport is in place and we can measure realistic sizes.
+// a forged length prefix. Video datagrams are guarded by
+// `VideoPacket::validate_packet_sizing` against MAX_FRAGMENTS_PER_FRAME /
+// MAX_FRAME_BODY_BYTES before any allocation, so the video path is safe.
+// What remains: `ControlMessage::CursorShape::pixels` and
+// `ControlMessage::Extension::payload` decoded over the reliable control
+// stream — both `Vec<u8>` with no length cap today. Wire bincode's Limit
+// config or per-field caps once we measure realistic sizes.
 pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> {
     let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode_config())?;
     // Strict-decode: every framed message must be fully consumed by its
@@ -1165,15 +1168,69 @@ mod tests {
         // A frame above FEC_MAX_PRIMARY_SHARDS × FEC_SHARD_SIZE
         // can't fit in a single FEC block — fragmenter falls back
         // to the pre-FEC mixed-budget shape with zero parity. Test
-        // that fec stays a no-op for this case (no Parity packets).
+        // that fec stays a no-op for this case (no Parity packets)
+        // and that the fallback counter bumps so the host can
+        // surface this in stats.
         let oversize = (FEC_MAX_PRIMARY_SHARDS + 5) * FEC_SHARD_SIZE;
         let body: bytes::Bytes = vec![0u8; oversize].into();
         let mut frag = FrameFragmenter::new_with_fec(0, 20);
+        assert_eq!(frag.no_fec_fallback_count(), 0);
         let pkts = frag.fragment(default_meta(), body);
         assert!(
             pkts.iter().all(|p| !matches!(p, VideoPacket::Parity { .. })),
             "oversize frames must fall back to no-FEC fragmentation"
         );
+        assert_eq!(
+            frag.no_fec_fallback_count(),
+            1,
+            "oversize FEC frame must bump the fallback counter"
+        );
+    }
+
+    #[test]
+    fn fec_falls_back_when_primary_count_exceeds_per_pct_ceiling() {
+        // At fec_percentage = 25, the GF(2^8) ceiling on total
+        // shards gives (255 * 100) / 125 = 204 primaries max — well
+        // under FEC_MAX_PRIMARY_SHARDS (212). A frame that needs
+        // 205-212 primaries used to silently fall through to
+        // ReedSolomon::new with total=257 > 255 and emit a misleading
+        // "construction failed" warning; the fix routes it cleanly
+        // to the no-FEC legacy path.
+        use crate::video::max_primary_shards_for_pct;
+        let ceiling_25 = max_primary_shards_for_pct(25);
+        assert!(
+            ceiling_25 < FEC_MAX_PRIMARY_SHARDS,
+            "25% parity should narrow the per-pct ceiling below the hard cap"
+        );
+        // One shard above the per-pct ceiling but inside the hard
+        // cap exercises the new gating without exceeding it.
+        let primaries = ceiling_25 + 1;
+        let body: bytes::Bytes = vec![0u8; primaries * FEC_SHARD_SIZE].into();
+        let mut frag = FrameFragmenter::new_with_fec(0, 25);
+        let pkts = frag.fragment(default_meta(), body);
+        assert!(
+            pkts.iter().all(|p| !matches!(p, VideoPacket::Parity { .. })),
+            "frame above per-pct ceiling must fall back to no-FEC"
+        );
+        assert_eq!(frag.no_fec_fallback_count(), 1);
+    }
+
+    #[test]
+    fn fec_at_25_pct_inside_ceiling_still_emits_parity() {
+        // Sanity check the other direction of the per-pct guard:
+        // at fec_percentage = 25 with a frame at the ceiling, FEC
+        // must still engage. Catches regressions that swap the
+        // comparison.
+        use crate::video::max_primary_shards_for_pct;
+        let primaries = max_primary_shards_for_pct(25);
+        let body: bytes::Bytes = vec![0u8; primaries * FEC_SHARD_SIZE].into();
+        let mut frag = FrameFragmenter::new_with_fec(0, 25);
+        let pkts = frag.fragment(default_meta(), body);
+        assert!(
+            pkts.iter().any(|p| matches!(p, VideoPacket::Parity { .. })),
+            "frame exactly at the per-pct ceiling must still emit parity"
+        );
+        assert_eq!(frag.no_fec_fallback_count(), 0);
     }
 
     #[test]
@@ -1226,7 +1283,7 @@ mod tests {
     fn wire_size_matches_serialized_length() {
         // The pacer relies on `wire_size()` for byte accounting.
         // Must equal the exact `encode().len()` for every packet
-        // shape the fragmenter produces.
+        // shape the fragmenter produces — including Parity.
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: false,
@@ -1235,12 +1292,29 @@ mod tests {
         };
         let body: bytes::Bytes = vec![0u8; 8 * 1024].into();
         let mut frag = FrameFragmenter::new(0);
-        let packets = frag.fragment(meta, body);
+        let packets = frag.fragment(meta.clone(), body.clone());
         for p in &packets {
             assert_eq!(
                 p.wire_size(),
                 encode(p).unwrap().len(),
                 "wire_size must equal actual serialized length"
+            );
+        }
+
+        // FEC path: include Parity in the coverage so a future
+        // change to Parity's fields can't silently desync wire_size
+        // from the actual encoded length.
+        let mut frag_fec = FrameFragmenter::new_with_fec(0, 20);
+        let packets_fec = frag_fec.fragment(meta, body);
+        assert!(
+            packets_fec.iter().any(|p| matches!(p, VideoPacket::Parity { .. })),
+            "FEC fragmenter must emit Parity for this body size"
+        );
+        for p in &packets_fec {
+            assert_eq!(
+                p.wire_size(),
+                encode(p).unwrap().len(),
+                "wire_size must equal actual serialized length for {p:?}"
             );
         }
     }
@@ -1430,9 +1504,28 @@ mod tests {
 
     #[test]
     fn unknown_video_packet_variant_fails_decode() {
-        // First = 0, Continuation = 1. Variant 2 is hypothetical.
-        let bytes = [2u8, 0, 0, 0, 0];
+        // First = 0, Continuation = 1, Parity = 2. Variant 3 is the
+        // hypothetical next addition.
+        let bytes = [3u8, 0, 0, 0, 0];
         assert!(decode::<crate::video::VideoPacket>(&bytes).is_err());
+    }
+
+    #[test]
+    fn unknown_host_cursor_packet_variant_fails_decode() {
+        // Position = 0 (only defined variant). Variant 1 is hypothetical.
+        let bytes = [1u8, 0, 0, 0, 0];
+        assert!(decode::<crate::cursor::HostCursorPacket>(&bytes).is_err());
+    }
+
+    #[test]
+    fn unknown_goodbye_code_variant_fails_decode() {
+        // Clean = 0, ProtocolError = 1, UnsupportedVersion = 2,
+        // InternalError = 3. Variant 4 is hypothetical. Pinning this
+        // is important because `GoodbyeCode` drives reconnect
+        // behaviour on the peer side; a future variant decoded as a
+        // current one would silently misclassify the shutdown reason.
+        let bytes = [4u8];
+        assert!(decode::<crate::control::GoodbyeCode>(&bytes).is_err());
     }
 
     #[test]

@@ -292,15 +292,7 @@ impl Worker {
         }
         let mut idr_request_fired = false;
         if decode_err.is_some() || soft_failure {
-            let rate_limit_ns = IDR_RATE_LIMIT.as_nanos() as u64;
-            let fire = self
-                .last_idr_request
-                .is_none_or(|t| now.saturating_sub(t) > rate_limit_ns);
-            if fire {
-                (self.request_idr)();
-                self.last_idr_request = Some(now);
-                idr_request_fired = true;
-            }
+            idr_request_fired |= self.try_fire_idr(now);
         }
 
         // Update failure / watchdog tracking. If the decoder emitted
@@ -332,7 +324,8 @@ impl Worker {
         // arriving (we're in process_job, so yes), fire an extra
         // request_idr + flush — one-shot per window — and escalate
         // to a rebuild if the wedge persists past two windows.
-        let recovery = self.evaluate_recovery(now);
+        let (recovery, watchdog_fired_idr) = self.evaluate_recovery(now);
+        idr_request_fired |= watchdog_fired_idr;
 
         DecodeCompletion {
             decode_duration_ns,
@@ -344,22 +337,44 @@ impl Worker {
         }
     }
 
-    fn evaluate_recovery(&mut self, now: MonoNanos) -> Option<RecoveryAction> {
+    /// Rate-limited `request_idr` invocation. Returns `true` if the
+    /// callback actually fired (i.e. the rate-limit window had elapsed
+    /// since the last request). Shared by the per-job failure path and
+    /// the watchdog so both update `DecodeCompletion::idr_request_fired`
+    /// consistently.
+    fn try_fire_idr(&mut self, now: MonoNanos) -> bool {
+        let rate_limit_ns = IDR_RATE_LIMIT.as_nanos() as u64;
+        let fire = self
+            .last_idr_request
+            .is_none_or(|t| now.saturating_sub(t) > rate_limit_ns);
+        if fire {
+            (self.request_idr)();
+            self.last_idr_request = Some(now);
+        }
+        fire
+    }
+
+    /// Returns `(recovery, watchdog_fired_idr)`. The second element
+    /// reflects whether the watchdog arm path actually invoked
+    /// `request_idr` this tick — surfaced in `DecodeCompletion` so the
+    /// recv-loop's per-second stats account for IDRs from both the
+    /// failure and watchdog paths.
+    fn evaluate_recovery(&mut self, now: MonoNanos) -> (Option<RecoveryAction>, bool) {
         // Transient threshold crossed → ask the loop to rebuild.
         if self.consecutive_failures >= TRANSIENT_FAILURE_THRESHOLD {
-            return Some(RecoveryAction::Rebuild);
+            return (Some(RecoveryAction::Rebuild), false);
         }
 
         // Watchdog: only meaningful once we've decoded at least one
         // frame and have a baseline. The first IDR after connect
         // hasn't landed yet otherwise; no-output is expected.
         let Some(last) = self.last_successful_decode else {
-            return None;
+            return (None, false);
         };
         let elapsed_ns = now.saturating_sub(last);
         let window_ns = NO_OUTPUT_WATCHDOG.as_nanos() as u64;
         if elapsed_ns < window_ns {
-            return None;
+            return (None, false);
         }
 
         if !self.watchdog_armed {
@@ -371,19 +386,13 @@ impl Worker {
             if let Err(e) = self.decoder.flush() {
                 tracing::warn!(error = %e, "decoder flush failed during watchdog recovery");
             }
-            let rate_limit_ns = IDR_RATE_LIMIT.as_nanos() as u64;
-            let fire = self
-                .last_idr_request
-                .is_none_or(|t| now.saturating_sub(t) > rate_limit_ns);
-            if fire {
-                (self.request_idr)();
-                self.last_idr_request = Some(now);
-            }
+            let fired = self.try_fire_idr(now);
             tracing::warn!(
                 elapsed_ms = elapsed_ns / 1_000_000,
+                idr_fired = fired,
                 "decoder produced no output for {NO_OUTPUT_WATCHDOG:?}; flushed and requested IDR"
             );
-            return None;
+            return (None, fired);
         }
 
         // Watchdog already armed, still no output one window
@@ -393,9 +402,9 @@ impl Worker {
                 elapsed_ms = elapsed_ns / 1_000_000,
                 "decoder still produced no output after watchdog flush; requesting rebuild"
             );
-            return Some(RecoveryAction::Rebuild);
+            return (Some(RecoveryAction::Rebuild), false);
         }
-        None
+        (None, false)
     }
 }
 

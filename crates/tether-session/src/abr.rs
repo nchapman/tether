@@ -56,10 +56,17 @@ pub struct AbrSample {
 
 impl AbrSample {
     /// `true` if any congestion or loss signal fired on this sample.
+    ///
+    /// `client_frames_dropped` counts here too: the client only drops
+    /// decoded frames when its render queue can't keep up, which on a
+    /// pure-network bottleneck is downstream of the same loss/RTT
+    /// pressure quinn is reporting — treating it as a loss signal
+    /// resets the healthy streak and gates the bitrate step-up.
     fn has_loss(&self) -> bool {
         self.congestion_events_delta > 0
             || self.lost_packets_delta > 0
             || self.client_fragments_lost > 0
+            || self.client_frames_dropped > 0
     }
 }
 
@@ -494,5 +501,29 @@ mod tests {
         s = healthy();
         s.client_fragments_lost = 1;
         assert!(s.has_loss());
+        s = healthy();
+        s.client_frames_dropped = 1;
+        assert!(s.has_loss());
+    }
+
+    #[test]
+    fn client_frames_dropped_resets_healthy_streak() {
+        let mut c = ctl();
+        // Force a fall to leave headroom for a step-up.
+        c.observe(Duration::from_secs(1), loss_burst());
+        assert_eq!(c.current().target_kbps, 1_500);
+        // Two healthy samples build the streak.
+        c.observe(Duration::from_secs(4), healthy());
+        c.observe(Duration::from_millis(500), healthy());
+        // A frames-dropped blip resets the streak; next would-be
+        // step-up should NOT fire even though the cooldown has
+        // elapsed and rtt is fine.
+        let mut blip = healthy();
+        blip.client_frames_dropped = 3;
+        let after_blip = c.observe(Duration::from_millis(500), blip).target_kbps;
+        assert_eq!(
+            after_blip, 1_500,
+            "client_frames_dropped should suppress the step-up"
+        );
     }
 }

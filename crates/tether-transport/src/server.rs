@@ -169,9 +169,10 @@ fn transport_config() -> quinn::TransportConfig {
     // opened in this direction at handshake time; the cap denies a
     // hostile client the ability to open many concurrent streams.
     t.max_concurrent_uni_streams(crate::MAX_CONCURRENT_UNI_STREAMS.into());
-    // TODO(latency): switch to a no-pacer / BBR controller for LAN once we
-    // have measurements showing Cubic adds visible jitter. Per the expert
-    // review, the right place is
-    // `TransportConfig::congestion_controller_factory`.
+    // Cap client→host bidi streams. Tether opens exactly one bidi
+    // stream (the control stream at handshake time); without this
+    // a hostile client could open quinn's default 100 half-open
+    // bidi streams and pin connection-table state.
+    t.max_concurrent_bidi_streams(crate::MAX_CONCURRENT_BIDI_STREAMS.into());
     t
 }

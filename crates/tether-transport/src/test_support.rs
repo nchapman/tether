@@ -473,6 +473,18 @@ pub struct DropEvent {
 /// Drops are recorded in [`Self::drop_log`] as full [`DropEvent`]s so
 /// a failing test can name the exact sequence numbers it dropped,
 /// rather than just a count.
+///
+/// # Single-consumer assumption
+///
+/// `recv_datagram` holds the reorder-buffer mutex across the inner
+/// `recv_datagram().await` while filling the window. Concurrent calls
+/// from multiple tasks would serialise on that lock — fine for the
+/// tests this wrapper exists for (one recv loop per side), but don't
+/// share a `LossyChannel` across multiple recv tasks: the second
+/// caller will block on the lock for the duration of the first's
+/// network read, which can hide bugs that only appear with true
+/// concurrency. The production `Connection` does not have this
+/// constraint.
 pub struct LossyChannel<V: VideoChannel + ?Sized> {
     inner: Arc<V>,
     // Sync `std::sync::Mutex` for state the sync `send_datagram` trait

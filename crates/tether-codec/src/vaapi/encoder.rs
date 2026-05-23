@@ -269,10 +269,45 @@ impl VaapiEncoder {
         // safest broadly-supported value across drivers; the encoder
         // defaults to High for H.264, which fails to open on hardware
         // that only exposes Main for the chosen entrypoint.
+        // Encoder min-QP floor: Sunshine's defaults (H.264=19,
+        // HEVC=23) bound the visual quality on static desktop frames
+        // where VBR alone over-compresses. Surfaced via env var so a
+        // hardware test session can validate before we bake it into
+        // the default config; production stays unset until verified.
+        let default_min_qp_c = match kind {
+            CodecKind::H264 => c"19",
+            CodecKind::Hevc => c"23",
+            CodecKind::Av1 => c"32",
+        };
         let mut dict_builder = AVDictionary::new(c"async_depth", c"1", 0)
             .set(c"rc_mode", c"VBR", 0)
             .set(c"idr_interval", c"2147483647", 0)
             .set(c"sei", c"0", 0);
+        if let Ok(qmin_str) = std::env::var("TETHER_MIN_QP") {
+            if let Ok(qmin) = qmin_str.parse::<u32>() {
+                if qmin > 0 && qmin <= 51 {
+                    let qmin_cstr = std::ffi::CString::new(qmin.to_string())
+                        .expect("integer string has no NULs");
+                    dict_builder = dict_builder.set(c"qmin", qmin_cstr.as_c_str(), 0);
+                    tracing::info!(
+                        qmin,
+                        "min-QP floor set via TETHER_MIN_QP (untested on hardware as of this writing)"
+                    );
+                }
+            }
+        } else {
+            // Apply the Sunshine default. Keep behind a separate
+            // env-var gate so the bake-in lands deliberately rather
+            // than as a hidden defaults change on a routine upgrade.
+            if std::env::var("TETHER_MIN_QP_DEFAULTS").is_ok() {
+                dict_builder = dict_builder.set(c"qmin", default_min_qp_c, 0);
+                tracing::info!(
+                    codec = ?kind,
+                    qmin = default_min_qp_c.to_string_lossy().as_ref(),
+                    "min-QP floor set to per-codec default via TETHER_MIN_QP_DEFAULTS"
+                );
+            }
+        }
 
         // Intra refresh: spreads intra-coded macroblocks across a
         // refresh period instead of one oversized IDR. Reads

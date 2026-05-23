@@ -95,9 +95,22 @@ pub struct AbrConfig {
     /// How many consecutive healthy samples are required before we
     /// step up. One alone could be transient.
     pub healthy_samples_for_step_up: u32,
-    /// Bitrate step size, expressed as the numerator of `step / 100`
-    /// (i.e. `10` = 10%).
+    /// Steady-state bitrate step-up size, expressed as the
+    /// numerator of `step / 100` (i.e. `10` = 10%). Applied once
+    /// the fast-climb budget is exhausted.
     pub bitrate_step_pct: u32,
+    /// Larger step used for the first `fast_climb_steps` step-ups
+    /// after a collapse. Climbing from the 1.5 Mbps floor back to
+    /// an 8 Mbps baseline at the steady-state 10% takes 16 cool-
+    /// down windows (~48 s); the fast-climb phase covers the
+    /// first few windows at 25% to absorb most of the gap in ~9 s,
+    /// then narrows to `bitrate_step_pct` to avoid overshooting
+    /// the path capacity.
+    pub bitrate_fast_step_pct: u32,
+    /// Number of step-ups taken at `bitrate_fast_step_pct` after a
+    /// collapse before switching to the steady-state percentage.
+    /// Any loss / step-down resets the budget.
+    pub fast_climb_steps: u32,
     /// FPS step-up size, expressed the same way. Separate from
     /// `bitrate_step_pct` because the FPS fall is a halving (sharp),
     /// so the recovery climb needs to be sharp too — a 10% step from
@@ -127,6 +140,8 @@ impl AbrConfig {
             rtt_low: Duration::from_millis(60),
             healthy_samples_for_step_up: 3,
             bitrate_step_pct: 10,
+            bitrate_fast_step_pct: 25,
+            fast_climb_steps: 4,
             fps_step_up_pct: 25,
             cooldown: Duration::from_secs(3),
         }
@@ -233,6 +248,12 @@ pub struct AbrController {
     bitrate: Gear,
     fps: Gear,
     healthy_run: HealthyRun,
+    /// Remaining fast-climb step-ups after a collapse. Decremented
+    /// on each step-up; reset to `cfg.fast_climb_steps` on every
+    /// step-down or collapse. Lets the climb take wider steps for
+    /// the first few healthy windows after a fall, then narrow to
+    /// the steady-state rate.
+    fast_climb_budget: u32,
 }
 
 impl AbrController {
@@ -242,6 +263,7 @@ impl AbrController {
             bitrate: Gear::new(cfg.baseline_kbps, cfg.floor_kbps, cfg.baseline_kbps),
             fps: Gear::new(cfg.baseline_fps, cfg.floor_fps, cfg.baseline_fps),
             healthy_run: HealthyRun::default(),
+            fast_climb_budget: 0,
             cfg,
         }
     }
@@ -283,14 +305,30 @@ impl AbrController {
             // window before we step up. No cooldown gate on a fall:
             // latency suffers if we hesitate.
             self.bitrate.collapse_to_floor();
+            // Refill the fast-climb budget: the next few healthy
+            // windows will take wider steps back up.
+            self.fast_climb_budget = self.cfg.fast_climb_steps;
         } else if congested && cooled(&self.bitrate) {
             // Sustained high RTT without loss yet — back off gently.
             self.bitrate.step_down_pct(self.cfg.bitrate_step_pct);
+            self.fast_climb_budget = self.cfg.fast_climb_steps;
         } else if healthy
             && cooled(&self.bitrate)
             && self.healthy_run.consecutive >= self.cfg.healthy_samples_for_step_up
         {
-            self.bitrate.step_up_pct(self.cfg.bitrate_step_pct);
+            // Asymmetric climb: spend the fast-climb budget first,
+            // then narrow to the steady-state percentage. The
+            // budget is drained one step per healthy cooldown
+            // window, so a transient collapse → 1.5 Mbps reaches
+            // ~3.66 Mbps after 4 fast steps (~12 s of healthy
+            // windows) before throttling back to 10% steps.
+            let pct = if self.fast_climb_budget > 0 {
+                self.fast_climb_budget = self.fast_climb_budget.saturating_sub(1);
+                self.cfg.bitrate_fast_step_pct
+            } else {
+                self.cfg.bitrate_step_pct
+            };
+            self.bitrate.step_up_pct(pct);
         }
 
         // --- FPS gear ---
@@ -400,6 +438,54 @@ mod tests {
             "expected step up, got {}",
             d.target_kbps
         );
+    }
+
+    #[test]
+    fn fast_climb_takes_wider_steps_after_collapse() {
+        let mut c = ctl();
+        c.observe(Duration::from_secs(1), loss_burst());
+        assert_eq!(c.current().target_kbps, 1_500);
+
+        // Build streak to 3 — the third healthy observe is the
+        // first eligible step (cooldown elapsed + streak met).
+        // After that, each healthy(4s) observe drives one step.
+        // First 4 step-ups at 25%, then 5th at steady-state 10%.
+        c.observe(Duration::from_secs(4), healthy()); // streak=1, no step
+        c.observe(Duration::from_millis(500), healthy()); // streak=2, no step
+        let s1 = c.observe(Duration::from_millis(500), healthy()).target_kbps; // streak=3 → fires
+        let s2 = c.observe(Duration::from_secs(4), healthy()).target_kbps;
+        let s3 = c.observe(Duration::from_secs(4), healthy()).target_kbps;
+        let s4 = c.observe(Duration::from_secs(4), healthy()).target_kbps;
+        let s5 = c.observe(Duration::from_secs(4), healthy()).target_kbps;
+        assert_eq!(s1, 1_875, "1st step at 25%: 1500 * 1.25");
+        assert_eq!(s2, 2_343, "2nd step at 25%");
+        assert_eq!(s3, 2_928, "3rd step at 25%");
+        assert_eq!(s4, 3_660, "4th step at 25%: budget exhausted");
+        assert_eq!(s5, 4_026, "5th step narrows to steady-state 10%");
+    }
+
+    #[test]
+    fn fast_climb_budget_reset_on_subsequent_collapse() {
+        let mut c = ctl();
+        c.observe(Duration::from_secs(1), loss_burst());
+        // Burn one fast-step.
+        c.observe(Duration::from_secs(4), healthy());
+        c.observe(Duration::from_millis(500), healthy());
+        let after_first_fast = c
+            .observe(Duration::from_millis(500), healthy())
+            .target_kbps;
+        assert!(after_first_fast > 1_500);
+        // Second collapse mid-climb.
+        c.observe(Duration::from_secs(4), loss_burst());
+        assert_eq!(c.current().target_kbps, 1_500);
+        // Fast-climb budget should be refilled; next eligible step
+        // fires at 25%.
+        c.observe(Duration::from_secs(4), healthy());
+        c.observe(Duration::from_millis(500), healthy());
+        let s1 = c
+            .observe(Duration::from_millis(500), healthy())
+            .target_kbps;
+        assert_eq!(s1, 1_875, "post-second-collapse step should be fast (25%)");
     }
 
     #[test]

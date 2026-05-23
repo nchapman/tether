@@ -156,6 +156,12 @@ async fn main() -> anyhow::Result<()> {
                     Ok(ControlMessage::ForceIdr) => {
                         tracing::trace!("host sent ForceIdr (no-op on client)");
                     }
+                    Ok(ControlMessage::RequestRecovery { .. }) => {
+                        // Client never receives RequestRecovery — it's
+                        // a client→host signal. A host that ever sends
+                        // it is misbehaving; log and ignore.
+                        tracing::warn!("host sent RequestRecovery (wrong direction); ignoring");
+                    }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
                         let t1 = MonoNanos::now();
                         let response = ControlMessage::ClockProbeResponse(
@@ -284,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
         decoder_ready_tx,
     );
 
+    let conn_for_recovery_send = conn.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
         if decoder_ready_rx.await.is_err() {
@@ -322,6 +329,17 @@ async fn main() -> anyhow::Result<()> {
         // per-interval drop and fragment-loss rates for ClientStats.
         let mut last_frames_dropped: u64 = 0;
         let mut last_fragments_lost: u64 = 0;
+        // Most-recent successfully-reassembled frame_seq. Quoted in
+        // RequestRecovery when the reassembler observes a stale
+        // drop, so the host knows the earliest reference we still
+        // trust. `frame_seq` (wire counter) stands in for the V2
+        // envelope's `reference_id` until the host stamps it.
+        let mut last_known_good_frame_seq: Option<u32> = None;
+        // Last time we emitted a RequestRecovery. Rate-limits the
+        // signal to one every IDR_RATE_LIMIT (500 ms) so a burst
+        // of drops collapses into a single recovery action — same
+        // cadence the decoder thread's auto-IDR uses.
+        let mut last_request_recovery_at: Option<MonoNanos> = None;
         // Sum of decode call wall-clocks across the frames in the
         // current log window, surfaced as avg_decode_ms on the
         // frame-stats line. Same shape as the host's avg_encode_ms
@@ -423,7 +441,59 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let Some(frame) = reassembler.handle(packet) else { continue };
+            // Snapshot loss counters around the handle() so we can
+            // see if this packet's processing pruned any in-flight
+            // frame. A non-zero delta means the reassembler just
+            // gave up on a frame whose fragments will never
+            // complete — the soonest possible loss signal, well
+            // before the decoder thread would ever notice.
+            //
+            // False positive note: a `prune_old` eviction of an
+            // *unrelated* frame on this handle() also increments
+            // the counter, so this is an over-trigger. The cost is
+            // an extra RequestRecovery (which collapses to a forced
+            // IDR in Phase 1; the rate limit caps the rate). Phase
+            // 2 should scope the trigger to the specific frame
+            // we're touching by tracking per-frame counters if the
+            // reassembler grows that API.
+            let pre_loss = reassembler.loss_counters();
+            let result = reassembler.handle(packet);
+            let post_loss = reassembler.loss_counters();
+            let new_loss = post_loss.0 > pre_loss.0 || post_loss.1 > pre_loss.1;
+            if new_loss {
+                if let Some(last_good) = last_known_good_frame_seq {
+                    let now = MonoNanos::now();
+                    let rate_limit_ns = 500_000_000u64;
+                    let fire = last_request_recovery_at
+                        .is_none_or(|t| now.saturating_sub(t) > rate_limit_ns);
+                    if fire {
+                        last_request_recovery_at = Some(now);
+                        let send_conn = conn_for_recovery_send.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = send_conn
+                                .send_control(&ControlMessage::RequestRecovery {
+                                    last_known_good_frame_id: last_good,
+                                })
+                                .await
+                            {
+                                tracing::debug!(
+                                    error = ?e,
+                                    "RequestRecovery send failed; host will fall back to its own auto-IDR"
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+            let Some(frame) = result else { continue };
+            // TODO(LTR Phase 2): once the host stamps `reference_id`
+            // in VideoFrameMetaEnvelope::V2, replace `frame.frame_seq`
+            // with `frame.meta.reference_id().unwrap_or(frame_seq)`
+            // so the RequestRecovery field carries the encoder's
+            // stable reference number (the wire frame_seq counter
+            // restarts on every stream-epoch bump, which would
+            // confuse the host's LTR invalidate logic).
+            last_known_good_frame_seq = Some(frame.frame_seq);
             let now = MonoNanos::now();
             // Host timestamps -> client clock via the handshake
             // offset. host_in_client_clock is the moment the

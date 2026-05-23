@@ -136,6 +136,17 @@ pub struct VideoFrameMeta {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoFrameMetaEnvelope {
     V1(VideoFrameMeta),
+    /// V2 adds `reference_id`: a monotonically-increasing counter the
+    /// host stamps each emitted frame with. The client tracks the
+    /// most recent successfully-decoded `reference_id` and quotes it
+    /// in [`crate::control::ControlMessage::RequestRecovery`] when
+    /// the reassembler observes a stale-dropped fragment. The host
+    /// uses the id to invalidate newer references and re-predict
+    /// from an LTR (when LTR plumbing lands) or fall back to IDR.
+    V2 {
+        meta: VideoFrameMeta,
+        reference_id: u32,
+    },
 }
 
 impl VideoFrameMetaEnvelope {
@@ -147,6 +158,19 @@ impl VideoFrameMetaEnvelope {
     pub fn into_meta(self) -> VideoFrameMeta {
         match self {
             Self::V1(m) => m,
+            Self::V2 { meta, .. } => meta,
+        }
+    }
+
+    /// `reference_id` if the envelope carries one. `V1` returns
+    /// `None`; `V2`+ returns `Some` with the host-stamped id. The
+    /// client uses this for LTR-style recovery requests; older
+    /// clients ignore it without harm.
+    #[must_use]
+    pub fn reference_id(&self) -> Option<u32> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2 { reference_id, .. } => Some(*reference_id),
         }
     }
 }

@@ -556,6 +556,22 @@ pub enum GoodbyeCode {
 pub enum ControlMessage {
     /// Client requests an immediate IDR (e.g., after detected packet loss).
     ForceIdr,
+    /// Client → host. Loss-driven recovery request. Names the most
+    /// recent frame the client successfully decoded; the host should
+    /// invalidate any newer references it might be relying on and
+    /// emit the next P-frame predicted against an earlier still-good
+    /// reference (Long-Term Reference path) or, when no usable LTR
+    /// is available, fall back to a fresh IDR.
+    ///
+    /// Today the host always falls back to IDR (the LTR plumbing on
+    /// the VAAPI encoder is a Phase 2 follow-up). Even with the
+    /// fallback, this message is a latency win over waiting for the
+    /// next decoder-driven `ForceIdr`: the client signals as soon as
+    /// the reassembler observes a stale-dropped fragment, before
+    /// the decoder even gets a chance to fail.
+    RequestRecovery {
+        last_known_good_frame_id: u32,
+    },
     /// Periodic clock-sync re-probe (either side may initiate).
     ClockProbeRequest { t0_sender: MonoNanos },
     ClockProbeResponse(ClockProbe),

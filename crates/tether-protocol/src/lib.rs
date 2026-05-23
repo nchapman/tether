@@ -704,6 +704,67 @@ mod tests {
     }
 
     #[test]
+    fn videoframe_meta_envelope_v2_round_trip_carries_reference_id() {
+        // V2 must round-trip and surface reference_id via the
+        // accessor; V1 returns None for the same accessor (forward-
+        // compat hatch — clients on the V1-only wire still parse
+        // and ignore the new field).
+        let v2 = VideoFrameMetaEnvelope::V2 {
+            meta: default_meta(),
+            reference_id: 7777,
+        };
+        let bytes = encode(&v2).unwrap();
+        let v2b: VideoFrameMetaEnvelope = decode(&bytes).unwrap();
+        assert_eq!(v2b.reference_id(), Some(7777));
+        assert_eq!(v2b.clone().into_meta().dimensions, (640, 480));
+        let v1 = VideoFrameMetaEnvelope::V1(default_meta());
+        assert_eq!(v1.reference_id(), None);
+    }
+
+    #[test]
+    fn video_packet_first_with_v2_meta_round_trips() {
+        // VideoPacket::First carries the envelope verbatim; a V2
+        // envelope must serialize/deserialize as part of a complete
+        // First packet, including the reference_id reaching the
+        // reassembler.
+        let env = VideoFrameMetaEnvelope::V2 {
+            meta: default_meta(),
+            reference_id: 5555,
+        };
+        let p = VideoPacket::First {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 1,
+            fragment_count: 1,
+            meta: env,
+            payload: bytes::Bytes::from(vec![0xaa; 128]),
+        };
+        let bytes = encode(&p).unwrap();
+        let p2: VideoPacket = decode(&bytes).unwrap();
+        match p2 {
+            VideoPacket::First { meta, .. } => {
+                assert_eq!(meta.reference_id(), Some(5555));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn request_recovery_control_message_round_trips() {
+        let m = ControlMessage::RequestRecovery {
+            last_known_good_frame_id: 12345,
+        };
+        let bytes = encode(&m).unwrap();
+        let m2: ControlMessage = decode(&bytes).unwrap();
+        match m2 {
+            ControlMessage::RequestRecovery {
+                last_known_good_frame_id,
+            } => assert_eq!(last_known_good_frame_id, 12345),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn videoframe_meta_envelope_round_trip() {
         // The envelope discriminator is the load-bearing addition:
         // future per-frame metadata (HDR, ROI, QP) lands as new

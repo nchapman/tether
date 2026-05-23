@@ -81,6 +81,15 @@ struct Params {
     dst_w: u32,
     dst_h: u32,
     n_taps: u32,
+    // Sample-position offset (in source-pixel units) added to the
+    // computed kernel center. For Y planes and the legacy RGB paths,
+    // this is zero. For UV planes in NV12-with-left-cosited-chroma,
+    // the host passes `-(scale - 1) * 0.5` on the appropriate axis so
+    // the dst chroma grid lines up with the dst luma grid — without
+    // it, naive plane-independent Mitchell shifts UV by half a luma
+    // pixel and text edges fringe colour.
+    chroma_offset_x: f32,
+    chroma_offset_y: f32,
     _pad: u32,
 };
 
@@ -96,7 +105,7 @@ fn horizontal(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let scale = f32(params_h.src_w) / f32(params_h.dst_w);
     let support = max(scale, 1.0);
-    let center = (f32(gid.x) + 0.5) * scale - 0.5;
+    let center = (f32(gid.x) + 0.5) * scale - 0.5 + params_h.chroma_offset_x;
     let half_taps = i32(params_h.n_taps / 2u);
     let i0 = i32(floor(center)) - half_taps + 1;
     var sum = vec3<f32>(0.0);
@@ -129,7 +138,7 @@ fn vertical(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let scale = f32(params_v.src_h) / f32(params_v.dst_h);
     let support = max(scale, 1.0);
-    let center = (f32(gid.y) + 0.5) * scale - 0.5;
+    let center = (f32(gid.y) + 0.5) * scale - 0.5 + params_v.chroma_offset_y;
     let half_taps = i32(params_v.n_taps / 2u);
     let i0 = i32(floor(center)) - half_taps + 1;
     var sum = vec3<f32>(0.0);
@@ -167,7 +176,7 @@ fn horizontal_linear(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let scale = f32(params_h_lin.src_w) / f32(params_h_lin.dst_w);
     let support = max(scale, 1.0);
-    let center = (f32(gid.x) + 0.5) * scale - 0.5;
+    let center = (f32(gid.x) + 0.5) * scale - 0.5 + params_h_lin.chroma_offset_x;
     let half_taps = i32(params_h_lin.n_taps / 2u);
     let i0 = i32(floor(center)) - half_taps + 1;
     var sum = vec3<f32>(0.0);
@@ -194,7 +203,7 @@ fn vertical_linear(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let scale = f32(params_v_lin.src_h) / f32(params_v_lin.dst_h);
     let support = max(scale, 1.0);
-    let center = (f32(gid.y) + 0.5) * scale - 0.5;
+    let center = (f32(gid.y) + 0.5) * scale - 0.5 + params_v_lin.chroma_offset_y;
     let half_taps = i32(params_v_lin.n_taps / 2u);
     let i0 = i32(floor(center)) - half_taps + 1;
     var sum = vec3<f32>(0.0);
@@ -208,6 +217,78 @@ fn vertical_linear(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let ws = select(weight_sum, 1.0, abs(weight_sum) < 1e-6);
     textureStore(dst_v_lin, vec2<i32>(gid.xy), vec4<f32>(sum / ws, 1.0));
+}
+
+// === YUV plane vertical passes ===
+//
+// The horizontal pass for Y and UV planes reuses `horizontal_linear`:
+// `texture_2d<f32>` sampling on an R8Unorm source returns (r, 0, 0)
+// and on Rg8Unorm returns (r, g, 0), and the intermediate is the same
+// Rgba16Float used by every other path. Only the *vertical* pass
+// differs because the destination format is scalar R8Unorm (Y plane)
+// or two-channel Rg8Unorm (UV plane).
+//
+// Both entry points read the same Rgba16Float intermediate (samples
+// 3 channels but only the first 1 or 2 are meaningful) and store the
+// relevant channels back. No transfer function: NV12 planes are
+// already in the encoded domain VT expects (limited-range BT.709 Y or
+// UV); Mitchell on gamma-encoded Y is mathematically imperfect but
+// visually fine at 8-bit and is the project trade-off (see plan).
+
+@group(0) @binding(0) var src_v_plane_r: texture_2d<f32>;
+@group(0) @binding(1) var dst_v_plane_r: texture_storage_2d<r8unorm, write>;
+@group(0) @binding(2) var<uniform> params_v_plane_r: Params;
+
+@compute @workgroup_size(8, 8, 1)
+fn vertical_plane_r(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params_v_plane_r.dst_w || gid.y >= params_v_plane_r.dst_h) {
+        return;
+    }
+    let scale = f32(params_v_plane_r.src_h) / f32(params_v_plane_r.dst_h);
+    let support = max(scale, 1.0);
+    let center = (f32(gid.y) + 0.5) * scale - 0.5 + params_v_plane_r.chroma_offset_y;
+    let half_taps = i32(params_v_plane_r.n_taps / 2u);
+    let i0 = i32(floor(center)) - half_taps + 1;
+    var sum = 0.0;
+    var weight_sum = 0.0;
+    for (var k: u32 = 0u; k < params_v_plane_r.n_taps; k = k + 1u) {
+        let y = i0 + i32(k);
+        let yc = clamp(y, 0, i32(params_v_plane_r.src_h) - 1);
+        let w = mitchell((f32(y) - center) / support);
+        sum = sum + textureLoad(src_v_plane_r, vec2<i32>(i32(gid.x), yc), 0).r * w;
+        weight_sum = weight_sum + w;
+    }
+    let ws = select(weight_sum, 1.0, abs(weight_sum) < 1e-6);
+    let v = clamp(sum / ws, 0.0, 1.0);
+    textureStore(dst_v_plane_r, vec2<i32>(gid.xy), vec4<f32>(v, 0.0, 0.0, 1.0));
+}
+
+@group(0) @binding(0) var src_v_plane_rg: texture_2d<f32>;
+@group(0) @binding(1) var dst_v_plane_rg: texture_storage_2d<rg8unorm, write>;
+@group(0) @binding(2) var<uniform> params_v_plane_rg: Params;
+
+@compute @workgroup_size(8, 8, 1)
+fn vertical_plane_rg(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params_v_plane_rg.dst_w || gid.y >= params_v_plane_rg.dst_h) {
+        return;
+    }
+    let scale = f32(params_v_plane_rg.src_h) / f32(params_v_plane_rg.dst_h);
+    let support = max(scale, 1.0);
+    let center = (f32(gid.y) + 0.5) * scale - 0.5 + params_v_plane_rg.chroma_offset_y;
+    let half_taps = i32(params_v_plane_rg.n_taps / 2u);
+    let i0 = i32(floor(center)) - half_taps + 1;
+    var sum = vec2<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var k: u32 = 0u; k < params_v_plane_rg.n_taps; k = k + 1u) {
+        let y = i0 + i32(k);
+        let yc = clamp(y, 0, i32(params_v_plane_rg.src_h) - 1);
+        let w = mitchell((f32(y) - center) / support);
+        sum = sum + textureLoad(src_v_plane_rg, vec2<i32>(i32(gid.x), yc), 0).rg * w;
+        weight_sum = weight_sum + w;
+    }
+    let ws = select(weight_sum, 1.0, abs(weight_sum) < 1e-6);
+    let v = clamp(sum / ws, vec2<f32>(0.0), vec2<f32>(1.0));
+    textureStore(dst_v_plane_rg, vec2<i32>(gid.xy), vec4<f32>(v.x, v.y, 0.0, 1.0));
 }
 
 // === Mip prefilter (2× box downsample, linear-light) ===

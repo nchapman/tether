@@ -73,4 +73,33 @@ pub enum ScalerError {
         expected: (u32, u32),
         got: (u32, u32),
     },
+
+    /// A YUV-plane scaling [`ColorSpace`] ([`ColorSpace::LumaR8`] or
+    /// [`ColorSpace::ChromaRg8`]) was requested, but the `Pipelines`
+    /// handed to the scaler was built without YUV plane support. Use
+    /// [`Pipelines::build_with_plane_storage`] on a device that has
+    /// opted into `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`.
+    #[error(
+        "YUV plane pipelines not built (use Pipelines::build_with_plane_storage \
+         and ensure the device opted into TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)"
+    )]
+    MissingPlanePipelines,
+
+    /// Requested downscale ratio exceeds what the YUV plane path can
+    /// bandlimit without a mip prefilter. The kernel-widening tap
+    /// count saturates at `MAX_TAPS` at ~8× downscale; the YUV path
+    /// skips the box-mipmap stage (no R8 / Rg8 mip shader is wired)
+    /// so we cap the ratio at `MAX_TAPS / 4` to keep the kernel
+    /// honest. Caller should either use a less aggressive viewport
+    /// or wire the missing mip variants.
+    #[error(
+        "YUV plane downscale ratio {ratio:.2} exceeds maximum {max_ratio:.2} \
+         (src={src:?}, dst={dst:?}); the YUV path skips mip prefiltering"
+    )]
+    YuvDownscaleTooLarge {
+        src: (u32, u32),
+        dst: (u32, u32),
+        ratio: f32,
+        max_ratio: f32,
+    },
 }

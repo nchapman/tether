@@ -261,6 +261,108 @@ pub fn mitchell_filter_default(
     mitchell_filter(src, src_w, src_h, dst_w, dst_h, 1.0 / 3.0, 1.0 / 3.0)
 }
 
+/// Linear-light Mitchell-Netravali scaler over a packed N-channel
+/// plane. Used as the CPU reference for the [`crate::Scaler`] YUV
+/// plane paths ([`crate::ColorSpace::LumaR8`] /
+/// [`crate::ColorSpace::ChromaRg8`]).
+///
+/// `channels` is 1 (Y plane) or 2 (interleaved UV plane). No transfer
+/// applied either way — NV12 planes are already in the encoded domain
+/// VT expects, and Mitchell-on-gamma is the project trade-off for
+/// 8-bit YUV planes (see plan).
+///
+/// `chroma_offset` is in *source-pixel* units, added to the kernel
+/// center before clamp/sum — the same uniform the shader receives.
+/// Y planes pass `(0.0, 0.0)`; UV planes pass the cosited-siting
+/// correction.
+///
+/// No mip prefilter — the YUV plane scaler currently relies on the
+/// tap-count widening for downscale > 2× (see `Scaler::scale`).
+///
+/// Panics if `src.len() != src_w * src_h * channels` or any dimension
+/// is zero. Caller validates at the boundary.
+#[must_use]
+pub fn mitchell_filter_plane(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    channels: usize,
+    chroma_offset: (f32, f32),
+) -> Vec<u8> {
+    assert!(src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0);
+    assert!(channels == 1 || channels == 2, "channels must be 1 or 2");
+    assert_eq!(
+        src.len(),
+        (src_w as usize) * (src_h as usize) * channels,
+        "src buffer size mismatch"
+    );
+
+    let (offset_x, offset_y) = chroma_offset;
+    // Horizontal pass → intermediate fp32 at (dst_w × src_h × channels).
+    let scale_x = src_w as f32 / dst_w as f32;
+    let n_taps_x = tap_count(scale_x);
+    let support_x = scale_x.max(1.0);
+    let mut intermediate = vec![0.0_f32; (dst_w as usize) * (src_h as usize) * channels];
+    for y in 0..src_h as usize {
+        for ox in 0..dst_w as usize {
+            let center = (ox as f32 + 0.5) * scale_x - 0.5 + offset_x;
+            let half = (n_taps_x / 2) as i32;
+            let i0 = center.floor() as i32 - half + 1;
+            let mut sum = [0.0_f32; 2];
+            let mut w_sum = 0.0_f32;
+            for k in 0..n_taps_x as i32 {
+                let x = i0 + k;
+                let xc = x.clamp(0, src_w as i32 - 1) as usize;
+                let w = mitchell_weight((x as f32 - center) / support_x, 1.0 / 3.0, 1.0 / 3.0);
+                let off = (y * src_w as usize + xc) * channels;
+                for ch in 0..channels {
+                    sum[ch] += f32::from(src[off + ch]) / 255.0 * w;
+                }
+                w_sum += w;
+            }
+            let ws = if w_sum.abs() < 1e-6 { 1.0 } else { w_sum };
+            let off = (y * dst_w as usize + ox) * channels;
+            for ch in 0..channels {
+                intermediate[off + ch] = sum[ch] / ws;
+            }
+        }
+    }
+
+    // Vertical pass → output u8 at (dst_w × dst_h × channels).
+    let scale_y = src_h as f32 / dst_h as f32;
+    let n_taps_y = tap_count(scale_y);
+    let support_y = scale_y.max(1.0);
+    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * channels];
+    for oy in 0..dst_h as usize {
+        let center = (oy as f32 + 0.5) * scale_y - 0.5 + offset_y;
+        let half = (n_taps_y / 2) as i32;
+        let i0 = center.floor() as i32 - half + 1;
+        for ox in 0..dst_w as usize {
+            let mut sum = [0.0_f32; 2];
+            let mut w_sum = 0.0_f32;
+            for k in 0..n_taps_y as i32 {
+                let y = i0 + k;
+                let yc = y.clamp(0, src_h as i32 - 1) as usize;
+                let w = mitchell_weight((y as f32 - center) / support_y, 1.0 / 3.0, 1.0 / 3.0);
+                let off = (yc * dst_w as usize + ox) * channels;
+                for ch in 0..channels {
+                    sum[ch] += intermediate[off + ch] * w;
+                }
+                w_sum += w;
+            }
+            let ws = if w_sum.abs() < 1e-6 { 1.0 } else { w_sum };
+            let off = (oy * dst_w as usize + ox) * channels;
+            for ch in 0..channels {
+                let v = (sum[ch] / ws).clamp(0.0, 1.0);
+                dst[off + ch] = (v * 255.0 + 0.5) as u8;
+            }
+        }
+    }
+    dst
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

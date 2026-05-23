@@ -22,7 +22,7 @@ use crate::ScalerError;
 pub type PipelineHandle = Arc<Pipelines>;
 
 /// Which colour-space pipeline to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColorSpace {
     /// sRGB-encoded `Rgba8Unorm` input and output. The shader
     /// applies the piecewise sRGB EOTF on read, filters in linear
@@ -45,6 +45,36 @@ pub enum ColorSpace {
     /// fragment shader already emits linear-light values into an
     /// `Rgba16Float` intermediate.
     LinearF16,
+    /// `R8Unorm` (single-channel) plane scaling, no transfer applied.
+    /// Used for the Y plane on the macOS host scaler bridge —
+    /// downscales an NV12 luma plane. Luma siting requires no
+    /// correction (luma samples are pixel-centered on both ends),
+    /// so this variant is a unit struct; the [`ChromaRg8`] sibling
+    /// is what carries the cosited-NV12 chroma offset.
+    ///
+    /// Output format: `R8Unorm` storage. The host device must opt
+    /// into `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`
+    /// and the adapter must advertise `STORAGE_BINDING` on
+    /// `R8Unorm` (Metal always; Vulkan depends on the ICD).
+    ///
+    /// No mip prefilter — for the typical macOS use case
+    /// (capture-vs-viewport ratio ≤ ~2×) the kernel widening
+    /// alone suffices. The [`Scaler::new_with_color_space`] entry
+    /// point rejects ratios that would overflow `MAX_TAPS` for
+    /// the YUV variants.
+    LumaR8,
+    /// `Rg8Unorm` (two-channel) plane scaling, no transfer applied.
+    /// Used for the interleaved UV plane on the macOS host scaler
+    /// bridge — downscales an NV12 chroma plane. `chroma_offset` is
+    /// the cosited-siting correction in *source-pixel* units;
+    /// callers pass `(-(h_scale - 1) * 0.5, 0.0)` for typical macOS
+    /// left-cosited NV12 (see plan, "Chroma siting"). Setting it to
+    /// zero produces visible chroma fringing on text at downscale
+    /// ratios > 1×.
+    ///
+    /// Output format: `Rg8Unorm` storage. Same wgpu feature
+    /// caveats as [`LumaR8`].
+    ChromaRg8 { chroma_offset: (f32, f32) },
 }
 
 impl ColorSpace {
@@ -52,10 +82,24 @@ impl ColorSpace {
         match self {
             Self::Srgb8 => wgpu::TextureFormat::Rgba8Unorm,
             Self::LinearF16 => wgpu::TextureFormat::Rgba16Float,
+            Self::LumaR8 => wgpu::TextureFormat::R8Unorm,
+            Self::ChromaRg8 { .. } => wgpu::TextureFormat::Rg8Unorm,
         }
     }
     fn supports_mip_prefilter(self) -> bool {
         matches!(self, Self::Srgb8)
+    }
+    /// Sample-position offset (in *source-pixel* units) to bake into
+    /// the kernel center. Zero for the RGB paths and the Y plane; the
+    /// caller computes the cosited NV12 chroma correction for UV.
+    fn chroma_offset(self) -> (f32, f32) {
+        match self {
+            Self::Srgb8 | Self::LinearF16 | Self::LumaR8 => (0.0, 0.0),
+            Self::ChromaRg8 { chroma_offset } => chroma_offset,
+        }
+    }
+    fn needs_plane_pipelines(self) -> bool {
+        matches!(self, Self::LumaR8 | Self::ChromaRg8 { .. })
     }
 }
 
@@ -67,6 +111,11 @@ struct Params {
     dst_w: u32,
     dst_h: u32,
     n_taps: u32,
+    // Sample-position offset (source-pixel units) added to the kernel
+    // center. Zero for the RGB paths; UV planes use the cosited-siting
+    // correction. See `ColorSpace::ChromaRg8` docs and the plan.
+    chroma_offset_x: f32,
+    chroma_offset_y: f32,
     _pad: u32,
 }
 
@@ -154,6 +203,34 @@ impl Scaler {
         if dst_dims == src_dims {
             return Err(ScalerError::NoScaleNeeded);
         }
+        // Fail at construction, not at first scale() — a YUV scaler
+        // built without plane pipelines is permanently broken, and
+        // catching it here turns a runtime frame-rate error into a
+        // bridge-init error that names the cause.
+        if color_space.needs_plane_pipelines() && pipelines.plane.is_none() {
+            return Err(ScalerError::MissingPlanePipelines);
+        }
+        // YUV plane paths skip the mip prefilter (would need r8unorm /
+        // rg8unorm mip variants of `mip_box_down`, which we haven't
+        // wired). Without mip prefiltering, tap_count widens with the
+        // downscale ratio and saturates at MAX_TAPS (32) at scale=8.
+        // Reject upfront if the requested ratio would saturate, so
+        // the bridge gets a clean error instead of a silently
+        // bandlimit-failing scaler.
+        if color_space.needs_plane_pipelines() {
+            let scale_x_check = src_dims.0 as f32 / dst_dims.0 as f32;
+            let scale_y_check = src_dims.1 as f32 / dst_dims.1 as f32;
+            let max_ratio = (MAX_TAPS as f32) / 4.0;
+            let ratio = scale_x_check.max(scale_y_check);
+            if ratio > max_ratio {
+                return Err(ScalerError::YuvDownscaleTooLarge {
+                    src: src_dims,
+                    dst: dst_dims,
+                    ratio,
+                    max_ratio,
+                });
+            }
+        }
 
         // Build the mip chain. Each level halves dimensions (round
         // up); stop when both axes are within 2× of dst. Linear-
@@ -222,12 +299,15 @@ impl Scaler {
 
         let scale_x = after_mip_w as f32 / dst_dims.0 as f32;
         let scale_y = after_mip_h as f32 / dst_dims.1 as f32;
+        let (offset_x, offset_y) = color_space.chroma_offset();
         let params_h_data = Params {
             src_w: after_mip_w,
             src_h: after_mip_h,
             dst_w: dst_dims.0,
             dst_h: after_mip_h,
             n_taps: tap_count(scale_x),
+            chroma_offset_x: offset_x,
+            chroma_offset_y: 0.0,
             _pad: 0,
         };
         let params_v_data = Params {
@@ -236,6 +316,8 @@ impl Scaler {
             dst_w: dst_dims.0,
             dst_h: dst_dims.1,
             n_taps: tap_count(scale_y),
+            chroma_offset_x: 0.0,
+            chroma_offset_y: offset_y,
             _pad: 0,
         };
 
@@ -316,9 +398,16 @@ impl Scaler {
             prev_view = tex.create_view(&TextureViewDescriptor::default());
         }
 
-        // Horizontal pass. Same bind-group layout for both colour
-        // spaces (intermediate is Rgba16Float in both); the dispatch
-        // picks the matching shader entry point.
+        // Horizontal pass: the linear-light horizontal entry point
+        // is reused for Srgb8 (via `horizontal`) and for the YUV
+        // plane paths (via `horizontal_linear`, which reads through
+        // `texture_2d<f32>` so an R8/Rg8 source returns its channels
+        // in `.r`/`.rg` automatically; the unused channels read
+        // as zero and contribute nothing to the weighted sum).
+        // The vertical bind-group layout and pipeline diverge across
+        // all four variants because the destination storage format is
+        // different in each (Rgba8Unorm / Rgba16Float / R8Unorm /
+        // Rg8Unorm).
         let (horizontal_pipeline, vertical_pipeline, vertical_bgl) = match self.color_space {
             ColorSpace::Srgb8 => (
                 &self.pipelines.horizontal,
@@ -330,8 +419,36 @@ impl Scaler {
                 &self.pipelines.vertical_linear,
                 &self.pipelines.vertical_linear_bgl,
             ),
+            ColorSpace::LumaR8 { .. } => {
+                let plane = self.pipelines.plane.as_ref().ok_or(
+                    ScalerError::MissingPlanePipelines,
+                )?;
+                (
+                    &self.pipelines.horizontal_linear,
+                    &plane.vertical_plane_r,
+                    &plane.vertical_plane_r_bgl,
+                )
+            }
+            ColorSpace::ChromaRg8 { .. } => {
+                let plane = self.pipelines.plane.as_ref().ok_or(
+                    ScalerError::MissingPlanePipelines,
+                )?;
+                (
+                    &self.pipelines.horizontal_linear,
+                    &plane.vertical_plane_rg,
+                    &plane.vertical_plane_rg_bgl,
+                )
+            }
         };
 
+        // Horizontal BGL is shared between the Srgb8, LinearF16, and
+        // YUV plane paths because every horizontal pipeline writes
+        // the Rgba16Float intermediate. If a future variant ever
+        // writes a different intermediate format, that new pipeline
+        // needs its own horizontal BGL — at which point this
+        // dispatch should grow a match arm. The comment is the
+        // load-bearing reminder; a debug_assert on layout identity
+        // isn't expressible through wgpu's public API today.
         let h_dst_view = self.intermediate.create_view(&TextureViewDescriptor::default());
         let h_bg = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("tether-scaler horizontal bg"),

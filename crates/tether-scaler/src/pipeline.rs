@@ -43,13 +43,56 @@ pub struct Pipelines {
     pub(crate) horizontal_linear: ComputePipeline,
     pub(crate) vertical_linear: ComputePipeline,
     pub(crate) vertical_linear_bgl: BindGroupLayout,
+    // YUV plane vertical passes (host NV12 scaler). Opt-in via
+    // [`Pipelines::build_with_plane_storage`] because R8Unorm and
+    // Rg8Unorm `STORAGE_BINDING` are not in WebGPU core — they
+    // require the device to have opted into
+    // `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` and the adapter to
+    // actually report `STORAGE_BINDING` on those formats. Creating
+    // the bind-group layouts without those preconditions raises a
+    // validation error, so we gate construction behind the
+    // [`PlanePipelines`] sub-struct and leave it `None` for callers
+    // that don't need them (client renderer, default scaler tests).
+    pub(crate) plane: Option<PlanePipelines>,
+}
+
+/// YUV-plane vertical pipelines + bind-group layouts. Constructed
+/// only when [`Pipelines::build_with_plane_storage`] is used. The
+/// horizontal pass for YUV planes reuses `Pipelines::horizontal_linear`
+/// — texture sampling treats R8/Rg8 sources transparently, only the
+/// destination storage format forces a new vertical entry point.
+pub(crate) struct PlanePipelines {
+    pub(crate) vertical_plane_r: ComputePipeline,
+    pub(crate) vertical_plane_r_bgl: BindGroupLayout,
+    pub(crate) vertical_plane_rg: ComputePipeline,
+    pub(crate) vertical_plane_rg_bgl: BindGroupLayout,
 }
 
 impl Pipelines {
-    /// Compile the shader and build all three pipelines + their bind-
-    /// group layouts. Caller wraps in `Arc` and reuses across
-    /// `Scaler::new` calls — see crate-level docs.
+    /// Compile the shader and build the core pipelines + their
+    /// bind-group layouts (sRGB and linear-light RGB paths). Caller
+    /// wraps in `Arc` and reuses across `Scaler::new` calls — see
+    /// crate-level docs.
+    ///
+    /// For the macOS host's NV12 YUV-plane scaler, use
+    /// [`Pipelines::build_with_plane_storage`] instead — that adds the
+    /// R8Unorm / Rg8Unorm vertical pipelines this constructor omits.
     pub fn build(device: &Device) -> Self {
+        Self::build_internal(device, false)
+    }
+
+    /// Like [`Pipelines::build`] but also constructs the YUV-plane
+    /// vertical pipelines used by [`crate::ColorSpace::LumaR8`] /
+    /// [`crate::ColorSpace::ChromaRg8`]. The device must have opted
+    /// into `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` and
+    /// the adapter must advertise `STORAGE_BINDING` support on
+    /// R8Unorm/Rg8Unorm (Metal always; Vulkan depends on the ICD) —
+    /// otherwise bind-group-layout creation will validation-error.
+    pub fn build_with_plane_storage(device: &Device) -> Self {
+        Self::build_internal(device, true)
+    }
+
+    fn build_internal(device: &Device, with_plane_storage: bool) -> Self {
         let module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("tether-scaler shader"),
             source: ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -120,6 +163,47 @@ impl Pipelines {
             cache: None,
         });
 
+        // YUV plane vertical entry points. Built only when opted in
+        // via `build_with_plane_storage` — see [`Pipelines::plane`]
+        // for the rationale (R8Unorm / Rg8Unorm storage isn't in
+        // WebGPU core and would validation-error on a default device).
+        let plane = if with_plane_storage {
+            let (vertical_plane_r_bgl, vertical_plane_r_layout) = build_mitchell_layout(
+                device,
+                "tether-scaler vertical_plane_r bgl",
+                TextureFormat::R8Unorm,
+            );
+            let vertical_plane_r = device.create_compute_pipeline(&ComputePipelineDescriptor {
+                label: Some("tether-scaler vertical_plane_r"),
+                layout: Some(&vertical_plane_r_layout),
+                module: &module,
+                entry_point: Some("vertical_plane_r"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let (vertical_plane_rg_bgl, vertical_plane_rg_layout) = build_mitchell_layout(
+                device,
+                "tether-scaler vertical_plane_rg bgl",
+                TextureFormat::Rg8Unorm,
+            );
+            let vertical_plane_rg = device.create_compute_pipeline(&ComputePipelineDescriptor {
+                label: Some("tether-scaler vertical_plane_rg"),
+                layout: Some(&vertical_plane_rg_layout),
+                module: &module,
+                entry_point: Some("vertical_plane_rg"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            Some(PlanePipelines {
+                vertical_plane_r,
+                vertical_plane_r_bgl,
+                vertical_plane_rg,
+                vertical_plane_rg_bgl,
+            })
+        } else {
+            None
+        };
+
         Self {
             horizontal,
             horizontal_bgl,
@@ -130,6 +214,7 @@ impl Pipelines {
             horizontal_linear,
             vertical_linear,
             vertical_linear_bgl,
+            plane,
         }
     }
 }

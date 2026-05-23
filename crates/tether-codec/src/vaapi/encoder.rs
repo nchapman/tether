@@ -269,10 +269,42 @@ impl VaapiEncoder {
         // safest broadly-supported value across drivers; the encoder
         // defaults to High for H.264, which fails to open on hardware
         // that only exposes Main for the chosen entrypoint.
-        let dict_builder = AVDictionary::new(c"async_depth", c"1", 0)
+        let mut dict_builder = AVDictionary::new(c"async_depth", c"1", 0)
             .set(c"rc_mode", c"VBR", 0)
             .set(c"idr_interval", c"2147483647", 0)
             .set(c"sei", c"0", 0);
+
+        // Intra refresh: spreads intra-coded macroblocks across a
+        // refresh period instead of one oversized IDR. Reads
+        // `TETHER_INTRA_REFRESH_PERIOD` (frame count) on every
+        // encoder construction. Off by default — VAAPI driver
+        // support is uneven (Intel iHD, Mesa, AMD all differ) and
+        // we don't have a capability probe yet, so the safe
+        // default is "stay on the current IDR-only path." A user
+        // with the right hardware sets the env var to opt in.
+        //
+        // libavcodec's encoder-private names: `intra_refresh` (h264
+        // / hevc VAAPI). The option is silently ignored when the
+        // driver doesn't recognise it — `open()` returns the
+        // leftover dict entries via the warn-on-unused-keys path
+        // below, so a typo or missing driver support surfaces
+        // loudly in the logs.
+        //
+        // SEI recovery-point emission and hardware round-trip
+        // tests are deferred to the Phase 2 follow-up.
+        if let Ok(period_str) = std::env::var("TETHER_INTRA_REFRESH_PERIOD") {
+            if let Ok(period) = period_str.parse::<u32>() {
+                if period > 0 {
+                    let period_cstr = std::ffi::CString::new(period.to_string())
+                        .expect("integer string has no NULs");
+                    dict_builder = dict_builder.set(c"intra_refresh", period_cstr.as_c_str(), 0);
+                    tracing::info!(
+                        period,
+                        "intra refresh enabled via TETHER_INTRA_REFRESH_PERIOD (untested on hardware as of this writing)"
+                    );
+                }
+            }
+        }
         let dict = match (chroma, bit_depth) {
             // 4:2:0 8-bit: pin Main profile via AVOption — broadly
             // compatible default the encoder picks up regardless of

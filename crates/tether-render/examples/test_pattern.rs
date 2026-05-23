@@ -34,6 +34,7 @@ fn main() -> anyhow::Result<()> {
         ChromaSubsampling::Yuv420,
         8,
         frames,
+        tether_render::CursorChannel::new(),
         None,
     )?;
     Ok(())

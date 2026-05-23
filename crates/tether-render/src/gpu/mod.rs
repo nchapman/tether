@@ -195,11 +195,20 @@ pub(crate) struct GpuState {
     ///   pass 2 (optional): Mitchell upscale `rgb_intermediate` → `scaler.output()`.
     ///   pass 3: blit (`rgb_intermediate` or `scaler.output()`) to the
     ///           swapchain with letterbox.
+    ///   pass 4 (optional): cursor overlay sprite on top of the blit
+    ///           output. Skipped when no sprite is active or the
+    ///           cursor is hidden / in relative-locked mode.
     /// Building the intermediate + blit pipeline up-front avoids
     /// per-frame allocation; the Mitchell scaler is built lazily on
     /// the first frame that calls for upscale and rebuilt on window
     /// resize (or video-dims change).
     upscale: UpscaleStage,
+    /// Cursor overlay pass + shared cursor state. The state is held
+    /// behind an `Arc<Mutex<_>>` so the client's wire-receive task can
+    /// write to it from another thread while the renderer reads each
+    /// frame.
+    cursor_overlay: crate::cursor_overlay::CursorOverlay,
+    cursor_channel: crate::cursor_overlay::CursorChannel,
 }
 
 /// Holds the resources for the multi-pass present pipeline.
@@ -412,6 +421,7 @@ impl GpuState {
         color_space: VideoColorSpec,
         chroma: ChromaSubsampling,
         bit_depth: u8,
+        cursor_channel: crate::cursor_overlay::CursorChannel,
     ) -> Result<Self> {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
@@ -572,6 +582,7 @@ impl GpuState {
             color_space,
             chroma,
             bit_depth,
+            cursor_channel,
             #[cfg(target_os = "linux")]
             dmabuf_import_supported,
             #[cfg(target_os = "macos")]
@@ -598,6 +609,10 @@ impl GpuState {
         chroma: ChromaSubsampling,
         bit_depth: u8,
     ) -> Result<Self> {
+        // Headless test harness has no wire-side producer of cursor
+        // events; instantiate a detached `CursorChannel` so the pass
+        // exists but never draws.
+        let cursor_channel = crate::cursor_overlay::CursorChannel::new();
         // Match the production swapchain format: production picks an
         // sRGB-encoded BGRA format from `surface_caps.formats` via
         // `is_srgb()`. The blit pipeline writes linear values to this
@@ -651,6 +666,7 @@ impl GpuState {
             color_space,
             chroma,
             bit_depth,
+            cursor_channel,
             #[cfg(target_os = "linux")]
             dmabuf_import_supported,
             #[cfg(target_os = "macos")]
@@ -671,6 +687,7 @@ impl GpuState {
         color_space: VideoColorSpec,
         chroma: ChromaSubsampling,
         bit_depth: u8,
+        cursor_channel: crate::cursor_overlay::CursorChannel,
         #[cfg(target_os = "linux")] dmabuf_import_supported: bool,
         #[cfg(target_os = "macos")] metal_import_supported: bool,
     ) -> Result<Self> {
@@ -986,6 +1003,8 @@ impl GpuState {
             identity_scale_bind_group,
         };
 
+        let cursor_overlay = crate::cursor_overlay::CursorOverlay::new(&device, format);
+
         Ok(Self {
             target,
             device,
@@ -1006,6 +1025,8 @@ impl GpuState {
             #[cfg(target_os = "macos")]
             metal_import_supported,
             upscale,
+            cursor_overlay,
+            cursor_channel,
         })
     }
 
@@ -1442,6 +1463,30 @@ impl GpuState {
             pass.set_bind_group(1, &self.scale_bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
+
+        // Pass 4: cursor overlay on top of the blit output. The pass
+        // is a no-op when no sprite is active, the cursor is hidden,
+        // or relative-locked mode is on — `CursorOverlay::render`
+        // bails before touching the encoder in those cases. The
+        // letterbox-fit rect inside the window is computed from the
+        // same `(sx, sy)` the blit pass used so the sprite lands in
+        // the exact pixel rect covered by the video.
+        #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let fit_dims = (
+            ((surface_dims.0 as f32) * sx).round() as u32,
+            ((surface_dims.1 as f32) * sy).round() as u32,
+        );
+        self.cursor_overlay.render(
+            &mut encoder,
+            &self.device,
+            &self.queue,
+            target_view,
+            &self.cursor_channel,
+            video_dims,
+            surface_dims,
+            fit_dims,
+        );
+
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Drop the previously-retired textures after the *next* submit

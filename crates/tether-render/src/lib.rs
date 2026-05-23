@@ -4,6 +4,7 @@
 //! always wants the most recent picture, not a queued backlog.
 
 pub mod color;
+mod cursor_overlay;
 mod gpu;
 pub mod present_policy;
 pub mod relative_mouse;
@@ -50,6 +51,12 @@ pub use winit::keyboard::{KeyCode, ModifiersState};
 pub use gpu::accepts_iosurface_fourcc;
 
 pub use gpu::supports_10bit_render;
+
+/// Shared cursor state for the overlay render pass. Construct one,
+/// hand a clone to the wire-receive side (call `with(|s| s.set_position(...))`
+/// / `with(|s| s.upload_shape(...))`), pass another clone into
+/// [`run`] which threads it to the renderer.
+pub use cursor_overlay::{CursorChannel, CursorState};
 
 /// One frame ready for display. Either the pixels live in CPU memory
 /// and need an `R8` + `Rg8` upload (the SW decoder path), or they live
@@ -251,6 +258,7 @@ pub fn run(
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
     frames: LatestFrame,
+    cursor_channel: CursorChannel,
     on_event: Option<EventSink>,
 ) -> Result<()> {
     let event_loop = EventLoop::new()?;
@@ -278,6 +286,7 @@ pub fn run(
         relative_accum: relative_mouse::SubPixelAccum::default(),
         ctrl_held: false,
         alt_held: false,
+        cursor_channel,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -330,6 +339,11 @@ struct App {
     /// `G` keydown specifically.
     ctrl_held: bool,
     alt_held: bool,
+    /// Shared cursor state for the overlay render pass. The client's
+    /// wire-receive task writes sprite cache + position; the renderer
+    /// reads each frame. Bypassed when no producer ever fires (the
+    /// existing test_pattern example passes a detached default).
+    cursor_channel: CursorChannel,
 }
 
 #[derive(Default)]
@@ -391,6 +405,12 @@ impl App {
             CursorMode::Relative => CursorMode::Absolute,
         };
         self.cursor_mode = new_mode;
+        // Mirror into the renderer's cursor state so the overlay
+        // pass doesn't draw the host pointer while we're rendering
+        // our own locked pointer locally.
+        self.cursor_channel.with(|state| {
+            state.set_relative_mode(matches!(new_mode, CursorMode::Relative));
+        });
         // Drop sub-pixel residue so stale fractional motion from
         // the prior mode doesn't leak into the first delta.
         self.relative_accum.reset();
@@ -429,6 +449,7 @@ impl ApplicationHandler for App {
             self.color_space,
             self.chroma,
             self.bit_depth,
+            self.cursor_channel.clone(),
         )) {
             Ok(g) => g,
             Err(e) => {

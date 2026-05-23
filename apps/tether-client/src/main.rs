@@ -144,12 +144,19 @@ async fn main() -> anyhow::Result<()> {
     // another.
     let frames = LatestFrame::new();
 
+    // Shared cursor state. The control-stream task uploads sprites
+    // and activates the current shape; the datagram-recv task pushes
+    // position updates; the renderer's overlay pass reads each
+    // frame. Cloned through to all three consumers (cheap `Arc`).
+    let cursor_channel = tether_render::CursorChannel::new();
+
     // Receive-side control loop. Today the host doesn't initiate any
     // typed messages we need to act on, but the Extension escape and
     // future variants (CursorShape, DisplayList, StreamPause/Resume)
     // arrive here, so the loop exists from V1 onward.
     {
         let conn = conn.clone();
+        let cursor_channel_ctrl = cursor_channel.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_control().await {
@@ -200,18 +207,43 @@ async fn main() -> anyhow::Result<()> {
                     Ok(ControlMessage::CursorShape {
                         id, hotspot, width, height, format, pixels,
                     }) => {
-                        info!(
-                            id,
-                            ?hotspot,
-                            width,
-                            height,
-                            ?format,
+                        // The wire pixel format is always Rgba8 today
+                        // (`CursorPixelFormat::Rgba8`). New variants
+                        // would land alongside renderer-side
+                        // conversion; until then we drop unknown
+                        // formats rather than rendering garbage.
+                        use tether_protocol::cursor::CursorPixelFormat;
+                        if !matches!(format, CursorPixelFormat::Rgba8) {
+                            tracing::warn!(
+                                id, ?format, "unsupported cursor pixel format; dropping shape"
+                            );
+                            continue;
+                        }
+                        tracing::debug!(
+                            id, ?hotspot, width, height,
                             pixel_bytes = pixels.len(),
-                            "received cursor shape (overlay rendering not yet implemented)"
+                            "received cursor shape; enqueuing for renderer upload",
                         );
+                        cursor_channel_ctrl.with(|state| {
+                            state.enqueue_shape(
+                                id,
+                                u32::from(width),
+                                u32::from(height),
+                                u32::from(hotspot.0),
+                                u32::from(hotspot.1),
+                                pixels,
+                            );
+                            // The first shape arrives before any
+                            // `CursorUseShape` and before any position
+                            // update; activate it eagerly so the
+                            // overlay starts drawing as soon as the
+                            // first position datagram arrives.
+                            state.activate(id);
+                        });
                     }
                     Ok(ControlMessage::CursorUseShape { id }) => {
                         tracing::debug!(id, "host activated cursor shape");
+                        cursor_channel_ctrl.with(|state| state.activate(id));
                     }
                     Ok(ControlMessage::DisplayList { displays }) => {
                         info!(count = displays.len(), "host display topology");
@@ -254,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
     let recv_clock_sync = clock_sync;
     let decode_profile = negotiated_profile;
     let conn_ready = conn.clone();
+    let cursor_channel_datagram = cursor_channel.clone();
 
     // Decode runs on a dedicated std::thread so a GPU-driver stall
     // (vaSyncSurface, vaExportSurfaceHandle, etc.) inside the
@@ -412,9 +445,20 @@ async fn main() -> anyhow::Result<()> {
                 d = conn_recv.recv_datagram() => {
                     match d {
                         Ok(Datagram::Video(p)) => p,
-                        Ok(Datagram::HostCursor(_)) => {
-                            // Host cursor sprite/position rendering isn't wired
-                            // on this side yet; the wire slot is reserved.
+                        Ok(Datagram::HostCursor(hc)) => {
+                            // Position datagrams ride latest-wins; the
+                            // overlay's render pass reads the most
+                            // recent value each frame.
+                            use tether_protocol::cursor::HostCursorPacket;
+                            match hc {
+                                HostCursorPacket::Position { x, y, visible, .. } => {
+                                    #[allow(clippy::cast_precision_loss)]
+                                    let (xf, yf) = (x as f32, y as f32);
+                                    cursor_channel_datagram.with(|state| {
+                                        state.set_position(xf, yf, visible);
+                                    });
+                                }
+                            }
                             continue;
                         }
                         Ok(Datagram::ClientCursor(_)) => {
@@ -800,6 +844,7 @@ async fn main() -> anyhow::Result<()> {
         negotiated_profile.chroma,
         negotiated_profile.bit_depth,
         frames,
+        cursor_channel,
         Some(on_event),
     )?;
 

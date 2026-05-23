@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
-use screencapturekit::cm::CMSampleBufferExt;
+use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
 use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::prelude::{
     CMSampleBuffer, PixelFormat, SCContentFilter, SCShareableContent, SCStream,
@@ -36,8 +36,8 @@ use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 use tether_protocol::MonoNanos;
 
 use crate::{
-    CaptureError, CapturedFrame, CapturedIOSurface, GpuCapturedFrame, GpuCapturedGuard,
-    GpuCapturedSource, Result,
+    damage::NativeDamage, CaptureError, CapturedFrame, CapturedIOSurface, GpuCapturedFrame,
+    GpuCapturedGuard, GpuCapturedSource, Result,
 };
 
 /// Channel depth matches the Linux path's `CAPTURE_CHANNEL_DEPTH` — small,
@@ -367,7 +367,32 @@ fn build_frame(
         t_capture_kernel,
         t_capture_userspace,
         release_guard: guard,
+        native_damage: sck_native_damage(sample),
     }))
+}
+
+/// Map `SCStreamFrameInfo.status` to our backend-agnostic
+/// [`NativeDamage`]. SCK delivers periodic re-emits with
+/// `Idle`/`Blank`/`Suspended` for liveness; `Complete` and `Started`
+/// are real frames. Missing attachment ⇒ `None`, falls back to hash.
+fn sck_native_damage(sample: &CMSampleBuffer) -> Option<NativeDamage> {
+    let status = sample.frame_status()?;
+    if matches!(status, SCFrameStatus::Stopped) {
+        // Terminal signal — the stream is ending. Convert to idle so
+        // the host stops encoding, and log it so a mid-session
+        // Stopped (which would otherwise be invisible) shows up in
+        // the host log instead of looking like a routine idle.
+        tracing::warn!("SCStreamFrameInfo.Stopped delivered; stream is ending");
+    }
+    Some(NativeDamage {
+        idle: matches!(
+            status,
+            SCFrameStatus::Idle
+                | SCFrameStatus::Blank
+                | SCFrameStatus::Suspended
+                | SCFrameStatus::Stopped
+        ),
+    })
 }
 
 /// The ScreenCaptureKit pixel format the live stream should use to

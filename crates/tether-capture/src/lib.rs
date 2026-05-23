@@ -22,7 +22,7 @@ pub mod test_pattern;
 pub mod test_support;
 
 pub use cursor::{CursorEvent, CursorShapeEvent, CursorSource, PlaceholderCursorSource};
-pub use damage::{DamageHint, DamageSignal, HashDamage};
+pub use damage::{DamageHint, DamageSignal, HashDamage, NativeDamage};
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -80,6 +80,10 @@ pub struct CpuFrame {
     /// Monotonic time at which our userspace code first observed the
     /// frame. Always populated.
     pub t_capture_userspace: MonoNanos,
+    /// Backend-supplied damage hint, when the capture API exposes one.
+    /// `None` means the backend has no opinion; the consumer falls back
+    /// to the hash classifier. See [`damage::NativeDamage`].
+    pub native_damage: Option<damage::NativeDamage>,
 }
 
 /// GPU-resident captured frame. The descriptor varies per platform via
@@ -99,6 +103,8 @@ pub struct GpuCapturedFrame {
     /// internally during `vaCreateSurfaces`) or otherwise no longer
     /// needs the source.
     pub release_guard: GpuCapturedGuard,
+    /// Backend-supplied damage hint; mirrors [`CpuFrame::native_damage`].
+    pub native_damage: Option<damage::NativeDamage>,
 }
 
 /// Per-platform GPU buffer descriptor. Gated on `target_os` so the

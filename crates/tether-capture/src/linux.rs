@@ -28,8 +28,8 @@ use pw::spa;
 use tether_protocol::MonoNanos;
 
 use crate::{
-    CaptureError, CapturedDmaBuf, CapturedFrame, CpuFrame, GpuCapturedFrame, GpuCapturedGuard,
-    GpuCapturedSource, PixelFormat, Result,
+    damage::NativeDamage, CaptureError, CapturedDmaBuf, CapturedFrame, CpuFrame, GpuCapturedFrame,
+    GpuCapturedGuard, GpuCapturedSource, PixelFormat, Result,
 };
 
 // Single-slot hand-off: combined with the drain loop in the `process`
@@ -254,6 +254,10 @@ fn run_pipewire(
             // metric. t_capture_kernel stays equal to this until we read
             // it out of MetaHeader::pts.
             let t = MonoNanos::now();
+            // Read SPA_META_VideoDamage before borrowing the data slice:
+            // `find_meta` takes &self while `datas_mut` takes &mut self,
+            // and Rust's borrow checker won't let them overlap.
+            let native_damage = read_video_damage(&buffer);
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -276,7 +280,7 @@ fn run_pipewire(
 
             let frame = match data.type_() {
                 pw::spa::buffer::DataType::DmaBuf => {
-                    match build_dmabuf_frame(data, user_data, width, height, t) {
+                    match build_dmabuf_frame(data, user_data, width, height, t, native_damage) {
                         Ok(f) => f,
                         Err(e) => {
                             tracing::warn!(error = %e, "DMA-BUF frame build failed");
@@ -330,13 +334,21 @@ fn run_pipewire(
     } else {
         Some(build_format_pod(&dmabuf_modifiers)?)
     };
-    let mut params_storage: Vec<&spa::pod::Pod> = Vec::with_capacity(2);
+    // Ask PipeWire to attach SPA_META_VideoDamage to each buffer. A
+    // server that doesn't advertise the meta simply ignores the
+    // request; the buffer callback's `find_meta` returns None in that
+    // case and the consumer falls back to the hash classifier.
+    let meta_pod_bytes = build_video_damage_meta_pod()?;
+    let meta_pod = spa::pod::Pod::from_bytes(&meta_pod_bytes)
+        .ok_or_else(|| CaptureError::PipeWire("meta pod from_bytes returned None".into()))?;
+    let mut params_storage: Vec<&spa::pod::Pod> = Vec::with_capacity(3);
     if let Some(ref bytes) = dmabuf_pod_bytes {
         params_storage.push(spa::pod::Pod::from_bytes(bytes).ok_or_else(|| {
             CaptureError::PipeWire("dmabuf pod from_bytes returned None".into())
         })?);
     }
     params_storage.push(shm_pod);
+    params_storage.push(meta_pod);
 
     stream.connect(
         spa::utils::Direction::Input,
@@ -564,6 +576,11 @@ fn build_cpu_frame(
         data: packed,
         t_capture_kernel: t,
         t_capture_userspace: t,
+        // SPA_META_VideoDamage isn't useful on the SHM fallback path:
+        // the producer typically only attaches it to DMA-BUF buffers,
+        // and even when present it'd race the memcpy we just did
+        // above. The hash classifier on the CPU path is fast enough.
+        native_damage: None,
     }))
 }
 
@@ -573,6 +590,7 @@ fn build_dmabuf_frame(
     width: u32,
     height: u32,
     t: MonoNanos,
+    native_damage: Option<NativeDamage>,
 ) -> std::result::Result<CapturedFrame, String> {
     let Some(modifier) = user_data.negotiated_modifier else {
         return Err("DMA-BUF buffer arrived but no modifier was negotiated".into());
@@ -636,7 +654,22 @@ fn build_dmabuf_frame(
         // above. A future refactor that holds the Buffer past callback
         // exit can stash it here.
         release_guard: GpuCapturedGuard::new(()),
+        native_damage,
     }))
+}
+
+/// Snapshot the `SPA_META_VideoDamage` attachment, if any.
+///
+/// PipeWire's contract: when the meta block is present, an empty
+/// region list means "no damage this frame" and a populated list
+/// means damage was reported. Producers that don't attach the meta
+/// at all yield `None`, which the consumer treats as "no opinion"
+/// and falls back to the hash classifier.
+fn read_video_damage(buffer: &pw::buffer::Buffer<'_>) -> Option<NativeDamage> {
+    let meta = buffer.find_meta::<pw::spa::buffer::meta::MetaVideoDamage>()?;
+    Some(NativeDamage {
+        idle: meta.iter().next().is_none(),
+    })
 }
 
 /// Build a `SPA_TYPE_OBJECT_ParamBuffers` pod announcing which buffer
@@ -663,6 +696,67 @@ fn build_buffers_param(data_type_mask: u32) -> Result<Vec<u8>> {
         &pw::spa::pod::Value::Object(obj),
     )
     .map_err(|e| CaptureError::PipeWire(format!("buffers pod serialize: {e:?}")))?
+    .0
+    .into_inner();
+    Ok(bytes)
+}
+
+/// Build the `SPA_TYPE_OBJECT_ParamMeta` pod that subscribes to the
+/// `SPA_META_VideoDamage` block.
+///
+/// The size we declare is the maximum amount of damage metadata we're
+/// willing to receive: `SPA_META_VideoDamage` carries an array of
+/// `spa_meta_region`s plus a trailing sentinel, and `find_meta` reads
+/// whatever the producer wrote within that budget. We cap at 16
+/// regions — well above the per-frame rectangle count any real
+/// compositor emits — and the producer either trims or skips
+/// per-rectangle data accordingly. Our consumer only inspects whether
+/// the list is empty (idle) or non-empty (damaged), so the exact cap
+/// doesn't affect correctness.
+fn build_video_damage_meta_pod() -> Result<Vec<u8>> {
+    let region_size = i32::try_from(std::mem::size_of::<libspa_sys::spa_meta_region>())
+        .expect("spa_meta_region size fits in i32");
+    // 16 regions plus the SPA_META trailer (one zero-region sentinel).
+    let max_regions = 16i32;
+    let meta_size = region_size
+        .checked_mul(max_regions + 1)
+        .expect("damage meta size fits in i32");
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: pw::spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            pw::spa::pod::Property {
+                key: libspa_sys::SPA_PARAM_META_type,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(libspa_sys::SPA_META_VideoDamage)),
+            },
+            pw::spa::pod::Property {
+                key: libspa_sys::SPA_PARAM_META_size,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                // CHOICE_RANGE rather than fixed Int — Sunshine and
+                // pipewire-utils both use the range form here. xdg-
+                // desktop-portal-gnome (and any consumer mirroring
+                // the pod back for negotiation) prefers the range
+                // encoding; a fixed Int silently degrades to
+                // hash-only on stricter producers.
+                value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
+                    pw::spa::utils::Choice::<i32>(
+                        pw::spa::utils::ChoiceFlags::empty(),
+                        pw::spa::utils::ChoiceEnum::<i32>::Range {
+                            default: meta_size,
+                            min: region_size,
+                            max: meta_size,
+                        },
+                    ),
+                )),
+            },
+        ],
+    };
+    let bytes: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(obj),
+    )
+    .map_err(|e| CaptureError::PipeWire(format!("meta pod serialize: {e:?}")))?
     .0
     .into_inner();
     Ok(bytes)

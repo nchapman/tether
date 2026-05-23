@@ -73,6 +73,7 @@ fn generate(width: u32, height: u32, t: u32) -> CapturedFrame {
         data,
         t_capture_kernel: t_capture,
         t_capture_userspace: t_capture,
+        native_damage: None,
     })
 }
 

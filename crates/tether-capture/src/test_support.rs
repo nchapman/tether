@@ -103,6 +103,7 @@ mod tests {
             data: vec![tag; 4 * 4 * 4],
             t_capture_kernel: t,
             t_capture_userspace: t,
+            native_damage: None,
         })
     }
 

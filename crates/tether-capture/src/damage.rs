@@ -24,20 +24,40 @@
 //! never *causes* a frame to be dropped; it only skips frames we've
 //! already proven are duplicates.
 //!
-//! ## Where the platform damage signals fit
+//! ## Native platform damage signals
 //!
 //! Both PipeWire (`SPA_META_VideoDamage`) and ScreenCaptureKit
-//! (`SCFrameStatus.idle` flag) carry per-frame metadata that's
-//! strictly cheaper to consult than any hash. The current bindings
-//! don't surface either signal yet, so this module ships the hash as
-//! the universal default; the [`DamageSignal`] trait exists so a
-//! native-signal implementation can drop in without churning the
-//! caller. See `[[damage_native_signals]]` to wire that follow-up.
+//! (`SCStreamFrameInfo.status`) emit per-frame metadata that's
+//! strictly cheaper to consult than any hash. The capture backends
+//! read those signals and attach a [`NativeDamage`] to each
+//! [`CapturedFrame`] when available. [`HashDamage::classify`] uses
+//! the native idle hint to short-circuit on quiescent desktops where
+//! it's authoritative; the hash stays the universal fallback for
+//! CPU frames the native signal didn't cover and for GPU frames
+//! where idle wasn't reported.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
 use crate::CapturedFrame;
+
+/// Per-frame native damage metadata attached by the capture backend.
+///
+/// PipeWire emits `SPA_META_VideoDamage` whose region list is empty
+/// for an idle frame; ScreenCaptureKit emits
+/// `SCStreamFrameInfo.status` whose `Idle`/`Blank`/`Suspended` values
+/// mean the frame is a periodic liveness re-emit with no visible
+/// change. Both collapse to `idle = true` here.
+///
+/// `Option<NativeDamage>` on a captured frame is the three-state
+/// signal: `None` means the backend had nothing to report (older
+/// PipeWire, missing attachment, CPU SHM path), `Some { idle: false }`
+/// means the backend confirmed real change, `Some { idle: true }`
+/// means the backend confirmed nothing changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeDamage {
+    pub idle: bool,
+}
 
 /// Outcome of [`DamageSignal::classify`] for one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +154,30 @@ impl HashDamage {
     }
 }
 
+/// Native-damage extraction. Free function so callers (and tests)
+/// can reach it without going through `&mut HashDamage`.
+pub fn native_damage_of(frame: &CapturedFrame) -> Option<NativeDamage> {
+    match frame {
+        CapturedFrame::Cpu(f) => f.native_damage,
+        CapturedFrame::Gpu(f) => f.native_damage,
+    }
+}
+
 impl DamageSignal for HashDamage {
     fn classify(&mut self, frame: &CapturedFrame) -> DamageHint {
+        // Trust a native "idle" signal unconditionally — both PW and
+        // SCK only flag idle when *they* observed no compositor
+        // changes since the previous frame, which is a stricter
+        // statement than our hash can make. A native "changed"
+        // signal does NOT short-circuit: on CPU we still want the
+        // hash's bit-identical check (cheap belt-and-suspenders), and
+        // on GPU there's nothing better to fall back to than the hash
+        // we can't run.
+        if let Some(nd) = native_damage_of(frame) {
+            if nd.idle {
+                return DamageHint::Unchanged;
+            }
+        }
         let CapturedFrame::Cpu(cpu) = frame else {
             // GPU-resident frames bypass the hash. See the module
             // doc for the zero-copy rationale.
@@ -158,6 +200,15 @@ mod tests {
     use tether_protocol::MonoNanos;
 
     fn cpu(width: u32, height: u32, fill: u8) -> CapturedFrame {
+        cpu_with(width, height, fill, None)
+    }
+
+    fn cpu_with(
+        width: u32,
+        height: u32,
+        fill: u8,
+        native_damage: Option<NativeDamage>,
+    ) -> CapturedFrame {
         CapturedFrame::Cpu(CpuFrame {
             width,
             height,
@@ -165,6 +216,7 @@ mod tests {
             data: vec![fill; (width * height * 4) as usize],
             t_capture_kernel: MonoNanos::ZERO,
             t_capture_userspace: MonoNanos::ZERO,
+            native_damage,
         })
     }
 
@@ -211,6 +263,30 @@ mod tests {
     /// always go through, even on a bit-identical frame.
     fn should_encode(hint: DamageHint, force_idr_pending: bool) -> bool {
         !matches!(hint, DamageHint::Unchanged) || force_idr_pending
+    }
+
+    #[test]
+    fn native_idle_short_circuits_on_changed_cpu_pixels() {
+        // Native idle is authoritative — the compositor observed no
+        // rendered change, so even if capture bytes differ (double-
+        // buffer aliasing, DMA-BUF slot rotation, format-conversion
+        // rounding) the display did not change and we should skip.
+        let mut d = HashDamage::new();
+        d.classify(&cpu(64, 64, 0));
+        let frame = cpu_with(64, 64, 0xFF, Some(NativeDamage { idle: true }));
+        assert_eq!(d.classify(&frame), DamageHint::Unchanged);
+    }
+
+    #[test]
+    fn native_changed_does_not_block_hash() {
+        // Native says "changed" but the pixels are bit-identical to
+        // the previous frame — the hash still gets the final word
+        // and returns Unchanged. This is the cheap-skip path on the
+        // CPU/SHM fallback when SCK/PW lied about damage.
+        let mut d = HashDamage::new();
+        d.classify(&cpu_with(64, 64, 0, Some(NativeDamage { idle: false })));
+        let frame = cpu_with(64, 64, 0, Some(NativeDamage { idle: false }));
+        assert_eq!(d.classify(&frame), DamageHint::Unchanged);
     }
 
     #[test]

@@ -339,6 +339,25 @@ pub const FEC_SHARD_SIZE: usize = FIRST_PAYLOAD_BUDGET;
 /// addition for sustained >100 Mbps streams.
 pub const FEC_MAX_PRIMARY_SHARDS: usize = 212;
 
+/// Hard ceiling on the per-frame fragment count enforced by
+/// [`FrameReassembler`]. The legitimate sender produces at most
+/// [`FEC_MAX_PRIMARY_SHARDS`] (212) for FEC-protected frames and
+/// roughly `body_len / CONTINUATION_PAYLOAD_BUDGET` for non-FEC P-frames
+/// — at the project's 25 Mbps / 60 fps budget, that's well under 100
+/// fragments per frame. 1024 leaves comfortable headroom for the worst
+/// realistic P-frame while bounding the receive-side allocation that
+/// a forged `fragment_count` could request to ~1.2 MB per crafted
+/// packet (vs. the unbounded GB-scale request the wire format alone
+/// would permit). Above this ceiling the receiver drops the packet
+/// rather than allocating the requested space.
+pub const MAX_FRAGMENTS_PER_FRAME: usize = 1024;
+
+/// Hard ceiling on `VideoPacket::Parity::total_body_len`, in bytes.
+/// Mirrors [`MAX_FRAGMENTS_PER_FRAME`] times the per-fragment payload
+/// budget — the largest body any legitimate sender could possibly
+/// fragment under those rules.
+pub const MAX_FRAME_BODY_BYTES: usize = MAX_FRAGMENTS_PER_FRAME * CONTINUATION_PAYLOAD_BUDGET;
+
 /// Splits a video frame body into a sequence of `VideoPacket`s sized to
 /// fit inside the QUIC datagram budget. Owns the per-stream `frame_seq`
 /// counter; bump `stream_epoch` via [`Self::bump_epoch`] whenever the
@@ -752,6 +771,21 @@ impl FrameReassembler {
     }
 
     pub fn handle(&mut self, packet: VideoPacket) -> Option<ReassembledFrame> {
+        // Wire-level sizing validation. Reject before any allocation —
+        // a forged packet with oversized fragment_count, parity_shards,
+        // or total_body_len would otherwise trigger a multi-MB
+        // `resize_with` / `BytesMut::with_capacity` per malicious
+        // packet, and the pending HashMap stacks them. The legitimate
+        // sender's caps are documented at MAX_FRAGMENTS_PER_FRAME /
+        // MAX_FRAME_BODY_BYTES; anything above that is malformed or
+        // hostile. Bump `fragments_lost` (the existing receive-side
+        // drop counter) so the rejection is observable in metrics.
+        if let Some(reason) = validate_packet_sizing(&packet) {
+            tracing::warn!(reason, "dropping malformed VideoPacket (wire-validation)");
+            self.fragments_lost = self.fragments_lost.saturating_add(1);
+            return None;
+        }
+
         let (display, stream_epoch, frame_seq) = packet.route_key();
 
         let stream_key = (display, stream_epoch);
@@ -1045,5 +1079,182 @@ fn enough_for_rs_decode(pending: &Pending) -> bool {
 fn ensure_capacity(v: &mut Vec<Option<Bytes>>, len: usize) {
     if v.len() < len {
         v.resize_with(len, || None);
+    }
+}
+
+/// Wire-validation guard for [`FrameReassembler::handle`]. Returns
+/// `None` for legitimate packets and `Some(reason)` for any packet
+/// whose declared sizing exceeds the receive-side caps. Called before
+/// any `pending` entry insert or `ensure_capacity` call, so a
+/// rejected packet costs only the deserialisation work — no
+/// `resize_with` or `BytesMut::with_capacity` runs on its claimed
+/// dimensions.
+fn validate_packet_sizing(packet: &VideoPacket) -> Option<&'static str> {
+    match packet {
+        VideoPacket::First { fragment_count, .. } => {
+            if *fragment_count as usize > MAX_FRAGMENTS_PER_FRAME {
+                return Some("First.fragment_count exceeds MAX_FRAGMENTS_PER_FRAME");
+            }
+        }
+        VideoPacket::Continuation {
+            fragment_index, ..
+        } => {
+            if *fragment_index as usize >= MAX_FRAGMENTS_PER_FRAME {
+                return Some("Continuation.fragment_index exceeds MAX_FRAGMENTS_PER_FRAME");
+            }
+        }
+        VideoPacket::Parity {
+            data_shards,
+            parity_shards,
+            shard_index,
+            total_body_len,
+            ..
+        } => {
+            if *data_shards as usize > MAX_FRAGMENTS_PER_FRAME {
+                return Some("Parity.data_shards exceeds MAX_FRAGMENTS_PER_FRAME");
+            }
+            if *parity_shards as usize > MAX_FRAGMENTS_PER_FRAME {
+                return Some("Parity.parity_shards exceeds MAX_FRAGMENTS_PER_FRAME");
+            }
+            if *shard_index >= *parity_shards {
+                return Some("Parity.shard_index out of range");
+            }
+            if *total_body_len as usize > MAX_FRAME_BODY_BYTES {
+                return Some("Parity.total_body_len exceeds MAX_FRAME_BODY_BYTES");
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    fn dummy_envelope() -> VideoFrameMetaEnvelope {
+        VideoFrameMetaEnvelope::V1(VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (128, 128),
+        })
+    }
+
+    #[test]
+    fn validate_rejects_oversized_first_fragment_count() {
+        let packet = VideoPacket::First {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_count: u16::MAX,
+            meta: dummy_envelope(),
+            payload: Bytes::new(),
+        };
+        assert!(validate_packet_sizing(&packet).is_some());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_continuation_index() {
+        let packet = VideoPacket::Continuation {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_index: u16::MAX,
+            payload: Bytes::new(),
+        };
+        assert!(validate_packet_sizing(&packet).is_some());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_parity_shards() {
+        let packet = VideoPacket::Parity {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            data_shards: 1,
+            parity_shards: u16::MAX,
+            shard_index: 0,
+            total_body_len: 1000,
+            meta: dummy_envelope(),
+            payload: Bytes::new(),
+        };
+        assert!(validate_packet_sizing(&packet).is_some());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_total_body_len() {
+        let packet = VideoPacket::Parity {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            data_shards: 1,
+            parity_shards: 1,
+            shard_index: 0,
+            total_body_len: u32::MAX,
+            meta: dummy_envelope(),
+            payload: Bytes::new(),
+        };
+        assert!(validate_packet_sizing(&packet).is_some());
+    }
+
+    #[test]
+    fn validate_rejects_parity_shard_index_out_of_range() {
+        let packet = VideoPacket::Parity {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            data_shards: 1,
+            parity_shards: 2,
+            shard_index: 2,
+            total_body_len: 1000,
+            meta: dummy_envelope(),
+            payload: Bytes::new(),
+        };
+        assert!(validate_packet_sizing(&packet).is_some());
+    }
+
+    #[test]
+    fn validate_accepts_legitimate_packets() {
+        let first = VideoPacket::First {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_count: 10,
+            meta: dummy_envelope(),
+            payload: Bytes::new(),
+        };
+        assert!(validate_packet_sizing(&first).is_none());
+        let parity = VideoPacket::Parity {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            data_shards: 10,
+            parity_shards: 2,
+            shard_index: 1,
+            total_body_len: 11000,
+            meta: dummy_envelope(),
+            payload: Bytes::new(),
+        };
+        assert!(validate_packet_sizing(&parity).is_none());
+    }
+
+    #[test]
+    fn handle_rejected_packet_bumps_fragments_lost() {
+        let mut reassembler = FrameReassembler::new();
+        let (_, before) = reassembler.loss_counters();
+        let crafted = VideoPacket::Parity {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            data_shards: u16::MAX,
+            parity_shards: u16::MAX,
+            shard_index: 0,
+            total_body_len: u32::MAX,
+            meta: dummy_envelope(),
+            payload: Bytes::new(),
+        };
+        assert!(reassembler.handle(crafted).is_none());
+        let (_, after) = reassembler.loss_counters();
+        assert_eq!(after, before + 1);
     }
 }

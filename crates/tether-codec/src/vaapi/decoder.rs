@@ -314,7 +314,7 @@ fn vaapi_av_codec_id(kind: CodecKind) -> Result<ffi::AVCodecID> {
     match kind {
         CodecKind::H264 => Ok(ffi::AV_CODEC_ID_H264),
         CodecKind::Hevc => Ok(ffi::AV_CODEC_ID_HEVC),
-        CodecKind::Av1 => Err(CodecError::CodecNotFound("av1 VAAPI (not yet supported)")),
+        CodecKind::Av1 => Ok(ffi::AV_CODEC_ID_AV1),
     }
 }
 

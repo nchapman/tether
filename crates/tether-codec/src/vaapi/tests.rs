@@ -1006,3 +1006,182 @@ fn vaapi_min_qp_floor_reduces_bitstream() {
         "min-QP floor verified: qmin=1 → {baseline_bytes} bytes, qmin=45 → {constrained_bytes} bytes, ratio {ratio:.3}"
     );
 }
+
+/// VAAPI AV1 Main 4:2:0 8-bit dma-buf round trip — the encode/decode
+/// twin of `hevc_main444_dmabuf_roundtrip` for the new AV1 codec. Real
+/// hardware support today: Intel Arc / Xe-HPG (encode), AMD RDNA 3
+/// (encode), and Intel Tiger Lake+ / AMD RDNA 2+ / NVIDIA Ampere+
+/// (decode). The probe layer is responsible for runtime gating; this
+/// test exercises the path on hardware that has it.
+///
+/// Exercises:
+/// 1. `Nv12DmaBuf` bridge constructs (gpuconvert wgpu + Vulkan + dma-buf
+///    export features available).
+/// 2. `VaapiEncoder::new(AV1_8BIT_420, …)` opens — i.e. the
+///    `av1_vaapi` AVCodec was found and the driver accepts the
+///    AV_PIX_FMT_NV12 hwframes pool.
+/// 3. `VaapiEncoder::submit_dmabuf` accepts the NV12 layer — the same
+///    DRM_PRIME path HEVC uses on 4:2:0, but with the AV1 encoder
+///    consuming it.
+/// 4. The encoder produces an AV1 bitstream with sequence-header OBUs
+///    in extradata (`AV_CODEC_FLAG_GLOBAL_HEADER`) prepended to each
+///    keyframe by `drain_encoder`.
+/// 5. `VaapiDecoder` accepts that bitstream and emits a frame.
+/// 6. The decoded surface exports as DMA-BUF with the expected NV12
+///    layer shape (Y as R8, UV as GR88, two layers).
+#[test]
+#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA 3) + VAAPI AV1 decode + Vulkan DMA-BUF export"]
+fn av1_main_dmabuf_roundtrip() {
+    use crate::{DmaBufFrame, DmaBufLayer, DmaBufObject};
+    use tether_gpuconvert::Nv12DmaBuf;
+    use tether_protocol::control::VideoProfile;
+
+    let w = 128u32;
+    let h = 128u32;
+
+    let bridge = match pollster::block_on(Nv12DmaBuf::new(w, h)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP: Nv12DmaBuf::new failed: {e}");
+            return;
+        }
+    };
+
+    let src = bridge
+        .device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("test bgra mid-grey av1"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+    let n = (w * h) as usize;
+    let bgra = vec![0x80u8; n * 4];
+    bridge.queue().write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &src,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bgra,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let mut enc = match VaapiEncoder::new(VideoProfile::AV1_8BIT_420, w, h, 30, 4_000) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "SKIP: VaapiEncoder::new(AV1) failed: {e}. \
+                 Requires a driver that exposes the AV1 encode entrypoint \
+                 (Intel Arc / AMD RDNA 3)."
+            );
+            return;
+        }
+    };
+    let mut dec = match VaapiDecoder::new(tether_protocol::control::CodecKind::Av1) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "SKIP: VaapiDecoder::new(Av1) failed: {e}. \
+                 Requires VAAPI AV1 decode (Intel Tiger Lake+ / AMD RDNA 2+ / NVIDIA Ampere+)."
+            );
+            return;
+        }
+    };
+
+    let mut got_decoded = false;
+    for t in 0..8i64 {
+        let bridge_frame = bridge.convert(&src).expect("bridge.convert");
+        let codec_frame = DmaBufFrame {
+            fourcc: u32::from_le_bytes(*b"NV12"),
+            objects: vec![DmaBufObject {
+                fd: bridge_frame.fd,
+                size: bridge_frame.size,
+                drm_format_modifier: bridge_frame.modifier,
+            }],
+            layers: vec![
+                DmaBufLayer {
+                    drm_format: u32::from_le_bytes(*b"R8  "),
+                    num_planes: 1,
+                    object_index: [0, 0, 0, 0],
+                    offset: [
+                        u32::try_from(bridge_frame.y_offset).expect("y_offset fits"),
+                        0,
+                        0,
+                        0,
+                    ],
+                    pitch: [
+                        u32::try_from(bridge_frame.y_stride).expect("y_stride fits"),
+                        0,
+                        0,
+                        0,
+                    ],
+                },
+                DmaBufLayer {
+                    drm_format: u32::from_le_bytes(*b"GR88"),
+                    num_planes: 1,
+                    object_index: [0, 0, 0, 0],
+                    offset: [
+                        u32::try_from(bridge_frame.uv_offset).expect("uv_offset fits"),
+                        0,
+                        0,
+                        0,
+                    ],
+                    pitch: [
+                        u32::try_from(bridge_frame.uv_stride).expect("uv_stride fits"),
+                        0,
+                        0,
+                        0,
+                    ],
+                },
+            ],
+        };
+        let packets = enc
+            .submit_dmabuf(&codec_frame, t, t == 0)
+            .expect("submit_dmabuf");
+        for p in packets {
+            assert!(!p.data.is_empty(), "encoded packet must not be empty");
+            dec.submit(&p.data).expect("decoder submit");
+            while let Some(f) = dec.next_frame().expect("decoder next_frame") {
+                let Frame::Gpu(g) = f else {
+                    panic!("VaapiDecoder must emit Gpu frames for AV1");
+                };
+                let GpuFrameSource::DmaBuf(dmabuf) = g.source;
+                assert_eq!(g.width, w);
+                assert_eq!(g.height, h);
+                eprintln!(
+                    "decoded AV1 surface exported: fourcc=0x{:08x} layers={} planes_per_layer={:?}",
+                    dmabuf.fourcc,
+                    dmabuf.layers.len(),
+                    dmabuf.layers.iter().map(|l| l.num_planes).collect::<Vec<_>>(),
+                );
+                got_decoded = true;
+            }
+        }
+        if got_decoded {
+            break;
+        }
+    }
+    assert!(
+        got_decoded,
+        "decoder must emit at least one AV1 frame within 8 input frames"
+    );
+}

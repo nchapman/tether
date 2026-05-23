@@ -7,8 +7,9 @@ purpose so they ride in the binary without bloating it.
 
 ## Regenerating
 
-Requires ffmpeg with libx264 + libx265 (libx265 must be built with
-`--enable-rext`; Homebrew's `ffmpeg` formula is). From this directory:
+Requires ffmpeg with libx264 + libx265 + libaom-av1 (libx265 must be
+built with `--enable-rext`; Homebrew's `ffmpeg` formula is). From this
+directory:
 
 ```sh
 ffmpeg -y -hide_banner -loglevel warning \
@@ -45,6 +46,16 @@ ffmpeg -y -hide_banner -loglevel warning \
   -f lavfi -i color=c=gray:s=128x128:r=30 -frames:v 1 \
   -c:v libx265 -preset ultrafast -x265-params "log-level=error" \
   -pix_fmt yuv444p10le -f hevc hevc_yuv444_10bit.idr
+
+ffmpeg -y -hide_banner -loglevel warning \
+  -f lavfi -i color=c=gray:s=128x128:r=30 -frames:v 1 \
+  -c:v libaom-av1 -crf 50 -b:v 0 -cpu-used 8 \
+  -pix_fmt yuv420p -f obu av1_yuv420_8bit.idr
+
+ffmpeg -y -hide_banner -loglevel warning \
+  -f lavfi -i color=c=gray:s=128x128:r=30 -frames:v 1 \
+  -c:v libaom-av1 -crf 50 -b:v 0 -cpu-used 8 \
+  -pix_fmt yuv420p10le -f obu av1_yuv420_10bit.idr
 ```
 
 Verify with `ffprobe`:
@@ -66,6 +77,8 @@ Expected:
 - `hevc_yuv422_10bit.idr` — `hevc`, profile `Rext`, `yuv422p10le`, 128×128
 - `hevc_yuv444_8bit.idr` — `hevc`, profile `Rext`, `yuv444p`, 128×128
 - `hevc_yuv444_10bit.idr` — `hevc`, profile `Rext`, `yuv444p10le`, 128×128
+- `av1_yuv420_8bit.idr` — `av1`, profile `Main`, `yuv420p`, 128×128
+- `av1_yuv420_10bit.idr` — `av1`, profile `Main`, `yuv420p10le`, 128×128
 
 If the HEVC 4:4:4 fixture comes out as `Main` instead of `Rext`, the
 linked libx265 wasn't built with `--enable-rext`. On macOS rebuild via

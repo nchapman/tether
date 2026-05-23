@@ -267,9 +267,12 @@ fn vt_av_codec_id(kind: CodecKind) -> Result<ffi::AVCodecID> {
     match kind {
         CodecKind::H264 => Ok(ffi::AV_CODEC_ID_H264),
         CodecKind::Hevc => Ok(ffi::AV_CODEC_ID_HEVC),
-        CodecKind::Av1 => Err(CodecError::CodecNotFound(
-            "av1 VideoToolbox (not yet supported)",
-        )),
+        // Apple Silicon decode AV1 starting at M3 (and later iGPUs);
+        // older Macs surface the rejection through the `get_format`
+        // callback at `avcodec_open2`, which the probe classifies as
+        // Decode-stage Unsupported. No encode arm: VT has no AV1
+        // encoder at any silicon generation as of this build.
+        CodecKind::Av1 => Ok(ffi::AV_CODEC_ID_AV1),
     }
 }
 

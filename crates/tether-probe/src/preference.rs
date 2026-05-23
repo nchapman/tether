@@ -24,6 +24,12 @@ use tether_protocol::control::VideoProfile;
 /// preference list can stay aspirational without breaking sessions
 /// on lower-capability hardware.
 ///
+/// AV1 sits between HEVC 4:4:4 and HEVC 4:2:0: it has no 4:4:4 rung
+/// in this build (encoder support is sparse), so it can't displace
+/// HEVC 4:4:4 for desktop-text fidelity, but at the 4:2:0 rung AV1
+/// delivers the same quality as HEVC at ~30% less bitrate — worth
+/// preferring whenever both ends advertise it.
+///
 /// H.264 4:4:4 is intentionally absent — VAAPI has no encode profile
 /// for it, and no other host backend in this build supports it yet.
 /// Yuv422 is likewise absent until the wire-side `ChromaSubsampling`
@@ -31,6 +37,8 @@ use tether_protocol::control::VideoProfile;
 pub const PROFILE_PREFERENCE: &[VideoProfile] = &[
     VideoProfile::HEVC_10BIT_444,
     VideoProfile::HEVC_8BIT_444,
+    VideoProfile::AV1_10BIT_420,
+    VideoProfile::AV1_8BIT_420,
     VideoProfile::HEVC_10BIT_420,
     VideoProfile::HEVC_8BIT_420,
     VideoProfile::H264_8BIT_420,
@@ -61,9 +69,11 @@ mod tests {
     fn preference_order_is_desktop_quality_first() {
         assert_eq!(PROFILE_PREFERENCE[0], VideoProfile::HEVC_10BIT_444);
         assert_eq!(PROFILE_PREFERENCE[1], VideoProfile::HEVC_8BIT_444);
-        assert_eq!(PROFILE_PREFERENCE[2], VideoProfile::HEVC_10BIT_420);
-        assert_eq!(PROFILE_PREFERENCE[3], VideoProfile::HEVC_8BIT_420);
-        assert_eq!(PROFILE_PREFERENCE[4], VideoProfile::H264_8BIT_420);
+        assert_eq!(PROFILE_PREFERENCE[2], VideoProfile::AV1_10BIT_420);
+        assert_eq!(PROFILE_PREFERENCE[3], VideoProfile::AV1_8BIT_420);
+        assert_eq!(PROFILE_PREFERENCE[4], VideoProfile::HEVC_10BIT_420);
+        assert_eq!(PROFILE_PREFERENCE[5], VideoProfile::HEVC_8BIT_420);
+        assert_eq!(PROFILE_PREFERENCE[6], VideoProfile::H264_8BIT_420);
     }
 
     #[test]

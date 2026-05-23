@@ -90,8 +90,8 @@ unsafe impl Send for VaapiEncoder {}
 
 impl VaapiEncoder {
     /// Construct a VAAPI encoder for the given codec at the given
-    /// dimensions. `kind` selects between `h264_vaapi` and
-    /// `hevc_vaapi`; AV1 is not yet supported.
+    /// dimensions. `profile.codec` selects between `h264_vaapi`,
+    /// `hevc_vaapi`, and `av1_vaapi`.
     ///
     /// Returns `Err(CodecError::CodecNotFound)` if the installed
     /// FFmpeg wasn't built with VAAPI support for the requested codec,
@@ -232,6 +232,15 @@ impl VaapiEncoder {
                     raw.profile = ffi::AV_PROFILE_HEVC_MAIN_10 as i32;
                 }
             }
+            // AV1 Main profile (Profile 0) covers 4:2:0 at both 8 and
+            // 10-bit; FFmpeg's `av1_vaapi` infers the bit depth from
+            // the hwframes `sw_format` (NV12 vs P010LE). Pin the
+            // context field so the choice is deterministic across
+            // driver versions rather than relying on the FFmpeg
+            // auto-pick heuristic.
+            if kind == CodecKind::Av1 {
+                raw.profile = ffi::AV_PROFILE_AV1_MAIN as i32;
+            }
         }
 
         // VAAPI private options. The defaults are tuned for file-based
@@ -303,8 +312,18 @@ impl VaapiEncoder {
         };
         let mut dict_builder = AVDictionary::new(c"async_depth", c"1", 0)
             .set(c"rc_mode", c"VBR", 0)
-            .set(c"idr_interval", c"2147483647", 0)
-            .set(c"sei", c"0", 0);
+            .set(c"idr_interval", c"2147483647", 0);
+        // `sei` is an H.264/HEVC-only AVOption — it controls Annex-B
+        // SEI prefix NAL emission, which has no AV1 analogue (AV1
+        // carries metadata as OBUs, not SEI). `av1_vaapi` does not
+        // expose the option, so setting it for AV1 would land in
+        // `unused_avoptions()` and trigger the noisy "encoder ignored
+        // some private options" warn! log on every encoder
+        // construction. Gate it on the codec rather than relying on
+        // the unused-options sink.
+        if kind != CodecKind::Av1 {
+            dict_builder = dict_builder.set(c"sei", c"0", 0);
+        }
         if let Ok(qmin_str) = std::env::var("TETHER_MIN_QP") {
             if let Ok(qmin) = qmin_str.parse::<u32>() {
                 if qmin > 0 && qmin <= 51 {
@@ -368,15 +387,17 @@ impl VaapiEncoder {
                 }
             }
         }
-        let dict = match (chroma, bit_depth) {
-            // 4:2:0 8-bit: pin Main profile via AVOption — broadly
-            // compatible default the encoder picks up regardless of
-            // driver capability advertisements.
-            (ChromaSubsampling::Yuv420, 8) => dict_builder.set(c"profile", c"main", 0),
-            // 4:2:0 10-bit and any 4:4:4: profile pinned via the
-            // context-field assignment above (Main10 or REXT). The
-            // `profile=` AVOption string would override that field;
-            // skip it.
+        let dict = match (chroma, bit_depth, kind) {
+            // H.264 / HEVC 4:2:0 8-bit: pin Main profile via AVOption —
+            // broadly compatible default the encoder picks up regardless
+            // of driver capability advertisements.
+            (ChromaSubsampling::Yuv420, 8, CodecKind::H264 | CodecKind::Hevc) => {
+                dict_builder.set(c"profile", c"main", 0)
+            }
+            // AV1 (any depth), HEVC 4:2:0 10-bit, any 4:4:4: profile
+            // pinned via the context-field assignment above (AV1 Main /
+            // HEVC Main10 / HEVC REXT). The `profile=` AVOption string
+            // would override that field; skip it.
             _ => dict_builder,
         };
         // AV_CODEC_FLAG_GLOBAL_HEADER routes the codec's parameter
@@ -880,7 +901,7 @@ fn vaapi_codec_cname(kind: CodecKind) -> Result<&'static std::ffi::CStr> {
     match kind {
         CodecKind::H264 => Ok(c"h264_vaapi"),
         CodecKind::Hevc => Ok(c"hevc_vaapi"),
-        CodecKind::Av1 => Err(CodecError::CodecNotFound("av1_vaapi (not yet supported)")),
+        CodecKind::Av1 => Ok(c"av1_vaapi"),
     }
 }
 

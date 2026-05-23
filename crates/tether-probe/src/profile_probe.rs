@@ -115,10 +115,17 @@ pub(crate) fn fixture_for(profile: VideoProfile) -> Option<&'static [u8]> {
         (CodecKind::Hevc, ChromaSubsampling::Yuv444, 10) => {
             Some(include_bytes!("../fixtures/probe/hevc_yuv444_10bit.idr"))
         }
+        (CodecKind::Av1, ChromaSubsampling::Yuv420, 8) => {
+            Some(include_bytes!("../fixtures/probe/av1_yuv420_8bit.idr"))
+        }
+        (CodecKind::Av1, ChromaSubsampling::Yuv420, 10) => {
+            Some(include_bytes!("../fixtures/probe/av1_yuv420_10bit.idr"))
+        }
         // 4:2:2 fixtures are checked in but not wired up until
-        // ChromaSubsampling::Yuv422 lands on the wire. H.264 4:4:4,
-        // AV1, etc. — no fixture means we conservatively report
-        // decode=false until one is added.
+        // ChromaSubsampling::Yuv422 lands on the wire. AV1 4:4:4 isn't
+        // in scope (encoder support too sparse); H.264 4:4:4 has no
+        // VAAPI encode profile. No fixture means we conservatively
+        // report decode=false until one is added.
         _ => None,
     }
 }

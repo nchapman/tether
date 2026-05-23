@@ -145,9 +145,13 @@ pub(crate) enum Capability {
     VulkanDmaBufImport,
     /// `TEXTURE_FORMAT_16BIT_NORM` — required for 10-bit Biplanar16.
     BitDepth10RendererSupport,
-    /// AV1 codec context. No cells use this yet; reserved so a future
-    /// AV1 cell SKIPs with a self-documenting capability label
-    /// instead of a misleading H.264 one.
+    /// AV1 codec context: a `RoundtripCase` that exercises the AV1
+    /// path SKIPs with this label when the driver lacks AV1 encode
+    /// or decode. The codec-level round-trip
+    /// `tether_codec::vaapi::tests::av1_main_dmabuf_roundtrip` is the
+    /// load-bearing verification; render-layer AV1 cells are
+    /// codec-agnostic via `RenderLayout::Biplanar8` / `Biplanar16` and
+    /// don't need their own surface fixtures.
     VaapiAv1,
 }
 

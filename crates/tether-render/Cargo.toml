@@ -59,6 +59,10 @@ objc2-io-surface = { version = "0.3.2", default-features = false, features = ["s
 [dev-dependencies]
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Cross-table consistency test in `dmabuf_test.rs` walks
+# `PROFILE_PREFERENCE` so any future profile addition is automatically
+# checked against `expected_dmabuf_fourcc`.
+tether-probe = { workspace = true }
 # Round-trip test harness pulls metrics, the Mitchell CPU reference,
 # the coordinate-encoded fixture, and the chroma-roundtrip model from
 # tether-scaler's test_util module — feature-gated to keep the

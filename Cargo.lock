@@ -3656,6 +3656,7 @@ dependencies = [
  "pollster",
  "tether-codec",
  "tether-gpuconvert",
+ "tether-probe",
  "tether-protocol",
  "tether-scaler",
  "thiserror 2.0.18",

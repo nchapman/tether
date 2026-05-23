@@ -520,7 +520,12 @@ should add:
 
 M1 / M2 / M3 / M4 are all identical for HEVC decode capability
 per Softron's documentation and Jellyfin's empirical results.
-AV1 hardware decode is M3+ only — not relevant to us today.
+AV1 hardware decode is M3+ only; VideoToolbox AV1 *encode* does
+not exist on any current Apple Silicon generation. AV1 on macOS is
+therefore decode-only — `apps/tether-host` running on a Mac cannot
+produce AV1; the probe layer will surface VT AV1 encode as
+`Construct`-stage Unsupported and the negotiator will pick another
+profile.
 
 ---
 

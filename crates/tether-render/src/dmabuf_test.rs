@@ -664,7 +664,7 @@ fn bench_encode_by_resolution_h264() {
 #[cfg(test)]
 mod cross_table_consistency {
     use tether_codec::vaapi::expected_dmabuf_fourcc;
-    use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+    use tether_protocol::control::ChromaSubsampling;
 
     use crate::gpu::{RenderLayout, render_layout_for};
 
@@ -732,14 +732,10 @@ mod cross_table_consistency {
 
     #[test]
     fn preference_list_profiles_have_fourcc() {
-        let profile_list = [
-            VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 8 },
-            VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 10 },
-            VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv444, bit_depth: 8 },
-            VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv444, bit_depth: 10 },
-            VideoProfile { codec: CodecKind::H264, chroma: ChromaSubsampling::Yuv420, bit_depth: 8 },
-        ];
-        for p in profile_list {
+        // Iterate `PROFILE_PREFERENCE` directly so any future profile
+        // addition (AV1, future chroma) is automatically covered. A
+        // hand-rolled list silently misses new entries.
+        for p in tether_probe::PROFILE_PREFERENCE.iter().copied() {
             let f = expected_dmabuf_fourcc(p.chroma, p.bit_depth);
             assert!(f.is_some(), "no encoder fourcc for profile {p:?}");
         }

@@ -467,6 +467,27 @@ mod tests {
         }
     }
 
+    /// Pin the AV1 profile constants on the wire: the bincode shape
+    /// must round-trip the new `CodecKind::Av1` variant at both 8- and
+    /// 10-bit depths cleanly. AV1 is a brand-new codec axis (no
+    /// `CodecKind::Av1` discriminant existed in shipped builds before
+    /// this), so the bincode enum tag is what older peers will treat
+    /// as "unknown" — the round-trip here is the contract that current
+    /// peers won't corrupt the new variant.
+    #[test]
+    fn av1_video_profile_round_trips() {
+        use crate::control::{CodecKind, VideoProfile};
+        for profile in [
+            VideoProfile::AV1_8BIT_420,
+            VideoProfile::AV1_10BIT_420,
+        ] {
+            let bytes = encode(&profile).unwrap();
+            let decoded: VideoProfile = decode(&bytes).unwrap();
+            assert_eq!(decoded, profile);
+            assert_eq!(decoded.codec, CodecKind::Av1);
+        }
+    }
+
     /// Regression guard: `bit_depth` must stay a plain `u8` on the
     /// wire. If this field is ever changed to a closed enum (e.g.
     /// `enum BitDepth { Eight, Ten }`), this test stops compiling,

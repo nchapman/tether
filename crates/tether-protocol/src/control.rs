@@ -220,6 +220,29 @@ impl VideoProfile {
         chroma: ChromaSubsampling::Yuv444,
         bit_depth: 10,
     };
+
+    /// AV1 Main 4:2:0 8-bit. The next-generation codec rung: at the
+    /// same quality as HEVC Main, AV1 spends roughly 30% less
+    /// bitrate, which matters most on congested links. Encode is
+    /// VAAPI-only in this build (Intel Arc / AMD RDNA 3); macOS
+    /// hosts cannot produce AV1 because VideoToolbox is decode-only.
+    /// Decode is wider: VAAPI (Intel Tiger Lake+, AMD RDNA 2+, NVIDIA
+    /// Ampere+) and VideoToolbox (Apple Silicon M3+).
+    pub const AV1_8BIT_420: Self = Self {
+        codec: CodecKind::Av1,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+
+    /// AV1 Main 4:2:0 10-bit. Same encode/decode hardware envelope as
+    /// [`AV1_8BIT_420`] with finer quantisation. AV1 4:4:4 is out of
+    /// scope for this build (rare encoder support; HEVC 4:4:4 covers
+    /// the desktop-text use case).
+    pub const AV1_10BIT_420: Self = Self {
+        codec: CodecKind::Av1,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 10,
+    };
 }
 
 /// Hello extension key. Client → host. Payload: bincode

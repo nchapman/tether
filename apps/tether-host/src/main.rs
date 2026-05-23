@@ -1797,9 +1797,12 @@ fn cursor_tick(
                         format: shape.format,
                         pixels: shape.pixels,
                     }));
+                    // Counts *distinct sprites deposited* on the wire,
+                    // not Shape events processed. Repeat-id touches
+                    // emit only `UseShape` and don't bump this.
+                    state.shapes_sent += 1;
                 }
                 effects.push(CursorEffect::UseShape(id));
-                state.shapes_sent += 1;
             }
         }
     }
@@ -1918,6 +1921,13 @@ async fn pump_cursor(
                             // be way worse than missing it.
                             warn!(error = ?e, id, w, h, bytes = n, "CursorShape send failed (non-fatal); skipping shape and continuing");
                             state.seen_ids.remove(&id);
+                            // `continue` skips this tick's paired
+                            // `CursorEffect::UseShape(id)` (cursor_tick
+                            // always pushes them together) — sending it
+                            // before the client has the bitmap would
+                            // reference an empty cache slot. Next tick
+                            // re-emits both because `seen_ids` no longer
+                            // contains the id.
                             continue;
                         }
                     }
@@ -2127,7 +2137,10 @@ mod cursor_pump_tests {
         let effects = cursor_tick(&mut state, &mut src, None, now());
         // 1 → Shape + UseShape; 2 → Shape + UseShape; 1 again → UseShape only
         assert_eq!(effects.len(), 5);
-        assert_eq!(state.shapes_sent, 3);
+        // shapes_sent counts distinct sprites deposited, not events
+        // processed — the repeat of id 1 emits UseShape only and does
+        // not bump the counter.
+        assert_eq!(state.shapes_sent, 2);
         assert_eq!(state.seen_ids.len(), 2);
     }
 }

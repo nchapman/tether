@@ -111,6 +111,12 @@ impl CursorState {
     /// to upload on its next frame. Caller is responsible for
     /// ensuring `pixels.len() == width * height * 4` (RGBA8); the
     /// renderer drops with a warn if not.
+    ///
+    /// Capped at [`CURSOR_CACHE_MAX`] pending entries — without the
+    /// cap, a minimised window (renderer paused → never drains) could
+    /// accumulate full sprite buffers indefinitely. The GPU side is
+    /// already bounded by the LRU cache; the CPU side needs the same
+    /// limit. Drops oldest when over cap.
     pub fn enqueue_shape(
         &mut self,
         id: u64,
@@ -120,6 +126,9 @@ impl CursorState {
         hotspot_y: u32,
         pixels: Vec<u8>,
     ) {
+        while self.pending_shapes.len() >= CURSOR_CACHE_MAX {
+            self.pending_shapes.remove(0);
+        }
         self.pending_shapes.push(PendingShape {
             id,
             width,
@@ -473,64 +482,60 @@ impl CursorOverlay {
         surface_dims: (u32, u32),
         fit_dims: (u32, u32),
     ) {
-        let snapshot_data = channel.with(|state| {
-            state.drain_pending(device, queue);
-            state.snapshot_for_render().map(|s| {
-                (
-                    s.view.clone(),
-                    s.width,
-                    s.height,
-                    s.hotspot_x,
-                    s.hotspot_y,
-                    s.position_x,
-                    s.position_y,
-                )
-            })
-        });
-        let Some((view, sw, sh, hx, hy, px, py)) = snapshot_data else {
-            return;
-        };
         let (vw, vh) = video_dims;
         let (surf_w, surf_h) = surface_dims;
         let (fit_w, fit_h) = fit_dims;
         if surf_w == 0 || surf_h == 0 || vw == 0 || vh == 0 {
             return;
         }
-        // Letterbox rect origin inside the window — same math the blit
-        // pass implicitly does via NDC scale, but we need explicit
-        // pixel-space anchors here for the sprite quad.
-        #[allow(clippy::cast_precision_loss)]
-        let rect_x = (surf_w as f32 - fit_w as f32) * 0.5;
-        #[allow(clippy::cast_precision_loss)]
-        let rect_y = (surf_h as f32 - fit_h as f32) * 0.5;
-
-        #[allow(clippy::cast_precision_loss)]
-        let rows = [
-            [rect_x, rect_y, fit_w as f32, fit_h as f32],
-            [px, py, hx as f32, hy as f32],
-            [sw as f32, sh as f32, vw as f32, vh as f32],
-            [surf_w as f32, surf_h as f32, 1.0, 0.0],
-        ];
-        queue.write_buffer(&self.uniform, 0, &cursor_uniform_bytes(&rows));
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tether-render cursor bind group"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
+        // Build the bind group *inside* the cursor-state lock so the
+        // resulting `wgpu::BindGroup` holds its references to the
+        // sprite's texture view before the cache can possibly evict
+        // the underlying texture. A `wgpu::TextureView` does not by
+        // itself keep its source `Texture` alive — without this
+        // ordering, a follow-up `enqueue_shape` that races eviction
+        // could drop the texture between snapshot and submit, leaving
+        // the bind group dangling.
+        let bind_group = channel.with(|state| {
+            state.drain_pending(device, queue);
+            let snap = state.snapshot_for_render()?;
+            // Letterbox rect origin inside the window — same math the
+            // blit pass implicitly does via NDC scale, but we need
+            // explicit pixel-space anchors here for the sprite quad.
+            #[allow(clippy::cast_precision_loss)]
+            let rect_x = (surf_w as f32 - fit_w as f32) * 0.5;
+            #[allow(clippy::cast_precision_loss)]
+            let rect_y = (surf_h as f32 - fit_h as f32) * 0.5;
+            #[allow(clippy::cast_precision_loss)]
+            let rows = [
+                [rect_x, rect_y, fit_w as f32, fit_h as f32],
+                [snap.position_x, snap.position_y, snap.hotspot_x as f32, snap.hotspot_y as f32],
+                [snap.width as f32, snap.height as f32, vw as f32, vh as f32],
+                [surf_w as f32, surf_h as f32, 1.0, 0.0],
+            ];
+            queue.write_buffer(&self.uniform, 0, &cursor_uniform_bytes(&rows));
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tether-render cursor bind group"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(snap.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            }))
         });
+        let Some(bind_group) = bind_group else {
+            return;
+        };
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("tether-render cursor pass"),

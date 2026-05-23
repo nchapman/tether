@@ -649,6 +649,17 @@ pub struct ReassembledFrame {
 pub struct FrameReassembler {
     pending: HashMap<FrameKey, Pending>,
     latest_seq: HashMap<StreamKey, u32>,
+    /// Highest `frame_seq` we've successfully returned a
+    /// `ReassembledFrame` for, per stream. Used to drop late packets
+    /// (typically `VideoPacket::Parity` arriving after all primaries
+    /// already finalized the frame) without re-creating a ghost
+    /// `pending` entry that would otherwise time out via
+    /// `max_pending_age` and falsely inflate `frames_dropped`. Without
+    /// this gate, FEC adds ~6 ghost entries per frame at 20% parity,
+    /// every one of which prunes-as-dropped within 500 ms — the client's
+    /// loss-counter watcher then storms `RequestRecovery` and the
+    /// encoder thrashes its DPB.
+    finalized_seq: HashMap<StreamKey, u32>,
     max_age: u32,
     /// Wall-clock cap on how long a pending (incomplete) frame stays
     /// in the buffer before being evicted. Belt-and-braces alongside
@@ -713,6 +724,7 @@ impl FrameReassembler {
         Self {
             pending: HashMap::new(),
             latest_seq: HashMap::new(),
+            finalized_seq: HashMap::new(),
             max_age: 4,
             max_pending_age: Duration::from_millis(500),
             frames_dropped: 0,
@@ -794,6 +806,32 @@ impl FrameReassembler {
         self.prune_old();
 
         let key = (display, stream_epoch, frame_seq);
+        // Drop packets for a frame that's already been finalized AND
+        // no longer has a pending entry. This is the FEC late-parity
+        // case: all primaries arrived, finalize_primary returned the
+        // frame and removed the entry; the parity packets that follow
+        // would otherwise resurrect a ghost entry, never gather
+        // enough shards to finalize, and prune-as-dropped after
+        // max_pending_age — inflating frames_dropped and triggering
+        // the client's loss-counter recovery storm.
+        if !self.pending.contains_key(&key) {
+            if let Some(&final_seq) = self.finalized_seq.get(&stream_key) {
+                if frame_seq <= final_seq {
+                    // Rebind `display` to a non-colliding name because
+                    // the tracing macro shadows it with
+                    // `tracing::field::display` inside the macro body.
+                    let display_id = display;
+                    tracing::trace!(
+                        display_id,
+                        stream_epoch,
+                        frame_seq,
+                        final_seq,
+                        "dropping late packet for already-finalized frame"
+                    );
+                    return None;
+                }
+            }
+        }
         let entry = self.pending.entry(key).or_insert_with(|| Pending {
             fragment_count: 0,
             received_count: 0,
@@ -917,6 +955,7 @@ impl FrameReassembler {
             buf.extend_from_slice(&fragment);
         }
         let body = buf.freeze();
+        self.mark_finalized(display, stream_epoch, frame_seq);
         Some(ReassembledFrame {
             display,
             stream_epoch,
@@ -924,6 +963,18 @@ impl FrameReassembler {
             meta,
             body,
         })
+    }
+
+    /// Record `frame_seq` as the latest finalized frame on this
+    /// `(display, stream_epoch)` stream. Subsequent late packets for
+    /// the same seq are silently dropped via the gate in
+    /// [`Self::handle`]. Idempotent + monotonic: a smaller seq never
+    /// rolls the watermark back.
+    fn mark_finalized(&mut self, display: u8, stream_epoch: u32, frame_seq: u32) {
+        self.finalized_seq
+            .entry((display, stream_epoch))
+            .and_modify(|s| *s = (*s).max(frame_seq))
+            .or_insert(frame_seq);
     }
 
     fn finalize_with_recovery(
@@ -1000,6 +1051,7 @@ impl FrameReassembler {
             buf.extend_from_slice(&data[..end - start]);
         }
 
+        self.mark_finalized(display, stream_epoch, frame_seq);
         Some(ReassembledFrame {
             display,
             stream_epoch,
@@ -1232,5 +1284,73 @@ mod validation_tests {
         assert!(reassembler.handle(crafted).is_none());
         let (_, after) = reassembler.loss_counters();
         assert_eq!(after, before + 1);
+    }
+
+    /// Steady-state FEC: all primaries arrive before any parity, frame
+    /// finalises cleanly, then the late parity packets must NOT
+    /// resurrect a ghost pending entry. The ghost-entry bug (see
+    /// `mark_finalized` / the `finalized_seq` gate in `handle`) made
+    /// every FEC-enabled session pile up ~6 ghost entries per frame
+    /// at 20% parity, each of which prunes-as-dropped within 500 ms;
+    /// the client's loss-counter watcher then storms `RequestRecovery`
+    /// and the encoder thrashes its DPB into chronic mmco errors.
+    ///
+    /// This test pins the no-loss case the FEC commit didn't cover.
+    #[test]
+    fn late_parity_after_finalize_does_not_create_ghost_entry() {
+        let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (128, 128),
+        };
+        // Three-shard frame at FEC_SHARD_SIZE * 3 bytes so we get 3
+        // primary + 1 parity (20% rounded up). Small enough to be
+        // cheap; large enough to exercise the multi-fragment path.
+        let body_len = FEC_SHARD_SIZE * 3;
+        let body = Bytes::from(vec![0xAAu8; body_len]);
+        let packets = fragmenter.fragment(meta, body);
+        let primary_count = packets
+            .iter()
+            .filter(|p| {
+                matches!(p, VideoPacket::First { .. } | VideoPacket::Continuation { .. })
+            })
+            .count();
+        let parity_count = packets
+            .iter()
+            .filter(|p| matches!(p, VideoPacket::Parity { .. }))
+            .count();
+        assert!(primary_count >= 3, "expected ≥3 primary packets, got {primary_count}");
+        assert!(parity_count >= 1, "expected ≥1 parity packet, got {parity_count}");
+
+        let mut reassembler = FrameReassembler::new();
+        let (drops_before, lost_before) = reassembler.loss_counters();
+
+        // Feed primaries first, parity second — the wire order the
+        // sender emits in `fragment()`.
+        let (primaries, parities): (Vec<_>, Vec<_>) = packets.into_iter().partition(|p| {
+            matches!(p, VideoPacket::First { .. } | VideoPacket::Continuation { .. })
+        });
+        let mut finalised = None;
+        for packet in primaries {
+            if let Some(frame) = reassembler.handle(packet) {
+                finalised = Some(frame);
+            }
+        }
+        assert!(finalised.is_some(), "frame must finalise from primaries alone");
+
+        // Late parity packets must drop silently — no new pending
+        // entry, no counter bump.
+        for packet in parities {
+            assert!(
+                reassembler.handle(packet).is_none(),
+                "late parity must not produce a second frame for the same seq"
+            );
+        }
+
+        let (drops_after, lost_after) = reassembler.loss_counters();
+        assert_eq!(drops_before, drops_after, "no frames should drop");
+        assert_eq!(lost_before, lost_after, "no fragments should count as lost");
     }
 }

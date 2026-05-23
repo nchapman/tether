@@ -826,6 +826,61 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit() {
     assert_grey("4:4:4 10-bit right", right);
 }
 
+/// Which input fixture to feed the host-scaler round-trip. Matches the
+/// Linux harness's `Fixture` enum in spirit — solid colours for
+/// photometric region checks, coord-encoded for geometric residual.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // `SolidSplit` is API-surface; the existing region cells call `make_test_bgra` directly via the `_rgba` helper.
+enum HostScalerFixture {
+    /// Solid red-left + blue-right BGRA split. Survives lossy
+    /// encode well; targeted by region-average / seam-region tests.
+    SolidSplit,
+    /// Coord-encoded gradient: `R = x/w * 255, G = y/h * 255, B = 128`.
+    /// Built by `tether_scaler::test_util::coord_fixture_fill`, the
+    /// same procedural fixture the Linux dmabuf harness uses. The
+    /// per-pixel `(x, y)` encoding lets a metric recover stride /
+    /// UV-addressing drift directly instead of approximating it via
+    /// SSIM windows.
+    CoordEncoded,
+}
+
+#[cfg(target_os = "macos")]
+fn host_scaler_input_bgra(w: u32, h: u32, fixture: HostScalerFixture) -> Vec<u8> {
+    match fixture {
+        HostScalerFixture::SolidSplit => make_test_bgra(w, h),
+        HostScalerFixture::CoordEncoded => {
+            tether_scaler::test_util::coord_fixture_fill((w, h))
+        }
+    }
+}
+
+/// Artifacts produced by [`run_host_scaler_roundtrip_artifacts`]:
+/// the rendered downscaled output (BGRA at dst_dims) alongside a
+/// CPU reference for the same scaling (also BGRA at dst_dims).
+/// Mirrors the Linux harness's reference-vs-actual structure so
+/// metric helpers ([`assert_host_scaler_metrics`]) can run the
+/// same SSIM / Y-PSNR / geometric residual computations.
+#[cfg(target_os = "macos")]
+struct HostScalerArtifacts {
+    /// Rendered output at `dst_dims`, packed BGRA (B, G, R, A). The
+    /// helper swaps from the renderer's `Rgba8Unorm` readback so the
+    /// channel order matches `tether_scaler::test_util`'s helpers
+    /// (`ssim_rgb` is symmetric in channel order but `psnr_db_y_bgra`
+    /// reads B from byte 0; both buffers must use the same layout).
+    bgra_dst: Vec<u8>,
+    /// CPU reference: `cpu_mitchell_resize_bgra(input, src, dst)`.
+    /// Skips chroma roundtrip for the same reason the Linux harness
+    /// does — see `test_harness::build_reference`'s comment for
+    /// the swscale-limited-range vs textbook-full-range gap.
+    reference_bgra: Vec<u8>,
+    dst_dims: (u32, u32),
+    /// Echo of the input for any cell that wants to e.g. compare
+    /// geometric residual at the source resolution.
+    #[allow(dead_code)]
+    input_bgra: Vec<u8>,
+}
+
 /// Wide-region averages (left half + right half, sampled away from
 /// the seam) extracted from a downscaled host-scaler render. Same
 /// shape as the existing no-scaling cells' return type.
@@ -853,20 +908,21 @@ fn host_scaler_seam_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8
     (seam_left, seam_right)
 }
 
-/// Host-scaler round-trip: encode BGRA at capture dims → decode →
-/// route through the production `Nv12IOSurfaceBridge` → render the
-/// downscaled IOSurface. Returns the raw RGBA readback so callers
-/// can sample whatever regions they care about (wide averages,
-/// seam-adjacent strips, etc.). Exercises every layer Stage 3
-/// added: IOSurface plane import (read-only), YUV-plane scaler
-/// (Y + UV with cosited chroma siting), destination IOSurface
-/// allocation, colorimetry-attachment copy from source to
-/// destination.
+/// Host-scaler round-trip: encode `input_bgra` at capture dims →
+/// decode → route through the production `Nv12IOSurfaceBridge` →
+/// render the downscaled IOSurface. Returns the raw RGBA readback so
+/// callers can sample whatever regions they care about (wide
+/// averages, seam-adjacent strips, photometric/geometric metrics).
+/// Exercises every layer Stage 3 added: IOSurface plane import
+/// (read-only), YUV-plane scaler (Y + UV with cosited chroma
+/// siting), destination IOSurface allocation, colorimetry-attachment
+/// copy from source to destination.
 #[cfg(target_os = "macos")]
-fn run_host_scaler_roundtrip_rgba(
+fn run_host_scaler_roundtrip_with_input(
     profile: VideoProfile,
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
+    input_bgra: &[u8],
 ) -> Option<Vec<u8>> {
     use tether_gpuconvert::nv12_iosurface::Nv12IOSurfaceBridge;
 
@@ -925,12 +981,11 @@ fn run_host_scaler_roundtrip_rgba(
     // === 1) encode + decode at src_dims to produce a representative
     // NV12 IOSurface (what SCK would deliver on the host) ===
     let (sw, sh) = src_dims;
-    let input_bgra = make_test_bgra(sw, sh);
     let mut enc = VideoToolboxEncoder::new(profile, sw, sh, 30, 4_000)
         .expect("VT encoder construction");
     let mut packets = Vec::new();
     for t in 0..6i64 {
-        packets.extend(enc.encode_bgra(&input_bgra, t, t == 0).expect("encode_bgra"));
+        packets.extend(enc.encode_bgra(input_bgra, t, t == 0).expect("encode_bgra"));
     }
     packets.extend(enc.flush().expect("encoder flush"));
     let mut dec = VideoToolboxDecoder::new(profile.codec).expect("VT decoder construction");
@@ -1116,11 +1171,21 @@ fn run_host_scaler_roundtrip_rgba(
     Some(rgba)
 }
 
+/// RGBA-readback wrapper using the solid-split fixture. Used by the
+/// existing region-average cells. Thin wrapper around
+/// [`run_host_scaler_roundtrip_with_input`].
+#[cfg(target_os = "macos")]
+fn run_host_scaler_roundtrip_rgba(
+    profile: VideoProfile,
+    src_dims: (u32, u32),
+    dst_dims: (u32, u32),
+) -> Option<Vec<u8>> {
+    let input_bgra = make_test_bgra(src_dims.0, src_dims.1);
+    run_host_scaler_roundtrip_with_input(profile, src_dims, dst_dims, &input_bgra)
+}
+
 /// Wide-region variant of [`run_host_scaler_roundtrip_rgba`] — the
-/// shape the existing 2× / 1.5× cells consume. Kept as a thin
-/// wrapper so a future seam-region or photometric cell can sample
-/// the raw RGBA without re-running the whole encode → bridge →
-/// render chain.
+/// shape the existing 2× / 1.5× cells consume.
 #[cfg(target_os = "macos")]
 fn run_host_scaler_roundtrip(
     profile: VideoProfile,
@@ -1129,6 +1194,93 @@ fn run_host_scaler_roundtrip(
 ) -> Option<((u8, u8, u8), (u8, u8, u8))> {
     let rgba = run_host_scaler_roundtrip_rgba(profile, src_dims, dst_dims)?;
     Some(host_scaler_wide_regions(&rgba, dst_dims.0, dst_dims.1))
+}
+
+/// Artifact-returning wrapper: runs the full chain with the chosen
+/// fixture and returns both the rendered output (BGRA at dst_dims)
+/// and a CPU reference (Mitchell-downscaled input at dst_dims, also
+/// BGRA). Caller drives SSIM / Y-PSNR / geometric-residual
+/// assertions on top via [`assert_host_scaler_metrics`].
+///
+/// The CPU reference mirrors `tether-render::test_harness::build_reference`
+/// — skipping the chroma roundtrip step for the same reason
+/// (swscale limited-range vs textbook full-range divergence inflates
+/// the floor without catching real bugs). The coord-encoded fixture's
+/// constant B-channel makes the omission invisible; a future PNG
+/// fixture with high-frequency chroma would need the step re-enabled.
+#[cfg(target_os = "macos")]
+fn run_host_scaler_roundtrip_artifacts(
+    profile: VideoProfile,
+    src_dims: (u32, u32),
+    dst_dims: (u32, u32),
+    fixture: HostScalerFixture,
+) -> Option<HostScalerArtifacts> {
+    use tether_scaler::test_util::cpu_mitchell_resize_bgra;
+
+    let input_bgra = host_scaler_input_bgra(src_dims.0, src_dims.1, fixture);
+    let rgba_dst = run_host_scaler_roundtrip_with_input(profile, src_dims, dst_dims, &input_bgra)?;
+
+    // The renderer wrote sRGB Rgba8Unorm; the helpers below expect
+    // BGRA byte order (psnr_db_y_bgra in particular reads B at
+    // offset 0). Swap R↔B in place — alpha stays at offset 3.
+    let mut bgra_dst = rgba_dst;
+    for chunk in bgra_dst.chunks_exact_mut(4) {
+        chunk.swap(0, 2);
+    }
+
+    // CPU reference: Mitchell-resize the input to dst_dims. No
+    // letterbox padding because every cell here has surface_dims
+    // == dst_dims (the renderer's identity-scale uniform is set
+    // accordingly).
+    let reference_bgra = if src_dims == dst_dims {
+        input_bgra.clone()
+    } else {
+        cpu_mitchell_resize_bgra(&input_bgra, src_dims, dst_dims)
+    };
+
+    Some(HostScalerArtifacts {
+        bgra_dst,
+        reference_bgra,
+        dst_dims,
+        input_bgra,
+    })
+}
+
+/// SSIM + Y-PSNR floor assertion against the artifacts' CPU
+/// reference. Computes both metrics and asserts they meet the given
+/// floors; prints both numbers (with the floor for context) on the
+/// eprintln channel before panicking so CI logs are useful for
+/// triage even without PNG diagnostic dumps.
+///
+/// Currently unused — the macOS coord-encoded smoke cell ships with
+/// a range-based assertion instead. Kept as ready-to-use
+/// infrastructure for a future calibrated pass that lands a
+/// macOS-tuned `cpu_chroma_roundtrip_bgra` reference (see the smoke
+/// cell's doc-comment for why floors are deferred).
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn assert_host_scaler_metrics(
+    label: &str,
+    artifacts: &HostScalerArtifacts,
+    ssim_floor: f64,
+    psnr_y_floor_db: f64,
+) {
+    use tether_scaler::test_util::{psnr_db_y_bgra, ssim_rgb};
+    let (dw, dh) = artifacts.dst_dims;
+    let ssim = ssim_rgb(&artifacts.bgra_dst, &artifacts.reference_bgra, dw, dh);
+    let psnr_y = psnr_db_y_bgra(&artifacts.bgra_dst, &artifacts.reference_bgra);
+    eprintln!(
+        "[{label}] {dw}×{dh}: SSIM {ssim:.4} (floor {ssim_floor:.4}), \
+         Y-PSNR {psnr_y:.2} dB (floor {psnr_y_floor_db:.2} dB)"
+    );
+    assert!(
+        ssim >= ssim_floor,
+        "{label}: SSIM {ssim:.4} below floor {ssim_floor:.4}"
+    );
+    assert!(
+        psnr_y >= psnr_y_floor_db,
+        "{label}: Y-PSNR {psnr_y:.2} dB below floor {psnr_y_floor_db:.2} dB"
+    );
 }
 
 /// HEVC 4:2:0 8-bit, host-scaler round-trip 640×480 → 320×240. The
@@ -1452,4 +1604,107 @@ fn iosurface_host_scaler_rejects_10bit_at_construction() {
             }
         }
     }
+}
+
+/// H.264 4:2:0 8-bit host-scaler round-trip 640×480 → 320×240.
+/// VideoToolbox supports both encode and decode for H.264, so the
+/// same chain that exercises HEVC also works for H.264. Linux has
+/// 6 H.264 cells (identity / host-scaler / surface-below /
+/// upscale-no-scaler / repro-shape / full-chain) and macOS had
+/// zero before this; the host-scaler cell is the highest-value
+/// addition because it's the one Stage 3 / Stage 4 actually
+/// changed.
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal + TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-render --release -- --ignored iosurface_host_scaler"]
+#[cfg(target_os = "macos")]
+fn iosurface_host_scaler_h264_8bit_downscale() {
+    let Some((left, right)) = run_host_scaler_roundtrip(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::H264,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        (640, 480),
+        (320, 240),
+    ) else {
+        return;
+    };
+    assert!(
+        left.0 > 130 && left.1 < 80 && left.2 < 80,
+        "left region should be reddish; got {left:?}"
+    );
+    assert!(
+        right.2 > 130 && right.0 < 80 && right.1 < 80,
+        "right region should be blueish; got {right:?}"
+    );
+}
+
+/// HEVC 4:2:0 8-bit host-scaler driving the coord-encoded fixture
+/// through `run_host_scaler_roundtrip_artifacts`. Asserts the chain
+/// completes and produces a non-trivial output (every channel sees
+/// a gradient sweep, not flat / wrong-colour-band output) without
+/// pinning SSIM / Y-PSNR floors against a CPU reference.
+///
+/// (Why no metric floors: the CPU reference produced by
+/// `cpu_mitchell_resize_bgra` doesn't model the BT.709 limited-range
+/// chroma roundtrip VideoToolbox applies, so SSIM/Y-PSNR floors
+/// would be empirical to *this hardware*'s VT colour-space math
+/// rather than catching a true regression. Linux's harness has the
+/// same skip — see `test_harness::build_reference`'s comment about
+/// the swscale parity gap. A future follow-up that calibrates
+/// `cpu_chroma_roundtrip_bgra(siting=HevcCentered)` for VT's
+/// limited-range expansion can land tight floors here; for now this
+/// cell is a structural smoke check that the coord-encoded path
+/// works end-to-end.)
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal + TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-render --release -- --ignored iosurface_host_scaler"]
+#[cfg(target_os = "macos")]
+fn iosurface_host_scaler_hevc_8bit_coord_encoded_smoke() {
+    let artifacts = match run_host_scaler_roundtrip_artifacts(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        (640, 480),
+        (320, 240),
+        HostScalerFixture::CoordEncoded,
+    ) {
+        Some(a) => a,
+        None => return,
+    };
+    let (dw, dh) = artifacts.dst_dims;
+    // The rendered BGRA buffer must be sized and at least span a
+    // non-trivial range on R and G (the gradient axes). A
+    // catastrophic regression (all-black, all-one-colour) would
+    // collapse the range; a working chain preserves at least 100
+    // levels of variation in each gradient channel even after
+    // limited-range expansion.
+    assert_eq!(artifacts.bgra_dst.len(), (dw * dh * 4) as usize);
+    let mut r_min = 255u8;
+    let mut r_max = 0u8;
+    let mut g_min = 255u8;
+    let mut g_max = 0u8;
+    for chunk in artifacts.bgra_dst.chunks_exact(4) {
+        let r = chunk[2];
+        let g = chunk[1];
+        r_min = r_min.min(r);
+        r_max = r_max.max(r);
+        g_min = g_min.min(g);
+        g_max = g_max.max(g);
+    }
+    let r_range = r_max.saturating_sub(r_min);
+    let g_range = g_max.saturating_sub(g_min);
+    eprintln!(
+        "coord-encoded smoke: R range {r_min}..{r_max} (Δ={r_range}), \
+         G range {g_min}..{g_max} (Δ={g_range})"
+    );
+    assert!(
+        r_range >= 100,
+        "R-channel gradient collapsed; range {r_min}..{r_max} (Δ={r_range}) — chain may be black or wrong colour"
+    );
+    assert!(
+        g_range >= 100,
+        "G-channel gradient collapsed; range {g_min}..{g_max} (Δ={g_range}) — chain may be black or wrong colour"
+    );
 }

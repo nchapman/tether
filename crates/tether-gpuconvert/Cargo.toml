@@ -59,5 +59,15 @@ core-foundation = "0.10"
 # scaler — the host wires them together at the binary layer.
 tether-scaler = { workspace = true }
 
+# Linux-only dev-dep: the fourcc-invariant unit test in
+# `nv12_dmabuf.rs` round-trips the bridge's hardcoded fourcc through
+# `tether_codec::vaapi::expected_dmabuf_fourcc` to catch drift between
+# the bridge and the encoder tables — same family of drift the macOS
+# side guards via `accepts_iosurface_fourcc`. Test-only; production
+# code in this crate doesn't depend on tether-codec.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tether-codec = { workspace = true }
+tether-protocol = { workspace = true }
+
 [lints]
 workspace = true

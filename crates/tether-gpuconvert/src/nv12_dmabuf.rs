@@ -391,6 +391,38 @@ mod tests {
     use super::*;
     use crate::dmabuf_export::export_texture_as_dmabuf;
 
+    /// Cross-table fourcc invariant: every `Nv12DmaBufFrame` this
+    /// crate produces must carry the fourcc the VAAPI encoder
+    /// expects for an 8-bit 4:2:0 profile, as reported by
+    /// `tether_codec::vaapi::expected_dmabuf_fourcc`. The
+    /// macOS-side equivalent (`nv12_iosurface::nv12_fourccs_round_trip_across_tables`)
+    /// catches the same family of drift on its host-scaler bridge;
+    /// the Linux side gets a smaller invariant because the
+    /// gpuconvert bridges hardcode their output fourcc rather than
+    /// having a runtime accept set.
+    ///
+    /// Cheap unit test: doesn't construct a bridge or touch GPU
+    /// state; just round-trips the constant through both crates'
+    /// tables.
+    #[test]
+    fn nv12_dmabuf_fourcc_matches_encoder_expectation() {
+        use tether_codec::vaapi::expected_dmabuf_fourcc;
+        use tether_protocol::control::ChromaSubsampling;
+        // The bridge's `nv12_dmabuf_to_codec_frame` (in tether-host)
+        // and the producer-side `DmaBufObject` here both encode
+        // NV12 via `u32::from_le_bytes(*b"NV12")`. The encoder
+        // looks up the same constant via `expected_dmabuf_fourcc`.
+        let bridge_fourcc = u32::from_le_bytes(*b"NV12");
+        let encoder_fourcc = expected_dmabuf_fourcc(ChromaSubsampling::Yuv420, 8)
+            .expect("VAAPI encoder must report an expected fourcc for 8-bit 4:2:0");
+        assert_eq!(
+            bridge_fourcc, encoder_fourcc,
+            "Nv12DmaBuf bridge fourcc 0x{bridge_fourcc:08x} drift vs encoder \
+             expected 0x{encoder_fourcc:08x} — a mismatch would crash \
+             av_hwframe_map(DRM_PRIME → VAAPI) at submit-frame time."
+        );
+    }
+
     /// End-to-end without VAAPI: load a solid-colour BGRA texture, run
     /// the bridge, re-import the returned Y plane via wgpu's existing
     /// `texture_from_dmabuf_fd`, read it back, assert the bytes match

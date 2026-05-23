@@ -1291,11 +1291,23 @@ fn encode_iosurface_frame(
         let bridge = slot.iosurface_bridge.as_ref().expect("just built");
         let pooled = match bridge.scale_to_iosurface(&src_frame) {
             Ok(p) => p,
-            Err(e) => {
-                // Per-frame transient — typically PoolExhausted under
-                // a brief encoder stall. Caller drops this frame.
+            Err(IOSurfaceBridgeError::PoolExhausted { depth }) => {
+                // Genuine per-frame transient: VT briefly held the
+                // encoder back and N PooledIOSurfaces are in flight.
+                // Drop this frame and let the next one acquire.
                 return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
-                    "nv12_iosurface scale: {e}"
+                    "nv12_iosurface pool exhausted (depth {depth})"
+                ));
+            }
+            Err(e) => {
+                // Any other bridge error from the per-frame path is
+                // structural — NotMetalBacked / MtlImportReturnedNil /
+                // MissingPlanePipelines etc. will recur on every
+                // frame. Treat as fatal so the host emits
+                // Goodbye(InternalError) instead of silently dropping
+                // every frame for the rest of the session.
+                return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                    "nv12_iosurface scale failed structurally: {e}"
                 ));
             }
         };

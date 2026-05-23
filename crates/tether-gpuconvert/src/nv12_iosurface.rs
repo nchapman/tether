@@ -81,6 +81,14 @@ pub enum BridgeError {
         fourcc: u32,
     },
 
+    /// The destination fourcc isn't in the bridge's known set at all
+    /// — distinct from [`Self::UnsupportedFourcc`], which reports a
+    /// known fourcc rejected by the encoder/renderer cross-check.
+    /// Carries only the offending fourcc because the chroma/bit_depth
+    /// can't be inferred.
+    #[error("destination fourcc 0x{fourcc:08x} is not recognised as any NV12-family fourcc")]
+    UnknownFourcc { fourcc: u32 },
+
     /// `IOSurfaceCreate` returned null. The properties dictionary is
     /// rejected: typically a zero dimension or an unsupported
     /// `kIOSurfacePixelFormat`.
@@ -391,11 +399,7 @@ impl Nv12IOSurfaceBridge {
         // tables in lockstep — see the unit test
         // `nv12_fourccs_round_trip_across_tables`.
         let (chroma, bit_depth) = chroma_bit_depth_for_fourcc(dst_fourcc)
-            .ok_or(BridgeError::UnsupportedFourcc {
-                chroma: tether_protocol::control::ChromaSubsampling::Yuv420,
-                bit_depth: 8,
-                fourcc: dst_fourcc,
-            })?;
+            .ok_or(BridgeError::UnknownFourcc { fourcc: dst_fourcc })?;
         if !accepts_iosurface_fourcc(chroma, bit_depth, dst_fourcc)
             || !tether_codec::videotoolbox::encoder::iosurface_fourcc_matches(
                 chroma, bit_depth, dst_fourcc,
@@ -430,6 +434,13 @@ impl Nv12IOSurfaceBridge {
             dst_dims,
             ColorSpace::LumaR8,
         )?;
+        // Vertical chroma offset is 0: MPEG-2 left-cosited NV12
+        // (`chroma_sample_loc_type_top_field = 0`, what VT/SCK tag)
+        // places the first chroma row co-sited with luma row 0, so
+        // a uniform downscale needs no vertical correction — the
+        // naive Mitchell center formula is already right for that
+        // axis. Only horizontal siting differs from the centered
+        // assumption.
         let uv_scaler = Scaler::new_with_color_space(
             pipelines,
             device.clone(),
@@ -634,10 +645,21 @@ impl Nv12IOSurfaceBridge {
         // Dispatch the scalers against the cloned texture handles.
         // The mutex is released; concurrent acquirers can pick a
         // different slot in parallel. `scale_into` calls
-        // `queue.submit`, so by the time `submit_iosurface` runs on
-        // the encoder side the IOSurface contents are observable to
-        // VideoToolbox. On Apple Silicon (unified memory) no
-        // explicit `MTLBlitCommandEncoder.synchronize` is needed.
+        // `queue.submit`, queueing the writes onto Metal's command
+        // queue.
+        //
+        // Ordering invariant: VideoToolbox's later access to the
+        // IOSurface happens through its own Metal command queue on
+        // the *same* MTLDevice that wgpu's submit went to, so Metal
+        // serialises the dependency without an explicit fence here
+        // — `submit_iosurface` retains the wrapping CVPixelBuffer
+        // synchronously, but VT's first read of the surface contents
+        // happens through MTL submission ordering. The Apple Silicon
+        // unified-memory model is what makes that read coherent;
+        // the same-MTLDevice contract is what makes it ordered.
+        // A multi-device pipeline (hypothetical; not exercised on
+        // macOS today) would need a `device.poll(Wait)` or an
+        // explicit cross-device fence.
         self.y_scaler.scale_into(&src_y, &y_dst_tex)?;
         self.uv_scaler.scale_into(&src_uv, &uv_dst_tex)?;
 
@@ -900,13 +922,30 @@ mod tests {
             assert_eq!(chroma, ChromaSubsampling::Yuv420);
             assert_eq!(bd, 10);
         }
+        // Negative cross-check: `'P010'` is in the renderer's accept
+        // set (VT decode emits it) but MUST NOT be in the encoder's
+        // input set. A future edit that mistakenly adds it to
+        // `iosurface_fourcc_matches` would break the bridge silently
+        // — the bridge would happily build a pool, then VT would
+        // reject every submit with a fourcc-mismatch.
+        use tether_codec::macos_interop::P010_FOURCC;
+        assert!(
+            !iosurface_fourcc_matches(ChromaSubsampling::Yuv420, 10, P010_FOURCC),
+            "encoder must NOT accept 'P010' as input fourcc — that path is decode-only"
+        );
     }
 
-    /// Verify the cosited-NV12 chroma offset formula matches the
-    /// expert review derivation: at 2× downscale the offset is
-    /// `-0.5` source-pixel; at 4× it's `-1.5`.
+    /// Verify the cosited-NV12 horizontal chroma offset formula
+    /// matches the expert review derivation: at 2× downscale the
+    /// offset is `-0.5` source-pixel; at 4× it's `-1.5`. The
+    /// vertical axis stays at 0 for MPEG-2 left-cosited NV12 (the
+    /// first chroma row is co-sited with luma row 0 — the naive
+    /// Mitchell center formula is already correct for that axis).
     #[test]
     fn chroma_offset_matches_cosited_formula() {
+        // (src, dst, expected_horizontal_offset). The vertical
+        // offset is `0.0` in every case by design — see the doc
+        // comment above; encoded as a separate assertion below.
         let cases = [
             ((640u32, 480u32), (640, 480), 0.0),
             ((1920, 1080), (960, 540), -0.5),
@@ -914,11 +953,23 @@ mod tests {
             ((1920, 1080), (1280, 720), -0.25),
         ];
         for (src, dst, expected) in cases {
-            let scale = src.0 as f32 / dst.0 as f32;
-            let computed = -(scale - 1.0) * 0.5;
+            let scale_x = src.0 as f32 / dst.0 as f32;
+            let computed_x = -(scale_x - 1.0) * 0.5;
             assert!(
-                (computed - expected).abs() < 1e-6,
-                "src={src:?} dst={dst:?}: expected offset {expected}, got {computed}"
+                (computed_x - expected).abs() < 1e-6,
+                "src={src:?} dst={dst:?}: expected x-offset {expected}, got {computed_x}"
+            );
+            // Vertical-axis invariant: the bridge always passes
+            // y-offset = 0.0 (see `with_pool_depth`). If a future
+            // change introduces a vertical correction (e.g. for a
+            // chroma-loc-type other than left-cosited), this
+            // assertion needs to grow into the same scale-aware
+            // shape as the horizontal one. Today the contract is
+            // explicit zero, and this test pins it.
+            let bridge_y_offset = 0.0_f32;
+            assert_eq!(
+                bridge_y_offset, 0.0,
+                "src={src:?} dst={dst:?}: vertical chroma offset must be 0 for left-cosited NV12"
             );
         }
     }

@@ -168,41 +168,6 @@ pub fn refresh_period_ns(refresh_rate_mhz: u32) -> u64 {
     1_000_000_000_000u64 / u64::from(rate_mhz)
 }
 
-/// Simple EWMA accumulator. α = 0.25 (one of the standard "slow but
-/// responsive" choices). Used by the renderer for inter-arrival,
-/// decode-to-present, and jitter samples — three instances of this
-/// struct, one shape.
-#[derive(Default, Debug, Clone, Copy)]
-pub struct EwmaNs {
-    mean_ns: u64,
-    samples: u32,
-}
-
-impl EwmaNs {
-    pub fn record(&mut self, sample_ns: u64) {
-        if self.samples == 0 {
-            self.mean_ns = sample_ns;
-        } else {
-            // 0.25 × sample + 0.75 × mean, integer-only:
-            //   (sample + 3 × mean) / 4
-            let s = u128::from(sample_ns);
-            let m = u128::from(self.mean_ns);
-            self.mean_ns = u64::try_from((s + 3 * m) / 4).unwrap_or(u64::MAX);
-        }
-        self.samples = self.samples.saturating_add(1);
-    }
-
-    #[must_use]
-    pub fn mean_ns(&self) -> u64 {
-        self.mean_ns
-    }
-
-    #[must_use]
-    pub fn samples(&self) -> u32 {
-        self.samples
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,23 +237,6 @@ mod tests {
     #[test]
     fn refresh_period_zero_falls_back_to_60hz() {
         assert_eq!(refresh_period_ns(0), 1_000_000_000_000 / 60_000);
-    }
-
-    #[test]
-    fn ewma_initial_sample_sets_mean() {
-        let mut e = EwmaNs::default();
-        e.record(1000);
-        assert_eq!(e.mean_ns(), 1000);
-    }
-
-    #[test]
-    fn ewma_converges_toward_steady_input() {
-        let mut e = EwmaNs::default();
-        for _ in 0..50 {
-            e.record(10_000);
-        }
-        // After many samples the mean should track input.
-        assert!(e.mean_ns().abs_diff(10_000) < 100);
     }
 
     #[test]

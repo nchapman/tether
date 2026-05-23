@@ -535,22 +535,22 @@ impl GpuState {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        // Per the expert review: Immediate is lowest-latency. Mailbox is
-        // smoother on systems that have it. Fifo (vsync) is the universal
-        // fallback but costs us a frame of latency.
-        let present_mode = if surface_caps
-            .present_modes
-            .contains(&wgpu::PresentMode::Immediate)
-        {
-            wgpu::PresentMode::Immediate
-        } else if surface_caps
-            .present_modes
-            .contains(&wgpu::PresentMode::Mailbox)
-        {
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::Fifo
-        };
+        // Present-mode preference is driven by the
+        // `crate::present_policy::PresentPolicy` enum. Default is
+        // `LowLatency` (Immediate > Mailbox > Fifo), matching the
+        // pre-policy behavior. The `Smooth` profile flips to
+        // Fifo-first for users who want vsync-locked presentation.
+        // The enum's `preference()` returns the ordered list; we
+        // pick the first one the surface advertises and fall back
+        // to Fifo (universal) if none match (impossible given
+        // wgpu's contract that Fifo is always supported, but
+        // tracked defensively).
+        let policy = crate::present_policy::PresentPolicy::default();
+        let present_mode = policy
+            .preference()
+            .into_iter()
+            .find(|m| surface_caps.present_modes.contains(m))
+            .unwrap_or(wgpu::PresentMode::Fifo);
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

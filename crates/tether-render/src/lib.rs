@@ -5,6 +5,7 @@
 
 pub mod color;
 mod gpu;
+pub mod present_policy;
 
 #[cfg(test)]
 mod dmabuf_test;
@@ -250,6 +251,13 @@ pub fn run(
         on_event,
         present_stats: PresentStats::default(),
         last_recorded_t_cap: None,
+        refresh_rate_mhz: present_policy::REFRESH_RATE_FALLBACK_HZ
+            .saturating_mul(1000),
+        age_tracker: present_policy::FrameAgeTracker::default(),
+        ewma_decode_to_present_ns: present_policy::EwmaNs::default(),
+        ewma_inter_arrival_ns: present_policy::EwmaNs::default(),
+        ewma_jitter_ns: present_policy::EwmaNs::default(),
+        last_frame_arrival: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -279,6 +287,18 @@ struct App {
     /// redraw would record the same age again, inflating the sample
     /// count and pulling the average up.
     last_recorded_t_cap: Option<MonoNanos>,
+    /// Cached monitor refresh rate, in millihertz. Queried on
+    /// resume + monitor change. Falls back to 60 Hz when winit
+    /// can't report a real value.
+    refresh_rate_mhz: u32,
+    /// Frame-age skip policy state. See [`present_policy`].
+    age_tracker: present_policy::FrameAgeTracker,
+    ewma_decode_to_present_ns: present_policy::EwmaNs,
+    ewma_inter_arrival_ns: present_policy::EwmaNs,
+    ewma_jitter_ns: present_policy::EwmaNs,
+    /// Userspace clock at the previous `RedrawRequested` that
+    /// observed a fresh frame. Powers the inter-arrival EWMA.
+    last_frame_arrival: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -352,6 +372,17 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        // Cache the monitor refresh rate. Winit returns an
+        // `Option<u32>` in millihertz; fall back to 60 Hz when
+        // it's unavailable (some Wayland compositors don't expose
+        // it on every monitor).
+        if let Some(monitor) = self.window.as_ref().and_then(|_| win.current_monitor()) {
+            if let Some(mhz) = monitor.refresh_rate_millihertz() {
+                self.refresh_rate_mhz = mhz;
+            }
+        } else if let Some(mhz) = win.current_monitor().and_then(|m| m.refresh_rate_millihertz()) {
+            self.refresh_rate_mhz = mhz;
+        }
         self.window = Some(win);
         self.gpu = Some(gpu);
     }
@@ -380,32 +411,71 @@ impl ApplicationHandler for App {
                 // so OS-initiated redraws (expose, focus) re-render the
                 // most recently applied frame without re-uploading or
                 // re-importing.
-                let applied_t_capture = if let Some(frame) = self.latest.take() {
-                    let t_capture = frame.t_capture_client_clock();
-                    if let Err(e) = gpu.apply_frame(frame) {
-                        warn!(error = ?e, "applying frame failed");
-                    }
-                    t_capture
-                } else {
-                    None
-                };
-                if let Err(e) = gpu.render() {
-                    warn!(error = ?e, "render frame failed");
-                }
-                // Sample t_present after the present() call inside
-                // gpu.render() returns. This isn't the true on-screen
-                // time (that's compositor + display latency further
-                // down) but it bounds it from below, which is enough
-                // to decompose recv-to-present vs network+encode.
                 //
-                // Only record on a frame we just applied; OS-initiated
-                // redraws without a new frame produce no sample.
-                if let Some(t_cap) = applied_t_capture {
-                    if self.last_recorded_t_cap != Some(t_cap) {
-                        let latency = MonoNanos::now().saturating_sub(t_cap);
-                        self.present_stats.record_and_maybe_log(latency);
-                        self.last_recorded_t_cap = Some(t_cap);
+                // Before applying, run the frame-age policy: a
+                // sufficiently-stale frame (>~1.5× refresh period,
+                // streak gated) is dropped on the floor so the
+                // refresh slot can carry whatever lands next instead
+                // of stale content the user has already adjusted to.
+                // Frames without a timestamp (test_pattern example)
+                // always render — no policy input to evaluate.
+                let mut skipped = false;
+                if let Some(frame) = self.latest.take() {
+                    let t_capture = frame.t_capture_client_clock();
+                    let now = MonoNanos::now();
+                    if let Some(t_cap) = t_capture {
+                        let age_ns = now.saturating_sub(t_cap);
+                        let decision = present_policy::decide_present(
+                            age_ns,
+                            self.refresh_rate_mhz,
+                            &mut self.age_tracker,
+                        );
+                        self.ewma_jitter_ns.record(age_ns);
+                        if matches!(decision, present_policy::PresentDecision::Skip) {
+                            skipped = true;
+                        }
                     }
+                    if !skipped {
+                        if let Err(e) = gpu.apply_frame(frame) {
+                            warn!(error = ?e, "applying frame failed");
+                        }
+                        // Inter-arrival EWMA: time between successive
+                        // applied frames. Captures producer cadence
+                        // independent of OS-initiated redraws (which
+                        // don't pull from `latest`).
+                        let now_inst = Instant::now();
+                        if let Some(prev) = self.last_frame_arrival {
+                            let delta_ns =
+                                u64::try_from(now_inst.duration_since(prev).as_nanos())
+                                    .unwrap_or(u64::MAX);
+                            self.ewma_inter_arrival_ns.record(delta_ns);
+                        }
+                        self.last_frame_arrival = Some(now_inst);
+                    }
+                    if !skipped && t_capture.is_some() {
+                        // Sample present latency only for frames we
+                        // actually applied. Dedup against
+                        // `last_recorded_t_cap` so OS-initiated
+                        // redraws don't double-count.
+                        if self.last_recorded_t_cap != t_capture {
+                            let t_cap = t_capture.expect("checked Some above");
+                            let latency = MonoNanos::now().saturating_sub(t_cap);
+                            self.present_stats.record_and_maybe_log(latency);
+                            self.ewma_decode_to_present_ns.record(latency);
+                            self.last_recorded_t_cap = Some(t_cap);
+                        }
+                    }
+                }
+                if !skipped {
+                    if let Err(e) = gpu.render() {
+                        warn!(error = ?e, "render frame failed");
+                    }
+                } else {
+                    tracing::trace!(
+                        late_streak = self.age_tracker.late_streak,
+                        drops = self.age_tracker.drops_in_window,
+                        "skipped stale frame"
+                    );
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

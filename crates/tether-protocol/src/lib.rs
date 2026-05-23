@@ -120,7 +120,7 @@ mod tests {
     use crate::video::{
         FrameFragmenter, FrameReassembler, HostFrameTiming, HostFrameTimingBuilder,
         InputEchoBatch, VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket,
-        CONTINUATION_PAYLOAD_BUDGET, FIRST_PAYLOAD_BUDGET,
+        CONTINUATION_PAYLOAD_BUDGET, FEC_MAX_PRIMARY_SHARDS, FEC_SHARD_SIZE, FIRST_PAYLOAD_BUDGET,
     };
 
     #[test]
@@ -697,7 +697,9 @@ mod tests {
                 assert_eq!(meta.input_echo.event_ids, vec![1, 2, 3]);
                 assert_eq!(payload.len(), 1100);
             }
-            VideoPacket::Continuation { .. } => panic!("wrong variant"),
+            VideoPacket::Continuation { .. } | VideoPacket::Parity { .. } => {
+                panic!("wrong variant")
+            }
         }
     }
 
@@ -743,7 +745,9 @@ mod tests {
         let p2: VideoPacket = decode(&bytes).unwrap();
         match p2 {
             VideoPacket::First { stream_epoch, .. } => assert_eq!(stream_epoch, epoch),
-            VideoPacket::Continuation { .. } => panic!("wrong variant"),
+            VideoPacket::Continuation { .. } | VideoPacket::Parity { .. } => {
+                panic!("wrong variant")
+            }
         }
     }
 
@@ -830,6 +834,174 @@ mod tests {
             bytes.len(),
             MAX_DATAGRAM_PAYLOAD
         );
+    }
+
+    #[test]
+    fn fragmenter_with_fec_zero_is_wire_identical_to_no_fec() {
+        // Default fec_percentage=0 means no Parity packets emitted
+        // and primary fragmentation stays in the original
+        // 1100/1180 mixed-budget shape — i.e. wire-compatible with
+        // pre-FEC reassemblers.
+        let body: bytes::Bytes = vec![0xab; 5000].into();
+        let mut a = FrameFragmenter::new(0);
+        let mut b = FrameFragmenter::new_with_fec(0, 0);
+        let pa = a.fragment(default_meta(), body.clone());
+        let pb = b.fragment(default_meta(), body);
+        assert_eq!(pa.len(), pb.len());
+        for (x, y) in pa.iter().zip(pb.iter()) {
+            assert_eq!(encode(x).unwrap(), encode(y).unwrap());
+        }
+        // And no parity packets in either.
+        assert!(pa.iter().all(|p| !matches!(p, VideoPacket::Parity { .. })));
+    }
+
+    fn default_meta() -> VideoFrameMeta {
+        VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (640, 480),
+        }
+    }
+
+    #[test]
+    fn fragmenter_with_fec_emits_parity_proportional_to_percentage() {
+        let body: bytes::Bytes = vec![0u8; 11_000].into(); // ~10 primary shards
+        let mut frag = FrameFragmenter::new_with_fec(0, 20);
+        let pkts = frag.fragment(default_meta(), body);
+        let primary = pkts
+            .iter()
+            .filter(|p| matches!(p, VideoPacket::First { .. } | VideoPacket::Continuation { .. }))
+            .count();
+        let parity = pkts
+            .iter()
+            .filter(|p| matches!(p, VideoPacket::Parity { .. }))
+            .count();
+        // 11_000 / 1100 = 10 primaries; 20% parity = 2.
+        assert_eq!(primary, 10);
+        assert_eq!(parity, 2);
+    }
+
+    #[test]
+    fn fec_recovers_from_losing_up_to_parity_count_primaries() {
+        // Drop up to K of the N primaries; reassembler must
+        // reconstruct from the K parity shards.
+        let body: bytes::Bytes = (0..5000u32).map(|i| (i & 0xff) as u8).collect::<Vec<u8>>().into();
+        let mut frag = FrameFragmenter::new_with_fec(0, 25); // 25% parity
+        let pkts = frag.fragment(default_meta(), body.clone());
+        let parity_count = pkts
+            .iter()
+            .filter(|p| matches!(p, VideoPacket::Parity { .. }))
+            .count();
+        // 5000 / 1100 = 5 primaries → 25% = 2 parity (rounded up).
+        assert!(parity_count >= 1);
+
+        // Drop the first `parity_count` primaries; keep all parity.
+        let kept: Vec<_> = pkts
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= parity_count) // drop primaries 0..parity_count
+            .map(|(_, p)| p)
+            .collect();
+        let mut r = FrameReassembler::new();
+        let mut got = None;
+        for p in kept {
+            if let Some(f) = r.handle(p) {
+                got = Some(f);
+            }
+        }
+        let f = got.expect("reassembled via FEC");
+        assert_eq!(f.body.as_ref(), body.as_ref());
+    }
+
+    #[test]
+    fn fec_fails_when_loss_exceeds_parity() {
+        // Losing more primaries than we have parity for must NOT
+        // produce a reconstructed frame.
+        let body: bytes::Bytes = vec![0xff; 5000].into();
+        let mut frag = FrameFragmenter::new_with_fec(0, 20); // 1 parity for 5 primaries
+        let pkts = frag.fragment(default_meta(), body);
+        let parity_count = pkts
+            .iter()
+            .filter(|p| matches!(p, VideoPacket::Parity { .. }))
+            .count();
+        // Drop parity_count + 1 primaries.
+        let kept: Vec<_> = pkts
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= parity_count + 1)
+            .map(|(_, p)| p)
+            .collect();
+        let mut r = FrameReassembler::new();
+        let mut got = None;
+        for p in kept {
+            if let Some(f) = r.handle(p) {
+                got = Some(f);
+            }
+        }
+        assert!(got.is_none(), "loss above parity must not reconstruct");
+    }
+
+    #[test]
+    fn fec_falls_back_to_legacy_when_frame_exceeds_max_primary_shards() {
+        // A frame above FEC_MAX_PRIMARY_SHARDS × FEC_SHARD_SIZE
+        // can't fit in a single FEC block — fragmenter falls back
+        // to the pre-FEC mixed-budget shape with zero parity. Test
+        // that fec stays a no-op for this case (no Parity packets).
+        let oversize = (FEC_MAX_PRIMARY_SHARDS + 5) * FEC_SHARD_SIZE;
+        let body: bytes::Bytes = vec![0u8; oversize].into();
+        let mut frag = FrameFragmenter::new_with_fec(0, 20);
+        let pkts = frag.fragment(default_meta(), body);
+        assert!(
+            pkts.iter().all(|p| !matches!(p, VideoPacket::Parity { .. })),
+            "oversize frames must fall back to no-FEC fragmentation"
+        );
+    }
+
+    #[test]
+    fn parity_packet_round_trips() {
+        let p = VideoPacket::Parity {
+            display: 7,
+            stream_epoch: 42,
+            frame_seq: 100,
+            data_shards: 5,
+            parity_shards: 1,
+            shard_index: 0,
+            total_body_len: 5000,
+            meta: VideoFrameMetaEnvelope::V1(default_meta()),
+            payload: bytes::Bytes::from(vec![0x42; FEC_SHARD_SIZE]),
+        };
+        let bytes = encode(&p).unwrap();
+        assert!(
+            bytes.len() <= MAX_DATAGRAM_PAYLOAD,
+            "parity packet must fit in a datagram"
+        );
+        let p2: VideoPacket = decode(&bytes).unwrap();
+        match p2 {
+            VideoPacket::Parity {
+                display,
+                stream_epoch,
+                frame_seq,
+                data_shards,
+                parity_shards,
+                shard_index,
+                total_body_len,
+                meta,
+                payload,
+            } => {
+                assert_eq!(display, 7);
+                assert_eq!(stream_epoch, 42);
+                assert_eq!(frame_seq, 100);
+                assert_eq!(data_shards, 5);
+                assert_eq!(parity_shards, 1);
+                assert_eq!(shard_index, 0);
+                assert_eq!(total_body_len, 5000);
+                let m = meta.into_meta();
+                assert_eq!(m.dimensions, (640, 480));
+                assert_eq!(payload.len(), FEC_SHARD_SIZE);
+            }
+            _ => panic!("expected Parity"),
+        }
     }
 
     #[test]

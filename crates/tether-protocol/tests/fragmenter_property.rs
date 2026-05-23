@@ -151,12 +151,7 @@ proptest! {
             } else {
                 let pkts = fragmenter.fragment(meta(), Bytes::from(vec![0u8; 100]));
                 for pkt in pkts {
-                    let (epoch, seq) = match pkt {
-                        VideoPacket::First { stream_epoch, frame_seq, .. }
-                        | VideoPacket::Continuation { stream_epoch, frame_seq, .. } => {
-                            (stream_epoch, frame_seq)
-                        }
-                    };
+                    let (_, epoch, seq) = pkt.route_key();
                     let entry = last_seq_per_epoch.entry(epoch).or_insert(None);
                     if let Some(last) = *entry {
                         prop_assert!(

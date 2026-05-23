@@ -1838,7 +1838,13 @@ fn run_capture_and_send(
     latest_client_stats: LatestClientStats,
     latest_viewport: LatestViewport,
 ) {
-    let mut fragmenter = FrameFragmenter::new(0);
+    // FEC parity ratio applied to P-frame datagrams. 20% is the
+    // default — enough to absorb the single-digit packet loss the
+    // pacer doesn't eliminate, well under the bandwidth penalty
+    // most LANs will notice. Disable by setting to 0 (a future
+    // `tether.cap.fec` negotiation will let the client opt-out).
+    const FEC_PERCENTAGE: u8 = 20;
+    let mut fragmenter = FrameFragmenter::new_with_fec(0, FEC_PERCENTAGE);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
     // Per-frame packet pacer. Smooths the natural sub-millisecond
     // burst of P-frame datagrams across the frame interval, sized

@@ -193,6 +193,41 @@ pub enum VideoPacket {
         fragment_index: u16,
         payload: Bytes,
     },
+    /// Reed-Solomon parity shard for a frame. Only emitted when the
+    /// fragmenter is constructed with `fec_percentage > 0`. The
+    /// receiver runs an RS-decode when at least `data_shards` of the
+    /// frame's `data_shards + parity_shards` total shards have
+    /// arrived (any mix of primary and parity).
+    ///
+    /// `data_shards` mirrors `First.fragment_count` for sanity-check
+    /// (and so the receiver can size the RS context before First
+    /// arrives). `parity_shards` is the total parity count for the
+    /// frame; `shard_index` is `0..parity_shards`.
+    ///
+    /// Wire size: each parity shard payload is exactly
+    /// [`FEC_SHARD_SIZE`] bytes. Sub-shard-size primaries (the last
+    /// one) are zero-padded for the RS computation but transmitted
+    /// at their actual length in the First/Continuation packets.
+    Parity {
+        display: u8,
+        stream_epoch: u32,
+        frame_seq: u32,
+        data_shards: u16,
+        parity_shards: u16,
+        shard_index: u16,
+        /// Total bytes in the original frame body. The receiver
+        /// needs this to trim zero-padding from a reconstructed
+        /// last shard.
+        total_body_len: u32,
+        /// Frame metadata, replicated from `First`. Carried on every
+        /// parity packet so reconstruction can still succeed when
+        /// First itself is one of the lost primaries. The ~50-byte
+        /// duplication is the cost of FEC actually being useful in
+        /// the lost-First case; without it, losing First makes the
+        /// frame unrecoverable even with sufficient parity.
+        meta: VideoFrameMetaEnvelope,
+        payload: Bytes,
+    },
 }
 
 impl VideoPacket {
@@ -219,6 +254,33 @@ impl VideoPacket {
     pub fn wire_size(&self) -> usize {
         crate::encode(self).map(|b| b.len()).unwrap_or(0)
     }
+
+    /// `(display, stream_epoch, frame_seq)` accessor common to all
+    /// variants. Used by the reassembler to route packets without
+    /// repeating the match in five places.
+    #[must_use]
+    pub fn route_key(&self) -> (u8, u32, u32) {
+        match self {
+            Self::First {
+                display,
+                stream_epoch,
+                frame_seq,
+                ..
+            }
+            | Self::Continuation {
+                display,
+                stream_epoch,
+                frame_seq,
+                ..
+            }
+            | Self::Parity {
+                display,
+                stream_epoch,
+                frame_seq,
+                ..
+            } => (*display, *stream_epoch, *frame_seq),
+        }
+    }
 }
 
 /// Conservative payload budget per [`VideoPacket::First`] packet. Leaves
@@ -229,6 +291,30 @@ pub const FIRST_PAYLOAD_BUDGET: usize = 1100;
 /// Leaves ~20 bytes of header headroom.
 pub const CONTINUATION_PAYLOAD_BUDGET: usize = 1180;
 
+/// Uniform shard size used when FEC is enabled.
+///
+/// Reed-Solomon requires all shards (primaries and parity) to be the
+/// same length. Bounded by [`FIRST_PAYLOAD_BUDGET`] because the
+/// First packet's meta envelope eats more header headroom than the
+/// Continuation/Parity variants do — making this any larger would
+/// push the First packet past [`crate::MAX_DATAGRAM_PAYLOAD`]. The
+/// 7% bandwidth penalty on Continuations (vs their 1180 B budget)
+/// is the cost of the uniform-shard requirement.
+pub const FEC_SHARD_SIZE: usize = FIRST_PAYLOAD_BUDGET;
+
+/// Maximum primary shards per FEC block. Single-block FEC today (no
+/// multi-block split), so this is also the per-frame primary cap when
+/// FEC is on. Caps at the GF(2^8) Reed-Solomon ceiling of 255 total
+/// shards (primary + parity); the formula
+/// `(255 * 100) / (100 + fec_pct)` floors as `fec_pct` rises.
+///
+/// At the default 20% parity, this lands at 212 primaries — ~233 KB
+/// of frame body, comfortably above any P-frame at 25 Mbps / 60 fps
+/// and large enough for typical IDRs too. Frames that exceed it fall
+/// back to no-FEC fragmentation; multi-block split is a future
+/// addition for sustained >100 Mbps streams.
+pub const FEC_MAX_PRIMARY_SHARDS: usize = 212;
+
 /// Splits a video frame body into a sequence of `VideoPacket`s sized to
 /// fit inside the QUIC datagram budget. Owns the per-stream `frame_seq`
 /// counter; bump `stream_epoch` via [`Self::bump_epoch`] whenever the
@@ -237,15 +323,36 @@ pub struct FrameFragmenter {
     display: u8,
     stream_epoch: u32,
     next_frame_seq: u32,
+    /// Parity ratio as a percentage of primary shards. `0` disables
+    /// FEC entirely (no `Parity` packets emitted; First/Continuation
+    /// fragments stay byte-identical to the pre-FEC output for the
+    /// same body — wire-compat with older clients).
+    fec_percentage: u8,
 }
 
 impl FrameFragmenter {
     pub fn new(display: u8) -> Self {
+        Self::new_with_fec(display, 0)
+    }
+
+    /// Construct a fragmenter with the given parity ratio. `0` keeps
+    /// behavior bit-identical to [`Self::new`]; positive values
+    /// emit additional `VideoPacket::Parity` packets after each
+    /// `fragment()` call. The fragmenter still emits the original
+    /// `First`/`Continuation` packets; FEC is purely additive.
+    pub fn new_with_fec(display: u8, fec_percentage: u8) -> Self {
         Self {
             display,
             stream_epoch: 0,
             next_frame_seq: 0,
+            fec_percentage,
         }
+    }
+
+    /// Current parity ratio.
+    #[must_use]
+    pub fn fec_percentage(&self) -> u8 {
+        self.fec_percentage
     }
 
     pub fn display(&self) -> u8 {
@@ -291,6 +398,108 @@ impl FrameFragmenter {
         let frame_seq = self.next_frame_seq;
         self.next_frame_seq = self.next_frame_seq.wrapping_add(1);
 
+        // FEC path uses uniform shard sizes so Reed-Solomon's
+        // same-length-shard requirement is satisfied without
+        // per-shard padding bookkeeping. Falls back to the
+        // pre-FEC mixed-budget shape when fec_percentage = 0 OR
+        // the body would need more than FEC_MAX_PRIMARY_SHARDS
+        // shards (multi-block FEC is a future addition).
+        let fec_on = self.fec_percentage > 0;
+        let body_len = body.len();
+        let primary_shards_needed = if body_len == 0 {
+            1
+        } else {
+            body_len.div_ceil(FEC_SHARD_SIZE)
+        };
+        let use_fec = fec_on && primary_shards_needed <= FEC_MAX_PRIMARY_SHARDS;
+
+        if !use_fec {
+            return self.fragment_legacy(meta, body, frame_seq);
+        }
+
+        // Uniform-shard primary fragmentation. First.payload sits at
+        // shard[0] (≤ FEC_SHARD_SIZE bytes); each Continuation
+        // carries one full shard. The last shard may be shorter than
+        // FEC_SHARD_SIZE on the wire, but its conceptual length for
+        // RS math is the full FEC_SHARD_SIZE (zero-padded).
+        let fragment_count = u16::try_from(primary_shards_needed)
+            .expect("primary count fits in u16; capped at FEC_MAX_PRIMARY_SHARDS");
+        let parity_count = compute_parity_count(primary_shards_needed, self.fec_percentage);
+
+        let mut packets =
+            Vec::with_capacity(primary_shards_needed + parity_count);
+
+        // First shard. Wrap meta in the envelope; clone so we can
+        // also replicate it across every parity packet for the
+        // lost-First recovery case.
+        let envelope = VideoFrameMetaEnvelope::V1(meta);
+        let first_end = FEC_SHARD_SIZE.min(body_len);
+        packets.push(VideoPacket::First {
+            display: self.display,
+            stream_epoch: self.stream_epoch,
+            frame_seq,
+            fragment_count,
+            meta: envelope.clone(),
+            payload: body.slice(..first_end),
+        });
+
+        let mut offset = first_end;
+        let mut idx: u16 = 1;
+        while offset < body_len {
+            let end = (offset + FEC_SHARD_SIZE).min(body_len);
+            packets.push(VideoPacket::Continuation {
+                display: self.display,
+                stream_epoch: self.stream_epoch,
+                frame_seq,
+                fragment_index: idx,
+                payload: body.slice(offset..end),
+            });
+            offset = end;
+            idx += 1;
+        }
+
+        // Compute parity. Reed-Solomon requires uniform-length
+        // shards; assemble a contiguous zero-padded buffer of size
+        // (primary + parity) * FEC_SHARD_SIZE, fill the primary
+        // region from the body, leave the parity region zero, then
+        // encode in place.
+        if parity_count > 0 {
+            if let Some(parity_packets) = encode_parity(
+                self.display,
+                self.stream_epoch,
+                frame_seq,
+                &body,
+                primary_shards_needed,
+                parity_count,
+                envelope,
+            ) {
+                packets.extend(parity_packets);
+            } else {
+                // RS construction failure is unreachable for the
+                // (data, parity) sizes we permit, but the crate
+                // returns Result so log and ship without parity if
+                // we ever hit it.
+                tracing::warn!(
+                    primary = primary_shards_needed,
+                    parity = parity_count,
+                    "reed-solomon construction failed; sending without FEC"
+                );
+            }
+        }
+
+        packets
+    }
+
+    /// Pre-FEC fragmentation shape: First gets FIRST_PAYLOAD_BUDGET,
+    /// continuations get CONTINUATION_PAYLOAD_BUDGET. Wire-identical
+    /// to the original `fragment` implementation; used when FEC is
+    /// disabled or the frame is too large for single-block FEC.
+    fn fragment_legacy(
+        &self,
+        meta: VideoFrameMeta,
+        body: Bytes,
+        frame_seq: u32,
+    ) -> Vec<VideoPacket> {
         let first_len = body.len().min(FIRST_PAYLOAD_BUDGET);
         let tail_len = body.len() - first_len;
         let cont_count = tail_len.div_ceil(CONTINUATION_PAYLOAD_BUDGET);
@@ -324,6 +533,76 @@ impl FrameFragmenter {
 
         packets
     }
+}
+
+/// `ceil(primary * pct / 100)`, but never zero when `pct > 0`. A
+/// "fec_percentage = 1" + primary = 50 frame would otherwise produce
+/// 0 parity shards (round-down), defeating the configuration.
+fn compute_parity_count(primary: usize, fec_percentage: u8) -> usize {
+    if fec_percentage == 0 {
+        return 0;
+    }
+    let raw = primary.saturating_mul(fec_percentage as usize).div_ceil(100);
+    raw.max(1)
+}
+
+/// Build the parity packets for a frame. Returns `None` if the
+/// reed-solomon crate failed to construct an encoder (impossible for
+/// the data + parity counts we permit, but the crate returns Result).
+fn encode_parity(
+    display: u8,
+    stream_epoch: u32,
+    frame_seq: u32,
+    body: &Bytes,
+    primary: usize,
+    parity: usize,
+    meta: VideoFrameMetaEnvelope,
+) -> Option<Vec<VideoPacket>> {
+    use reed_solomon_erasure::galois_8::ReedSolomon;
+
+    let rs = ReedSolomon::new(primary, parity).ok()?;
+    let total_body_len = u32::try_from(body.len()).ok()?;
+
+    // Assemble shards: contiguous (primary + parity) * FEC_SHARD_SIZE
+    // buffer. Primary region copied from body (zero-padded last
+    // shard), parity region left zero. Then encode in place.
+    let mut shards: Vec<Vec<u8>> = (0..(primary + parity))
+        .map(|i| {
+            if i < primary {
+                let start = i * FEC_SHARD_SIZE;
+                let end = (start + FEC_SHARD_SIZE).min(body.len());
+                let mut shard = vec![0u8; FEC_SHARD_SIZE];
+                shard[..end - start].copy_from_slice(&body[start..end]);
+                shard
+            } else {
+                vec![0u8; FEC_SHARD_SIZE]
+            }
+        })
+        .collect();
+
+    rs.encode(&mut shards).ok()?;
+
+    let parity_shards_u16 = u16::try_from(parity).ok()?;
+    let data_shards_u16 = u16::try_from(primary).ok()?;
+    Some(
+        shards
+            .into_iter()
+            .enumerate()
+            .skip(primary)
+            .enumerate()
+            .map(|(shard_idx, (_, payload))| VideoPacket::Parity {
+                display,
+                stream_epoch,
+                frame_seq,
+                data_shards: data_shards_u16,
+                parity_shards: parity_shards_u16,
+                shard_index: u16::try_from(shard_idx).expect("parity count fits in u16"),
+                total_body_len,
+                meta: meta.clone(),
+                payload: Bytes::from(payload),
+            })
+            .collect(),
+    )
 }
 
 /// Reassembled frame produced by [`FrameReassembler::handle`].
@@ -383,6 +662,25 @@ struct Pending {
     /// When the first fragment for this frame arrived. Used by the
     /// wall-clock timeout in `prune_old`.
     first_seen: Instant,
+    /// Parity shards received so far. `None` slots are missing
+    /// parity packets. Sized lazily on the first Parity packet for
+    /// this frame; left empty when no Parity arrived.
+    parity_shards: Vec<Option<Bytes>>,
+    /// Set on the first Parity packet for the frame. `0` (= "no
+    /// parity"), set non-zero once any Parity arrives. The
+    /// reassembler will only attempt RS recovery when this is
+    /// non-zero AND `received_primaries + received_parity >=
+    /// fragment_count`.
+    parity_count: u16,
+    /// Set on the first Parity packet. The reassembler needs this
+    /// to trim zero-padding from the reconstructed last shard.
+    total_body_len: Option<u32>,
+    /// Latches `true` the first time an RS reconstruct attempt
+    /// runs for this frame. If reconstruct failed (impossible for
+    /// well-formed shards over QUIC, but the RS crate returns
+    /// Result), don't retry on every subsequent packet — that
+    /// would be quadratic work for no benefit.
+    recovery_attempted: bool,
 }
 
 impl Default for FrameReassembler {
@@ -430,20 +728,7 @@ impl FrameReassembler {
     }
 
     pub fn handle(&mut self, packet: VideoPacket) -> Option<ReassembledFrame> {
-        let (display, stream_epoch, frame_seq) = match &packet {
-            VideoPacket::First {
-                display,
-                stream_epoch,
-                frame_seq,
-                ..
-            }
-            | VideoPacket::Continuation {
-                display,
-                stream_epoch,
-                frame_seq,
-                ..
-            } => (*display, *stream_epoch, *frame_seq),
-        };
+        let (display, stream_epoch, frame_seq) = packet.route_key();
 
         let stream_key = (display, stream_epoch);
         let latest = *self
@@ -481,6 +766,10 @@ impl FrameReassembler {
             fragments: Vec::new(),
             meta: None,
             first_seen: Instant::now(),
+            parity_shards: Vec::new(),
+            parity_count: 0,
+            total_body_len: None,
+            recovery_attempted: false,
         });
 
         match packet {
@@ -512,43 +801,178 @@ impl FrameReassembler {
                     entry.received_count += 1;
                 }
             }
+            VideoPacket::Parity {
+                data_shards,
+                parity_shards,
+                shard_index,
+                total_body_len,
+                meta,
+                payload,
+                ..
+            } => {
+                // Treat data_shards as authoritative for sizing the
+                // primaries vector — by the time a Parity packet
+                // arrives, the receiver may not yet have seen the
+                // First (out-of-order datagrams).
+                ensure_capacity(&mut entry.fragments, data_shards as usize);
+                if entry.fragment_count == 0 {
+                    entry.fragment_count = data_shards;
+                }
+                if entry.parity_count == 0 {
+                    entry.parity_count = parity_shards;
+                    entry.total_body_len = Some(total_body_len);
+                }
+                // Parity replicates meta so a lost First can still
+                // be recovered. First overwrites this with its own
+                // meta if both arrive — same envelope contents
+                // either way.
+                if entry.meta.is_none() {
+                    entry.meta = Some(meta.into_meta());
+                }
+                let idx = shard_index as usize;
+                ensure_capacity(&mut entry.parity_shards, parity_shards as usize);
+                if entry.parity_shards[idx].is_none() {
+                    entry.parity_shards[idx] = Some(payload);
+                }
+            }
         }
 
-        // Complete if we know the total and have received that many,
-        // and the First (with meta) has arrived.
+        // Fast path: every primary arrived. Skip RS decode and run
+        // the existing concat path, byte-identical to the pre-FEC
+        // behavior.
         if entry.fragment_count > 0
             && entry.received_count == entry.fragment_count
             && entry.meta.is_some()
         {
-            let pending = self
-                .pending
-                .remove(&key)
-                .expect("entry exists, we just inserted into it");
-            let meta = pending.meta.expect("checked Some above");
-            // Pre-size to the exact total so reassembly is one
-            // allocation + one memcpy pass — rather than the growth-
-            // doubling churn `Iterator::collect::<Vec<u8>>` would
-            // incur, and rather than the per-fragment `flatten()`
-            // chain materializing intermediate slices.
-            let total_len: usize = pending
-                .fragments
-                .iter()
-                .filter_map(|f| f.as_ref().map(bytes::Bytes::len))
-                .sum();
-            let mut buf = BytesMut::with_capacity(total_len);
-            for fragment in pending.fragments.into_iter().flatten() {
-                buf.extend_from_slice(&fragment);
-            }
-            let body = buf.freeze();
-            return Some(ReassembledFrame {
-                display,
-                stream_epoch,
-                frame_seq,
-                meta,
-                body,
-            });
+            return self.finalize_primary(key, display, stream_epoch, frame_seq);
         }
+
+        // Recovery path: enough total shards have arrived to run RS
+        // decode and reconstruct the missing primaries.
+        if entry.fragment_count > 0
+            && entry.parity_count > 0
+            && entry.meta.is_some()
+            && !entry.recovery_attempted
+            && enough_for_rs_decode(entry)
+        {
+            return self.finalize_with_recovery(key, display, stream_epoch, frame_seq);
+        }
+
         None
+    }
+
+    fn finalize_primary(
+        &mut self,
+        key: FrameKey,
+        display: u8,
+        stream_epoch: u32,
+        frame_seq: u32,
+    ) -> Option<ReassembledFrame> {
+        let pending = self
+            .pending
+            .remove(&key)
+            .expect("entry exists, we just inserted into it");
+        let meta = pending.meta.expect("checked Some above");
+        let total_len: usize = pending
+            .fragments
+            .iter()
+            .filter_map(|f| f.as_ref().map(bytes::Bytes::len))
+            .sum();
+        let mut buf = BytesMut::with_capacity(total_len);
+        for fragment in pending.fragments.into_iter().flatten() {
+            buf.extend_from_slice(&fragment);
+        }
+        let body = buf.freeze();
+        Some(ReassembledFrame {
+            display,
+            stream_epoch,
+            frame_seq,
+            meta,
+            body,
+        })
+    }
+
+    fn finalize_with_recovery(
+        &mut self,
+        key: FrameKey,
+        display: u8,
+        stream_epoch: u32,
+        frame_seq: u32,
+    ) -> Option<ReassembledFrame> {
+        use reed_solomon_erasure::galois_8::ReedSolomon;
+
+        let pending = self.pending.remove(&key)?;
+        let meta = pending.meta.clone()?;
+        let primary = pending.fragment_count as usize;
+        let parity = pending.parity_count as usize;
+        let total_body_len = pending.total_body_len? as usize;
+
+        let rs = ReedSolomon::new(primary, parity).ok()?;
+
+        // Build a Vec<Option<Vec<u8>>> of length primary + parity.
+        // Each Some shard is zero-padded to FEC_SHARD_SIZE; missing
+        // shards are None. RS decode fills in the missing primaries
+        // (we don't care about reconstructing missing parities).
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(primary + parity);
+        for i in 0..primary {
+            shards.push(pending.fragments.get(i).and_then(|opt| {
+                opt.as_ref().map(|b| {
+                    let mut shard = vec![0u8; FEC_SHARD_SIZE];
+                    shard[..b.len()].copy_from_slice(b);
+                    shard
+                })
+            }));
+        }
+        for i in 0..parity {
+            shards.push(
+                pending
+                    .parity_shards
+                    .get(i)
+                    .and_then(|opt| opt.as_ref().map(|b| b.to_vec())),
+            );
+        }
+
+        if rs.reconstruct(&mut shards).is_err() {
+            // Reconstruction failure should be unreachable over
+            // QUIC (authenticated datagrams + valid N/K). Re-insert
+            // with `recovery_attempted = true` so future packets
+            // don't re-trigger the same wasted RS attempt — the
+            // frame will instead time out via `prune_old`.
+            tracing::trace!(
+                primary,
+                parity,
+                "RS reconstruct failed; will not retry this frame"
+            );
+            let mut pending = pending;
+            pending.recovery_attempted = true;
+            self.pending.insert(key, pending);
+            return None;
+        }
+
+        // Concatenate the recovered primaries, trimming the last
+        // shard down to its actual length so we don't ship the
+        // zero padding as part of the body.
+        let mut buf = BytesMut::with_capacity(total_body_len);
+        for (i, shard) in shards.into_iter().take(primary).enumerate() {
+            let Some(data) = shard else {
+                // Should be unreachable after a successful
+                // reconstruct, but guard so we never publish a
+                // half-reconstructed body.
+                tracing::warn!(i, "RS reconstruct returned None primary shard");
+                return None;
+            };
+            let start = i * FEC_SHARD_SIZE;
+            let end = (start + FEC_SHARD_SIZE).min(total_body_len);
+            buf.extend_from_slice(&data[..end - start]);
+        }
+
+        Some(ReassembledFrame {
+            display,
+            stream_epoch,
+            frame_seq,
+            meta,
+            body: buf.freeze(),
+        })
     }
 
     fn prune_old(&mut self) {
@@ -580,6 +1004,18 @@ impl FrameReassembler {
         // report the loss.
         self.frames_dropped = self.frames_dropped.saturating_add(pruned as u64);
     }
+}
+
+/// Decide whether `pending` has enough shards to run RS decode.
+/// Requires (primary slots filled OR parity slots filled) ≥ data_shards
+/// AND parity availability > 0.
+fn enough_for_rs_decode(pending: &Pending) -> bool {
+    let parity_received = pending
+        .parity_shards
+        .iter()
+        .filter(|s| s.is_some())
+        .count() as u16;
+    pending.received_count + parity_received >= pending.fragment_count
 }
 
 fn ensure_capacity(v: &mut Vec<Option<Bytes>>, len: usize) {

@@ -78,5 +78,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tether-gpuconvert = { workspace = true }
 
+# macOS dev-dep: the iosurface_test.rs host-scaler round-trip cell
+# drives a captured IOSurface through tether-gpuconvert's
+# nv12_iosurface bridge to verify the production downscale path
+# (Stage 3 of the macOS GPU-scaling plan). Test-only — the renderer
+# itself doesn't link the bridge.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tether-gpuconvert = { workspace = true }
+
 [lints]
 workspace = true

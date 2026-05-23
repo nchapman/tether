@@ -60,10 +60,14 @@ the relevant crate (e.g. `tether-capture/src/macos.rs`).
 
 End-to-end for one frame, host on a Linux Wayland session, client on
 any Linux machine. The **macOS host** variant diverges only inside the
-capture→encoder hop (ScreenCaptureKit hands NV12 IOSurfaces straight
-to VideoToolbox — no gpuconvert step); the rest of the pipeline from
-`FrameFragmenter` onward is identical. See the dedicated **macOS host
-(shipping today)** subsection further down.
+capture→encoder hop: at 1:1 (capture_dims == encode_dims)
+ScreenCaptureKit hands NV12 IOSurfaces straight to VideoToolbox with
+no gpuconvert step; when the client viewport asks for a smaller
+encode, the `Nv12IOSurfaceBridge` runs the same Mitchell scaler
+pipelines as Linux on the Y and UV planes into a pooled destination
+IOSurface that's then fed to VideoToolbox. The rest of the pipeline
+from `FrameFragmenter` onward is identical. See the dedicated
+**macOS host (shipping today)** subsection further down.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -96,8 +100,9 @@ to VideoToolbox — no gpuconvert step); the rest of the pipeline from
 │       run tether-scaler (Mitchell-Netravali in linear-light)        │
 │       between PipeWire's BGRA dma-buf import and the chroma         │
 │       bridge; CPU paths bilinear-resize before encode_bgra.         │
-│       macOS GPU paths keep encode == capture pending phase-2 SCK    │
-│       plumbing (see "Mac host scaler" below).                       │
+│       macOS GPU paths run the same Mitchell pipelines via the       │
+│       Nv12IOSurfaceBridge (gpuconvert) — see Mac host scaler        │
+│       below.                                                        │
 │     • ABR tick: drains the latest ClientStats + quinn path stats    │
 │       into tether_session::abr::AbrController; calls                │
 │       set_bitrate_kbps when the controller crosses a hysteresis     │
@@ -718,22 +723,6 @@ Listed to set expectations; each is a real follow-up, not a "never":
 - **NAT traversal.** LAN direct only. QUIC's pluggable transport makes
   adding ICE later straightforward; today the user runs the client
   binary with a host IP.
-- **Mac host scaler (phase-2).** The Linux host runs `tether-scaler`
-  (Mitchell-Netravali bicubic in linear-light, with a 2× box mipmap
-  prefilter for ratios > 2×) between PipeWire's BGRA dma-buf import
-  and the chroma bridge — host downscale wired. The client renderer
-  runs the same shader in `ColorSpace::LinearF16` mode between
-  YUV→RGB conversion and the present blit when the window is larger
-  than the encoded video — client upscale wired. The macOS host
-  path (SCK → IOSurface NV12 → VideoToolbox) is *not* yet on the
-  unified shader: SCK does its own opaque-kernel scaling driven by
-  `SCStreamConfiguration.width/height`. Unifying would require
-  either (a) asking SCK for BGRA capture and inserting a Metal
-  BGRA→NV12 stage with the Mitchell pre-pass, or (b) adding an
-  NV12-native scaler variant (Y and UV scaled separately, chroma
-  siting accounted for). For now the host's macOS GPU branch holds
-  `encode_dims = capture_dims` so VideoToolbox isn't fed mis-sized
-  pixel buffers — see the cfg-gated check in `apps/tether-host/src/main.rs`.
 - **Real cursor sprite capture.** `tether-capture::cursor::CursorSource`
   trait + `PlaceholderCursorSource` are in place; per-platform
   backends (Wayland `SPA_META_Cursor` parser, macOS `NSCursor` or

@@ -1870,8 +1870,33 @@ fn run_capture_and_send(
         //     (Mitchell-Netravali in YUV space with cosited UV
         //     siting) runs inside `encode_iosurface_frame` between
         //     SCK's NV12 IOSurface and `submit_iosurface`.
-        let (encode_width, encode_height) =
+        let (mut encode_width, mut encode_height) =
             encode_dims_for_viewport(frame_width, frame_height, current_viewport);
+        // 10-bit fallback: the macOS NV12 IOSurface bridge ships R8 /
+        // Rg8 plane pipelines only — R16 / Rg16 is a deferred follow-
+        // up. If a viewport scale would otherwise force the bridge
+        // for a 10-bit profile, fall back to encoding at capture
+        // dims (no scaling) so the session keeps running. The client
+        // renderer's Mitchell upscale handles the dst-side resize.
+        // Once the R16 / Rg16 plane pipelines land in tether-scaler
+        // + tether-gpuconvert, drop this override.
+        #[cfg(target_os = "macos")]
+        if chosen_profile.bit_depth == 10
+            && matches!(frame, CapturedFrame::Gpu(_))
+            && (encode_width, encode_height) != (frame_width, frame_height)
+        {
+            tracing::debug!(
+                viewport = ?current_viewport,
+                capture_w = frame_width,
+                capture_h = frame_height,
+                requested_encode_w = encode_width,
+                requested_encode_h = encode_height,
+                "10-bit macOS session: bridge would be needed but isn't \
+                 implemented yet; falling back to capture-dim encode"
+            );
+            encode_width = frame_width;
+            encode_height = frame_height;
+        }
         // viewport_seq isn't part of the rebuild check: only an actual
         // change in encoder dimensions warrants tearing down the
         // encoder + bumping stream_epoch. A viewport change that

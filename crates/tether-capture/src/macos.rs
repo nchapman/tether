@@ -175,41 +175,72 @@ fn build_and_start_stream(
     // point dims makes SCK deliver a downsampled stream — the client
     // then upscales it back to viewport dims, producing the blurry
     // output a HiDPI session would otherwise be missing entirely.
-    // CGDisplayPixelsWide / CGDisplayPixelsHigh return the backing
-    // pixel dimensions; use those as SCK's capture grid.
+    //
+    // `CGDisplayPixelsWide`/`High` ALSO return logical-point dims on
+    // a Retina display configured with HiDPI scaling enabled (the
+    // "active display mode" is the scaled mode, and that mode's
+    // `width`/`height` are points). The right API is
+    // `CGDisplayCopyDisplayMode` → `CGDisplayModeGetPixelWidth` /
+    // `GetPixelHeight`, which return the *backing pixel* count
+    // independent of the active scaling mode.
     let display_id = primary.display_id();
     let logical_w = primary.width();
     let logical_h = primary.height();
-    // SAFETY: CGDisplayPixelsWide / CGDisplayPixelsHigh are
-    // thread-safe Core Graphics APIs taking a CGDirectDisplayID
-    // (`u32`). The display_id was just obtained from SCShareableContent
-    // for an attached display, so the kernel-side mapping is live.
+    // SAFETY: `CGDisplayCopyDisplayMode` returns a +1 retained
+    // `CGDisplayModeRef` (CF object) for an attached display, or
+    // null if the display dropped off. The display_id was just
+    // obtained from SCShareableContent for an attached display.
     let (pixel_w, pixel_h) = unsafe {
-        (
-            CGDisplayPixelsWide(display_id) as u32,
-            CGDisplayPixelsHigh(display_id) as u32,
-        )
+        let mode = CGDisplayCopyDisplayMode(display_id);
+        if mode.is_null() {
+            (0u32, 0u32)
+        } else {
+            let w = CGDisplayModeGetPixelWidth(mode) as u32;
+            let h = CGDisplayModeGetPixelHeight(mode) as u32;
+            // CGDisplayModeRef is a CFType; balance the +1 retain
+            // from Copy.
+            cf_release(mode);
+            (w, h)
+        }
     };
-    // Fall back to the logical dims if CG returned 0 (would happen
-    // if the display dropped off between SCShareableContent and the
-    // CG query). 0×0 would crash SCStreamConfiguration anyway.
-    let (width, height) = if pixel_w > 0 && pixel_h > 0 {
+    // Fall back to the logical dims if the CG query failed (would
+    // happen if the display dropped off between SCShareableContent
+    // and the CG query). 0×0 would crash SCStreamConfiguration.
+    let (raw_w, raw_h) = if pixel_w > 0 && pixel_h > 0 {
         (pixel_w, pixel_h)
     } else {
         tracing::warn!(
             display_id,
             logical_w,
             logical_h,
-            "CGDisplayPixelsWide/High returned 0; falling back to logical dims"
+            "CGDisplayCopyDisplayMode returned null; falling back to logical dims"
         );
         (logical_w as u32, logical_h as u32)
     };
+    // Align capture dims down to the encoder's 16-pixel block grid.
+    // Without this, the host's encode_dims_for_viewport floor-to-16
+    // would shrink encode dims below capture dims by a few pixels
+    // (e.g. 1512 → 1504), forcing the NV12 IOSurface bridge to
+    // engage for what's really a block-alignment trim, not a real
+    // viewport downscale. That spurious engagement crashes 10-bit
+    // sessions (the bridge's 10-bit pipelines aren't wired yet) and
+    // wastes Mitchell scaler work in 8-bit sessions for an 8-pixel
+    // crop the encoder could have done on its own. Captures already
+    // discard cropped content via SPS/PPS crop offsets at the
+    // decoder, so the visual loss is bounded to ≤15px on each axis.
+    const CAPTURE_ALIGN: u32 = 16;
+    let width = (raw_w / CAPTURE_ALIGN) * CAPTURE_ALIGN;
+    let height = (raw_h / CAPTURE_ALIGN) * CAPTURE_ALIGN;
+    let width = width.max(CAPTURE_ALIGN);
+    let height = height.max(CAPTURE_ALIGN);
     tracing::info!(
         display_id,
         logical_w,
         logical_h,
-        pixel_w = width,
-        pixel_h = height,
+        raw_pixel_w = raw_w,
+        raw_pixel_h = raw_h,
+        capture_w = width,
+        capture_h = height,
         fps = CAPTURE_FPS,
         pixel_format = %pixel_format,
         "capture source: macOS (ScreenCaptureKit, primary display)"
@@ -219,10 +250,11 @@ fn build_and_start_stream(
         .with_display(&primary)
         .with_excluding_windows(&[])
         .build();
-    // Configure SCK at the display's *backing pixel* grid (see the
-    // CGDisplayPixelsWide call above). The host's NV12 IOSurface
-    // bridge then downscales to the client's viewport. Capturing at
-    // the logical-point grid here would lock the wire stream to that
+    // Configure SCK at the display's *backing pixel* grid, aligned
+    // to the encoder block size. The host's NV12 IOSurface bridge
+    // downscales to the client's viewport only when it's a real
+    // downscale, not a block-alignment trim. Capturing at the
+    // logical-point grid here would lock the wire stream to that
     // resolution and force the client's renderer to upscale —
     // producing the blurry output observed on Retina hosts.
     let config = SCStreamConfiguration::new()
@@ -836,24 +868,50 @@ mod tests {
 
 // === Core Graphics FFI for physical-pixel display dimensions ===
 //
-// SCDisplay::width/height (from screencapturekit) report the display's
-// *logical point* dimensions, which on a Retina 2× display is half the
-// real backing-pixel grid. Capturing at the logical grid forces the
-// wire stream to that resolution and makes the client's renderer
-// upscale, producing the blurry output a HiDPI session would otherwise
-// be missing entirely.
+// SCDisplay::width/height (from screencapturekit) and the simpler
+// `CGDisplayPixelsWide`/`High` APIs both report the display's
+// *active mode* dimensions, which on a Retina display configured
+// with HiDPI scaling is the scaled (logical-point) grid — half the
+// backing-pixel grid on a 2× display. Capturing at that grid forces
+// the wire stream to half resolution and makes the client renderer
+// upscale, producing the blurry output a HiDPI session would
+// otherwise be missing.
 //
-// CGDisplayPixelsWide / CGDisplayPixelsHigh are documented thread-safe
-// Core Graphics APIs that return `size_t` backing-pixel dims for a
-// `CGDirectDisplayID`. Declared inline here rather than pulling in the
-// full `core-graphics` crate just for two functions.
+// The correct path is `CGDisplayCopyDisplayMode` to get the active
+// `CGDisplayModeRef`, then `CGDisplayModeGetPixelWidth` /
+// `GetPixelHeight` which return the actual backing-pixel count
+// regardless of the active scaling mode. Declared inline here rather
+// than pulling in the full `core-graphics` crate just for these
+// functions.
 //
 // Apple docs:
-//   https://developer.apple.com/documentation/coregraphics/1455785-cgdisplaypixelswide
-//   https://developer.apple.com/documentation/coregraphics/1455807-cgdisplaypixelshigh
+//   https://developer.apple.com/documentation/coregraphics/1454417-cgdisplaycopydisplaymode
+//   https://developer.apple.com/documentation/coregraphics/1454205-cgdisplaymodegetpixelwidth
+//   https://developer.apple.com/documentation/coregraphics/1454163-cgdisplaymodegetpixelheight
+
+/// `CGDisplayModeRef` is an opaque CF type. We treat it as an opaque
+/// pointer.
+type CGDisplayModeRef = *mut std::ffi::c_void;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGDisplayPixelsWide(display: u32) -> usize;
-    fn CGDisplayPixelsHigh(display: u32) -> usize;
+    /// Returns a `+1` retained `CGDisplayModeRef` for the display's
+    /// active mode (or null if the display is invalid).
+    fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
+    fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+    fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+/// Balance the `+1` retain from `CGDisplayCopyDisplayMode`.
+unsafe fn cf_release(mode: CGDisplayModeRef) {
+    if !mode.is_null() {
+        // SAFETY: caller's contract — the pointer was a +1 retained
+        // CF reference and is not used after this call.
+        unsafe { CFRelease(mode as *const std::ffi::c_void) };
+    }
 }

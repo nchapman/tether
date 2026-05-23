@@ -1705,13 +1705,85 @@ fn xv30_dmabuf_to_codec_frame(out: Xv30DmaBufFrame) -> DmaBufFrame {
 /// Returning from this function ends the JoinSet task and tears down
 /// the session. The match arms below treat a send error as fatal
 /// because there's no useful retry — the connection is already gone.
+/// Dedup + debounce state carried across cursor-pump ticks. Pulled
+/// out so the decision logic in [`cursor_tick`] is a pure function
+/// of `(state, source) -> effects` and can be unit-tested without
+/// the async runtime + Connection wired in.
+#[derive(Default)]
+struct CursorPumpState {
+    seen_ids: std::collections::HashSet<u64>,
+    last_pos: Option<tether_capture::CursorPosition>,
+    positions_sent: u64,
+    shapes_sent: u64,
+}
+
+/// What one cursor-pump tick decided to send. Pure data; the async
+/// loop turns each variant into a wire call.
+#[derive(Debug, PartialEq)]
+enum CursorEffect {
+    /// New sprite the client hasn't cached — deposit pixels.
+    Shape(ControlMessage),
+    /// Activate an already-cached id (or the just-deposited one).
+    UseShape(u64),
+    /// Latest-wins position datagram.
+    Position(tether_protocol::cursor::HostCursorPacket),
+}
+
+/// Step the cursor-pump state once. Drains every buffered shape
+/// event from `source`, emits a deduped `Shape`/`UseShape` pair per
+/// new id (just `UseShape` for repeats), then emits a single
+/// `Position` if the latest snapshot differs from what was sent
+/// last tick.
+///
+/// Pure function — no I/O, no clock side effects beyond
+/// `t_capture` on the position packet. The `now` parameter is
+/// injected so tests can pin it.
+fn cursor_tick(
+    state: &mut CursorPumpState,
+    source: &mut dyn CursorSource,
+    now: MonoNanos,
+) -> Vec<CursorEffect> {
+    let mut effects = Vec::new();
+    loop {
+        match source.next_event() {
+            CursorEvent::Idle => break,
+            CursorEvent::Shape(shape) => {
+                let id = shape.id;
+                if state.seen_ids.insert(id) {
+                    effects.push(CursorEffect::Shape(ControlMessage::CursorShape {
+                        id,
+                        hotspot: shape.hotspot,
+                        width: shape.width,
+                        height: shape.height,
+                        format: shape.format,
+                        pixels: shape.pixels,
+                    }));
+                }
+                effects.push(CursorEffect::UseShape(id));
+                state.shapes_sent += 1;
+            }
+        }
+    }
+    if let Some(pos) = source.poll_position() {
+        if state.last_pos != Some(pos) {
+            state.last_pos = Some(pos);
+            effects.push(CursorEffect::Position(
+                tether_protocol::cursor::HostCursorPacket::Position {
+                    t_capture: now,
+                    x: pos.x,
+                    y: pos.y,
+                    visible: pos.visible,
+                },
+            ));
+            state.positions_sent += 1;
+        }
+    }
+    effects
+}
+
 async fn pump_cursor(conn: Arc<Connection>, mut source: Box<dyn CursorSource>) {
-    use tether_protocol::cursor::HostCursorPacket;
     info!("cursor pump started");
-    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut last_pos: Option<tether_capture::CursorPosition> = None;
-    let mut positions_sent: u64 = 0;
-    let mut shapes_sent: u64 = 0;
+    let mut state = CursorPumpState::default();
     let mut last_log = std::time::Instant::now();
     // 120 Hz is the upper bound a typical desktop generates pointer
     // motion at; sleeping for one tick collapses any sub-tick
@@ -1722,32 +1794,27 @@ async fn pump_cursor(conn: Arc<Connection>, mut source: Box<dyn CursorSource>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        // Drain every shape event the backend has buffered. `Idle`
-        // means the queue is empty *right now*; the backend will
-        // produce more on its own cadence and we'll pick them up
-        // next tick.
-        loop {
-            match source.next_event() {
-                CursorEvent::Idle => break,
-                CursorEvent::Shape(shape) => {
-                    let id = shape.id;
-                    let new_id = seen_ids.insert(id);
-                    if new_id {
-                        let (w, h, n) = (shape.width, shape.height, shape.pixels.len());
-                        let msg = ControlMessage::CursorShape {
+        let effects = cursor_tick(&mut state, source.as_mut(), MonoNanos::now());
+        for effect in effects {
+            match effect {
+                CursorEffect::Shape(msg) => {
+                    let (id, w, h, n) = match &msg {
+                        ControlMessage::CursorShape {
                             id,
-                            hotspot: shape.hotspot,
-                            width: shape.width,
-                            height: shape.height,
-                            format: shape.format,
-                            pixels: shape.pixels,
-                        };
-                        if let Err(e) = conn.send_control(&msg).await {
-                            warn!(error = ?e, id, "CursorShape send failed; ending cursor pump");
-                            return;
-                        }
-                        info!(id, w, h, bytes = n, "sent CursorShape");
+                            width,
+                            height,
+                            pixels,
+                            ..
+                        } => (*id, *width, *height, pixels.len()),
+                        _ => unreachable!("CursorEffect::Shape always carries CursorShape"),
+                    };
+                    if let Err(e) = conn.send_control(&msg).await {
+                        warn!(error = ?e, id, "CursorShape send failed; ending cursor pump");
+                        return;
                     }
+                    info!(id, w, h, bytes = n, "sent CursorShape");
+                }
+                CursorEffect::UseShape(id) => {
                     if let Err(e) = conn
                         .send_control(&ControlMessage::CursorUseShape { id })
                         .await
@@ -1755,39 +1822,199 @@ async fn pump_cursor(conn: Arc<Connection>, mut source: Box<dyn CursorSource>) {
                         warn!(error = ?e, id, "CursorUseShape send failed; ending cursor pump");
                         return;
                     }
-                    shapes_sent += 1;
                 }
-            }
-        }
-        // Position: only fire if the snapshot moved. Without this
-        // guard the channel would carry a constant 120 Hz stream of
-        // identical packets and defeat the bandwidth win the
-        // separation was supposed to buy.
-        if let Some(pos) = source.poll_position() {
-            if last_pos != Some(pos) {
-                last_pos = Some(pos);
-                let pkt = HostCursorPacket::Position {
-                    t_capture: MonoNanos::now(),
-                    x: pos.x,
-                    y: pos.y,
-                    visible: pos.visible,
-                };
-                if let Err(e) = conn.send_datagram(&Datagram::HostCursor(pkt)) {
-                    warn!(error = ?e, "HostCursor datagram send failed; ending cursor pump");
-                    return;
+                CursorEffect::Position(pkt) => {
+                    if let Err(e) = conn.send_datagram(&Datagram::HostCursor(pkt)) {
+                        warn!(error = ?e, "HostCursor datagram send failed; ending cursor pump");
+                        return;
+                    }
                 }
-                positions_sent += 1;
             }
         }
         if last_log.elapsed() >= std::time::Duration::from_secs(2) {
             info!(
-                positions_sent,
-                shapes_sent,
-                seen_shape_ids = seen_ids.len(),
+                positions_sent = state.positions_sent,
+                shapes_sent = state.shapes_sent,
+                seen_shape_ids = state.seen_ids.len(),
                 "cursor pump stats"
             );
             last_log = std::time::Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod cursor_pump_tests {
+    use super::*;
+    use tether_capture::{CursorPosition, CursorShapeEvent};
+    use tether_protocol::cursor::{CursorPixelFormat, HostCursorPacket};
+
+    /// Scripted source: pops `events` FIFO on each `next_event` call,
+    /// returns `position` on every `poll_position`. Lets us drive
+    /// `cursor_tick` without a real PipeWire stream.
+    struct ScriptedSource {
+        events: std::collections::VecDeque<CursorEvent>,
+        position: Option<CursorPosition>,
+    }
+    impl CursorSource for ScriptedSource {
+        fn next_event(&mut self) -> CursorEvent {
+            self.events.pop_front().unwrap_or(CursorEvent::Idle)
+        }
+        fn poll_position(&mut self) -> Option<CursorPosition> {
+            self.position
+        }
+    }
+
+    fn shape(id: u64) -> CursorShapeEvent {
+        CursorShapeEvent {
+            id,
+            width: 16,
+            height: 16,
+            hotspot: (1, 2),
+            format: CursorPixelFormat::Rgba8,
+            pixels: vec![0xAB; 16 * 16 * 4],
+        }
+    }
+
+    fn now() -> MonoNanos {
+        MonoNanos(1)
+    }
+
+    #[test]
+    fn idle_tick_emits_nothing() {
+        let mut state = CursorPumpState::default();
+        let mut src = ScriptedSource {
+            events: Default::default(),
+            position: None,
+        };
+        assert!(cursor_tick(&mut state, &mut src, now()).is_empty());
+    }
+
+    #[test]
+    fn new_shape_emits_shape_then_use_shape() {
+        let mut state = CursorPumpState::default();
+        let mut src = ScriptedSource {
+            events: vec![CursorEvent::Shape(shape(42))].into(),
+            position: None,
+        };
+        let effects = cursor_tick(&mut state, &mut src, now());
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(
+            effects[0],
+            CursorEffect::Shape(ControlMessage::CursorShape { id: 42, .. })
+        ));
+        assert_eq!(effects[1], CursorEffect::UseShape(42));
+        assert!(state.seen_ids.contains(&42));
+        assert_eq!(state.shapes_sent, 1);
+    }
+
+    #[test]
+    fn repeat_shape_emits_use_shape_only() {
+        let mut state = CursorPumpState::default();
+        state.seen_ids.insert(42);
+        let mut src = ScriptedSource {
+            events: vec![CursorEvent::Shape(shape(42))].into(),
+            position: None,
+        };
+        let effects = cursor_tick(&mut state, &mut src, now());
+        assert_eq!(effects, vec![CursorEffect::UseShape(42)]);
+    }
+
+    #[test]
+    fn moved_position_emits_datagram() {
+        let mut state = CursorPumpState::default();
+        let mut src = ScriptedSource {
+            events: Default::default(),
+            position: Some(CursorPosition {
+                x: 100,
+                y: 200,
+                visible: true,
+            }),
+        };
+        let effects = cursor_tick(&mut state, &mut src, now());
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            CursorEffect::Position(HostCursorPacket::Position {
+                x,
+                y,
+                visible,
+                ..
+            }) => {
+                assert_eq!(*x, 100);
+                assert_eq!(*y, 200);
+                assert!(*visible);
+            }
+            other => panic!("expected Position, got {other:?}"),
+        }
+        assert_eq!(state.positions_sent, 1);
+    }
+
+    #[test]
+    fn unchanged_position_emits_nothing_second_tick() {
+        let mut state = CursorPumpState::default();
+        let pos = CursorPosition {
+            x: 50,
+            y: 60,
+            visible: true,
+        };
+        let mut src = ScriptedSource {
+            events: Default::default(),
+            position: Some(pos),
+        };
+        // First tick: position changed (from None to Some) → emit.
+        let first = cursor_tick(&mut state, &mut src, now());
+        assert_eq!(first.len(), 1);
+        // Second tick with the same snapshot: debounce → no emit.
+        let second = cursor_tick(&mut state, &mut src, now());
+        assert!(
+            second.is_empty(),
+            "identical position must not produce a second datagram (got {second:?})"
+        );
+        assert_eq!(state.positions_sent, 1);
+    }
+
+    #[test]
+    fn visibility_flip_emits_new_datagram_even_at_same_xy() {
+        let mut state = CursorPumpState::default();
+        state.last_pos = Some(CursorPosition {
+            x: 50,
+            y: 60,
+            visible: true,
+        });
+        state.positions_sent = 1;
+        let mut src = ScriptedSource {
+            events: Default::default(),
+            position: Some(CursorPosition {
+                x: 50,
+                y: 60,
+                visible: false,
+            }),
+        };
+        let effects = cursor_tick(&mut state, &mut src, now());
+        assert_eq!(effects.len(), 1, "visibility flip must emit a datagram");
+        let CursorEffect::Position(HostCursorPacket::Position { visible, .. }) = effects[0] else {
+            panic!("expected Position effect");
+        };
+        assert!(!visible);
+    }
+
+    #[test]
+    fn multiple_distinct_shapes_in_one_tick_each_get_shape_pair() {
+        let mut state = CursorPumpState::default();
+        let mut src = ScriptedSource {
+            events: vec![
+                CursorEvent::Shape(shape(1)),
+                CursorEvent::Shape(shape(2)),
+                CursorEvent::Shape(shape(1)), // repeat: just UseShape
+            ]
+            .into(),
+            position: None,
+        };
+        let effects = cursor_tick(&mut state, &mut src, now());
+        // 1 → Shape + UseShape; 2 → Shape + UseShape; 1 again → UseShape only
+        assert_eq!(effects.len(), 5);
+        assert_eq!(state.shapes_sent, 3);
+        assert_eq!(state.seen_ids.len(), 2);
     }
 }
 

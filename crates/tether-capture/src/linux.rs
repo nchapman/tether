@@ -123,6 +123,26 @@ pub struct PipeWireCursorSource {
     position_state: Arc<Mutex<Option<CursorPosition>>>,
 }
 
+#[cfg(test)]
+impl PipeWireCursorSource {
+    /// Test-only constructor that hands the producer side back to
+    /// the caller. Lets a unit test exercise `next_event` /
+    /// `poll_position` without spinning up a real PipeWire stream.
+    fn for_test() -> (
+        Self,
+        Sender<CursorEvent>,
+        Arc<Mutex<Option<CursorPosition>>>,
+    ) {
+        let (shape_tx, shape_rx) = unbounded::<CursorEvent>();
+        let position_state = Arc::new(Mutex::new(None::<CursorPosition>));
+        let source = Self {
+            shape_rx,
+            position_state: Arc::clone(&position_state),
+        };
+        (source, shape_tx, position_state)
+    }
+}
+
 impl CursorSource for PipeWireCursorSource {
     fn next_event(&mut self) -> CursorEvent {
         self.shape_rx.try_recv().unwrap_or(CursorEvent::Idle)
@@ -1414,5 +1434,101 @@ mod tests {
             (0, 0),
         );
         assert!(shape.is_none());
+    }
+
+    /// Empty shape channel + uninitialised position snapshot ⇒ the
+    /// source idles cleanly. This is the state the host pump sees on
+    /// the very first tick before the PipeWire callback has run.
+    #[test]
+    fn pipewire_cursor_source_initial_state_is_idle() {
+        let (mut source, _shape_tx, _position) = PipeWireCursorSource::for_test();
+        assert_eq!(source.next_event(), CursorEvent::Idle);
+        assert_eq!(source.poll_position(), None);
+    }
+
+    /// Producer-side shape sends arrive on `next_event` in FIFO
+    /// order; once drained, the source returns to `Idle`.
+    #[test]
+    fn pipewire_cursor_source_drains_shape_events_in_order() {
+        let (mut source, shape_tx, _position) = PipeWireCursorSource::for_test();
+        let mk = |id: u64| CursorShapeEvent {
+            id,
+            width: 16,
+            height: 16,
+            hotspot: (0, 0),
+            format: CursorPixelFormat::Rgba8,
+            pixels: vec![0; 16 * 16 * 4],
+        };
+        shape_tx.send(CursorEvent::Shape(mk(1))).expect("send 1");
+        shape_tx.send(CursorEvent::Shape(mk(2))).expect("send 2");
+        match source.next_event() {
+            CursorEvent::Shape(s) => assert_eq!(s.id, 1),
+            other => panic!("expected Shape(1), got {other:?}"),
+        }
+        match source.next_event() {
+            CursorEvent::Shape(s) => assert_eq!(s.id, 2),
+            other => panic!("expected Shape(2), got {other:?}"),
+        }
+        assert_eq!(source.next_event(), CursorEvent::Idle);
+    }
+
+    /// `poll_position` returns the *latest* snapshot — not a queue.
+    /// Multiple rapid producer writes between two consumer polls
+    /// collapse to one; that's the latest-wins property the wire
+    /// protocol depends on (one position datagram per pump tick).
+    #[test]
+    fn pipewire_cursor_source_position_is_latest_wins() {
+        let (mut source, _shape_tx, position) = PipeWireCursorSource::for_test();
+        *position.lock().unwrap() = Some(CursorPosition {
+            x: 100,
+            y: 200,
+            visible: true,
+        });
+        *position.lock().unwrap() = Some(CursorPosition {
+            x: 300,
+            y: 400,
+            visible: true,
+        });
+        assert_eq!(
+            source.poll_position(),
+            Some(CursorPosition {
+                x: 300,
+                y: 400,
+                visible: true
+            })
+        );
+        // Second poll without an intervening producer write returns
+        // the same value, not Idle/None. Important: the pump
+        // debounces by equality, not by "did we just poll."
+        assert_eq!(
+            source.poll_position(),
+            Some(CursorPosition {
+                x: 300,
+                y: 400,
+                visible: true
+            })
+        );
+    }
+
+    /// Visibility flag is part of the snapshot; producer writing
+    /// `visible: false` must round-trip exactly so the host pump
+    /// emits a hide-cursor datagram instead of holding the last
+    /// visible position.
+    #[test]
+    fn pipewire_cursor_source_propagates_visibility_false() {
+        let (mut source, _shape_tx, position) = PipeWireCursorSource::for_test();
+        *position.lock().unwrap() = Some(CursorPosition {
+            x: 0,
+            y: 0,
+            visible: false,
+        });
+        assert_eq!(
+            source.poll_position(),
+            Some(CursorPosition {
+                x: 0,
+                y: 0,
+                visible: false
+            })
+        );
     }
 }

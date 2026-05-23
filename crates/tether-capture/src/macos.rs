@@ -271,9 +271,14 @@ fn build_and_start_stream(
         .with_width(width)
         .with_height(height)
         .with_fps(CAPTURE_FPS)
-        // Low queue depth keeps capture-side latency tight; the wire
-        // path already absorbs jitter via the fragmenter.
-        .with_queue_depth(3)
+        // Queue depth follows OBS's mac-capture (depth 8) trimmed
+        // for remote-desktop latency targets. Depth 3 left no slack
+        // for downstream stalls (encode thread blocked on VT
+        // session, NSCursor poller scheduled on the same core) and
+        // SCK dropped frames at the producer. Five keeps the buffer
+        // window under one frame at 60 Hz while absorbing the
+        // 1-2 frame stalls we see in practice.
+        .with_queue_depth(5)
         .with_shows_cursor(true);
 
     let mut stream = SCStream::new(&filter, &config);

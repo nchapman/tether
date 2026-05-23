@@ -32,7 +32,10 @@ use crate::{
     GpuCapturedSource, PixelFormat, Result,
 };
 
-const CAPTURE_CHANNEL_DEPTH: usize = 2;
+// Single-slot hand-off: combined with the drain loop in the `process`
+// callback, this keeps the freshest frame at every stage. A deeper
+// channel would just bank latency for a consumer that's already behind.
+const CAPTURE_CHANNEL_DEPTH: usize = 1;
 
 /// Run the portal handshake and spawn the PipeWire stream thread.
 /// Returns a receiver that emits one [`CapturedFrame`] per produced frame.
@@ -234,9 +237,18 @@ fn run_pipewire(
             }
         })
         .process(|stream, user_data| {
+            // Drain the pending buffer queue and keep only the freshest.
+            // Older buffers are dropped immediately; pipewire-rs' Buffer
+            // RAII guard requeues them to PipeWire so the compositor can
+            // refill. Without this, a slow consumer would have us keep
+            // processing stale frames the compositor produced while we
+            // were behind, racking up latency.
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            while let Some(newer) = stream.dequeue_buffer() {
+                buffer = newer;
+            }
             // Sample userspace clock as early as possible — anything later
             // (memcpy, allocation) would fold into the capture-latency
             // metric. t_capture_kernel stays equal to this until we read

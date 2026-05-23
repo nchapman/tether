@@ -13,6 +13,17 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
 
+[features]
+# Opts in fakes used by integration tests in downstream crates. Empty
+# default features means production builds never carry this code; tests
+# enable it via `[dev-dependencies] tether-capture = { ..., features =
+# ["test-support"] }`. Mirrors the `test-support` pattern established
+# by `tether-transport`.
+#
+# CI guards against this feature leaking into a non-`[dev-dependencies]`
+# slot — see `make check`.
+test-support = []
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Safe SCK bindings — wraps Apple's framework via the doom-fish Swift
 # FFI shim. `macos_13_0` is the minimum feature level Tether targets;

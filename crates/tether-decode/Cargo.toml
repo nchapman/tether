@@ -1,0 +1,27 @@
+[package]
+name = "tether-decode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Dedicated decoder worker — owns the codec, drives LatestFrame, requests recovery IDRs."
+
+[dependencies]
+tether-protocol = { workspace = true }
+tether-codec = { workspace = true }
+tether-render = { workspace = true }
+
+crossbeam-channel = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# Opt-in fakes for downstream integration tests. Empty default means
+# production builds never carry this code; tests enable it via
+# `[dev-dependencies] tether-decode = { ..., features =
+# ["test-support"] }`. Mirrors `tether-transport`'s `test-support`
+# pattern.
+test-support = []
+
+[lints]
+workspace = true

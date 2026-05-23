@@ -4,7 +4,7 @@
 # description. Targets are documentation; the real cost-of-truth is
 # the cargo invocation each one wraps.
 
-.PHONY: help build release test test-hw test-correctness bench probe clippy fmt clean
+.PHONY: help build release test test-hw test-correctness bench probe clippy fmt check clean
 
 help:
 	@awk 'BEGIN { FS = ":.*##"; printf "\nTether dev targets:\n\n" } \
@@ -19,6 +19,9 @@ release: ## Release build of the host + client binaries
 
 test: ## Fast unit tests (no hardware required)
 	cargo test --workspace --lib
+
+check: ## Static workspace hygiene checks (no compile / no codegen)
+	@scripts/check_test_support_gating.sh
 
 test-hw: test-correctness bench ## All hardware-backed tests + benchmarks
 

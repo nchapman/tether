@@ -5,6 +5,7 @@ members = [
     "crates/tether-transport",
     "crates/tether-capture",
     "crates/tether-codec",
+    "crates/tether-decode",
     "crates/tether-gpuconvert",
     "crates/tether-input",
     "crates/tether-probe",
@@ -27,6 +28,7 @@ tether-protocol = { path = "crates/tether-protocol" }
 tether-transport = { path = "crates/tether-transport" }
 tether-capture = { path = "crates/tether-capture" }
 tether-codec = { path = "crates/tether-codec" }
+tether-decode = { path = "crates/tether-decode" }
 tether-gpuconvert = { path = "crates/tether-gpuconvert" }
 tether-input = { path = "crates/tether-input" }
 tether-probe = { path = "crates/tether-probe" }

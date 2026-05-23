@@ -20,5 +20,12 @@ bytes = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# Random body sizes × random fragment drop masks for the fragmenter ↔
+# reassembler property test. Hand-written cases stay in
+# `src/lib.rs#mod tests`; the proptest covers loss-counter accuracy
+# over the full state space rather than enumerated cases.
+proptest = "1"
+
 [lints]
 workspace = true

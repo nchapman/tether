@@ -18,6 +18,9 @@ pub mod cursor;
 pub mod damage;
 pub mod test_pattern;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub use cursor::{CursorEvent, CursorShapeEvent, CursorSource, PlaceholderCursorSource};
 pub use damage::{DamageHint, DamageSignal, HashDamage};
 

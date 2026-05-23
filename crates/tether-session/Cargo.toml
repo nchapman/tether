@@ -16,5 +16,10 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tether-transport = { workspace = true, features = ["test-support"] }
+tether-decode = { workspace = true, features = ["test-support"] }
+tether-codec = { workspace = true }
+tether-render = { workspace = true }
+crossbeam-channel = { workspace = true }
+bytes = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-test = "0.4"

@@ -21,6 +21,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rcgen = "0.14"
 sha2 = "0.11"
 
+# Only pulled in when `test-support` is enabled. SmallRng + seedable
+# RNG drive the `LossyChannel` deterministic loss simulator. Marked
+# `optional` so production builds never compile rand.
+rand = { version = "0.9", features = ["small_rng"], optional = true }
+
 [features]
 # Exposes `test_support::DuplexControlChannel` for downstream crates'
 # integration tests. The feature gates only the items inside the
@@ -33,7 +38,7 @@ sha2 = "0.11"
 # it has to be in `[dependencies]` (not gated behind this feature).
 # That's fine — `async-trait` is a proc-macro that emits ordinary
 # code; there's no runtime cost in release builds.
-test-support = []
+test-support = ["dep:rand"]
 
 [dev-dependencies]
 anyhow = { workspace = true }

@@ -181,12 +181,19 @@ impl WinitTranslator {
                     modifiers: self.modifiers,
                 }]
             }
-            // Resize events flow on a separate viewport channel in the
-            // client binary (see `tether-client/src/main.rs`); they
-            // never reach the input translator. Keep the arm
-            // exhaustive so a future variant addition is a compile
-            // error here rather than a silent ignore.
-            RenderEvent::Resized { .. } => Vec::new(),
+            RenderEvent::RelativeMouseMove { dx, dy } => {
+                vec![InputEventKind::RelativeMouseMove {
+                    dx,
+                    dy,
+                    modifiers: self.modifiers,
+                }]
+            }
+            // Resize + CursorModeChanged flow on separate channels
+            // in the client binary (viewport on a watch; cursor
+            // mode goes to ControlMessage::SetCursorMode). Keep
+            // these arms exhaustive so a future variant addition
+            // is a compile error here rather than a silent ignore.
+            RenderEvent::Resized { .. } | RenderEvent::CursorModeChanged(_) => Vec::new(),
         };
         self.wrap(kinds)
     }
@@ -406,6 +413,31 @@ mod tests {
             WireEvent::Input(e) => e,
             other => panic!("expected Input, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn relative_mouse_move_translates_to_input_kind() {
+        let mut t = WinitTranslator::new();
+        let evts = t.translate(RenderEvent::RelativeMouseMove { dx: -120, dy: 250 });
+        assert_eq!(evts.len(), 1);
+        match &expect_input(&evts[0]).kind {
+            InputEventKind::RelativeMouseMove { dx, dy, .. } => {
+                assert_eq!(*dx, -120);
+                assert_eq!(*dy, 250);
+            }
+            other => panic!("expected RelativeMouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_mode_changed_does_not_produce_input_events() {
+        // CursorModeChanged is forwarded on the control stream by
+        // the client binary, not through the input translator.
+        let mut t = WinitTranslator::new();
+        let evts = t.translate(RenderEvent::CursorModeChanged(
+            tether_protocol::control::CursorMode::Relative,
+        ));
+        assert!(evts.is_empty());
     }
 
     #[test]

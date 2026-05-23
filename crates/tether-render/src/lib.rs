@@ -26,7 +26,7 @@ use tether_protocol::MonoNanos;
 use tracing::warn;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -274,6 +274,10 @@ pub fn run(
         ewma_inter_arrival_ns: present_policy::EwmaNs::default(),
         ewma_jitter_ns: present_policy::EwmaNs::default(),
         last_frame_arrival: None,
+        cursor_mode: CursorMode::Absolute,
+        relative_accum: relative_mouse::SubPixelAccum::default(),
+        ctrl_held: false,
+        alt_held: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -315,6 +319,17 @@ struct App {
     /// Userspace clock at the previous `RedrawRequested` that
     /// observed a fresh frame. Powers the inter-arrival EWMA.
     last_frame_arrival: Option<Instant>,
+    /// Cursor input model. Toggled by Ctrl+Alt+G; on
+    /// transition to `Relative` we grab + hide the cursor and
+    /// route `DeviceEvent::MouseMotion` through `relative_accum`.
+    cursor_mode: CursorMode,
+    relative_accum: relative_mouse::SubPixelAccum,
+    /// Modifier-key edge tracker for the hotkey. We watch
+    /// `WindowEvent::ModifiersChanged` for the actual state but
+    /// also need the Ctrl+Alt+G three-key combo to fire on the
+    /// `G` keydown specifically.
+    ctrl_held: bool,
+    alt_held: bool,
 }
 
 #[derive(Default)]
@@ -355,6 +370,40 @@ impl App {
         if let Some(cb) = &self.on_event {
             cb(event);
         }
+    }
+
+    /// Try `Locked` first (true pointer-lock, supported on most
+    /// platforms in 2026), fall back to `Confined` on X11/Wayland
+    /// combos that reject Locked. Hide the cursor either way.
+    fn apply_cursor_grab(&self, window: &Window) {
+        if window
+            .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+            .is_err()
+        {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+        }
+        window.set_cursor_visible(false);
+    }
+
+    fn toggle_cursor_mode(&mut self) {
+        let new_mode = match self.cursor_mode {
+            CursorMode::Absolute => CursorMode::Relative,
+            CursorMode::Relative => CursorMode::Absolute,
+        };
+        self.cursor_mode = new_mode;
+        // Drop sub-pixel residue so stale fractional motion from
+        // the prior mode doesn't leak into the first delta.
+        self.relative_accum.reset();
+        if let Some(window) = &self.window {
+            match new_mode {
+                CursorMode::Relative => self.apply_cursor_grab(window),
+                CursorMode::Absolute => {
+                    let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                    window.set_cursor_visible(true);
+                }
+            }
+        }
+        self.emit(RenderEvent::CursorModeChanged(new_mode));
     }
 }
 
@@ -499,6 +548,18 @@ impl ApplicationHandler for App {
                 // for shortcuts, text for layout-aware typing. The
                 // translator decides which path each event takes.
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    // Hotkey gate: Ctrl+Alt+G toggles cursor mode.
+                    // Consume the G keydown on this combo so the
+                    // host doesn't receive a phantom "G" press.
+                    if code == KeyCode::KeyG
+                        && event.state == ElementState::Pressed
+                        && !event.repeat
+                        && self.ctrl_held
+                        && self.alt_held
+                    {
+                        self.toggle_cursor_mode();
+                        return;
+                    }
                     self.emit(RenderEvent::Key {
                         code,
                         pressed: event.state == ElementState::Pressed,
@@ -508,9 +569,17 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
+                self.ctrl_held = m.state().control_key();
+                self.alt_held = m.state().alt_key();
                 self.emit(RenderEvent::Modifiers(m.state()));
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // Suppress absolute-cursor reports while the
+                // pointer is grabbed for relative mode — the
+                // DeviceEvent::MouseMotion path is authoritative.
+                if matches!(self.cursor_mode, CursorMode::Relative) {
+                    return;
+                }
                 let (texture, surface) = gpu.dimensions();
                 self.emit(RenderEvent::Cursor {
                     video_normalized: cursor_to_video_normalized(position, surface, texture),
@@ -536,9 +605,43 @@ impl ApplicationHandler for App {
                 self.emit(RenderEvent::Scroll { dx, dy, by_line });
             }
             WindowEvent::Focused(b) => {
+                // Window blur → release the grab so the user can
+                // get their cursor back to switch apps. Don't
+                // change `cursor_mode` itself — on focus-regain
+                // we re-acquire the grab if still in Relative.
+                if let Some(window) = &self.window {
+                    if !b {
+                        let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                    } else if matches!(self.cursor_mode, CursorMode::Relative) {
+                        // Re-acquire on focus regain.
+                        self.apply_cursor_grab(window);
+                    }
+                }
                 self.emit(RenderEvent::Focused(b));
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Device-level pointer motion fires even when the cursor
+        // is grabbed (locked or confined), which is exactly the
+        // raw-input shape recenter-loop games need. Only emit
+        // while we're actually in Relative mode; otherwise the
+        // host already gets absolute reports via
+        // `WindowEvent::CursorMoved`.
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if matches!(self.cursor_mode, CursorMode::Relative) {
+                if let Some((dxi, dyi)) = self.relative_accum.record(dx, dy) {
+                    self.emit(RenderEvent::RelativeMouseMove { dx: dxi, dy: dyi });
+                }
+            }
         }
     }
 

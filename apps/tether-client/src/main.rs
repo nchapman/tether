@@ -659,6 +659,19 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut translator = WinitTranslator::new();
         while let Some(render_event) = events_rx.recv().await {
+            // Forward CursorModeChanged separately on the control
+            // stream so the host learns of the toggle. The input
+            // translator skips these events.
+            if let RenderEvent::CursorModeChanged(mode) = render_event {
+                let send_conn = conn_input.clone();
+                tokio::spawn(async move {
+                    let msg = ControlMessage::SetCursorMode { mode };
+                    if let Err(e) = send_conn.send_control(&msg).await {
+                        tracing::debug!(error = ?e, "SetCursorMode send failed");
+                    }
+                });
+                continue;
+            }
             for wire in translator.translate(render_event) {
                 match wire {
                     WireEvent::Input(evt) => {

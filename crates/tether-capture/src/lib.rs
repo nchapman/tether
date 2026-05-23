@@ -21,7 +21,9 @@ pub mod test_pattern;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
-pub use cursor::{CursorEvent, CursorShapeEvent, CursorSource, PlaceholderCursorSource};
+pub use cursor::{
+    CursorEvent, CursorPosition, CursorShapeEvent, CursorSource, PlaceholderCursorSource,
+};
 pub use damage::{DamageHint, DamageSignal, HashDamage, NativeDamage};
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -53,6 +55,11 @@ pub struct CaptureHandle {
     /// controller can hold a clone and update it from a different
     /// thread.
     target_fps: Arc<AtomicU32>,
+    /// Optional per-backend cursor source. Wayland/PipeWire fills
+    /// this with a `SPA_META_Cursor` parser; macOS will fill it with
+    /// an `NSCursor` poller; the test pattern leaves it `None` and
+    /// the host falls back to [`PlaceholderCursorSource`].
+    cursor_source: Option<Box<dyn CursorSource>>,
 }
 
 impl CaptureHandle {
@@ -61,7 +68,26 @@ impl CaptureHandle {
     /// it from their producer thread) and pass it through.
     #[must_use]
     pub fn from_parts(rx: Receiver<CapturedFrame>, target_fps: Arc<AtomicU32>) -> Self {
-        Self { rx, target_fps }
+        Self {
+            rx,
+            target_fps,
+            cursor_source: None,
+        }
+    }
+
+    /// Attach a cursor source to this handle. Called by the backend
+    /// after `from_parts` once the producer thread is spawned.
+    #[must_use]
+    pub fn with_cursor_source(mut self, src: Box<dyn CursorSource>) -> Self {
+        self.cursor_source = Some(src);
+        self
+    }
+
+    /// Take the cursor source out, leaving `None`. The host pump
+    /// consumes this once at session start.
+    #[must_use]
+    pub fn take_cursor_source(&mut self) -> Option<Box<dyn CursorSource>> {
+        self.cursor_source.take()
     }
 
     /// Borrow the frame receiver — for callers that need to interleave

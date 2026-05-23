@@ -23,13 +23,16 @@ use ashpd::desktop::{
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
-use crossbeam_channel::{bounded, Sender, TrySendError};
+use crossbeam_channel::{bounded, unbounded, Receiver as XReceiver, Sender, TrySendError};
 use enumflags2::BitFlags;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
+use std::sync::Mutex;
+use tether_protocol::cursor::CursorPixelFormat;
 use tether_protocol::MonoNanos;
 
+use crate::cursor::{CursorEvent, CursorPosition, CursorShapeEvent, CursorSource};
 use crate::{
     damage::NativeDamage, CaptureError, CaptureHandle, CapturedDmaBuf, CapturedFrame, CpuFrame,
     GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, PixelFormat, Result,
@@ -70,6 +73,12 @@ pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
     );
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
+    // Cursor channels: shape changes are rare → unbounded crossbeam (a
+    // misbehaving compositor can't blow memory because we dedup by id
+    // at the parser); position is latest-wins via a shared snapshot.
+    let (shape_tx, shape_rx) = unbounded::<CursorEvent>();
+    let position_state = Arc::new(Mutex::new(None::<CursorPosition>));
+    let position_state_for_cb = Arc::clone(&position_state);
     let target_fps = Arc::new(AtomicU32::new(LINUX_INITIAL_TARGET_FPS));
     // PipeWire-side FPS renegotiation is not yet wired; stash the
     // atomic on the handle so callers (the ABR controller) can
@@ -79,21 +88,87 @@ pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
     std::thread::Builder::new()
         .name("tether-capture-pipewire".into())
         .spawn(move || {
-            if let Err(e) = run_pipewire(node_id, fd, tx, dmabuf_modifiers) {
+            if let Err(e) = run_pipewire(
+                node_id,
+                fd,
+                tx,
+                dmabuf_modifiers,
+                shape_tx,
+                position_state_for_cb,
+            ) {
                 tracing::error!(error = %e, "pipewire capture thread failed");
             }
         })?;
-    Ok(CaptureHandle::from_parts(rx, target_fps))
+    let cursor_source: Box<dyn CursorSource> = Box::new(PipeWireCursorSource {
+        shape_rx,
+        position_state,
+    });
+    Ok(CaptureHandle::from_parts(rx, target_fps).with_cursor_source(cursor_source))
+}
+
+/// Receiver-side wiring for the PipeWire cursor extractor. The
+/// producer side is the `param_changed`/`process` callback in
+/// [`run_pipewire`]: it parses `SPA_META_Cursor` (plus the chained
+/// `MetaBitmap` when present), dedup-hashes the pixel bytes for a
+/// stable sprite id, and pushes events here.
+///
+/// Shape changes ride an unbounded crossbeam channel — real
+/// compositors emit a handful of distinct sprites per session, and
+/// the parser drops duplicates before sending. Position rides a
+/// shared `Option<CursorPosition>` snapshot: PipeWire fires the
+/// `process` callback at frame cadence (60-120 Hz), and the host
+/// pump reads latest-wins.
+pub struct PipeWireCursorSource {
+    shape_rx: XReceiver<CursorEvent>,
+    position_state: Arc<Mutex<Option<CursorPosition>>>,
+}
+
+impl CursorSource for PipeWireCursorSource {
+    fn next_event(&mut self) -> CursorEvent {
+        self.shape_rx.try_recv().unwrap_or(CursorEvent::Idle)
+    }
+
+    fn poll_position(&mut self) -> Option<CursorPosition> {
+        // Lock-poison is fatal: nothing in the producer thread
+        // panics with the guard held in normal operation, and the
+        // host has no useful "no cursor" fallback if the snapshot is
+        // unreadable. Log and treat as transient None.
+        self.position_state
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+    }
 }
 
 async fn open_portal() -> Result<(u32, OwnedFd)> {
     let proxy = Screencast::new().await?;
+    // Query supported cursor modes up front. GNOME 45+ and KDE
+    // Plasma 6 both advertise Metadata, but legacy portals fall
+    // back to Embedded only. If we request Metadata against a
+    // portal that doesn't advertise it, the portal silently
+    // accepts the call and uses Embedded — and we end up with a
+    // burned-in cursor *and* no metadata, the worst of both
+    // worlds.
+    let available = proxy
+        .available_cursor_modes()
+        .await
+        .map_err(|e| CaptureError::Portal(format!("AvailableCursorModes query: {e}")))?;
+    let chosen_cursor_mode = if available.contains(CursorMode::Metadata) {
+        CursorMode::Metadata
+    } else {
+        CursorMode::Embedded
+    };
+    tracing::info!(
+        ?available,
+        ?chosen_cursor_mode,
+        "portal cursor mode negotiation"
+    );
     let session = proxy.create_session(Default::default()).await?;
     proxy
         .select_sources(
             &session,
             SelectSourcesOptions::default()
-                .set_cursor_mode(CursorMode::Embedded)
+                .set_cursor_mode(chosen_cursor_mode)
                 .set_sources(BitFlags::from(SourceType::Monitor))
                 .set_multiple(false)
                 .set_restore_token(None)
@@ -125,6 +200,25 @@ struct UserData {
     /// completed yet); the process callback uses this to know which
     /// CapturedFrame variant to emit.
     negotiated_modifier: Option<u64>,
+    /// Producer side of the cursor shape channel. Send-only here;
+    /// receiver lives in [`PipeWireCursorSource`].
+    cursor_shape_tx: Sender<CursorEvent>,
+    /// Latest cursor position snapshot. The host pump reads this
+    /// at frame cadence; producer writes on every process callback
+    /// that sees a `SPA_META_Cursor`.
+    cursor_position: Arc<Mutex<Option<CursorPosition>>>,
+    /// Last sprite id forwarded as a `Shape` event. Used to dedup so
+    /// a static cursor doesn't blow the unbounded shape channel.
+    /// `0` is reserved by SPA as "no new cursor data," so we use
+    /// `None` to mean "nothing emitted yet."
+    last_shape_id: Option<u64>,
+    /// Once-only logging guards. Tells us *which* leg of cursor-meta
+    /// processing fired on the very first frame so a silent failure
+    /// (compositor accepted CursorMode::Metadata but isn't actually
+    /// attaching the meta) doesn't masquerade as "everything fine,
+    /// just no movement."
+    logged_first_cursor_meta: bool,
+    logged_first_cursor_meta_absent: bool,
 }
 
 fn run_pipewire(
@@ -132,6 +226,8 @@ fn run_pipewire(
     fd: OwnedFd,
     sender: Sender<CapturedFrame>,
     dmabuf_modifiers: Vec<u64>,
+    cursor_shape_tx: Sender<CursorEvent>,
+    cursor_position: Arc<Mutex<Option<CursorPosition>>>,
 ) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -142,6 +238,11 @@ fn run_pipewire(
         format: spa::param::video::VideoInfoRaw::new(),
         sender,
         negotiated_modifier: None,
+        cursor_shape_tx,
+        cursor_position,
+        last_shape_id: None,
+        logged_first_cursor_meta: false,
+        logged_first_cursor_meta_absent: false,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -244,13 +345,44 @@ fn run_pipewire(
                     return;
                 }
             };
-            let Some(pod) = spa::pod::Pod::from_bytes(&buffers_param) else {
+            // Resend the meta subscriptions inside `param_changed`,
+            // not just at stream.connect. OBS Studio established this
+            // pattern empirically: a number of compositors accept
+            // CursorMode::Metadata in the portal call but only attach
+            // SPA_META_Cursor to buffers if the meta is requested
+            // *after* format negotiation completes. Sending the pods
+            // at both points costs nothing extra (PipeWire dedups
+            // by ParamType + meta::type), so we keep the connect-time
+            // subscription as a defence-in-depth.
+            let video_damage_param = match build_video_damage_meta_pod() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to build VideoDamage meta pod");
+                    return;
+                }
+            };
+            let cursor_meta_param = match build_cursor_meta_pod() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to build cursor meta pod");
+                    return;
+                }
+            };
+            let Some(buffers_pod) = spa::pod::Pod::from_bytes(&buffers_param) else {
                 tracing::warn!("ParamBuffers pod from_bytes returned None");
                 return;
             };
-            let mut params = [pod];
+            let Some(damage_pod) = spa::pod::Pod::from_bytes(&video_damage_param) else {
+                tracing::warn!("VideoDamage meta pod from_bytes returned None");
+                return;
+            };
+            let Some(cursor_pod) = spa::pod::Pod::from_bytes(&cursor_meta_param) else {
+                tracing::warn!("Cursor meta pod from_bytes returned None");
+                return;
+            };
+            let mut params = [buffers_pod, damage_pod, cursor_pod];
             if let Err(e) = stream.update_params(&mut params) {
-                tracing::warn!(error = %e, "pw_stream_update_params (Buffers) failed");
+                tracing::warn!(error = %e, "pw_stream_update_params failed");
             }
         })
         .process(|stream, user_data| {
@@ -271,10 +403,12 @@ fn run_pipewire(
             // metric. t_capture_kernel stays equal to this until we read
             // it out of MetaHeader::pts.
             let t = MonoNanos::now();
-            // Read SPA_META_VideoDamage before borrowing the data slice:
-            // `find_meta` takes &self while `datas_mut` takes &mut self,
-            // and Rust's borrow checker won't let them overlap.
+            // Read SPA_META_VideoDamage + SPA_META_Cursor before
+            // borrowing the data slice: `find_meta` takes &self while
+            // `datas_mut` takes &mut self, and Rust's borrow checker
+            // won't let them overlap.
             let native_damage = read_video_damage(&buffer);
+            process_cursor_meta(&buffer, user_data);
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -358,7 +492,16 @@ fn run_pipewire(
     let meta_pod_bytes = build_video_damage_meta_pod()?;
     let meta_pod = spa::pod::Pod::from_bytes(&meta_pod_bytes)
         .ok_or_else(|| CaptureError::PipeWire("meta pod from_bytes returned None".into()))?;
-    let mut params_storage: Vec<&spa::pod::Pod> = Vec::with_capacity(3);
+    // Same trick for SPA_META_Cursor — the meta carries pointer
+    // position every buffer, plus a chained bitmap when the sprite
+    // changes. A compositor that doesn't honour CursorMode::Metadata
+    // simply omits the meta and we render no overlay (no regression
+    // vs the embedded-cursor era — just no separately-rendered
+    // pointer until the user moves to a meta-capable session).
+    let cursor_meta_pod_bytes = build_cursor_meta_pod()?;
+    let cursor_meta_pod = spa::pod::Pod::from_bytes(&cursor_meta_pod_bytes)
+        .ok_or_else(|| CaptureError::PipeWire("cursor meta pod from_bytes returned None".into()))?;
+    let mut params_storage: Vec<&spa::pod::Pod> = Vec::with_capacity(4);
     if let Some(ref bytes) = dmabuf_pod_bytes {
         params_storage.push(spa::pod::Pod::from_bytes(bytes).ok_or_else(|| {
             CaptureError::PipeWire("dmabuf pod from_bytes returned None".into())
@@ -366,6 +509,7 @@ fn run_pipewire(
     }
     params_storage.push(shm_pod);
     params_storage.push(meta_pod);
+    params_storage.push(cursor_meta_pod);
 
     stream.connect(
         spa::utils::Direction::Input,
@@ -726,6 +870,247 @@ fn build_buffers_param(data_type_mask: u32) -> Result<Vec<u8>> {
 }
 
 /// Build the `SPA_TYPE_OBJECT_ParamMeta` pod that subscribes to the
+/// `SPA_META_Cursor` block. The range is `CURSOR_META_SIZE(w, h) =
+/// sizeof(spa_meta_cursor) + sizeof(spa_meta_bitmap) + w*h*4`
+/// instantiated at OBS's published values (`min = 1×1`,
+/// `default = 64×64`, `max = 1024×1024`).
+///
+/// Why match OBS exactly: a previous min of "header only, no bitmap"
+/// told Mutter the consumer was happy without sprite pixels, and the
+/// compositor silently dropped the entire meta attachment in
+/// response. The OBS values are the only ones we've verified actually
+/// produce a non-None `find_meta::<MetaCursor>()` on GNOME 45+ /
+/// KDE Plasma 6.
+fn build_cursor_meta_pod() -> Result<Vec<u8>> {
+    let header = i32::try_from(
+        std::mem::size_of::<libspa_sys::spa_meta_cursor>()
+            + std::mem::size_of::<libspa_sys::spa_meta_bitmap>(),
+    )
+    .expect("cursor meta header size fits in i32");
+    let cursor_size = |w: i32, h: i32| header + w * h * 4;
+    let min_size = cursor_size(1, 1);
+    let default_size = cursor_size(64, 64);
+    let max_size = cursor_size(1024, 1024);
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: pw::spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            pw::spa::pod::Property {
+                key: libspa_sys::SPA_PARAM_META_type,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(libspa_sys::SPA_META_Cursor)),
+            },
+            pw::spa::pod::Property {
+                key: libspa_sys::SPA_PARAM_META_size,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
+                    pw::spa::utils::Choice::<i32>(
+                        pw::spa::utils::ChoiceFlags::empty(),
+                        pw::spa::utils::ChoiceEnum::<i32>::Range {
+                            default: default_size,
+                            min: min_size,
+                            max: max_size,
+                        },
+                    ),
+                )),
+            },
+        ],
+    };
+    let bytes: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(obj),
+    )
+    .map_err(|e| CaptureError::PipeWire(format!("cursor meta pod serialize: {e:?}")))?
+    .0
+    .into_inner();
+    Ok(bytes)
+}
+
+/// Parse `SPA_META_Cursor` out of the buffer and forward any updates
+/// to the cursor channel.
+///
+/// Position is written every frame the meta is present (compositors
+/// always include a cursor meta when in `CursorMode::Metadata`, even
+/// when only the pointer position changed). Shape is forwarded only
+/// when the parser sees a *new* sprite — id `0` is SPA's "no new
+/// cursor data" sentinel, and the dedup state in `UserData` skips
+/// re-forwarding an id we've already sent.
+fn process_cursor_meta(buffer: &pw::buffer::Buffer<'_>, user_data: &mut UserData) {
+    let Some(meta) = buffer.find_meta::<pw::spa::buffer::meta::MetaCursor>() else {
+        if !user_data.logged_first_cursor_meta_absent {
+            tracing::warn!(
+                "first frame: no SPA_META_Cursor on buffer (compositor accepted CursorMode::Metadata but is not attaching the meta)"
+            );
+            user_data.logged_first_cursor_meta_absent = true;
+        }
+        // CursorMode::Metadata advertised but compositor isn't
+        // attaching the meta — flip visibility off so the client
+        // doesn't show a stale overlay forever. Initialise the
+        // snapshot if this is the first frame so the host pump
+        // still emits a `visible: false` datagram and the client
+        // suppresses any stale placeholder.
+        if let Ok(mut guard) = user_data.cursor_position.lock() {
+            match guard.as_mut() {
+                Some(pos) => pos.visible = false,
+                None => {
+                    *guard = Some(CursorPosition {
+                        x: 0,
+                        y: 0,
+                        visible: false,
+                    });
+                }
+            }
+        }
+        return;
+    };
+    if !user_data.logged_first_cursor_meta {
+        tracing::info!(
+            id = meta.id(),
+            valid = meta.is_valid(),
+            pos = ?meta.position(),
+            has_bitmap = meta.bitmap().is_some(),
+            "first frame: SPA_META_Cursor present"
+        );
+        user_data.logged_first_cursor_meta = true;
+    }
+    if !meta.is_valid() {
+        return;
+    }
+    let position = meta.position();
+    if let Ok(mut guard) = user_data.cursor_position.lock() {
+        *guard = Some(CursorPosition {
+            x: position.x,
+            y: position.y,
+            visible: true,
+        });
+    }
+    // Bitmap is only present on sprite changes. The id alone isn't
+    // a reliable dedup key — compositors recycle ids across sessions
+    // — so we hash the pixel bytes and use that as our stable sprite
+    // id on the wire.
+    let Some(bitmap) = meta.bitmap() else {
+        return;
+    };
+    if !bitmap.is_valid() {
+        return;
+    }
+    let Some(shape) = build_cursor_shape_from_bitmap(bitmap, meta.hotspot()) else {
+        return;
+    };
+    if user_data.last_shape_id == Some(shape.id) {
+        return;
+    }
+    tracing::debug!(
+        id = shape.id,
+        w = shape.width,
+        h = shape.height,
+        hotspot = ?shape.hotspot,
+        prev = ?user_data.last_shape_id,
+        "pipewire cursor sprite change"
+    );
+    user_data.last_shape_id = Some(shape.id);
+    // try_send because the receiver might be lagging (host pump
+    // hasn't drained yet); dropping a stale shape forward is the
+    // right call — the next change will resend.
+    let _ = user_data.cursor_shape_tx.try_send(CursorEvent::Shape(shape));
+}
+
+/// Convert a `MetaBitmap` payload into a wire-ready
+/// [`CursorShapeEvent`]. Returns `None` on unsupported formats or
+/// malformed dimensions. The pure swizzle/hash work lives in
+/// [`build_cursor_shape`] so it stays testable without faking the
+/// libspa `MetaBitmap` memory layout.
+fn build_cursor_shape_from_bitmap(
+    bitmap: &pw::spa::buffer::meta::MetaBitmap,
+    hotspot: pw::spa::utils::Point,
+) -> Option<CursorShapeEvent> {
+    let size = bitmap.size();
+    let width = u16::try_from(size.width).ok()?;
+    let height = u16::try_from(size.height).ok()?;
+    let stride = usize::try_from(bitmap.stride().unsigned_abs()).ok()?;
+    let raw = bitmap.bitmap_data()?;
+    build_cursor_shape(
+        bitmap.format(),
+        width,
+        height,
+        stride,
+        raw,
+        (hotspot.x, hotspot.y),
+    )
+}
+
+/// Pure version: given the wire-format pixel bytes and dimensions,
+/// produce the RGBA-normalised [`CursorShapeEvent`]. Pixel byte
+/// layout for the supported `SPA_VIDEO_FORMAT` values (memory order,
+/// low → high):
+///   - `BGRA` / `BGRx` → `[B, G, R, A]`  swizzle to RGBA
+///   - `RGBA` / `RGBx` → `[R, G, B, A]`  passthrough
+///   - `ARGB`          → `[A, R, G, B]`  swizzle to RGBA
+fn build_cursor_shape(
+    format: pw::spa::param::video::VideoFormat,
+    width: u16,
+    height: u16,
+    stride: usize,
+    raw: &[u8],
+    hotspot: (i32, i32),
+) -> Option<CursorShapeEvent> {
+    use pw::spa::param::video::VideoFormat as V;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let row_bytes = (width as usize).checked_mul(4)?;
+    if stride < row_bytes {
+        return None;
+    }
+    if raw.len() < stride.checked_mul(height as usize)? {
+        return None;
+    }
+    let mut rgba: Vec<u8> = Vec::with_capacity(row_bytes * height as usize);
+    for row in 0..height as usize {
+        let start = row * stride;
+        let line = &raw[start..start + row_bytes];
+        for px in line.chunks_exact(4) {
+            let (r, g, b, a) = match format {
+                V::BGRA | V::BGRx => (px[2], px[1], px[0], px[3]),
+                V::RGBA | V::RGBx => (px[0], px[1], px[2], px[3]),
+                V::ARGB => (px[1], px[2], px[3], px[0]),
+                _ => return None,
+            };
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
+    }
+    // FNV-1a 64-bit. Build-stable and platform-stable so the same
+    // sprite produces the same id across reconnects (and across
+    // host binaries) — required by both the host's `seen_ids` dedup
+    // and the client's LRU shape cache. `DefaultHasher`'s output is
+    // explicitly not stable, so we hand-roll the standard one.
+    let id = {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for byte in width
+            .to_le_bytes()
+            .iter()
+            .chain(height.to_le_bytes().iter())
+            .chain(rgba.iter())
+        {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    };
+    Some(CursorShapeEvent {
+        id,
+        width,
+        height,
+        hotspot: (
+            u16::try_from(hotspot.0.max(0)).unwrap_or(0),
+            u16::try_from(hotspot.1.max(0)).unwrap_or(0),
+        ),
+        format: CursorPixelFormat::Rgba8,
+        pixels: rgba,
+    })
+}
+
+/// Build the `SPA_TYPE_OBJECT_ParamMeta` pod that subscribes to the
 /// `SPA_META_VideoDamage` block.
 ///
 /// The size we declare is the maximum amount of damage metadata we're
@@ -856,5 +1241,178 @@ mod tests {
             *max % region_size == 0,
             "max must be an integer multiple of region size (got {max} vs {region_size})"
         );
+    }
+
+    #[test]
+    fn cursor_meta_pod_targets_spa_meta_cursor() {
+        let bytes = build_cursor_meta_pod().expect("cursor pod builds");
+        let (_, value) = pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(&bytes)
+            .expect("cursor pod parses");
+        let Value::Object(obj) = value else {
+            panic!("expected Object, got {value:?}");
+        };
+        let type_prop = obj
+            .properties
+            .iter()
+            .find(|p| p.key == libspa_sys::SPA_PARAM_META_type)
+            .expect("META_type present");
+        let Value::Id(pw::spa::utils::Id(raw)) = &type_prop.value else {
+            panic!("META_type should be Id, got {:?}", type_prop.value);
+        };
+        assert_eq!(*raw, libspa_sys::SPA_META_Cursor);
+    }
+
+    /// Lock the cursor meta size range to OBS's published values
+    /// (`CURSOR_META_SIZE(1×1)` .. `CURSOR_META_SIZE(1024×1024)`,
+    /// default `64×64`). An earlier draft used `min = header only,
+    /// no bitmap` which Mutter took as a hint to skip the meta
+    /// attachment entirely — `find_meta::<MetaCursor>()` returned
+    /// `None` on every buffer with no log surface. Failure mode is
+    /// silent, so we encode the expectation.
+    #[test]
+    fn cursor_meta_pod_size_range_matches_obs() {
+        let bytes = build_cursor_meta_pod().expect("cursor pod builds");
+        let (_, value) = pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(&bytes)
+            .expect("cursor pod parses");
+        let Value::Object(obj) = value else {
+            panic!("expected Object, got {value:?}");
+        };
+        let size_prop = obj
+            .properties
+            .iter()
+            .find(|p| p.key == libspa_sys::SPA_PARAM_META_size)
+            .expect("META_size present");
+        let Value::Choice(ChoiceValue::Int(choice)) = &size_prop.value else {
+            panic!("META_size must be CHOICE_Int, got {:?}", size_prop.value);
+        };
+        let pw::spa::utils::ChoiceEnum::Range { default, min, max } = &choice.1 else {
+            panic!("META_size must use Range, got {:?}", choice.1);
+        };
+        let header = i32::try_from(
+            std::mem::size_of::<libspa_sys::spa_meta_cursor>()
+                + std::mem::size_of::<libspa_sys::spa_meta_bitmap>(),
+        )
+        .expect("header size fits in i32");
+        assert_eq!(
+            *min,
+            header + 1 * 1 * 4,
+            "min must reserve a 1×1 bitmap (matching OBS CURSOR_META_SIZE)"
+        );
+        assert_eq!(
+            *default,
+            header + 64 * 64 * 4,
+            "default must reserve a 64×64 bitmap (matching OBS CURSOR_META_SIZE)"
+        );
+        assert_eq!(
+            *max,
+            header + 1024 * 1024 * 4,
+            "max must reserve a 1024×1024 bitmap (matching OBS CURSOR_META_SIZE)"
+        );
+    }
+
+    /// 1×1 sprite with a known input pixel through each supported
+    /// format. The expected output is RGBA `[R, G, B, A]`.
+    #[test]
+    fn build_cursor_shape_swizzles_per_format() {
+        use pw::spa::param::video::VideoFormat as V;
+        // input is "red, green, blue, alpha = 0xFF" in each variant's
+        // byte order. Resulting RGBA should be [R=0x10, G=0x20, B=0x30, A=0xFF].
+        let cases: &[(V, [u8; 4])] = &[
+            (V::BGRA, [0x30, 0x20, 0x10, 0xFF]),
+            (V::BGRx, [0x30, 0x20, 0x10, 0xFF]),
+            (V::RGBA, [0x10, 0x20, 0x30, 0xFF]),
+            (V::RGBx, [0x10, 0x20, 0x30, 0xFF]),
+            (V::ARGB, [0xFF, 0x10, 0x20, 0x30]),
+        ];
+        for (fmt, raw) in cases {
+            let shape = build_cursor_shape(*fmt, 1, 1, 4, raw, (0, 0))
+                .unwrap_or_else(|| panic!("build_cursor_shape returned None for {fmt:?}"));
+            assert_eq!(
+                shape.pixels,
+                vec![0x10, 0x20, 0x30, 0xFF],
+                "format {fmt:?} did not produce expected RGBA"
+            );
+        }
+    }
+
+    /// Stride padding past the row should be skipped — only the
+    /// first `width * 4` bytes per row are visible pixels.
+    #[test]
+    fn build_cursor_shape_respects_stride_padding() {
+        // 2×1 BGRA, stride = 16 (8 bytes padding).
+        let mut raw = vec![0u8; 16];
+        raw[0..4].copy_from_slice(&[0x30, 0x20, 0x10, 0xFF]); // BGRA → R=10
+        raw[4..8].copy_from_slice(&[0x60, 0x50, 0x40, 0xFF]); // BGRA → R=40
+        // Padding (bytes 8..16) is junk that must not appear in output.
+        for b in raw.iter_mut().take(16).skip(8) {
+            *b = 0xAB;
+        }
+        let shape = build_cursor_shape(
+            pw::spa::param::video::VideoFormat::BGRA,
+            2,
+            1,
+            16,
+            &raw,
+            (0, 0),
+        )
+        .expect("stride-padded build succeeds");
+        assert_eq!(
+            shape.pixels,
+            vec![0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xFF]
+        );
+    }
+
+    /// Identical pixels → identical id; one-byte change → different id.
+    /// The wire-side dedup relies on this stability.
+    #[test]
+    fn cursor_shape_id_is_pixel_stable() {
+        let raw_a = [0x30, 0x20, 0x10, 0xFF];
+        let raw_b = [0x30, 0x20, 0x11, 0xFF];
+        let a = build_cursor_shape(
+            pw::spa::param::video::VideoFormat::BGRA,
+            1,
+            1,
+            4,
+            &raw_a,
+            (0, 0),
+        )
+        .unwrap();
+        let a2 = build_cursor_shape(
+            pw::spa::param::video::VideoFormat::BGRA,
+            1,
+            1,
+            4,
+            &raw_a,
+            (1, 2), // hotspot must not influence id
+        )
+        .unwrap();
+        let b = build_cursor_shape(
+            pw::spa::param::video::VideoFormat::BGRA,
+            1,
+            1,
+            4,
+            &raw_b,
+            (0, 0),
+        )
+        .unwrap();
+        assert_eq!(a.id, a2.id, "id must depend on pixels + dims only");
+        assert_ne!(a.id, b.id, "different pixel bytes must yield different id");
+    }
+
+    /// Unsupported source format yields `None`, not garbage RGBA.
+    /// Catches the case where a compositor advertises a cursor in an
+    /// exotic format we haven't taught the swizzle about.
+    #[test]
+    fn build_cursor_shape_rejects_unsupported_format() {
+        let raw = [0u8; 4];
+        let shape = build_cursor_shape(
+            pw::spa::param::video::VideoFormat::I420,
+            1,
+            1,
+            4,
+            &raw,
+            (0, 0),
+        );
+        assert!(shape.is_none());
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! The host originates two kinds of cursor information:
 //!
-//! - **Position**, already on the unreliable `HostCursorPacket::Position`
+//! - **Position**, on the unreliable `HostCursorPacket::Position`
 //!   datagram channel — high-rate, latest-wins.
 //! - **Shape** (the pointer sprite itself: pixels + hotspot), on the
 //!   reliable control stream via `ControlMessage::CursorShape` and
@@ -10,33 +10,10 @@
 //!   recurring cursors (text-beam, hand, arrow) ride the wire once.
 //!
 //! This module owns the trait that produces those events. The host
-//! send-side plumbing pumps a [`CursorSource`] for events on its own
-//! cadence and forwards them onto the cursor channel. Backends are
-//! swapped per platform — there's no runtime "discover the cursor
-//! API" step, just a compile-time `#[cfg]` selection.
-//!
-//! ## Status: scaffolding only
-//!
-//! [`PlaceholderCursorSource`] emits a single 16×16 checkerboard shape
-//! at startup and nothing else — that's the same wire shape the host
-//! has been sending inline since the cursor channel was added. The
-//! trait exists so the per-platform implementations can land without
-//! re-plumbing the host's send loop:
-//!
-//! - **Linux (Wayland)**: parse `SPA_META_Cursor` metadata out of each
-//!   PipeWire buffer (requires flipping `CursorMode::Embedded` to
-//!   `CursorMode::Metadata` in `linux.rs` — that change is gated on
-//!   the parser existing, since otherwise the cursor disappears from
-//!   the burned-in stream and the client renders nothing). X11 fallback
-//!   uses `XFixesGetCursorImage`.
-//! - **macOS**: SCK's `SCStreamConfiguration::shows_cursor = false`
-//!   removes the cursor from the captured frame. Pair with
-//!   `NSCursor::currentSystemCursor` polled at ~30 Hz to extract the
-//!   sprite (NSImage → RGBA pixel buffer), or with SCK's cursor
-//!   metadata callback on Sonoma+.
-//!
-//! The seam here keeps that work isolated to per-platform files when
-//! it lands — no host-loop refactor required.
+//! send-side pump polls a [`CursorSource`] each tick and forwards
+//! events onto the wire. Backends are swapped per platform via
+//! compile-time `#[cfg]` selection — no runtime "discover the
+//! cursor API" step.
 
 use tether_protocol::cursor::CursorPixelFormat;
 
@@ -68,18 +45,41 @@ pub enum CursorEvent {
     Idle,
 }
 
+/// Latest pointer position snapshot the host's send pump reads on each
+/// tick. `(x, y)` are captured-frame pixels in the same coordinate
+/// space as the encoded video. `visible = false` means the pointer is
+/// off-screen / hidden and the client should not draw the overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPosition {
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
+}
+
 /// Per-platform cursor source. Implementations are typically I/O-
 /// driven (PipeWire buffer callbacks, SCK delegate, X11 event loop)
 /// and own their own state — the trait stays minimal so a future
 /// impl can do whatever bookkeeping fits its API surface.
 pub trait CursorSource: Send {
-    /// Returns the next pending event without blocking. Backends
-    /// that have nothing buffered yield [`CursorEvent::Idle`] — that
-    /// means "try again later," not "done forever." Named
-    /// `next_event` rather than `poll` to keep it out of the
-    /// `Future::poll` idiom space, which carries different
+    /// Returns the next pending shape / lifecycle event without
+    /// blocking. Backends that have nothing buffered yield
+    /// [`CursorEvent::Idle`] — that means "try again later," not "done
+    /// forever." Named `next_event` rather than `poll` to keep it out
+    /// of the `Future::poll` idiom space, which carries different
     /// non-blocking semantics.
     fn next_event(&mut self) -> CursorEvent;
+
+    /// Snapshot of the latest known pointer position, if the backend
+    /// can produce one. Latest-wins: the host pump reads this once
+    /// per send tick and emits a single `HostCursorPacket::Position`
+    /// datagram, so backends that update at sub-frame rate must
+    /// collapse internally rather than emit a queue here.
+    ///
+    /// Default returns `None`, which the placeholder + any future
+    /// position-less source can take unchanged.
+    fn poll_position(&mut self) -> Option<CursorPosition> {
+        None
+    }
 }
 
 /// Stub source matching the pre-trait inline behaviour: one

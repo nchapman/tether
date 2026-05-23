@@ -324,12 +324,10 @@ async fn handle_client(
     // the handshake-time profile floor it implied is already baked into
     // the negotiated profile.
 
-    // Cursor source. Behind the [`CursorSource`] trait so a future
-    // per-platform impl (Wayland SPA_META_Cursor parser, macOS NSCursor
-    // poller) can drop in without touching this block. The placeholder
-    // emits one 16×16 checkerboard at startup so the wire is
-    // exercised — that's the same shape the previous inline code sent.
-    drain_initial_cursor(&conn, &mut PlaceholderCursorSource::new()).await;
+    // Cursor pump runs as its own task below (after the JoinSet is
+    // built) so it owns the cursor source for the lifetime of the
+    // session — startup shape delivery, ongoing position datagrams,
+    // and per-sprite-change shape forwarding are one loop.
 
     // DisplayList: one entry, single-monitor placeholder. Real values
     // (refresh rate from the PipeWire stream, scale + position from
@@ -370,9 +368,16 @@ async fn handle_client(
     // per-backend follow-up work). Re-grab the Arc clone via
     // `capture_handle.fps_handle()` when the first backend wires
     // through. See `tether_capture::CaptureHandle` docs.
-    let frames = pick_capture_source(use_test_pattern, chosen_profile)
-        .await?
-        .into_rx();
+    let mut capture_handle = pick_capture_source(use_test_pattern, chosen_profile).await?;
+    // Take the per-backend cursor source out before we drop the
+    // handle. Wayland/PipeWire fills this with a `SPA_META_Cursor`
+    // parser; the test-pattern and macOS-stub backends leave it
+    // `None`, in which case we fall back to the placeholder so the
+    // wire-level cursor protocol stays exercised.
+    let cursor_source: Box<dyn CursorSource> = capture_handle
+        .take_cursor_source()
+        .unwrap_or_else(|| Box::new(PlaceholderCursorSource::new()));
+    let frames = capture_handle.into_rx();
 
     // Force-IDR signal + stream-readiness gate were created by
     // `HostSession::accept` and destructured at the top of this fn.
@@ -773,6 +778,19 @@ async fn handle_client(
                     }
                 }
             }
+        });
+    }
+
+    // Cursor pump: forwards shape changes on the reliable control
+    // stream, position updates on the unreliable cursor datagram
+    // channel. One task drives both so id-dedup state and latest-
+    // position state share a single owner. Ending this task on a
+    // send error tears the session down through the JoinSet just
+    // like the other recv tasks.
+    {
+        let conn = conn.clone();
+        tasks.spawn(async move {
+            pump_cursor(conn, cursor_source).await;
         });
     }
 
@@ -1668,56 +1686,107 @@ fn xv30_dmabuf_to_codec_frame(out: Xv30DmaBufFrame) -> DmaBufFrame {
     )
 }
 
-/// Drain any pending events from the cursor source and forward them
-/// to the client on the reliable control stream. Called at session
-/// start so the placeholder's one-shot shape lands before the client
-/// gets its first video frame; when a real cursor source replaces
-/// the placeholder this same call covers initial-state delivery.
+/// Long-running cursor pump. Owns the per-backend
+/// [`CursorSource`] for the lifetime of the session and drives two
+/// wire paths off it:
 ///
-/// Per-session sprite cache keeps `CursorShape` (pixels) from re-
-/// sending when the platform reports the same id twice in a row —
-/// the second hit becomes `CursorUseShape { id }`.
-async fn drain_initial_cursor<S: CursorSource>(conn: &Connection, source: &mut S) {
-    // Forward-looking cache: a future real cursor source emits the
-    // same arrow id every time the pointer enters the desktop, so a
-    // `Shape` -> `UseShape` dedup pays off. The placeholder emits a
-    // single unique id so this cache is empty-allocated overhead
-    // today — kept because the real impl will need it.
+/// - **Shape changes** (reliable control stream): each unique sprite
+///   id is sent as a `CursorShape` with full pixel bytes the first
+///   time we see it, then activated with `CursorUseShape`. Subsequent
+///   activations of the same id skip the pixel re-send so a
+///   compositor that recycles arrows / text-beams / hand cursors
+///   pays for them once.
+/// - **Position** (unreliable `Datagram::HostCursor`): polled at
+///   ~120 Hz, debounced — we only emit when the snapshot actually
+///   changed, so an idle desktop keeps the channel quiet enough for
+///   the host-side native-damage path to flag the frame as unchanged
+///   and skip the encoder entirely.
+///
+/// Returning from this function ends the JoinSet task and tears down
+/// the session. The match arms below treat a send error as fatal
+/// because there's no useful retry — the connection is already gone.
+async fn pump_cursor(conn: Arc<Connection>, mut source: Box<dyn CursorSource>) {
+    use tether_protocol::cursor::HostCursorPacket;
+    info!("cursor pump started");
     let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut last_pos: Option<tether_capture::CursorPosition> = None;
+    let mut positions_sent: u64 = 0;
+    let mut shapes_sent: u64 = 0;
+    let mut last_log = std::time::Instant::now();
+    // 120 Hz is the upper bound a typical desktop generates pointer
+    // motion at; sleeping for one tick collapses any sub-tick
+    // updates into a single latest-wins datagram, which is exactly
+    // what the unreliable channel wants.
+    let mut tick =
+        tokio::time::interval(std::time::Duration::from_millis(8));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        match source.next_event() {
-            CursorEvent::Idle => break,
-            CursorEvent::Shape(shape) => {
-                let id = shape.id;
-                let already_sent = !seen_ids.insert(id);
-                if !already_sent {
-                    // Deposit the pixels into the client's cache.
-                    // `CursorShape` defines but does NOT activate; the
-                    // protocol pairs it with `CursorUseShape` so the
-                    // host can swap between cached cursors without
-                    // resending pixels.
-                    let msg = ControlMessage::CursorShape {
-                        id,
-                        hotspot: shape.hotspot,
-                        width: shape.width,
-                        height: shape.height,
-                        format: shape.format,
-                        pixels: shape.pixels,
-                    };
-                    if let Err(e) = conn.send_control(&msg).await {
-                        warn!(error = ?e, id, "CursorShape send failed; continuing anyway");
+        tick.tick().await;
+        // Drain every shape event the backend has buffered. `Idle`
+        // means the queue is empty *right now*; the backend will
+        // produce more on its own cadence and we'll pick them up
+        // next tick.
+        loop {
+            match source.next_event() {
+                CursorEvent::Idle => break,
+                CursorEvent::Shape(shape) => {
+                    let id = shape.id;
+                    let new_id = seen_ids.insert(id);
+                    if new_id {
+                        let (w, h, n) = (shape.width, shape.height, shape.pixels.len());
+                        let msg = ControlMessage::CursorShape {
+                            id,
+                            hotspot: shape.hotspot,
+                            width: shape.width,
+                            height: shape.height,
+                            format: shape.format,
+                            pixels: shape.pixels,
+                        };
+                        if let Err(e) = conn.send_control(&msg).await {
+                            warn!(error = ?e, id, "CursorShape send failed; ending cursor pump");
+                            return;
+                        }
+                        info!(id, w, h, bytes = n, "sent CursorShape");
                     }
-                }
-                // Always activate — applies to both first-send and
-                // cached-switch cases. Without this, defining a shape
-                // never becomes the visible cursor on the client.
-                if let Err(e) = conn
-                    .send_control(&ControlMessage::CursorUseShape { id })
-                    .await
-                {
-                    warn!(error = ?e, id, "CursorUseShape send failed; continuing anyway");
+                    if let Err(e) = conn
+                        .send_control(&ControlMessage::CursorUseShape { id })
+                        .await
+                    {
+                        warn!(error = ?e, id, "CursorUseShape send failed; ending cursor pump");
+                        return;
+                    }
+                    shapes_sent += 1;
                 }
             }
+        }
+        // Position: only fire if the snapshot moved. Without this
+        // guard the channel would carry a constant 120 Hz stream of
+        // identical packets and defeat the bandwidth win the
+        // separation was supposed to buy.
+        if let Some(pos) = source.poll_position() {
+            if last_pos != Some(pos) {
+                last_pos = Some(pos);
+                let pkt = HostCursorPacket::Position {
+                    t_capture: MonoNanos::now(),
+                    x: pos.x,
+                    y: pos.y,
+                    visible: pos.visible,
+                };
+                if let Err(e) = conn.send_datagram(&Datagram::HostCursor(pkt)) {
+                    warn!(error = ?e, "HostCursor datagram send failed; ending cursor pump");
+                    return;
+                }
+                positions_sent += 1;
+            }
+        }
+        if last_log.elapsed() >= std::time::Duration::from_secs(2) {
+            info!(
+                positions_sent,
+                shapes_sent,
+                seen_shape_ids = seen_ids.len(),
+                "cursor pump stats"
+            );
+            last_log = std::time::Instant::now();
         }
     }
 }

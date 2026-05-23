@@ -219,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
                             );
                             continue;
                         }
-                        tracing::debug!(
+                        info!(
                             id, ?hotspot, width, height,
                             pixel_bytes = pixels.len(),
                             "received cursor shape; enqueuing for renderer upload",
@@ -428,6 +428,10 @@ async fn main() -> anyhow::Result<()> {
         // under backpressure.
         let mut decode_completion_count: u64 = 0;
         let mut last_log = Instant::now();
+        // Cursor datagram observability — separate cadence so a
+        // chatty cursor channel doesn't bury the video stats line.
+        let mut cursor_pos_packets: u64 = 0;
+        let mut last_cursor_log = std::time::Instant::now();
 
         loop {
             // Race the unreliable datagram path (P-frames, cursor) against
@@ -457,6 +461,11 @@ async fn main() -> anyhow::Result<()> {
                                     cursor_channel_datagram.with(|state| {
                                         state.set_position(xf, yf, visible);
                                     });
+                                    cursor_pos_packets += 1;
+                                    if last_cursor_log.elapsed() >= std::time::Duration::from_secs(2) {
+                                        info!(cursor_pos_packets, last_x = x, last_y = y, visible, "cursor position datagrams");
+                                        last_cursor_log = std::time::Instant::now();
+                                    }
                                 }
                             }
                             continue;

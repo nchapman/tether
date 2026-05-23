@@ -287,14 +287,15 @@ fn build_and_start_stream(
         .with_width(width)
         .with_height(height)
         .with_fps(CAPTURE_FPS)
-        // Queue depth follows OBS's mac-capture (depth 8) trimmed
-        // for remote-desktop latency targets. Depth 3 left no slack
-        // for downstream stalls (encode thread blocked on VT
-        // session, NSCursor poller scheduled on the same core) and
-        // SCK dropped frames at the producer. Five keeps the buffer
-        // window under one frame at 60 Hz while absorbing the
-        // 1-2 frame stalls we see in practice.
-        .with_queue_depth(5)
+        // Low queue depth keeps capture-side latency tight; the wire
+        // path already absorbs jitter via the fragmenter. Previously
+        // raised to 5 (commit 8f252b6) to absorb VT-session / cursor-
+        // poller stalls, but the deeper queue aged frames by up to
+        // ~33 ms whenever the encoder paused, which dominated user-
+        // perceived lag. Reverted to 3 pending stage-by-stage latency
+        // instrumentation — re-raise only with measured evidence that
+        // SCK is the producer-side dropper, not a downstream stall.
+        .with_queue_depth(3)
         // Cursor is extracted out-of-band by `cursor_macos` and
         // overlay-rendered on the client at sub-frame latency. Leaving
         // SCK's in-frame cursor on would double-draw it.

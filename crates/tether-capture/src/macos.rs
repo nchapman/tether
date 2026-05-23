@@ -169,12 +169,47 @@ fn build_and_start_stream(
         .into_iter()
         .next()
         .ok_or_else(|| CaptureError::Sck("no displays reported by SCShareableContent".into()))?;
-    let width = primary.width();
-    let height = primary.height();
+    // SCDisplay::width/height report logical *point* dimensions, not
+    // physical pixels. On a Retina 2× display that's half the actual
+    // resolution, and configuring SCStreamConfiguration with the
+    // point dims makes SCK deliver a downsampled stream — the client
+    // then upscales it back to viewport dims, producing the blurry
+    // output a HiDPI session would otherwise be missing entirely.
+    // CGDisplayPixelsWide / CGDisplayPixelsHigh return the backing
+    // pixel dimensions; use those as SCK's capture grid.
+    let display_id = primary.display_id();
+    let logical_w = primary.width();
+    let logical_h = primary.height();
+    // SAFETY: CGDisplayPixelsWide / CGDisplayPixelsHigh are
+    // thread-safe Core Graphics APIs taking a CGDirectDisplayID
+    // (`u32`). The display_id was just obtained from SCShareableContent
+    // for an attached display, so the kernel-side mapping is live.
+    let (pixel_w, pixel_h) = unsafe {
+        (
+            CGDisplayPixelsWide(display_id) as u32,
+            CGDisplayPixelsHigh(display_id) as u32,
+        )
+    };
+    // Fall back to the logical dims if CG returned 0 (would happen
+    // if the display dropped off between SCShareableContent and the
+    // CG query). 0×0 would crash SCStreamConfiguration anyway.
+    let (width, height) = if pixel_w > 0 && pixel_h > 0 {
+        (pixel_w, pixel_h)
+    } else {
+        tracing::warn!(
+            display_id,
+            logical_w,
+            logical_h,
+            "CGDisplayPixelsWide/High returned 0; falling back to logical dims"
+        );
+        (logical_w as u32, logical_h as u32)
+    };
     tracing::info!(
-        display_id = primary.display_id(),
-        width,
-        height,
+        display_id,
+        logical_w,
+        logical_h,
+        pixel_w = width,
+        pixel_h = height,
         fps = CAPTURE_FPS,
         pixel_format = %pixel_format,
         "capture source: macOS (ScreenCaptureKit, primary display)"
@@ -184,23 +219,12 @@ fn build_and_start_stream(
         .with_display(&primary)
         .with_excluding_windows(&[])
         .build();
-    // SCK does its own scaling driven by `SCStreamConfiguration.
-    // width/height` and `scalesToFit` (default true). To unify on the
-    // Mitchell shader the way Linux host does, we'd need one of:
-    //   (a) feed SCK BGRA at native dims, add a Metal BGRA→NV12 stage
-    //       with the Mitchell pre-pass between them, and hand the
-    //       result to VideoToolbox. SCK→VT today bypasses any
-    //       gpuconvert step — adding one is a real chunk of code.
-    //   (b) extend `start()` to accept a viewport hint and either
-    //       restart the SCStream on viewport changes or call
-    //       `SCStream::updateConfiguration` to live-resize.
-    //
-    // Neither lands in this phase. The unified-shader Mac host path
-    // is the phase-2 follow-up in ARCHITECTURE.md; until then, Mac
-    // host always captures (and therefore encodes) at native display
-    // dims regardless of the client viewport. The host's GPU encode
-    // path on macOS keeps `encode_dims = capture_dims` for that
-    // reason — see the cfg-gated branch in `apps/tether-host/src/main.rs`.
+    // Configure SCK at the display's *backing pixel* grid (see the
+    // CGDisplayPixelsWide call above). The host's NV12 IOSurface
+    // bridge then downscales to the client's viewport. Capturing at
+    // the logical-point grid here would lock the wire stream to that
+    // resolution and force the client's renderer to upscale —
+    // producing the blurry output observed on Retina hosts.
     let config = SCStreamConfiguration::new()
         .with_pixel_format(pixel_format)
         .with_width(width)
@@ -217,8 +241,8 @@ fn build_and_start_stream(
         tx,
         stop,
         wake: thread_handle,
-        width: width as u32,
-        height: height as u32,
+        width,
+        height,
     };
     stream.add_output_handler(handler, SCStreamOutputType::Screen);
     stream.start_capture()?;
@@ -809,3 +833,27 @@ mod tests {
     }
 }
 
+
+// === Core Graphics FFI for physical-pixel display dimensions ===
+//
+// SCDisplay::width/height (from screencapturekit) report the display's
+// *logical point* dimensions, which on a Retina 2× display is half the
+// real backing-pixel grid. Capturing at the logical grid forces the
+// wire stream to that resolution and makes the client's renderer
+// upscale, producing the blurry output a HiDPI session would otherwise
+// be missing entirely.
+//
+// CGDisplayPixelsWide / CGDisplayPixelsHigh are documented thread-safe
+// Core Graphics APIs that return `size_t` backing-pixel dims for a
+// `CGDirectDisplayID`. Declared inline here rather than pulling in the
+// full `core-graphics` crate just for two functions.
+//
+// Apple docs:
+//   https://developer.apple.com/documentation/coregraphics/1455785-cgdisplaypixelswide
+//   https://developer.apple.com/documentation/coregraphics/1455807-cgdisplaypixelshigh
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGDisplayPixelsWide(display: u32) -> usize;
+    fn CGDisplayPixelsHigh(display: u32) -> usize;
+}

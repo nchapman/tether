@@ -18,9 +18,9 @@
 //! separate `warm_gpuconvert_capability_cache` used to fill.
 
 use tether_codec::vaapi::{VaapiDecoder, VaapiEncoder};
-use tether_codec::{build_p010_dmabuf_frame, Decoder, Encoder, Frame};
-use tether_gpuconvert::Bgra2P010DmaBuf;
-use tether_protocol::control::VideoProfile;
+use tether_codec::{build_p010_dmabuf_frame, build_xv30_dmabuf_frame, Decoder, Encoder, Frame};
+use tether_gpuconvert::{Bgra2P010DmaBuf, Bgra2Xv30DmaBuf};
+use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
 use crate::profile_probe::{ProbeError, ProfileProbe, Result};
 use crate::PipelineStage;
@@ -45,50 +45,36 @@ impl ProfileProbe for VaapiProbe {
 }
 
 fn probe_encode_inner(profile: VideoProfile) -> Result<()> {
-    // Narrow gate for HEVC 4:4:4 10-bit: VAAPI's encode side
-    // takes packed XV30 input (vaapi_drm_format_map has no P410
-    // entry), and no gpuconvert bridge produces XV30 today. If a
-    // driver constructs the encoder for (Yuv444, 10) successfully
-    // and we report encode=true, the host's send loop would crash
-    // trying to build a bridge for XV30. Until an XV30 bridge
-    // lands, gate this combination explicitly. The 4:2:0 10-bit
-    // and 4:4:4 8-bit paths are both fully wired and not gated.
-    if profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv444
-        && profile.bit_depth == 10
-    {
-        return Err(ProbeError::new(
-            PipelineStage::Capture,
-            "HEVC 4:4:4 10-bit (XV30 input) — VAAPI accepts packed XV30 \
-                 input but no gpuconvert bridge produces it yet. Profile \
-                 will become available when Bgra2Xv30DmaBuf ships.",
-        ));
-    }
-
     let mut enc = VaapiEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
-    if profile.bit_depth == 8 {
-        // Drive a single BGRA frame through the encoder so any
-        // driver rejection that only fires at submit time (not
-        // construction) surfaces here. The CPU-upload path is
-        // 8-bit-only by design — see `encode_bgra`'s comment.
-        let bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
-        let packets = enc
-            .encode_bgra(&bytes, 0, true)
-            .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
-        // Some encoders buffer the first frame and don't return a
-        // packet until the second. The contract we care about is
-        // "no error" — the empty-packet case still means the
-        // encoder accepted the input.
-        let _ = packets;
-    } else {
-        // 10-bit: real submit_dmabuf round trip via the production
-        // `Bgra2P010DmaBuf` bridge. This is the gap that the
-        // codec-internal probe couldn't close (the codec crate
-        // can't depend on gpuconvert), and exactly the gap that
-        // Intel iHD + Mesa + FFmpeg 8.1 hits — `VaapiEncoder::new`
-        // accepts Main10 + P010LE, but `av_hwframe_map(DRM_PRIME →
-        // VAAPI)` rejects the matching dma-buf at submit time.
-        probe_10bit_submit(&mut enc)?;
+    match (profile.chroma, profile.bit_depth) {
+        // 8-bit: CPU BGRA upload exercises encoder submit-time
+        // rejection (some Intel paths only fail here, not at
+        // `VaapiEncoder::new`).
+        (_, 8) => {
+            let bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
+            let _ = enc
+                .encode_bgra(&bytes, 0, true)
+                .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
+        }
+        // 10-bit 4:2:0: real submit_dmabuf round trip via the
+        // production `Bgra2P010DmaBuf` bridge. Closes the gap the
+        // codec-internal probe couldn't (no gpuconvert dep) and
+        // catches the Intel iHD + Mesa + FFmpeg 8.1 case where
+        // `VaapiEncoder::new` accepts Main10 + P010LE but
+        // `av_hwframe_map(DRM_PRIME → VAAPI)` rejects the dma-buf at
+        // submit time.
+        (ChromaSubsampling::Yuv420, 10) => probe_p010_submit(&mut enc)?,
+        // 10-bit 4:4:4: same shape via the packed XV30 bridge.
+        // VAAPI's vaapi_drm_format_map has no biplanar P410 entry,
+        // so XV30 is the only viable 4:4:4 10-bit input format.
+        (ChromaSubsampling::Yuv444, 10) => probe_xv30_submit(&mut enc)?,
+        (_, bd) => {
+            return Err(ProbeError::new(
+                PipelineStage::Construct,
+                format!("unsupported bit depth {bd} for VAAPI encode probe"),
+            ));
+        }
     }
     Ok(())
 }
@@ -131,7 +117,7 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
 ///   * Bridge convert fails (transient GPU-side error).
 ///   * `submit_dmabuf` fails (the Intel iHD `av_hwframe_map` rejection
 ///     case).
-fn probe_10bit_submit(enc: &mut VaapiEncoder) -> Result<()> {
+fn probe_p010_submit(enc: &mut VaapiEncoder) -> Result<()> {
     // Bridge construction failure → Capture stage. The driver
     // doesn't expose R16/Rg16 storage modifiers on DRM_FORMAT_MOD_LINEAR,
     // i.e. the producer side can't make a P010 dma-buf at all.
@@ -165,6 +151,43 @@ fn probe_10bit_submit(enc: &mut VaapiEncoder) -> Result<()> {
     // driver-side rejection (both our own encoder warn and ffmpeg's
     // native error line) is downgraded — the typed `ProbeError` we
     // return is the load-bearing signal, not the log line.
+    enc.submit_dmabuf(&codec_frame, 0, true)
+        .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
+    Ok(())
+}
+
+/// XV30 (HEVC Main 4:4:4 10-bit) sibling of [`probe_p010_submit`].
+/// Same three failure modes:
+///   * Bridge construction fails — driver doesn't advertise
+///     `STORAGE_IMAGE` on `DRM_FORMAT_XV30`
+///     (`VK_FORMAT_A2B10G10R10_UNORM_PACK32`) with `LINEAR`. The
+///     bridge probes this up front and returns
+///     `Xv30DmaBufError::StorageUnsupported` cleanly.
+///   * Bridge convert fails — transient GPU-side error.
+///   * `submit_dmabuf` fails — `av_hwframe_map(DRM_PRIME → VAAPI)`
+///     rejects the XV30 descriptor at submit time (the 4:4:4 10-bit
+///     analogue of the Intel iHD P010 rejection).
+fn probe_xv30_submit(enc: &mut VaapiEncoder) -> Result<()> {
+    let bridge = pollster::block_on(Bgra2Xv30DmaBuf::new(PROBE_DIM, PROBE_DIM)).map_err(|e| {
+        ProbeError::new(
+            PipelineStage::Capture,
+            format!(
+                "Bgra2Xv30DmaBuf::new failed — driver likely lacks Rgb10a2Unorm \
+                 storage support on DRM_FORMAT_MOD_LINEAR: {e}"
+            ),
+        )
+    })?;
+    let probe_bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
+    let xv30 = bridge.convert_bgra_bytes(&probe_bytes).map_err(|e| {
+        ProbeError::new(PipelineStage::Capture, format!("XV30 bridge convert: {e}"))
+    })?;
+    let codec_frame = build_xv30_dmabuf_frame(
+        xv30.fd,
+        xv30.size,
+        xv30.modifier,
+        xv30.offset,
+        xv30.stride,
+    );
     enc.submit_dmabuf(&codec_frame, 0, true)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
     Ok(())

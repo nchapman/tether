@@ -435,5 +435,140 @@ fn hevc_main444_dmabuf_roundtrip() {
     );
 }
 
+/// HEVC Main 4:4:4 10-bit dma-buf round trip — the 10-bit cousin of
+/// `hevc_main444_dmabuf_roundtrip`. Exercises every layer of the new
+/// XV30 path:
+///
+/// 1. `Bgra2Xv30DmaBuf` bridge constructs (gpuconvert wgpu device +
+///    feature negotiation + Rgb10a2Unorm storage-modifier probe).
+/// 2. Compute pass writes a valid packed-XV30 dma-buf.
+/// 3. `VaapiEncoder::submit_dmabuf` accepts the XV30 layer — i.e.
+///    ffmpeg's `vaapi_drm_format_map` actually has a path for our
+///    `DRM_FORMAT_XV30` descriptor and `AV_PIX_FMT_XV30LE` source
+///    format. **This is the gate the probe-level rejection in
+///    `tether-probe/src/host/vaapi.rs` currently substitutes for —
+///    the test must pass before that rejection is removed.**
+/// 4. The encoder produces a HEVC Main 4:4:4 10-bit bitstream.
+/// 5. `VaapiDecoder` accepts that bitstream and emits a frame.
+/// 6. The decoded surface is exportable as a DMA-BUF (catches the
+///    symmetric ffmpeg gap on the decode side).
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Vulkan DMA-BUF export + Rgb10a2Unorm storage"]
+fn hevc_main444_10bit_xv30_dmabuf_roundtrip() {
+    use crate::build_xv30_dmabuf_frame;
+    use tether_gpuconvert::Bgra2Xv30DmaBuf;
+    use tether_protocol::control::VideoProfile;
+
+    let w = 128u32;
+    let h = 128u32;
+
+    let bridge = match pollster::block_on(Bgra2Xv30DmaBuf::new(w, h)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP: Bgra2Xv30DmaBuf::new failed: {e}");
+            return;
+        }
+    };
+
+    let src = bridge
+        .device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("test bgra mid-grey"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+    let n = (w * h) as usize;
+    let bgra = vec![0x80u8; n * 4];
+    bridge.queue().write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &src,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bgra,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let mut enc = match VaapiEncoder::new(VideoProfile::HEVC_10BIT_444, w, h, 30, 8_000) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("SKIP: VAAPI HEVC Main 4:4:4 10-bit encoder unavailable: {e}");
+            return;
+        }
+    };
+    let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::Hevc)
+        .expect("VAAPI HEVC decoder");
+
+    let mut got_decoded = false;
+    for t in 0..8i64 {
+        let bridge_frame = bridge.convert(&src).expect("bridge.convert");
+        let codec_frame = build_xv30_dmabuf_frame(
+            bridge_frame.fd,
+            bridge_frame.size,
+            bridge_frame.modifier,
+            bridge_frame.offset,
+            bridge_frame.stride,
+        );
+        let packets = enc
+            .submit_dmabuf(&codec_frame, t, t == 0)
+            .expect("submit_dmabuf");
+        for p in packets {
+            assert!(!p.data.is_empty(), "encoded packet must not be empty");
+            dec.submit(&p.data).expect("decoder submit");
+            while let Some(f) = dec.next_frame().expect("decoder next_frame") {
+                let Frame::Gpu(g) = f else {
+                    panic!("VaapiDecoder must emit Gpu frames for Main 4:4:4 10-bit");
+                };
+                let GpuFrameSource::DmaBuf(dmabuf) = g.source;
+                assert_eq!(g.width, w);
+                assert_eq!(g.height, h);
+                // Log the decoder's chosen export shape so a driver-
+                // dependent decision (packed XV30 vs biplanar P410-
+                // style 16-bit) shows up in test output. The
+                // renderer's `b"XV30" → RenderLayout::Biplanar16`
+                // mapping in `tether-render::dmabuf_test::cross_table_consistency`
+                // assumes biplanar 16-bit; if the driver emits
+                // something else, the renderer needs a new
+                // `RenderLayout::Packed1010102` variant.
+                eprintln!(
+                    "decoded 4:4:4 10-bit surface exported: fourcc=0x{:08x} ({:?}) \
+                     layers={} planes_per_layer={:?}",
+                    dmabuf.fourcc,
+                    std::str::from_utf8(&dmabuf.fourcc.to_le_bytes()).unwrap_or("?"),
+                    dmabuf.layers.len(),
+                    dmabuf.layers.iter().map(|l| l.num_planes).collect::<Vec<_>>(),
+                );
+                got_decoded = true;
+            }
+        }
+        if got_decoded {
+            break;
+        }
+    }
+    assert!(
+        got_decoded,
+        "decoder must emit at least one 4:4:4 10-bit frame within 8 input frames"
+    );
+}
+
 // supported_encode_profiles is gone from tether-codec — the equivalent
 // is `tether_probe::host_encode_profiles()`, tested in that crate.

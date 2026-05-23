@@ -26,6 +26,7 @@ use ash::vk;
 
 mod shared_nv12;
 mod shared_p010;
+mod shared_xv30;
 mod shared_yuv444;
 mod single;
 
@@ -34,6 +35,7 @@ mod tests;
 
 pub use shared_nv12::{export_nv12_shared_dmabuf, SharedNv12Export};
 pub use shared_p010::{export_p010_shared_dmabuf, SharedP010Export};
+pub use shared_xv30::{export_xv30_shared_dmabuf, SharedXv30Export};
 pub use shared_yuv444::{export_yuv444_shared_dmabuf, SharedYuv444Export};
 pub use single::export_texture_as_dmabuf;
 

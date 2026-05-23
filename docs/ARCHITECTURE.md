@@ -489,15 +489,28 @@ switches `sw_format` + the AVCodecContext `profile` field for
 `AV_PROFILE_HEVC_REXT` on 4:4:4 + BGRA→input swscale stage; color
 primaries / transfer / colorspace / range tagged explicitly on the
 context so the SPS VUI doesn't say "Unspecified") and the gpuconvert
-bridge (NV12 with two-plane R8+Rg8 export vs. YUV444 with packed
-XYUV) branch on chroma at construction. The renderer dispatches on a
-derived `RenderLayout` (`Biplanar` vs `PackedXYUV`) rather than
-chroma directly: Yuv420 is always biplanar (NV12, half-res UV);
-Yuv444 is biplanar on macOS (NV24 IOSurface from VT, full-res UV
-through the same Y R8 + UV Rg8 shader) and packed XYUV on Linux
-(VAAPI dma-buf). Mid-session chroma switch is not supported — same
-rebuild path as a mid-session resolution change (encoder + bridge +
-render pipeline all reset).
+bridge branch on `(chroma, bit_depth)` at construction:
+
+- `(Yuv420, 8)` → `Nv12DmaBuf` (R8 + Rg8 biplanar, fourcc `NV12`).
+- `(Yuv420, 10)` → `Bgra2P010DmaBuf` (R16 + Rg16 biplanar, fourcc
+  `P010` with 10-bit data MSB-aligned in 16-bit cells).
+- `(Yuv444, 8)` → `Yuv444DmaBuf` (single-plane Rgba8Unorm packed,
+  fourcc `XYUV` per DRM_FORMAT_XYUV8888).
+- `(Yuv444, 10)` → `Bgra2Xv30DmaBuf` (single-plane Rgb10a2Unorm
+  packed, fourcc `XV30` per DRM_FORMAT_XV30 — biplanar P410 has no
+  `vaapi_drm_format_map` entry, so packed is the only viable input).
+
+The renderer dispatches on a derived `RenderLayout`
+(`Biplanar8` / `Biplanar16` / `PackedXYUV`) rather than chroma
+directly: Yuv420 is always biplanar (NV12 / P010, half-res UV);
+Yuv444 is biplanar on macOS (NV24 / `'xf44'` / `'P410'` IOSurface from
+VT, full-res UV through the same Y + UV shader at 8 or 16 bit) and on
+Linux is packed XYUV at 8-bit, biplanar P410-style 16-bit at 10-bit
+(driver-dependent — RADV has emitted both packed and biplanar across
+Mesa versions; see `gpu/import.rs:53` for the failure mode if the
+decoder picks packed). Mid-session chroma or bit-depth switch is not
+supported — same rebuild path as a mid-session resolution change
+(encoder + bridge + render pipeline all reset).
 
 **Per-platform asymmetries.** `tether_probe::host_supported_profiles()`
 does a real encode + decode round trip per profile against the live
@@ -532,9 +545,10 @@ one-layer/three-plane form, which matches VAAPI's PRIME_2 *importer*
 expectation on Main444.
 
 The `tether.pixel-format` extension echoes the on-wire pixel format
-of the encoded stream (`Nv12` for 4:2:0, `Yuv444p` for HEVC Main444)
-so client decoders that wire their import path before the first SPS
-arrives can pick the right plane layout up front.
+of the encoded stream (`Nv12` for 4:2:0 8-bit, `P010` for 4:2:0
+10-bit, `Yuv444p` for HEVC Main 4:4:4 8-bit, `P410` for HEVC Main
+4:4:4 10-bit) so client decoders that wire their import path before
+the first SPS arrives can pick the right plane layout up front.
 
 Four non-negotiable invariants tracked end-to-end:
 
@@ -594,17 +608,20 @@ Listed to set expectations; each is a real follow-up, not a "never":
   Intel iGPUs) and a separate codec_id path. The probe stub returns
   `CodecNotFound` for AV1 today.
 - **HDR (BT.2020 + PQ / HLG).** The 10-bit *bit-depth* path is in
-  place (see `docs/CODEC_CAPABILITIES.md`): `PROFILE_PREFERENCE`
-  advertises HEVC Main10 and HEVC Main 4:4:4 10-bit; the renderer
-  has an R16/Rg16 biplanar `RenderLayout::Biplanar16` for both
-  Linux dma-buf and macOS IOSurface (`'P010'`/`'P410'`/`'xf44'`)
-  paths; the shader carries a `luma_scale` uniform that compensates
-  10-in-16 MSB-aligned sampler reads. What's *not* yet in place is
-  HDR signalling proper (BT.2020 primaries, PQ / HLG transfer
-  curves in the EOTF dispatch, HDR-capable surface format) — the
-  renderer hard-pins BT.709 limited range regardless of `bit_depth`.
-  10-bit on the wire today buys precision (less banding on
-  gradients) without HDR luminance range.
+  place at every layer (see `docs/CODEC_CAPABILITIES.md`):
+  `PROFILE_PREFERENCE` advertises HEVC Main10 and HEVC Main 4:4:4
+  10-bit; the host encode-side bridge produces P010 dma-buf for
+  4:2:0 (R16 + Rg16 biplanar) and packed XV30 dma-buf for 4:4:4
+  (Rgb10a2Unorm, via `Bgra2Xv30DmaBuf`); the renderer has an
+  R16/Rg16 biplanar `RenderLayout::Biplanar16` for both Linux
+  dma-buf and macOS IOSurface (`'P010'`/`'P410'`/`'xf44'`) paths;
+  the shader carries a `luma_scale` uniform that compensates 10-in-16
+  MSB-aligned sampler reads. What's *not* yet in place is HDR
+  signalling proper (BT.2020 primaries, PQ / HLG transfer curves in
+  the EOTF dispatch, HDR-capable surface format) — the renderer
+  hard-pins BT.709 limited range regardless of `bit_depth`. 10-bit
+  on the wire today buys precision (less banding on gradients)
+  without HDR luminance range.
 - **NAT traversal.** LAN direct only. QUIC's pluggable transport makes
   adding ICE later straightforward; today the user runs the client
   binary with a host IP.

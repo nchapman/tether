@@ -132,7 +132,12 @@ pub(crate) enum Capability {
     VaapiH264,
     VaapiHevcMain,
     VaapiHevcMain444,
-    /// 10-bit dma-buf path: empirically SKIPs on Intel iHD +
+    /// 4:4:4 10-bit dma-buf path (XV30). Distinct from the 8-bit
+    /// `VaapiHevcMain444` because Intel iHD historically supports
+    /// HEVC 4:4:4 encode at 8-bit while rejecting the 10-bit XV30
+    /// descriptor at submit time (see `tether-codec::vaapi::tests::hevc_main444_10bit_xv30_dmabuf_roundtrip`).
+    VaapiHevcMain444_10DmaBuf,
+    /// 4:2:0 10-bit dma-buf path: empirically SKIPs on Intel iHD +
     /// Meteor Lake (FFmpeg's vaapi_drm_format_map lacks P010
     /// entries on that combo).
     VaapiHevcMain10DmaBuf,
@@ -861,8 +866,15 @@ fn decode_all(
 /// HEVC Main 4:4:4, or HEVC Main 10.
 fn capability_for_profile(profile: VideoProfile) -> Capability {
     use tether_protocol::control::CodecKind;
+    // Order matters: the 4:4:4 10-bit arm must come before the generic
+    // `(Hevc, Yuv444, _)` arm, otherwise 4:4:4 10-bit cells skip on
+    // the 8-bit-only `VaapiHevcMain444` capability and an Intel iHD
+    // driver gap at 10-bit shows up as a misleading "Main444 missing".
     match (profile.codec, profile.chroma, profile.bit_depth) {
         (CodecKind::H264, _, _) => Capability::VaapiH264,
+        (CodecKind::Hevc, ChromaSubsampling::Yuv444, 10) => {
+            Capability::VaapiHevcMain444_10DmaBuf
+        }
         (CodecKind::Hevc, ChromaSubsampling::Yuv444, _) => Capability::VaapiHevcMain444,
         (CodecKind::Hevc, _, 10) => Capability::VaapiHevcMain10DmaBuf,
         (CodecKind::Hevc, _, _) => Capability::VaapiHevcMain,

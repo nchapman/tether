@@ -29,7 +29,8 @@ use tether_codec::{build_encoder, Encoder};
 use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{
-    Bgra2P010DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
+    Bgra2P010DmaBuf, Bgra2Xv30DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame, Xv30DmaBufFrame,
+    Yuv444DmaBuf, Yuv444DmaBufFrame,
 };
 #[cfg(target_os = "linux")]
 use tether_scaler::{Pipelines as ScalerPipelines, Scaler, ScalerError};
@@ -849,6 +850,7 @@ enum GpuConvertBridge {
     Nv12(Nv12DmaBuf),
     Yuv444(Yuv444DmaBuf),
     P010(Bgra2P010DmaBuf),
+    Xv30(Bgra2Xv30DmaBuf),
 }
 
 /// Outcome of one Gpu-frame encode attempt. Distinguishes per-frame
@@ -875,6 +877,7 @@ fn bridge_device_queue(b: &GpuConvertBridge) -> (wgpu::Device, wgpu::Queue) {
         GpuConvertBridge::Nv12(b) => (b.device().clone(), b.queue().clone()),
         GpuConvertBridge::Yuv444(b) => (b.device().clone(), b.queue().clone()),
         GpuConvertBridge::P010(b) => (b.device().clone(), b.queue().clone()),
+        GpuConvertBridge::Xv30(b) => (b.device().clone(), b.queue().clone()),
     }
 }
 
@@ -984,11 +987,24 @@ fn encode_gpu_frame(
                         }
                     }
                 }
-                // Yuv444 10-bit (XV30) has no bridge; tether-probe's
-                // capture-stage check is supposed to keep it out of the
-                // negotiated set. Reaching this arm is a contract
-                // violation — fail loud rather than silently dropping
-                // every frame.
+                (ChromaSubsampling::Yuv444, 10) => {
+                    match pollster::block_on(Bgra2Xv30DmaBuf::new(slot.width, slot.height)) {
+                        Ok(b) => GpuConvertBridge::Xv30(b),
+                        Err(e) => {
+                            return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                                "XV30 gpuconvert bridge init failed for {}x{} after \
+                                 startup probe succeeded — device loss or OOM: {e}",
+                                slot.width,
+                                slot.height,
+                            ));
+                        }
+                    }
+                }
+                // Any future profile combination not enumerated above.
+                // tether_probe::host_supported_profiles must filter
+                // unsupported (chroma, bit_depth) tuples out of the
+                // negotiated set; reaching this arm is a contract
+                // violation, not a transient failure.
                 (chroma, bit_depth) => {
                     return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
                         "no gpuconvert bridge for negotiated profile chroma={:?} \
@@ -1167,6 +1183,37 @@ fn encode_gpu_frame(
             };
             drop(imported);
             p010_dmabuf_to_codec_frame(p010)
+        }
+        GpuConvertBridge::Xv30(b) => {
+            let imported = match b.import_bgra_dmabuf(
+                fd,
+                modifier,
+                stride,
+                offset,
+                slot.capture_width,
+                slot.capture_height,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "import_bgra_dmabuf (xv30 bridge): {e}"
+                    ));
+                }
+            };
+            let bridge_input = match scale_if_needed(slot.scaler.as_ref(), &imported) {
+                Ok(t) => t,
+                Err(e) => return GpuEncodeOutcome::DropFrame(e),
+            };
+            let xv30 = match b.convert(bridge_input) {
+                Ok(f) => f,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "Bgra2Xv30DmaBuf::convert: {e}"
+                    ));
+                }
+            };
+            drop(imported);
+            xv30_dmabuf_to_codec_frame(xv30)
         }
     };
 
@@ -1526,6 +1573,25 @@ fn yuv444_dmabuf_to_codec_frame(out: Yuv444DmaBufFrame) -> DmaBufFrame {
             ],
         }],
     }
+}
+
+/// Build a `DmaBufFrame` for the XV30 (HEVC Main 4:4:4 10-bit) path:
+/// one DRM object, one `XV30` layer, one packed plane (32 bpp, layout
+/// `[31:30]X | [29:20]V | [19:10]U | [9:0]Y`). FFmpeg consumes this as
+/// `AV_PIX_FMT_XV30LE` via `vaapi_drm_format_map`. The construction
+/// itself is delegated to `tether_codec::build_xv30_dmabuf_frame` so
+/// the production send loop and the startup probe share one source of
+/// truth — cross-table consistency tests in `tether-render::dmabuf_test`
+/// pin the fourcc family.
+#[cfg(target_os = "linux")]
+fn xv30_dmabuf_to_codec_frame(out: Xv30DmaBufFrame) -> DmaBufFrame {
+    tether_codec::build_xv30_dmabuf_frame(
+        out.fd,
+        out.size,
+        out.modifier,
+        out.offset,
+        out.stride,
+    )
 }
 
 /// Drain any pending events from the cursor source and forward them

@@ -37,6 +37,8 @@ pub mod modifier_query;
 #[cfg(target_os = "linux")]
 pub mod nv12_dmabuf;
 #[cfg(target_os = "linux")]
+pub mod xv30_dmabuf;
+#[cfg(target_os = "linux")]
 pub mod yuv444_dmabuf;
 
 /// macOS NV12 IOSurface scaler bridge — the host-side equivalent of
@@ -60,6 +62,8 @@ pub use modifier_query::{
 };
 #[cfg(target_os = "linux")]
 pub use nv12_dmabuf::{Nv12DmaBuf, Nv12DmaBufError, Nv12DmaBufFrame};
+#[cfg(target_os = "linux")]
+pub use xv30_dmabuf::{Bgra2Xv30DmaBuf, Xv30DmaBufError, Xv30DmaBufFrame};
 #[cfg(target_os = "linux")]
 pub use yuv444_dmabuf::{Yuv444DmaBuf, Yuv444DmaBufError, Yuv444DmaBufFrame};
 

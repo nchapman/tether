@@ -58,6 +58,19 @@ pub(crate) fn import_dmabuf_textures(
             // sniff the DRM fourcc for layout decisions, which would
             // be wrong for any driver that emits a non-P010/P410
             // fourcc for the same (chroma, bit_depth) shape.
+            //
+            // **Unverified for 4:4:4 10-bit on Linux**: the encoder
+            // takes packed XV30 input, but VAAPI's *decode* output
+            // format for HEVC Main 4:4:4 10-bit is driver-dependent —
+            // RADV has emitted both packed XV30 (1 layer) and
+            // biplanar P410-style 16-bit (2 layers) across Mesa
+            // versions. If `import_biplanar` errors below with
+            // "expected 2 layers, got 1" on a 4:4:4 10-bit frame,
+            // the driver emitted packed XV30 and the renderer needs
+            // a new `RenderLayout::Packed1010102` import variant
+            // analogous to `PackedXYUV`. The hardware test
+            // `dmabuf_test::roundtrip_hevc_main444_10bit_identity`
+            // is the gate that surfaces this on RADV/NVK.
             import_biplanar(
                 device, layout, sampler, chroma, dmabuf, width, height, guard, true,
             )

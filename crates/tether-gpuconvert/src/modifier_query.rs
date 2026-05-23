@@ -58,7 +58,8 @@ pub async fn importable_dmabuf_modifiers(drm_fourcc: u32) -> Result<Vec<u64>> {
 /// `STORAGE_IMAGE` instead of `SAMPLED_IMAGE`.
 ///
 /// Required gate for the 10-bit gpuconvert compute pipelines: a BGRA→P010
-/// or BGRA→XV30 shader writes into an R16/Rg16/Rgba16 storage texture,
+/// or BGRA→XV30 shader writes into an R16/Rg16 (P010) or
+/// Rgb10a2Unorm (XV30) storage texture,
 /// which the importer must support as `VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT`,
 /// not just sampled-image. Some drivers expose 16-bit unorm as sampleable
 /// (so [`importable_dmabuf_modifiers`] returns a non-empty list) but not
@@ -215,6 +216,11 @@ fn drm_fourcc_to_vk_format(drm_fourcc: u32) -> Result<vk::Format> {
     // not a convenience choice (changing it to B8G8R8A8_UNORM would
     // silently query the wrong modifier table).
     const XYUV: u32 = u32::from_le_bytes(*b"XYUV");
+    // Packed XV30 (DRM_FORMAT_XV30) for HEVC Main 4:4:4 10-bit. Each
+    // pixel is one 10:10:10:2 little-endian word X:V:U:Y; the matching
+    // Vulkan format is A2B10G10R10_UNORM_PACK32 per the
+    // VK_EXT_image_drm_format_modifier spec appendix.
+    const XV30: u32 = u32::from_le_bytes(*b"XV30");
     match drm_fourcc {
         AR24 | XR24 => Ok(vk::Format::B8G8R8A8_UNORM),
         R8 => Ok(vk::Format::R8_UNORM),
@@ -222,6 +228,7 @@ fn drm_fourcc_to_vk_format(drm_fourcc: u32) -> Result<vk::Format> {
         R16 => Ok(vk::Format::R16_UNORM),
         GR32 => Ok(vk::Format::R16G16_UNORM),
         XYUV => Ok(vk::Format::R8G8B8A8_UNORM),
+        XV30 => Ok(vk::Format::A2B10G10R10_UNORM_PACK32),
         other => Err(ModifierQueryError::UnsupportedFourcc(other)),
     }
 }
@@ -259,6 +266,19 @@ mod tests {
         );
         assert_eq!(drm_fourcc_to_vk_format(r8).unwrap(), vk::Format::R8_UNORM);
         assert_eq!(drm_fourcc_to_vk_format(gr88).unwrap(), vk::Format::R8G8_UNORM);
+    }
+
+    /// Pin DRM_FORMAT_XV30 → A2B10G10R10_UNORM_PACK32 — the
+    /// VK_EXT_image_drm_format_modifier-mandated alias for HEVC Main
+    /// 4:4:4 10-bit encode input. Drift here silently breaks the
+    /// XV30 storage-modifier probe.
+    #[test]
+    fn drm_fourcc_table_covers_xv30() {
+        let xv30 = u32::from_le_bytes(*b"XV30");
+        assert_eq!(
+            drm_fourcc_to_vk_format(xv30).unwrap(),
+            vk::Format::A2B10G10R10_UNORM_PACK32,
+        );
     }
 
     #[test]
@@ -316,6 +336,27 @@ mod tests {
         assert!(
             gr32_mods.contains(&linear),
             "expected DRM_FORMAT_MOD_LINEAR in GR32 storage modifiers, got {gr32_mods:?}",
+        );
+    }
+
+    /// XV30 sibling of the R16/GR32 storage probe — confirms LINEAR
+    /// `STORAGE_IMAGE` support on `DRM_FORMAT_XV30`
+    /// (`VK_FORMAT_A2B10G10R10_UNORM_PACK32`) on whatever hardware
+    /// runs the test. Catches a driver regression that drops storage
+    /// writability on the packed 10-bit format before it manifests as
+    /// a `Bgra2Xv30DmaBuf::new` mid-session failure. May SKIP on
+    /// Intel iHD per the same driver-gap CLAUDE.md documents for the
+    /// other 10-bit paths.
+    #[test]
+    #[ignore = "requires a working Vulkan adapter advertising VK_EXT_image_drm_format_modifier; may SKIP on Intel iHD"]
+    fn storable_probe_returns_linear_for_xv30() {
+        let xv30 = u32::from_le_bytes(*b"XV30");
+        let xv30_mods = pollster::block_on(storable_dmabuf_modifiers(xv30))
+            .expect("storage probe for XV30");
+        let linear = crate::dmabuf_export::DRM_FORMAT_MOD_LINEAR;
+        assert!(
+            xv30_mods.contains(&linear),
+            "expected DRM_FORMAT_MOD_LINEAR in XV30 storage modifiers, got {xv30_mods:?}",
         );
     }
 }

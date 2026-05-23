@@ -401,17 +401,30 @@ authoritative gate.
 - Cross-platform path (macOS host → Linux client at Main10) already
   works today; it's only the Linux *encode* side that hits the gap
 
-### 4:4:4 10-bit — deliberately not yet wired
+### 4:4:4 10-bit — wired on the encode side via packed XV30
 
 VAAPI's `vaapi_drm_format_map` lists `AV_PIX_FMT_XV30LE` (packed
 10:10:10:2) as the only 10-bit 4:4:4 entry — planar P410 has no map
-row, mirroring the 8-bit YUV444P→XYUV story. No gpuconvert bridge
-produces XV30 today. The codec-layer probe explicitly gates this
-combination out (`tether-codec/src/vaapi/probe.rs`, narrow `(Yuv444,
-10)` reject) so the host never advertises a profile it can't
-construct. The biplanar P410 shader stays in-tree dead-code for an
-eventual macOS gpuconvert-equivalent (where the IOSurface fourcc
-`'P410'` is biplanar).
+row, mirroring the 8-bit YUV444P→XYUV story. The host now produces
+XV30 via `tether-gpuconvert::Bgra2Xv30DmaBuf`: a BGRA→Rgb10a2Unorm
+compute pass writes a single packed plane into a dma-buf exported as
+`VK_FORMAT_A2B10G10R10_UNORM_PACK32` (DRM_FORMAT_XV30, R=Y / G=U /
+B=V / A=X under the Vulkan PACK32 channel mapping; the 2-bit X is
+unused per VAAPI). Pitch alignment is 128 bytes / 32 luma pixels and
+height alignment is 32 rows — Intel HEVC 4:4:4 encode reads 32×32
+CTUs and the analogous pitch boundary lands at 4× the NV12-luma
+constraint. The probe-side gate (`tether-probe/src/host/vaapi.rs`)
+runs a real `submit_dmabuf` round trip through the same bridge, so
+`(Yuv444, 10)` only ends up in the advertised set when the driver
+actually accepts it. Decoder output format for the 4:4:4 10-bit case
+is driver-dependent (RADV has emitted both packed XV30 and biplanar
+P410-style 16-bit across Mesa versions) — the renderer-import side
+assumes biplanar 16-bit (`RenderLayout::Biplanar16`); if a driver
+emits packed XV30, the import errors with "expected 2 layers, got 1"
+and a new `RenderLayout::Packed1010102` variant is needed. See
+`gpu/import.rs:53` for the comment that surfaces this on the
+failure path, and `dmabuf_test.rs::roundtrip_hevc_main444_10bit_identity`
+for the hardware test that gates it on RADV/NVK.
 
 ---
 
@@ -470,18 +483,26 @@ AV1 hardware decode is M3+ only — not relevant to us today.
 
 The renderer doesn't care what codec produced the surface; it
 cares about plane count, per-plane format, and DRM/IOSurface
-fourcc. Today we support two layouts (`RenderLayout::Biplanar` and
-`RenderLayout::PackedXYUV`) at 8-bit.
+fourcc. Today we support three layouts: `RenderLayout::Biplanar8`
+(NV12 / NV24, 8-bit), `RenderLayout::Biplanar16` (P010 / P410 /
+`'xf44'`, 10-bit MSB-aligned in 16-bit cells), and
+`RenderLayout::PackedXYUV` (DRM_FORMAT_XYUV8888, 4:4:4 8-bit).
+A packed 10-bit 4:4:4 variant (`Rgb10a2Unorm`) is not yet wired
+on the import side — see `## Layer 5 — VAAPI encode` for why
+the producer side ships ahead of the consumer side.
 
 ### What's hard-limited
 
-- **wgpu pin at the trunk SHA in `Cargo.toml`** does not expose
-  `TextureFormat::P010` or `TextureFormat::P410` as variants.
-  Those exist on newer wgpu trunk but behind feature flags and
-  not at our pinned commit. **10-bit biplanar import on our
-  current pin must go via `R16Unorm` + `Rg16Unorm` per plane.**
-  Bumping the pin to acquire P010/P410 is an option; doing
-  R16/Rg16 manually is the path with the fewest dependencies.
+- **wgpu has no high-level multi-plane `TextureFormat::P010` /
+  `P410`**, so 10-bit biplanar import on Linux dma-buf and macOS
+  IOSurface both go via separate `R16Unorm` Y + `Rg16Unorm` UV
+  planes per-import; the same shader path handles both because the
+  storage convention (10-bit data MSB-aligned in 16-bit cells) is
+  identical between P010 and P410. `Rgb10a2Unorm` is exposed on
+  our pinned wgpu and is used today as a storage *output* format
+  in `Bgra2Xv30DmaBuf`; whether it can be imported via
+  `texture_from_dmabuf_fd` for the renderer-side packed-XV30
+  variant is the open hardware question.
 - **MSB-aligned 10-in-16 sampler arithmetic**: a 10-bit value max
   (1023) stored in bits [15:6] of a 16-bit word reads through an
   `R16Unorm` sampler as `60160 / 65535 ≈ 0.918` (limited-range
@@ -511,10 +532,17 @@ fourcc. Today we support two layouts (`RenderLayout::Biplanar` and
 
 ### What's open
 
-- **Packed 10-bit 4:4:4 (`'xf44'` style)**: would need a wgpu
-  format equivalent to `VK_FORMAT_A2R10G10B10_UNORM_PACK32`.
-  wgpu's `Rgb10a2Unorm` is the candidate but its dma-buf import
-  story is unverified at our pinned SHA.
+- **Packed 10-bit 4:4:4 on the renderer-import side.** The
+  encode-side producer is wired (`Bgra2Xv30DmaBuf` writes
+  `Rgb10a2Unorm` via `VK_FORMAT_A2B10G10R10_UNORM_PACK32` dma-buf
+  export — DRM_FORMAT_XV30). The renderer-import side has not been
+  verified on hardware: VAAPI's decoded surface format for HEVC
+  Main 4:4:4 10-bit is driver-dependent. If a driver exports packed
+  XV30 rather than biplanar 16-bit, the renderer needs a new
+  `RenderLayout::Packed1010102` variant that samples
+  `Rgb10a2Unorm` directly (analogous to `PackedXYUV` for the 8-bit
+  case). The `dmabuf_test::roundtrip_hevc_main444_10bit_identity`
+  cell on RADV/NVK is the gate that surfaces this.
 
 ---
 

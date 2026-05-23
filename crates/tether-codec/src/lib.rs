@@ -462,6 +462,52 @@ pub fn build_p010_dmabuf_frame(
     }
 }
 
+/// Build a `DmaBufFrame` matching the XV30 (HEVC Main 4:4:4 10-bit)
+/// descriptor shape FFmpeg's `vaapi_drm_format_map` expects: one DRM
+/// object, one layer (DRM_FORMAT_XV30, packed 10:10:10:2), one plane
+/// pointing at `object_index=0` with the bridge-reported offset and
+/// pitch.
+///
+/// Same one-source-of-truth contract as [`build_p010_dmabuf_frame`] —
+/// the production send loop in `tether-host` and the startup probe in
+/// `tether-probe` both call this helper. Cross-table consistency tests
+/// in `tether-render::dmabuf_test` pin the fourcc family.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn build_xv30_dmabuf_frame(
+    fd: std::os::fd::OwnedFd,
+    size: u64,
+    modifier: u64,
+    offset: u64,
+    stride: u64,
+) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"XV30"),
+        objects: vec![DmaBufObject {
+            fd,
+            size,
+            drm_format_modifier: modifier,
+        }],
+        layers: vec![DmaBufLayer {
+            drm_format: u32::from_le_bytes(*b"XV30"),
+            num_planes: 1,
+            object_index: [0, 0, 0, 0],
+            offset: [
+                u32::try_from(offset).expect("XV30 plane offset fits in u32"),
+                0,
+                0,
+                0,
+            ],
+            pitch: [
+                u32::try_from(stride).expect("XV30 plane stride fits in u32"),
+                0,
+                0,
+                0,
+            ],
+        }],
+    }
+}
+
 /// macOS IOSurface descriptor for a captured (encoder input) or
 /// decoded (renderer input) frame. Mirrors what
 /// `tether_capture::CapturedIOSurface` carries on the capture side;

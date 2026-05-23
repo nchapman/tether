@@ -17,7 +17,7 @@ each layer covers, and how to extend it.
 | `tether-render` | 23 default + 15 `#[ignore]` (Linux); + 4 `#[ignore]` (macOS) | Cursor letterbox clipping, aspect ratio; `LatestFrame` Send+Sync + drop-oldest displacement; transfer_kind dispatch table pin; `range_kind_for(bit_depth, layout)` dispatch table pin + algebraic check that 10-bit limited-range breakpoints land white at 1.0 and black at 0.0; `render_layout_for(chroma, bit_depth)` dispatch table pin (incl. Yuv420 10-bit → Biplanar16 which the import path relies on for UV dimensioning); the **end-to-end roundtrip harness** (`test_harness.rs` + `dmabuf_test.rs`) drives the production multi-pass renderer (`Gpu::new_headless`) through 14 hardware cells covering identity / host-scaler / client-upscale / surface-below-video / full-chain / repro-shape rows at H.264 4:2:0, HEVC Main, HEVC Main 4:4:4, HEVC Main 10, and HEVC Main 4:4:4 10-bit (10-bit cells SKIP on Intel iHD + Meteor Lake driver gap; the 4:4:4 10-bit cell may *additionally* error on drivers that emit packed XV30 from decode rather than biplanar 16-bit — see `gpu/import.rs:53`). Primary metric is **geometric residual on a coordinate-encoded fixture** (`Fixture::CoordEncoded`); SSIM and BT.709 Y-PSNR are the secondary catch-net. On failure the harness dumps readback/reference/diff/SSIM-heatmap PNGs + `metrics.txt` to `target/roundtrip-diagnostics/<case>/`. IOSurface zero-copy on macOS hardware (HEVC 4:2:0 8-bit + 10-bit via encode→decode→render; HEVC 4:4:4 8-bit + 10-bit via fixture-decode→render since VT lacks Main444 encode). |
 | `tether-gpuconvert` | 4 default + 18 `#[ignore]` lib + 7 `#[ignore]` integration (`tests/scaler_roundtrip.rs`) | `drm_fourcc_to_vk_format` table coverage incl. 10-bit biplanar plane fourccs (R16/GR32 → R16_UNORM/R16G16_UNORM), packed XV30 → A2B10G10R10_UNORM_PACK32, 8-bit family regression, unknown-fourcc rejection; BGRA→NV12 + DMA-BUF round-trip with real Vulkan adapter; `convert_solid_{white,red}_roundtrip_packed_xv30` round-trips the new XV30 bridge with hand-extracted 10-bit code values, catching channel-mapping (R=Y/G=U/B=V/A=X) and BT.709 10-bit math regressions; `storable_probe_returns_linear_for_xv30` mirrors the R16/GR32 storage-modifier probe for the packed 10-bit format; structural alignment-regression `convert_reports_64_aligned_y_stride_at_unaligned_width` (lib unit test in `src/nv12_dmabuf.rs`) asserts the iHD-VAAPI 64-byte luma row pitch fix at 2160×1440 without needing encoder/decoder/renderer in the loop. Integration tests `bgra_dmabuf_roundtrip_{1920×1200,2880×1920}` and `imported_bgra_then_scaler_2880×1920_to_2160×1440` are bisect entry points: split a failing roundtrip into (scaler isolation) ↔ (BGRA dma-buf import/export) ↔ (scaler-on-dma-buf) without running the full chain. |
 | `tether-scaler` | 18 default lib + 12 `#[ignore]` (hardware) + 6 `quality` integration | Mitchell-Netravali reference vs CPU implementation parity, fp16 linear-light path, mip prefilter, asymmetric scale; `matches_reference_coord_encoded_left_edge` (the harness-companion left-edge regression at 2880×1920 → 2160×1440 — bottom of the bisect stack for any future left-edge-corruption bug). |
-| `tether-capture` | 1 default + 1 `#[ignore]` macOS | SCK pixel-format probe records `420v`/`420f`/`'444v'`/`'444f'`/`xf44` acceptance via real `start_capture` + frame-arrival check for the Unknown-fourcc cases. |
+| `tether-capture` | 13 default (Linux) / 11 default + 1 `#[ignore]` (macOS) | `HashDamage::classify` policy incl. native-damage short-circuit (native idle wins over differing bytes; native changed defers to hash). `native_damage_for_frame_status` (macOS) maps all six `SCFrameStatus` variants. `native_damage_from_region_count` (Linux) maps the empty-list ⇒ idle policy. `video_damage_meta_pod_has_choice_range_size` deserializes the `SPA_PARAM_Meta` pod and asserts the `META_size` field is `CHOICE_RANGE_Int` (a fixed `Int` silently degrades to hash-only on stricter compositors — pure-shape regression catcher). Test-pattern producer lifecycle. SCK pixel-format probe (`#[ignore]` on macOS) records `420v`/`420f`/`'444v'`/`'444f'`/`xf44` acceptance via real `start_capture` + frame-arrival check for the Unknown-fourcc cases. |
 
 ## Test categories
 
@@ -134,3 +134,22 @@ See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
   limit; we don't have a test that opens more than the cap to confirm
   the rejection happens at the connection layer. Trusted to quinn's
   own test suite.
+- **Capture-backend FFI surface (PipeWire pod negotiation, SCK
+  attachment reads).** We carve the testable kernel out of each
+  backend — `native_damage_for_frame_status` (`crates/tether-capture/
+  src/macos.rs`), `native_damage_from_region_count` and the
+  `video_damage_meta_pod_has_choice_range_size` pod-shape snapshot
+  (`crates/tether-capture/src/linux.rs`) — so policy and pod
+  *encoding* are unit-testable without hardware. What stays
+  unverified in-tree: whether a real PipeWire server actually
+  attaches the meta in response to our `SPA_PARAM_Meta` request
+  (compositor / xdg-desktop-portal version dependent — mutter, kwin,
+  wlroots, gnome-portal all parse the negotiation slightly
+  differently), whether real SCK fires `Idle`/`Stopped` at the rate
+  we expect, and whether `find_meta` returns the same pointer shape
+  across libpipewire minor versions. A manual session is the only
+  thing that confirms the *negotiation* succeeded; the bandwidth
+  drop on a quiescent desktop is the observable proof. Any new
+  capture-backend FFI surface (a new SPA meta type, a new SCK
+  attachment) should follow the same shape: pure helper +
+  pod-shape snapshot + manual verification note.

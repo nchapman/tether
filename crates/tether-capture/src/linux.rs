@@ -665,11 +665,18 @@ fn build_dmabuf_frame(
 /// means damage was reported. Producers that don't attach the meta
 /// at all yield `None`, which the consumer treats as "no opinion"
 /// and falls back to the hash classifier.
+///
+/// Split from [`native_damage_from_region_count`] so the policy
+/// (empty ⇒ idle) is unit-testable without faking PW's FFI region
+/// type.
 fn read_video_damage(buffer: &pw::buffer::Buffer<'_>) -> Option<NativeDamage> {
     let meta = buffer.find_meta::<pw::spa::buffer::meta::MetaVideoDamage>()?;
-    Some(NativeDamage {
-        idle: meta.iter().next().is_none(),
-    })
+    Some(native_damage_from_region_count(meta.iter().count()))
+}
+
+/// Policy: empty damage region list ⇒ frame is idle.
+fn native_damage_from_region_count(n: usize) -> NativeDamage {
+    NativeDamage { idle: n == 0 }
 }
 
 /// Build a `SPA_TYPE_OBJECT_ParamBuffers` pod announcing which buffer
@@ -760,4 +767,77 @@ fn build_video_damage_meta_pod() -> Result<Vec<u8>> {
     .0
     .into_inner();
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pw::spa::pod::{ChoiceValue, Value};
+
+    #[test]
+    fn region_count_zero_is_idle() {
+        assert!(native_damage_from_region_count(0).idle);
+    }
+
+    #[test]
+    fn region_count_nonzero_is_changed() {
+        for n in [1usize, 2, 7, 16, 1024] {
+            assert!(
+                !native_damage_from_region_count(n).idle,
+                "{n} regions should not be idle"
+            );
+        }
+    }
+
+    /// Snapshot the structure of the `SPA_PARAM_Meta` pod we send for
+    /// `SPA_META_VideoDamage`. Catches FFI-shape regressions of the
+    /// "fixed Int vs CHOICE_RANGE_Int" kind that no manual session
+    /// would surface — a stricter compositor would silently degrade
+    /// to hash-only with no log warning.
+    #[test]
+    fn video_damage_meta_pod_has_choice_range_size() {
+        let bytes = build_video_damage_meta_pod().expect("pod builds");
+        let (_, value) = pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(&bytes)
+            .expect("pod parses");
+        let Value::Object(obj) = value else {
+            panic!("expected Object, got {value:?}");
+        };
+        assert_eq!(obj.type_, pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw());
+        assert_eq!(obj.id, pw::spa::param::ParamType::Meta.as_raw());
+
+        let type_prop = obj
+            .properties
+            .iter()
+            .find(|p| p.key == libspa_sys::SPA_PARAM_META_type)
+            .expect("META_type property present");
+        match &type_prop.value {
+            Value::Id(pw::spa::utils::Id(raw)) => {
+                assert_eq!(*raw, libspa_sys::SPA_META_VideoDamage)
+            }
+            other => panic!("META_type should be Id, got {other:?}"),
+        }
+
+        let size_prop = obj
+            .properties
+            .iter()
+            .find(|p| p.key == libspa_sys::SPA_PARAM_META_size)
+            .expect("META_size property present");
+        let Value::Choice(ChoiceValue::Int(choice)) = &size_prop.value else {
+            panic!("META_size must be CHOICE_Int, got {:?}", size_prop.value);
+        };
+        let pw::spa::utils::ChoiceEnum::Range { default, min, max } = &choice.1 else {
+            panic!("META_size must use Range, got {:?}", choice.1);
+        };
+        let region_size = i32::try_from(std::mem::size_of::<libspa_sys::spa_meta_region>())
+            .expect("region size fits in i32");
+        assert_eq!(*min, region_size, "min must be one region");
+        assert!(
+            *max >= *default && *default >= *min,
+            "size range must be ordered: min={min} default={default} max={max}"
+        );
+        assert!(
+            *max % region_size == 0,
+            "max must be an integer multiple of region size (got {max} vs {region_size})"
+        );
+    }
 }

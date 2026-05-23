@@ -367,24 +367,30 @@ fn build_frame(
         t_capture_kernel,
         t_capture_userspace,
         release_guard: guard,
-        native_damage: sck_native_damage(sample),
+        native_damage: read_sck_damage(sample),
     }))
+}
+
+/// Read `SCStreamFrameInfo.status` from the sample buffer. Split out
+/// from the policy fn ([`native_damage_for_frame_status`]) so the
+/// policy is unit-testable on the pure `SCFrameStatus` enum without
+/// fabricating a `CMSampleBuffer`.
+fn read_sck_damage(sample: &CMSampleBuffer) -> Option<NativeDamage> {
+    let status = sample.frame_status()?;
+    Some(native_damage_for_frame_status(status))
 }
 
 /// Map `SCStreamFrameInfo.status` to our backend-agnostic
 /// [`NativeDamage`]. SCK delivers periodic re-emits with
 /// `Idle`/`Blank`/`Suspended` for liveness; `Complete` and `Started`
-/// are real frames. Missing attachment ⇒ `None`, falls back to hash.
-fn sck_native_damage(sample: &CMSampleBuffer) -> Option<NativeDamage> {
-    let status = sample.frame_status()?;
+/// are real frames. `Stopped` is a terminal signal — we treat it as
+/// idle (stream is ending; host shuts down shortly) and log a warn at
+/// the call site so a mid-session `Stopped` stays visible.
+fn native_damage_for_frame_status(status: SCFrameStatus) -> NativeDamage {
     if matches!(status, SCFrameStatus::Stopped) {
-        // Terminal signal — the stream is ending. Convert to idle so
-        // the host stops encoding, and log it so a mid-session
-        // Stopped (which would otherwise be invisible) shows up in
-        // the host log instead of looking like a routine idle.
         tracing::warn!("SCStreamFrameInfo.Stopped delivered; stream is ending");
     }
-    Some(NativeDamage {
+    NativeDamage {
         idle: matches!(
             status,
             SCFrameStatus::Idle
@@ -392,7 +398,33 @@ fn sck_native_damage(sample: &CMSampleBuffer) -> Option<NativeDamage> {
                 | SCFrameStatus::Suspended
                 | SCFrameStatus::Stopped
         ),
-    })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sck_status_complete_and_started_are_changed() {
+        assert!(!native_damage_for_frame_status(SCFrameStatus::Complete).idle);
+        assert!(!native_damage_for_frame_status(SCFrameStatus::Started).idle);
+    }
+
+    #[test]
+    fn sck_status_idle_blank_suspended_stopped_are_idle() {
+        for s in [
+            SCFrameStatus::Idle,
+            SCFrameStatus::Blank,
+            SCFrameStatus::Suspended,
+            SCFrameStatus::Stopped,
+        ] {
+            assert!(
+                native_damage_for_frame_status(s).idle,
+                "{s:?} should map to idle"
+            );
+        }
+    }
 }
 
 /// The ScreenCaptureKit pixel format the live stream should use to

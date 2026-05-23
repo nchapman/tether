@@ -281,16 +281,21 @@ impl VaapiEncoder {
         // hardware test session can validate before we bake it into
         // the default config; production stays unset until verified.
         //
-        // **Observed driver gap.** On Intel iHD (Meteor Lake), the
-        // `qmin` AVOption is consumed by the generic AVCodecContext
-        // handler (so it does NOT appear in `unused_avoptions()`),
-        // but the VAAPI VBR rate-control pathway silently ignores
-        // it — encoding the same content with qmin=1 vs qmin=45
-        // produces byte-identical bitstreams. The hardware test
-        // `vaapi_min_qp_floor_reduces_bitstream` SKIPs on the
-        // byte-count-ratio signal and will start asserting the floor
-        // the moment any driver + ffmpeg combo plumbs qmin through
-        // to the rate-control choice.
+        // **Observed driver gap.** On Intel iHD (Meteor Lake), `qmin`
+        // appears consumed by AVCodecContext (does not appear in
+        // `unused_avoptions()`) but produces no bitstream-level
+        // effect. The mechanism: FFmpeg's `vaapi_encode_init_rate_control`
+        // builds `VAEncMiscParameterRateControl` (incl. min_qp /
+        // max_qp fields) exactly once at `init()` time; on iHD the
+        // VBR rate-control pathway doesn't read those min/max fields
+        // from the misc buffer back into per-picture QP selection.
+        // Verified across two bitrate targets (10 Mbps and 500 kbps)
+        // — qmin=1 and qmin=45 produce byte-identical bitstreams at
+        // both, ruling out "bitrate headroom masked the difference."
+        // The hardware test `vaapi_min_qp_floor_reduces_bitstream`
+        // SKIPs on the byte-count-ratio signal and will start
+        // asserting the floor the moment any driver + ffmpeg combo
+        // plumbs qmin through to the rate-control choice.
         let default_min_qp_c = match kind {
             CodecKind::H264 => c"19",
             CodecKind::Hevc => c"23",
@@ -822,18 +827,22 @@ impl Encoder for VaapiEncoder {
 
     // `supports_changing_bitrate` and `set_bitrate_kbps` deliberately
     // not overridden. The trait defaults (`false` / Ok-no-op) are
-    // load-bearing: FFmpeg's `h264_vaapi` / `hevc_vaapi` wrappers do
-    // not propagate post-open `AVCodecContext.bit_rate` writes to the
-    // VAAPI rate-control machinery — verified on Intel iHD Meteor
-    // Lake via `vaapi_bitrate_retune_changes_bitstream_size`, which
-    // observes a 1.13× ratio when retuning between 1 Mbps and
-    // 20 Mbps (would be 5-10× if honoured). Effective retunes would
-    // require either an upstream FFmpeg fix that emits
-    // `VAEncMiscParameterTypeRateControl` on `bit_rate` change, or a
-    // direct libva call bypassing the FFmpeg wrapper. Until then the
-    // host (`apps/tether-host/src/main.rs:2064`) reads this predicate
-    // and disables ABR entirely on VAAPI hosts — which is correct,
-    // not a bug. A future driver/wrapper that plumbs live retune
+    // load-bearing: the rate-control misc buffer in
+    // `vaapi_encode_init_rate_control` is built once at `init()` and
+    // not re-emitted, so post-open `AVCodecContext.bit_rate` writes
+    // mutate the field but nothing downstream observes them.
+    // Verified on Intel iHD Meteor Lake via
+    // `vaapi_bitrate_retune_changes_bitstream_size`: retuning 1 Mbps
+    // → 20 Mbps produces a 1.13× ratio (would be 5–10× if honoured).
+    // Effective retunes would require either an upstream FFmpeg fix
+    // that wires the `reconfigure` callback for `bit_rate` and
+    // re-emits the misc buffer, or a direct libva call submitting
+    // a fresh `VAEncMiscParameterRateControl` buffer that races
+    // with the wrapper's own buffer management — neither path is
+    // worth the cost on a backend slated for replacement by NVENC
+    // (GH #16) on resilience-sensitive setups. Until then the host
+    // reads this predicate and disables ABR entirely on VAAPI
+    // hosts. A future driver/wrapper that plumbs live retune
     // through end-to-end can override this pair; the hw test
     // becomes the green-light gate.
 

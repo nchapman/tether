@@ -60,7 +60,7 @@ impl FakeDecoder {
 
     /// Convenience: a decoder that succeeds every submit and emits one
     /// trivial frame per submit. Useful as a baseline "happy path".
-    pub fn always_one_frame(width: u32, height: u32) -> Self {
+    pub fn one_frame_then_idle(width: u32, height: u32) -> Self {
         Self {
             queue: VecDeque::new(),
             pending_frames: VecDeque::new(),

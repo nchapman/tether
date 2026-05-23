@@ -75,7 +75,7 @@ fn at(base: MonoNanos, offset: Duration) -> MonoNanos {
 
 #[test]
 fn decode_success_pushes_frame_to_latest_and_no_idr() {
-    let dec = FakeDecoder::always_one_frame(8, 8);
+    let dec = FakeDecoder::one_frame_then_idle(8, 8);
     let (mut worker, idr_calls, _warnings, frames) = make_worker(dec);
     let completion = worker.process_job(job(), MonoNanos::now());
     assert!(!completion.decode_err);
@@ -118,7 +118,7 @@ fn soft_failure_via_warning_bump_fires_idr() {
     let frames = LatestFrame::new();
 
     let mut worker = Worker::new(
-        Box::new(FakeDecoder::always_one_frame(8, 8)),
+        Box::new(FakeDecoder::one_frame_then_idle(8, 8)),
         frames,
         Arc::new(move || {
             idr_cb.fetch_add(1, Ordering::Relaxed);

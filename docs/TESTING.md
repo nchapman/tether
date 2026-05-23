@@ -4,20 +4,52 @@ The foundation review (Q2 2026) made the test surface deliberately
 small and predictable. This document codifies what we have, what
 each layer covers, and how to extend it.
 
-## Unit tests by crate
+## Headline counts
+
+`cargo test --workspace` runs **294 default-on tests** (including
+integration tests; lib-only is 222). Hardware-gated `#[ignore]`
+tests total **~69** across `tether-codec`, `tether-render`,
+`tether-gpuconvert`, and `tether-scaler`. Numbers below are
+authoritative — `docs/ARCHITECTURE.md` and `CLAUDE.md` defer here.
+
+## Unit and integration tests by crate
 
 | Crate | Tests | Covers |
 | --- | --- | --- |
-| `tether-protocol` | 50 | Wire round-trips for every control variant (handshake, codec negotiation incl. 10-bit `VideoProfile` constants + forward-compat `u8` bit_depth probe, video packets + `stream_epoch>u16` widening, `VideoFrameMetaEnvelope`, cursor position + control-stream cursor shapes, multi-monitor `DisplayList`, stream lifecycle, `ClientStats`, `ControlMessage::Extension`, audio `Opus`, `PixelFormat` hello extension incl. `P010` / `P410`, `InputEvent::device_id`), fragmenter / reassembler invariants (out-of-order, stale eviction, wall-clock-timeout eviction, cross-epoch rejection, duplicate-fragment idempotency, continuation-before-First, `single_packet` reliable-IDR path), `HostFrameTimingBuilder` typestate, forward-compat probes for every wire-serialised tagged enum (`ClientHello`, `ServerHello`, `ControlMessage`, `VideoPacket`, `VideoFrameMetaEnvelope`), clock-sync edges (zero-RTT, negative-processing, near-i64::MAX offset). |
-| `tether-transport` | 6 integration tests in `tests/roundtrip.rs` + 3 in `test_support` + 1 in `handshake` (the last two under the `test-support` feature) | QUIC handshake, control + datagram round-trip, fingerprint pinning, oversized-datagram local reject, video-keyframe-stream round-trip, oversized-keyframe local reject. `test_support`: `DuplexControlChannel` handshake round-trip, post-handshake control message exchange, dropped-peer surfaces `StreamClosed`. `handshake`: `HostHandshake` → `ClientHelloReceived` typestate routes recv-then-send and returns the channel for post-handshake use. |
-| `tether-codec` | (count) | `validate_chosen_profile` accept/reject/empty-advertised paths; SW H264 round-trip (test-only); VT `codec_name` map; VAAPI encoder/decoder/dma-buf-import on Linux hardware (incl. `hevc_main444_dmabuf_roundtrip` for 8-bit XYUV and `hevc_main444_10bit_xv30_dmabuf_roundtrip` for 10-bit XV30 — the latter is the gate the probe-side `(Yuv444, 10)` rejection used to substitute for); per-codec × per-resolution benchmarks (`vaapi::bench`, 4 cells × 3 paths); VideoToolbox: encoder construct, H.264 BGRA round-trip, HEVC 10-bit / 4:4:4 probe matrix, `videotoolbox_round_trip_chroma_matrix` cross-checks the encode side against an independent encode→decode→IOSurface-fourcc check (catches silent downsample regressions), self-decodable-IDR mid-session recovery. Capability discovery and preference-list negotiation tests live in `tether-probe`. |
-| `tether-probe` | 10 default + 0 `#[ignore]` (today) | `PipelineStage` exhaustiveness, `ProfileSupport` helper accessors, preference order (5-entry list, 10-bit-first), `pick_supported_profile` (best mutual / fallback / disjoint / empty / forward-compat unknown bit_depth), `probe_client_does_not_mirror_encode_bit_into_decode_field` (the Mac 4:4:4 decode-without-encode invariant). |
-| `tether-input` | 9 | Modifier tracking, HID routing, cursor normalization. |
-| `tether-session` | 15 unit + 7 integration in `tests/loopback.rs` | Unit: `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate; `HostSession::accept` decode-profile-extension parsing (missing / oversize / malformed / well-formed / unknown bit_depth filter / no-match server-hello shape / chosen-profile echo); `ClientSession::connect` resolve_negotiated_profile (extension absent → 8-bit synth, present + decodes → authoritative, undecodable → error, unknown bit_depth → reject). Integration (via `tether-transport`'s `test-support` feature `DuplexControlChannel`): happy-path handshake with RTT/offset bounds, no-mutual-profile sends Goodbye after placeholder hello, host picks unadvertised profile → client `ProfileNotAdvertised`, host picks unknown bit_depth → client `UnknownBitDepth`, host filters unknown depths from advert keeping known ones, legacy host with no encode-profile extension synthesizes 8-bit profile from inline fields, dropped client during handshake → `Transport(_)`. |
-| `tether-render` | 23 default + 15 `#[ignore]` (Linux); + 4 `#[ignore]` (macOS) | Cursor letterbox clipping, aspect ratio; `LatestFrame` Send+Sync + drop-oldest displacement; transfer_kind dispatch table pin; `range_kind_for(bit_depth, layout)` dispatch table pin + algebraic check that 10-bit limited-range breakpoints land white at 1.0 and black at 0.0; `render_layout_for(chroma, bit_depth)` dispatch table pin (incl. Yuv420 10-bit → Biplanar16 which the import path relies on for UV dimensioning); the **end-to-end roundtrip harness** (`test_harness.rs` + `dmabuf_test.rs`) drives the production multi-pass renderer (`Gpu::new_headless`) through 14 hardware cells covering identity / host-scaler / client-upscale / surface-below-video / full-chain / repro-shape rows at H.264 4:2:0, HEVC Main, HEVC Main 4:4:4, HEVC Main 10, and HEVC Main 4:4:4 10-bit (10-bit cells SKIP on Intel iHD + Meteor Lake driver gap; the 4:4:4 10-bit cell may *additionally* error on drivers that emit packed XV30 from decode rather than biplanar 16-bit — see `gpu/import.rs:53`). Primary metric is **geometric residual on a coordinate-encoded fixture** (`Fixture::CoordEncoded`); SSIM and BT.709 Y-PSNR are the secondary catch-net. On failure the harness dumps readback/reference/diff/SSIM-heatmap PNGs + `metrics.txt` to `target/roundtrip-diagnostics/<case>/`. IOSurface zero-copy on macOS hardware (HEVC 4:2:0 8-bit + 10-bit via encode→decode→render; HEVC 4:4:4 8-bit + 10-bit via fixture-decode→render since VT lacks Main444 encode). |
-| `tether-gpuconvert` | 4 default + 18 `#[ignore]` lib + 7 `#[ignore]` integration (`tests/scaler_roundtrip.rs`) | `drm_fourcc_to_vk_format` table coverage incl. 10-bit biplanar plane fourccs (R16/GR32 → R16_UNORM/R16G16_UNORM), packed XV30 → A2B10G10R10_UNORM_PACK32, 8-bit family regression, unknown-fourcc rejection; BGRA→NV12 + DMA-BUF round-trip with real Vulkan adapter; `convert_solid_{white,red}_roundtrip_packed_xv30` round-trips the new XV30 bridge with hand-extracted 10-bit code values, catching channel-mapping (R=Y/G=U/B=V/A=X) and BT.709 10-bit math regressions; `storable_probe_returns_linear_for_xv30` mirrors the R16/GR32 storage-modifier probe for the packed 10-bit format; structural alignment-regression `convert_reports_64_aligned_y_stride_at_unaligned_width` (lib unit test in `src/nv12_dmabuf.rs`) asserts the iHD-VAAPI 64-byte luma row pitch fix at 2160×1440 without needing encoder/decoder/renderer in the loop. Integration tests `bgra_dmabuf_roundtrip_{1920×1200,2880×1920}` and `imported_bgra_then_scaler_2880×1920_to_2160×1440` are bisect entry points: split a failing roundtrip into (scaler isolation) ↔ (BGRA dma-buf import/export) ↔ (scaler-on-dma-buf) without running the full chain. |
-| `tether-scaler` | 18 default lib + 12 `#[ignore]` (hardware) + 6 `quality` integration | Mitchell-Netravali reference vs CPU implementation parity, fp16 linear-light path, mip prefilter, asymmetric scale; `matches_reference_coord_encoded_left_edge` (the harness-companion left-edge regression at 2880×1920 → 2160×1440 — bottom of the bisect stack for any future left-edge-corruption bug). |
-| `tether-capture` | 13 default (Linux) / 11 default + 1 `#[ignore]` (macOS) | `HashDamage::classify` policy incl. native-damage short-circuit (native idle wins over differing bytes; native changed defers to hash). `native_damage_for_frame_status` (macOS) maps all six `SCFrameStatus` variants. `native_damage_from_region_count` (Linux) maps the empty-list ⇒ idle policy. `video_damage_meta_pod_has_choice_range_size` deserializes the `SPA_PARAM_Meta` pod and asserts the `META_size` field is `CHOICE_RANGE_Int` (a fixed `Int` silently degrades to hash-only on stricter compositors — pure-shape regression catcher). Test-pattern producer lifecycle. SCK pixel-format probe (`#[ignore]` on macOS) records `420v`/`420f`/`'444v'`/`'444f'`/`xf44` acceptance via real `start_capture` + frame-arrival check for the Unknown-fourcc cases. |
+| `tether-protocol` | 71 lib + 2 integration | Wire round-trips for every control variant (handshake, codec negotiation incl. 10-bit `VideoProfile` constants + forward-compat `u8` bit_depth probe, video packets + `stream_epoch>u16` widening, `VideoFrameMetaEnvelope`, cursor position + control-stream cursor shapes, multi-monitor `DisplayList`, stream lifecycle, `ClientStats`, `ControlMessage::Extension`, audio `Opus`, `PixelFormat` hello extension incl. `P010` / `P410`, `InputEvent::device_id`), fragmenter / reassembler invariants (out-of-order, stale eviction, wall-clock-timeout eviction, cross-epoch rejection, duplicate-fragment idempotency, continuation-before-First, `single_packet` reliable-IDR path), `HostFrameTimingBuilder` typestate, forward-compat probes for every tagged enum, clock-sync edges, **receiver-side wire-validation** (`video::validation_tests`: oversized fragment_count / continuation index / parity_shards / total_body_len, out-of-range shard index, legitimate-accept, `fragments_lost` bump on reject; constants `MAX_FRAGMENTS_PER_FRAME = 1024`, `MAX_FRAME_BODY_BYTES = MAX_FRAGMENTS_PER_FRAME * CONTINUATION_PAYLOAD_BUDGET`), **Reed-Solomon FEC** around `VideoPacket::Parity` (fragment + parity emission + RS recovery under simulated loss; `FEC_SHARD_SIZE = 1100`, `FEC_MAX_PRIMARY_SHARDS = 212`). Integration: `tests/fragmenter_property.rs` — 2 proptest cases (256 iterations each) over fragmenter ↔ reassembler under random loss + reorder. |
+| `tether-transport` | 10 lib (test-support) + 6 integration (`tests/roundtrip.rs`) | QUIC handshake, control + datagram round-trip, fingerprint pinning, oversized-datagram local reject, video-keyframe-stream round-trip, oversized-keyframe local reject. `test_support` (feature-gated): `DuplexControlChannel` handshake round-trip, post-handshake control message exchange, dropped-peer surfaces `StreamClosed`; `HostHandshake` → `ClientHelloReceived` typestate routes recv-then-send. |
+| `tether-codec` | 19 lib + 14 `#[ignore]` | `validate_chosen_profile` accept/reject/empty paths; SW H264 round-trip (test-only); VT `codec_name` map. Hardware: VAAPI encoder/decoder/dma-buf import incl. `hevc_main444_dmabuf_roundtrip` (8-bit XYUV) and `hevc_main444_10bit_xv30_dmabuf_roundtrip` (10-bit XV30); per-codec × per-resolution `vaapi::bench` (4 cells × 3 paths); VideoToolbox encoder, H.264 BGRA round-trip, HEVC 10-bit / 4:4:4 probe matrix, `videotoolbox_round_trip_chroma_matrix` cross-check, self-decodable-IDR mid-session recovery. **New encoder-knob tests** (all use the SKIP-with-diagnostic pattern — see below): `vaapi_intra_refresh_round_trip`, `vaapi_min_qp_floor_reduces_bitstream`, `vaapi_bitrate_retune_changes_bitstream_size`. |
+| `tether-probe` | 10 | `PipelineStage` exhaustiveness, `ProfileSupport` helpers, preference order (5-entry, 10-bit-first), `pick_supported_profile` (best mutual / fallback / disjoint / empty / forward-compat unknown bit_depth), Mac 4:4:4 decode-without-encode invariant. |
+| `tether-input` | 15 | Modifier tracking, HID routing, cursor normalization, `clamp_relative_delta` (±1000 px per event) — 4 unit tests in `inject/enigo_backend.rs`. |
+| `tether-session` | 34 lib + 20 integration | Lib: `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate; `HostSession::accept` decode-profile-extension parsing (missing / oversize / malformed / well-formed / unknown bit_depth filter / no-match server-hello / chosen-profile echo); `ClientSession::connect` resolve_negotiated_profile (absent → 8-bit synth, present + decodes → authoritative, undecodable → error, unknown → reject); `paced_sender` pacing math + `Arc<AtomicU64>` retune (8 tests). Integration (via `tether-transport`'s `test-support` feature): `loopback.rs` (10) — full handshake, RTT/offset bounds, Goodbye on no-mutual-profile, `ProfileNotAdvertised`, `UnknownBitDepth`, host filters unknown depths, legacy host inline-field synthesis, dropped-peer Transport error; `decoder_thread_loopback.rs` (3) — `run_thread` + `DuplexVideoChannel` + `LatestFrame` smoke; `video_loopback.rs` (2); `video_loopback_with_loss.rs` (3) via `LossyChannel`; `epoch_bump_invalidates_inflight.rs` (1); `input_loopback.rs` (1). |
+| `tether-render` | 39 lib + 15 `#[ignore]` (Linux) + 4 `#[ignore]` (macOS) | Cursor letterbox/aspect; `LatestFrame` Send+Sync + drop-oldest; `transfer_kind` / `range_kind_for` / `render_layout_for` dispatch-table pins (incl. 10-bit limited-range breakpoint algebra and Yuv420 10-bit → Biplanar16); `PresentPolicy` / `FrameAgeTracker` / `EwmaNs` (10 tests on pure `decide_present` logic); **relative-mouse sub-pixel accumulator** (6 tests in `relative_mouse.rs`: whole-pixel passthrough, sub-pixel-held, long-run convergence, mixed-sign no-stall, i16 saturation, reset). Hardware: end-to-end roundtrip harness (`test_harness.rs` + `dmabuf_test.rs`) drives the production multi-pass renderer (`Gpu::new_headless`) through 14 cells covering identity / host-scaler / client-upscale / surface-below-video / full-chain / repro-shape across H.264 4:2:0, HEVC Main, HEVC Main 4:4:4, HEVC Main 10, HEVC Main 4:4:4 10-bit. Primary metric is geometric residual on `Fixture::CoordEncoded`; SSIM + BT.709 Y-PSNR are the secondary catch-net. macOS IOSurface zero-copy across HEVC Main / Main10 / Main 4:4:4 8 + 10-bit. |
+| `tether-gpuconvert` | 6 lib + 18 `#[ignore]` lib + 7 `#[ignore]` integration (`tests/scaler_roundtrip.rs`) | `drm_fourcc_to_vk_format` table coverage (8 + 10-bit biplanar + packed XV30 → A2B10G10R10_UNORM_PACK32 + unknown rejection); BGRA→NV12 + DMA-BUF round-trip; `convert_solid_{white,red}_roundtrip_packed_xv30` (10-bit channel-mapping + BT.709 math); `storable_probe_returns_linear_for_xv30`; structural alignment regression `convert_reports_64_aligned_y_stride_at_unaligned_width`. Integration: `bgra_dmabuf_roundtrip_{1920×1200,2880×1920}` + `imported_bgra_then_scaler_2880×1920_to_2160×1440` — bisect entry points splitting (scaler isolation) ↔ (BGRA dma-buf import/export) ↔ (scaler-on-dma-buf). |
+| `tether-scaler` | 8 lib + 6 integration (`tests/quality.rs`) + 15 `#[ignore]` integration (`tests/hardware.rs`) | Mitchell-Netravali reference vs CPU parity, fp16 linear-light, mip prefilter, asymmetric scale; `matches_reference_coord_encoded_left_edge` (2880×1920 → 2160×1440 left-edge regression — bottom of the bisect stack). |
+| `tether-capture` | 15 default / 18 with `test-support` | `HashDamage::classify` policy incl. native-damage short-circuit; `native_damage_for_frame_status` (macOS) maps all six `SCFrameStatus`; `native_damage_from_region_count` (Linux) empty-list ⇒ idle; `video_damage_meta_pod_has_choice_range_size` pod-shape snapshot. Test-pattern producer lifecycle + `set_target_fps_changes_cadence_mid_stream` + `set_target_fps_clamps_zero_to_one`. SCK pixel-format probe (`#[ignore]` on macOS). `test_support`: `ScriptedSource` for precise-timing scenarios. |
+| `tether-decode` | 0 lib + 14 integration (`tests/run_thread.rs`, requires `test-support`) | `run_thread` (extracted from `apps/tether-client/src/main.rs`) under fault injection: decode success → `LatestFrame`, hard-error → IDR callback, soft-error → IDR callback, rate-limiting, build failure, dropped sender, watchdog escalation, rebuild budget exhaustion. Exercised via `FakeDecoder` (`one_frame_then_idle`, scriptable submit/next_frame outcomes, `flush_count` field). |
+| `tether-vaapi` | 0 | Hand-rolled libva FFI bindings; tested transitively through `tether-codec/vaapi/tests.rs`. |
+
+## Test infrastructure (`test-support` features)
+
+Several crates expose loopback + fault-injection primitives behind a
+`test-support` cargo feature so downstream crates can compose them
+without pulling test-only types into production builds.
+
+- **`tether-transport::test_support`** — `DuplexControlChannel`
+  (tokio `duplex` backed `ControlChannel`), `DuplexVideoChannel`
+  (mpsc for datagrams + unbounded for keyframe uni-streams),
+  `DuplexInputChannel`, `LossyChannel<V: VideoChannel>` with
+  `LossyConfig { drop_probability, reorder_window, seed }` for
+  deterministic loss/reorder fuzzing.
+- **`tether-decode::test_support`** — `FakeDecoder` (constructor
+  `one_frame_then_idle`, scriptable submit/next_frame outcomes,
+  `flush_count`).
+- **`tether-capture::test_support`** — `ScriptedSource` for precise
+  per-frame timing scenarios.
+
+Consumers: `tether-session/tests/{loopback,decoder_thread_loopback,
+video_loopback,video_loopback_with_loss,epoch_bump_invalidates_inflight,
+input_loopback}.rs`, `tether-decode/tests/run_thread.rs`.
 
 ## Test categories
 
@@ -28,20 +60,12 @@ with an explanatory string:
   beyond what the workstation already has (file I/O, in-process QUIC
   loopback via tokio).
 - **`#[ignore = "requires …"]`** — needs real GPU, VAAPI, or
-  VideoToolbox. Run via `cargo test -- --ignored` on a host with the
-  right capabilities. The ignore message names the requirement
-  (`vainfo`, the Vulkan extension, `requires macOS + VideoToolbox`,
-  etc.) so the next person can see at a glance whether their box
-  should run them.
-
-Today there are **~58 ignored tests** (count varies by platform-cfg):
-`tether-codec` (10 — VAAPI + VideoToolbox correctness, plus the
-`bench` matrix cells), `tether-gpuconvert` (15 lib + 7 integration —
-includes the BGRA dma-buf import/export bisect helpers + the
-structural alignment-regression test), `tether-render` (14 — the
-roundtrip-harness matrix in `dmabuf_test.rs`), and `tether-scaler`
-(12 — Mitchell reference parity at production dims). They are real
-and load-bearing on hardware; they are not abandoned.
+  VideoToolbox. The ignore message names the requirement (`vainfo`,
+  the Vulkan extension, `requires macOS + VideoToolbox`, etc.).
+- **Proptest** — `tether-protocol/tests/fragmenter_property.rs` runs
+  256-iteration property cases over fragmenter ↔ reassembler under
+  random loss + reorder. New invariants on fragmenter shape go here,
+  not in lib unit tests.
 
 The benchmark cells (one per codec × resolution) live in
 `crates/tether-codec/src/vaapi/bench.rs`. Run with:
@@ -50,106 +74,97 @@ The benchmark cells (one per codec × resolution) live in
 cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1
 ```
 
-`--test-threads=1` is required: parallel cells interleave output and
-contend for the same VAAPI device, which makes the per-iteration
-timing meaningless. Results print as `p50 / p99 / max ms` with a
-budget headroom annotation for the 60 fps frame budget (16.67 ms).
-See `docs/ARCHITECTURE.md` for the current baseline on Intel Arc.
+`--test-threads=1` is required: parallel cells contend for the same
+VAAPI device.
+
+## SKIP-with-diagnostic pattern (hardware tests)
+
+When a hardware test asserts a *behaviour* whose backing driver
+support is patchy across vendors, the test SKIPs (prints a diagnostic
++ returns) on drivers where the feature is known-missing rather than
+hard-failing. SKIP requires a **verified-negative**: a diagnostic
+that confirms the feature was not honoured (e.g. ratio in a known
+no-op regime, or option present in `unused_avoptions()`). Without
+the verified-negative we hard-fail.
+
+Used today in:
+
+- `vaapi_intra_refresh_round_trip` — SKIPs when
+  `intra_refresh_period` lands in `unused_avoptions()` (Intel iHD);
+  otherwise asserts ≤ 1 IDR + ≥ 56/60 decoded.
+- `vaapi_min_qp_floor_reduces_bitstream` — encodes noisy content
+  at qmin=1 vs qmin=45; ratio < 0.70 passes, ≥ 0.95 SKIPs (Intel
+  iHD reality), 0.70..0.95 fails-with-diagnostic.
+- `vaapi_bitrate_retune_changes_bitstream_size` — live retune
+  1 Mbps → 20 Mbps; SKIPs at ratio ≤ 1.5 (Intel iHD reality).
+
+When to use SKIP: the property is real *behaviour* (not API shape)
+and known to be silently no-op on a specific driver. When to
+hard-fail: API-shape contract (`set_bitrate_kbps` returns Ok) or
+behaviour we expect to work everywhere.
 
 ## Conventions for new tests
 
-- **Wire round-trip first.** Any new protocol message gets a unit test
-  in `tether-protocol/src/lib.rs#mod tests` that encodes + decodes and
-  asserts every field round-trips.
+- **Wire round-trip first.** Any new protocol message gets a unit
+  test in `tether-protocol/src/lib.rs#mod tests` that encodes +
+  decodes and asserts every field round-trips.
 - **Forward-compat probes for tagged enums.** When you add a new
-  `*Hello` body field or a new `*Hello` variant, add a test that
-  hand-crafts a "future" wire byte sequence and asserts older code
-  errors cleanly. See `unknown_client_hello_variant_fails_decode`
-  for the template.
-- **Stamp every timing.** New stages in the host pipeline that touch
-  `HostFrameTimingBuilder` should add a `should_panic` test for the
+  `*Hello` body field or variant, hand-craft a "future" wire byte
+  sequence and assert older code errors cleanly. See
+  `unknown_client_hello_variant_fails_decode`.
+- **Stamp every timing.** New stages in the host pipeline that
+  touch `HostFrameTimingBuilder` add a `should_panic` test for the
   skip case — the panic is the contract.
-- **Hardware tests are `#[ignore]`, not deleted.** If a test needs a
-  GPU, gate it on `#[ignore = "requires …"]` with a specific message,
-  not silently skipped via runtime checks. Make the requirement
-  obvious.
+- **Hardware tests are `#[ignore]`, not deleted.** Gate on
+  `#[ignore = "requires …"]` with a specific message.
+- **No scaffolding for hypothetical futures.** Tests that exist
+  only to assert "this hook exists" without an in-tree caller get
+  deleted, not kept.
 
 ## CI shape
 
 - Default: `cargo build --workspace --all-targets && cargo test --workspace`.
-  `cargo build --workspace --all-targets` is warning-free today —
-  treat any new warning as a gate.
-- Hardware runner (separate job, when one exists): same plus
+  `cargo build --workspace --all-targets` is warning-free — treat any
+  new warning as a gate.
+- Hardware runner (when one exists): same plus
   `cargo test --workspace -- --ignored`.
-- `cargo clippy --workspace --all-targets` is currently advisory
-  (pre-existing cast warnings in `tether-codec` and
-  `tether-scaler/src/reference.rs`; `#[allow]`s pending). New
-  clippy warnings in files under active edit should be addressed
+- `cargo clippy --workspace --all-targets` is advisory (pre-existing
+  cast warnings in `tether-codec` and `tether-scaler/src/reference.rs`).
+  New clippy warnings in files under active edit should be addressed
   in the same change.
 
 ## What's deliberately untested today
 
 - **End-to-end host↔client glass-to-glass.** Validated by hand on a
-  Linux↔Linux LAN and Mac→Linux LAN; no automation. The handshake
-  layer is now loopback-tested in-process via
-  `tether-transport::test_support::DuplexControlChannel` —
-  `crates/tether-session/tests/loopback.rs` runs `HostSession::accept`
-  and `ClientSession::connect` against each other through a
-  `tokio::io::duplex` pair, covering the clock-sync RTT/offset math,
-  Goodbye-on-no-match, unknown bit-depth refusal, and the host-
-  lenient / client-strict bit-depth asymmetry. The video / input /
-  datagram layers don't yet have duplex fakes — `InputChannel` and
-  `VideoChannel` traits are defined in `tether-transport` but
-  duplex impls land when the first test that needs one does. The
-  remaining glass-to-glass gap is everything past `StreamReady`:
-  fragmenter under loss, IDR signalling latency, decoder restart
-  recovery, render-thread drop-oldest under backpressure.
-- ~~**The actual rendered pixels.**~~ As of the
-  `test_harness.rs` + `dmabuf_test.rs` work, the production
-  multi-pass renderer (`Gpu::new_headless`) is exercised against a
-  coordinate-encoded fixture across a 13-cell `(capture × encode ×
-  surface)` matrix and compared to a CPU Mitchell reference with
-  three metrics (geometric residual, SSIM, BT.709 Y-PSNR). On-
-  failure diagnostic dumps land in `target/roundtrip-diagnostics/`.
-  Gap that remains: the **macOS** harness sibling (`iosurface_test.rs`
-  uses fixed dims and asserts the IOSurface→Metal→wgpu import, but
-  doesn't drive the full multi-pass renderer across a (capture ×
-  encode × surface) matrix yet).
-- **`tether-vaapi` directly.** The hand-rolled libva FFI bindings
-  are tested transitively through `tether-codec/vaapi/tests.rs`.
-  Direct tests would just exercise libva itself.
-- **`VaapiDecoder` SW-fallback rejection.** The hard-error path that
-  fires when the driver hands back a non-VAAPI AVFrame mid-stream
-  isn't unit-tested — reaching it requires either real hardware that
-  bails, or a substantial refactor to extract a test seam. The check
-  is short enough to verify by inspection and the failure mode is
-  observably loud (returns `Err(UnsupportedInputFormat)`, auto-IDR
-  fires from the client).
-- **Encoder parameter-set repetition.** The `drain_encoder` prepend of
-  extradata onto every keyframe is exercised by the hardware VAAPI
-  encoder tests; there's no fake-AVCodecContext path that would let
-  us unit-test the prepend logic in isolation. Verified by inspection
-  + hardware tests.
+  Linux↔Linux LAN and Mac→Linux LAN; no automation. The handshake,
+  video, input, decoder-thread, and epoch-bump layers are now
+  loopback-tested in-process (see `tether-session` integration tests
+  above). What still requires a manual session: real QUIC across a
+  real link, real capture backend producing real frames, real
+  display present, glass-to-glass latency.
+- **`tether-vaapi` directly.** Tested transitively through
+  `tether-codec/vaapi/tests.rs`. Direct tests would exercise libva.
+- **`VaapiDecoder` SW-fallback rejection.** The hard-error path
+  when the driver hands back a non-VAAPI AVFrame mid-stream isn't
+  unit-tested — reaching it requires real hardware that bails or a
+  substantial test-seam refactor. Verified by inspection; failure
+  mode is observably loud (`Err(UnsupportedInputFormat)` + auto-IDR).
+- **Encoder parameter-set repetition.** The `drain_encoder` prepend
+  of extradata onto every keyframe is exercised by hardware VAAPI
+  encoder tests; no fake-AVCodecContext seam exists to unit-test
+  the prepend in isolation.
 - **`max_concurrent_uni_streams` enforcement.** Quinn enforces the
-  limit; we don't have a test that opens more than the cap to confirm
-  the rejection happens at the connection layer. Trusted to quinn's
-  own test suite.
+  limit; trusted to quinn's own test suite.
 - **Capture-backend FFI surface (PipeWire pod negotiation, SCK
-  attachment reads).** We carve the testable kernel out of each
-  backend — `native_damage_for_frame_status` (`crates/tether-capture/
-  src/macos.rs`), `native_damage_from_region_count` and the
-  `video_damage_meta_pod_has_choice_range_size` pod-shape snapshot
-  (`crates/tether-capture/src/linux.rs`) — so policy and pod
+  attachment reads).** We carve testable kernels out of each backend
+  (`native_damage_for_frame_status`, `native_damage_from_region_count`,
+  `video_damage_meta_pod_has_choice_range_size`) so policy and pod
   *encoding* are unit-testable without hardware. What stays
-  unverified in-tree: whether a real PipeWire server actually
-  attaches the meta in response to our `SPA_PARAM_Meta` request
-  (compositor / xdg-desktop-portal version dependent — mutter, kwin,
-  wlroots, gnome-portal all parse the negotiation slightly
-  differently), whether real SCK fires `Idle`/`Stopped` at the rate
-  we expect, and whether `find_meta` returns the same pointer shape
-  across libpipewire minor versions. A manual session is the only
-  thing that confirms the *negotiation* succeeded; the bandwidth
-  drop on a quiescent desktop is the observable proof. Any new
-  capture-backend FFI surface (a new SPA meta type, a new SCK
-  attachment) should follow the same shape: pure helper +
-  pod-shape snapshot + manual verification note.
+  unverified in-tree: whether a real PipeWire server attaches the
+  meta in response to our `SPA_PARAM_Meta` request (compositor /
+  xdg-desktop-portal version dependent), whether real SCK fires
+  `Idle`/`Stopped` at the rate we expect, and whether `find_meta`
+  returns the same pointer shape across libpipewire minor versions.
+  Any new capture-backend FFI surface (a new SPA meta type, a new
+  SCK attachment) follows the same shape: pure helper + pod-shape
+  snapshot + manual verification note.

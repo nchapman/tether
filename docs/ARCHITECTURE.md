@@ -83,6 +83,10 @@ to VideoToolbox — no gpuconvert step); the rest of the pipeline from
 │         │                                                           │
 │         ▼                                                           │
 │   send loop pre-encode gates (apps/tether-host)                     │
+│     • native damage short-circuit: CapturedFrame::native_damage     │
+│       (PipeWire SPA_META_VideoDamage on Linux; SCStreamFrameInfo    │
+│       .status on macOS) skips encode on NativeDamage { idle: true } │
+│       regardless of pixel hash                                      │
 │     • damage classifier (HashDamage, CPU frames only — GPU frames   │
 │       report Unknown and pass through; skip predicate is gated      │
 │       additionally by IdrSignal::peek so forced IDRs always go)     │
@@ -95,8 +99,11 @@ to VideoToolbox — no gpuconvert step); the rest of the pipeline from
 │       macOS GPU paths keep encode == capture pending phase-2 SCK    │
 │       plumbing (see "Mac host scaler" below).                       │
 │     • ABR tick: drains the latest ClientStats + quinn path stats    │
-│       into AbrController; calls set_bitrate_kbps when the           │
-│       controller crosses a hysteresis boundary.                     │
+│       into tether_session::abr::AbrController; calls                │
+│       set_bitrate_kbps when the controller crosses a hysteresis     │
+│       boundary. Asymmetric: fast climb after a collapse, slow on    │
+│       steady state. Bitrate-only (no runtime FPS gear — no          │
+│       capture backend honours runtime FPS retunes today).           │
 │         │                                                           │
 │         ▼                                                           │
 │   tether-gpuconvert::Nv12DmaBuf                                     │
@@ -124,13 +131,25 @@ to VideoToolbox — no gpuconvert step); the rest of the pipeline from
 │         │                                                           │
 │         ▼                                                           │
 │   tether-protocol::video::FrameFragmenter                           │
-│     • P-frame:  fragment() → MTU-sized VideoPackets, datagram path  │
+│     • P-frame:  fragment() → MTU-sized VideoPackets + Reed-Solomon  │
+│                 parity (20% default; GF(2^8) caps primaries at      │
+│                 FEC_MAX_PRIMARY_SHARDS=212 at 20%, oversize frames  │
+│                 fall back to no-FEC); shard size = FEC_SHARD_SIZE   │
+│                 = FIRST_PAYLOAD_BUDGET (1100 B)                     │
 │     • Keyframe: single_packet() → one fragment_count=1 packet,      │
 │                 reliable per-IDR uni stream path                    │
 │         │       attach HostFrameTiming + stream_epoch + frame_seq   │
 │         ▼                                                           │
+│   tether-session::PacedSender                                       │
+│     • begin_frame(now) + per-packet wait_for_slot(wire_size) spread │
+│       fragments across the frame interval so a burst doesn't pin    │
+│       the network queue and induce correlated loss. Bitrate is an   │
+│       Arc<AtomicU64> shared with the ABR controller so retunes      │
+│       are live without rebuilding the pacer.                        │
+│         │                                                           │
+│         ▼                                                           │
 │   tether-transport::Server                                          │
-│     • P-frames → QUIC datagrams (unreliable, low latency)           │
+│     • P-frames + Parity → QUIC datagrams (unreliable, low latency)  │
 │     • IDRs → fresh QUIC uni stream per IDR (reliable, ~1 RTT        │
 │       deterministic recovery on loss vs one GOP stochastic)         │
 │                                                                     │
@@ -148,22 +167,33 @@ to VideoToolbox — no gpuconvert step); the rest of the pipeline from
 │         │                                                           │
 │         ▼                                                           │
 │   FrameReassembler                                                  │
+│     • validate_packet_sizing first: rejects fragment_count >        │
+│       MAX_FRAGMENTS_PER_FRAME (1024) or total_body_len >            │
+│       MAX_FRAME_BODY_BYTES before any allocation                    │
 │     • drops cross-epoch fragments                                   │
+│     • Reed-Solomon recovery from Parity packets when primaries      │
+│       arrive incomplete                                             │
 │     • wall-clock-evicts pending frames older than max_pending_age   │
 │       (500ms default) on every fragment                             │
 │         │   complete encoded frame                                  │
 │         ▼  (bounded crossbeam channel, capacity 8)                  │
-│   tether-decode std::thread (owns the Decoder)                      │
+│   tether-decode::run::run_thread (owns the Decoder)                 │
 │     • VAAPI submit + drain                                          │
-│     • on decode error / libavcodec warn, fire rate-limited          │
-│       (500ms) ForceIdr via stashed tokio::runtime::Handle           │
+│     • classified error recovery: Flush (cheap) → Rebuild            │
+│       (REBUILD_BUDGET=10) → Idr (request from host); rate-limited   │
+│       at IDR_RATE_LIMIT (500ms) so a decode-error storm can't pin   │
+│       the encoder. NO_OUTPUT_WATCHDOG=1500ms triggers Idr on        │
+│       silent decoder stalls.                                        │
 │     • vaSyncSurface + vaExportSurfaceHandle → DRM_PRIME             │
 │         │   Frame::Gpu(GpuFrame { DmaBuf { fd, stride, modifier } })│
 │         ▼  (LatestFrame single-slot drop-oldest)                    │
 │   tether-render::gpu                                                │
 │     • imports VAAPI dma-buf as two wgpu textures (Y + UV planes)    │
 │     • fragment shader does NV12→RGB matrix at present time          │
-│     • wgpu present to the winit window                              │
+│     • FrameAgeTracker / decide_present: skip a frame past its       │
+│       deadline (late-streak hysteresis + post-skip cooldown);       │
+│       PresentPolicy::{LowLatency, Smooth} picks the wgpu present    │
+│       mode. wgpu present to the winit window.                       │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -176,9 +206,13 @@ is ~20-25 ms including the ~10 ms present scheduler wait.
 
 **Threading model on the client.** Three concurrent owners on the
 critical path: the recv tokio task (QUIC poll + reassemble + hand off
-to decoder), a dedicated `std::thread` named `tether-decode` (owns
-the VAAPI decoder + auto-IDR rate-limit), and winit's main thread
-running the wgpu render loop. Communication is via crossbeam channels
+to decoder), a dedicated `std::thread` named `tether-decode` running
+`tether_decode::run::run_thread` (owns the VAAPI decoder, classified
+error recovery, and the auto-IDR rate-limit; the host-recovery seam
+is an injected `request_idr: Arc<dyn Fn() + Send + Sync>` callback
+plus a `warnings: Arc<dyn Fn() -> u64>` reader so the run-thread is
+backend- and transport-agnostic and loopback-testable), and winit's
+main thread running the wgpu render loop. Communication is via crossbeam channels
 (recv→decode is bounded(8) so decoder backpressure shows up as
 `decode_queue_drops` rather than starving the recv loop;
 decode→stats is unbounded, drained non-blocking once per recv
@@ -290,6 +324,15 @@ are cfg-gated internally. The host's dispatch doesn't need a per-
 platform `#[cfg]`. The Windows D3D11 variant slots in the same way
 when that backend arrives.
 
+**Encoder-backend dispatch** lives in
+`tether_codec::probe::build_encoder`: a `#[cfg(target_os = "linux")]`
+arm constructs `VaapiEncoder`, a `#[cfg(target_os = "macos")]` arm
+constructs `VideoToolboxEncoder`, both return `Box<dyn Encoder>` so
+the host send loop is backend-agnostic. A second Linux backend (the
+tracked NVENC follow-up) lands as an inner `match` inside the Linux
+arm that prefers NVENC when the probe accepts it and falls through to
+VAAPI otherwise — no signature change at the call site.
+
 **Decoder side** uses the same shape, mirrored: `Decoder::next_frame ->
 Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
 `GpuFrameSource` enum with the same cfg gating. The decoder hands the
@@ -364,7 +407,14 @@ documented in `docs/INVESTIGATION_lan_freeze.md`:
 - **DoS-relevant transport limits.** `MAX_VIDEO_STREAM_MESSAGE = 2 MiB`
   caps per-keyframe-stream allocation; `max_concurrent_uni_streams = 4`
   prevents a peer from opening thousands of streams and pinning
-  receive-side buffers.
+  receive-side buffers. On the datagram path,
+  `validate_packet_sizing` is the *first* call in
+  `FrameReassembler::handle`: any packet declaring
+  `fragment_count > MAX_FRAGMENTS_PER_FRAME` (1024) or implying a
+  body larger than `MAX_FRAME_BODY_BYTES` is dropped before the
+  reassembler allocates anything keyed on that frame. The host's
+  control recv loop applies the same defensive shape on the other
+  direction (250 ms IDR-trigger floor — see invariant 3).
 
 ## Protocol shape
 
@@ -434,7 +484,17 @@ concrete `Connection` impls all four. `HostSession::accept` and
 handshake is loopback-testable through
 `tether_transport::test_support::DuplexControlChannel` (a
 `tokio::io::duplex`-backed impl gated behind the `test-support`
-feature, used by `crates/tether-session/tests/loopback.rs`).
+feature, used by `crates/tether-session/tests/loopback.rs`). The
+same feature ships `DuplexVideoChannel` and `DuplexInputChannel`
+fakes (so a session test can drive the full
+fragmenter→datagram→reassembler→decoder path without QUIC), a
+`LossyChannel` wrapper that drops a configurable percentage of
+packets (used to exercise the Reed-Solomon recovery path under
+random loss, alongside the proptest at
+`crates/tether-protocol/tests/fragmenter_property.rs`), and
+`tether_decode::test_support::FakeDecoder` so the decode run-thread
+can be driven with synthetic output without VAAPI/VideoToolbox in
+the loop.
 
 The handshake is split across two `ControlChannel` methods —
 `recv_client_hello` returning `(ClientHello, t1_server_recv)`, then
@@ -562,13 +622,21 @@ Four non-negotiable invariants tracked end-to-end:
    defragmenter discards any pre-epoch fragments still in flight,
    preventing fusion of a partial old frame with a new one.
 3. **On-demand IDR.** Client can request a keyframe at any time via
-   `ControlMessage::ForceIdr`. The host swap-and-zeros an `AtomicBool`
-   so multiple requests between encode calls coalesce to one. GOP is
-   long (~240 frames) and IDRs are driven by request, not cadence —
-   the GOP is the safety net, not the primary recovery mechanism.
-   The client's decode thread also rate-limits ForceIdr emission to
-   one per 500 ms so a decode-error storm can't generate a keyframe
-   storm on the host.
+   `ControlMessage::ForceIdr` or `ControlMessage::RequestRecovery
+   { last_known_good_frame_id }`. The host swap-and-zeros an
+   `AtomicBool` so multiple requests between encode calls coalesce
+   to one; the control recv loop additionally enforces a 250 ms
+   floor between any IDR-triggering messages so a client flood
+   can't pin the encoder in perpetual-keyframe mode. GOP is long
+   (~240 frames); IDRs are driven by request, not cadence — the GOP
+   is the safety net, not the primary recovery mechanism. The
+   client's decode run-thread also rate-limits IDR emission to one
+   per `IDR_RATE_LIMIT` (500 ms). Phase-1 `RequestRecovery` collapses
+   to IDR on the host side — an LTR-aware recovery path that uses
+   `last_known_good_frame_id` to pick a reference instead of
+   sending a fresh keyframe is parked until NVENC lands; FFmpeg's
+   `h264_vaapi` / `hevc_vaapi` wrappers expose no LTR plumbing
+   (see CODEC_CAPABILITIES.md).
 4. **Self-decodable IDRs.** Every keyframe carries its own codec
    parameter sets (SPS/PPS for H.264, VPS+SPS+PPS for HEVC).
    Achieved by setting `AV_CODEC_FLAG_GLOBAL_HEADER` on the VAAPI
@@ -593,6 +661,31 @@ Host side, Linux:
 
 Client side: native `winit` event loop captures keyboard/mouse, encodes
 to a transport-agnostic HID-style `InputEvent`, sends to host.
+
+**Relative mouse mode** is wired end-to-end for FPS / 3D apps that
+need pointer-lock semantics rather than absolute coordinates.
+`ControlMessage::SetCursorMode { mode: CursorMode::{Absolute,
+Relative} }` switches the host's dispatch; client-side, winit's
+`DeviceEvent::MouseMotion` feeds
+`tether-render::relative_mouse::SubPixelAccum` (a DDA-style residue
+accumulator that folds f64 sub-pixel deltas into `i16` emissions —
+sub-pixel motion accumulates across events instead of being
+rounded away). `InputEventKind::RelativeMouseMove { dx, dy,
+modifiers }` rides the input stream. Ctrl+Alt+G toggles the mode
+on the client; cursor grab uses winit `CursorGrabMode::Locked` and
+falls back to `Confined`. Host-side, the enigo backend clamps each
+delta to ±1000 px before dispatching `Coordinate::Rel` so a
+malformed or hostile event can't teleport the cursor.
+
+**`CaptureHandle` seam** (`tether-capture/src/lib.rs`). Every
+backend's `start()` returns `CaptureHandle { rx:
+Receiver<CapturedFrame>, target_fps: Arc<AtomicU32> }`. The
+test-pattern source reads the atomic each producer iteration; the
+Linux PipeWire and macOS SCK backends accept the atomic for API
+symmetry but do not yet renegotiate the underlying stream when it
+changes (per-backend follow-up — SCK needs an
+`SCStreamConfiguration.minimumFrameInterval` reapply, PipeWire
+needs a re-`set_param`).
 
 ---
 
@@ -663,11 +756,12 @@ Listed to set expectations; each is a real follow-up, not a "never":
   the NVENC path; we follow suit. Worth adding if we ever see a
   "client went silent without observing decode failure" stall mode
   (display sleep, decoder lockup) — cheap insurance, ~20 LOC.
-- **FEC on keyframes.** Reliable per-IDR streams give us deterministic
-  1-RTT recovery with no bandwidth overhead in the no-loss case.
-  Sunshine/Apollo/Moonlight use FEC because RTP-over-UDP has no
-  reliable side-channel; we have QUIC streams and don't need to
-  reinvent FEC.
+- **FEC on keyframes specifically.** P-frame datagrams now carry
+  Reed-Solomon parity (see hot path), but IDR keyframes still ride
+  reliable per-IDR QUIC uni streams for deterministic 1-RTT recovery
+  — no FEC overhead on the keyframe path. Sunshine/Apollo/Moonlight
+  use FEC on keyframes because RTP-over-UDP has no reliable side-
+  channel; we have QUIC streams and don't.
 - **Reference frame invalidation (RFI).** Cheaper than a full IDR for
   recovering from limited reference loss, but adds wire complexity
   and the benefit at our resolutions is marginal. Skip.

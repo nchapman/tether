@@ -346,6 +346,51 @@ intersection of:
   used in reverse. The renderer-side import path assumes XYUV
   for 4:4:4 on Linux because that's what comes out.
 
+### Verified-negative VAAPI rate-control knobs (Intel iHD)
+
+Three rate-control knobs that look like they should be live-tunable
+through FFmpeg's `vaapi_encode_*` wrappers are verified-negative on
+Intel iHD (Meteor Lake) with FFmpeg n8.1.1. All three share a
+mechanism: FFmpeg's `vaapi_encode_init_rate_control` builds the
+`VAEncMiscParameterRateControl` misc buffer **once** at encoder
+`init()` from `AVCodecContext.bit_rate` / `qmin` / `qmax`; the
+per-frame issue path doesn't re-read those fields, and there's no
+`AVOption` or `AVFrame` side-data plumbing that would let a runtime
+change reach the driver. The `VaapiEncoder::unused_avoptions()`
+accessor was added so hardware tests can detect when an AVOption
+fell into the leftover dict (i.e. the driver / wrapper didn't
+consume it).
+
+| Knob | Hardware test | Outcome on Intel iHD |
+| ---- | ------------- | -------------------- |
+| `intra_refresh` (CIR / pseudo-IDR-free recovery) | `vaapi_intra_refresh_round_trip` | SKIPs with diagnostic eprintln; AVOption falls into the unused dict, output is indistinguishable from non-CIR |
+| `qmin` floor (per-codec H264=19, HEVC=23, AV1=32 scaffolded in `vaapi/encoder.rs`, mirroring Sunshine) | `vaapi_min_qp_floor_reduces_bitstream` | SKIPs; floor change doesn't shrink bitstream |
+| Live `bit_rate` retune (mid-session ABR) | `vaapi_bitrate_retune_changes_bitstream_size` | SKIPs; bitstream size unchanged before/after retune |
+
+Consequence for the runtime: `VaapiEncoder` deliberately leaves
+`supports_changing_bitrate` at the trait default `false`. The
+host's ABR controller (`tether_session::abr::AbrController`) is
+disabled entirely on VAAPI hosts as a result — this is correct
+behaviour, not a bug. ABR will re-enable on Linux when a backend
+that actually honours live retune lands (NVENC — issue #16). The
+per-codec min-QP scaffolding stays in the encoder so it can be
+hooked up the moment a backend does plumb it; today it's
+documentation-grade only on VAAPI.
+
+LTR (long-term reference frames; protocol-side
+`ControlMessage::RequestRecovery` carries the wire payload today)
+is parked on the same upstream gap: FFmpeg n8.1.1 has zero LTR
+plumbing in `h264_vaapi` / `hevc_vaapi` (no AVOption, no AVFrame
+side-data field, no AVCodecContext field). Sunshine's VAAPI
+encoder falls back to IDR for `invalidate_ref_frames`; RustDesk
+hardcodes `support_changing_quality = false` on VAAPI for the same
+reason. Tracked as issue #11 (LTR), with the "live bitrate retune
+upstream-blocked" finding closing the related #15. NVENC (issue
+#16) is the path that may unlock both — caveat that runtime LTR
+mark / use may require direct NVENC SDK calls rather than just
+AVOption + AVFrame side-data, to be verified against the installed
+FFmpeg version when that backend lands.
+
 ### What's probed
 
 The probe at `tether-codec/src/vaapi/probe.rs` constructs an

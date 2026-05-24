@@ -71,7 +71,7 @@ impl Injector for NoopInjector {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod enigo_backend;
 
 #[cfg(target_os = "linux")]
@@ -83,6 +83,11 @@ pub use linux::LibeiInjector;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacOsInjector;
+
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::WindowsInjector;
 
 /// Pick the best available backend for the current target. On Linux
 /// [`LibeiInjector`] drives libei via the Remote Desktop portal; on
@@ -123,7 +128,22 @@ pub async fn default_injector() -> Box<dyn Injector> {
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        match WindowsInjector::connect().await {
+            Ok(inj) => {
+                return Box::new(inj);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Windows injector unavailable; falling back to noop. \
+                     Input events will be logged but not applied."
+                );
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     tracing::warn!(
         "no input injection backend compiled for this target; using noop"
     );

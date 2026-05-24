@@ -63,5 +63,15 @@ tether-gpuconvert = { workspace = true }
 wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["vulkan"] }
 pollster = "0.4"
 
+# Windows D3D11 Video Processor for the BGRA→NV12 blit in the encoder's
+# encode_gpu path. Only the Video* interfaces are needed — the base
+# device/texture types come through as raw pointers from tether-capture.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
 [lints]
 workspace = true

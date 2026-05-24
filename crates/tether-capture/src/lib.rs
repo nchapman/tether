@@ -140,6 +140,9 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod cursor_macos;
 
+#[cfg(target_os = "windows")]
+pub mod windows;
+
 use tether_protocol::MonoNanos;
 
 /// Re-export of [`tether_protocol::GpuResourceGuard`]. Producers (the
@@ -235,6 +238,13 @@ pub enum GpuCapturedSource {
     /// non-owning view, valid until the guard is dropped.
     #[cfg(target_os = "macos")]
     IOSurface(CapturedIOSurface),
+    /// Windows D3D11 texture from DXGI Desktop Duplication. The
+    /// texture is an owned pool copy (the duplication surface is
+    /// released immediately after `CopyResource`). Carries a
+    /// reference to the shared device so downstream consumers can
+    /// operate without cross-device copies.
+    #[cfg(target_os = "windows")]
+    D3D11Texture(windows::CapturedD3D11Texture),
 }
 
 /// Linux DMA-BUF descriptor for a captured frame. Mirrors what
@@ -325,6 +335,12 @@ pub enum CaptureError {
     /// Carries the framework error's display form.
     #[error("ScreenCaptureKit: {0}")]
     Sck(String),
+    /// DXGI Desktop Duplication (Windows) error — typically
+    /// `DuplicateOutput` failure, access lost (driver reset / mode
+    /// change), or D3D11 device creation failure.
+    #[cfg(target_os = "windows")]
+    #[error("DXGI: {0}")]
+    Dxgi(String),
 }
 
 pub type Result<T> = std::result::Result<T, CaptureError>;

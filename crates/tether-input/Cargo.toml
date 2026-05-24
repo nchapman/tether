@@ -39,5 +39,11 @@ libc = "0.2"
 enigo = { version = "0.6", default-features = false }
 tokio = { workspace = true }
 
+# Windows uses enigo's SendInput backend (compiled by default on
+# Windows targets, no feature flag needed).
+[target.'cfg(target_os = "windows")'.dependencies]
+enigo = { version = "0.6", default-features = false }
+tokio = { workspace = true }
+
 [lints]
 workspace = true

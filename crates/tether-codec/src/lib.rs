@@ -12,9 +12,9 @@ pub mod av_log;
 pub mod h264;
 pub mod probe;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod bitstream_sps;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod encoder_common;
 
 #[cfg(target_os = "linux")]
@@ -26,7 +26,12 @@ pub mod videotoolbox;
 #[cfg(target_os = "macos")]
 pub mod macos_interop;
 
+#[cfg(target_os = "windows")]
+pub mod d3d11;
+
 pub use probe::{build_decoder, build_encoder, validate_chosen_profile};
+#[cfg(target_os = "windows")]
+pub use probe::build_encoder_d3d11;
 
 // Re-exported so downstream crates can name the payload type on
 // [`EncodedPacket::data`] without independently depending on `bytes`
@@ -251,10 +256,15 @@ pub enum GpuEncoderFrame<'a> {
     /// IOSurface).
     #[cfg(target_os = "macos")]
     IOSurface(&'a IOSurfaceFrame),
+    /// Windows D3D11 texture from DXGI Desktop Duplication. Consumed
+    /// zero-copy by the encoder via FFmpeg's `d3d11va` hwaccel
+    /// (`AVFrame` mapped from the shared `ID3D11Texture2D`).
+    #[cfg(target_os = "windows")]
+    D3D11Texture(&'a D3D11TextureFrame),
     // Keeps the enum inhabited on platforms where no cfg branch above
-    // fires (e.g. Windows until D3D11 lands). On platforms that have
-    // a real variant (`linux`, `macos`) this is unreachable by safe
-    // code; the encoder's `encode_gpu` default body never matches it.
+    // fires. On platforms that have a real variant this is unreachable
+    // by safe code; the encoder's `encode_gpu` default body never
+    // matches it.
     #[doc(hidden)]
     _Phantom(std::marker::PhantomData<&'a ()>),
 }
@@ -551,6 +561,35 @@ pub struct IOSurfaceFrame {
 // would conflict with crossing a thread boundary.
 #[cfg(target_os = "macos")]
 unsafe impl Send for IOSurfaceFrame {}
+
+/// Windows D3D11 texture descriptor for encoder input. Carries the
+/// raw COM pointer to an `ID3D11Texture2D` on the shared device plus
+/// the device/context pointers needed for the encoder to map the
+/// texture into an FFmpeg `AVFrame` via `d3d11va` hwaccel.
+///
+/// Lifetime: the texture stays valid for the duration of the
+/// `encode_gpu` call (guarded by the capture-side `release_guard`
+/// or the pool's reference semantics). The device and context are
+/// `Arc`-shared and outlive any single frame.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct D3D11TextureFrame {
+    /// `ID3D11Texture2D` — the BGRA (or NV12) texture to encode.
+    /// Non-owning: lifetime is the capture pool or the guard.
+    pub texture: *mut std::ffi::c_void,
+    /// `ID3D11Device` — shared device between capture and encoder.
+    pub device: *mut std::ffi::c_void,
+    /// `ID3D11DeviceContext` — immediate context on the shared device.
+    pub device_context: *mut std::ffi::c_void,
+    pub width: u32,
+    pub height: u32,
+    /// DXGI_FORMAT value (e.g. `DXGI_FORMAT_B8G8R8A8_UNORM` = 87,
+    /// `DXGI_FORMAT_NV12` = 103).
+    pub format: u32,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for D3D11TextureFrame {}
 
 /// Pluggable video-decoder backend. Same probe pattern as `Encoder` —
 /// the client probes available backends at startup, picks the best

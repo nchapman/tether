@@ -444,19 +444,16 @@ fn hid_to_enigo(usage: HidUsage) -> Option<Key> {
         0x44 => Key::F11,
         0x45 => Key::F12,
         // PrintScreen / ScrollLock / Pause / Insert / Numlock / F21–F24
-        // are gated to non-macOS in enigo's `Key` enum (no `CGEvent`
-        // equivalent on Apple keyboards — and notably no `Key::Help`
-        // either; enigo gates Help the same way). The only viable
-        // policy on macOS is to drop them silently. Document the wire
-        // side as "macOS host doesn't honor PrintScr/Insert/Numlock"
-        // rather than mapping to surprising-on-Mac fallbacks.
-        #[cfg(not(target_os = "macos"))]
+        // are gated to Linux-only in enigo's `Key` enum (no equivalent
+        // on macOS; on Windows enigo 0.6 doesn't expose ScrollLock et al
+        // as Key variants). Drop silently on other platforms.
+        #[cfg(target_os = "linux")]
         0x46 => Key::PrintScr,
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         0x47 => Key::ScrollLock,
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         0x48 => Key::Pause,
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         0x49 => Key::Insert,
         0x4A => Key::Home,
         0x4B => Key::PageUp,
@@ -471,7 +468,7 @@ fn hid_to_enigo(usage: HidUsage) -> Option<Key> {
         // row digits; the arithmetic keys reuse the non-numpad symbol
         // variants since enigo doesn't have NumpadAdd etc. Numlock is
         // Linux/Windows-only (no NumLock on Mac keyboards).
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         0x53 => Key::Numlock,
         0x54 => Key::Divide,
         0x55 => Key::Multiply,
@@ -504,14 +501,15 @@ fn hid_to_enigo(usage: HidUsage) -> Option<Key> {
         0x6E => Key::F19,
         0x6F => Key::F20,
         // F21–F24 — enigo's macOS Key enum stops at F20 (CGEvent
-        // doesn't have key codes past F20). Drop silently on macOS.
-        #[cfg(not(target_os = "macos"))]
+        // doesn't have key codes past F20); Windows enigo 0.6 also
+        // doesn't expose F21-F24 variants. Linux-only.
+        #[cfg(target_os = "linux")]
         0x70 => Key::F21,
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         0x71 => Key::F22,
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         0x72 => Key::F23,
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         0x73 => Key::F24,
         0x85 => Key::Unicode(','),
         0xE0 => Key::LControl,

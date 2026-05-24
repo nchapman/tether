@@ -22,7 +22,7 @@ use tether_capture::{
     CapturedFrame, CursorEvent, CursorSource, DamageHint, DamageSignal, HashDamage,
     PixelFormat, PlaceholderCursorSource,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use tether_codec::GpuEncoderFrame;
 use tether_codec::{build_encoder, Encoder};
 #[cfg(target_os = "linux")]
@@ -2697,7 +2697,38 @@ fn run_capture_and_send(
                     }
                 }
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(target_os = "windows")]
+            CapturedFrame::Gpu(gpu) => {
+                use windows::core::Interface as _;
+                let tether_capture::GpuCapturedSource::D3D11Texture(ref tex) = gpu.source;
+                let d3d11_frame = tether_codec::D3D11TextureFrame {
+                    texture: tex.texture.as_raw() as *mut std::ffi::c_void,
+                    device: tex.device.device.as_raw() as *mut std::ffi::c_void,
+                    device_context: tex.device.context.as_raw() as *mut std::ffi::c_void,
+                    width: tex.width,
+                    height: tex.height,
+                    format: tex.format.0 as u32,
+                };
+                let result = slot_mut.encoder.encode_gpu(
+                    GpuEncoderFrame::D3D11Texture(&d3d11_frame),
+                    pts,
+                    force_kf,
+                );
+                match result {
+                    Ok(p) => p,
+                    Err(tether_codec::CodecError::UnsupportedInputFormat) => {
+                        // GPU path not yet wired; fall through to encode_bgra
+                        // via CPU readback for Phase 1.
+                        warn!("D3D11 encode_gpu not yet wired; dropping GPU frame");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "D3D11 encode failed; dropping frame");
+                        continue;
+                    }
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             CapturedFrame::Gpu(_) => {
                 warn!("Gpu CapturedFrame on an unsupported build; dropping");
                 continue;
@@ -2910,7 +2941,18 @@ async fn real_capture(chosen_profile: VideoProfile) -> anyhow::Result<tether_cap
         .map_err(anyhow::Error::from)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
+    info!("capture source: windows (DXGI Desktop Duplication)");
+    // Phase 2: forward d3d11_device to build_encoder to eliminate the
+    // cross-device copy. For now it stays alive (capture thread holds
+    // a clone) but is not plumbed to the encoder.
+    let (handle, _d3d11_device) = tether_capture::windows::start()
+        .map_err(anyhow::Error::from)?;
+    Ok(handle)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
     warn!("no real capture backend on this platform yet; falling back to test-pattern");
     Ok(tether_capture::test_pattern::start(

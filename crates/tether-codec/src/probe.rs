@@ -103,10 +103,53 @@ pub fn build_encoder(
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        build_encoder_d3d11(profile, width, height, fps, bitrate_kbps, std::ptr::null_mut(), std::ptr::null_mut())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (profile, width, height, fps, bitrate_kbps);
         Err(no_hw_encoder_for_platform())
+    }
+}
+
+/// Windows-specific encoder construction that accepts a shared D3D11
+/// device from the capture layer. When `device_ptr` is non-null, the
+/// encoder reuses the capture device (zero-copy texture sharing);
+/// when null, FFmpeg creates its own device (probe path, or fallback).
+#[cfg(target_os = "windows")]
+pub fn build_encoder_d3d11(
+    profile: VideoProfile,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    device_ptr: *mut std::ffi::c_void,
+    device_ctx_ptr: *mut std::ffi::c_void,
+) -> Result<(VideoProfile, Box<dyn Encoder>)> {
+    match crate::d3d11::D3D11Encoder::new(
+        profile,
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+        device_ptr,
+        device_ctx_ptr,
+    ) {
+        Ok(enc) => Ok((profile, Box::new(enc))),
+        Err(e) => {
+            tracing::warn!(
+                backend = "d3d11",
+                codec = ?profile.codec,
+                chroma = ?profile.chroma,
+                bit_depth = profile.bit_depth,
+                error = %e,
+                "D3D11 encoder construction failed"
+            );
+            Err(no_hw_encoder_d3d11(profile.codec, e))
+        }
     }
 }
 
@@ -158,6 +201,7 @@ pub fn build_decoder(profile: VideoProfile) -> Result<Box<dyn Decoder>> {
         }
     }
 
+    // TODO: Windows decoder (d3d11va hwaccel) — lands with client work.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = profile;
@@ -214,12 +258,22 @@ fn no_hw_decoder_vt(kind: CodecKind, source: CodecError) -> CodecError {
     ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn no_hw_encoder_d3d11(kind: CodecKind, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "D3D11 encoder unavailable for {kind:?} ({source}). \
+         Check that FFmpeg was built with Media Foundation, NVENC, or AMF support \
+         (`ffmpeg -encoders | grep -E 'mf|nvenc|amf'`). \
+         Tether requires GPU encode — there is no software fallback."
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn no_hw_encoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
-        "Tether currently supports hardware encode on Linux (VAAPI) and \
-         macOS (VideoToolbox). Windows/NVENC and Windows/AMF backends are \
-         not yet implemented."
+        "Tether currently supports hardware encode on Linux (VAAPI), \
+         macOS (VideoToolbox), and Windows (D3D11VA). No backend is \
+         available for this platform."
             .to_string(),
     )
 }
@@ -228,8 +282,7 @@ fn no_hw_encoder_for_platform() -> CodecError {
 fn no_hw_decoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
         "Tether currently supports hardware decode on Linux (VAAPI) and \
-         macOS (VideoToolbox). Windows/NVDEC and Windows/D3D11VA backends \
-         are not yet implemented."
+         macOS (VideoToolbox). Windows/D3D11VA decoder is not yet implemented."
             .to_string(),
     )
 }

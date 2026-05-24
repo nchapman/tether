@@ -141,6 +141,9 @@ pub mod macos;
 pub mod cursor_macos;
 
 #[cfg(target_os = "windows")]
+pub mod cursor_windows;
+
+#[cfg(target_os = "windows")]
 pub mod windows;
 
 use tether_protocol::MonoNanos;

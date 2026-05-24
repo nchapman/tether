@@ -47,6 +47,7 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Performance",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

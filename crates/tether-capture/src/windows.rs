@@ -36,7 +36,10 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
 };
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
+use crate::cursor_windows::DxgiCursorState;
+use crate::damage::NativeDamage;
 use crate::{
     CaptureError, CaptureHandle, CapturedFrame, GpuCapturedFrame, GpuCapturedGuard,
     GpuCapturedSource, Result,
@@ -104,6 +107,8 @@ pub fn start() -> Result<(CaptureHandle, D3D11Device)> {
     let target_fps_thread = Arc::clone(&target_fps);
     let device_thread = shared_device.clone();
 
+    let (cursor_state, cursor_source) = DxgiCursorState::new();
+
     std::thread::Builder::new()
         .name("tether-capture-dxgi".into())
         .spawn(move || {
@@ -114,11 +119,13 @@ pub fn start() -> Result<(CaptureHandle, D3D11Device)> {
                 width,
                 height,
                 target_fps_thread,
+                cursor_state,
             );
         })
         .map_err(|e| CaptureError::Io(e))?;
 
-    let handle = CaptureHandle::from_parts(rx, target_fps);
+    let handle =
+        CaptureHandle::from_parts(rx, target_fps).with_cursor_source(Box::new(cursor_source));
     Ok((handle, shared_device))
 }
 
@@ -200,9 +207,6 @@ fn create_pool_texture(
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        // Phase 2: D3D11_BIND_SHADER_RESOURCE when used as VP input
-        // for the BGRA→NV12 blit. No bind flags needed for the
-        // current CopyResource-only path.
         BindFlags: 0,
         CPUAccessFlags: 0,
         MiscFlags: 0,
@@ -219,6 +223,7 @@ fn run_capture_thread(
     width: u32,
     height: u32,
     target_fps: Arc<AtomicU32>,
+    mut cursor_state: DxgiCursorState,
 ) {
     let mut pool: Vec<ID3D11Texture2D> = Vec::with_capacity(TEXTURE_POOL_SIZE);
     for _ in 0..TEXTURE_POOL_SIZE {
@@ -231,6 +236,8 @@ fn run_capture_thread(
         }
     }
     let mut pool_idx = 0usize;
+
+    let qpc_freq = qpc_frequency();
 
     let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = unsafe { std::mem::zeroed() };
 
@@ -252,14 +259,9 @@ fn run_capture_thread(
                 continue;
             }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                // ACCESS_LOST is recoverable (mode change, monitor hotplug,
-                // fast-user-switch). The correct response is to call
-                // DuplicateOutput again. For now we exit the thread — the
-                // disconnected channel signals the session to tear down.
-                // TODO: reconnect loop (re-enumerate outputs, re-duplicate).
                 tracing::error!(
                     "DXGI access lost (display mode change or driver reset); \
-                     capture thread exiting — session will stall until reconnect is implemented"
+                     capture thread exiting"
                 );
                 break;
             }
@@ -270,6 +272,30 @@ fn run_capture_thread(
         };
 
         let t_userspace = MonoNanos::now();
+
+        // Frame timing: use DXGI's LastPresentTime (QPC) as the
+        // kernel-side capture timestamp when available.
+        let t_kernel = qpc_to_mono_nanos(frame_info.LastPresentTime, qpc_freq)
+            .unwrap_or(t_userspace);
+
+        // Cursor extraction — always runs even on idle frames so
+        // position updates are continuous.
+        cursor_state.update(&frame_info, &duplication);
+
+        // Damage detection: TotalMetadataBufferSize == 0 means no
+        // dirty rects and no move rects were accumulated — the desktop
+        // did not change.
+        let native_damage = Some(NativeDamage {
+            idle: frame_info.TotalMetadataBufferSize == 0,
+        });
+
+        // If the frame is idle, skip the expensive texture copy + send.
+        // We still needed to AcquireNextFrame + ReleaseFrame to advance
+        // DXGI's state machine, and cursor updates above still fire.
+        if native_damage == Some(NativeDamage { idle: true }) {
+            let _ = unsafe { duplication.ReleaseFrame() };
+            continue;
+        }
 
         // QueryInterface the resource to ID3D11Texture2D.
         let src_texture: ID3D11Texture2D = match resource.cast() {
@@ -303,10 +329,10 @@ fn run_capture_thread(
                 height,
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
             }),
-            t_capture_kernel: t_userspace,
+            t_capture_kernel: t_kernel,
             t_capture_userspace: t_userspace,
             release_guard: GpuCapturedGuard::new(()),
-            native_damage: None,
+            native_damage,
         });
 
         match tx.try_send(frame) {
@@ -327,6 +353,100 @@ fn run_capture_thread(
     }
 }
 
+/// Query QPC frequency (ticks per second).
+fn qpc_frequency() -> u64 {
+    let mut freq = 0i64;
+    let _ = unsafe { QueryPerformanceFrequency(&mut freq) };
+    freq as u64
+}
+
+/// Convert a DXGI `LastPresentTime` (QPC value) to a [`MonoNanos`]
+/// relative to the same epoch as [`MonoNanos::now()`]. Works by
+/// computing how far in the past the QPC timestamp is relative to the
+/// current QPC, then subtracting that delta from `MonoNanos::now()`.
+/// Returns `None` if the value is zero (DXGI sets it to 0 when
+/// unavailable).
+fn qpc_to_mono_nanos(qpc: i64, freq: u64) -> Option<MonoNanos> {
+    if qpc <= 0 || freq == 0 {
+        return None;
+    }
+    let mut now_qpc = 0i64;
+    let _ = unsafe { QueryPerformanceCounter(&mut now_qpc) };
+    let elapsed_ticks = now_qpc.saturating_sub(qpc).max(0) as u128;
+    let elapsed_nanos = (elapsed_ticks * 1_000_000_000) / freq as u128;
+    let now = MonoNanos::now();
+    let kernel_nanos = now.0.saturating_sub(elapsed_nanos as u64);
+    Some(MonoNanos(kernel_nanos))
+}
+
 fn hresult_io(e: windows::core::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qpc_zero_returns_none() {
+        assert!(qpc_to_mono_nanos(0, 10_000_000).is_none());
+    }
+
+    #[test]
+    fn qpc_negative_returns_none() {
+        assert!(qpc_to_mono_nanos(-1, 10_000_000).is_none());
+    }
+
+    #[test]
+    fn qpc_zero_freq_returns_none() {
+        assert!(qpc_to_mono_nanos(100, 0).is_none());
+    }
+
+    #[test]
+    fn qpc_recent_timestamp_produces_valid_mono_nanos() {
+        let freq = qpc_frequency();
+        assert!(freq > 0, "QPC frequency should be non-zero on Windows");
+        let mut qpc_now = 0i64;
+        let _ = unsafe { QueryPerformanceCounter(&mut qpc_now) };
+        let result = qpc_to_mono_nanos(qpc_now, freq);
+        assert!(result.is_some());
+        let mono = result.unwrap();
+        let now = MonoNanos::now();
+        // The kernel timestamp should be very close to now (within 1ms).
+        assert!(
+            now.0.saturating_sub(mono.0) < 1_000_000,
+            "kernel timestamp should be within 1ms of now, got delta={}ns",
+            now.0.saturating_sub(mono.0)
+        );
+    }
+
+    #[test]
+    fn qpc_past_timestamp_produces_earlier_mono_nanos() {
+        // Warm up MonoNanos epoch and give enough headroom.
+        let _ = MonoNanos::now();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let freq = qpc_frequency();
+        // Take a QPC reading, sleep, then take another. The first should
+        // produce a MonoNanos earlier than the second.
+        let mut qpc_before = 0i64;
+        let _ = unsafe { QueryPerformanceCounter(&mut qpc_before) };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut qpc_after = 0i64;
+        let _ = unsafe { QueryPerformanceCounter(&mut qpc_after) };
+
+        let mono_before = qpc_to_mono_nanos(qpc_before, freq).unwrap();
+        let mono_after = qpc_to_mono_nanos(qpc_after, freq).unwrap();
+        assert!(
+            mono_after.0 > mono_before.0,
+            "later QPC should map to later MonoNanos"
+        );
+        let delta_ns = mono_after.0 - mono_before.0;
+        // Should be ~20ms (allow 10-50ms for scheduling).
+        assert!(
+            delta_ns > 10_000_000 && delta_ns < 50_000_000,
+            "expected ~20ms delta between readings, got {}ns",
+            delta_ns
+        );
+    }
 }

@@ -5,7 +5,9 @@
 //! opens wins. All share the same D3D11 device for zero-copy texture
 //! input from DXGI Desktop Duplication.
 
+pub mod decoder;
 pub mod encoder;
 mod video_processor;
 
+pub use decoder::D3D11Decoder;
 pub use encoder::D3D11Encoder;

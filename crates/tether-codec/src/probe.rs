@@ -201,8 +201,25 @@ pub fn build_decoder(profile: VideoProfile) -> Result<Box<dyn Decoder>> {
         }
     }
 
-    // TODO: Windows decoder (d3d11va hwaccel) — lands with client work.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        match crate::d3d11::D3D11Decoder::new(kind) {
+            Ok(dec) => return Ok(Box::new(dec)),
+            Err(e) => {
+                tracing::error!(
+                    backend = "d3d11va",
+                    codec = ?kind,
+                    chroma = ?profile.chroma,
+                    bit_depth = profile.bit_depth,
+                    error = %e,
+                    "D3D11VA decoder construction failed"
+                );
+                return Err(no_hw_decoder_d3d11(kind, e));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = profile;
         Err(no_hw_decoder_for_platform())
@@ -278,11 +295,22 @@ fn no_hw_encoder_for_platform() -> CodecError {
     )
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn no_hw_decoder_d3d11(kind: CodecKind, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "D3D11VA decoder unavailable for {kind:?} ({source}). \
+         Check that FFmpeg was built with d3d11va support \
+         (`ffmpeg -hwaccels | grep d3d11va`). \
+         Tether requires GPU decode — there is no software fallback."
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn no_hw_decoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
-        "Tether currently supports hardware decode on Linux (VAAPI) and \
-         macOS (VideoToolbox). Windows/D3D11VA decoder is not yet implemented."
+        "Tether currently supports hardware decode on Linux (VAAPI), \
+         macOS (VideoToolbox), and Windows (D3D11VA). No backend is \
+         available for this platform."
             .to_string(),
     )
 }

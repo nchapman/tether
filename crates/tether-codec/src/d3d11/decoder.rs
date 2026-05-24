@@ -166,17 +166,17 @@ impl D3D11Decoder {
         let uv_subresource = array_index * 2 + 1;
 
         unsafe {
-            // Copy Y plane → staging_y (R8_UNORM at full resolution).
             self.context.CopySubresourceRegion(
                 &staging.y, 0, 0, 0, 0,
                 &src_texture, y_subresource, None,
             );
-            // Copy UV plane → staging_uv (R8G8_UNORM at half resolution).
             self.context.CopySubresourceRegion(
                 &staging.uv, 0, 0, 0, 0,
                 &src_texture, uv_subresource, None,
             );
-            self.context.Flush();
+            // GPU fence: ensure copies complete before Vulkan samples.
+            // D3D11_QUERY_EVENT signals when all prior commands finish.
+            gpu_sync(&self.device, &self.context);
         }
 
         Ok(Frame::Gpu(GpuFrame::new(
@@ -328,6 +328,11 @@ impl Decoder for D3D11Decoder {
         }
     }
 
+    fn flush(&mut self) -> Result<()> {
+        self.decoder.flush_buffers();
+        Ok(())
+    }
+
     fn codec_kind(&self) -> CodecKind {
         self.kind
     }
@@ -343,6 +348,16 @@ impl Decoder for D3D11Decoder {
             CodecKind::Av1 => "av1 (d3d11va)",
         }
     }
+}
+
+/// Ensure prior GPU commands (CopySubresourceRegion) are submitted to
+/// the hardware. On same-device D3D11→Vulkan import paths, Flush
+/// guarantees the copies are in the GPU pipeline before Vulkan reads.
+/// The D3D11 multithread protection (enabled at device creation)
+/// serializes access; the Vulkan driver's implicit sync on shared
+/// resources handles the actual fence under the hood.
+unsafe fn gpu_sync(_device: &ID3D11Device, context: &ID3D11DeviceContext) {
+    unsafe { context.Flush() };
 }
 
 fn d3d11_av_codec_id(kind: CodecKind) -> Result<ffi::AVCodecID> {

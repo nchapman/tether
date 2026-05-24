@@ -25,6 +25,8 @@ use tether_capture::{
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use tether_codec::GpuEncoderFrame;
 use tether_codec::{build_encoder, Encoder};
+#[cfg(target_os = "windows")]
+use tether_codec::build_encoder_d3d11;
 #[cfg(target_os = "linux")]
 use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 #[cfg(target_os = "linux")]
@@ -2468,13 +2470,30 @@ fn run_capture_and_send(
             // probe; per-resize cost is one construction attempt.
             let baseline_kbps =
                 derive_bitrate_kbps(chosen_profile, encode_width, encode_height, ENCODER_FPS);
-            slot = match build_encoder(
+            #[cfg(target_os = "windows")]
+            let encoder_result = {
+                let (dev, ctx) = SHARED_D3D11_DEVICE
+                    .get()
+                    .map(|d| {
+                        use windows::core::Interface;
+                        (d.device.as_raw() as *mut std::ffi::c_void,
+                         d.context.as_raw() as *mut std::ffi::c_void)
+                    })
+                    .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+                build_encoder_d3d11(
+                    chosen_profile, encode_width, encode_height,
+                    ENCODER_FPS, baseline_kbps, dev, ctx,
+                )
+            };
+            #[cfg(not(target_os = "windows"))]
+            let encoder_result = build_encoder(
                 chosen_profile,
                 encode_width,
                 encode_height,
                 ENCODER_FPS,
                 baseline_kbps,
-            ) {
+            );
+            slot = match encoder_result {
                 Ok((_profile, e)) => {
                     info!(
                         backend = e.name(),
@@ -2942,13 +2961,15 @@ async fn real_capture(chosen_profile: VideoProfile) -> anyhow::Result<tether_cap
 }
 
 #[cfg(target_os = "windows")]
+static SHARED_D3D11_DEVICE: std::sync::OnceLock<tether_capture::windows::D3D11Device> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
 async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
     info!("capture source: windows (DXGI Desktop Duplication)");
-    // Phase 2: forward d3d11_device to build_encoder to eliminate the
-    // cross-device copy. For now it stays alive (capture thread holds
-    // a clone) but is not plumbed to the encoder.
-    let (handle, _d3d11_device) = tether_capture::windows::start()
+    let (handle, d3d11_device) = tether_capture::windows::start()
         .map_err(anyhow::Error::from)?;
+    let _ = SHARED_D3D11_DEVICE.set(d3d11_device);
     Ok(handle)
 }
 

@@ -11,6 +11,11 @@ mod import;
 #[cfg(target_os = "linux")]
 pub(crate) use import::import_dmabuf_textures;
 
+#[cfg(target_os = "windows")]
+mod d3d11_import;
+#[cfg(target_os = "windows")]
+pub(crate) use d3d11_import::import_d3d11_textures;
+
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]
@@ -1191,11 +1196,33 @@ impl GpuState {
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    fn apply_gpu(&mut self, frame: GpuFrame) -> Result<()> {
+        let GpuFrameSource::D3D11Texture(ref d3d11) = frame.source;
+        let shared_handle = d3d11.shared_handle;
+        let w = frame.width;
+        let h = frame.height;
+        // The D3D11DecodedTexture owns the shared DXGI handle. Move
+        // the entire frame (source + guard) into the YuvTextures guard
+        // so the handle outlives the imported wgpu textures.
+        let combined_guard = GpuFrameGuard::new(frame);
+        let fresh = import_d3d11_textures(
+            &self.device,
+            &self.yuv_bgl,
+            &self.sampler,
+            self.chroma,
+            self.bit_depth,
+            shared_handle,
+            w,
+            h,
+            combined_guard,
+        )?;
+        self.retire_textures(fresh);
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     fn apply_gpu(&mut self, _frame: GpuFrame) -> Result<()> {
-        // GpuFrameSource has no variants off-Linux/macOS, so a GpuFrame
-        // is type-level uninhabitable here; this stub exists to keep
-        // the match in `apply_frame` exhaustive across cfgs.
         unreachable!("GpuFrame cannot be constructed on this platform")
     }
 

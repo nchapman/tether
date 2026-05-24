@@ -359,11 +359,42 @@ pub enum GpuFrameSource {
     /// macOS VideoToolbox-decoded `CVPixelBuffer` (typically with an
     /// IOSurface backing). The renderer imports the IOSurface as a
     /// Metal texture via wgpu's Metal HAL `texture_from_raw` path.
-    /// Carried here so the protocol/codec contract is symmetric with
-    /// the encoder side; the client-side decoder implementation is a
-    /// follow-up plan.
     #[cfg(target_os = "macos")]
     IOSurface(IOSurfaceFrame),
+    /// Windows D3D11VA decoded NV12 texture with a shared DXGI handle
+    /// for cross-API import into wgpu's Vulkan backend. The texture is
+    /// a GPU-side copy from the decoder's pool surface into a shared-
+    /// handle-enabled staging texture.
+    #[cfg(target_os = "windows")]
+    D3D11Texture(D3D11DecodedTexture),
+}
+
+/// Decoded D3D11 texture exported with a shared DXGI NT handle for
+/// import into wgpu's Vulkan backend via VK_KHR_external_memory_win32.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct D3D11DecodedTexture {
+    /// NT handle from `IDXGIResource1::CreateSharedHandle`. Owned by
+    /// this struct; closed on drop via `CloseHandle`.
+    pub shared_handle: *mut std::ffi::c_void,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for D3D11DecodedTexture {}
+
+#[cfg(target_os = "windows")]
+impl Drop for D3D11DecodedTexture {
+    fn drop(&mut self) {
+        if !self.shared_handle.is_null() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(
+                    windows::Win32::Foundation::HANDLE(self.shared_handle),
+                );
+            }
+        }
+    }
 }
 
 /// DMA-BUF descriptor as returned by `vaExportSurfaceHandle`. Mirrors

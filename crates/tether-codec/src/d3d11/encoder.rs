@@ -51,14 +51,14 @@ struct AvD3D11VAFramesContext {
 /// Full struct declared to prevent offset drift; we only write `device`
 /// and `device_context` (FFmpeg's `init` derives the rest).
 #[repr(C)]
-struct AvD3D11VADeviceContext {
-    device: *mut std::ffi::c_void,
-    device_context: *mut std::ffi::c_void,
-    video_device: *mut std::ffi::c_void,
-    video_context: *mut std::ffi::c_void,
-    lock: *mut std::ffi::c_void,
-    unlock: *mut std::ffi::c_void,
-    lock_ctx: *mut std::ffi::c_void,
+pub(crate) struct AvD3D11VADeviceContext {
+    pub(crate) device: *mut std::ffi::c_void,
+    pub(crate) device_context: *mut std::ffi::c_void,
+    pub(crate) video_device: *mut std::ffi::c_void,
+    pub(crate) video_context: *mut std::ffi::c_void,
+    pub(crate) lock: *mut std::ffi::c_void,
+    pub(crate) unlock: *mut std::ffi::c_void,
+    pub(crate) lock_ctx: *mut std::ffi::c_void,
 }
 const _: () = assert!(std::mem::size_of::<AvD3D11VADeviceContext>() == 56);
 

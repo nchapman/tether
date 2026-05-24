@@ -188,8 +188,9 @@ mod tests {
                 assert!(!f.y.is_empty());
                 assert!(!f.uv.is_empty());
             }
-            Frame::Gpu(_) => {
-                panic!("expected CPU frame from D3D11 Phase 1 decoder");
+            Frame::Gpu(g) => {
+                assert_eq!(g.width, TEST_WIDTH);
+                assert_eq!(g.height, TEST_HEIGHT);
             }
         }
     }
@@ -316,7 +317,10 @@ mod tests {
                 assert_eq!(f.height, encode_h);
                 assert!(!f.y.is_empty());
             }
-            Frame::Gpu(_) => panic!("expected CPU frame"),
+            Frame::Gpu(g) => {
+                assert_eq!(g.width, encode_w);
+                assert_eq!(g.height, encode_h);
+            }
         }
     }
 
@@ -375,7 +379,10 @@ mod tests {
                 assert!(!f.y.is_empty());
                 assert!(!f.uv.is_empty());
             }
-            Frame::Gpu(_) => panic!("expected CPU frame"),
+            Frame::Gpu(g) => {
+                assert_eq!(g.width, TEST_WIDTH);
+                assert_eq!(g.height, TEST_HEIGHT);
+            }
         }
     }
 

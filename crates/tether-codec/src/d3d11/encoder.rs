@@ -47,6 +47,21 @@ struct AvD3D11VAFramesContext {
     texture_infos: *mut std::ffi::c_void,
 }
 
+/// Matches FFmpeg's `AVD3D11VADeviceContext` from hwcontext_d3d11va.h.
+/// Full struct declared to prevent offset drift; we only write `device`
+/// and `device_context` (FFmpeg's `init` derives the rest).
+#[repr(C)]
+struct AvD3D11VADeviceContext {
+    device: *mut std::ffi::c_void,
+    device_context: *mut std::ffi::c_void,
+    video_device: *mut std::ffi::c_void,
+    video_context: *mut std::ffi::c_void,
+    lock: *mut std::ffi::c_void,
+    unlock: *mut std::ffi::c_void,
+    lock_ctx: *mut std::ffi::c_void,
+}
+const _: () = assert!(std::mem::size_of::<AvD3D11VADeviceContext>() == 56);
+
 const D3D11_BIND_RENDER_TARGET: u32 = 0x20;
 
 /// Encoder backend names to try in preference order for each codec.
@@ -146,17 +161,14 @@ impl D3D11Encoder {
         fps: u32,
         bitrate_kbps: u32,
         device_ptr: *mut std::ffi::c_void,
-        _device_ctx_ptr: *mut std::ffi::c_void,
+        device_ctx_ptr: *mut std::ffi::c_void,
     ) -> Result<Self> {
         let codec_cname = std::ffi::CString::new(backend_name)
             .map_err(|_| CodecError::CodecNotFound(backend_name))?;
         let codec = AVCodec::find_encoder_by_name(&codec_cname)
             .ok_or(CodecError::CodecNotFound(backend_name))?;
 
-        // Create the d3d11va hardware device context using the shared
-        // D3D11 device from capture. FFmpeg's d3d11va hwcontext accepts
-        // an externally-provided device via the hwctx data pointer.
-        let hw_device = create_d3d11va_hw_device(device_ptr)?;
+        let hw_device = create_d3d11va_hw_device(device_ptr, device_ctx_ptr)?;
 
         let width_i32 = i32::try_from(width).expect("width fits i32");
         let height_i32 = i32::try_from(height).expect("height fits i32");
@@ -455,18 +467,68 @@ impl Encoder for D3D11Encoder {
 
 /// Create an FFmpeg `d3d11va` hardware device context.
 ///
-/// Currently always lets FFmpeg create its own D3D11 device. Both
-/// the capture device and the encoder device are on the same adapter
-/// (adapter 0), so the Video Processor blit works across devices.
-///
-/// True single-device sharing requires injecting the capture device
-/// into `AVD3D11VADeviceContext.device` via `av_hwdevice_ctx_alloc`
-/// + manual struct access. Deferred until rsmpeg exposes
-/// `AVD3D11VADeviceContext` or we add a raw FFI binding for it.
+/// When `device_ptr` is non-null, injects the capture-created device
+/// into FFmpeg's hwctx so both capture and encode share a single
+/// D3D11 device (no cross-device texture copies in the VP blit).
+/// When null (probe path), lets FFmpeg create its own device.
 fn create_d3d11va_hw_device(
-    _device_ptr: *mut std::ffi::c_void,
+    device_ptr: *mut std::ffi::c_void,
+    device_ctx_ptr: *mut std::ffi::c_void,
 ) -> Result<AVHWDeviceContext> {
-    let hw_device =
-        AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_D3D11VA, None, None, 0)?;
+    if device_ptr.is_null() {
+        let hw_device =
+            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_D3D11VA, None, None, 0)?;
+        return Ok(hw_device);
+    }
+
+    // Inject the externally-provided device into FFmpeg's hwctx.
+    // AddRef both COM objects — FFmpeg calls Release on cleanup.
+    let mut hw_device = AVHWDeviceContext::alloc(ffi::AV_HWDEVICE_TYPE_D3D11VA);
+    unsafe {
+        com_addref(device_ptr);
+        if !device_ctx_ptr.is_null() {
+            com_addref(device_ctx_ptr);
+        }
+
+        let buf_ptr = hw_device.as_mut_ptr();
+        let data = &mut *((*buf_ptr).data as *mut ffi::AVHWDeviceContext);
+        let hwctx = data.hwctx as *mut AvD3D11VADeviceContext;
+        (*hwctx).device = device_ptr;
+        (*hwctx).device_context = device_ctx_ptr;
+    }
+    if let Err(e) = hw_device.init() {
+        // init failed — FFmpeg won't release the injected refs, so we must.
+        unsafe {
+            com_release(device_ptr);
+            if !device_ctx_ptr.is_null() {
+                com_release(device_ctx_ptr);
+            }
+        }
+        return Err(CodecError::Ffmpeg(e));
+    }
     Ok(hw_device)
+}
+
+/// Raw COM IUnknown vtable layout.
+#[repr(C)]
+struct IUnknownVtbl {
+    query_interface: *const std::ffi::c_void,
+    add_ref: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+    release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+}
+
+/// Call IUnknown::AddRef on a raw COM pointer via vtable.
+unsafe fn com_addref(ptr: *mut std::ffi::c_void) {
+    unsafe {
+        let vtbl_ptr = *(ptr as *const *const IUnknownVtbl);
+        ((*vtbl_ptr).add_ref)(ptr);
+    }
+}
+
+/// Call IUnknown::Release on a raw COM pointer via vtable.
+unsafe fn com_release(ptr: *mut std::ffi::c_void) {
+    unsafe {
+        let vtbl_ptr = *(ptr as *const *const IUnknownVtbl);
+        ((*vtbl_ptr).release)(ptr);
+    }
 }

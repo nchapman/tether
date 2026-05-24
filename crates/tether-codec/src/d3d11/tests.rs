@@ -65,6 +65,48 @@ mod tests {
 
     #[test]
     #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn d3d11_encoder_shared_device_h264() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        };
+        use windows::Win32::Foundation::HMODULE;
+
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        }
+        .expect("D3D11CreateDevice");
+        let device = device.unwrap();
+        let context = context.unwrap();
+
+        let enc = D3D11Encoder::new(
+            h264_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+        );
+        assert!(enc.is_ok(), "shared-device encoder failed: {:?}", enc.err());
+        assert!(enc.unwrap().is_hardware());
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
     fn d3d11_decoder_constructs_h264() {
         let dec = D3D11Decoder::new(CodecKind::H264);
         assert!(dec.is_ok(), "H.264 decoder construction failed: {:?}", dec.err());

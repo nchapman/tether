@@ -7,6 +7,8 @@
 
 pub mod decoder;
 pub mod encoder;
+#[cfg(test)]
+mod tests;
 mod video_processor;
 
 pub use decoder::D3D11Decoder;

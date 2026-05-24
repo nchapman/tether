@@ -36,11 +36,24 @@ use crate::{
 
 use super::video_processor::VideoProcessorState;
 
-const D3D11_POOL_SIZE: i32 = 8;
+/// Matches FFmpeg's `AVD3D11VAFramesContext` from `hwcontext_d3d11va.h`.
+/// Only the fields we need to set before `av_hwframe_ctx_init` are
+/// included; the struct is `repr(C)` so field offsets match the C layout.
+#[repr(C)]
+struct AvD3D11VAFramesContext {
+    texture: *mut std::ffi::c_void,
+    bind_flags: u32,
+    misc_flags: u32,
+    texture_infos: *mut std::ffi::c_void,
+}
+
+const D3D11_BIND_RENDER_TARGET: u32 = 0x20;
 
 /// Encoder backend names to try in preference order for each codec.
-const HEVC_BACKENDS: &[&str] = &["hevc_mf", "hevc_nvenc", "hevc_amf"];
-const H264_BACKENDS: &[&str] = &["h264_mf", "h264_nvenc", "h264_amf"];
+/// AMF first: on AMD hardware, native AMF handles d3d11 hw_frames
+/// correctly; MF's wrapper sometimes fails at send_frame for H.264.
+const HEVC_BACKENDS: &[&str] = &["hevc_amf", "hevc_mf", "hevc_nvenc"];
+const H264_BACKENDS: &[&str] = &["h264_amf", "h264_mf", "h264_nvenc"];
 
 pub struct D3D11Encoder {
     kind: CodecKind,
@@ -170,8 +183,22 @@ impl D3D11Encoder {
         hw_frames_ref.data().sw_format = ffi::AV_PIX_FMT_NV12;
         hw_frames_ref.data().width = width_i32;
         hw_frames_ref.data().height = height_i32;
-        hw_frames_ref.data().initial_pool_size = D3D11_POOL_SIZE;
+        hw_frames_ref.data().initial_pool_size = 0;
+
+        // AMF/MF require D3D11_BIND_RENDER_TARGET on pool textures,
+        // otherwise avcodec_open2 fails with AVERROR_UNKNOWN. Access
+        // the backend-specific AVD3D11VAFramesContext and set flags.
+        unsafe {
+            let hwctx = hw_frames_ref.data().hwctx as *mut AvD3D11VAFramesContext;
+            (*hwctx).bind_flags = D3D11_BIND_RENDER_TARGET;
+            (*hwctx).misc_flags = 0;
+        }
+
         hw_frames_ref.init()?;
+
+        // Set hw_device_ctx on the encoder as well — some backends
+        // (h264_mf) read it separately from hw_frames_ctx.
+        encoder.set_hw_device_ctx(hw_device.clone());
         encoder.set_hw_frames_ctx(hw_frames_ref);
 
         unsafe {

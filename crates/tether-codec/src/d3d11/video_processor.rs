@@ -26,22 +26,27 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL;
 
 /// Cached Video Processor state. Created once per encoder lifetime,
-/// reused across frames.
+/// reused across frames. Supports input→output scaling when
+/// `input_width != output_width` or `input_height != output_height`.
 pub(crate) struct VideoProcessorState {
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     processor: ID3D11VideoProcessor,
     enumerator: ID3D11VideoProcessorEnumerator,
-    width: u32,
-    height: u32,
+    input_width: u32,
+    input_height: u32,
+    output_width: u32,
+    output_height: u32,
 }
 
 impl VideoProcessorState {
     pub(crate) fn new(
         device_ptr: *mut std::ffi::c_void,
         context_ptr: *mut std::ffi::c_void,
-        width: u32,
-        height: u32,
+        input_width: u32,
+        input_height: u32,
+        output_width: u32,
+        output_height: u32,
     ) -> std::result::Result<Self, String> {
         if device_ptr.is_null() || context_ptr.is_null() {
             return Err("null device or context pointer".into());
@@ -69,14 +74,14 @@ impl VideoProcessorState {
                 Numerator: 60,
                 Denominator: 1,
             },
-            InputWidth: width,
-            InputHeight: height,
+            InputWidth: input_width,
+            InputHeight: input_height,
             OutputFrameRate: DXGI_RATIONAL {
                 Numerator: 60,
                 Denominator: 1,
             },
-            OutputWidth: width,
-            OutputHeight: height,
+            OutputWidth: output_width,
+            OutputHeight: output_height,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };
 
@@ -108,9 +113,19 @@ impl VideoProcessorState {
             video_context,
             processor,
             enumerator,
-            width,
-            height,
+            input_width,
+            input_height,
+            output_width,
+            output_height,
         })
+    }
+
+    pub(crate) fn input_width(&self) -> u32 {
+        self.input_width
+    }
+
+    pub(crate) fn input_height(&self) -> u32 {
+        self.input_height
     }
 
     pub(crate) fn blit(
@@ -193,13 +208,25 @@ impl VideoProcessorState {
             ppFutureSurfacesRight: std::ptr::null_mut(),
         };
 
+        let source_rect = RECT {
+            left: 0,
+            top: 0,
+            right: self.input_width as i32,
+            bottom: self.input_height as i32,
+        };
         let target_rect = RECT {
             left: 0,
             top: 0,
-            right: self.width as i32,
-            bottom: self.height as i32,
+            right: self.output_width as i32,
+            bottom: self.output_height as i32,
         };
         unsafe {
+            self.video_context.VideoProcessorSetStreamSourceRect(
+                &self.processor,
+                0,
+                true,
+                Some(&source_rect),
+            );
             self.video_context.VideoProcessorSetOutputTargetRect(
                 &self.processor,
                 true,

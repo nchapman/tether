@@ -73,5 +73,14 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi_Common",
 ] }
 
+# Tests create their own D3D11 device for hardware roundtrip validation.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
 [lints]
 workspace = true

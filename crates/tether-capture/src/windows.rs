@@ -216,25 +216,29 @@ fn create_pool_texture(
     Ok(texture.unwrap())
 }
 
+const RECONNECT_BACKOFF: &[Duration] = &[
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+const RECONNECT_MAX_TOTAL: Duration = Duration::from_secs(30);
+
 fn run_capture_thread(
     tx: Sender<CapturedFrame>,
     device: D3D11Device,
-    duplication: IDXGIOutputDuplication,
-    width: u32,
-    height: u32,
+    mut duplication: IDXGIOutputDuplication,
+    mut width: u32,
+    mut height: u32,
     target_fps: Arc<AtomicU32>,
     mut cursor_state: DxgiCursorState,
 ) {
-    let mut pool: Vec<ID3D11Texture2D> = Vec::with_capacity(TEXTURE_POOL_SIZE);
-    for _ in 0..TEXTURE_POOL_SIZE {
-        match create_pool_texture(&device.device, width, height) {
-            Ok(tex) => pool.push(tex),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to create texture pool");
-                return;
-            }
-        }
-    }
+    let mut pool = match create_texture_pool(&device.device, width, height) {
+        Some(p) => p,
+        None => return,
+    };
     let mut pool_idx = 0usize;
 
     let qpc_freq = qpc_frequency();
@@ -245,7 +249,6 @@ fn run_capture_thread(
         let fps = target_fps.load(Ordering::Relaxed).max(1);
         let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(fps));
 
-        // Acquire next frame with a timeout matching the frame interval.
         let timeout_ms = frame_interval.as_millis().min(100) as u32;
         let resource: std::result::Result<IDXGIResource, _> = unsafe {
             let mut resource = None;
@@ -259,11 +262,26 @@ fn run_capture_thread(
                 continue;
             }
             Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                tracing::error!(
-                    "DXGI access lost (display mode change or driver reset); \
-                     capture thread exiting"
-                );
-                break;
+                match reconnect_duplication(&device.device) {
+                    Some((new_dup, new_w, new_h)) => {
+                        duplication = new_dup;
+                        if new_w != width || new_h != height {
+                            width = new_w;
+                            height = new_h;
+                            match create_texture_pool(&device.device, width, height) {
+                                Some(p) => pool = p,
+                                None => break,
+                            }
+                            pool_idx = 0;
+                        }
+                        tracing::info!(width, height, "DXGI reconnected after ACCESS_LOST");
+                        continue;
+                    }
+                    None => {
+                        tracing::error!("DXGI reconnect failed after 30s; exiting capture");
+                        break;
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "AcquireNextFrame failed");
@@ -273,31 +291,20 @@ fn run_capture_thread(
 
         let t_userspace = MonoNanos::now();
 
-        // Frame timing: use DXGI's LastPresentTime (QPC) as the
-        // kernel-side capture timestamp when available.
         let t_kernel = qpc_to_mono_nanos(frame_info.LastPresentTime, qpc_freq)
             .unwrap_or(t_userspace);
 
-        // Cursor extraction — always runs even on idle frames so
-        // position updates are continuous.
         cursor_state.update(&frame_info, &duplication);
 
-        // Damage detection: TotalMetadataBufferSize == 0 means no
-        // dirty rects and no move rects were accumulated — the desktop
-        // did not change.
         let native_damage = Some(NativeDamage {
             idle: frame_info.TotalMetadataBufferSize == 0,
         });
 
-        // If the frame is idle, skip the expensive texture copy + send.
-        // We still needed to AcquireNextFrame + ReleaseFrame to advance
-        // DXGI's state machine, and cursor updates above still fire.
         if native_damage == Some(NativeDamage { idle: true }) {
             let _ = unsafe { duplication.ReleaseFrame() };
             continue;
         }
 
-        // QueryInterface the resource to ID3D11Texture2D.
         let src_texture: ID3D11Texture2D = match resource.cast() {
             Ok(t) => t,
             Err(e) => {
@@ -307,13 +314,11 @@ fn run_capture_thread(
             }
         };
 
-        // Copy into a pool texture so we can release the frame immediately.
         let dst_texture = &pool[pool_idx % TEXTURE_POOL_SIZE];
         unsafe {
             device.context.CopyResource(dst_texture, &src_texture);
         }
 
-        // Release the DXGI frame as soon as the copy is submitted.
         let _ = unsafe { duplication.ReleaseFrame() };
 
         let frame_texture = dst_texture.clone();
@@ -337,19 +342,57 @@ fn run_capture_thread(
 
         match tx.try_send(frame) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                // Drop oldest — consumer is behind. This matches the
-                // bounded-channel back-pressure strategy on Linux/macOS.
-            }
+            Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => {
                 tracing::debug!("capture receiver dropped; shutting down");
                 break;
             }
         }
+    }
+}
 
-        // AcquireNextFrame's timeout_ms provides the frame-rate pacing.
-        // No additional sleep — the next call blocks until a new frame
-        // arrives or the timeout expires.
+fn create_texture_pool(device: &ID3D11Device, width: u32, height: u32) -> Option<Vec<ID3D11Texture2D>> {
+    let mut pool = Vec::with_capacity(TEXTURE_POOL_SIZE);
+    for _ in 0..TEXTURE_POOL_SIZE {
+        match create_pool_texture(device, width, height) {
+            Ok(tex) => pool.push(tex),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create texture pool");
+                return None;
+            }
+        }
+    }
+    Some(pool)
+}
+
+/// Attempt to re-acquire DXGI OutputDuplication after ACCESS_LOST.
+/// Retries with exponential backoff up to [`RECONNECT_MAX_TOTAL`].
+/// First attempt is immediate (fast-user-switch recovers instantly);
+/// backoff sleep happens only after a failed attempt.
+fn reconnect_duplication(device: &ID3D11Device) -> Option<(IDXGIOutputDuplication, u32, u32)> {
+    let start = std::time::Instant::now();
+    let mut attempt = 0usize;
+
+    loop {
+        if start.elapsed() > RECONNECT_MAX_TOTAL {
+            return None;
+        }
+
+        match create_duplication(device) {
+            Ok(result) => return Some(result),
+            Err(e) => {
+                tracing::debug!(
+                    attempt,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    error = %e,
+                    "DXGI reconnect attempt failed"
+                );
+            }
+        }
+
+        let backoff = RECONNECT_BACKOFF[attempt.min(RECONNECT_BACKOFF.len() - 1)];
+        std::thread::sleep(backoff);
+        attempt += 1;
     }
 }
 

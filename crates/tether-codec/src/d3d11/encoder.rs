@@ -284,18 +284,36 @@ impl D3D11Encoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
-        if frame.width != self.width || frame.height != self.height {
-            return Err(CodecError::UnsupportedInputFormat);
-        }
         if frame.texture.is_null() || frame.device.is_null() {
             return Err(CodecError::UnsupportedInputFormat);
         }
 
+        // Guard: if the VP was built for different input dims (e.g.
+        // capture resolution changed after a DXGI reconnect), reject
+        // the frame. The encoder slot should be rebuilt upstream.
+        if let Some(vp) = &self.vp_state {
+            if vp.input_width() != frame.width || vp.input_height() != frame.height {
+                tracing::error!(
+                    vp_input_w = vp.input_width(),
+                    vp_input_h = vp.input_height(),
+                    frame_w = frame.width,
+                    frame_h = frame.height,
+                    "VP input dims mismatch; encoder slot should rebuild"
+                );
+                return Err(CodecError::UnsupportedInputFormat);
+            }
+        }
+
         // Lazily initialize the Video Processor on first GPU frame.
+        // The VP handles both color conversion (BGRA→NV12) and scaling
+        // when the input (capture) dimensions differ from the output
+        // (encode) dimensions.
         if self.vp_state.is_none() {
             match VideoProcessorState::new(
                 frame.device,
                 frame.device_context,
+                frame.width,
+                frame.height,
                 self.width,
                 self.height,
             ) {

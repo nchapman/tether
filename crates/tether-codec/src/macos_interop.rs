@@ -70,6 +70,17 @@ pub const XF20_FOURCC: u32 = u32::from_be_bytes(*b"xf20");
 /// and `videotoolbox::expected_iosurface_fourccs` — drift between the
 /// three is the family of bug that bit us when the renderer used to
 /// reject `'x420'`.
+///
+/// **Range policy:** the renderer shader is hardcoded BT.709 limited
+/// (see `tether-render::shader.wgsl`), so only video-range fourccs
+/// are accepted for the 4:2:0 / 4:4:4 8-bit families. The 4:2:0
+/// 10-bit family accepts the canonical `'P010'` MSB-aligned label
+/// alongside `'x420'` (video range); `'xf20'` (full range) and the
+/// 4:4:4 8-bit full-range `'444f'` are rejected. The 4:4:4 10-bit
+/// family has no video-range fourcc on macOS, so `'xf44'` /
+/// `'P410'` are accepted — that path is gated by the encoder probe
+/// anyway. Matches the encoder's range policy in
+/// `videotoolbox::encoder::iosurface_fourcc_matches`.
 #[must_use]
 pub fn accepts_iosurface_fourcc(
     chroma: ChromaSubsampling,
@@ -78,9 +89,9 @@ pub fn accepts_iosurface_fourcc(
 ) -> bool {
     matches!(
         (chroma, bit_depth, fourcc),
-        (ChromaSubsampling::Yuv420, 8, NV12_VIDEO_RANGE_FOURCC | NV12_FULL_RANGE_FOURCC)
-            | (ChromaSubsampling::Yuv444, 8, NV24_VIDEO_RANGE_FOURCC | NV24_FULL_RANGE_FOURCC)
-            | (ChromaSubsampling::Yuv420, 10, X420_FOURCC | XF20_FOURCC | P010_FOURCC)
+        (ChromaSubsampling::Yuv420, 8, NV12_VIDEO_RANGE_FOURCC)
+            | (ChromaSubsampling::Yuv444, 8, NV24_VIDEO_RANGE_FOURCC)
+            | (ChromaSubsampling::Yuv420, 10, X420_FOURCC | P010_FOURCC)
             | (ChromaSubsampling::Yuv444, 10, XF44_FOURCC | P410_FOURCC)
     )
 }

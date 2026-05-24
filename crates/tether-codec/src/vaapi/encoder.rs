@@ -211,6 +211,17 @@ impl VaapiEncoder {
             raw.color_trc = ffi::AVCOL_TRC_BT709;
             raw.colorspace = ffi::AVCOL_SPC_BT709;
             raw.color_range = ffi::AVCOL_RANGE_MPEG;
+            // Chroma siting. AVCHROMA_LOC_CENTER (= HEVC
+            // chroma_sample_loc_type=1, JPEG/MPEG-1 siting) matches
+            // what the gpuconvert shaders produce: a 2x2 box-average
+            // places the U/V sample at the geometric centre of the
+            // 2x2 luma block (`bgra_to_nv12.wgsl:104`). Without this
+            // the SPS VUI omits the chroma_loc fields and decoders
+            // default to type-0 (MPEG-2 left/co-sited), introducing
+            // a half-pixel chroma offset on saturated edges. 4:4:4
+            // has no chroma subsampling so the field is ignored
+            // there; setting it unconditionally is harmless.
+            raw.chroma_sample_location = ffi::AVCHROMA_LOC_CENTER;
             // HEVC profile pin. Sunshine's reference pattern (see
             // refs/Sunshine/src/video.cpp:1687) sets `profile` on the
             // context field rather than via the `profile=` AVOption
@@ -439,7 +450,7 @@ impl VaapiEncoder {
         }
 
         let scaler_label = crate::encoder_common::pix_fmt_scaler_label(sw_format);
-        let bgra_to_encoder_input = SwsContext::get_context(
+        let mut bgra_to_encoder_input = SwsContext::get_context(
             width_i32,
             height_i32,
             ffi::AV_PIX_FMT_BGRA,
@@ -452,6 +463,42 @@ impl VaapiEncoder {
             None,
         )
         .ok_or(CodecError::ScalerInit(scaler_label))?;
+
+        // Pin swscale's RGB→YUV matrix to BT.709 limited so the
+        // encoded bytes match the VUI we wrote above (lines 210-213).
+        // Default behaviour picks BT.601 for sources shorter than 576
+        // lines and BT.709 above — a silent hue shift at 720p that the
+        // bench-path encode would otherwise hit on test fixtures
+        // smaller than 576 lines. Production sessions never run this
+        // path (the live host pipeline uses `encode_vaapi_dma_buf`,
+        // which bypasses swscale entirely), but the bench / test cells
+        // do, and a BT.601-matrixed test fixture mis-tagged BT.709
+        // would skew measured PSNR / SSIM.
+        //
+        // SAFETY: same shape as the VideoToolbox sibling
+        // (`videotoolbox/encoder.rs:265-277`). Coefficient tables are
+        // static, owned by libswscale; never freed by us.
+        // brightness=0, contrast/saturation=65536 is the documented
+        // neutral default.
+        unsafe {
+            let coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as i32);
+            let rc = ffi::sws_setColorspaceDetails(
+                bgra_to_encoder_input.as_mut_ptr(),
+                coeffs,
+                1, // src_range: BGRA is full range
+                coeffs,
+                0, // dst_range: YUV video range (matches AVCOL_RANGE_MPEG)
+                0,
+                65536,
+                65536,
+            );
+            if rc != 0 {
+                tracing::warn!(
+                    rc,
+                    "sws_setColorspaceDetails refused; BGRA→YUV may fall back to BT.601 for <576-line sources"
+                );
+            }
+        }
 
         let mut bgra_frame = AVFrame::new();
         bgra_frame.set_format(ffi::AV_PIX_FMT_BGRA);

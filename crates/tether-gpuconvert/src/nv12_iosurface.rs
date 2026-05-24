@@ -983,55 +983,82 @@ mod tests {
         use tether_protocol::control::ChromaSubsampling;
 
         // The bridge allocates IOSurfaces that VideoToolbox encodes
-        // from, so the consistency check is "every fourcc the bridge
-        // can allocate (its `chroma_bit_depth_for_fourcc` table) must
-        // be accepted by both the encoder and the renderer". The
-        // renderer accepts a superset (it also tolerates `'P010'` /
-        // `'P410'` because VT *decode* can emit those even though
-        // VT *encode* doesn't take them as input) — that asymmetry
-        // is by design, so the bridge restricts itself to the
-        // encoder's accept set.
+        // from, so the consistency check is "every video-range fourcc
+        // the bridge can allocate (its `chroma_bit_depth_for_fourcc`
+        // table) must be accepted by both the encoder and the
+        // renderer". Full-range fourccs ('420f', 'xf20', '444f') are
+        // rejected at the encoder and renderer because both pin
+        // BT.709 limited; they remain in `chroma_bit_depth_for_fourcc`
+        // for diagnostic identification (e.g. logging which fourcc
+        // arrived when a session can't proceed) but the bridge does
+        // not allocate them.
         //
-        // 8-bit 4:2:0: NV12_VIDEO and NV12_FULL.
-        for &fcc in &[NV12_VIDEO_RANGE_FOURCC, NV12_FULL_RANGE_FOURCC] {
-            assert!(
-                iosurface_fourcc_matches(ChromaSubsampling::Yuv420, 8, fcc),
-                "encoder rejected 8-bit 4:2:0 fourcc 0x{fcc:08x}"
-            );
-            assert!(
-                renderer_accepts(ChromaSubsampling::Yuv420, 8, fcc),
-                "renderer rejected 8-bit 4:2:0 fourcc 0x{fcc:08x}"
-            );
-            assert_eq!(
-                nv12_bytes_per_element(fcc),
-                (1, 2),
-                "bridge plane-bytes-per-element wrong for 8-bit 4:2:0"
-            );
-            let (chroma, bd) = chroma_bit_depth_for_fourcc(fcc).expect("known fourcc");
-            assert_eq!(chroma, ChromaSubsampling::Yuv420);
-            assert_eq!(bd, 8);
-        }
-        // 10-bit 4:2:0: x420 (video-range) and xf20 (full-range).
-        // P010 is NOT in the encoder's input set — see fn-level
-        // comment above; the bridge's table excludes it.
-        for &fcc in &[X420_FOURCC, XF20_FOURCC] {
-            assert!(
-                iosurface_fourcc_matches(ChromaSubsampling::Yuv420, 10, fcc),
-                "encoder rejected 10-bit 4:2:0 fourcc 0x{fcc:08x}"
-            );
-            assert!(
-                renderer_accepts(ChromaSubsampling::Yuv420, 10, fcc),
-                "renderer rejected 10-bit 4:2:0 fourcc 0x{fcc:08x}"
-            );
-            assert_eq!(
-                nv12_bytes_per_element(fcc),
-                (2, 4),
-                "bridge plane-bytes-per-element wrong for 10-bit 4:2:0"
-            );
-            let (chroma, bd) = chroma_bit_depth_for_fourcc(fcc).expect("known fourcc");
-            assert_eq!(chroma, ChromaSubsampling::Yuv420);
-            assert_eq!(bd, 10);
-        }
+        // 8-bit 4:2:0 video-range: must round-trip.
+        assert!(
+            iosurface_fourcc_matches(ChromaSubsampling::Yuv420, 8, NV12_VIDEO_RANGE_FOURCC),
+            "encoder rejected 8-bit 4:2:0 video-range fourcc"
+        );
+        assert!(
+            renderer_accepts(ChromaSubsampling::Yuv420, 8, NV12_VIDEO_RANGE_FOURCC),
+            "renderer rejected 8-bit 4:2:0 video-range fourcc"
+        );
+        assert_eq!(
+            nv12_bytes_per_element(NV12_VIDEO_RANGE_FOURCC),
+            (1, 2),
+            "bridge plane-bytes-per-element wrong for 8-bit 4:2:0"
+        );
+        let (chroma, bd) =
+            chroma_bit_depth_for_fourcc(NV12_VIDEO_RANGE_FOURCC).expect("known fourcc");
+        assert_eq!(chroma, ChromaSubsampling::Yuv420);
+        assert_eq!(bd, 8);
+
+        // 8-bit 4:2:0 full-range: encoder + renderer reject.
+        // chroma_bit_depth_for_fourcc still identifies the family for
+        // diagnostics, but the bridge never targets this fourcc.
+        assert!(
+            !iosurface_fourcc_matches(ChromaSubsampling::Yuv420, 8, NV12_FULL_RANGE_FOURCC),
+            "encoder must reject 8-bit 4:2:0 full-range fourcc (limited VUI)"
+        );
+        assert!(
+            !renderer_accepts(ChromaSubsampling::Yuv420, 8, NV12_FULL_RANGE_FOURCC),
+            "renderer must reject 8-bit 4:2:0 full-range fourcc (BT.709 limited shader)"
+        );
+        assert!(
+            chroma_bit_depth_for_fourcc(NV12_FULL_RANGE_FOURCC).is_some(),
+            "full-range '420f' must stay identifiable in chroma_bit_depth_for_fourcc \
+             for diagnostic logging when a session can't proceed"
+        );
+
+        // 10-bit 4:2:0 video-range: must round-trip.
+        assert!(
+            iosurface_fourcc_matches(ChromaSubsampling::Yuv420, 10, X420_FOURCC),
+            "encoder rejected 10-bit 4:2:0 video-range fourcc"
+        );
+        assert!(
+            renderer_accepts(ChromaSubsampling::Yuv420, 10, X420_FOURCC),
+            "renderer rejected 10-bit 4:2:0 video-range fourcc"
+        );
+        assert_eq!(
+            nv12_bytes_per_element(X420_FOURCC),
+            (2, 4),
+            "bridge plane-bytes-per-element wrong for 10-bit 4:2:0"
+        );
+
+        // 10-bit 4:2:0 full-range: encoder + renderer reject.
+        assert!(
+            !iosurface_fourcc_matches(ChromaSubsampling::Yuv420, 10, XF20_FOURCC),
+            "encoder must reject 10-bit 4:2:0 full-range fourcc"
+        );
+        assert!(
+            !renderer_accepts(ChromaSubsampling::Yuv420, 10, XF20_FOURCC),
+            "renderer must reject 10-bit 4:2:0 full-range fourcc"
+        );
+        assert!(
+            chroma_bit_depth_for_fourcc(XF20_FOURCC).is_some(),
+            "full-range 'xf20' must stay identifiable in chroma_bit_depth_for_fourcc \
+             for diagnostic logging"
+        );
+
         // Negative cross-check: `'P010'` is in the renderer's accept
         // set (VT decode emits it) but MUST NOT be in the encoder's
         // input set. A future edit that mistakenly adds it to

@@ -21,7 +21,11 @@ use crate::{
 };
 
 use super::ffi::{
-    CFRelease, CVPixelBufferCreateWithIOSurface, CVPixelBufferRef, K_CV_RETURN_SUCCESS,
+    kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
+    kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+    kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, CFRelease,
+    CVBufferSetAttachment, CVPixelBufferCreateWithIOSurface, CVPixelBufferRef,
+    K_CV_ATTACHMENT_MODE_SHOULD_PROPAGATE, K_CV_RETURN_SUCCESS,
 };
 
 /// Pool size for the VideoToolbox surface pool. With `async_depth=1`
@@ -165,6 +169,14 @@ impl VideoToolboxEncoder {
             raw.color_trc = ffi::AVCOL_TRC_BT709;
             raw.colorspace = ffi::AVCOL_SPC_BT709;
             raw.color_range = ffi::AVCOL_RANGE_MPEG;
+            // Chroma siting. Capture is NV12 from ScreenCaptureKit,
+            // which Apple documents as centred chroma (matches what
+            // gpuconvert produces on Linux for the same shader).
+            // AVCHROMA_LOC_CENTER → HEVC SPS chroma_sample_loc_type=1.
+            // Parity with the VAAPI sibling; without this the SPS
+            // VUI defaults to type-0 and decoders apply a half-pixel
+            // chroma offset on saturated edges.
+            raw.chroma_sample_location = ffi::AVCHROMA_LOC_CENTER;
         }
 
         // VideoToolbox-specific private options. The defaults are
@@ -252,7 +264,7 @@ impl VideoToolboxEncoder {
         // documented neutral default.
         unsafe {
             let coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as i32);
-            let _ = ffi::sws_setColorspaceDetails(
+            let rc = ffi::sws_setColorspaceDetails(
                 bgra_to_sw.as_mut_ptr(),
                 coeffs,
                 1, // src_range: BGRA is full range
@@ -262,6 +274,12 @@ impl VideoToolboxEncoder {
                 65536,
                 65536,
             );
+            if rc != 0 {
+                tracing::warn!(
+                    rc,
+                    "sws_setColorspaceDetails refused; BGRA→YUV may fall back to BT.601 for <576-line sources"
+                );
+            }
         }
 
         let mut bgra_frame = AVFrame::new();
@@ -371,6 +389,46 @@ impl VideoToolboxEncoder {
         };
         if rc != K_CV_RETURN_SUCCESS || pixbuf.is_null() {
             return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR_EXTERNAL)));
+        }
+
+        // 1a. Pin BT.709 limited-range color attachments on the
+        // wrapped buffer. `CVPixelBufferCreateWithIOSurface` carries
+        // forward whatever the IOSurface was tagged with; on
+        // pre-Sequoia macOS, ScreenCaptureKit has been observed to
+        // attach BT.601 for sub-720p capture regions. The VT encoder
+        // does not re-matrix the IOSurface — it consumes the bytes
+        // as-is and just writes the `color_*` fields we set in
+        // `new()` into the SPS VUI. Without these attachments, a
+        // small-region capture would ship as BT.601-encoded bytes
+        // tagged as BT.709, decoding with crushed greens and shifted
+        // skin tones. The encoder VUI is hardcoded ITU_R_709 in
+        // `new()`; mirror it here so the input and the tag agree.
+        //
+        // SAFETY: pixbuf is non-null (checked above). The key/value
+        // arguments are `CV_NONNULL` in the SDK header; the dynamic
+        // linker resolves both from CoreVideo's data segment at load
+        // time, so the static pointers we hand in are always non-null
+        // by the time any code in this function runs (a missing symbol
+        // would have failed dyld load, not this call).
+        unsafe {
+            CVBufferSetAttachment(
+                pixbuf,
+                kCVImageBufferYCbCrMatrixKey,
+                kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                K_CV_ATTACHMENT_MODE_SHOULD_PROPAGATE,
+            );
+            CVBufferSetAttachment(
+                pixbuf,
+                kCVImageBufferColorPrimariesKey,
+                kCVImageBufferColorPrimaries_ITU_R_709_2,
+                K_CV_ATTACHMENT_MODE_SHOULD_PROPAGATE,
+            );
+            CVBufferSetAttachment(
+                pixbuf,
+                kCVImageBufferTransferFunctionKey,
+                kCVImageBufferTransferFunction_ITU_R_709_2,
+                K_CV_ATTACHMENT_MODE_SHOULD_PROPAGATE,
+            );
         }
 
         // 2. Wrap the +1 retained CVPixelBufferRef in an AVBufferRef
@@ -623,6 +681,20 @@ fn vt_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
 /// from `sw_format`, not from the runtime CVPixelBuffer, so a mismatch
 /// produces corrupted output rather than an error.
 ///
+/// **Range policy:** only video-range fourccs (`'420v'`, `'x420'`,
+/// `'444v'`) are accepted for the families that have both range
+/// variants. The encoder VUI is hardcoded to `AVCOL_RANGE_MPEG`
+/// (limited) in `new()` and the renderer is hardcoded to BT.709
+/// limited; a full-range IOSurface (`'420f'`, `'xf20'`, `'444f'`)
+/// would land as full-range bytes in a limited-tagged bitstream and
+/// decode with crushed blacks and clipped whites on the client. The
+/// capture layer (`sck_pixel_format_for_profile`) already asks for
+/// video range; rejecting full range here is the defence-in-depth
+/// guard if that ever changes. The 4:4:4 10-bit family has no
+/// video-range fourcc on macOS — `'xf44'` is accepted, but the 4:4:4
+/// encoder path is gated off by the probe anyway due to VT's silent
+/// 4:4:4 → 4:2:0 downsample bug.
+///
 /// Exposed at `pub` so cross-crate consistency tests can confirm the
 /// encoder's accept set is a superset of what the capture layer
 /// (`tether-capture::macos::sck_pixel_format_for_profile`) can
@@ -631,17 +703,14 @@ fn vt_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
 #[must_use]
 pub fn iosurface_fourcc_matches(chroma: ChromaSubsampling, bit_depth: u8, fourcc: u32) -> bool {
     const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
-    const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
     const P010_VIDEO: u32 = u32::from_be_bytes(*b"x420");
-    const P010_FULL: u32 = u32::from_be_bytes(*b"xf20");
     const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
-    const NV24_FULL: u32 = u32::from_be_bytes(*b"444f");
     const P410_FULL: u32 = u32::from_be_bytes(*b"xf44");
     matches!(
         (chroma, bit_depth, fourcc),
-        (ChromaSubsampling::Yuv420, 8, NV12_VIDEO | NV12_FULL)
-            | (ChromaSubsampling::Yuv420, 10, P010_VIDEO | P010_FULL)
-            | (ChromaSubsampling::Yuv444, 8, NV24_VIDEO | NV24_FULL)
+        (ChromaSubsampling::Yuv420, 8, NV12_VIDEO)
+            | (ChromaSubsampling::Yuv420, 10, P010_VIDEO)
+            | (ChromaSubsampling::Yuv444, 8, NV24_VIDEO)
             | (ChromaSubsampling::Yuv444, 10, P410_FULL)
     )
 }
@@ -653,18 +722,21 @@ mod fourcc_match_tests {
     #[test]
     fn fourcc_matches_for_each_supported_combo() {
         // Encoder configured (chroma, bit_depth) ↔ IOSurface fourcc.
-        // Both range variants of 4:2:0 (8-bit / 10-bit) are accepted
-        // — the encoder doesn't care about video vs full range at
-        // this layer; the renderer's color matrix handles range
-        // conversion downstream.
+        // Only video-range fourccs are accepted for families that
+        // have both range variants — the encoder VUI is hardcoded
+        // AVCOL_RANGE_MPEG, so a full-range surface would mis-tag.
+        // 4:4:4 10-bit has no video-range fourcc on macOS, so
+        // `'xf44'` is accepted (and the path is probe-gated anyway).
         for (chroma, bd, fourcc, accept) in [
             (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"420v"), true),
-            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"420f"), true),
             (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"x420"), true),
-            (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"xf20"), true),
             (ChromaSubsampling::Yuv444, 8, u32::from_be_bytes(*b"444v"), true),
-            (ChromaSubsampling::Yuv444, 8, u32::from_be_bytes(*b"444f"), true),
             (ChromaSubsampling::Yuv444, 10, u32::from_be_bytes(*b"xf44"), true),
+            // Full-range siblings are rejected: encoder VUI is
+            // limited, full-range bytes would mis-tag.
+            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"420f"), false),
+            (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"xf20"), false),
+            (ChromaSubsampling::Yuv444, 8, u32::from_be_bytes(*b"444f"), false),
             // Cross-bucket mismatches: 10-bit cells for an 8-bit
             // encoder, 4:4:4 fourcc for a 4:2:0 encoder, etc.
             (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"x420"), false),
@@ -679,6 +751,7 @@ mod fourcc_match_tests {
             );
         }
     }
+
 }
 
 

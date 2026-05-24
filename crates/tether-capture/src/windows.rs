@@ -24,9 +24,9 @@ use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+    ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
@@ -154,7 +154,15 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     }
     .map_err(|e| CaptureError::Io(hresult_io(e)))?;
 
-    Ok((device.unwrap(), context.unwrap()))
+    let device = device.unwrap();
+
+    // Enable multithread protection — the capture thread and encoder
+    // thread both use this device's immediate context concurrently.
+    if let Ok(mt) = device.cast::<ID3D11Multithread>() {
+        let _ = unsafe { mt.SetMultithreadProtected(true) };
+    }
+
+    Ok((device, context.unwrap()))
 }
 
 fn create_duplication(

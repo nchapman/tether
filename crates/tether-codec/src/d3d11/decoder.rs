@@ -19,7 +19,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIResource;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM,
+    DXGI_SAMPLE_DESC,
+};
 
 use tether_protocol::control::CodecKind;
 
@@ -31,6 +34,7 @@ use crate::{
 
 const DECODE_EXTRA_HW_FRAMES: i32 = 4;
 const D3D11_RESOURCE_MISC_SHARED: u32 = 0x2;
+const D3D11_BIND_SHADER_RESOURCE: u32 = 0x8;
 
 pub struct D3D11Decoder {
     kind: CodecKind,
@@ -38,11 +42,18 @@ pub struct D3D11Decoder {
     _hw_device: AVHWDeviceContext,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    staging: Option<StagingTexture>,
+    staging: Option<PlaneStagingPair>,
 }
 
-struct StagingTexture {
-    texture: ID3D11Texture2D,
+/// Per-plane staging textures for GPU-side NV12 plane extraction.
+/// D3D11 NV12 textures have two subresources: plane 0 (Y as R8) and
+/// plane 1 (UV as RG8). We copy each into a separate MISC_SHARED
+/// texture so they can be imported independently into wgpu/Vulkan.
+struct PlaneStagingPair {
+    y: ID3D11Texture2D,
+    uv: ID3D11Texture2D,
+    y_handle: HANDLE,
+    uv_handle: HANDLE,
     width: u32,
     height: u32,
 }
@@ -116,9 +127,9 @@ impl D3D11Decoder {
         })
     }
 
-    /// Export a D3D11VA surface as a `Frame::Gpu` via shared DXGI handle.
-    /// Copies the decode pool surface to a staging texture with shared-
-    /// handle flags, then exports via `CreateSharedHandle`.
+    /// Export a D3D11VA surface as `Frame::Gpu` with per-plane shared
+    /// handles. Copies each NV12 plane (Y and UV) from the decode pool
+    /// into separate MISC_SHARED staging textures, entirely on the GPU.
     fn export_gpu_frame(&mut self, hw_frame: &AVFrame) -> Result<Frame> {
         let width = hw_frame.width as u32;
         let height = hw_frame.height as u32;
@@ -128,8 +139,8 @@ impl D3D11Decoder {
             Some(hw_frame.pts)
         };
 
-        // D3D11VA frames: data[0] = ID3D11Texture2D*, data[1] = array index (as intptr_t)
         let src_texture_ptr = hw_frame.data[0] as *mut std::ffi::c_void;
+        // D3D11VA: array index stored as intptr_t in data[1].
         let array_index = hw_frame.data[1] as usize as u32;
 
         if src_texture_ptr.is_null() {
@@ -142,44 +153,39 @@ impl D3D11Decoder {
                 .clone()
         };
 
-        // Ensure staging texture exists at the right dimensions.
+        // Rebuild staging pair if dimensions changed.
         if self.staging.as_ref().map_or(true, |s| s.width != width || s.height != height) {
-            self.staging = Some(self.create_staging(width, height)?);
+            self.staging = Some(Self::create_plane_staging(&self.device, width, height)?);
         }
         let staging = self.staging.as_ref().unwrap();
 
-        // Copy from the decode pool array slice to our staging texture.
-        // Flush ensures the copy is visible to the Vulkan importer
-        // (legacy MISC_SHARED textures have no keyed-mutex sync).
+        // NV12 texture array subresource layout:
+        //   Y plane  of slice N = subresource N * 2 + 0
+        //   UV plane of slice N = subresource N * 2 + 1
+        let y_subresource = array_index * 2;
+        let uv_subresource = array_index * 2 + 1;
+
         unsafe {
+            // Copy Y plane → staging_y (R8_UNORM at full resolution).
             self.context.CopySubresourceRegion(
-                &staging.texture,
-                0,
-                0,
-                0,
-                0,
-                &src_texture,
-                array_index,
-                None,
+                &staging.y, 0, 0, 0, 0,
+                &src_texture, y_subresource, None,
+            );
+            // Copy UV plane → staging_uv (R8G8_UNORM at half resolution).
+            self.context.CopySubresourceRegion(
+                &staging.uv, 0, 0, 0, 0,
+                &src_texture, uv_subresource, None,
             );
             self.context.Flush();
         }
-
-        // Export shared handle via IDXGIResource::GetSharedHandle.
-        let dxgi_resource: IDXGIResource = staging
-            .texture
-            .cast()
-            .map_err(|_| CodecError::CodecNotFound("IDXGIResource cast failed"))?;
-
-        let handle: HANDLE = unsafe { dxgi_resource.GetSharedHandle() }
-            .map_err(|_| CodecError::CodecNotFound("GetSharedHandle failed"))?;
 
         Ok(Frame::Gpu(GpuFrame::new(
             width,
             height,
             pts,
             GpuFrameSource::D3D11Texture(D3D11DecodedTexture {
-                shared_handle: handle.0 as *mut std::ffi::c_void,
+                y_handle: staging.y_handle.0 as *mut std::ffi::c_void,
+                uv_handle: staging.uv_handle.0 as *mut std::ffi::c_void,
                 width,
                 height,
             }),
@@ -187,27 +193,64 @@ impl D3D11Decoder {
         )))
     }
 
-    fn create_staging(&self, width: u32, height: u32) -> Result<StagingTexture> {
+    fn create_plane_staging(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> Result<PlaneStagingPair> {
+        let chroma_w = (width + 1) / 2;
+        let chroma_h = (height + 1) / 2;
+
+        let y_tex = Self::create_shared_texture(
+            device, width, height, DXGI_FORMAT_R8_UNORM,
+        )?;
+        let uv_tex = Self::create_shared_texture(
+            device, chroma_w, chroma_h, DXGI_FORMAT_R8G8_UNORM,
+        )?;
+
+        let y_handle = Self::get_shared_handle(&y_tex)?;
+        let uv_handle = Self::get_shared_handle(&uv_tex)?;
+
+        Ok(PlaneStagingPair {
+            y: y_tex,
+            uv: uv_tex,
+            y_handle,
+            uv_handle,
+            width,
+            height,
+        })
+    }
+
+    fn create_shared_texture(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<ID3D11Texture2D> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_NV12,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: 0,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE,
             CPUAccessFlags: 0,
             MiscFlags: D3D11_RESOURCE_MISC_SHARED,
         };
         let mut texture = None;
-        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-            .map_err(|e| CodecError::CodecNotFound("staging texture creation failed"))?;
-        Ok(StagingTexture {
-            texture: texture.unwrap(),
-            width,
-            height,
-        })
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+            .map_err(|_| CodecError::CodecNotFound("staging texture creation failed"))?;
+        Ok(texture.unwrap())
+    }
+
+    fn get_shared_handle(texture: &ID3D11Texture2D) -> Result<HANDLE> {
+        let dxgi_resource: IDXGIResource = texture
+            .cast()
+            .map_err(|_| CodecError::CodecNotFound("IDXGIResource cast failed"))?;
+        unsafe { dxgi_resource.GetSharedHandle() }
+            .map_err(|_| CodecError::CodecNotFound("GetSharedHandle failed"))
     }
 
     /// Fallback: download to CPU when GPU export isn't possible.

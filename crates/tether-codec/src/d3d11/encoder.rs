@@ -37,8 +37,8 @@ use crate::{
 use super::video_processor::VideoProcessorState;
 
 /// Matches FFmpeg's `AVD3D11VAFramesContext` from `hwcontext_d3d11va.h`.
-/// Only the fields we need to set before `av_hwframe_ctx_init` are
-/// included; the struct is `repr(C)` so field offsets match the C layout.
+/// Matches FFmpeg 8.x `AVD3D11VAFramesContext` from hwcontext_d3d11va.h.
+/// Size assertion guards against layout drift across FFmpeg versions.
 #[repr(C)]
 struct AvD3D11VAFramesContext {
     texture: *mut std::ffi::c_void,
@@ -46,6 +46,8 @@ struct AvD3D11VAFramesContext {
     misc_flags: u32,
     texture_infos: *mut std::ffi::c_void,
 }
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<AvD3D11VAFramesContext>() == 24);
 
 /// Matches FFmpeg's `AVD3D11VADeviceContext` from hwcontext_d3d11va.h.
 /// Full struct declared to prevent offset drift; we only write `device`
@@ -60,6 +62,7 @@ pub(crate) struct AvD3D11VADeviceContext {
     pub(crate) unlock: *mut std::ffi::c_void,
     pub(crate) lock_ctx: *mut std::ffi::c_void,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<AvD3D11VADeviceContext>() == 56);
 
 const D3D11_BIND_RENDER_TARGET: u32 = 0x20;

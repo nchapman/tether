@@ -1199,23 +1199,22 @@ impl GpuState {
     #[cfg(target_os = "windows")]
     fn apply_gpu(&mut self, frame: GpuFrame) -> Result<()> {
         let GpuFrameSource::D3D11Texture(ref d3d11) = frame.source;
-        let shared_handle = d3d11.shared_handle;
         let w = frame.width;
         let h = frame.height;
-        // The D3D11DecodedTexture owns the shared DXGI handle. Move
-        // the entire frame (source + guard) into the YuvTextures guard
-        // so the handle outlives the imported wgpu textures.
-        let combined_guard = GpuFrameGuard::new(frame);
+        // The decoder's staging textures own the DXGI handles (they're
+        // valid for the staging texture lifetime, which is the decoder's
+        // lifetime). The AVFrame guard keeps the decode surface alive
+        // until the renderer is done sampling.
         let fresh = import_d3d11_textures(
             &self.device,
             &self.yuv_bgl,
             &self.sampler,
             self.chroma,
             self.bit_depth,
-            shared_handle,
+            d3d11,
             w,
             h,
-            combined_guard,
+            frame.guard,
         )?;
         self.retire_textures(fresh);
         Ok(())

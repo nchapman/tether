@@ -1,18 +1,18 @@
 //! Windows D3D11 texture import into wgpu via Vulkan external memory.
 //!
-//! The decoder exports an NV12 texture as a shared DXGI handle.
-//! We import it into wgpu's Vulkan backend via
-//! `VK_KHR_external_memory_win32` (`texture_from_d3d11_shared_handle`),
-//! then create R8 (Y plane) and Rg8 (UV plane) views for the YUV
-//! shader.
+//! The decoder exports NV12 planes as two separate shared DXGI handles
+//! (Y as R8_UNORM, UV as R8G8_UNORM). We import each into wgpu's
+//! Vulkan backend via `VK_KHR_external_memory_win32`
+//! (`texture_from_d3d11_shared_handle`), matching the Linux path which
+//! imports two separate DMA-BUF fds per NV12 frame.
 
-use tether_codec::GpuFrameGuard;
+use tether_codec::{D3D11DecodedTexture, GpuFrameGuard};
 use tether_protocol::control::ChromaSubsampling;
 
 use crate::{RenderError, Result};
 use super::YuvTextures;
 
-/// Import a D3D11 shared-handle NV12 texture into wgpu and build the
+/// Import D3D11 per-plane shared handles into wgpu and build the
 /// YUV plane textures + bind group for rendering.
 pub(crate) fn import_d3d11_textures(
     device: &wgpu::Device,
@@ -20,12 +20,12 @@ pub(crate) fn import_d3d11_textures(
     sampler: &wgpu::Sampler,
     chroma: ChromaSubsampling,
     bit_depth: u8,
-    shared_handle: *mut std::ffi::c_void,
+    d3d11: &D3D11DecodedTexture,
     width: u32,
     height: u32,
     guard: GpuFrameGuard,
 ) -> Result<YuvTextures> {
-    if shared_handle.is_null() {
+    if d3d11.y_handle.is_null() || d3d11.uv_handle.is_null() {
         return Err(RenderError::DmaBufImport("null D3D11 shared handle".into()));
     }
 
@@ -43,23 +43,8 @@ pub(crate) fn import_d3d11_textures(
         _ => (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm),
     };
 
-    let y_texture = import_plane(
-        device,
-        shared_handle,
-        width,
-        height,
-        y_format,
-        "d3d11_y",
-    )?;
-
-    let uv_texture = import_plane(
-        device,
-        shared_handle,
-        chroma_w,
-        chroma_h,
-        uv_format,
-        "d3d11_uv",
-    )?;
+    let y_texture = import_plane(device, d3d11.y_handle, width, height, y_format, "d3d11_y")?;
+    let uv_texture = import_plane(device, d3d11.uv_handle, chroma_w, chroma_h, uv_format, "d3d11_uv")?;
 
     let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let uv_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -125,8 +110,9 @@ fn import_plane(
             .ok_or_else(|| {
                 RenderError::DmaBufImport("device is not Vulkan-backed".into())
             })?;
-        // HANDLE is repr(transparent) over *mut c_void in the windows
-        // crate. Transmute to match wgpu's pinned version.
+        // HANDLE is repr(transparent) over a pointer-sized value.
+        // Transmute bridges the windows crate version gap between
+        // our dep and wgpu's internal dep.
         hal_dev
             .texture_from_d3d11_shared_handle(
                 std::mem::transmute(shared_handle),

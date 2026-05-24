@@ -197,6 +197,12 @@ fn monochrome_to_rgba(buf: &[u8], width: u32, height: u32, pitch: u32) -> Vec<u8
     let h = (height / 2) as usize;
     let w = width as usize;
     let pitch = pitch as usize;
+
+    let required = (h * 2) * pitch;
+    if buf.len() < required || w == 0 || h == 0 {
+        return vec![];
+    }
+
     let mut rgba = vec![0u8; w * h * 4];
 
     for row in 0..h {
@@ -234,6 +240,12 @@ fn masked_color_to_rgba(buf: &[u8], width: u32, height: u32, pitch: u32) -> Vec<
     let w = width as usize;
     let h = height as usize;
     let pitch = pitch as usize;
+
+    let required = h * pitch;
+    if buf.len() < required || pitch < w * 4 || w == 0 || h == 0 {
+        return vec![];
+    }
+
     let mut rgba = vec![0u8; w * h * 4];
 
     for row in 0..h {

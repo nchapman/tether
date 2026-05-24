@@ -369,33 +369,24 @@ pub enum GpuFrameSource {
     D3D11Texture(D3D11DecodedTexture),
 }
 
-/// Decoded D3D11 texture exported with a shared DXGI NT handle for
-/// import into wgpu's Vulkan backend via VK_KHR_external_memory_win32.
+/// Decoded D3D11 NV12 frame exported as two separate shared DXGI
+/// handles (one per plane) for import into wgpu's Vulkan backend.
+/// Handles are DXGI-runtime-owned (from `GetSharedHandle`) and must
+/// NOT be closed — they remain valid as long as the backing staging
+/// textures exist (held by the decoder).
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
 pub struct D3D11DecodedTexture {
-    /// NT handle from `IDXGIResource1::CreateSharedHandle`. Owned by
-    /// this struct; closed on drop via `CloseHandle`.
-    pub shared_handle: *mut std::ffi::c_void,
+    /// Shared handle for the Y plane (R8_UNORM, full resolution).
+    pub y_handle: *mut std::ffi::c_void,
+    /// Shared handle for the UV plane (R8G8_UNORM, half resolution).
+    pub uv_handle: *mut std::ffi::c_void,
     pub width: u32,
     pub height: u32,
 }
 
 #[cfg(target_os = "windows")]
 unsafe impl Send for D3D11DecodedTexture {}
-
-#[cfg(target_os = "windows")]
-impl Drop for D3D11DecodedTexture {
-    fn drop(&mut self) {
-        if !self.shared_handle.is_null() {
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(
-                    windows::Win32::Foundation::HANDLE(self.shared_handle),
-                );
-            }
-        }
-    }
-}
 
 /// DMA-BUF descriptor as returned by `vaExportSurfaceHandle`. Mirrors
 /// `tether_vaapi::DrmPrimeSurface` but is owned by `tether-codec` so

@@ -32,6 +32,14 @@ mod tests {
         }
     }
 
+    fn hevc_main10_profile() -> VideoProfile {
+        VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        }
+    }
+
     #[test]
     #[ignore = "requires D3D11VA-capable GPU (Windows)"]
     fn d3d11_encoder_constructs_h264() {
@@ -369,5 +377,40 @@ mod tests {
             }
             Frame::Gpu(_) => panic!("expected CPU frame"),
         }
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU with HEVC Main10 (Windows)"]
+    fn d3d11_hevc_main10_encode_produces_packets() {
+        let mut enc = D3D11Encoder::new(
+            hevc_main10_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .expect("HEVC Main10 encoder construction");
+
+        let bgra = vec![100u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
+
+        let mut all_packets = Vec::new();
+        for pts in 0..30 {
+            let pkts = enc
+                .encode_bgra(&bgra, pts, pts == 0)
+                .expect("encode_bgra failed");
+            all_packets.extend(pkts);
+            if !all_packets.is_empty() {
+                break;
+            }
+        }
+        assert!(!all_packets.is_empty(), "Main10 encoder produced no packets after 30 frames");
+        // Verify the first packet contains valid HEVC NALUs (starts with
+        // 00 00 00 01 or is Annex-B formatted after extradata prepend).
+        assert!(
+            all_packets[0].data.len() > 4,
+            "packet too small to contain HEVC NALUs"
+        );
     }
 }

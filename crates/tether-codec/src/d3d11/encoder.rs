@@ -25,7 +25,7 @@ use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 use rsmpeg::UnsafeDerefMut;
 
-use tether_protocol::control::{CodecKind, VideoProfile};
+use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
 use crate::encoder_common::{drain_encoder, snapshot_extradata};
 use crate::h264::frame_plane_mut;
@@ -120,7 +120,7 @@ impl D3D11Encoder {
         let mut last_err = CodecError::CodecNotFound("d3d11 encoder");
         for &backend_name in backends {
             match Self::try_open(
-                kind,
+                profile,
                 backend_name,
                 width,
                 height,
@@ -154,7 +154,7 @@ impl D3D11Encoder {
     }
 
     fn try_open(
-        kind: CodecKind,
+        profile: VideoProfile,
         backend_name: &'static str,
         width: u32,
         height: u32,
@@ -163,6 +163,7 @@ impl D3D11Encoder {
         device_ptr: *mut std::ffi::c_void,
         device_ctx_ptr: *mut std::ffi::c_void,
     ) -> Result<Self> {
+        let kind = profile.codec;
         let codec_cname = std::ffi::CString::new(backend_name)
             .map_err(|_| CodecError::CodecNotFound(backend_name))?;
         let codec = AVCodec::find_encoder_by_name(&codec_cname)
@@ -189,10 +190,11 @@ impl D3D11Encoder {
         #[allow(clippy::cast_possible_wrap)]
         encoder.set_flags(encoder.flags | ffi::AV_CODEC_FLAG_GLOBAL_HEADER as i32);
 
-        // Configure hw_frames_ctx: NV12 pool on the shared device.
+        let sw_format = d3d11_sw_format(profile);
+
         let mut hw_frames_ref = hw_device.hwframe_ctx_alloc();
         hw_frames_ref.data().format = ffi::AV_PIX_FMT_D3D11;
-        hw_frames_ref.data().sw_format = ffi::AV_PIX_FMT_NV12;
+        hw_frames_ref.data().sw_format = sw_format;
         hw_frames_ref.data().width = width_i32;
         hw_frames_ref.data().height = height_i32;
         hw_frames_ref.data().initial_pool_size = 0;
@@ -231,13 +233,13 @@ impl D3D11Encoder {
             ffi::AV_PIX_FMT_BGRA,
             width_i32,
             height_i32,
-            ffi::AV_PIX_FMT_NV12,
+            sw_format,
             ffi::SWS_FAST_BILINEAR,
             None,
             None,
             None,
         )
-        .ok_or(CodecError::ScalerInit("bgra→nv12 for d3d11 encoder"))?;
+        .ok_or(CodecError::ScalerInit("bgra→nv12/p010 for d3d11 encoder"))?;
 
         unsafe {
             let coeffs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709 as i32);
@@ -260,7 +262,7 @@ impl D3D11Encoder {
         bgra_frame.alloc_buffer()?;
 
         let mut sw_frame = AVFrame::new();
-        sw_frame.set_format(ffi::AV_PIX_FMT_NV12);
+        sw_frame.set_format(sw_format);
         sw_frame.set_width(width_i32);
         sw_frame.set_height(height_i32);
         sw_frame.alloc_buffer()?;
@@ -507,6 +509,15 @@ fn create_d3d11va_hw_device(
         return Err(CodecError::Ffmpeg(e));
     }
     Ok(hw_device)
+}
+
+/// Map a VideoProfile to the FFmpeg sw_format for the hw_frames pool.
+fn d3d11_sw_format(profile: VideoProfile) -> ffi::AVPixelFormat {
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => ffi::AV_PIX_FMT_NV12,
+        (ChromaSubsampling::Yuv420, 10) => ffi::AV_PIX_FMT_P010LE,
+        _ => ffi::AV_PIX_FMT_NV12,
+    }
 }
 
 /// Raw COM IUnknown vtable layout.

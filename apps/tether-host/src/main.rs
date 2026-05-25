@@ -2857,9 +2857,15 @@ fn persistent_cert_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        anyhow::anyhow!("neither $TETHER_CERT_DIR nor $HOME is set; can't choose a cert directory")
-    })?;
+    // $HOME on Unix, $USERPROFILE on Windows.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "neither $TETHER_CERT_DIR nor $HOME/$USERPROFILE is set; \
+                 can't choose a cert directory"
+            )
+        })?;
     Ok(PathBuf::from(home).join(".tether"))
 }
 

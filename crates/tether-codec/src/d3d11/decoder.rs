@@ -320,7 +320,13 @@ impl Decoder for D3D11Decoder {
     fn next_frame(&mut self) -> Result<Option<Frame>> {
         match self.decoder.receive_frame() {
             Ok(frame) => {
-                let decoded = self.export_gpu_frame(&frame)?;
+                // CPU download path: GPU decode → av_hwframe_transfer_data
+                // → NV12 bytes → queue.write_texture on the renderer.
+                // The GPU export path (export_gpu_frame → shared DXGI
+                // handle → Vulkan import) requires VK_KHR_external_memory_win32
+                // which not all drivers expose (AMD Vulkan doesn't).
+                // Activate GPU export when the renderer can signal support.
+                let decoded = self.download_frame_cpu(&frame)?;
                 Ok(Some(decoded))
             }
             Err(RsmpegError::DecoderDrainError) => Ok(None),

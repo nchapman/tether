@@ -440,12 +440,6 @@ mod tests {
     /// asymmetry as an explicit invariant.
     #[test]
     fn probe_client_does_not_mirror_encode_bit_into_decode_field() {
-        // Drive the real cached probe — we can't inject a mock
-        // ProfileCapability from outside tether-codec, so this test is
-        // a structural assertion: for every profile, the client's
-        // encode field must be Unsupported with the "not probed"
-        // reason. That fingerprint can only hold if probe_client is
-        // reading c.decode (not c.encode) into the decode field.
         for support in client_supported_profiles() {
             match &support.encode {
                 SupportStatus::Unsupported { reason, .. }
@@ -457,5 +451,101 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_host_includes_h264_encode() {
+        let profiles = host_supported_profiles();
+        let h264 = profiles.iter().find(|s| {
+            s.profile.codec == tether_protocol::control::CodecKind::H264
+                && s.profile.bit_depth == 8
+        });
+        assert!(
+            h264.is_some(),
+            "H.264 8-bit not found in host probe results: {profiles:?}"
+        );
+        assert!(
+            h264.unwrap().is_encode_supported(),
+            "H.264 8-bit encode should be supported; got: {:?}",
+            h264.unwrap().encode
+        );
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_host_includes_hevc_420_encode() {
+        let profiles = host_supported_profiles();
+        let hevc = profiles.iter().find(|s| {
+            s.profile.codec == tether_protocol::control::CodecKind::Hevc
+                && s.profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv420
+                && s.profile.bit_depth == 8
+        });
+        assert!(
+            hevc.is_some(),
+            "HEVC 4:2:0 8-bit not found in host probe results"
+        );
+        assert!(
+            hevc.unwrap().is_encode_supported(),
+            "HEVC 4:2:0 8-bit encode should be supported; got: {:?}",
+            hevc.unwrap().encode
+        );
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_client_includes_h264_decode() {
+        let profiles = client_supported_profiles();
+        let h264 = profiles.iter().find(|s| {
+            s.profile.codec == tether_protocol::control::CodecKind::H264
+                && s.profile.bit_depth == 8
+        });
+        assert!(
+            h264.is_some(),
+            "H.264 8-bit not found in client probe results"
+        );
+        assert!(
+            h264.unwrap().is_decode_supported(),
+            "H.264 8-bit decode should be supported; got: {:?}",
+            h264.unwrap().decode
+        );
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_client_includes_hevc_420_decode() {
+        let profiles = client_supported_profiles();
+        let hevc = profiles.iter().find(|s| {
+            s.profile.codec == tether_protocol::control::CodecKind::Hevc
+                && s.profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv420
+                && s.profile.bit_depth == 8
+        });
+        assert!(
+            hevc.is_some(),
+            "HEVC 4:2:0 8-bit not found in client probe results"
+        );
+        assert!(
+            hevc.unwrap().is_decode_supported(),
+            "HEVC 4:2:0 8-bit decode should be supported; got: {:?}",
+            hevc.unwrap().decode
+        );
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_host_and_client_intersect_on_at_least_one_profile() {
+        let host = host_encode_profiles();
+        let client: Vec<_> = client_supported_profiles()
+            .iter()
+            .filter(|s| s.is_decode_supported())
+            .map(|s| s.profile)
+            .collect();
+        let intersection = host.iter().any(|p| client.contains(p));
+        assert!(
+            intersection,
+            "host and client must share at least one profile for sessions to work.\n\
+             host encode: {host:?}\n\
+             client decode: {client:?}"
+        );
     }
 }

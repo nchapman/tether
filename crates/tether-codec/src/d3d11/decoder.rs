@@ -127,6 +127,14 @@ impl D3D11Decoder {
         })
     }
 
+    /// Signal end-of-stream so the decoder emits any buffered frames.
+    /// D3D11VA's wrapper (like VideoToolbox) holds a single-IDR submit
+    /// until either another packet arrives or EOF is signalled.
+    pub fn signal_eof(&mut self) -> Result<()> {
+        self.decoder.send_packet(None)?;
+        Ok(())
+    }
+
     /// Export a D3D11VA surface as `Frame::Gpu` with per-plane shared
     /// handles. Copies each NV12 plane (Y and UV) from the decode pool
     /// into separate MISC_SHARED staging textures, entirely on the GPU.

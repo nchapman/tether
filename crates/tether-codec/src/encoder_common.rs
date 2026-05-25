@@ -104,26 +104,28 @@ pub(crate) fn snapshot_extradata(
     Ok(ensure_annexb_extradata(extradata, codec_kind))
 }
 
-/// Normalize HEVC extradata to Annex-B format. Some encoders (notably
-/// D3D11VA/AMF on Windows) emit extradata in hvcC container format
-/// (ISO 14496-15 length-prefixed NALUs) rather than Annex-B. This
-/// function detects hvcC and converts to Annex-B so downstream code
-/// (SPS parser, decoder) gets a consistent format.
+/// Normalize codec extradata to Annex-B format. Some encoders (notably
+/// D3D11VA/AMF on Windows) emit extradata in container format — hvcC for
+/// HEVC, avcC for H.264 (both ISO 14496-15, length-prefixed NALUs) —
+/// rather than Annex-B. This function detects container format and
+/// converts to Annex-B so downstream code (SPS parser, decoder) gets a
+/// consistent format.
 ///
-/// H.264 and AV1 extradata is passed through unchanged — H.264 encoders
-/// universally emit Annex-B, and AV1 uses OBU framing (not handled here).
-/// Already-Annex-B HEVC data is also passed through unchanged.
+/// AV1 extradata uses OBU framing (not handled here) and is passed
+/// through unchanged. Already-Annex-B data is also passed through.
 pub(crate) fn ensure_annexb_extradata(extradata: Vec<u8>, codec_kind: CodecKind) -> Vec<u8> {
-    if codec_kind != CodecKind::Hevc {
+    if codec_kind == CodecKind::Av1 {
         return extradata;
     }
     if is_annexb(&extradata) {
         return extradata;
     }
-    match hvcc_to_annexb(&extradata) {
-        Some(annexb) => annexb,
-        None => extradata,
-    }
+    let converted = match codec_kind {
+        CodecKind::Hevc => hvcc_to_annexb(&extradata),
+        CodecKind::H264 => avcc_to_annexb(&extradata),
+        CodecKind::Av1 => None,
+    };
+    converted.unwrap_or(extradata)
 }
 
 /// Check if data starts with an Annex-B start code.
@@ -169,6 +171,65 @@ fn hvcc_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
             }
             pos += nalu_len;
         }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parse an AVCDecoderConfigurationRecord (avcC) and convert to Annex-B.
+/// Returns None if the data doesn't look like valid avcC.
+/// ISO 14496-15 §5.3.3.1.
+fn avcc_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
+    // Minimum avcC: 6 bytes header + at least one SPS entry.
+    if data.len() < 7 {
+        return None;
+    }
+    // configurationVersion must be 1.
+    if data[0] != 1 {
+        return None;
+    }
+    // Byte 5 lower 5 bits = numOfSequenceParameterSets.
+    let num_sps = (data[5] & 0x1F) as usize;
+    let mut out = Vec::with_capacity(data.len());
+    let mut pos = 6;
+    // Read SPS entries.
+    for _ in 0..num_sps {
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + nalu_len > data.len() {
+            return None;
+        }
+        if nalu_len > 0 {
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            out.extend_from_slice(&data[pos..pos + nalu_len]);
+        }
+        pos += nalu_len;
+    }
+    // numOfPictureParameterSets.
+    if pos >= data.len() {
+        return if out.is_empty() { None } else { Some(out) };
+    }
+    let num_pps = data[pos] as usize;
+    pos += 1;
+    for _ in 0..num_pps {
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + nalu_len > data.len() {
+            return None;
+        }
+        if nalu_len > 0 {
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            out.extend_from_slice(&data[pos..pos + nalu_len]);
+        }
+        pos += nalu_len;
     }
     if out.is_empty() {
         return None;
@@ -330,10 +391,62 @@ mod tests {
     }
 
     #[test]
-    fn ensure_annexb_passthrough_for_h264() {
-        let data = vec![1, 2, 3, 4, 5]; // arbitrary bytes
+    fn ensure_annexb_passthrough_for_already_annexb_h264() {
+        let data = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e];
         let result = ensure_annexb_extradata(data.clone(), CodecKind::H264);
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn avcc_to_annexb_converts_known_record() {
+        // Synthetic avcC: version=1, profile=66, compat=0, level=30,
+        // lengthSizeMinusOne=3, 1 SPS, 1 PPS
+        let sps = [0x67, 0x42, 0x00, 0x1e, 0xab]; // NAL type 7 (SPS)
+        let pps = [0x68, 0xce, 0x38, 0x80]; // NAL type 8 (PPS)
+
+        let mut avcc = Vec::new();
+        avcc.push(1); // configurationVersion
+        avcc.push(66); // AVCProfileIndication (Baseline)
+        avcc.push(0); // profile_compatibility
+        avcc.push(30); // AVCLevelIndication
+        avcc.push(0xFF); // lengthSizeMinusOne=3 (lower 2 bits) + reserved
+        avcc.push(0xE1); // numSPS=1 (lower 5 bits) + reserved
+        // SPS
+        avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        avcc.extend_from_slice(&sps);
+        // numPPS
+        avcc.push(1);
+        // PPS
+        avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        avcc.extend_from_slice(&pps);
+
+        let annexb = avcc_to_annexb(&avcc).expect("should parse valid avcC");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        expected.extend_from_slice(&sps);
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        expected.extend_from_slice(&pps);
+        assert_eq!(annexb, expected);
+    }
+
+    #[test]
+    fn avcc_to_annexb_rejects_truncated() {
+        assert_eq!(avcc_to_annexb(&[1, 66, 0, 30, 0xFF]), None); // too short
+    }
+
+    #[test]
+    fn ensure_annexb_converts_avcc_h264() {
+        // Build a minimal avcC with one SPS
+        let sps = [0x67, 0x42, 0x00, 0x1e];
+        let mut avcc = vec![1, 66, 0, 30, 0xFF, 0xE1];
+        avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        avcc.extend_from_slice(&sps);
+        avcc.push(0); // 0 PPS
+
+        let result = ensure_annexb_extradata(avcc, CodecKind::H264);
+        assert!(is_annexb(&result), "result should be Annex-B");
+        assert_eq!(&result[4..], &sps);
     }
 
     #[test]

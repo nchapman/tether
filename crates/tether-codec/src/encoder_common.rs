@@ -125,7 +125,18 @@ pub(crate) fn ensure_annexb_extradata(extradata: Vec<u8>, codec_kind: CodecKind)
         CodecKind::H264 => avcc_to_annexb(&extradata),
         CodecKind::Av1 => None,
     };
-    converted.unwrap_or(extradata)
+    match converted {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                codec = ?codec_kind,
+                len = extradata.len(),
+                "extradata is neither Annex-B nor recognisable container format; \
+                 passing through unchanged — decoder may reject it"
+            );
+            extradata
+        }
+    }
 }
 
 /// Check if data starts with an Annex-B start code.
@@ -210,9 +221,10 @@ fn avcc_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
         }
         pos += nalu_len;
     }
-    // numOfPictureParameterSets.
+    // numOfPictureParameterSets — truncated before PPS count means
+    // incomplete record (decoder needs both SPS and PPS).
     if pos >= data.len() {
-        return if out.is_empty() { None } else { Some(out) };
+        return None;
     }
     let num_pps = data[pos] as usize;
     pos += 1;

@@ -477,4 +477,58 @@ mod tests {
         assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
         assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
     }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU with H.264 encode (Windows)"]
+    fn d3d11_h264_extradata_is_valid_annexb() {
+        use crate::bitstream_sps::parse_sps_chroma_bit_depth;
+        use tether_protocol::control::CodecKind;
+
+        let mut enc = D3D11Encoder::new(
+            h264_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .expect("H.264 encoder construction");
+
+        let bgra = vec![128u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
+
+        let mut keyframe = None;
+        for pts in 0..30 {
+            let pkts = enc
+                .encode_bgra(&bgra, pts, pts == 0)
+                .expect("encode_bgra");
+            for pkt in pkts {
+                if pkt.keyframe {
+                    keyframe = Some(pkt);
+                    break;
+                }
+            }
+            if keyframe.is_some() {
+                break;
+            }
+        }
+        let kf = keyframe.expect("encoder produced no keyframe after 30 frames");
+
+        assert!(
+            kf.data.starts_with(&[0x00, 0x00, 0x00, 0x01])
+                || kf.data.starts_with(&[0x00, 0x00, 0x01]),
+            "keyframe does not start with Annex-B start code: {:02x?}",
+            &kf.data[..kf.data.len().min(8)]
+        );
+
+        let sps = parse_sps_chroma_bit_depth(&kf.data, CodecKind::H264);
+        assert!(
+            sps.is_some(),
+            "SPS parser could not find valid SPS in H.264 keyframe — \
+             extradata format conversion may have failed"
+        );
+        let sps = sps.unwrap();
+        assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
+        assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
+    }
 }

@@ -470,6 +470,16 @@ impl Encoder for D3D11Encoder {
     }
 }
 
+impl D3D11Encoder {
+    /// Flush the encoder so AMF's hardware session is idle before the
+    /// context is destroyed. Without this, AMF's async session cleanup
+    /// may cause subsequent encoder construction to fail with a
+    /// single-session-limit error.
+    pub fn shutdown(&mut self) {
+        self.encoder.flush_buffers();
+    }
+}
+
 /// Create an FFmpeg `d3d11va` hardware device context.
 ///
 /// When `device_ptr` is non-null, injects the capture-created device

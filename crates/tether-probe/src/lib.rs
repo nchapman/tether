@@ -214,7 +214,25 @@ fn probe_host() -> Vec<ProfileSupport> {
     use host::ActiveProbe;
     use profile_probe::{fixture_for, ProfileProbe};
 
-    PROFILE_PREFERENCE
+    // On Windows/AMF, the encoder has a single-session limit and releases
+    // asynchronously on drop. Probe H.264 first so the floor codec always
+    // gets a fresh session; higher profiles can fail without breaking
+    // negotiation. Probe order doesn't affect negotiation priority (that's
+    // PROFILE_PREFERENCE in pick_supported_profile).
+    #[cfg(target_os = "windows")]
+    let probe_order = {
+        let mut order: Vec<_> = PROFILE_PREFERENCE.to_vec();
+        // Move H.264 to front.
+        if let Some(pos) = order.iter().position(|p| p.codec == tether_protocol::control::CodecKind::H264) {
+            let h264 = order.remove(pos);
+            order.insert(0, h264);
+        }
+        order
+    };
+    #[cfg(not(target_os = "windows"))]
+    let probe_order = PROFILE_PREFERENCE.to_vec();
+
+    probe_order
         .iter()
         .copied()
         .map(|profile| {

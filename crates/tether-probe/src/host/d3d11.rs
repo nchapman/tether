@@ -43,10 +43,27 @@ fn probe_encode_inner(profile: VideoProfile) -> Result<()> {
     .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
 
     let bgra = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
-    let _ = enc
-        .encode_bgra(&bgra, 0, true)
-        .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
-    Ok(())
+    let mut success = false;
+    for pts in 0i64..8 {
+        let pkts = enc
+            .encode_bgra(&bgra, pts, pts == 0)
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
+        if !pkts.is_empty() {
+            success = true;
+            break;
+        }
+    }
+    // Drain the encoder so AMF's hardware session is fully released
+    // before the next profile's probe tries to construct one.
+    enc.shutdown();
+    if success {
+        Ok(())
+    } else {
+        Err(ProbeError::new(
+            PipelineStage::Submit,
+            "encoder produced no packets after 8 frames",
+        ))
+    }
 }
 
 fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
@@ -58,6 +75,10 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
     // arrives (same as VideoToolbox). Signal EOF to drain.
     dec.signal_eof()
         .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
+    // Accept Frame::Cpu: D3D11Decoder::next_frame currently always
+    // downloads to CPU (GPU export pending Vulkan external-memory
+    // support). Tighten to require Frame::Gpu when GPU export lands,
+    // matching the VAAPI/VideoToolbox probe contract.
     for _ in 0..4 {
         match dec
             .next_frame()

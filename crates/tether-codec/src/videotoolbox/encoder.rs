@@ -282,7 +282,7 @@ impl VideoToolboxEncoder {
         // `extradata` so we can prepend it to every keyframe at drain
         // time. See `encoder_common` for the contract — an empty
         // extradata here is fatal (would break self-decodable IDRs).
-        let extradata = snapshot_extradata(&encoder, vt_codec_name(kind))?;
+        let extradata = snapshot_extradata(&encoder, vt_codec_name(kind), kind)?;
 
         Ok(Self {
             kind,

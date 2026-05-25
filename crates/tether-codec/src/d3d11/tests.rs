@@ -420,4 +420,61 @@ mod tests {
             "packet too small to contain HEVC NALUs"
         );
     }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows)"]
+    fn d3d11_hevc_extradata_is_valid_annexb() {
+        use crate::bitstream_sps::parse_sps_chroma_bit_depth;
+        use tether_protocol::control::CodecKind;
+
+        let mut enc = D3D11Encoder::new(
+            hevc_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .expect("HEVC encoder construction");
+
+        let bgra = vec![128u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
+
+        let mut keyframe = None;
+        for pts in 0..30 {
+            let pkts = enc
+                .encode_bgra(&bgra, pts, pts == 0)
+                .expect("encode_bgra");
+            for pkt in pkts {
+                if pkt.keyframe {
+                    keyframe = Some(pkt);
+                    break;
+                }
+            }
+            if keyframe.is_some() {
+                break;
+            }
+        }
+        let kf = keyframe.expect("encoder produced no keyframe after 30 frames");
+
+        // Keyframe data must start with Annex-B start code (extradata was
+        // converted from hvcC if needed by snapshot_extradata).
+        assert!(
+            kf.data.starts_with(&[0x00, 0x00, 0x00, 0x01])
+                || kf.data.starts_with(&[0x00, 0x00, 0x01]),
+            "keyframe does not start with Annex-B start code: {:02x?}",
+            &kf.data[..kf.data.len().min(8)]
+        );
+
+        // SPS parser must be able to extract chroma + bit_depth.
+        let sps = parse_sps_chroma_bit_depth(&kf.data, CodecKind::Hevc);
+        assert!(
+            sps.is_some(),
+            "SPS parser could not find valid SPS in HEVC keyframe — \
+             extradata format conversion may have failed"
+        );
+        let sps = sps.unwrap();
+        assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
+        assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
+    }
 }

@@ -1,5 +1,5 @@
 //! Bits of encoder logic shared between every hardware backend
-//! (VAAPI on Linux, VideoToolbox on macOS, future NVENC/QSV/…).
+//! (VAAPI on Linux, VideoToolbox on macOS, D3D11VA on Windows).
 //!
 //! Right now the only resident is `drain_encoder`, which yields all
 //! packets currently buffered in an `AVCodecContext` and prepends the
@@ -18,6 +18,7 @@ use bytes::{Bytes, BytesMut};
 use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
+use tether_protocol::control::CodecKind;
 
 use crate::{CodecError, EncodedPacket, Result};
 
@@ -77,7 +78,11 @@ pub(crate) fn drain_encoder(
 /// owned buffer immediately prevents any subsequent encoder operation
 /// from racing with our read.
 #[allow(clippy::cast_sign_loss)]
-pub(crate) fn snapshot_extradata(encoder: &AVCodecContext, codec_name: &str) -> Result<Vec<u8>> {
+pub(crate) fn snapshot_extradata(
+    encoder: &AVCodecContext,
+    codec_name: &str,
+    codec_kind: CodecKind,
+) -> Result<Vec<u8>> {
     let extradata = unsafe {
         let raw = encoder.extradata;
         let size = encoder.extradata_size;
@@ -96,7 +101,79 @@ pub(crate) fn snapshot_extradata(encoder: &AVCodecContext, codec_name: &str) -> 
              AV_CODEC_FLAG_GLOBAL_HEADER for this codec."
         )));
     }
-    Ok(extradata)
+    Ok(ensure_annexb_extradata(extradata, codec_kind))
+}
+
+/// Normalize HEVC extradata to Annex-B format. Some encoders (notably
+/// D3D11VA/AMF on Windows) emit extradata in hvcC container format
+/// (ISO 14496-15 length-prefixed NALUs) rather than Annex-B. This
+/// function detects hvcC and converts to Annex-B so downstream code
+/// (SPS parser, decoder) gets a consistent format.
+///
+/// H.264 and AV1 extradata is passed through unchanged — H.264 encoders
+/// universally emit Annex-B, and AV1 uses OBU framing (not handled here).
+/// Already-Annex-B HEVC data is also passed through unchanged.
+pub(crate) fn ensure_annexb_extradata(extradata: Vec<u8>, codec_kind: CodecKind) -> Vec<u8> {
+    if codec_kind != CodecKind::Hevc {
+        return extradata;
+    }
+    if is_annexb(&extradata) {
+        return extradata;
+    }
+    match hvcc_to_annexb(&extradata) {
+        Some(annexb) => annexb,
+        None => extradata,
+    }
+}
+
+/// Check if data starts with an Annex-B start code.
+fn is_annexb(data: &[u8]) -> bool {
+    (data.len() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+        || (data.len() >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1)
+}
+
+/// Parse an HEVCDecoderConfigurationRecord (hvcC) and convert to Annex-B.
+/// Returns None if the data doesn't look like valid hvcC.
+fn hvcc_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
+    // Minimum hvcC header is 23 bytes.
+    if data.len() < 23 {
+        return None;
+    }
+    // configurationVersion must be 1.
+    if data[0] != 1 {
+        return None;
+    }
+    let num_arrays = data[22] as usize;
+    let mut out = Vec::with_capacity(data.len());
+    let mut pos = 23;
+    for _ in 0..num_arrays {
+        if pos + 3 > data.len() {
+            return None;
+        }
+        let _nal_type = data[pos] & 0x3F;
+        pos += 1;
+        let num_nalus = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        for _ in 0..num_nalus {
+            if pos + 2 > data.len() {
+                return None;
+            }
+            let nalu_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + nalu_len > data.len() {
+                return None;
+            }
+            if nalu_len > 0 {
+                out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+                out.extend_from_slice(&data[pos..pos + nalu_len]);
+            }
+            pos += nalu_len;
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
 }
 
 /// Static debug label for `CodecError::ScalerInit`, keyed off the
@@ -124,10 +201,6 @@ mod tests {
 
     #[test]
     fn pix_fmt_scaler_label_covers_every_sw_format_in_use() {
-        // Every format any `*_sw_format` function in the codec backends
-        // returns must produce a specific label — not the generic
-        // fallback. If you add a new sw_format to a backend, add the
-        // case here too.
         for (fmt, expected) in [
             (ffi::AV_PIX_FMT_NV12, "BGRA -> NV12"),
             (ffi::AV_PIX_FMT_P010LE, "BGRA -> P010"),
@@ -143,5 +216,213 @@ mod tests {
     #[test]
     fn pix_fmt_scaler_label_falls_back_for_unknown_format() {
         assert_eq!(pix_fmt_scaler_label(-1), "BGRA -> sw_format");
+    }
+
+    #[test]
+    fn is_annexb_detects_4byte_start_code() {
+        assert!(is_annexb(&[0x00, 0x00, 0x00, 0x01, 0x67]));
+    }
+
+    #[test]
+    fn is_annexb_detects_3byte_start_code() {
+        assert!(is_annexb(&[0x00, 0x00, 0x01, 0x67]));
+    }
+
+    #[test]
+    fn is_annexb_rejects_hvcc() {
+        // hvcC starts with configurationVersion=1, not a start code
+        let mut hvcc = vec![0u8; 30];
+        hvcc[0] = 1; // configurationVersion
+        assert!(!is_annexb(&hvcc));
+    }
+
+    #[test]
+    fn is_annexb_rejects_empty() {
+        assert!(!is_annexb(&[]));
+        assert!(!is_annexb(&[0x00, 0x00]));
+    }
+
+    #[test]
+    fn hvcc_to_annexb_converts_known_record() {
+        // Construct a synthetic hvcC with one array containing two NALUs
+        // (simulating VPS + SPS in one array, which some encoders do).
+        let vps_nalu = [0x40, 0x01, 0x0C, 0x01]; // NAL type 32 (VPS)
+        let sps_nalu = [0x42, 0x01, 0x01, 0x02, 0x20]; // NAL type 33 (SPS)
+
+        let mut hvcc = vec![0u8; 23];
+        hvcc[0] = 1; // configurationVersion
+        hvcc[22] = 1; // numOfArrays = 1
+
+        // Array 0: type VPS (32), 2 NALUs
+        hvcc.push(0x20); // completeness=0, nal_unit_type=32
+        hvcc.extend_from_slice(&(2u16).to_be_bytes()); // numNalus = 2
+        // NALU 1 (VPS)
+        hvcc.extend_from_slice(&(vps_nalu.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(&vps_nalu);
+        // NALU 2 (SPS)
+        hvcc.extend_from_slice(&(sps_nalu.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(&sps_nalu);
+
+        let annexb = hvcc_to_annexb(&hvcc).expect("should parse valid hvcC");
+
+        // Expected: start_code + VPS + start_code + SPS
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        expected.extend_from_slice(&vps_nalu);
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        expected.extend_from_slice(&sps_nalu);
+
+        assert_eq!(annexb, expected);
+    }
+
+    #[test]
+    fn hvcc_to_annexb_handles_multiple_arrays() {
+        // Three arrays: VPS, SPS, PPS (common hvcC layout)
+        let vps = [0x40, 0x01, 0x0C];
+        let sps = [0x42, 0x01, 0x01, 0x02];
+        let pps = [0x44, 0x01, 0xC0];
+
+        let mut hvcc = vec![0u8; 23];
+        hvcc[0] = 1;
+        hvcc[22] = 3; // numOfArrays = 3
+
+        // Array 0: VPS
+        hvcc.push(0x20);
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&(vps.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(&vps);
+        // Array 1: SPS
+        hvcc.push(0x21);
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(&sps);
+        // Array 2: PPS
+        hvcc.push(0x22);
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(&pps);
+
+        let annexb = hvcc_to_annexb(&hvcc).expect("should parse valid hvcC");
+
+        let mut expected = Vec::new();
+        for nalu in [&vps[..], &sps[..], &pps[..]] {
+            expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            expected.extend_from_slice(nalu);
+        }
+        assert_eq!(annexb, expected);
+    }
+
+    #[test]
+    fn hvcc_to_annexb_rejects_truncated_record() {
+        assert_eq!(hvcc_to_annexb(&[1; 10]), None); // too short for header
+        // Header says 1 array but no array data follows
+        let mut hvcc = vec![0u8; 23];
+        hvcc[0] = 1;
+        hvcc[22] = 1;
+        assert_eq!(hvcc_to_annexb(&hvcc), None);
+    }
+
+    #[test]
+    fn hvcc_to_annexb_rejects_wrong_version() {
+        let mut data = vec![0u8; 30];
+        data[0] = 2; // wrong version
+        assert_eq!(hvcc_to_annexb(&data), None);
+    }
+
+    #[test]
+    fn ensure_annexb_passthrough_for_h264() {
+        let data = vec![1, 2, 3, 4, 5]; // arbitrary bytes
+        let result = ensure_annexb_extradata(data.clone(), CodecKind::H264);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn ensure_annexb_passthrough_for_already_annexb_hevc() {
+        let data = vec![0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0C];
+        let result = ensure_annexb_extradata(data.clone(), CodecKind::Hevc);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn ensure_annexb_converts_hvcc_hevc() {
+        // Build a minimal hvcC with one VPS NALU
+        let vps = [0x40, 0x01, 0x0C, 0x01, 0xFF];
+        let mut hvcc = vec![0u8; 23];
+        hvcc[0] = 1;
+        hvcc[22] = 1;
+        hvcc.push(0x20);
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&(vps.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(&vps);
+
+        let result = ensure_annexb_extradata(hvcc, CodecKind::Hevc);
+        assert!(is_annexb(&result), "result should be Annex-B");
+        // Should contain start code + VPS bytes
+        assert_eq!(&result[0..4], &[0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(&result[4..], &vps);
+    }
+
+    #[test]
+    fn converted_hvcc_is_parseable_by_sps_parser() {
+        // Use the real HEVC fixture to build a synthetic hvcC, then verify
+        // the converted output still parses. We'll grab the NALUs from the
+        // fixture (which is already Annex-B) and wrap them in hvcC format.
+        let fixture = include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv420_8bit.idr");
+
+        // Extract NALUs from the Annex-B fixture
+        let mut nalus: Vec<&[u8]> = Vec::new();
+        let mut i = 0;
+        let mut starts: Vec<usize> = Vec::new();
+        while i + 3 <= fixture.len() {
+            if fixture[i] == 0 && fixture[i + 1] == 0 {
+                if fixture[i + 2] == 1 {
+                    starts.push(i + 3);
+                    i += 3;
+                    continue;
+                }
+                if i + 4 <= fixture.len() && fixture[i + 2] == 0 && fixture[i + 3] == 1 {
+                    starts.push(i + 4);
+                    i += 4;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        for (idx, &start) in starts.iter().enumerate() {
+            let end = starts.get(idx + 1).map(|&s| {
+                // back up past trailing zeros before next start code
+                let mut e = s;
+                while e > start && fixture[e - 1] == 0 { e -= 1; }
+                e
+            }).unwrap_or(fixture.len());
+            nalus.push(&fixture[start..end]);
+        }
+
+        // Build hvcC from these NALUs (one array per NALU for simplicity)
+        let mut hvcc = vec![0u8; 23];
+        hvcc[0] = 1; // configurationVersion
+        hvcc[22] = nalus.len() as u8; // numOfArrays
+        for nalu in &nalus {
+            let nal_type = if !nalu.is_empty() { (nalu[0] >> 1) & 0x3F } else { 0 };
+            hvcc.push(nal_type);
+            hvcc.extend_from_slice(&1u16.to_be_bytes());
+            hvcc.extend_from_slice(&(nalu.len() as u16).to_be_bytes());
+            hvcc.extend_from_slice(nalu);
+        }
+
+        let converted = ensure_annexb_extradata(hvcc, CodecKind::Hevc);
+        assert!(is_annexb(&converted));
+
+        // The SPS parser should find the SPS and extract chroma+bit_depth
+        let parsed = crate::bitstream_sps::parse_sps_chroma_bit_depth(
+            &converted, CodecKind::Hevc
+        );
+        assert!(
+            parsed.is_some(),
+            "converted hvcC should be parseable as Annex-B HEVC"
+        );
+        let sps = parsed.unwrap();
+        assert_eq!(sps.chroma_format_idc, 1); // 4:2:0
+        assert_eq!(sps.bit_depth_luma, 8);
     }
 }

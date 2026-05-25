@@ -51,7 +51,7 @@ use std::sync::OnceLock;
 
 use tether_protocol::control::VideoProfile;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod host;
 mod preference;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -209,7 +209,7 @@ pub fn client_decode_profiles() -> Vec<VideoProfile> {
 /// [`profile_probe::ProbeError`] carries the [`PipelineStage`] tag
 /// for each rejection, so a log dump names exactly which stage
 /// rejected each profile.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn probe_host() -> Vec<ProfileSupport> {
     use host::ActiveProbe;
     use profile_probe::{fixture_for, ProfileProbe};
@@ -266,60 +266,6 @@ fn probe_host() -> Vec<ProfileSupport> {
         .collect()
 }
 
-#[cfg(target_os = "windows")]
-fn probe_host() -> Vec<ProfileSupport> {
-    use crate::profile_probe::fixture_for;
-    use tether_protocol::control::CodecKind;
-
-    PROFILE_PREFERENCE
-        .iter()
-        .copied()
-        .map(|profile| {
-            // HEVC VPS/SPS parsing fails on the decode side when the
-            // stream passes through the fragmenter (works in direct
-            // roundtrip tests). H.264 works end-to-end. Hold out HEVC
-            // until the transport-layer interaction is debugged.
-            let encode = if profile.codec != tether_protocol::control::CodecKind::H264 {
-                SupportStatus::Unsupported {
-                    stage: PipelineStage::Construct,
-                    reason: "HEVC held out: VPS parse fails through fragmenter on Windows".into(),
-                }
-            } else {
-                match tether_codec::build_encoder(profile, 128, 128, 30, 1000) {
-                    Ok(_) => SupportStatus::Supported,
-                    Err(e) => SupportStatus::Unsupported {
-                        stage: PipelineStage::Construct,
-                        reason: format!("{e}"),
-                    },
-                }
-            };
-            let decode = match fixture_for(profile) {
-                Some(fixture) => match tether_codec::build_decoder(profile) {
-                    Ok(mut dec) => {
-                        use tether_codec::Decoder;
-                        match dec.submit(fixture) {
-                            Ok(()) => SupportStatus::Supported,
-                            Err(e) => SupportStatus::Unsupported {
-                                stage: PipelineStage::Decode,
-                                reason: format!("{e}"),
-                            },
-                        }
-                    }
-                    Err(e) => SupportStatus::Unsupported {
-                        stage: PipelineStage::Construct,
-                        reason: format!("{e}"),
-                    },
-                },
-                None => SupportStatus::Unsupported {
-                    stage: PipelineStage::Decode,
-                    reason: format!("no fixture for {profile:?}"),
-                },
-            };
-            ProfileSupport { profile, encode, decode }
-        })
-        .collect()
-}
-
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn probe_host() -> Vec<ProfileSupport> {
     PROFILE_PREFERENCE
@@ -346,7 +292,7 @@ fn probe_host() -> Vec<ProfileSupport> {
 /// decode half of the trait per profile, and report encode as
 /// `Unsupported{Construct, "client-side encode not probed"}` — callers
 /// asking the client about encode are asking the wrong question.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn probe_client() -> Vec<ProfileSupport> {
     use host::ActiveProbe;
     use profile_probe::{fixture_for, ProfileProbe};
@@ -358,72 +304,24 @@ fn probe_client() -> Vec<ProfileSupport> {
             let decode = match fixture_for(profile) {
                 Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
                     Ok(()) => SupportStatus::Supported,
-                    Err(e) => SupportStatus::Unsupported {
-                        stage: e.stage,
-                        reason: e.reason,
-                    },
+                    Err(e) => {
+                        tracing::debug!(
+                            ?profile,
+                            stage = ?e.stage,
+                            reason = %e.reason,
+                            "client decode probe rejected profile"
+                        );
+                        SupportStatus::Unsupported {
+                            stage: e.stage,
+                            reason: e.reason,
+                        }
+                    }
                 },
                 None => SupportStatus::Unsupported {
                     stage: PipelineStage::Decode,
                     reason: format!(
                         "no decode fixture shipped for {profile:?}; \
                          add a fixture and extend fixture_for"
-                    ),
-                },
-            };
-            ProfileSupport {
-                profile,
-                encode: SupportStatus::Unsupported {
-                    stage: PipelineStage::Construct,
-                    reason: "client-side encode not probed".into(),
-                },
-                decode,
-            }
-        })
-        .collect()
-}
-
-#[cfg(target_os = "windows")]
-fn probe_client() -> Vec<ProfileSupport> {
-    use crate::profile_probe::fixture_for;
-
-    PROFILE_PREFERENCE
-        .iter()
-        .copied()
-        .map(|profile| {
-            let decode = match fixture_for(profile) {
-                Some(fixture) => {
-                    match tether_codec::build_decoder(profile) {
-                        Ok(mut dec) => {
-                            use tether_codec::Decoder;
-                            match dec.submit(fixture) {
-                                Ok(()) => {
-                                    // Try to pull a frame — success means decode works.
-                                    match dec.next_frame() {
-                                        Ok(Some(_)) => SupportStatus::Supported,
-                                        Ok(None) => SupportStatus::Supported,
-                                        Err(e) => SupportStatus::Unsupported {
-                                            stage: PipelineStage::Decode,
-                                            reason: format!("decode frame failed: {e}"),
-                                        },
-                                    }
-                                }
-                                Err(e) => SupportStatus::Unsupported {
-                                    stage: PipelineStage::Decode,
-                                    reason: format!("submit failed: {e}"),
-                                },
-                            }
-                        }
-                        Err(e) => SupportStatus::Unsupported {
-                            stage: PipelineStage::Construct,
-                            reason: format!("decoder construction failed: {e}"),
-                        },
-                    }
-                }
-                None => SupportStatus::Unsupported {
-                    stage: PipelineStage::Decode,
-                    reason: format!(
-                        "no decode fixture for {profile:?}"
                     ),
                 },
             };

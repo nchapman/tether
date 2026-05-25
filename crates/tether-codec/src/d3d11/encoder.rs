@@ -270,7 +270,7 @@ impl D3D11Encoder {
         sw_frame.set_height(height_i32);
         sw_frame.alloc_buffer()?;
 
-        let extradata = snapshot_extradata(&encoder, backend_name)?;
+        let extradata = snapshot_extradata(&encoder, backend_name, kind)?;
         let bgra_row_bytes = (width as usize) * 4;
 
         Ok(Self {

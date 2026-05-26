@@ -231,6 +231,7 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
         let job = tether_decode::DecodeJob {
             body,
             host_in_client_clock: MonoNanos::now(),
+            keyframe: false,
         };
         let c = worker.process_job(job, MonoNanos::now());
         assert!(c.soft_failure, "warnings bump must classify as soft failure");

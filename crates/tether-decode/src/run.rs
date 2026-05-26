@@ -60,6 +60,10 @@ pub const NO_OUTPUT_WATCHDOG: Duration = Duration::from_millis(1500);
 pub struct DecodeJob {
     pub body: Bytes,
     pub host_in_client_clock: MonoNanos,
+    /// Whether this frame is a keyframe (IDR). Used by the worker to
+    /// skip non-IDR frames after a decoder rebuild — a fresh decoder
+    /// has no parameter sets and will fail on P-frames.
+    pub keyframe: bool,
 }
 
 /// Per-frame metrics shipped back from the decode thread to the recv
@@ -126,6 +130,11 @@ pub struct Worker {
     /// window? Prevents a stuck decoder from triggering a flush +
     /// IDR on every job — one shot per window, then escalate.
     watchdog_armed: bool,
+    /// Set after a decoder rebuild. While true, non-IDR frames are
+    /// discarded without submission — a freshly-built decoder has no
+    /// parameter sets and will fail on P-frames, burning through the
+    /// rebuild budget in a death spiral. Cleared on the first IDR.
+    awaiting_idr: bool,
 }
 
 impl Worker {
@@ -148,6 +157,7 @@ impl Worker {
             consecutive_failures: 0,
             last_successful_decode: None,
             watchdog_armed: false,
+            awaiting_idr: false,
         }
     }
 
@@ -158,6 +168,7 @@ impl Worker {
         self.decoder = new_decoder;
         self.consecutive_failures = 0;
         self.watchdog_armed = false;
+        self.awaiting_idr = true;
         // `last_successful_decode` stays as-is: the watchdog clock
         // shouldn't reset just because we rebuilt; if the rebuild
         // doesn't produce a frame either, we want the *original*
@@ -171,6 +182,26 @@ impl Worker {
     /// iteration. Tests supply a synthetic value to drive the rate
     /// limiter deterministically.
     pub fn process_job(&mut self, job: DecodeJob, now: MonoNanos) -> DecodeCompletion {
+        // After a rebuild, discard P-frames until an IDR arrives.
+        // A fresh decoder has no parameter sets; feeding it non-IDR
+        // data produces immediate "PPS id out of range" errors that
+        // burn through the rebuild budget.
+        //
+        // Detection: check both the wire-level `keyframe` flag AND
+        // the bitstream itself. Some encoders (AMF) don't set
+        // AV_PKT_FLAG_KEY on forced IDRs, so the wire flag can be
+        // false even when the bitstream IS a self-decodable IDR.
+        // drain_encoder prepends VPS/SPS/PPS extradata to every
+        // keyframe, so we detect IDRs by looking for Annex-B
+        // parameter sets at the start of the body.
+        if self.awaiting_idr {
+            if job.keyframe || body_starts_with_parameter_sets(&job.body) {
+                self.awaiting_idr = false;
+            } else {
+                return DecodeCompletion::default();
+            }
+        }
+
         // submit + drain. The trait swallows ffmpeg's drain/flushed
         // sentinels and returns them as `Ok(None)`, so any `Err` we
         // see here is a real decode failure — never a benign "need
@@ -496,4 +527,35 @@ pub fn run_thread_with_init(
             info!("decode thread exiting");
         })
         .expect("spawn tether-decode thread")
+}
+
+/// Check if a frame body starts with Annex-B parameter sets, indicating
+/// a self-decodable IDR. `drain_encoder` prepends extradata (VPS/SPS/PPS
+/// for HEVC, SPS/PPS for H.264) to every keyframe, so the first NALU
+/// will be a parameter set. This is more reliable than the wire-level
+/// `keyframe` flag, which some encoders (AMF) fail to set on forced IDRs.
+fn body_starts_with_parameter_sets(body: &[u8]) -> bool {
+    // Find the first NALU type after the Annex-B start code.
+    let nalu_byte = if body.len() >= 5
+        && body[0] == 0 && body[1] == 0 && body[2] == 0 && body[3] == 1
+    {
+        Some(body[4])
+    } else if body.len() >= 4
+        && body[0] == 0 && body[1] == 0 && body[2] == 1
+    {
+        Some(body[3])
+    } else {
+        None
+    };
+    let Some(b) = nalu_byte else { return false };
+    // HEVC: VPS = type 32, first byte = (32 << 1) | 0 = 0x40.
+    // NALU type is bits [6:1] of the first byte.
+    let hevc_type = (b >> 1) & 0x3F;
+    if hevc_type == 32 || hevc_type == 33 || hevc_type == 34 {
+        return true;
+    }
+    // H.264: SPS = type 7, PPS = type 8.
+    // NALU type is bits [4:0] of the first byte.
+    let h264_type = b & 0x1F;
+    h264_type == 7 || h264_type == 8
 }

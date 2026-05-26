@@ -46,6 +46,7 @@ fn job() -> DecodeJob {
     DecodeJob {
         body: Bytes::from_static(b"encoded-bytes"),
         host_in_client_clock: MonoNanos::now(),
+        keyframe: true,
     }
 }
 
@@ -331,6 +332,7 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
         .send(DecodeJob {
             body: Bytes::from_static(b"x"),
             host_in_client_clock: MonoNanos::now(),
+            keyframe: true,
         })
         .unwrap();
     let completion = tokio::task::spawn_blocking(move || {
@@ -627,4 +629,62 @@ fn watchdog_alone_escalates_after_two_silent_windows() {
         Some(tether_decode::RecoveryAction::Rebuild),
         "two silent watchdog windows must escalate to Rebuild"
     );
+}
+
+#[test]
+fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
+    // Build a decoder that always succeeds (returns one frame per submit).
+    let outcomes: Vec<FakeOutcome> = (0..10)
+        .map(|_| FakeOutcome::Solid { width: 8, height: 8, luma: 0x80 })
+        .collect();
+    let (mut worker, _idr_calls, _warnings, frames) = make_worker(FakeDecoder::new(outcomes));
+
+    // First job succeeds (establishes baseline).
+    let c = worker.process_job(job(), MonoNanos::now());
+    assert!(!c.decode_err);
+    assert!(frames.take().is_some(), "first frame should render");
+
+    // Simulate a rebuild by calling replace_decoder.
+    let rebuild_outcomes: Vec<FakeOutcome> = (0..10)
+        .map(|_| FakeOutcome::Solid { width: 8, height: 8, luma: 0x40 })
+        .collect();
+    worker.replace_decoder(Box::new(FakeDecoder::new(rebuild_outcomes)));
+
+    // P-frames (keyframe=false) should be silently dropped.
+    let p_frame = DecodeJob {
+        body: Bytes::from_static(b"p-frame-1"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: false,
+    };
+    let c = worker.process_job(p_frame, MonoNanos::now());
+    assert!(!c.decode_err, "skipped frames should not count as errors");
+    assert!(frames.take().is_none(), "P-frame after rebuild should not render");
+
+    let p_frame2 = DecodeJob {
+        body: Bytes::from_static(b"p-frame-2"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: false,
+    };
+    let _c = worker.process_job(p_frame2, MonoNanos::now());
+    assert!(frames.take().is_none(), "second P-frame after rebuild should not render");
+
+    // IDR (keyframe=true) clears the gate and decodes normally.
+    let idr = DecodeJob {
+        body: Bytes::from_static(b"idr-frame"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: true,
+    };
+    let c = worker.process_job(idr, MonoNanos::now());
+    assert!(!c.decode_err);
+    assert!(frames.take().is_some(), "IDR after rebuild should decode and render");
+
+    // Subsequent P-frames now work (gate cleared).
+    let p_after = DecodeJob {
+        body: Bytes::from_static(b"p-frame-after-idr"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: false,
+    };
+    let c = worker.process_job(p_after, MonoNanos::now());
+    assert!(!c.decode_err);
+    assert!(frames.take().is_some(), "P-frame after IDR should decode normally");
 }

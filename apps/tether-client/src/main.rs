@@ -574,6 +574,7 @@ async fn main() -> anyhow::Result<()> {
             let job = DecodeJob {
                 body: frame.body,
                 host_in_client_clock,
+                keyframe: frame.meta.keyframe,
             };
             if decode_job_tx.try_send(job).is_err() {
                 decode_queue_drops = decode_queue_drops.saturating_add(1);

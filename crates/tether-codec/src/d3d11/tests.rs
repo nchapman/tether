@@ -531,4 +531,111 @@ mod tests {
         assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
         assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
     }
+
+    /// Reproduce the live HEVC first-IDR failure: encode a keyframe,
+    /// submit ONLY that packet to a fresh decoder, signal EOF, and
+    /// verify a frame comes back. This isolates whether the decoder
+    /// can handle a single self-contained IDR (extradata + slice).
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows)"]
+    fn d3d11_hevc_single_idr_decode() {
+        let mut enc = D3D11Encoder::new(
+            hevc_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .expect("HEVC encoder construction");
+
+        let bgra = vec![128u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
+
+        let mut keyframe_data = None;
+        for pts in 0..30 {
+            let pkts = enc.encode_bgra(&bgra, pts, pts == 0).expect("encode");
+            for pkt in pkts {
+                if pkt.keyframe && keyframe_data.is_none() {
+                    keyframe_data = Some(pkt.data.clone());
+                }
+            }
+            if keyframe_data.is_some() {
+                break;
+            }
+        }
+        let kf = keyframe_data.expect("no keyframe produced");
+
+        // Dump first bytes for debugging
+        eprintln!("keyframe {} bytes, first 64: {:02x?}", kf.len(), &kf[..kf.len().min(64)]);
+
+        // Parse NALU types from the bitstream
+        let mut i = 0;
+        let mut nalu_types = Vec::new();
+        while i + 4 < kf.len() {
+            if kf[i] == 0 && kf[i + 1] == 0 && kf[i + 2] == 0 && kf[i + 3] == 1 {
+                let nalu_type = (kf[i + 4] >> 1) & 0x3F;
+                nalu_types.push(nalu_type);
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        eprintln!("NALU types in keyframe: {:?}", nalu_types);
+        assert!(
+            nalu_types.contains(&32),
+            "keyframe missing VPS (type 32); found types: {nalu_types:?}"
+        );
+        assert!(
+            nalu_types.contains(&33),
+            "keyframe missing SPS (type 33); found types: {nalu_types:?}"
+        );
+        assert!(
+            nalu_types.contains(&34),
+            "keyframe missing PPS (type 34); found types: {nalu_types:?}"
+        );
+
+        // Submit to a FRESH decoder (no prior state) and verify decode
+        let mut dec = D3D11Decoder::new(CodecKind::Hevc).expect("decoder");
+        dec.submit(&kf).expect("submit keyframe");
+        dec.signal_eof().expect("signal_eof");
+
+        let mut got_frame = false;
+        for _ in 0..8 {
+            if dec.next_frame().expect("next_frame").is_some() {
+                got_frame = true;
+                break;
+            }
+        }
+        assert!(got_frame, "decoder produced no frames from single IDR with VPS/SPS/PPS");
+    }
+
+    /// Verify the extradata stored in the encoder starts with VPS (type 32)
+    /// after the reordering fix. AMF emits SPS→PPS→VPS but we fix it to
+    /// VPS→SPS→PPS at snapshot time.
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows)"]
+    fn d3d11_hevc_extradata_starts_with_vps() {
+        let enc = D3D11Encoder::new(
+            hevc_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+        .expect("HEVC encoder construction");
+
+        let extradata = enc.extradata();
+        assert!(extradata.len() > 5, "extradata too short");
+        // Must start with Annex-B start code.
+        assert_eq!(&extradata[..4], &[0x00, 0x00, 0x00, 0x01]);
+        // First NALU must be VPS (type 32).
+        let nalu_type = (extradata[4] >> 1) & 0x3F;
+        assert_eq!(
+            nalu_type, 32,
+            "first NALU in extradata should be VPS (32), got {nalu_type}"
+        );
+    }
 }

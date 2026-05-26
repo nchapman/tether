@@ -117,26 +117,108 @@ pub(crate) fn ensure_annexb_extradata(extradata: Vec<u8>, codec_kind: CodecKind)
     if codec_kind == CodecKind::Av1 {
         return extradata;
     }
-    if is_annexb(&extradata) {
-        return extradata;
-    }
-    let converted = match codec_kind {
-        CodecKind::Hevc => hvcc_to_annexb(&extradata),
-        CodecKind::H264 => avcc_to_annexb(&extradata),
-        CodecKind::Av1 => None,
-    };
-    match converted {
-        Some(v) => v,
-        None => {
-            tracing::warn!(
-                codec = ?codec_kind,
-                len = extradata.len(),
-                "extradata is neither Annex-B nor recognisable container format; \
-                 passing through unchanged — decoder may reject it"
-            );
-            extradata
+    let annexb = if is_annexb(&extradata) {
+        extradata
+    } else {
+        let converted = match codec_kind {
+            CodecKind::Hevc => hvcc_to_annexb(&extradata),
+            CodecKind::H264 => avcc_to_annexb(&extradata),
+            CodecKind::Av1 => None,
+        };
+        match converted {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    codec = ?codec_kind,
+                    len = extradata.len(),
+                    "extradata is neither Annex-B nor recognisable container format; \
+                     passing through unchanged — decoder may reject it"
+                );
+                return extradata;
+            }
         }
+    };
+    // HEVC decoders require VPS before SPS before PPS. Some encoders
+    // (AMF) emit them in SPS→PPS→VPS order. Reorder if needed.
+    if codec_kind == CodecKind::Hevc {
+        reorder_hevc_parameter_sets(annexb)
+    } else {
+        annexb
     }
+}
+
+/// Reorder HEVC Annex-B NALUs so VPS (32) comes before SPS (33) before
+/// PPS (34). Some encoders (AMF) emit SPS→PPS→VPS; decoders require
+/// VPS first. Non-parameter-set NALUs keep their relative order.
+fn reorder_hevc_parameter_sets(data: Vec<u8>) -> Vec<u8> {
+    let nalus = split_annexb_nalus(&data);
+    if nalus.len() < 2 {
+        return data;
+    }
+    // Check if reordering is needed by finding the first VPS and SPS.
+    let first_vps = nalus.iter().position(|n| hevc_nalu_type(n) == 32);
+    let first_sps = nalus.iter().position(|n| hevc_nalu_type(n) == 33);
+    let needs_reorder = match (first_vps, first_sps) {
+        (Some(v), Some(s)) => v > s,
+        _ => false,
+    };
+    if !needs_reorder {
+        return data;
+    }
+    let mut sorted = nalus;
+    sorted.sort_by_key(|n| match hevc_nalu_type(n) {
+        32 => 0, // VPS first
+        33 => 1, // SPS second
+        34 => 2, // PPS third
+        _ => 3,  // everything else after
+    });
+    let mut out = Vec::with_capacity(data.len());
+    for nalu in &sorted {
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(nalu);
+    }
+    out
+}
+
+/// Split Annex-B byte stream into individual NALUs (without start codes).
+fn split_annexb_nalus(data: &[u8]) -> Vec<&[u8]> {
+    let mut nalus = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        // Find start code (3 or 4 bytes).
+        let sc_len = if i + 3 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+            4
+        } else if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+        let nalu_start = i + sc_len;
+        // Find next start code or end of data.
+        let mut end = nalu_start;
+        while end < data.len() {
+            if end + 3 <= data.len() && data[end] == 0 && data[end + 1] == 0
+                && (data[end + 2] == 1 || (end + 3 < data.len() && data[end + 2] == 0 && data[end + 3] == 1))
+            {
+                break;
+            }
+            end += 1;
+        }
+        if end > nalu_start {
+            nalus.push(&data[nalu_start..end]);
+        }
+        i = end;
+    }
+    nalus
+}
+
+/// Extract the HEVC NAL unit type from the first byte of a NALU body.
+fn hevc_nalu_type(nalu: &[u8]) -> u8 {
+    if nalu.is_empty() {
+        return 0;
+    }
+    (nalu[0] >> 1) & 0x3F
 }
 
 /// Check if data starts with an Annex-B start code.
@@ -147,27 +229,29 @@ fn is_annexb(data: &[u8]) -> bool {
 
 /// Parse an HEVCDecoderConfigurationRecord (hvcC) and convert to Annex-B.
 /// Returns None if the data doesn't look like valid hvcC.
+///
+/// AMF's hvcC may order arrays as SPS→PPS→VPS, but the decoder needs
+/// VPS before SPS. We sort arrays by NAL type (VPS=32 < SPS=33 < PPS=34)
+/// so the output is always VPS→SPS→PPS regardless of the hvcC order.
 fn hvcc_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
-    // Minimum hvcC header is 23 bytes.
     if data.len() < 23 {
         return None;
     }
-    // configurationVersion must be 1.
     if data[0] != 1 {
         return None;
     }
     let num_arrays = data[22] as usize;
-    let mut out = Vec::with_capacity(data.len());
+    let mut nalus: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut pos = 23;
     for _ in 0..num_arrays {
         if pos + 3 > data.len() {
             return None;
         }
-        let _nal_type = data[pos] & 0x3F;
+        let nal_type = data[pos] & 0x3F;
         pos += 1;
-        let num_nalus = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        let num_nalus_in_array = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
-        for _ in 0..num_nalus {
+        for _ in 0..num_nalus_in_array {
             if pos + 2 > data.len() {
                 return None;
             }
@@ -177,14 +261,20 @@ fn hvcc_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
             if nalu_len > 0 {
-                out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                out.extend_from_slice(&data[pos..pos + nalu_len]);
+                nalus.push((nal_type, data[pos..pos + nalu_len].to_vec()));
             }
             pos += nalu_len;
         }
     }
-    if out.is_empty() {
+    if nalus.is_empty() {
         return None;
+    }
+    // Sort by NAL type so VPS (32) comes before SPS (33) before PPS (34).
+    nalus.sort_by_key(|(t, _)| *t);
+    let mut out = Vec::with_capacity(data.len());
+    for (_, nalu) in &nalus {
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(nalu);
     }
     Some(out)
 }

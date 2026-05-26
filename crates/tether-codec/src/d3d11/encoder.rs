@@ -112,11 +112,25 @@ impl D3D11Encoder {
         init_ffmpeg();
 
         let kind = profile.codec;
-        let backends = match kind {
-            CodecKind::Hevc => HEVC_BACKENDS,
-            CodecKind::H264 => H264_BACKENDS,
-            CodecKind::Av1 => {
-                return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
+        let has_shared_device = !device_ptr.is_null();
+        let backends: &[&str] = if has_shared_device {
+            // When using a shared capture device, only try AMF. The MF/NVENC
+            // fallbacks create conflicting hw contexts that can trigger
+            // DXGI_ERROR_DEVICE_REMOVED on the shared device.
+            match kind {
+                CodecKind::Hevc => &["hevc_amf"],
+                CodecKind::H264 => &["h264_amf"],
+                CodecKind::Av1 => {
+                    return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
+                }
+            }
+        } else {
+            match kind {
+                CodecKind::Hevc => HEVC_BACKENDS,
+                CodecKind::H264 => H264_BACKENDS,
+                CodecKind::Av1 => {
+                    return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
+                }
             }
         };
 
@@ -477,6 +491,11 @@ impl D3D11Encoder {
     /// single-session-limit error.
     pub fn shutdown(&mut self) {
         self.encoder.flush_buffers();
+    }
+
+    #[cfg(test)]
+    pub fn extradata(&self) -> &[u8] {
+        &self.extradata
     }
 }
 

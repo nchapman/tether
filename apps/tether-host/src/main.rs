@@ -24,7 +24,9 @@ use tether_capture::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use tether_codec::GpuEncoderFrame;
-use tether_codec::{build_encoder, Encoder};
+#[cfg(not(target_os = "windows"))]
+use tether_codec::build_encoder;
+use tether_codec::Encoder;
 #[cfg(target_os = "windows")]
 use tether_codec::build_encoder_d3d11;
 #[cfg(target_os = "linux")]
@@ -165,6 +167,23 @@ async fn main() -> anyhow::Result<()> {
     // a hardcoded conservative profile set (the H.264 4:2:0 8-bit
     // floor) — the encoder still constructs lazily for that single
     // profile, so a broken-encoder host still fails loud.
+    // On Windows, pre-create the DXGI capture device BEFORE the codec
+    // probe. AMF's probe activity corrupts in-process DXGI output
+    // enumeration (EnumOutputs returns 0 outputs after AMF runs).
+    // The capture device is kept separate from the encoder device —
+    // AMF destroys any D3D11 device it touches on encoder drop.
+    #[cfg(target_os = "windows")]
+    if !use_test_pattern {
+        match tether_capture::windows::pre_create() {
+            Ok(pre) => {
+                *PRECREATED_CAPTURE.lock().unwrap() = Some(pre);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DXGI pre-create failed; capture will retry later");
+            }
+        }
+    }
+
     if !use_test_pattern {
         tokio::task::spawn_blocking(|| {
             let _ = tether_probe::host_supported_profiles();
@@ -2472,17 +2491,13 @@ fn run_capture_and_send(
                 derive_bitrate_kbps(chosen_profile, encode_width, encode_height, ENCODER_FPS);
             #[cfg(target_os = "windows")]
             let encoder_result = {
-                let (dev, ctx) = SHARED_D3D11_DEVICE
-                    .get()
-                    .map(|d| {
-                        use windows::core::Interface;
-                        (d.device.as_raw() as *mut std::ffi::c_void,
-                         d.context.as_raw() as *mut std::ffi::c_void)
-                    })
-                    .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
+                let dev = SHARED_D3D11_DEVICE.get()
+                    .expect("SHARED_D3D11_DEVICE must be set before encoder construction");
+                let (dev_ptr, ctx_ptr) = dev.device_ptrs();
                 build_encoder_d3d11(
                     chosen_profile, encode_width, encode_height,
-                    ENCODER_FPS, baseline_kbps, dev, ctx,
+                    ENCODER_FPS, baseline_kbps,
+                    dev_ptr, ctx_ptr,
                 )
             };
             #[cfg(not(target_os = "windows"))]
@@ -2718,9 +2733,9 @@ fn run_capture_and_send(
             }
             #[cfg(target_os = "windows")]
             CapturedFrame::Gpu(gpu) => {
-                use windows::core::Interface as _;
+                use windows::core::Interface;
                 let tether_capture::GpuCapturedSource::D3D11Texture(ref tex) = gpu.source;
-                let d3d11_frame = tether_codec::D3D11TextureFrame {
+                let frame = tether_codec::D3D11TextureFrame {
                     texture: tex.texture.as_raw() as *mut std::ffi::c_void,
                     device: tex.device.device.as_raw() as *mut std::ffi::c_void,
                     device_context: tex.device.context.as_raw() as *mut std::ffi::c_void,
@@ -2728,21 +2743,12 @@ fn run_capture_and_send(
                     height: tex.height,
                     format: tex.format.0 as u32,
                 };
-                let result = slot_mut.encoder.encode_gpu(
-                    GpuEncoderFrame::D3D11Texture(&d3d11_frame),
-                    pts,
-                    force_kf,
-                );
-                match result {
+                match slot_mut.encoder.encode_gpu(
+                    GpuEncoderFrame::D3D11Texture(&frame), pts, force_kf,
+                ) {
                     Ok(p) => p,
-                    Err(tether_codec::CodecError::UnsupportedInputFormat) => {
-                        // GPU path not yet wired; fall through to encode_bgra
-                        // via CPU readback for Phase 1.
-                        warn!("D3D11 encode_gpu not yet wired; dropping GPU frame");
-                        continue;
-                    }
                     Err(e) => {
-                        warn!(error = %e, "D3D11 encode failed; dropping frame");
+                        warn!(error = %e, "D3D11 GPU encode failed; dropping frame");
                         continue;
                     }
                 }
@@ -2971,10 +2977,20 @@ static SHARED_D3D11_DEVICE: std::sync::OnceLock<tether_capture::windows::D3D11De
     std::sync::OnceLock::new();
 
 #[cfg(target_os = "windows")]
+static PRECREATED_CAPTURE: std::sync::Mutex<Option<tether_capture::windows::PreCreatedCapture>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "windows")]
 async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
     info!("capture source: windows (DXGI Desktop Duplication)");
-    let (handle, d3d11_device) = tether_capture::windows::start()
-        .map_err(anyhow::Error::from)?;
+    let pre = PRECREATED_CAPTURE.lock().unwrap().take();
+    let (handle, d3d11_device) = match pre {
+        Some(p) => tether_capture::windows::start_with(p)
+            .map_err(anyhow::Error::from)?,
+        None => tether_capture::windows::start_with(
+            tether_capture::windows::pre_create().map_err(anyhow::Error::from)?
+        ).map_err(anyhow::Error::from)?,
+    };
     let _ = SHARED_D3D11_DEVICE.set(d3d11_device);
     Ok(handle)
 }

@@ -22,14 +22,14 @@ use crossbeam_channel::{bounded, Sender, TrySendError};
 use tether_protocol::MonoNanos;
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
     ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
@@ -56,6 +56,18 @@ const TEXTURE_POOL_SIZE: usize = 3;
 pub struct D3D11Device {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
+}
+
+impl D3D11Device {
+    /// Raw COM pointers for injecting into FFmpeg's hwctx so the encoder
+    /// shares the same D3D11 device as capture (zero-copy VP blit).
+    pub fn device_ptrs(&self) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
+        use windows::core::Interface;
+        (
+            self.device.as_raw() as *mut std::ffi::c_void,
+            self.context.as_raw() as *mut std::ffi::c_void,
+        )
+    }
 }
 
 // SAFETY: ID3D11Device and ID3D11DeviceContext are thread-safe COM
@@ -88,19 +100,35 @@ pub struct CapturedD3D11Texture {
 // under the same conditions as the device.
 unsafe impl Send for CapturedD3D11Texture {}
 
-/// Start DXGI Desktop Duplication on the primary output.
-///
-/// Returns a [`CaptureHandle`] whose receiver emits
-/// [`CapturedFrame::Gpu`] frames containing D3D11 textures on the
-/// shared device.
-pub fn start() -> Result<(CaptureHandle, D3D11Device)> {
-    let (device, context) = create_d3d11_device()?;
+/// Pre-create the DXGI device and output duplication. Must be called
+/// BEFORE any AMF/D3D11VA probe activity (the AMF driver corrupts
+/// in-process DXGI output enumeration). The returned value is passed
+/// to [`start_with`].
+pub fn pre_create() -> Result<PreCreatedCapture> {
+    let (device, context, duplication, width, height) =
+        create_d3d11_device_and_duplication()?;
+    Ok(PreCreatedCapture { device, context, duplication, width, height })
+}
+
+/// Opaque handle holding pre-created DXGI resources.
+pub struct PreCreatedCapture {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    duplication: IDXGIOutputDuplication,
+    width: u32,
+    height: u32,
+}
+
+// SAFETY: same conditions as D3D11Device — multithread-protected COM objects.
+unsafe impl Send for PreCreatedCapture {}
+
+/// Start DXGI Desktop Duplication using pre-created resources from [`pre_create`].
+pub fn start_with(pre: PreCreatedCapture) -> Result<(CaptureHandle, D3D11Device)> {
+    let PreCreatedCapture { device, context, duplication, width, height } = pre;
     let shared_device = D3D11Device {
         device: device.clone(),
         context: context.clone(),
     };
-
-    let (duplication, width, height) = create_duplication(&device)?;
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
     let target_fps = Arc::new(AtomicU32::new(CAPTURE_FPS));
@@ -129,20 +157,17 @@ pub fn start() -> Result<(CaptureHandle, D3D11Device)> {
     Ok((handle, shared_device))
 }
 
-fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
-    let factory: IDXGIFactory1 =
-        unsafe { CreateDXGIFactory1() }.map_err(|e| CaptureError::Io(hresult_io(e)))?;
-
-    let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(0) }
-        .map_err(|e| CaptureError::Io(hresult_io(e)))?;
-
+fn create_d3d11_device_and_duplication(
+) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication, u32, u32)> {
+    // First try: create device via D3D_DRIVER_TYPE_HARDWARE (lets D3D11
+    // pick the GPU itself, bypassing DXGI factory enumeration which can
+    // become stale after AMF/D3D11VA probe activity in-process).
     let mut device = None;
     let mut context = None;
-
-    unsafe {
+    let hw_ok = unsafe {
         D3D11CreateDevice(
-            &adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
             HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             None,
@@ -151,18 +176,126 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
             None,
             Some(&mut context),
         )
+    };
+
+    if let (Ok(()), Some(device), Some(context)) = (hw_ok, device, context) {
+        if let Ok(mt) = device.cast::<ID3D11Multithread>() {
+            let _ = unsafe { mt.SetMultithreadProtected(true) };
+        }
+
+        let dxgi_device: windows::Win32::Graphics::Dxgi::IDXGIDevice =
+            device.cast().map_err(|e| CaptureError::Io(hresult_io(e)))?;
+        let adapter: IDXGIAdapter1 = unsafe { dxgi_device.GetParent() }
+            .map_err(|e| CaptureError::Io(hresult_io(e)))?;
+
+        let mut output_idx = 0u32;
+        while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
+            let output1: IDXGIOutput1 = match output.cast() {
+                Ok(o) => o,
+                Err(_) => { output_idx += 1; continue; }
+            };
+            match unsafe { output1.DuplicateOutput(&device) } {
+                Ok(duplication) => {
+                    let desc = unsafe { duplication.GetDesc() };
+                    let width = desc.ModeDesc.Width;
+                    let height = desc.ModeDesc.Height;
+                    tracing::info!(
+                        output_idx,
+                        width,
+                        height,
+                        format = ?desc.ModeDesc.Format,
+                        "DXGI Desktop Duplication initialized (hardware device)"
+                    );
+                    return Ok((device, context, duplication, width, height));
+                }
+                Err(e) => {
+                    tracing::warn!(output_idx, error = %e, "DuplicateOutput failed on hardware device");
+                }
+            }
+            output_idx += 1;
+        }
+        tracing::warn!("hardware device has no duplicable outputs; falling back to factory enumeration");
     }
-    .map_err(|e| CaptureError::Io(hresult_io(e)))?;
 
-    let device = device.unwrap();
+    // Fallback: enumerate all adapters via factory.
+    let factory: IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1() }.map_err(|e| CaptureError::Io(hresult_io(e)))?;
 
-    // Enable multithread protection — the capture thread and encoder
-    // thread both use this device's immediate context concurrently.
-    if let Ok(mt) = device.cast::<ID3D11Multithread>() {
-        let _ = unsafe { mt.SetMultithreadProtected(true) };
+    let mut adapter_idx = 0u32;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_idx) } {
+        let adapter_desc = unsafe { adapter.GetDesc1() }
+            .map_err(|e| CaptureError::Io(hresult_io(e)))?;
+        let adapter_name = String::from_utf16_lossy(
+            &adapter_desc.Description[..adapter_desc.Description.iter().position(|&c| c == 0).unwrap_or(adapter_desc.Description.len())]
+        );
+
+        let mut output_idx = 0u32;
+        while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
+            let output1: IDXGIOutput1 = match output.cast() {
+                Ok(o) => o,
+                Err(_) => { output_idx += 1; continue; }
+            };
+
+            let mut dev = None;
+            let mut ctx = None;
+            if unsafe {
+                D3D11CreateDevice(
+                    &adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut dev),
+                    None,
+                    Some(&mut ctx),
+                )
+            }.is_err() {
+                output_idx += 1;
+                continue;
+            }
+
+            let dev = dev.unwrap();
+            let ctx = ctx.unwrap();
+
+            match unsafe { output1.DuplicateOutput(&dev) } {
+                Ok(duplication) => {
+                    if let Ok(mt) = dev.cast::<ID3D11Multithread>() {
+                        let _ = unsafe { mt.SetMultithreadProtected(true) };
+                    }
+                    let desc = unsafe { duplication.GetDesc() };
+                    let width = desc.ModeDesc.Width;
+                    let height = desc.ModeDesc.Height;
+                    tracing::info!(
+                        adapter = adapter_name.as_str(),
+                        adapter_idx,
+                        output_idx,
+                        width,
+                        height,
+                        format = ?desc.ModeDesc.Format,
+                        "DXGI Desktop Duplication initialized (factory fallback)"
+                    );
+                    return Ok((dev, ctx, duplication, width, height));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        adapter = adapter_name.as_str(),
+                        adapter_idx,
+                        output_idx,
+                        error = %e,
+                        "DuplicateOutput failed; trying next output"
+                    );
+                }
+            }
+            output_idx += 1;
+        }
+        adapter_idx += 1;
     }
 
-    Ok((device, context.unwrap()))
+    Err(CaptureError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no DXGI adapter has an active output",
+    )))
 }
 
 fn create_duplication(
@@ -174,29 +307,27 @@ fn create_duplication(
     let adapter: IDXGIAdapter1 = unsafe { dxgi_device.GetParent() }
         .map_err(|e| CaptureError::Io(hresult_io(e)))?;
 
-    let output: IDXGIOutput = unsafe { adapter.EnumOutputs(0) }
-        .map_err(|e| CaptureError::Io(hresult_io(e)))?;
-
-    let output1: IDXGIOutput1 = output
-        .cast()
-        .map_err(|e| CaptureError::Io(hresult_io(e)))?;
-
-    let duplication = unsafe { output1.DuplicateOutput(device) }
-        .map_err(|e| CaptureError::Io(hresult_io(e)))?;
-
-    let desc = unsafe { duplication.GetDesc() };
-
-    let width = desc.ModeDesc.Width;
-    let height = desc.ModeDesc.Height;
-
-    tracing::info!(
-        width,
-        height,
-        format = ?desc.ModeDesc.Format,
-        "DXGI Desktop Duplication initialized"
-    );
-
-    Ok((duplication, width, height))
+    let mut output_idx = 0u32;
+    while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
+        let output1: IDXGIOutput1 = match output.cast() {
+            Ok(o) => o,
+            Err(_) => { output_idx += 1; continue; }
+        };
+        match unsafe { output1.DuplicateOutput(device) } {
+            Ok(duplication) => {
+                let desc = unsafe { duplication.GetDesc() };
+                let width = desc.ModeDesc.Width;
+                let height = desc.ModeDesc.Height;
+                tracing::info!(width, height, "DXGI reconnected on output {output_idx}");
+                return Ok((duplication, width, height));
+            }
+            Err(_) => { output_idx += 1; }
+        }
+    }
+    Err(CaptureError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no DXGI output available for duplication on this adapter",
+    )))
 }
 
 fn create_pool_texture(

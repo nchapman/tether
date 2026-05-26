@@ -236,6 +236,16 @@ fn probe_host() -> Vec<ProfileSupport> {
         .iter()
         .copied()
         .map(|profile| {
+            // On Windows/AMF, the deep encode probe is destructive: AMF
+            // has a single-session limit and doesn't reliably release
+            // sessions on drop, so probing N profiles exhausts AMF for
+            // the live encoder. Skip the encode probe and report
+            // H.264/HEVC as supported (AMF hardware is known-good if
+            // the driver loaded). The live encoder will fail-fast with
+            // a clear error if the hardware genuinely can't encode.
+            #[cfg(target_os = "windows")]
+            let encode = SupportStatus::Supported;
+            #[cfg(not(target_os = "windows"))]
             let encode = match ActiveProbe::probe_encode(profile) {
                 Ok(()) => SupportStatus::Supported,
                 Err(e) => {
@@ -251,6 +261,14 @@ fn probe_host() -> Vec<ProfileSupport> {
                     }
                 }
             };
+            // On Windows, skip the decode probe on the host side.
+            // Creating multiple D3D11VA decoder contexts triggers
+            // DXGI_ERROR_DEVICE_REMOVED on the pre-created capture
+            // device (AMD RDNA 4 driver bug). The client runs its own
+            // decode probe independently.
+            #[cfg(target_os = "windows")]
+            let decode = SupportStatus::Supported;
+            #[cfg(not(target_os = "windows"))]
             let decode = match fixture_for(profile) {
                 Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
                     Ok(()) => SupportStatus::Supported,

@@ -47,13 +47,12 @@ pub use tether_protocol::GpuResourceGuard as GpuFrameGuard;
 
 
 /// GOP length used by every H.264 encoder we ship. Long enough that
-/// keyframes don't dominate the bitrate envelope (1 IDR every ~240
-/// frames at 30 fps), short enough that a client joining mid-stream
-/// after our handshake's eager-IDR request never has to wait more
-/// than this for a periodic recovery point. Loss recovery between
-/// IDRs is handled by the client's on-demand `ForceIdr` plumbing,
-/// not by GOP cadence.
-pub(crate) const GOP_SECONDS: u32 = 8;
+/// GOP length in seconds. Safety-net cadence for decoder recovery —
+/// even if on-demand `ForceIdr` fails (some AMF driver versions
+/// silently ignore forced IDR), a natural keyframe arrives within
+/// this interval. Two seconds balances recovery latency against
+/// keyframe bitrate overhead on mostly-static desktop content.
+pub(crate) const GOP_SECONDS: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {

@@ -19,7 +19,7 @@
 //! wins. The probe layer surfaces this empirically.
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
-use rsmpeg::avutil::{ra, AVFrame, AVHWDeviceContext};
+use rsmpeg::avutil::{ra, AVDictionary, AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
@@ -240,7 +240,13 @@ impl D3D11Encoder {
             raw.color_range = ffi::AVCOL_RANGE_MPEG;
         }
 
-        let _leftover = encoder.open(None)?;
+        let dict = if backend_name.contains("amf") {
+            Some(AVDictionary::new(c"forced_idr", c"1", 0)
+                .set(c"gops_per_idr", c"1", 0))
+        } else {
+            None
+        };
+        let _leftover = encoder.open(dict)?;
 
         // Prepare software fallback path (BGRA → NV12 via swscale).
         // Used by encode_bgra; the zero-copy GPU path bypasses this.

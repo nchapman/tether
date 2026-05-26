@@ -68,10 +68,10 @@ const _: () = assert!(std::mem::size_of::<AvD3D11VADeviceContext>() == 56);
 const D3D11_BIND_RENDER_TARGET: u32 = 0x20;
 
 /// Encoder backend names to try in preference order for each codec.
-/// AMF first: on AMD hardware, native AMF handles d3d11 hw_frames
-/// correctly; MF's wrapper sometimes fails at send_frame for H.264.
-const HEVC_BACKENDS: &[&str] = &["hevc_amf", "hevc_mf", "hevc_nvenc"];
-const H264_BACKENDS: &[&str] = &["h264_amf", "h264_mf", "h264_nvenc"];
+/// Each vendor's native backend first (fails fast on wrong hardware),
+/// then the generic MF wrapper as fallback.
+const HEVC_BACKENDS: &[&str] = &["hevc_amf", "hevc_nvenc", "hevc_qsv", "hevc_mf"];
+const H264_BACKENDS: &[&str] = &["h264_amf", "h264_nvenc", "h264_qsv", "h264_mf"];
 
 pub struct D3D11Encoder {
     kind: CodecKind,
@@ -112,25 +112,11 @@ impl D3D11Encoder {
         init_ffmpeg();
 
         let kind = profile.codec;
-        let has_shared_device = !device_ptr.is_null();
-        let backends: &[&str] = if has_shared_device {
-            // When using a shared capture device, only try AMF. The MF/NVENC
-            // fallbacks create conflicting hw contexts that can trigger
-            // DXGI_ERROR_DEVICE_REMOVED on the shared device.
-            match kind {
-                CodecKind::Hevc => &["hevc_amf"],
-                CodecKind::H264 => &["h264_amf"],
-                CodecKind::Av1 => {
-                    return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
-                }
-            }
-        } else {
-            match kind {
-                CodecKind::Hevc => HEVC_BACKENDS,
-                CodecKind::H264 => H264_BACKENDS,
-                CodecKind::Av1 => {
-                    return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
-                }
+        let backends: &[&str] = match kind {
+            CodecKind::Hevc => HEVC_BACKENDS,
+            CodecKind::H264 => H264_BACKENDS,
+            CodecKind::Av1 => {
+                return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
             }
         };
 
@@ -241,8 +227,23 @@ impl D3D11Encoder {
         }
 
         let dict = if backend_name.contains("amf") {
-            Some(AVDictionary::new(c"forced_idr", c"1", 0)
+            Some(AVDictionary::new(c"usage", c"ultralowlatency", 0)
+                .set(c"quality", c"speed", 0)
+                .set(c"latency", c"1", 0)
+                .set(c"forced_idr", c"1", 0)
                 .set(c"gops_per_idr", c"1", 0))
+        } else if backend_name.contains("nvenc") {
+            Some(AVDictionary::new(c"delay", c"0", 0)
+                .set(c"forced-idr", c"1", 0)
+                .set(c"zerolatency", c"1", 0)
+                .set(c"tune", c"ull", 0)
+                .set(c"rc", c"cbr", 0)
+                .set(c"surfaces", c"1", 0))
+        } else if backend_name.contains("qsv") {
+            Some(AVDictionary::new(c"forced_idr", c"1", 0)
+                .set(c"async_depth", c"1", 0)
+                .set(c"low_delay_brc", c"1", 0)
+                .set(c"low_power", c"1", 0))
         } else {
             None
         };

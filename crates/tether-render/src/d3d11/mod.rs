@@ -15,6 +15,8 @@
 //! surface (`new`, `resize`, `apply_frame`, `render`, `dimensions`) so
 //! the shared `App` event loop drives it unchanged.
 
+mod cursor;
+
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -27,7 +29,8 @@ use windows::Win32::Graphics::Direct3D::{
     D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
+    D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11Device1,
+    ID3D11DeviceContext,
     ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
     ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE,
     D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -207,6 +210,12 @@ pub(crate) struct D3D11RenderState {
     /// EOTF + range tags baked into the per-frame cbuffer.
     transfer_kind: u32,
     range_kind: u32,
+    /// Cursor overlay pass. Drawn over the video each frame (no-op when
+    /// no sprite is active / cursor hidden / relative-locked).
+    cursor: cursor::D3D11CursorOverlay,
+    /// Shared cursor state, written by the client's wire-receive task
+    /// and read by `cursor` each frame.
+    cursor_channel: CursorChannel,
 }
 
 impl D3D11RenderState {
@@ -217,7 +226,7 @@ impl D3D11RenderState {
         color_space: VideoColorSpec,
         chroma: ChromaSubsampling,
         bit_depth: u8,
-        _cursor_channel: CursorChannel,
+        cursor_channel: CursorChannel,
     ) -> Result<Self> {
         // Windows is 4:2:0-only today; 4:4:4 has no D3D11 sample path and
         // is rejected at negotiation. Guard here so a mis-negotiation
@@ -297,6 +306,7 @@ impl D3D11RenderState {
 
         let rtv = create_rtv(&device, &swapchain)?;
         let pipeline = build_pipeline(&device)?;
+        let cursor = cursor::D3D11CursorOverlay::new(&device)?;
 
         tracing::info!(
             width = surface_size.0,
@@ -320,6 +330,8 @@ impl D3D11RenderState {
             video_size: surface_size,
             transfer_kind,
             range_kind,
+            cursor,
+            cursor_channel,
         })
     }
 
@@ -459,6 +471,11 @@ impl D3D11RenderState {
 
         unsafe {
             self.context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+            // Reset to opaque blending each frame: the cursor pass below
+            // sets a straight-alpha blend state that must not leak into
+            // the next frame's (opaque) video draw.
+            self.context
+                .OMSetBlendState(None::<&ID3D11BlendState>, None, 0xffff_ffff);
 
             // Draw the video only once a frame has been imported; until
             // then the cleared black backbuffer is presented.
@@ -501,6 +518,30 @@ impl D3D11RenderState {
                 self.context.PSSetSamplers(0, Some(&self.pipeline.samplers));
 
                 self.context.Draw(6, 0);
+
+                // Cursor overlay over the video. `fit_dims` is the pixel
+                // rect the video covers inside the window — the same
+                // `(sx, sy)` letterbox scale the YUV draw used — so the
+                // sprite lands in the exact video rect. No-op when no
+                // sprite is active. The RTV + viewport set above stay
+                // bound for this pass.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation
+                )]
+                let fit_dims = (
+                    (self.surface_size.0 as f32 * sx).round() as u32,
+                    (self.surface_size.1 as f32 * sy).round() as u32,
+                );
+                self.cursor.render(
+                    &self.device,
+                    &self.context,
+                    &self.cursor_channel,
+                    self.video_size,
+                    self.surface_size,
+                    fit_dims,
+                );
             }
 
             match &self.target {
@@ -580,6 +621,7 @@ impl D3D11RenderState {
         let color = color.ok_or_else(|| RenderError::GraphicsApi("null offscreen tex".into()))?;
         let rtv = create_rtv_for_texture(&device, &color)?;
         let pipeline = build_pipeline(&device)?;
+        let cursor = cursor::D3D11CursorOverlay::new(&device)?;
 
         Ok(Self {
             device,
@@ -594,7 +636,19 @@ impl D3D11RenderState {
             video_size: (width, height),
             transfer_kind: transfer_kind_for(color_space),
             range_kind: if bit_depth == 10 { RANGE_KIND_LIMITED_10 } else { RANGE_KIND_LIMITED_8 },
+            cursor,
+            // Detached channel: headless tests with no wire-side producer
+            // get an overlay that exists but never draws. The cursor
+            // hardware test below replaces this via `cursor_channel()`.
+            cursor_channel: CursorChannel::new(),
         })
+    }
+
+    /// Test-only accessor to the cursor channel, so a headless test can
+    /// feed sprites the same way the client's wire-receive task does.
+    #[cfg(test)]
+    pub(crate) fn cursor_channel(&self) -> CursorChannel {
+        self.cursor_channel.clone()
     }
 
     /// Build R8 (Y) + R8G8 (UV) textures from raw plane bytes, create
@@ -1005,6 +1059,64 @@ mod tests {
         );
         let (max, min) = (r.max(g).max(b) as i32, r.min(g).min(b) as i32);
         assert!(max - min < 40, "neutral chroma should be near-gray: ({b}, {g}, {r})");
+    }
+
+    /// Drives the cursor overlay through the real `render` path: a gray
+    /// video frame underneath, then an opaque red cursor sprite fed via
+    /// the cursor channel exactly as the client's wire task does. Reads
+    /// back and asserts the sprite's center is red (overlay composited)
+    /// while a corner outside the sprite stays gray (video untouched).
+    /// Exercises sprite upload → SRV → alpha-blend draw on top of the
+    /// video, and that the blend state doesn't bleed onto the video.
+    #[test]
+    #[ignore = "requires D3D11 GPU (Windows)"]
+    fn cursor_overlay_composites_over_video() {
+        let (w, h) = (64u32, 64u32);
+        let mut state = D3D11RenderState::new_headless(w, h, VideoColorSpec::sdr_bt709(), 8)
+            .expect("headless renderer");
+
+        // Gray video underneath (mid-luma, neutral chroma).
+        let y = vec![180u8; (w * h) as usize];
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let uv = vec![128u8; (cw * ch * 2) as usize];
+        state.upload_test_planes(&y, &uv, w, h);
+
+        // 16×16 fully-opaque red sprite (straight RGBA8). Place it
+        // centered with a centered hotspot so its 16×16 footprint
+        // straddles (24..40, 24..40) in window pixels (video==surface).
+        let (cur_w, cur_h) = (16u32, 16u32);
+        let mut pixels = Vec::with_capacity((cur_w * cur_h * 4) as usize);
+        for _ in 0..(cur_w * cur_h) {
+            pixels.extend_from_slice(&[255, 0, 0, 255]); // R,G,B,A
+        }
+        let channel = state.cursor_channel();
+        channel.with(|s| {
+            s.enqueue_shape(1, cur_w, cur_h, cur_w / 2, cur_h / 2, pixels);
+            s.activate(1);
+            s.set_position((w / 2) as f32, (h / 2) as f32, true);
+        });
+
+        state.render().expect("render");
+        let bgra = state.read_back_bgra();
+
+        // Center is inside the sprite → red.
+        let c = (((h / 2) * w + (w / 2)) * 4) as usize;
+        let (cb, cg, cr) = (bgra[c], bgra[c + 1], bgra[c + 2]);
+        eprintln!("cursor center BGRA = ({cb}, {cg}, {cr})");
+        assert!(
+            cr > 150 && cg < 80 && cb < 80,
+            "sprite center should be red (overlay), got ({cb}, {cg}, {cr})"
+        );
+
+        // A corner well outside the 16×16 footprint → untouched gray.
+        let k = ((2 * w + 2) * 4) as usize;
+        let (kb, kg, kr) = (bgra[k], bgra[k + 1], bgra[k + 2]);
+        eprintln!("corner BGRA = ({kb}, {kg}, {kr})");
+        let (max, min) = (kr.max(kg).max(kb) as i32, kr.min(kg).min(kb) as i32);
+        assert!(
+            kr > 40 && kg > 40 && kb > 40 && max - min < 40,
+            "corner outside sprite should stay near-gray video, got ({kb}, {kg}, {kr})"
+        );
     }
 
     /// Full cross-device chain on the coordinate fixture: QSV encodes the

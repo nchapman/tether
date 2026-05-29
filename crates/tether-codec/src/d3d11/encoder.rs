@@ -97,11 +97,16 @@ fn backends_for_vendor(kind: CodecKind, vendor_id: u32) -> &'static [&'static st
         (CodecKind::Hevc, VENDOR_INTEL) => &["hevc_qsv", "hevc_mf"],
         (CodecKind::Hevc, VENDOR_AMD) => &["hevc_amf", "hevc_mf"],
         (CodecKind::Hevc, VENDOR_NVIDIA) => &["hevc_nvenc", "hevc_mf"],
-        (CodecKind::Hevc, _) => &["hevc_mf", "hevc_amf", "hevc_nvenc"],
+        // Unknown vendor: Media Foundation ONLY. Never speculatively try
+        // a foreign vendor's encoder — constructing AMF/NVENC on hardware
+        // that isn't theirs faults inside the vendor runtime
+        // (STATUS_ACCESS_VIOLATION), not a recoverable error. MF is the
+        // vendor-agnostic encoder and works on any D3D11 GPU.
+        (CodecKind::Hevc, _) => &["hevc_mf"],
         (CodecKind::H264, VENDOR_INTEL) => &["h264_qsv", "h264_mf"],
         (CodecKind::H264, VENDOR_AMD) => &["h264_amf", "h264_mf"],
         (CodecKind::H264, VENDOR_NVIDIA) => &["h264_nvenc", "h264_mf"],
-        (CodecKind::H264, _) => &["h264_mf", "h264_amf", "h264_nvenc"],
+        (CodecKind::H264, _) => &["h264_mf"],
         (CodecKind::Av1, _) => &[],
     }
 }
@@ -780,5 +785,45 @@ unsafe fn com_release(ptr: *mut std::ffi::c_void) {
     unsafe {
         let vtbl_ptr = *(ptr as *const *const IUnknownVtbl);
         ((*vtbl_ptr).release)(ptr);
+    }
+}
+
+#[cfg(test)]
+mod backend_selection_tests {
+    use super::*;
+
+    /// An unknown vendor must fall back to Media Foundation ONLY, never
+    /// to a foreign vendor's encoder. Constructing AMF/NVENC on hardware
+    /// that isn't theirs faults inside the vendor runtime
+    /// (STATUS_ACCESS_VIOLATION), so the unknown-vendor chain must not
+    /// list them. Pure logic — no hardware.
+    #[test]
+    fn unknown_vendor_falls_back_to_mf_only() {
+        for kind in [CodecKind::Hevc, CodecKind::H264] {
+            let backends = backends_for_vendor(kind, 0);
+            assert!(
+                !backends.is_empty(),
+                "unknown vendor should still offer MF for {kind:?}"
+            );
+            for name in backends {
+                assert!(
+                    name.contains("_mf"),
+                    "unknown-vendor fallback for {kind:?} must be MF-only; \
+                     found {name} (would fault on the wrong GPU)"
+                );
+            }
+        }
+    }
+
+    /// Known vendors still lead with their hardware encoder and keep MF
+    /// as the safe (vendor-agnostic) fallback.
+    #[test]
+    fn known_vendors_lead_with_hardware_then_mf() {
+        assert_eq!(backends_for_vendor(CodecKind::Hevc, VENDOR_INTEL), &["hevc_qsv", "hevc_mf"]);
+        assert_eq!(backends_for_vendor(CodecKind::Hevc, VENDOR_AMD), &["hevc_amf", "hevc_mf"]);
+        assert_eq!(
+            backends_for_vendor(CodecKind::Hevc, VENDOR_NVIDIA),
+            &["hevc_nvenc", "hevc_mf"]
+        );
     }
 }

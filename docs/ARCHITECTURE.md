@@ -19,9 +19,16 @@ Main 4:4:4 (8 and 10-bit) decode — the renderer's biplanar 8 /
 biplanar 16 / packed XYUV layouts cover the IOSurface and dma-buf
 shapes each profile produces, verified by the four
 `iosurface_zero_copy_roundtrip_*` tests in
-`tether-render/src/iosurface_test.rs`. Windows backends (DXGI /
-Media Foundation / D3D11) are additional modules per platform, not
-a rewrite of the core path.
+`tether-render/src/iosurface_test.rs`. **Windows host** (DXGI Desktop
+Duplication capture → D3D11 Video Processor BGRA→NV12 → vendor-selected
+hardware encode) and a **Windows client** decode→render path are wired
+end-to-end and verified in a live loopback session. Encode picks the
+backend from the DXGI adapter's PCI vendor — Intel→QSV, AMD→AMF,
+NVIDIA→NVENC — with Media Foundation as the vendor-agnostic fallback;
+4:2:0 only (the Video Processor has no 4:4:4 output path, so Windows
+never advertises 4:4:4). Audio remains deferred. See
+`docs/CODEC_CAPABILITIES.md` for the Windows capture/encode layers and
+their per-backend limits.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -292,7 +299,7 @@ pub enum CapturedFrame { Cpu(CpuFrame), Gpu(GpuCapturedFrame) }
 pub enum GpuCapturedSource {
     #[cfg(target_os = "linux")] DmaBuf(CapturedDmaBuf),
     #[cfg(target_os = "macos")] IOSurface(CapturedIOSurface),
-    // future: #[cfg(target_os = "windows")] D3D11Texture(...),
+    #[cfg(target_os = "windows")] D3D11Texture(CapturedD3D11Texture),
 }
 ```
 
@@ -320,23 +327,31 @@ pub trait Encoder: Send {
 pub enum GpuEncoderFrame<'a> {
     #[cfg(target_os = "linux")] DmaBuf(&'a DmaBufFrame),
     #[cfg(target_os = "macos")] IOSurface(&'a IOSurfaceFrame),
+    #[cfg(target_os = "windows")] D3D11Texture(&'a D3D11TextureFrame),
     #[doc(hidden)] _Phantom(PhantomData<&'a ()>),
 }
 ```
 
 The trait method is cross-platform; variants inside `GpuEncoderFrame`
 are cfg-gated internally. The host's dispatch doesn't need a per-
-platform `#[cfg]`. The Windows D3D11 variant slots in the same way
-when that backend arrives.
+platform `#[cfg]`. All three platform variants are now live; a fourth
+backend is a variant plus a module, not a refactor.
 
-**Encoder-backend dispatch** lives in
-`tether_codec::probe::build_encoder`: a `#[cfg(target_os = "linux")]`
-arm constructs `VaapiEncoder`, a `#[cfg(target_os = "macos")]` arm
-constructs `VideoToolboxEncoder`, both return `Box<dyn Encoder>` so
-the host send loop is backend-agnostic. A second Linux backend (the
-tracked NVENC follow-up) lands as an inner `match` inside the Linux
-arm that prefers NVENC when the probe accepts it and falls through to
-VAAPI otherwise — no signature change at the call site.
+**Encoder-backend dispatch** lives in `tether_codec::probe`: a
+`#[cfg(target_os = "linux")]` `build_encoder` arm constructs
+`VaapiEncoder`, a `#[cfg(target_os = "macos")]` arm constructs
+`VideoToolboxEncoder`, and a `#[cfg(target_os = "windows")]`
+`build_encoder_d3d11` arm constructs `D3D11Encoder` — all return
+`Box<dyn Encoder>` so the host send loop is backend-agnostic. On
+Windows the *vendor* selection happens one level down, in
+`D3D11Encoder::new` → `backends_for_vendor(codec, vendor_id)`: it tries
+the GPU's native encoder first (`hevc_qsv`/`hevc_amf`/`hevc_nvenc`) then
+`hevc_mf`. An unknown vendor falls back to Media Foundation **only** —
+speculatively constructing a foreign vendor's encoder faults inside that
+vendor's runtime. A second Linux backend (the tracked NVENC follow-up)
+lands as an inner `match` inside the Linux arm that prefers NVENC when
+the probe accepts it and falls through to VAAPI otherwise — no signature
+change at the call site.
 
 **Decoder side** uses the same shape, mirrored: `Decoder::next_frame ->
 Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
@@ -409,6 +424,17 @@ documented in `docs/INVESTIGATION_lan_freeze.md`:
   frame, not a queued backlog. Crossbeam bounded(N) drop-newest is
   exactly wrong for this hop — under render backpressure the user
   would stare at stale pixels while newer frames got rejected.
+- **Same freshest-wins principle on the Windows capture→encode hop.**
+  The DXGI capture thread uses a single-slot drop-oldest mailbox plus a
+  texture-pool free-list with an ownership handshake: a pool slot is
+  reused only once the frame's `release_guard` drops, so the capture
+  thread never `CopyResource`s over a texture the encoder's Video
+  Processor is still sampling (the cause of an earlier progressive-
+  corruption regression). Because capture and encode share one D3D11
+  immediate context, GPU commands execute in submission order and the
+  channel's happens-before edge is sufficient — no GPU fence/keyed-mutex
+  needed. Shutdown is detected via a consumer-liveness token, since the
+  evict-clone the producer holds masks channel `Disconnected`.
 - **DoS-relevant transport limits.** `MAX_VIDEO_STREAM_MESSAGE = 2 MiB`
   caps per-keyframe-stream allocation; `max_concurrent_uni_streams = 4`
   prevents a peer from opening thousands of streams and pinning
@@ -698,9 +724,13 @@ needs a re-`set_param`).
 
 Listed to set expectations; each is a real follow-up, not a "never":
 
-- **Windows backends.** macOS host and macOS client both ship today
-  (see "Cross-platform additivity"); the Windows host/client (DXGI /
-  Media Foundation / D3D11) are follow-up modules per platform.
+- **Windows: remaining gaps.** The Windows host (DXGI capture, D3D11
+  vendor-selected encode) and client (D3D11VA decode → render) are wired
+  and loopback-verified. What's still open: the decoder downloads frames
+  to CPU before the renderer (zero-copy GPU export pending Vulkan
+  external-memory support — see the D3D11 probe note in
+  `CODEC_CAPABILITIES.md`); there is no 4:4:4 encode path (the Video
+  Processor only outputs 4:2:0); and audio is deferred everywhere.
 - **AV1.** H.264 and HEVC are supported; AV1 needs a different VAAPI
   decoder probe (no `vaapi_av1` encode entrypoint on most current
   Intel iGPUs) and a separate codec_id path. The probe stub returns

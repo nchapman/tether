@@ -2321,6 +2321,38 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
     }
 }
 
+/// Host-local per-stage latency accumulator. Complements
+/// `EncodeStatsWindow::avg_encode_ms` (the encode stage) with the two
+/// stages it doesn't see: the capture→dequeue handoff age (time a frame
+/// waited between capture and the encode loop picking it up) and the
+/// fragment+send duration. Averaged over the stats window and logged
+/// beside `avg_encode_ms`, this shows which stage owns end-to-end host
+/// latency — the breakdown the native-encode pass needs to know whether
+/// the FFmpeg async floor or something else dominates.
+#[derive(Default)]
+struct StageLatency {
+    frames: u64,
+    capture_age_ns: u64,
+    send_ns: u64,
+}
+
+impl StageLatency {
+    fn record(&mut self, capture_age_ns: u64, send_ns: u64) {
+        self.frames += 1;
+        self.capture_age_ns += capture_age_ns;
+        self.send_ns += send_ns;
+    }
+
+    /// Mean of `sum_ns` over recorded frames, in milliseconds.
+    fn avg_ms(sum_ns: u64, frames: u64) -> f64 {
+        if frames == 0 {
+            0.0
+        } else {
+            sum_ns as f64 / frames as f64 / 1_000_000.0
+        }
+    }
+}
+
 fn run_capture_and_send(
     conn: Arc<Connection>,
     frames: FrameReceiver,
@@ -2353,6 +2385,9 @@ fn run_capture_and_send(
     const FEC_PERCENTAGE: u8 = 20;
     let mut fragmenter = FrameFragmenter::new_with_fec(0, FEC_PERCENTAGE);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
+    // Per-stage latency (handoff + send), averaged over the same window
+    // as `stats` and logged alongside it. See [`StageLatency`].
+    let mut stage_latency = StageLatency::default();
     let mut slot: Option<EncoderSlot> = None;
     // macOS-only host GPU state: shared wgpu Metal device + queue for
     // the NV12 IOSurface scaler bridge. Lazily initialised on the
@@ -2396,10 +2431,13 @@ fn run_capture_and_send(
         }
         let frame_width = frame.width();
         let frame_height = frame.height();
-        let mut timing = {
-            let (k, u) = frame.timestamps();
-            HostFrameTimingBuilder::captured(k, u)
-        };
+        let (k, u) = frame.timestamps();
+        // Handoff age: how long this frame waited between capture and the
+        // encode loop dequeuing it. With the single-slot drop-oldest
+        // mailbox this should stay near zero; a rising value means the
+        // encoder can't keep up and frames are queuing (or being evicted).
+        let capture_age_ns = MonoNanos::now().0.saturating_sub(u.0);
+        let mut timing = HostFrameTimingBuilder::captured(k, u);
 
         // Reject CPU frames in non-BGRA formats up front (no encoder
         // path consumes them today). GPU frames already passed format
@@ -2809,6 +2847,7 @@ fn run_capture_and_send(
             dimensions: (frame_width, frame_height),
         };
 
+        let send_t0 = std::time::Instant::now();
         if keyframe {
             // Keyframes ride a reliable per-IDR QUIC uni stream. The
             // single_packet path doesn't chunk into datagram-sized
@@ -2839,6 +2878,7 @@ fn run_capture_and_send(
                 }
             }
         }
+        stage_latency.record(capture_age_ns, send_t0.elapsed().as_nanos() as u64);
 
         if stats.should_emit() {
             if let Some(snap) = stats.snapshot_and_reset() {
@@ -2847,13 +2887,26 @@ fn run_capture_and_send(
                 } else {
                     0.0
                 };
+                // Per-stage host latency breakdown: capture_age_ms is the
+                // handoff (capture→dequeue), avg_encode_ms is the encoder
+                // (the FFmpeg send_frame→packet floor), send_ms is
+                // fragment+wire. Their sum ≈ host-side end-to-end latency.
                 info!(
                     frames = snap.frame_count,
+                    capture_age_ms = format!(
+                        "{:.2}",
+                        StageLatency::avg_ms(stage_latency.capture_age_ns, stage_latency.frames)
+                    ),
                     avg_encode_ms = format!("{:.2}", snap.avg_encode_ms),
+                    send_ms = format!(
+                        "{:.2}",
+                        StageLatency::avg_ms(stage_latency.send_ns, stage_latency.frames)
+                    ),
                     kbps_out = format!("{:.0}", snap.kbps_out),
                     kf_per_s = format!("{kf_per_s:.2}"),
                     "send stats"
                 );
+                stage_latency = StageLatency::default();
             }
         }
     }
@@ -3104,6 +3157,20 @@ mod tests {
     //! see the project task list.
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn stage_latency_averages_over_recorded_frames() {
+        let mut s = StageLatency::default();
+        // No frames recorded → zero, not a divide-by-zero.
+        assert_eq!(StageLatency::avg_ms(s.capture_age_ns, s.frames), 0.0);
+
+        // 1 ms + 3 ms handoff, 2 ms + 4 ms send over two frames.
+        s.record(1_000_000, 2_000_000);
+        s.record(3_000_000, 4_000_000);
+        assert_eq!(s.frames, 2);
+        assert!((StageLatency::avg_ms(s.capture_age_ns, s.frames) - 2.0).abs() < 1e-9);
+        assert!((StageLatency::avg_ms(s.send_ns, s.frames) - 3.0).abs() < 1e-9);
+    }
     use std::sync::Arc;
     use tokio::task::JoinSet;
 

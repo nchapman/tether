@@ -295,12 +295,24 @@ impl D3D11Encoder {
         }
 
         let dict = if backend_name.contains("amf") {
+            // `async_depth=1` is critical: amfenc defaults it to 16
+            // ("Higher values increase output latency" per its AVOption
+            // help), so without this the AMD path runs with 16 frames of
+            // encode queue. One frame in flight matches QSV/NVENC and the
+            // single-frame handoff. `usage=ultralowlatency` + `latency=1`
+            // select AMF's low-latency RC path (B-frames are already off
+            // via `max_b_frames=0` above).
             Some(AVDictionary::new(c"usage", c"ultralowlatency", 0)
                 .set(c"quality", c"speed", 0)
                 .set(c"latency", c"1", 0)
+                .set(c"async_depth", c"1", 0)
                 .set(c"forced_idr", c"1", 0)
                 .set(c"gops_per_idr", c"1", 0))
         } else if backend_name.contains("nvenc") {
+            // `delay=0` is critical: nvenc defaults it to INT_MAX (output
+            // is held indefinitely waiting to reorder). `zerolatency=1`
+            // removes the reordering delay, `tune=ull` is the ultra-low-
+            // latency tuning, `surfaces=1` bounds the pool to one frame.
             Some(AVDictionary::new(c"delay", c"0", 0)
                 .set(c"forced-idr", c"1", 0)
                 .set(c"zerolatency", c"1", 0)

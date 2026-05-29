@@ -15,10 +15,10 @@
 //! iteration to see a disconnected channel and exit cleanly.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use tether_protocol::MonoNanos;
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
@@ -45,8 +45,20 @@ use crate::{
     GpuCapturedSource, Result,
 };
 
-const CAPTURE_CHANNEL_DEPTH: usize = 2;
+/// Capture→encode mailbox depth. One slot: the handoff is single-frame,
+/// drop-oldest (freshest-wins) via [`send_latest`], so the encode loop
+/// always dequeues the newest captured frame, never a stale backlog —
+/// the property that matters when an encode stall (e.g. shared-iGPU
+/// contention) briefly lets the capture thread outrun the consumer.
+const CAPTURE_MAILBOX_DEPTH: usize = 1;
 const CAPTURE_FPS: u32 = 60;
+/// Texture pool size. Three is the minimum that lets the capture thread
+/// always own a free slot to write into: at most one frame sits in the
+/// mailbox and one is held by the encoder mid-flight, leaving a third
+/// free. A slot is reused only once its `release_guard` ([`SlotReturn`])
+/// drops — the ownership handshake that prevents overwriting a texture
+/// the encoder's Video Processor is still sampling (the cause of the
+/// progressive-corruption regression).
 const TEXTURE_POOL_SIZE: usize = 3;
 
 /// Shared D3D11 device handle. The capture thread creates it; the
@@ -135,18 +147,33 @@ pub fn start_with(pre: PreCreatedCapture) -> Result<(CaptureHandle, D3D11Device)
         vendor_id,
     };
 
-    let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
+    let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_MAILBOX_DEPTH);
+    // The capture thread keeps a receiver clone purely to evict the
+    // unconsumed mailbox frame (drop-oldest); it never consumes frames.
+    // Because that clone masks channel disconnection, shutdown is driven
+    // off the consumer-liveness weak handle below, not `Disconnected`.
+    let evict_rx = rx.clone();
     let target_fps = Arc::new(AtomicU32::new(CAPTURE_FPS));
     let target_fps_thread = Arc::clone(&target_fps);
     let device_thread = shared_device.clone();
 
     let (cursor_state, cursor_source) = DxgiCursorState::new();
 
+    // Build the handle first so its liveness token exists, then hand the
+    // capture thread a weak ref to it. The handle (or, after `into_rx`,
+    // the `FrameReceiver`) keeps the strong count non-zero while a
+    // consumer is alive.
+    let handle =
+        CaptureHandle::from_parts(rx, target_fps).with_cursor_source(Box::new(cursor_source));
+    let liveness = handle.liveness();
+
     std::thread::Builder::new()
         .name("tether-capture-dxgi".into())
         .spawn(move || {
             run_capture_thread(
                 tx,
+                evict_rx,
+                liveness,
                 device_thread,
                 duplication,
                 width,
@@ -157,8 +184,6 @@ pub fn start_with(pre: PreCreatedCapture) -> Result<(CaptureHandle, D3D11Device)
         })
         .map_err(|e| CaptureError::Io(e))?;
 
-    let handle =
-        CaptureHandle::from_parts(rx, target_fps).with_cursor_source(Box::new(cursor_source));
     Ok((handle, shared_device))
 }
 
@@ -377,8 +402,55 @@ const RECONNECT_BACKOFF: &[Duration] = &[
 ];
 const RECONNECT_MAX_TOTAL: Duration = Duration::from_secs(30);
 
+/// Returns a texture-pool slot to the capture thread's free-list when
+/// the consumer (or an evicted mailbox entry) drops the frame. This is
+/// the ownership handshake: a slot is only reused once `SlotReturn`
+/// drops, so the capture thread never `CopyResource`s a new frame into a
+/// texture the encoder's Video Processor is still sampling. Stashed in
+/// [`GpuCapturedFrame::release_guard`].
+struct SlotReturn {
+    free_tx: Sender<usize>,
+    slot: usize,
+}
+
+impl Drop for SlotReturn {
+    fn drop(&mut self) {
+        // try_send never blocks: the free-list is sized to the pool, so
+        // it can't be full of in-use slots. A failure means the pool was
+        // torn down (capture thread exited), in which case the slot is
+        // moot.
+        let _ = self.free_tx.try_send(self.slot);
+    }
+}
+
+/// Single-slot, drop-oldest handoff: evict any unconsumed frame before
+/// enqueuing the newest, so the consumer always dequeues the freshest
+/// (invariant: at most one frame resident, freshest wins). Dropping the
+/// evicted frame runs its [`SlotReturn`], freeing the slot it held.
+fn send_latest<T>(tx: &Sender<T>, evict: &Receiver<T>, item: T) {
+    let _ = evict.try_recv();
+    let _ = tx.try_send(item);
+}
+
+/// Acquire a free pool slot to write the next capture into. A slot is
+/// free only once its previous frame's [`SlotReturn`] dropped, so the
+/// caller never overwrites a texture the encoder is still sampling. If
+/// the free-list is momentarily empty, evict the unconsumed mailbox
+/// frame (freshest-wins) to reclaim its slot and retry. Returns `None`
+/// only when every slot is held downstream (a consumer stall) — the
+/// caller then drops the capture rather than overwrite an in-use texture.
+fn acquire_slot<T>(free_rx: &Receiver<usize>, evict_rx: &Receiver<T>) -> Option<usize> {
+    if let Ok(slot) = free_rx.try_recv() {
+        return Some(slot);
+    }
+    let _ = evict_rx.try_recv();
+    free_rx.try_recv().ok()
+}
+
 fn run_capture_thread(
     tx: Sender<CapturedFrame>,
+    evict_rx: Receiver<CapturedFrame>,
+    liveness: Weak<()>,
     device: D3D11Device,
     mut duplication: IDXGIOutputDuplication,
     mut width: u32,
@@ -390,13 +462,27 @@ fn run_capture_thread(
         Some(p) => p,
         None => return,
     };
-    let mut pool_idx = 0usize;
+    // Free-list of pool slot indices, prefilled with every slot. The
+    // capture thread acquires a slot to write into; a slot returns only
+    // when its frame's `release_guard` ([`SlotReturn`]) drops.
+    let (free_tx, free_rx) = bounded::<usize>(TEXTURE_POOL_SIZE);
+    for slot in 0..TEXTURE_POOL_SIZE {
+        let _ = free_tx.try_send(slot);
+    }
 
     let qpc_freq = qpc_frequency();
 
     let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = unsafe { std::mem::zeroed() };
 
     loop {
+        // Shut down when the consumer has dropped its `FrameReceiver`.
+        // Our `evict_rx` clone keeps the channel connected, so we can't
+        // rely on `Disconnected`; the liveness token's strong count
+        // hitting zero is the signal.
+        if liveness.strong_count() == 0 {
+            tracing::debug!("capture consumer dropped; shutting down");
+            break;
+        }
         let fps = target_fps.load(Ordering::Relaxed).max(1);
         let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(fps));
 
@@ -423,7 +509,9 @@ fn run_capture_thread(
                                 Some(p) => pool = p,
                                 None => break,
                             }
-                            pool_idx = 0;
+                            // Free-list indices stay valid across the new
+                            // pool (same count); outstanding guards return
+                            // indices that now map to the new textures.
                         }
                         tracing::info!(width, height, "DXGI reconnected after ACCESS_LOST");
                         continue;
@@ -465,7 +553,20 @@ fn run_capture_thread(
             }
         };
 
-        let dst_texture = &pool[pool_idx % TEXTURE_POOL_SIZE];
+        // Acquire a free pool slot to write into (see [`acquire_slot`]).
+        // `None` means every slot is in flight (a mid-encode stall); drop
+        // this capture rather than overwrite a texture the encoder is
+        // still sampling — the ownership handshake that fixes the
+        // progressive-corruption regression.
+        let slot = match acquire_slot(&free_rx, &evict_rx) {
+            Some(s) => s,
+            None => {
+                let _ = unsafe { duplication.ReleaseFrame() };
+                continue;
+            }
+        };
+
+        let dst_texture = &pool[slot];
         unsafe {
             device.context.CopyResource(dst_texture, &src_texture);
         }
@@ -473,7 +574,6 @@ fn run_capture_thread(
         let _ = unsafe { duplication.ReleaseFrame() };
 
         let frame_texture = dst_texture.clone();
-        pool_idx = pool_idx.wrapping_add(1);
 
         let frame = CapturedFrame::Gpu(GpuCapturedFrame {
             width,
@@ -487,18 +587,18 @@ fn run_capture_thread(
             }),
             t_capture_kernel: t_kernel,
             t_capture_userspace: t_userspace,
-            release_guard: GpuCapturedGuard::new(()),
+            release_guard: GpuCapturedGuard::new(SlotReturn {
+                free_tx: free_tx.clone(),
+                slot,
+            }),
             native_damage,
         });
 
-        match tx.try_send(frame) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {}
-            Err(TrySendError::Disconnected(_)) => {
-                tracing::debug!("capture receiver dropped; shutting down");
-                break;
-            }
-        }
+        // Freshest-wins single-slot handoff: evict any unconsumed frame
+        // (returning its slot) before enqueuing the newest. Shutdown is
+        // detected via the liveness check at the top of the loop, not a
+        // send error, since `evict_rx` keeps the channel connected.
+        send_latest(&tx, &evict_rx, frame);
     }
 }
 
@@ -580,6 +680,104 @@ fn hresult_io(e: windows::core::Error) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_return_releases_slot_to_free_list_on_drop() {
+        // The ownership handshake: a pool slot is reclaimable only after
+        // the frame holding it is dropped.
+        let (free_tx, free_rx) = bounded::<usize>(1);
+        {
+            let _guard = SlotReturn {
+                free_tx: free_tx.clone(),
+                slot: 7,
+            };
+            assert!(free_rx.try_recv().is_err(), "slot must not return while held");
+        }
+        assert_eq!(free_rx.try_recv().ok(), Some(7), "slot returns once guard drops");
+    }
+
+    #[test]
+    fn send_latest_drops_oldest_and_reclaims_its_slot() {
+        // Freshest-wins: enqueuing a second frame onto a full depth-1
+        // mailbox evicts the first, the consumer dequeues the newest, and
+        // the evicted frame's pool slot returns to the free-list.
+        let (free_tx, free_rx) = bounded::<usize>(2);
+        free_tx.try_send(0).unwrap();
+        free_tx.try_send(1).unwrap();
+
+        let (mtx, mrx) = bounded::<(u32, SlotReturn)>(CAPTURE_MAILBOX_DEPTH);
+        let evict = mrx.clone();
+
+        // Frame A grabs slot 0 and goes into the mailbox.
+        let s0 = free_rx.try_recv().unwrap();
+        send_latest(&mtx, &evict, (100, SlotReturn { free_tx: free_tx.clone(), slot: s0 }));
+
+        // Frame B grabs slot 1; sending it evicts (drops) A → slot 0 frees.
+        let s1 = free_rx.try_recv().unwrap();
+        send_latest(&mtx, &evict, (200, SlotReturn { free_tx: free_tx.clone(), slot: s1 }));
+
+        assert_eq!(free_rx.try_recv().ok(), Some(s0), "evicted frame's slot returns");
+        let (val, _held) = mrx.try_recv().expect("mailbox holds the newest frame");
+        assert_eq!(val, 200, "consumer dequeues the freshest frame, not the stale one");
+    }
+
+    #[test]
+    fn acquire_slot_evicts_mailbox_when_free_list_empty() {
+        // When the free-list is momentarily empty, acquiring a slot must
+        // evict the unconsumed mailbox frame and reclaim the slot it held.
+        let (free_tx, free_rx) = bounded::<usize>(2);
+        let (mtx, mrx) = bounded::<(u32, SlotReturn)>(CAPTURE_MAILBOX_DEPTH);
+        let evict = mrx.clone();
+
+        // Slot 5 is held by the mailbox frame; the free-list is empty.
+        mtx.try_send((1, SlotReturn { free_tx: free_tx.clone(), slot: 5 }))
+            .unwrap();
+
+        assert_eq!(acquire_slot(&free_rx, &evict), Some(5), "eviction reclaims the slot");
+        assert!(mrx.try_recv().is_err(), "the evicted frame is gone from the mailbox");
+    }
+
+    #[test]
+    fn acquire_slot_returns_none_when_every_slot_is_in_flight() {
+        // Free-list empty and mailbox empty: the consumer holds every
+        // slot (a stall). Acquire must refuse rather than overwrite.
+        let (_free_tx, free_rx) = bounded::<usize>(2);
+        let (_mtx, mrx) = bounded::<(u32, SlotReturn)>(CAPTURE_MAILBOX_DEPTH);
+        let evict = mrx.clone();
+
+        assert_eq!(acquire_slot(&free_rx, &evict), None);
+    }
+
+    #[test]
+    fn producer_outrunning_consumer_keeps_freshest_and_leaks_no_slots() {
+        // Drive the real acquire+send cadence: a 3-slot pool, the consumer
+        // never reads. Each iteration must find a slot (eviction reclaims
+        // one), and after ten produces the mailbox holds only the newest
+        // frame with every pool slot still accounted for.
+        const POOL: usize = TEXTURE_POOL_SIZE;
+        let (free_tx, free_rx) = bounded::<usize>(POOL);
+        for s in 0..POOL {
+            free_tx.try_send(s).unwrap();
+        }
+        let (mtx, mrx) = bounded::<(u32, SlotReturn)>(CAPTURE_MAILBOX_DEPTH);
+        let evict = mrx.clone();
+
+        for id in 0..10u32 {
+            let slot = acquire_slot(&free_rx, &evict)
+                .expect("eviction keeps a slot available while only the mailbox holds one");
+            send_latest(&mtx, &evict, (id, SlotReturn { free_tx: free_tx.clone(), slot }));
+        }
+
+        let (newest, guard) = mrx.try_recv().expect("mailbox holds a frame");
+        assert_eq!(newest, 9, "consumer would dequeue the freshest frame");
+        drop(guard);
+
+        let mut reclaimed = 0;
+        while free_rx.try_recv().is_ok() {
+            reclaimed += 1;
+        }
+        assert_eq!(reclaimed, POOL, "every pool slot is reclaimed; none leaked");
+    }
 
     #[test]
     fn qpc_zero_returns_none() {

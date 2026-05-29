@@ -28,9 +28,10 @@ pub use cursor::{
 pub use damage::{DamageHint, DamageSignal, HashDamage, NativeDamage};
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 /// Capture-source handle returned by every backend's `start()`. Bundles
 /// the [`CapturedFrame`] receiver with a runtime-mutable target-FPS
@@ -61,6 +62,13 @@ pub struct CaptureHandle {
     /// an `NSCursor` poller; the test pattern leaves it `None` and
     /// the host falls back to [`PlaceholderCursorSource`].
     cursor_source: Option<Box<dyn CursorSource>>,
+    /// Consumer-liveness token. Moves into the [`FrameReceiver`] on
+    /// [`Self::into_rx`] so its strong count tracks whether the consumer
+    /// still holds the receiver. A backend producer that keeps its own
+    /// receiver clone (Windows drop-oldest eviction masks channel
+    /// disconnection) watches [`Self::liveness`] to know when to stop;
+    /// backends that rely on channel `Disconnected` ignore it.
+    alive: Arc<()>,
 }
 
 impl CaptureHandle {
@@ -73,7 +81,18 @@ impl CaptureHandle {
             rx,
             target_fps,
             cursor_source: None,
+            alive: Arc::new(()),
         }
+    }
+
+    /// A weak handle to the consumer-liveness token. A backend producer
+    /// holds this to detect when the consumer has dropped its
+    /// [`FrameReceiver`] — necessary when the producer keeps its own
+    /// receiver clone (which would otherwise mask channel disconnection).
+    /// `strong_count() == 0` means the consumer is gone.
+    #[must_use]
+    pub fn liveness(&self) -> Weak<()> {
+        Arc::downgrade(&self.alive)
     }
 
     /// Attach a cursor source to this handle. Called by the backend
@@ -98,13 +117,17 @@ impl CaptureHandle {
         &self.rx
     }
 
-    /// Consume the handle, returning the receiver. The FPS atomic is
-    /// dropped from the handle's side; clone via [`Self::fps_handle`]
-    /// before calling this if the ABR controller needs to keep
-    /// writing.
+    /// Consume the handle, returning the [`FrameReceiver`]. The FPS atomic
+    /// is dropped from the handle's side; clone via [`Self::fps_handle`]
+    /// before calling this if the ABR controller needs to keep writing.
+    /// The returned receiver carries the consumer-liveness token (see
+    /// [`Self::liveness`]); hold it for as long as frames are wanted.
     #[must_use]
-    pub fn into_rx(self) -> Receiver<CapturedFrame> {
-        self.rx
+    pub fn into_rx(self) -> FrameReceiver {
+        FrameReceiver {
+            rx: self.rx,
+            _alive: self.alive,
+        }
     }
 
     /// Current target FPS as observed by the backend's producer
@@ -128,6 +151,28 @@ impl CaptureHandle {
     #[must_use]
     pub fn fps_handle(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.target_fps)
+    }
+}
+
+/// The consuming end of a capture stream, returned by
+/// [`CaptureHandle::into_rx`]. Wraps the [`CapturedFrame`] receiver and
+/// carries the consumer-liveness token: while this is held, the backend
+/// producer's [`CaptureHandle::liveness`] weak handle reports a non-zero
+/// strong count. Dropping it both disconnects the channel and drops the
+/// token, so producers can detect consumer shutdown either way.
+pub struct FrameReceiver {
+    rx: Receiver<CapturedFrame>,
+    _alive: Arc<()>,
+}
+
+impl FrameReceiver {
+    /// Wait up to `timeout` for the next frame. Mirrors
+    /// [`crossbeam_channel::Receiver::recv_timeout`] exactly.
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<CapturedFrame, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
     }
 }
 
@@ -366,5 +411,53 @@ impl From<pipewire::Error> for CaptureError {
 impl From<screencapturekit::error::SCError> for CaptureError {
     fn from(e: screencapturekit::error::SCError) -> Self {
         Self::Sck(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+
+    // The Windows drop-oldest producer keeps its own receiver clone to
+    // evict the stale mailbox frame, which masks channel `Disconnected`.
+    // It therefore shuts down off the liveness token instead. These
+    // tests pin the exact contract that producer relies on.
+
+    #[test]
+    fn liveness_tracks_frame_receiver_lifetime() {
+        let (_tx, rx) = bounded::<CapturedFrame>(1);
+        let handle = CaptureHandle::from_parts(rx, Arc::new(AtomicU32::new(60)));
+
+        let weak = handle.liveness();
+        assert_eq!(weak.strong_count(), 1, "handle holds the liveness token");
+
+        let frames = handle.into_rx();
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "token moves into the FrameReceiver — still a live consumer"
+        );
+
+        drop(frames);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "dropping the receiver signals the consumer is gone"
+        );
+    }
+
+    #[test]
+    fn liveness_drops_when_handle_discarded_without_into_rx() {
+        let (_tx, rx) = bounded::<CapturedFrame>(1);
+        let handle = CaptureHandle::from_parts(rx, Arc::new(AtomicU32::new(60)));
+        let weak = handle.liveness();
+
+        drop(handle);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "a handle dropped without into_rx means no consumer ever materialised"
+        );
     }
 }

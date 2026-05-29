@@ -15,11 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
-use crossbeam_channel::Receiver;
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
 use tether_capture::{
-    CapturedFrame, CursorEvent, CursorSource, DamageHint, DamageSignal, HashDamage,
+    CapturedFrame, CursorEvent, CursorSource, DamageHint, DamageSignal, FrameReceiver, HashDamage,
     PixelFormat, PlaceholderCursorSource,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -2324,7 +2323,7 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
 
 fn run_capture_and_send(
     conn: Arc<Connection>,
-    frames: Receiver<CapturedFrame>,
+    frames: FrameReceiver,
     force_idr: tether_session::IdrSignal,
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
     cursor_frame_tx: tokio::sync::watch::Sender<Option<CursorFrameDims>>,

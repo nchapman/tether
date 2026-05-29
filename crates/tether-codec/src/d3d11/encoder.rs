@@ -164,6 +164,21 @@ impl D3D11Encoder {
         init_ffmpeg();
 
         let kind = profile.codec;
+
+        // The D3D11 Video Processor BGRA→YUV blit only produces 4:2:0
+        // surfaces (NV12 / P010); there is no 4:4:4 output path. Reject
+        // 4:4:4 here so the host probe records it Unsupported at the
+        // Construct stage and host-authoritative negotiation never picks
+        // a profile we would silently downsample to 4:2:0 (the trap in
+        // `d3d11_sw_format`'s NV12 fallback). A real 4:4:4 path needs
+        // custom HLSL conversion (AYUV/Y410, like Apollo) — a separate
+        // future capability, not a silent no-op.
+        if profile.chroma == ChromaSubsampling::Yuv444 {
+            return Err(CodecError::CodecNotFound(
+                "D3D11 Video Processor has no 4:4:4 encode path (only NV12/P010 4:2:0)",
+            ));
+        }
+
         let backends = backends_for_vendor(kind, vendor_id);
         if backends.is_empty() {
             return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
@@ -726,6 +741,11 @@ fn create_d3d11va_hw_device(
 }
 
 /// Map a VideoProfile to the FFmpeg sw_format for the hw_frames pool.
+///
+/// `D3D11Encoder::new` rejects 4:4:4 up front, so only 4:2:0 profiles
+/// reach here. The NV12 fallback therefore only ever covers 4:2:0 with
+/// an unexpected bit depth — it is NOT a silent 4:4:4→4:2:0 downsample
+/// (that path is closed at construction).
 fn d3d11_sw_format(profile: VideoProfile) -> ffi::AVPixelFormat {
     match (profile.chroma, profile.bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => ffi::AV_PIX_FMT_NV12,

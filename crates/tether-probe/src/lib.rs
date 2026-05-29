@@ -243,8 +243,25 @@ fn probe_host() -> Vec<ProfileSupport> {
             // H.264/HEVC as supported (AMF hardware is known-good if
             // the driver loaded). The live encoder will fail-fast with
             // a clear error if the hardware genuinely can't encode.
+            //
+            // 4:4:4 is the one exception: the D3D11 Video Processor only
+            // outputs 4:2:0 (NV12/P010), so there is no 4:4:4 encode path
+            // at all — a code-path absence, not a hardware question (cf.
+            // VAAPI H.264 4:4:4). Exclude it explicitly so negotiation
+            // never picks a profile the encoder would reject at
+            // construction and silently downsample. See `D3D11Encoder::new`.
             #[cfg(target_os = "windows")]
-            let encode = SupportStatus::Supported;
+            let encode = if profile.chroma
+                == tether_protocol::control::ChromaSubsampling::Yuv444
+            {
+                SupportStatus::Unsupported {
+                    stage: PipelineStage::Construct,
+                    reason: "D3D11 Video Processor has no 4:4:4 encode path (NV12/P010 only)"
+                        .into(),
+                }
+            } else {
+                SupportStatus::Supported
+            };
             #[cfg(not(target_os = "windows"))]
             let encode = match ActiveProbe::probe_encode(profile) {
                 Ok(()) => SupportStatus::Supported,
@@ -525,6 +542,33 @@ mod tests {
             hevc.unwrap().is_encode_supported(),
             "HEVC 4:2:0 8-bit encode should be supported; got: {:?}",
             hevc.unwrap().encode
+        );
+    }
+
+    /// The D3D11 Video Processor can't output 4:4:4, so the host must
+    /// never advertise a 4:4:4 encode profile — negotiation would pick it
+    /// and the encoder would silently downsample (or now, reject). On
+    /// Windows `probe_host()` is pure logic (encode/decode are not
+    /// hardware-probed), so this needs no GPU.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_host_never_advertises_444_encode() {
+        use tether_protocol::control::ChromaSubsampling;
+        let profiles = host_supported_profiles();
+        for s in profiles {
+            if s.profile.chroma == ChromaSubsampling::Yuv444 {
+                assert!(
+                    !s.is_encode_supported(),
+                    "host must not advertise 4:4:4 encode (no VP path); got: {:?}",
+                    s.profile
+                );
+            }
+        }
+        assert!(
+            profiles
+                .iter()
+                .any(|s| s.profile.chroma == ChromaSubsampling::Yuv420 && s.is_encode_supported()),
+            "host should still advertise at least one 4:2:0 encode profile"
         );
     }
 

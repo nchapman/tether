@@ -43,6 +43,49 @@ mod tests {
         }
     }
 
+    fn hevc_444_profile() -> VideoProfile {
+        VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 8,
+        }
+    }
+
+    fn hevc_444_10bit_profile() -> VideoProfile {
+        VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 10,
+        }
+    }
+
+    /// 4:4:4 must be refused at construction — the Video Processor path
+    /// only outputs 4:2:0 (NV12/P010), so advertising 4:4:4 would make
+    /// the host silently downsample. The rejection runs before any
+    /// device work, so this needs no GPU (not `#[ignore]`).
+    #[test]
+    fn d3d11_rejects_444_at_construction_no_silent_downsample() {
+        for profile in [hevc_444_profile(), hevc_444_10bit_profile()] {
+            let err = match D3D11Encoder::new(
+                profile,
+                TEST_WIDTH,
+                TEST_HEIGHT,
+                TEST_FPS,
+                TEST_BITRATE_KBPS,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            ) {
+                Ok(_) => panic!("4:4:4 must be rejected, not silently downsampled: {profile:?}"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("4:4:4"),
+                "expected a 4:4:4 rejection for {profile:?}, got: {err}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires D3D11VA-capable GPU (Windows)"]
     fn d3d11_encoder_constructs_h264() {

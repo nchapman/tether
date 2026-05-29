@@ -18,10 +18,9 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIResource;
+use windows::Win32::Graphics::Dxgi::{IDXGIResource1, DXGI_SHARED_RESOURCE_READ};
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 
 use tether_protocol::control::CodecKind;
@@ -33,7 +32,15 @@ use crate::{
 };
 
 const DECODE_EXTRA_HW_FRAMES: i32 = 4;
+// Shareable so a separate device (wgpu's Vulkan backend) can open the
+// staging texture. `SHARED_NTHANDLE` produces an NT handle via
+// `IDXGIResource1::CreateSharedHandle`, which is what Vulkan's
+// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT` import expects — the
+// legacy `GetSharedHandle` KMT handle is the wrong type for that import.
+// Matches Moonlight's cross-device share (d3d11va.cpp). `SHARED` must be
+// set alongside `SHARED_NTHANDLE`.
 const D3D11_RESOURCE_MISC_SHARED: u32 = 0x2;
+const D3D11_RESOURCE_MISC_SHARED_NTHANDLE: u32 = 0x800;
 const D3D11_BIND_SHADER_RESOURCE: u32 = 0x8;
 
 pub struct D3D11Decoder {
@@ -43,6 +50,12 @@ pub struct D3D11Decoder {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     staging: Option<PlaneStagingPair>,
+    /// Whether the renderer can import D3D11 shared-handle textures into
+    /// wgpu (Vulkan `VK_KHR_external_memory_win32`). When true we export
+    /// decoded frames GPU-resident (`Frame::Gpu`); when false — the
+    /// driver lacks the extension (some AMD Vulkan stacks) — we fall back
+    /// to a CPU download. GPU-resident is the rule; CPU is the exception.
+    gpu_export: bool,
 }
 
 /// Per-plane staging textures for GPU-side NV12 plane extraction.
@@ -61,7 +74,10 @@ struct PlaneStagingPair {
 unsafe impl Send for D3D11Decoder {}
 
 impl D3D11Decoder {
-    pub fn new(kind: CodecKind) -> Result<Self> {
+    /// `gpu_export` is the renderer's D3D11→Vulkan import capability (see
+    /// the field doc). The host probe builds a decoder with `false` — it
+    /// only checks that decode produces a frame and never renders.
+    pub fn new(kind: CodecKind, gpu_export: bool) -> Result<Self> {
         init_ffmpeg();
 
         let codec_id = d3d11_av_codec_id(kind)?;
@@ -114,6 +130,7 @@ impl D3D11Decoder {
 
         tracing::info!(
             codec = d3d11_decoder_name(kind),
+            gpu_export,
             "D3D11VA decoder opened"
         );
 
@@ -124,6 +141,7 @@ impl D3D11Decoder {
             device,
             context,
             staging: None,
+            gpu_export,
         })
     }
 
@@ -245,7 +263,7 @@ impl D3D11Decoder {
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE,
             CPUAccessFlags: 0,
-            MiscFlags: D3D11_RESOURCE_MISC_SHARED,
+            MiscFlags: D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
         };
         let mut texture = None;
         unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
@@ -254,11 +272,21 @@ impl D3D11Decoder {
     }
 
     fn get_shared_handle(texture: &ID3D11Texture2D) -> Result<HANDLE> {
-        let dxgi_resource: IDXGIResource = texture
+        // NT handle (not the legacy `GetSharedHandle` KMT handle): Vulkan's
+        // `D3D11_TEXTURE` external-memory import opens an NT handle, and
+        // the texture is created with `SHARED_NTHANDLE` above. Read-only
+        // because the renderer only samples it.
+        let dxgi_resource: IDXGIResource1 = texture
             .cast()
-            .map_err(|_| CodecError::CodecNotFound("IDXGIResource cast failed"))?;
-        unsafe { dxgi_resource.GetSharedHandle() }
-            .map_err(|_| CodecError::CodecNotFound("GetSharedHandle failed"))
+            .map_err(|_| CodecError::CodecNotFound("IDXGIResource1 cast failed"))?;
+        unsafe {
+            dxgi_resource.CreateSharedHandle(
+                None,
+                DXGI_SHARED_RESOURCE_READ.0,
+                windows::core::PCWSTR::null(),
+            )
+        }
+        .map_err(|_| CodecError::CodecNotFound("CreateSharedHandle failed"))
     }
 
     /// Fallback: download to CPU when GPU export isn't possible.
@@ -328,13 +356,19 @@ impl Decoder for D3D11Decoder {
     fn next_frame(&mut self) -> Result<Option<Frame>> {
         match self.decoder.receive_frame() {
             Ok(frame) => {
-                // CPU download path: GPU decode → av_hwframe_transfer_data
-                // → NV12 bytes → queue.write_texture on the renderer.
-                // The GPU export path (export_gpu_frame → shared DXGI
-                // handle → Vulkan import) requires VK_KHR_external_memory_win32
-                // which not all drivers expose (AMD Vulkan doesn't).
-                // Activate GPU export when the renderer can signal support.
-                let decoded = self.download_frame_cpu(&frame)?;
+                // GPU-resident by default: export the decoded D3D11
+                // surface as a shared-handle `Frame::Gpu` for zero-copy
+                // import into wgpu's Vulkan backend
+                // (VK_KHR_external_memory_win32). `gpu_export` is false
+                // only when the renderer's driver lacks that extension
+                // (some AMD Vulkan stacks); then we download to CPU.
+                // `export_gpu_frame` itself also falls back to CPU if the
+                // decode surface pointer is unexpectedly null.
+                let decoded = if self.gpu_export {
+                    self.export_gpu_frame(&frame)?
+                } else {
+                    self.download_frame_cpu(&frame)?
+                };
                 Ok(Some(decoded))
             }
             Err(RsmpegError::DecoderDrainError) => Ok(None),

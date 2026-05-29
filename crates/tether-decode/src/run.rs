@@ -420,8 +420,9 @@ pub fn run_thread(
     request_idr: Arc<dyn Fn() + Send + Sync + 'static>,
     warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
+    gpu_export: bool,
 ) -> JoinHandle<()> {
-    let decoder_init = build_decoder(profile);
+    let decoder_init = build_decoder(profile, gpu_export);
     run_thread_with_init(
         profile,
         decoder_init,
@@ -431,6 +432,7 @@ pub fn run_thread(
         request_idr,
         warnings,
         ready_tx,
+        gpu_export,
     )
 }
 
@@ -450,6 +452,9 @@ pub fn run_thread_with_init(
     request_idr: Arc<dyn Fn() + Send + Sync + 'static>,
     warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
+    // Renderer's zero-copy import capability, forwarded to `build_decoder`
+    // on rebuild so a rebuilt Windows decoder keeps the same export mode.
+    gpu_export: bool,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("tether-decode".into())
@@ -504,7 +509,7 @@ pub fn run_thread_with_init(
                     // requires a full session restart (the
                     // surrounding QUIC session is torn down when
                     // the decode thread exits).
-                    match build_decoder(profile) {
+                    match build_decoder(profile, gpu_export) {
                         Ok(new) => {
                             info!(
                                 rebuilds_used,

@@ -51,6 +51,7 @@ pub use winit::keyboard::{KeyCode, ModifiersState};
 pub use gpu::accepts_iosurface_fourcc;
 
 pub use gpu::supports_10bit_render;
+pub use gpu::supports_d3d11_zero_copy_import;
 
 /// Shared cursor state for the overlay render pass. Construct one,
 /// hand a clone to the wire-receive side (call `with(|s| s.set_position(...))`

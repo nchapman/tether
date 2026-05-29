@@ -22,8 +22,10 @@ impl ProfileProbe for D3D11Probe {
 }
 
 fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
-    let mut dec =
-        D3D11Decoder::new(profile.codec).map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
+    // The probe never renders — CPU download is fine and avoids needing
+    // a renderer capability here.
+    let mut dec = D3D11Decoder::new(profile.codec, false)
+        .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
     dec.submit(fixture)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
     // D3D11VA buffers a single IDR until either another packet or EOF

@@ -165,7 +165,7 @@ mod tests {
     #[test]
     #[ignore = "requires D3D11VA-capable GPU (Windows)"]
     fn d3d11_decoder_constructs_h264() {
-        let dec = D3D11Decoder::new(CodecKind::H264);
+        let dec = D3D11Decoder::new(CodecKind::H264, false);
         assert!(dec.is_ok(), "H.264 decoder construction failed: {:?}", dec.err());
         assert!(dec.unwrap().is_hardware());
     }
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     #[ignore = "requires D3D11VA-capable GPU (Windows)"]
     fn d3d11_decoder_constructs_hevc() {
-        let dec = D3D11Decoder::new(CodecKind::Hevc);
+        let dec = D3D11Decoder::new(CodecKind::Hevc, false);
         assert!(dec.is_ok(), "HEVC decoder construction failed: {:?}", dec.err());
     }
 
@@ -192,7 +192,7 @@ mod tests {
         )
         .expect("encoder construction");
 
-        let mut dec = D3D11Decoder::new(CodecKind::H264).expect("decoder construction");
+        let mut dec = D3D11Decoder::new(CodecKind::H264, false).expect("decoder construction");
 
         let bgra = vec![128u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
 
@@ -243,6 +243,18 @@ mod tests {
                 assert_eq!(g.height, TEST_HEIGHT);
             }
         }
+    }
+
+    /// With `gpu_export = true` the decoder must hand back a GPU-resident
+    /// `Frame::Gpu` carrying two non-null D3D11 NT shared handles (what
+    /// wgpu's Vulkan backend imports), not a CPU download. Drives the real
+    /// QSV GPU encode path on Intel and asserts inside the shared helper;
+    /// the renderer-side Vulkan import is exercised by the client
+    /// end-to-end. SKIPs on non-Intel GPUs (see the helper's vendor gate).
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    fn d3d11_qsv_decode_exports_gpu_shared_handles() {
+        gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", true);
     }
 
     #[test]
@@ -322,7 +334,7 @@ mod tests {
         )
         .expect("encoder construction");
 
-        let mut dec = D3D11Decoder::new(CodecKind::H264).expect("decoder construction");
+        let mut dec = D3D11Decoder::new(CodecKind::H264, false).expect("decoder construction");
 
         let frame = D3D11TextureFrame {
             texture: texture.as_raw() as *mut _,
@@ -390,7 +402,7 @@ mod tests {
         )
         .expect("encoder construction");
 
-        let mut dec = D3D11Decoder::new(CodecKind::Hevc).expect("decoder construction");
+        let mut dec = D3D11Decoder::new(CodecKind::Hevc, false).expect("decoder construction");
 
         let bgra = vec![64u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
 
@@ -652,7 +664,7 @@ mod tests {
         );
 
         // Submit to a FRESH decoder (no prior state) and verify decode
-        let mut dec = D3D11Decoder::new(CodecKind::Hevc).expect("decoder");
+        let mut dec = D3D11Decoder::new(CodecKind::Hevc, false).expect("decoder");
         dec.submit(&kf).expect("submit keyframe");
         dec.signal_eof().expect("signal_eof");
 
@@ -768,7 +780,7 @@ mod tests {
     /// Asserts the *intended* backend opened, not the `hevc_mf` fallback
     /// `backends_for_vendor` appends — so on the wrong GPU the test fails
     /// loudly rather than silently passing through Media Foundation.
-    fn gpu_roundtrip_for_vendor(vendor_id: u32, expected_backend: &str) {
+    fn gpu_roundtrip_for_vendor(vendor_id: u32, expected_backend: &str, gpu_export: bool) {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D11::{
@@ -844,7 +856,7 @@ mod tests {
             enc.name()
         );
 
-        let mut dec = D3D11Decoder::new(CodecKind::Hevc).expect("decoder construction");
+        let mut dec = D3D11Decoder::new(CodecKind::Hevc, gpu_export).expect("decoder construction");
         let frame = D3D11TextureFrame {
             texture: texture.as_raw() as *mut _,
             device: device.as_raw() as *mut _,
@@ -871,10 +883,26 @@ mod tests {
                 dec.submit(&pkt.data).expect("submit");
             }
             if let Some(f) = dec.next_frame().expect("next_frame") {
-                decoded_dims = Some(match f {
+                decoded_dims = Some(match &f {
                     Frame::Cpu(f) => (f.width, f.height),
                     Frame::Gpu(g) => (g.width, g.height),
                 });
+                // When the renderer can import D3D11 textures, the decoder
+                // must hand back a GPU-resident frame carrying two non-null
+                // NT shared handles — not a CPU download.
+                if gpu_export {
+                    match f {
+                        Frame::Gpu(g) => {
+                            let (_w, _h, _pts, source, _guard) = g.into_parts();
+                            let crate::GpuFrameSource::D3D11Texture(tex) = source;
+                            assert!(!tex.y_handle.is_null(), "Y plane shared handle is null");
+                            assert!(!tex.uv_handle.is_null(), "UV plane shared handle is null");
+                        }
+                        Frame::Cpu(_) => {
+                            panic!("gpu_export = true must yield Frame::Gpu, got a CPU download")
+                        }
+                    }
+                }
             }
         }
         assert!(
@@ -890,7 +918,7 @@ mod tests {
     #[test]
     #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
     fn d3d11_qsv_gpu_encode_decode_roundtrip() {
-        gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv");
+        gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", false);
     }
 
     /// AMF via the zero-copy GPU submit path — the only coverage of the
@@ -898,7 +926,7 @@ mod tests {
     #[test]
     #[ignore = "requires AMD GPU with AMF (Windows)"]
     fn d3d11_amf_gpu_encode_decode_roundtrip() {
-        gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf");
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", false);
     }
 
     /// NVENC via the zero-copy GPU submit path — the only coverage of the
@@ -906,7 +934,7 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU with NVENC (Windows)"]
     fn d3d11_nvenc_gpu_encode_decode_roundtrip() {
-        gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "hevc_nvenc");
+        gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "hevc_nvenc", false);
     }
 
     /// Diagnostic probe for QSV encode latency. Measures `submit_d3d11_texture`
@@ -1066,7 +1094,7 @@ mod tests {
         .expect("QSV encoder construction");
         assert_eq!(enc.name(), "hevc_qsv", "QSV unavailable; got {}", enc.name());
 
-        let mut dec = D3D11Decoder::new(CodecKind::Hevc).expect("decoder construction");
+        let mut dec = D3D11Decoder::new(CodecKind::Hevc, false).expect("decoder construction");
         let bgra = vec![128u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
 
         let mut packets = Vec::new();

@@ -72,6 +72,10 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # IDXGIResource1::CreateSharedHandle takes an Option<*const
+    # SECURITY_ATTRIBUTES>; that param type lives behind Win32_Security,
+    # so the method is cfg'd out without this feature.
+    "Win32_Security",
 ] }
 
 # Tests create their own D3D11 device for hardware roundtrip validation.

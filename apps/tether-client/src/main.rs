@@ -320,6 +320,14 @@ async fn main() -> anyhow::Result<()> {
     });
     let warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static> =
         Arc::new(tether_codec::av_log::warning_or_above_count);
+    // Windows zero-copy decode capability: when the renderer's Vulkan
+    // adapter can import D3D11 shared-handle textures, the decoder exports
+    // GPU-resident frames; otherwise it downloads to CPU. Always false off
+    // Windows (those backends always export GPU-resident frames). Probed
+    // here, before the window exists, on a throwaway adapter that matches
+    // the one the renderer will select.
+    let gpu_export = tether_render::supports_d3d11_zero_copy_import().await;
+    info!(gpu_export, "decode export mode resolved");
     tether_decode::run_thread(
         decode_profile,
         decode_job_rx,
@@ -328,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
         request_idr,
         warnings,
         decoder_ready_tx,
+        gpu_export,
     );
 
     let conn_for_recovery_send = conn.clone();

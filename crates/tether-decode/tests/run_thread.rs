@@ -285,6 +285,7 @@ async fn init_failure_drops_ready_tx_without_send() {
         request_idr,
         warnings,
         ready_tx,
+        false,
     );
 
     // ready_rx must surface RecvError because the worker dropped the
@@ -325,6 +326,7 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
         request_idr,
         warnings,
         ready_tx,
+        false,
     );
 
     ready_rx.await.expect("ready signal");

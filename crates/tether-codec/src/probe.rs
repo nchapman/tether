@@ -166,9 +166,14 @@ pub fn build_encoder_d3d11(
 /// doesn't need them at construction. Future chroma-aware decoder
 /// backends won't require a signature change.
 ///
+/// `gpu_export` is the renderer's zero-copy import capability, consumed
+/// only by the Windows D3D11 decoder (other backends always export
+/// GPU-resident frames). See [`crate::d3d11::D3D11Decoder::new`].
+///
 /// Errors if no GPU decoder is available for `profile.codec` on this
 /// client.
-pub fn build_decoder(profile: VideoProfile) -> Result<Box<dyn Decoder>> {
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+pub fn build_decoder(profile: VideoProfile, gpu_export: bool) -> Result<Box<dyn Decoder>> {
     let kind = profile.codec;
     #[cfg(target_os = "linux")]
     {
@@ -208,7 +213,7 @@ pub fn build_decoder(profile: VideoProfile) -> Result<Box<dyn Decoder>> {
 
     #[cfg(target_os = "windows")]
     {
-        match crate::d3d11::D3D11Decoder::new(kind) {
+        match crate::d3d11::D3D11Decoder::new(kind, gpu_export) {
             Ok(dec) => return Ok(Box::new(dec)),
             Err(e) => {
                 tracing::error!(

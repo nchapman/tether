@@ -105,7 +105,7 @@ pub fn build_encoder(
 
     #[cfg(target_os = "windows")]
     {
-        build_encoder_d3d11(profile, width, height, fps, bitrate_kbps, std::ptr::null_mut(), std::ptr::null_mut())
+        build_encoder_d3d11(profile, width, height, fps, bitrate_kbps, std::ptr::null_mut(), std::ptr::null_mut(), 0)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -128,6 +128,7 @@ pub fn build_encoder_d3d11(
     bitrate_kbps: u32,
     device_ptr: *mut std::ffi::c_void,
     device_ctx_ptr: *mut std::ffi::c_void,
+    vendor_id: u32,
 ) -> Result<(VideoProfile, Box<dyn Encoder>)> {
     match crate::d3d11::D3D11Encoder::new(
         profile,
@@ -137,6 +138,7 @@ pub fn build_encoder_d3d11(
         bitrate_kbps,
         device_ptr,
         device_ctx_ptr,
+        vendor_id,
     ) {
         Ok(enc) => Ok((profile, Box::new(enc))),
         Err(e) => {
@@ -279,8 +281,8 @@ fn no_hw_decoder_vt(kind: CodecKind, source: CodecError) -> CodecError {
 fn no_hw_encoder_d3d11(kind: CodecKind, source: CodecError) -> CodecError {
     CodecError::NoHardwareCodec(format!(
         "D3D11 encoder unavailable for {kind:?} ({source}). \
-         Check that FFmpeg was built with Media Foundation, NVENC, or AMF support \
-         (`ffmpeg -encoders | grep -E 'mf|nvenc|amf'`). \
+         Check that FFmpeg was built with Media Foundation, QSV, NVENC, or AMF support \
+         (`ffmpeg -encoders | grep -E 'mf|nvenc|amf|qsv'`). \
          Tether requires GPU encode — there is no software fallback."
     ))
 }

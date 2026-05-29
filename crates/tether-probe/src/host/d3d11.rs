@@ -39,6 +39,7 @@ fn probe_encode_inner(profile: VideoProfile) -> Result<()> {
         PROBE_BITRATE_KBPS,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
+        0,
     )
     .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
 

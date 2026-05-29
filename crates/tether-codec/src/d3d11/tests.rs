@@ -15,6 +15,9 @@ mod tests {
     const TEST_HEIGHT: u32 = 720;
     const TEST_FPS: u32 = 30;
     const TEST_BITRATE_KBPS: u32 = 4000;
+    /// Intel PCI vendor ID — routes `D3D11Encoder::new` to the QSV
+    /// backend (see `backends_for_vendor`).
+    const VENDOR_INTEL: u32 = 0x8086;
 
     fn h264_profile() -> VideoProfile {
         VideoProfile {
@@ -51,6 +54,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         );
         assert!(enc.is_ok(), "H.264 encoder construction failed: {:?}", enc.err());
         assert!(enc.unwrap().is_hardware());
@@ -67,6 +71,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         );
         assert!(enc.is_ok(), "HEVC encoder construction failed: {:?}", enc.err());
     }
@@ -108,6 +113,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             device.as_raw() as *mut _,
             context.as_raw() as *mut _,
+            0,
         );
         assert!(enc.is_ok(), "shared-device encoder failed: {:?}", enc.err());
         assert!(enc.unwrap().is_hardware());
@@ -139,6 +145,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         )
         .expect("encoder construction");
 
@@ -268,6 +275,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         )
         .expect("encoder construction");
 
@@ -335,6 +343,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         )
         .expect("encoder construction");
 
@@ -397,6 +406,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         )
         .expect("HEVC Main10 encoder construction");
 
@@ -435,6 +445,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         )
         .expect("HEVC encoder construction");
 
@@ -492,6 +503,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         )
         .expect("H.264 encoder construction");
 
@@ -547,6 +559,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         )
         .expect("HEVC encoder construction");
 
@@ -624,6 +637,7 @@ mod tests {
             TEST_BITRATE_KBPS,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            0,
         )
         .expect("HEVC encoder construction");
 
@@ -637,5 +651,383 @@ mod tests {
             nalu_type, 32,
             "first NALU in extradata should be VPS (32), got {nalu_type}"
         );
+    }
+
+    /// Create a D3D11 device with `VIDEO_SUPPORT` (required by both the
+    /// Video Processor blit and QSV's oneVPL session) and multithread
+    /// protection (QSV derivation requires it). Mirrors the capture
+    /// layer's device setup so QSV tests exercise the real config.
+    fn create_video_device() -> (
+        windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    ) {
+        use windows::core::Interface;
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, ID3D11Multithread, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+        };
+
+        let mut device = None;
+        let mut context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        }
+        .expect("D3D11CreateDevice with VIDEO_SUPPORT");
+        let device = device.unwrap();
+        let context = context.unwrap();
+        if let Ok(mt) = device.cast::<ID3D11Multithread>() {
+            let _ = unsafe { mt.SetMultithreadProtected(true) };
+        }
+        (device, context)
+    }
+
+    /// QSV via the zero-copy GPU submit path (`submit_d3d11_texture`) —
+    /// the path the host actually uses. Exercises: QSV device derivation,
+    /// the VP blit into the `av_hwframe_map`-exposed QSV surface, the
+    /// first-frame-forced-IDR requirement, and an encode→decode round
+    /// trip. The vendor-agnostic tests pass `vendor_id=0` (→ MF), so this
+    /// is the only coverage of the QSV backend.
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    fn d3d11_qsv_gpu_encode_decode_roundtrip() {
+        use crate::D3D11TextureFrame;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let capture_w = 1920u32;
+        let capture_h = 1080u32;
+        let encode_w = 1280u32;
+        let encode_h = 720u32;
+
+        let (device, context) = create_video_device();
+
+        // BGRA source texture at capture dims.
+        let bgra = vec![128u8; (capture_w * capture_h * 4) as usize];
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: capture_w,
+            Height: capture_h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bgra.as_ptr().cast(),
+            SysMemPitch: capture_w * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&init), Some(&mut texture)) }
+            .expect("CreateTexture2D");
+        let texture = texture.unwrap();
+
+        let mut enc = D3D11Encoder::new(
+            hevc_profile(),
+            encode_w,
+            encode_h,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            VENDOR_INTEL,
+        )
+        .expect("QSV encoder construction");
+        assert_eq!(
+            enc.name(),
+            "hevc_qsv",
+            "expected QSV backend on Intel; got {} — QSV unavailable in this FFmpeg build",
+            enc.name()
+        );
+
+        let mut dec = D3D11Decoder::new(CodecKind::Hevc).expect("decoder construction");
+        let frame = D3D11TextureFrame {
+            texture: texture.as_raw() as *mut _,
+            device: device.as_raw() as *mut _,
+            device_context: context.as_raw() as *mut _,
+            width: capture_w,
+            height: capture_h,
+            format: DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32,
+        };
+
+        // Sustained throughput: push 90 frames (~1.5 s at 60 fps) back to
+        // back, draining packets each iteration. Every submit MUST
+        // succeed — a too-small QSV surface pool serves only the first
+        // frame, then fails AVERROR(ENOMEM) on every subsequent
+        // `av_hwframe_get_buffer` (the production "froze after one frame"
+        // bug). Do NOT break early; that's exactly what hid the bug.
+        let mut total_packets = 0usize;
+        let mut decoded_dims = None;
+        for pts in 0..90 {
+            let pkts = enc
+                .submit_d3d11_texture(&frame, pts, pts == 0)
+                .expect("submit_d3d11_texture (sustained) — QSV pool exhausted?");
+            total_packets += pkts.len();
+            for pkt in &pkts {
+                dec.submit(&pkt.data).expect("submit");
+            }
+            if let Some(f) = dec.next_frame().expect("next_frame") {
+                decoded_dims = Some(match f {
+                    Frame::Cpu(f) => (f.width, f.height),
+                    Frame::Gpu(g) => (g.width, g.height),
+                });
+            }
+        }
+        assert!(
+            total_packets > 30,
+            "expected sustained packet output over 90 frames, got {total_packets}"
+        );
+        let (dw, dh) = decoded_dims.expect("decoder produced no frame from QSV GPU encode");
+        assert_eq!((dw, dh), (encode_w, encode_h));
+    }
+
+    /// Diagnostic probe for QSV encode latency. Measures `submit_d3d11_texture`
+    /// while a second thread saturates the SAME iGPU with `CopyResource`
+    /// batches. Findings (Intel iGPU): encode alone ~5ms; under a light
+    /// shared-device `CopyResource` loop still ~4ms (device-wide lock is
+    /// NOT the bottleneck); under GPU-queue saturation ~16-26ms. This is
+    /// why a loopback session (host encode + client decode/render/present
+    /// on one iGPU) shows 100ms+ `avg_encode_ms`: `receive_packet`'s
+    /// blocking MFX `SyncOperation` waits behind queued GPU work. The
+    /// encoder itself is fast — the latency is GPU contention/topology,
+    /// not an encoder bug. Keep this probe before "optimizing" QSV options.
+    #[test]
+    #[ignore = "diagnostic: QSV submit latency under shared-iGPU contention"]
+    fn d3d11_qsv_submit_under_capture_contention() {
+        use crate::D3D11TextureFrame;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D11::{
+            ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_SUBRESOURCE_DATA,
+            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+
+        let capture_w = 1920u32;
+        let capture_h = 1200u32;
+        let encode_w = 1440u32;
+        let encode_h = 896u32;
+
+        let (device, context) = create_video_device();
+
+        let make_bgra = |w: u32, h: u32| -> ID3D11Texture2D {
+            let data = vec![128u8; (w * h * 4) as usize];
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: 0,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let init = D3D11_SUBRESOURCE_DATA {
+                pSysMem: data.as_ptr().cast(),
+                SysMemPitch: w * 4,
+                SysMemSlicePitch: 0,
+            };
+            let mut t = None;
+            unsafe { device.CreateTexture2D(&desc, Some(&init), Some(&mut t)) }
+                .expect("CreateTexture2D");
+            t.unwrap()
+        };
+
+        let enc_src = make_bgra(capture_w, capture_h);
+
+        // Capture-contention thread: CopyResource a full-size frame on the
+        // shared context in a ~60fps loop. Pass COM pointers as usize.
+        let stop = Arc::new(AtomicBool::new(false));
+        let dev_us = device.as_raw() as usize;
+        let ctx_us = context.as_raw() as usize;
+        let cap_src = make_bgra(capture_w, capture_h);
+        let cap_dst = make_bgra(capture_w, capture_h);
+        let cap_src_us = cap_src.as_raw() as usize;
+        let cap_dst_us = cap_dst.as_raw() as usize;
+        let stop_t = stop.clone();
+        let contention = std::thread::spawn(move || {
+            let ctx: ID3D11DeviceContext =
+                unsafe { ID3D11DeviceContext::from_raw_borrowed(&(ctx_us as *mut _)) }
+                    .unwrap()
+                    .clone();
+            let src: ID3D11Texture2D =
+                unsafe { ID3D11Texture2D::from_raw_borrowed(&(cap_src_us as *mut _)) }
+                    .unwrap()
+                    .clone();
+            let dst: ID3D11Texture2D =
+                unsafe { ID3D11Texture2D::from_raw_borrowed(&(cap_dst_us as *mut _)) }
+                    .unwrap()
+                    .clone();
+            let _ = dev_us;
+            // Saturate the GPU queue: many full-frame copies per flush, no
+            // sleep — approximates the loopback client's continuous render.
+            while !stop_t.load(Ordering::Relaxed) {
+                for _ in 0..32 {
+                    unsafe { ctx.CopyResource(&dst, &src) };
+                }
+                unsafe { ctx.Flush() };
+            }
+        });
+
+        let mut enc = D3D11Encoder::new(
+            hevc_profile(),
+            encode_w,
+            encode_h,
+            60,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            VENDOR_INTEL,
+        )
+        .expect("QSV encoder construction");
+
+        let frame = D3D11TextureFrame {
+            texture: enc_src.as_raw() as *mut _,
+            device: device.as_raw() as *mut _,
+            device_context: context.as_raw() as *mut _,
+            width: capture_w,
+            height: capture_h,
+            format: DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32,
+        };
+
+        let mut submit_us: Vec<u128> = Vec::with_capacity(90);
+        for pts in 0..90 {
+            let t0 = std::time::Instant::now();
+            enc.submit_d3d11_texture(&frame, pts, pts == 0)
+                .expect("submit_d3d11_texture under contention");
+            submit_us.push(t0.elapsed().as_micros());
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = contention.join();
+
+        let warm = &submit_us[5..];
+        let avg: u128 = warm.iter().sum::<u128>() / warm.len() as u128;
+        let mx = warm.iter().max().unwrap();
+        eprintln!(
+            "QSV submit UNDER capture contention (warm): avg={}us max={}us  [first5={:?}us]",
+            avg, mx, &submit_us[..5]
+        );
+    }
+
+    /// QSV via the `encode_bgra` path (`av_hwframe_transfer_data` upload),
+    /// the same upload mechanism FFmpeg's own `hwupload`+`hevc_qsv` uses.
+    /// Isolates "does QSV encode work at all" from the zero-copy VP-blit
+    /// GPU path: if this passes but `d3d11_qsv_gpu_encode_decode_roundtrip`
+    /// fails, the bug is specifically the VP-blit-into-mapped-QSV-surface.
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    fn d3d11_qsv_encode_bgra_roundtrip() {
+        use windows::core::Interface;
+
+        let (device, context) = create_video_device();
+        let mut enc = D3D11Encoder::new(
+            hevc_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            VENDOR_INTEL,
+        )
+        .expect("QSV encoder construction");
+        assert_eq!(enc.name(), "hevc_qsv", "QSV unavailable; got {}", enc.name());
+
+        let mut dec = D3D11Decoder::new(CodecKind::Hevc).expect("decoder construction");
+        let bgra = vec![128u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
+
+        let mut packets = Vec::new();
+        for pts in 0..30 {
+            let pkts = enc.encode_bgra(&bgra, pts, pts == 0).expect("encode_bgra");
+            packets.extend(pkts);
+            if !packets.is_empty() {
+                break;
+            }
+        }
+        assert!(!packets.is_empty(), "QSV encode_bgra produced no packets after 30 frames");
+
+        for pkt in &packets {
+            dec.submit(&pkt.data).expect("submit");
+        }
+        let mut decoded = None;
+        for pts in 30..60 {
+            if let Some(f) = dec.next_frame().expect("next_frame") {
+                decoded = Some(f);
+                break;
+            }
+            let pkts = enc.encode_bgra(&bgra, pts, false).expect("encode_bgra");
+            for pkt in &pkts {
+                dec.submit(&pkt.data).expect("submit");
+            }
+        }
+        assert!(decoded.is_some(), "decoder produced no frame from QSV encode_bgra");
+    }
+
+    /// Build a QSV encoder, drop it, then build another at different
+    /// dims on the SAME D3D11 device. Regression for the recreate path:
+    /// a QSV session/frame-pool that isn't released on drop made the
+    /// second encoder's child-frames-context `CreateTexture2D` fail with
+    /// `DXGI_ERROR_INVALID_CALL`. The host recreates the encoder on every
+    /// viewport change, so this must hold.
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    fn d3d11_qsv_encoder_rebuild_same_device() {
+        use windows::core::Interface;
+
+        let (device, context) = create_video_device();
+        let dev_ptr = device.as_raw() as *mut _;
+        let ctx_ptr = context.as_raw() as *mut _;
+
+        let enc_a = D3D11Encoder::new(
+            hevc_profile(),
+            1152,
+            720,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            dev_ptr,
+            ctx_ptr,
+            VENDOR_INTEL,
+        )
+        .expect("first QSV encoder construction");
+        assert_eq!(enc_a.name(), "hevc_qsv", "QSV unavailable; got {}", enc_a.name());
+        drop(enc_a);
+
+        let enc_b = D3D11Encoder::new(
+            hevc_profile(),
+            1440,
+            896,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            dev_ptr,
+            ctx_ptr,
+            VENDOR_INTEL,
+        )
+        .expect("rebuilt QSV encoder on same device — was the first session released?");
+        assert_eq!(enc_b.name(), "hevc_qsv");
     }
 }

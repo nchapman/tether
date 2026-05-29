@@ -2,3 +2,6 @@
 
 # Ad-hoc log captures from manual `cargo run` testing.
 *.log
+
+# Machine-specific mise overrides (FFmpeg paths, etc.).
+mise.local.toml

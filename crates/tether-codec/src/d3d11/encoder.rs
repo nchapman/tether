@@ -10,13 +10,14 @@
 //!    color-space conversion, no CPU readback).
 //! 4. Sends the hw frame to the encoder.
 //!
-//! Encoder selection follows a preference order:
-//! - `hevc_mf` / `h264_mf` (Media Foundation — Intel/AMD/NVIDIA)
-//! - `hevc_nvenc` / `h264_nvenc` (NVIDIA-specific, higher quality)
-//! - `hevc_amf` / `h264_amf` (AMD-specific)
+//! Encoder backend is selected by GPU vendor (DXGI VendorId):
+//! - Intel (0x8086): `hevc_qsv` / `h264_qsv` via derived QSV device
+//! - AMD   (0x1002): `hevc_amf` / `h264_amf` via D3D11VA device
+//! - NVIDIA(0x10de): `hevc_nvenc` / `h264_nvenc` via D3D11VA device
+//! - Fallback:       `hevc_mf` / `h264_mf` (Media Foundation)
 //!
-//! The first encoder that successfully opens with the given profile
-//! wins. The probe layer surfaces this empirically.
+//! QSV requires an FFmpeg build with a working oneVPL-over-D3D11 path
+//! (see [`backends_for_vendor`]).
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{ra, AVDictionary, AVFrame, AVHWDeviceContext};
@@ -67,11 +68,47 @@ const _: () = assert!(std::mem::size_of::<AvD3D11VADeviceContext>() == 56);
 
 const D3D11_BIND_RENDER_TARGET: u32 = 0x20;
 
-/// Encoder backend names to try in preference order for each codec.
-/// Each vendor's native backend first (fails fast on wrong hardware),
-/// then the generic MF wrapper as fallback.
-const HEVC_BACKENDS: &[&str] = &["hevc_amf", "hevc_nvenc", "hevc_qsv", "hevc_mf"];
-const H264_BACKENDS: &[&str] = &["h264_amf", "h264_nvenc", "h264_qsv", "h264_mf"];
+/// QSV hw_frames pool size. MUST be 1: the Intel D3D11 driver rejects
+/// multi-slice NV12 texture arrays (DXGI_ERROR_INVALID_CALL on
+/// CreateTexture2D), so the pool can only hold one surface. We then
+/// follow Apollo's pattern — allocate that surface ONCE and reuse it
+/// every frame (re-blit + re-send, async_depth=1 keeps the encoder
+/// synchronous so the surface is free before the next send). Calling
+/// `av_hwframe_get_buffer` per frame against a pool of 1 instead
+/// exhausts it (the encoder holds the surface) → AVERROR(ENOMEM).
+const QSV_POOL_SIZE: i32 = 1;
+
+const VENDOR_INTEL: u32 = 0x8086;
+const VENDOR_AMD: u32 = 0x1002;
+const VENDOR_NVIDIA: u32 = 0x10de;
+
+/// Return the encoder backends to try for a given codec and GPU vendor.
+/// Vendor-native backend first, Media Foundation as universal fallback.
+///
+/// QSV (Intel) derives an `AV_HWDEVICE_TYPE_QSV` context from D3D11VA;
+/// this depends on the oneVPL runtime in the linked FFmpeg build. Builds
+/// with a broken QSV-over-D3D11 path (notably gyan.dev's
+/// `full_build-shared`) fail child-frames-context creation AND hang in
+/// `MFXClose` during teardown, so a failed QSV attempt is unrecoverable.
+/// Link an FFmpeg build whose oneVPL works (e.g. BtbN's) — see
+/// `docs/CODEC_CAPABILITIES.md`.
+fn backends_for_vendor(kind: CodecKind, vendor_id: u32) -> &'static [&'static str] {
+    match (kind, vendor_id) {
+        (CodecKind::Hevc, VENDOR_INTEL) => &["hevc_qsv", "hevc_mf"],
+        (CodecKind::Hevc, VENDOR_AMD) => &["hevc_amf", "hevc_mf"],
+        (CodecKind::Hevc, VENDOR_NVIDIA) => &["hevc_nvenc", "hevc_mf"],
+        (CodecKind::Hevc, _) => &["hevc_mf", "hevc_amf", "hevc_nvenc"],
+        (CodecKind::H264, VENDOR_INTEL) => &["h264_qsv", "h264_mf"],
+        (CodecKind::H264, VENDOR_AMD) => &["h264_amf", "h264_mf"],
+        (CodecKind::H264, VENDOR_NVIDIA) => &["h264_nvenc", "h264_mf"],
+        (CodecKind::H264, _) => &["h264_mf", "h264_amf", "h264_nvenc"],
+        (CodecKind::Av1, _) => &[],
+    }
+}
+
+fn is_qsv_backend(name: &str) -> bool {
+    name.contains("qsv")
+}
 
 pub struct D3D11Encoder {
     kind: CodecKind,
@@ -86,20 +123,34 @@ pub struct D3D11Encoder {
     height: u32,
     bgra_row_bytes: usize,
     vp_state: Option<VideoProcessorState>,
+    /// QSV frames use `AV_PIX_FMT_QSV` and need `av_hwframe_map` to
+    /// expose the underlying D3D11 texture for VP blit.
+    is_qsv: bool,
+    /// QSV's media-driver rejects a first frame whose `FrameType` is
+    /// UNKNOWN (`Invalid FrameType:0`) — the stream must open on an IDR.
+    /// Other backends auto-promote frame 0, but forcing it is correct
+    /// for our protocol regardless (the client needs an initial IDR).
+    first_frame: bool,
+    /// QSV-only: the single hw surface (pool size 1) allocated once and
+    /// reused every frame (Apollo's pattern — see [`QSV_POOL_SIZE`]).
+    /// `qsv_mapped` is its persistent `AV_PIX_FMT_D3D11` mapping;
+    /// `qsv_dst_texture`/`qsv_dst_index` are the VP blit target read from
+    /// that mapping. All `None`/null until the first GPU frame.
+    qsv_frame: Option<AVFrame>,
+    qsv_mapped: Option<AVFrame>,
+    qsv_dst_texture: *mut std::ffi::c_void,
+    qsv_dst_index: u32,
 }
 
 unsafe impl Send for D3D11Encoder {}
 
 impl D3D11Encoder {
-    /// Construct a D3D11-accelerated encoder. Tries multiple FFmpeg
-    /// backend encoders in preference order and returns the first that
-    /// successfully opens.
+    /// Construct a D3D11-accelerated encoder. Selects the backend based
+    /// on `vendor_id` (PCI vendor from DXGI adapter) and tries each
+    /// candidate until one successfully opens.
     ///
     /// `device_ptr` and `device_ctx_ptr` are raw COM pointers to the
     /// shared `ID3D11Device` / `ID3D11DeviceContext` from capture.
-    /// The encoder configures FFmpeg's `d3d11va` hw_device_ctx to use
-    /// this device — no new device is created, and textures produced by
-    /// capture are directly usable without cross-device copies.
     pub fn new(
         profile: VideoProfile,
         width: u32,
@@ -108,17 +159,15 @@ impl D3D11Encoder {
         bitrate_kbps: u32,
         device_ptr: *mut std::ffi::c_void,
         device_ctx_ptr: *mut std::ffi::c_void,
+        vendor_id: u32,
     ) -> Result<Self> {
         init_ffmpeg();
 
         let kind = profile.codec;
-        let backends: &[&str] = match kind {
-            CodecKind::Hevc => HEVC_BACKENDS,
-            CodecKind::H264 => H264_BACKENDS,
-            CodecKind::Av1 => {
-                return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
-            }
-        };
+        let backends = backends_for_vendor(kind, vendor_id);
+        if backends.is_empty() {
+            return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
+        }
 
         let mut last_err = CodecError::CodecNotFound("d3d11 encoder");
         for &backend_name in backends {
@@ -135,6 +184,7 @@ impl D3D11Encoder {
                 Ok(enc) => {
                     tracing::info!(
                         encoder = backend_name,
+                        vendor_id = format_args!("0x{vendor_id:04x}"),
                         width,
                         height,
                         bitrate_kbps,
@@ -143,7 +193,7 @@ impl D3D11Encoder {
                     return Ok(enc);
                 }
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         encoder = backend_name,
                         error = %e,
                         "D3D11 encoder backend unavailable, trying next"
@@ -172,7 +222,23 @@ impl D3D11Encoder {
         let codec = AVCodec::find_encoder_by_name(&codec_cname)
             .ok_or(CodecError::CodecNotFound(backend_name))?;
 
-        let hw_device = create_d3d11va_hw_device(device_ptr, device_ctx_ptr)?;
+        let d3d11va_device = create_d3d11va_hw_device(device_ptr, device_ctx_ptr)?;
+
+        let is_qsv = is_qsv_backend(backend_name);
+
+        // QSV requires a derived QSV device context on top of D3D11VA.
+        // SetMultithreadProtected is already called by tether-capture.
+        let (encoder_device, pix_fmt) = if is_qsv {
+            let qsv_device = d3d11va_device
+                .create_derived(ffi::AV_HWDEVICE_TYPE_QSV)
+                .map_err(|e| {
+                    tracing::debug!("QSV device derivation failed: {e}");
+                    CodecError::Ffmpeg(e)
+                })?;
+            (qsv_device, ffi::AV_PIX_FMT_QSV)
+        } else {
+            (d3d11va_device.clone(), ffi::AV_PIX_FMT_D3D11)
+        };
 
         let width_i32 = i32::try_from(width).expect("width fits i32");
         let height_i32 = i32::try_from(height).expect("height fits i32");
@@ -181,7 +247,7 @@ impl D3D11Encoder {
         let mut encoder = AVCodecContext::new(&codec);
         encoder.set_width(width_i32);
         encoder.set_height(height_i32);
-        encoder.set_pix_fmt(ffi::AV_PIX_FMT_D3D11);
+        encoder.set_pix_fmt(pix_fmt);
         encoder.set_time_base(ra(1, fps_i32));
         encoder.set_framerate(ra(fps_i32, 1));
         encoder.set_bit_rate(i64::from(bitrate_kbps) * 1000);
@@ -195,27 +261,29 @@ impl D3D11Encoder {
 
         let sw_format = d3d11_sw_format(profile);
 
-        let mut hw_frames_ref = hw_device.hwframe_ctx_alloc();
-        hw_frames_ref.data().format = ffi::AV_PIX_FMT_D3D11;
+        // Provide the hw_frames pool. Non-QSV (AMF/MF/NVENC): D3D11VA
+        // device, format = D3D11, pool 0 = dynamic. QSV: QSV device,
+        // format = QSV, FIXED pool (libmfx can't grow). The pool must be
+        // big enough for the async pipeline + DPB + our in-flight frame,
+        // but this Intel driver rejects large multi-slice NV12 arrays
+        // (DXGI_ERROR_INVALID_CALL) — QSV_POOL_SIZE is the tuned bound.
+        let mut hw_frames_ref = encoder_device.hwframe_ctx_alloc();
+        hw_frames_ref.data().format = pix_fmt;
         hw_frames_ref.data().sw_format = sw_format;
         hw_frames_ref.data().width = width_i32;
         hw_frames_ref.data().height = height_i32;
-        hw_frames_ref.data().initial_pool_size = 0;
+        hw_frames_ref.data().initial_pool_size = if is_qsv { QSV_POOL_SIZE } else { 0 };
 
-        // AMF/MF require D3D11_BIND_RENDER_TARGET on pool textures,
-        // otherwise avcodec_open2 fails with AVERROR_UNKNOWN. Access
-        // the backend-specific AVD3D11VAFramesContext and set flags.
-        unsafe {
-            let hwctx = hw_frames_ref.data().hwctx as *mut AvD3D11VAFramesContext;
-            (*hwctx).bind_flags = D3D11_BIND_RENDER_TARGET;
-            (*hwctx).misc_flags = 0;
+        if !is_qsv {
+            unsafe {
+                let hwctx = hw_frames_ref.data().hwctx as *mut AvD3D11VAFramesContext;
+                (*hwctx).bind_flags = D3D11_BIND_RENDER_TARGET;
+                (*hwctx).misc_flags = 0;
+            }
         }
 
         hw_frames_ref.init()?;
-
-        // Set hw_device_ctx on the encoder as well — some backends
-        // (h264_mf) read it separately from hw_frames_ctx.
-        encoder.set_hw_device_ctx(hw_device.clone());
+        encoder.set_hw_device_ctx(encoder_device.clone());
         encoder.set_hw_frames_ctx(hw_frames_ref);
 
         unsafe {
@@ -240,10 +308,18 @@ impl D3D11Encoder {
                 .set(c"rc", c"cbr", 0)
                 .set(c"surfaces", c"1", 0))
         } else if backend_name.contains("qsv") {
+            // `async_depth=1` keeps latency low (one frame in flight) and
+            // bounds the surface pool. `forced_idr` honours ForceIdr.
+            // Do NOT add `low_delay_brc` / `low_power`: both put the QSV
+            // media-driver into a mode that demands an explicit per-frame
+            // `mfxEncodeCtrl.FrameType`, which our `pict_type` doesn't
+            // supply — every frame is rejected `Invalid FrameType:0`
+            // (AVERROR_INVALIDDATA). Verified by
+            // `d3d11_qsv_gpu_encode_decode_roundtrip`.
             Some(AVDictionary::new(c"forced_idr", c"1", 0)
-                .set(c"async_depth", c"1", 0)
-                .set(c"low_delay_brc", c"1", 0)
-                .set(c"low_power", c"1", 0))
+                .set(c"async_depth", c"1", 0))
+        } else if backend_name.contains("mf") {
+            Some(AVDictionary::new(c"hw_encoding", c"1", 0))
         } else {
             None
         };
@@ -294,6 +370,10 @@ impl D3D11Encoder {
         let extradata = snapshot_extradata(&encoder, backend_name, kind)?;
         let bgra_row_bytes = (width as usize) * 4;
 
+        // Keep the D3D11VA device alive — for QSV the derived device
+        // holds a reference to it, but we own it explicitly too.
+        let hw_device = d3d11va_device;
+
         Ok(Self {
             kind,
             encoder,
@@ -307,6 +387,12 @@ impl D3D11Encoder {
             height,
             bgra_row_bytes,
             vp_state: None,
+            is_qsv,
+            first_frame: true,
+            qsv_frame: None,
+            qsv_mapped: None,
+            qsv_dst_texture: std::ptr::null_mut(),
+            qsv_dst_index: 0,
         })
     }
 
@@ -363,7 +449,76 @@ impl D3D11Encoder {
             }
         }
 
-        // Get a hardware frame from the pool.
+        let force_idr = force_keyframe || self.first_frame;
+
+        if self.is_qsv {
+            // QSV: one surface, allocated once and reused every frame
+            // (the Intel driver caps the pool at 1 — see QSV_POOL_SIZE).
+            // Lazily get the buffer and its persistent D3D11 mapping; the
+            // mapping aliases the QSV surface so the VP blit writes the
+            // bytes the encoder reads.
+            if self.qsv_frame.is_none() {
+                let mut hw = AVFrame::new();
+                let rc = unsafe {
+                    ffi::av_hwframe_get_buffer(
+                        self.encoder.deref_mut().hw_frames_ctx,
+                        hw.as_mut_ptr(),
+                        0,
+                    )
+                };
+                if rc < 0 {
+                    return Err(CodecError::Ffmpeg(RsmpegError::AVError(rc)));
+                }
+                let mut mapped = AVFrame::new();
+                unsafe {
+                    (*mapped.as_mut_ptr()).format = ffi::AV_PIX_FMT_D3D11;
+                }
+                let rc = unsafe {
+                    ffi::av_hwframe_map(
+                        mapped.as_mut_ptr(),
+                        hw.as_ptr(),
+                        (ffi::AV_HWFRAME_MAP_WRITE | ffi::AV_HWFRAME_MAP_OVERWRITE) as i32,
+                    )
+                };
+                if rc < 0 {
+                    return Err(CodecError::Ffmpeg(RsmpegError::AVError(rc)));
+                }
+                self.qsv_dst_texture =
+                    unsafe { (*mapped.as_ptr()).data[0] as *mut std::ffi::c_void };
+                self.qsv_dst_index = unsafe { (*mapped.as_ptr()).data[1] as usize as u32 };
+                self.qsv_mapped = Some(mapped);
+                self.qsv_frame = Some(hw);
+            }
+
+            // Re-blit into the reused surface.
+            let dst_texture = self.qsv_dst_texture;
+            let dst_index = self.qsv_dst_index;
+            self.vp_state
+                .as_ref()
+                .unwrap()
+                .blit(frame.texture, dst_texture, dst_index)
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Video Processor blit failed");
+                    CodecError::UnsupportedInputFormat
+                })?;
+
+            let hw_frame = self.qsv_frame.as_mut().unwrap();
+            hw_frame.set_pts(pts);
+            unsafe {
+                (*hw_frame.as_mut_ptr()).pict_type = if force_idr {
+                    ffi::AV_PICTURE_TYPE_I
+                } else {
+                    ffi::AV_PICTURE_TYPE_NONE
+                };
+            }
+            self.first_frame = false;
+            let hw_ptr: *const AVFrame = &*hw_frame;
+            self.encoder.send_frame(Some(unsafe { &*hw_ptr }))?;
+            return drain_encoder(&mut self.encoder, &self.extradata);
+        }
+
+        // Non-QSV (AMF/MF/NVENC): pull a fresh D3D11 frame from the pool
+        // each call (these backends honour a dynamically-grown pool).
         let mut hw_frame = AVFrame::new();
         let rc = unsafe {
             ffi::av_hwframe_get_buffer(
@@ -376,11 +531,8 @@ impl D3D11Encoder {
             return Err(CodecError::Ffmpeg(RsmpegError::AVError(rc)));
         }
 
-        // BGRA→NV12 via D3D11 Video Processor. data[0] is the pool's
-        // ID3D11Texture2D (NV12 array texture), data[1] is the slice
-        // index within that array.
-        let dst_texture = unsafe { (*hw_frame.as_mut_ptr()).data[0] as *mut std::ffi::c_void };
-        let dst_index = unsafe { (*hw_frame.as_mut_ptr()).data[1] as usize };
+        let dst_texture = unsafe { (*hw_frame.as_ptr()).data[0] as *mut std::ffi::c_void };
+        let dst_index = unsafe { (*hw_frame.as_ptr()).data[1] as usize };
 
         let vp = self.vp_state.as_ref().unwrap();
         vp.blit(frame.texture, dst_texture, dst_index as u32)
@@ -390,11 +542,12 @@ impl D3D11Encoder {
             })?;
 
         hw_frame.set_pts(pts);
-        if force_keyframe {
+        if force_idr {
             unsafe {
                 (*hw_frame.as_mut_ptr()).pict_type = ffi::AV_PICTURE_TYPE_I;
             }
         }
+        self.first_frame = false;
 
         self.encoder.send_frame(Some(&hw_frame))?;
         drain_encoder(&mut self.encoder, &self.extradata)
@@ -450,11 +603,12 @@ impl Encoder for D3D11Encoder {
         }
         hw_frame.set_pts(pts);
 
-        if force_keyframe {
+        if force_keyframe || self.first_frame {
             unsafe {
                 (*hw_frame.as_mut_ptr()).pict_type = ffi::AV_PICTURE_TYPE_I;
             }
         }
+        self.first_frame = false;
 
         self.encoder.send_frame(Some(&hw_frame))?;
         drain_encoder(&mut self.encoder, &self.extradata)
@@ -536,6 +690,15 @@ fn create_d3d11va_hw_device(
         let hwctx = data.hwctx as *mut AvD3D11VADeviceContext;
         (*hwctx).device = device_ptr;
         (*hwctx).device_context = device_ctx_ptr;
+        // Install no-op lock/unlock: the device is already
+        // multithread-protected by the capture layer
+        // (SetMultithreadProtected). Without this, FFmpeg installs its
+        // own ID3D11Multithread-based lock, which conflicts with QSV's
+        // session creation on a derived device (MFX_ERR_NOT_FOUND).
+        // lock_ctx must be non-null or FFmpeg falls back to its default.
+        (*hwctx).lock = d3d11_no_op_lock as *mut std::ffi::c_void;
+        (*hwctx).unlock = d3d11_no_op_lock as *mut std::ffi::c_void;
+        (*hwctx).lock_ctx = 1 as *mut std::ffi::c_void;
     }
     if let Err(e) = hw_device.init() {
         // init failed — FFmpeg won't release the injected refs, so we must.
@@ -558,6 +721,11 @@ fn d3d11_sw_format(profile: VideoProfile) -> ffi::AVPixelFormat {
         _ => ffi::AV_PIX_FMT_NV12,
     }
 }
+
+/// No-op lock callback for FFmpeg's `AVD3D11VADeviceContext`. The
+/// shared D3D11 device is externally synchronized via
+/// `SetMultithreadProtected`, so FFmpeg need not lock around its use.
+unsafe extern "C" fn d3d11_no_op_lock(_lock_ctx: *mut std::ffi::c_void) {}
 
 /// Raw COM IUnknown vtable layout.
 #[repr(C)]

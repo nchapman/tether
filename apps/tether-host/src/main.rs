@@ -2462,7 +2462,14 @@ fn run_capture_and_send(
                 || s.height != encode_height
         });
         if needs_recreate {
-            if let Some(old) = slot.as_ref() {
+            // Drop the previous encoder BEFORE constructing its
+            // replacement. `slot.take()` moves the old `EncoderSlot` out
+            // (slot = None) and it drops at the end of this block —
+            // releasing its hardware session and D3D11 frame pool before
+            // the new encoder allocates its own. Required for QSV: two
+            // live QSV sessions on one D3D11 device fail child-texture
+            // creation with DXGI_ERROR_INVALID_CALL.
+            if let Some(old) = slot.take() {
                 info!(
                     old_capture = old.capture_width,
                     new_capture = frame_width,
@@ -2498,6 +2505,7 @@ fn run_capture_and_send(
                     chosen_profile, encode_width, encode_height,
                     ENCODER_FPS, baseline_kbps,
                     dev_ptr, ctx_ptr,
+                    dev.vendor_id,
                 )
             };
             #[cfg(not(target_os = "windows"))]

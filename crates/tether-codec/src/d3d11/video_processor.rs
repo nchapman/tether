@@ -31,6 +31,9 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL;
 pub(crate) struct VideoProcessorState {
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
+    /// Base immediate context, kept to `Flush()` queued blits before the
+    /// encoder reads the surface (QSV/MFX reads out-of-band).
+    context: ID3D11DeviceContext,
     processor: ID3D11VideoProcessor,
     enumerator: ID3D11VideoProcessorEnumerator,
     input_width: u32,
@@ -111,6 +114,7 @@ impl VideoProcessorState {
         Ok(Self {
             video_device,
             video_context,
+            context,
             processor,
             enumerator,
             input_width,
@@ -240,6 +244,11 @@ impl VideoProcessorState {
                     &[stream],
                 )
                 .map_err(|e| format!("VideoProcessorBlt: {e}"))?;
+            // Flush so the blit is submitted to the GPU before the
+            // encoder (esp. QSV/MFX, which reads the surface out-of-band)
+            // samples it. Without this MFX can read a stale/incomplete
+            // surface → AVERROR_INVALIDDATA on send_frame.
+            self.context.Flush();
         }
 
         Ok(())

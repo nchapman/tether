@@ -25,8 +25,8 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
-    ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
@@ -56,6 +56,9 @@ const TEXTURE_POOL_SIZE: usize = 3;
 pub struct D3D11Device {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
+    /// PCI vendor ID from the DXGI adapter (0x8086 = Intel, 0x1002 = AMD,
+    /// 0x10de = NVIDIA). Used by the encoder to select the right backend.
+    pub vendor_id: u32,
 }
 
 impl D3D11Device {
@@ -105,9 +108,9 @@ unsafe impl Send for CapturedD3D11Texture {}
 /// in-process DXGI output enumeration). The returned value is passed
 /// to [`start_with`].
 pub fn pre_create() -> Result<PreCreatedCapture> {
-    let (device, context, duplication, width, height) =
+    let (device, context, duplication, width, height, vendor_id) =
         create_d3d11_device_and_duplication()?;
-    Ok(PreCreatedCapture { device, context, duplication, width, height })
+    Ok(PreCreatedCapture { device, context, duplication, width, height, vendor_id })
 }
 
 /// Opaque handle holding pre-created DXGI resources.
@@ -117,6 +120,7 @@ pub struct PreCreatedCapture {
     duplication: IDXGIOutputDuplication,
     width: u32,
     height: u32,
+    vendor_id: u32,
 }
 
 // SAFETY: same conditions as D3D11Device — multithread-protected COM objects.
@@ -124,10 +128,11 @@ unsafe impl Send for PreCreatedCapture {}
 
 /// Start DXGI Desktop Duplication using pre-created resources from [`pre_create`].
 pub fn start_with(pre: PreCreatedCapture) -> Result<(CaptureHandle, D3D11Device)> {
-    let PreCreatedCapture { device, context, duplication, width, height } = pre;
+    let PreCreatedCapture { device, context, duplication, width, height, vendor_id } = pre;
     let shared_device = D3D11Device {
         device: device.clone(),
         context: context.clone(),
+        vendor_id,
     };
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
@@ -157,8 +162,9 @@ pub fn start_with(pre: PreCreatedCapture) -> Result<(CaptureHandle, D3D11Device)
     Ok((handle, shared_device))
 }
 
+/// Returns (device, context, duplication, width, height, vendor_id).
 fn create_d3d11_device_and_duplication(
-) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication, u32, u32)> {
+) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication, u32, u32, u32)> {
     // First try: create device via D3D_DRIVER_TYPE_HARDWARE (lets D3D11
     // pick the GPU itself, bypassing DXGI factory enumeration which can
     // become stale after AMF/D3D11VA probe activity in-process).
@@ -169,7 +175,7 @@ fn create_d3d11_device_and_duplication(
             None,
             D3D_DRIVER_TYPE_HARDWARE,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             None,
             D3D11_SDK_VERSION,
             Some(&mut device),
@@ -187,6 +193,9 @@ fn create_d3d11_device_and_duplication(
             device.cast().map_err(|e| CaptureError::Io(hresult_io(e)))?;
         let adapter: IDXGIAdapter1 = unsafe { dxgi_device.GetParent() }
             .map_err(|e| CaptureError::Io(hresult_io(e)))?;
+        let vendor_id = unsafe { adapter.GetDesc1() }
+            .map(|d| d.VendorId)
+            .unwrap_or(0);
 
         let mut output_idx = 0u32;
         while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
@@ -203,10 +212,11 @@ fn create_d3d11_device_and_duplication(
                         output_idx,
                         width,
                         height,
+                        vendor_id = format_args!("0x{vendor_id:04x}"),
                         format = ?desc.ModeDesc.Format,
                         "DXGI Desktop Duplication initialized (hardware device)"
                     );
-                    return Ok((device, context, duplication, width, height));
+                    return Ok((device, context, duplication, width, height, vendor_id));
                 }
                 Err(e) => {
                     tracing::warn!(output_idx, error = %e, "DuplicateOutput failed on hardware device");
@@ -243,7 +253,7 @@ fn create_d3d11_device_and_duplication(
                     &adapter,
                     D3D_DRIVER_TYPE_UNKNOWN,
                     HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                     None,
                     D3D11_SDK_VERSION,
                     Some(&mut dev),
@@ -266,16 +276,18 @@ fn create_d3d11_device_and_duplication(
                     let desc = unsafe { duplication.GetDesc() };
                     let width = desc.ModeDesc.Width;
                     let height = desc.ModeDesc.Height;
+                    let vendor_id = adapter_desc.VendorId;
                     tracing::info!(
                         adapter = adapter_name.as_str(),
                         adapter_idx,
                         output_idx,
                         width,
                         height,
+                        vendor_id = format_args!("0x{vendor_id:04x}"),
                         format = ?desc.ModeDesc.Format,
                         "DXGI Desktop Duplication initialized (factory fallback)"
                     );
-                    return Ok((dev, ctx, duplication, width, height));
+                    return Ok((dev, ctx, duplication, width, height, vendor_id));
                 }
                 Err(e) => {
                     tracing::warn!(

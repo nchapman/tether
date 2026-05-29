@@ -13,15 +13,13 @@ use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::UnsafeDerefMut;
 use windows::core::Interface;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIResource1, DXGI_SHARED_RESOURCE_READ};
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
 use tether_protocol::control::CodecKind;
 
@@ -49,7 +47,7 @@ pub struct D3D11Decoder {
     _hw_device: AVHWDeviceContext,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    staging: Option<PlaneStagingPair>,
+    staging: Option<Nv12Staging>,
     /// Whether the renderer can import D3D11 shared-handle textures into
     /// wgpu (Vulkan `VK_KHR_external_memory_win32`). When true we export
     /// decoded frames GPU-resident (`Frame::Gpu`); when false — the
@@ -58,17 +56,33 @@ pub struct D3D11Decoder {
     gpu_export: bool,
 }
 
-/// Per-plane staging textures for GPU-side NV12 plane extraction.
-/// D3D11 NV12 textures have two subresources: plane 0 (Y as R8) and
-/// plane 1 (UV as RG8). We copy each into a separate MISC_SHARED
-/// texture so they can be imported independently into wgpu/Vulkan.
-struct PlaneStagingPair {
-    y: ID3D11Texture2D,
-    uv: ID3D11Texture2D,
-    y_handle: HANDLE,
-    uv_handle: HANDLE,
+/// Single NV12 staging texture for GPU-side plane extraction. The decode
+/// pool surface (an NV12 texture array) is copied slice→staging per plane
+/// — `CopySubresourceRegion` only works between same-format subresources,
+/// so the staging must itself be NV12 (a separate R8 / R8G8 destination
+/// would make the copy a silent no-op). The consumer opens the shared
+/// handle and views plane 0 as R8 and plane 1 as R8G8.
+struct Nv12Staging {
+    tex: ID3D11Texture2D,
+    /// NT handle from `CreateSharedHandle` — owned by us, closed on drop.
+    /// (`tex` is allocated at even-rounded dims; `width`/`height` are the
+    /// codec-reported dims used for the resolution-change staleness check
+    /// and propagated to the renderer.)
+    handle: HANDLE,
     width: u32,
     height: u32,
+}
+
+impl Drop for Nv12Staging {
+    fn drop(&mut self) {
+        // `CreateSharedHandle` returns an owned NT handle; without this it
+        // leaks one kernel handle per resolution change / decoder teardown.
+        // The renderer's `OpenSharedResource1` copy is independent and is
+        // released when its `ID3D11Texture2D` drops.
+        if !self.handle.is_invalid() {
+            unsafe { let _ = CloseHandle(self.handle); }
+        }
+    }
 }
 
 unsafe impl Send for D3D11Decoder {}
@@ -179,29 +193,40 @@ impl D3D11Decoder {
                 .clone()
         };
 
-        // Rebuild staging pair if dimensions changed.
+        // Rebuild staging if dimensions changed.
         if self.staging.as_ref().map_or(true, |s| s.width != width || s.height != height) {
-            self.staging = Some(Self::create_plane_staging(&self.device, width, height)?);
+            self.staging = Some(Self::create_nv12_staging(&self.device, width, height)?);
         }
         let staging = self.staging.as_ref().unwrap();
 
-        // NV12 texture array subresource layout:
-        //   Y plane  of slice N = subresource N * 2 + 0
-        //   UV plane of slice N = subresource N * 2 + 1
-        let y_subresource = array_index * 2;
-        let uv_subresource = array_index * 2 + 1;
+        // NV12 texture-array subresource layout is PLANE-MAJOR:
+        // D3D11CalcSubresource(plane, slice) =
+        // planeSlice * (MipLevels * ArraySize) + arraySlice * MipLevels.
+        // With MipLevels == 1 that's Y of slice N = N, UV of slice N =
+        // ArraySize + N. We copy each plane of the decode slice into the
+        // matching plane subresource of the single-slice NV12 staging
+        // (subresource 0 = Y, 1 = UV). Both endpoints are NV12 plane
+        // subresources, so the formats match and the copy is honoured —
+        // copying an NV12 plane into a separate R8/R8G8 texture is a
+        // silent no-op (the all-zero "green screen" bug).
+        let array_size = {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { src_texture.GetDesc(&mut desc) };
+            desc.ArraySize
+        };
+        let y_subresource = array_index;
+        let uv_subresource = array_size + array_index;
 
         unsafe {
             self.context.CopySubresourceRegion(
-                &staging.y, 0, 0, 0, 0,
+                &staging.tex, 0, 0, 0, 0,
                 &src_texture, y_subresource, None,
             );
             self.context.CopySubresourceRegion(
-                &staging.uv, 0, 0, 0, 0,
+                &staging.tex, 1, 0, 0, 0,
                 &src_texture, uv_subresource, None,
             );
-            // GPU fence: ensure copies complete before Vulkan samples.
-            // D3D11_QUERY_EVENT signals when all prior commands finish.
+            // Submit the copies so the consumer device sees them.
             gpu_sync(&self.device, &self.context);
         }
 
@@ -210,8 +235,7 @@ impl D3D11Decoder {
             height,
             pts,
             GpuFrameSource::D3D11Texture(D3D11DecodedTexture {
-                y_handle: staging.y_handle.0 as *mut std::ffi::c_void,
-                uv_handle: staging.uv_handle.0 as *mut std::ffi::c_void,
+                handle: staging.handle.0 as *mut std::ffi::c_void,
                 width,
                 height,
             }),
@@ -219,32 +243,19 @@ impl D3D11Decoder {
         )))
     }
 
-    fn create_plane_staging(
+    fn create_nv12_staging(
         device: &ID3D11Device,
         width: u32,
         height: u32,
-    ) -> Result<PlaneStagingPair> {
-        let chroma_w = (width + 1) / 2;
-        let chroma_h = (height + 1) / 2;
-
-        let y_tex = Self::create_shared_texture(
-            device, width, height, DXGI_FORMAT_R8_UNORM,
-        )?;
-        let uv_tex = Self::create_shared_texture(
-            device, chroma_w, chroma_h, DXGI_FORMAT_R8G8_UNORM,
-        )?;
-
-        let y_handle = Self::get_shared_handle(&y_tex)?;
-        let uv_handle = Self::get_shared_handle(&uv_tex)?;
-
-        Ok(PlaneStagingPair {
-            y: y_tex,
-            uv: uv_tex,
-            y_handle,
-            uv_handle,
-            width,
-            height,
-        })
+    ) -> Result<Nv12Staging> {
+        // NV12 requires even dimensions; round up so the chroma plane is
+        // whole. The decoder declares the real width/height downstream, so
+        // a 1px pad on odd inputs is harmless.
+        let w = (width + 1) & !1;
+        let h = (height + 1) & !1;
+        let tex = Self::create_shared_texture(device, w, h, DXGI_FORMAT_NV12)?;
+        let handle = Self::get_shared_handle(&tex)?;
+        Ok(Nv12Staging { tex, handle, width, height })
     }
 
     fn create_shared_texture(
@@ -398,12 +409,14 @@ impl Decoder for D3D11Decoder {
     }
 }
 
-/// Ensure prior GPU commands (CopySubresourceRegion) are submitted to
-/// the hardware. On same-device D3D11→Vulkan import paths, Flush
-/// guarantees the copies are in the GPU pipeline before Vulkan reads.
-/// The D3D11 multithread protection (enabled at device creation)
-/// serializes access; the Vulkan driver's implicit sync on shared
-/// resources handles the actual fence under the hood.
+/// Submit the prior `CopySubresourceRegion` copies to the GPU so the
+/// renderer's (separate) D3D11 device can open the shared texture and
+/// sample the result. `Flush` guarantees submission, not completion;
+/// there is no keyed mutex, so cross-device visibility relies on the
+/// decode→render handoff latency on a shared iGPU (validated by
+/// `d3d11_cross_device_shared_handle_coherency`). On discrete GPUs with
+/// separate hardware queues this assumption may not hold — the durable
+/// fix is a single shared device for decode + present (Moonlight's model).
 unsafe fn gpu_sync(_device: &ID3D11Device, context: &ID3D11DeviceContext) {
     unsafe { context.Flush() };
 }

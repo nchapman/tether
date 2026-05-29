@@ -368,18 +368,22 @@ pub enum GpuFrameSource {
     D3D11Texture(D3D11DecodedTexture),
 }
 
-/// Decoded D3D11 NV12 frame exported as two separate shared DXGI
-/// handles (one per plane) for import into wgpu's Vulkan backend.
-/// Handles are DXGI-runtime-owned (from `GetSharedHandle`) and must
-/// NOT be closed — they remain valid as long as the backing staging
-/// textures exist (held by the decoder).
+/// Decoded D3D11 NV12 frame exported as a single shared NT handle to a
+/// `DXGI_FORMAT_NV12` staging texture. The consumer opens it and creates
+/// two SRVs over the one texture — `R8_UNORM` reads the luma plane,
+/// `R8G8_UNORM` the chroma plane (the SRV format selects the plane).
+///
+/// A single NV12 texture (not two R8/R8G8 textures) is required because
+/// the decode→staging copy is `CopySubresourceRegion` per plane, and
+/// D3D11 only permits that between same-format subresources — an
+/// NV12-plane → R8 copy is silently dropped, leaving the export blank.
+/// The handle is owned by `CreateSharedHandle` and stays valid as long
+/// as the backing staging texture (held by the decoder) exists.
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
 pub struct D3D11DecodedTexture {
-    /// Shared handle for the Y plane (R8_UNORM, full resolution).
-    pub y_handle: *mut std::ffi::c_void,
-    /// Shared handle for the UV plane (R8G8_UNORM, half resolution).
-    pub uv_handle: *mut std::ffi::c_void,
+    /// Shared NT handle to the NV12 staging texture.
+    pub handle: *mut std::ffi::c_void,
     pub width: u32,
     pub height: u32,
 }

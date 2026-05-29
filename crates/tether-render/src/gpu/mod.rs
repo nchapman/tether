@@ -11,11 +11,6 @@ mod import;
 #[cfg(target_os = "linux")]
 pub(crate) use import::import_dmabuf_textures;
 
-#[cfg(target_os = "windows")]
-mod d3d11_import;
-#[cfg(target_os = "windows")]
-pub(crate) use d3d11_import::import_d3d11_textures;
-
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(target_os = "macos")]
@@ -420,39 +415,6 @@ pub async fn supports_10bit_render() -> bool {
         .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
 }
 
-/// True if the wgpu adapter can import D3D11 shared-handle textures into
-/// its Vulkan backend (`VK_KHR_external_memory_win32`) — i.e. the Windows
-/// zero-copy decode path is available. The client passes the result to
-/// the decoder so it exports GPU-resident frames when supported and falls
-/// back to CPU download otherwise (some AMD Vulkan stacks lack the
-/// extension). Always false off Windows: no other platform imports D3D11
-/// textures. Mirrors [`supports_10bit_render`] — a throwaway adapter with
-/// no surface, so it can run before the window exists.
-pub async fn supports_d3d11_zero_copy_import() -> bool {
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let instance = wgpu::Instance::default();
-        let Ok(adapter) = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await
-        else {
-            return false;
-        };
-        adapter
-            .features()
-            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32)
-    }
-}
-
 impl GpuState {
     pub(crate) async fn new(
         window: Arc<Window>,
@@ -487,7 +449,7 @@ impl GpuState {
         // If the adapter doesn't advertise it (lavapipe, very old
         // Mesa, missing VK_EXT_image_drm_format_modifier), fail loudly
         // here rather than silently dropping every frame later.
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let info = adapter.get_info();
         let adapter_features = adapter.features();
         #[cfg(target_os = "linux")]
@@ -525,17 +487,6 @@ impl GpuState {
         // below is harmless either way.
         if adapter_features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
             required |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
-        }
-        // Windows zero-copy decode: the D3D11VA decoder hands us NV12
-        // planes as D3D11 shared-handle textures, imported via
-        // `texture_from_d3d11_shared_handle` (VK_KHR_external_memory_win32).
-        // wgpu rejects that import unless the device was created with this
-        // feature. Unlike the Linux dma-buf path we don't hard-require it:
-        // when absent (some AMD Vulkan stacks) the client tells the
-        // decoder to fall back to CPU download instead.
-        #[cfg(target_os = "windows")]
-        if adapter_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32) {
-            required |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
         }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -584,17 +535,6 @@ impl GpuState {
             driver = info.driver,
             backend = ?info.backend,
             metal_import_supported,
-            "wgpu device initialised"
-        );
-        #[cfg(target_os = "windows")]
-        let d3d11_import_supported =
-            device.features().contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32);
-        #[cfg(target_os = "windows")]
-        tracing::info!(
-            adapter = info.name,
-            driver = info.driver,
-            backend = ?info.backend,
-            d3d11_import_supported,
             "wgpu device initialised"
         );
 
@@ -1252,31 +1192,9 @@ impl GpuState {
         Ok(())
     }
 
-    #[cfg(target_os = "windows")]
-    fn apply_gpu(&mut self, frame: GpuFrame) -> Result<()> {
-        let GpuFrameSource::D3D11Texture(ref d3d11) = frame.source;
-        let w = frame.width;
-        let h = frame.height;
-        // The decoder's staging textures own the DXGI handles (they're
-        // valid for the staging texture lifetime, which is the decoder's
-        // lifetime). The AVFrame guard keeps the decode surface alive
-        // until the renderer is done sampling.
-        let fresh = import_d3d11_textures(
-            &self.device,
-            &self.yuv_bgl,
-            &self.sampler,
-            self.chroma,
-            self.bit_depth,
-            d3d11,
-            w,
-            h,
-            frame.guard,
-        )?;
-        self.retire_textures(fresh);
-        Ok(())
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    // Windows renders natively in D3D11 (`crate::d3d11`), not through this
+    // wgpu backend, so there is no Windows `apply_gpu` here.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn apply_gpu(&mut self, _frame: GpuFrame) -> Result<()> {
         unreachable!("GpuFrame cannot be constructed on this platform")
     }

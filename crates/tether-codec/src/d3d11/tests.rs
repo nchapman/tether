@@ -895,8 +895,7 @@ mod tests {
                         Frame::Gpu(g) => {
                             let (_w, _h, _pts, source, _guard) = g.into_parts();
                             let crate::GpuFrameSource::D3D11Texture(tex) = source;
-                            assert!(!tex.y_handle.is_null(), "Y plane shared handle is null");
-                            assert!(!tex.uv_handle.is_null(), "UV plane shared handle is null");
+                            assert!(!tex.handle.is_null(), "NV12 shared handle is null");
                         }
                         Frame::Cpu(_) => {
                             panic!("gpu_export = true must yield Frame::Gpu, got a CPU download")
@@ -1122,6 +1121,159 @@ mod tests {
             }
         }
         assert!(decoded.is_some(), "decoder produced no frame from QSV encode_bgra");
+    }
+
+    /// Diagnostic: can a second D3D11 device read content a first device
+    /// wrote into a shared NT-handle texture, with only a `Flush` between
+    /// them (no keyed mutex / fence)? This is the exact coherency contract
+    /// the cross-device renderer relies on — the decoder copies a decoded
+    /// plane into a `MISC_SHARED|NTHANDLE` texture on its device, the
+    /// renderer opens it on its own device and samples. If this reads back
+    /// zero on device B (but the right value on device A), the shared read
+    /// is uninitialised/stale and the black-screen loopback is a coherency
+    /// failure, not a render bug.
+    #[test]
+    #[ignore = "diagnostic: cross-device shared-handle read coherency (Windows)"]
+    fn d3d11_cross_device_shared_handle_coherency() {
+        use windows::core::Interface;
+        use windows::Win32::Foundation::{HANDLE, HMODULE};
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
+            D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::{IDXGIResource1, DXGI_SHARED_RESOURCE_READ};
+
+        const D3D11_RESOURCE_MISC_SHARED: u32 = 0x2;
+        const D3D11_RESOURCE_MISC_SHARED_NTHANDLE: u32 = 0x800;
+        const DIM: u32 = 64;
+        const FILL: u8 = 200;
+
+        fn make_device() -> (ID3D11Device, ID3D11DeviceContext) {
+            let mut device = None;
+            let mut context = None;
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            }
+            .expect("D3D11CreateDevice");
+            (device.unwrap(), context.unwrap())
+        }
+
+        // Copy `tex` into a STAGING texture on `device`/`context` and read
+        // the center R8 texel.
+        fn read_center(
+            device: &ID3D11Device,
+            context: &ID3D11DeviceContext,
+            tex: &ID3D11Texture2D,
+        ) -> u8 {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: DIM,
+                Height: DIM,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }
+                .expect("staging CreateTexture2D");
+            let staging = staging.unwrap();
+            unsafe {
+                context.CopyResource(&staging, tex);
+                context.Flush();
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                    .expect("Map staging");
+                let row = (DIM / 2) as usize;
+                let col = (DIM / 2) as usize;
+                let byte = *(mapped.pData as *const u8).add(row * mapped.RowPitch as usize + col);
+                context.Unmap(&staging, 0);
+                byte
+            }
+        }
+
+        // Device A (producer / decoder role).
+        let (dev_a, ctx_a) = make_device();
+        // Source filled with a known value, then GPU-copied into the
+        // shared texture — mirrors the decoder's CopySubresourceRegion.
+        let src_data = vec![FILL; (DIM * DIM) as usize];
+        let src_desc = D3D11_TEXTURE2D_DESC {
+            Width: DIM,
+            Height: DIM,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: src_data.as_ptr().cast(),
+            SysMemPitch: DIM,
+            SysMemSlicePitch: 0,
+        };
+        let mut src = None;
+        unsafe { dev_a.CreateTexture2D(&src_desc, Some(&init), Some(&mut src)) }
+            .expect("source CreateTexture2D");
+        let src = src.unwrap();
+
+        let shared_desc = D3D11_TEXTURE2D_DESC {
+            MiscFlags: D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+            ..src_desc
+        };
+        let mut shared = None;
+        unsafe { dev_a.CreateTexture2D(&shared_desc, None, Some(&mut shared)) }
+            .expect("shared CreateTexture2D");
+        let shared = shared.unwrap();
+
+        unsafe {
+            ctx_a.CopyResource(&shared, &src);
+            ctx_a.Flush();
+        }
+
+        // A must see its own write (proves the copy itself worked).
+        let a_value = read_center(&dev_a, &ctx_a, &shared);
+        assert_eq!(a_value, FILL, "device A can't read its own write — copy failed, not a coherency issue");
+
+        // Export the NT handle and open it on device B (renderer role).
+        let dxgi_res: IDXGIResource1 = shared.cast().expect("IDXGIResource1");
+        let handle: HANDLE = unsafe {
+            dxgi_res.CreateSharedHandle(None, DXGI_SHARED_RESOURCE_READ.0, windows::core::PCWSTR::null())
+        }
+        .expect("CreateSharedHandle");
+
+        let (dev_b, ctx_b) = make_device();
+        let dev_b1: ID3D11Device1 = dev_b.cast().expect("ID3D11Device1");
+        let opened: ID3D11Texture2D =
+            unsafe { dev_b1.OpenSharedResource1(handle) }.expect("OpenSharedResource1");
+
+        let b_value = read_center(&dev_b, &ctx_b, &opened);
+        eprintln!("cross-device shared read: A={a_value} B={b_value} (expected {FILL})");
+        assert_eq!(
+            b_value, FILL,
+            "device B read {b_value}, not {FILL}: the cross-device shared-handle read does \
+             NOT see device A's GPU write with Flush alone — this is the loopback black screen"
+        );
     }
 
     /// Build a QSV encoder, drop it, then build another at different

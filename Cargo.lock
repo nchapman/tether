@@ -3658,6 +3658,7 @@ dependencies = [
  "objc2-io-surface",
  "objc2-metal 0.3.2",
  "pollster",
+ "raw-window-handle",
  "tether-codec",
  "tether-gpuconvert",
  "tether-probe",

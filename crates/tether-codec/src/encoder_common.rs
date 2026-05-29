@@ -346,6 +346,11 @@ fn avcc_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
 /// back to a generic label for a future `*_sw_format` addition that
 /// hasn't reached this table yet (the fallback keeps `ScalerInit` a
 /// `&'static str` instead of a heap-allocating per-call format).
+///
+/// Linux/macOS only: the Windows D3D11 encoder converts via the
+/// `ID3D11VideoProcessor` and uses a literal `ScalerInit` label, so it
+/// never feeds this table.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn pix_fmt_scaler_label(sw_format: i32) -> &'static str {
     match sw_format {
         x if x == ffi::AV_PIX_FMT_NV12 => "BGRA -> NV12",
@@ -363,6 +368,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn pix_fmt_scaler_label_covers_every_sw_format_in_use() {
         for (fmt, expected) in [
             (ffi::AV_PIX_FMT_NV12, "BGRA -> NV12"),
@@ -377,6 +383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn pix_fmt_scaler_label_falls_back_for_unknown_format() {
         assert_eq!(pix_fmt_scaler_label(-1), "BGRA -> sw_format");
     }

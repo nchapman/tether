@@ -24,7 +24,10 @@
 
 use crate::{CodecError, Decoder, Encoder, Result};
 #[cfg_attr(target_os = "macos", allow(unused_imports))]
-use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+use tether_protocol::control::{CodecKind, VideoProfile};
+// Only the Linux `no_hw_encoder` VAAPI-profile hint matches on chroma.
+#[cfg(target_os = "linux")]
+use tether_protocol::control::ChromaSubsampling;
 
 /// Verify that a host's chosen `VideoProfile` is one this client
 /// actually advertised it could decode. Returns `Ok(())` if `chosen`

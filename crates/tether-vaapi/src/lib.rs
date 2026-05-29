@@ -10,6 +10,13 @@
 //! `src/platform/linux/vaapi.cpp` — constants, struct definitions, and
 //! the call site live in one file there.
 
+// VAAPI is a Linux-only API. The crate is a workspace member, so a
+// `cargo build --workspace` on macOS/Windows still compiles it — gate the
+// whole crate to Linux so it resolves to an empty rlib elsewhere instead
+// of failing on the Unix-only `std::os::fd` import below. `tether-codec`
+// only depends on it under `cfg(target_os = "linux")`, so nothing
+// references these symbols off-Linux anyway.
+#![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]
 
 mod ffi;

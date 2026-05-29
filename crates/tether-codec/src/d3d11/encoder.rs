@@ -118,7 +118,10 @@ fn is_qsv_backend(name: &str) -> bool {
 pub struct D3D11Encoder {
     kind: CodecKind,
     encoder: AVCodecContext,
-    hw_device: AVHWDeviceContext,
+    // Kept alive for the lifetime of `encoder`: the AVCodecContext holds a
+    // borrowed ref to this hwdevice; dropping it early would free the
+    // D3D11VA device out from under the encoder. Never read directly.
+    _hw_device: AVHWDeviceContext,
     bgra_to_nv12: SwsContext,
     sw_frame: AVFrame,
     bgra_frame: AVFrame,
@@ -409,7 +412,7 @@ impl D3D11Encoder {
         Ok(Self {
             kind,
             encoder,
-            hw_device,
+            _hw_device: hw_device,
             bgra_to_nv12,
             sw_frame,
             bgra_frame,

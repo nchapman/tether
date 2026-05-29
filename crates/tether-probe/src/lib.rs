@@ -211,7 +211,12 @@ pub fn client_decode_profiles() -> Vec<VideoProfile> {
 /// rejected each profile.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn probe_host() -> Vec<ProfileSupport> {
+    // Windows reports host encode/decode support statically (see the
+    // per-branch comments below), so it never touches the live probe
+    // backend or fixtures.
+    #[cfg(not(target_os = "windows"))]
     use host::ActiveProbe;
+    #[cfg(not(target_os = "windows"))]
     use profile_probe::{fixture_for, ProfileProbe};
 
     // On Windows/AMF, the encoder has a single-session limit and releases

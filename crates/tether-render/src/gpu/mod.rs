@@ -454,6 +454,7 @@ impl GpuState {
         // If the adapter doesn't advertise it (lavapipe, very old
         // Mesa, missing VK_EXT_image_drm_format_modifier), fail loudly
         // here rather than silently dropping every frame later.
+        #[cfg(target_os = "linux")]
         let info = adapter.get_info();
         let adapter_features = adapter.features();
         #[cfg(target_os = "linux")]

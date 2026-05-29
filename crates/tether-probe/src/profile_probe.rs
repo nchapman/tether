@@ -80,6 +80,12 @@ pub(crate) trait ProfileProbe {
     /// it actually produces a non-empty IDR packet. Returns `Err` if
     /// any step fails; the caller treats either outcome as a single
     /// "encode supported" bit.
+    ///
+    /// Not required on Windows: the D3D11 host reports encode support
+    /// statically (the AMF session limit makes a destructive per-profile
+    /// encode probe unsafe — see `probe_host`), so no backend implements
+    /// this there.
+    #[cfg(not(target_os = "windows"))]
     fn probe_encode(profile: VideoProfile) -> Result<()>;
 
     /// Submit `fixture` (an IDR bitstream pre-generated at this

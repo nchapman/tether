@@ -927,7 +927,7 @@ mod tests {
         use std::sync::Arc;
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D11::{
-            ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_SUBRESOURCE_DATA,
+            ID3D11DeviceContext, ID3D11Texture2D, D3D11_SUBRESOURCE_DATA,
             D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
         };
         use windows::Win32::Graphics::Dxgi::Common::{

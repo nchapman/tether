@@ -736,15 +736,39 @@ mod tests {
         (device, context)
     }
 
-    /// QSV via the zero-copy GPU submit path (`submit_d3d11_texture`) —
-    /// the path the host actually uses. Exercises: QSV device derivation,
-    /// the VP blit into the `av_hwframe_map`-exposed QSV surface, the
-    /// first-frame-forced-IDR requirement, and an encode→decode round
-    /// trip. The vendor-agnostic tests pass `vendor_id=0` (→ MF), so this
-    /// is the only coverage of the QSV backend.
-    #[test]
-    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
-    fn d3d11_qsv_gpu_encode_decode_roundtrip() {
+    /// PCI vendor ID of the GPU backing `device`. Used to gate vendor
+    /// roundtrip tests *before* constructing the encoder: attempting an
+    /// AMF/NVENC encoder on a machine without that GPU faults inside the
+    /// vendor's runtime (STATUS_ACCESS_VIOLATION), so we must skip rather
+    /// than try-and-fall-back.
+    fn device_vendor_id(
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    ) -> u32 {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
+        unsafe {
+            let dxgi: IDXGIDevice = device.cast().expect("ID3D11Device -> IDXGIDevice");
+            let adapter: IDXGIAdapter = dxgi.GetAdapter().expect("GetAdapter");
+            adapter.GetDesc().map(|d| d.VendorId).unwrap_or(0)
+        }
+    }
+
+    /// AMD PCI vendor ID — routes `D3D11Encoder::new` to the AMF backend.
+    const VENDOR_AMD: u32 = 0x1002;
+    /// NVIDIA PCI vendor ID — routes `D3D11Encoder::new` to NVENC.
+    const VENDOR_NVIDIA: u32 = 0x10de;
+
+    /// Shared zero-copy GPU encode→decode round trip for one vendor — the
+    /// path the host actually uses (`submit_d3d11_texture`). Exercises
+    /// the backend's device setup, the VP BGRA→NV12 blit, the
+    /// first-frame-forced-IDR requirement, the per-frame hw_frames pool
+    /// handling (the non-QSV dynamic pool vs QSV's reused single surface),
+    /// and an encode→decode round trip with viewport scaling.
+    ///
+    /// Asserts the *intended* backend opened, not the `hevc_mf` fallback
+    /// `backends_for_vendor` appends — so on the wrong GPU the test fails
+    /// loudly rather than silently passing through Media Foundation.
+    fn gpu_roundtrip_for_vendor(vendor_id: u32, expected_backend: &str) {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D11::{
@@ -760,6 +784,19 @@ mod tests {
         let encode_h = 720u32;
 
         let (device, context) = create_video_device();
+
+        // SKIP-with-diagnostic when this machine's GPU isn't the target
+        // vendor. Constructing the wrong vendor's encoder faults inside
+        // that vendor's runtime, so gate on the present GPU *before*
+        // touching `D3D11Encoder::new`. Run this test on a matching GPU.
+        let present_vendor = device_vendor_id(&device);
+        if present_vendor != vendor_id {
+            eprintln!(
+                "SKIP {expected_backend}: GPU vendor 0x{present_vendor:04x} != target \
+                 0x{vendor_id:04x}; run on a {expected_backend}-capable GPU"
+            );
+            return;
+        }
 
         // BGRA source texture at capture dims.
         let bgra = vec![128u8; (capture_w * capture_h * 4) as usize];
@@ -793,13 +830,17 @@ mod tests {
             TEST_BITRATE_KBPS,
             device.as_raw() as *mut _,
             context.as_raw() as *mut _,
-            VENDOR_INTEL,
+            vendor_id,
         )
-        .expect("QSV encoder construction");
+        .expect("encoder construction");
+        // We're on matching hardware (gated above), so the intended
+        // backend must open — a fall-through to `hevc_mf` means this
+        // FFmpeg build lacks the vendor encoder, which is a real failure.
         assert_eq!(
             enc.name(),
-            "hevc_qsv",
-            "expected QSV backend on Intel; got {} — QSV unavailable in this FFmpeg build",
+            expected_backend,
+            "GPU is vendor 0x{vendor_id:04x} but {expected_backend} did not open (got {}); \
+             FFmpeg build is missing the {expected_backend} encoder",
             enc.name()
         );
 
@@ -815,8 +856,8 @@ mod tests {
 
         // Sustained throughput: push 90 frames (~1.5 s at 60 fps) back to
         // back, draining packets each iteration. Every submit MUST
-        // succeed — a too-small QSV surface pool serves only the first
-        // frame, then fails AVERROR(ENOMEM) on every subsequent
+        // succeed — a too-small surface pool serves only the first frame,
+        // then fails AVERROR(ENOMEM) on every subsequent
         // `av_hwframe_get_buffer` (the production "froze after one frame"
         // bug). Do NOT break early; that's exactly what hid the bug.
         let mut total_packets = 0usize;
@@ -824,7 +865,7 @@ mod tests {
         for pts in 0..90 {
             let pkts = enc
                 .submit_d3d11_texture(&frame, pts, pts == 0)
-                .expect("submit_d3d11_texture (sustained) — QSV pool exhausted?");
+                .expect("submit_d3d11_texture (sustained) — surface pool exhausted?");
             total_packets += pkts.len();
             for pkt in &pkts {
                 dec.submit(&pkt.data).expect("submit");
@@ -840,8 +881,32 @@ mod tests {
             total_packets > 30,
             "expected sustained packet output over 90 frames, got {total_packets}"
         );
-        let (dw, dh) = decoded_dims.expect("decoder produced no frame from QSV GPU encode");
+        let (dw, dh) = decoded_dims.expect("decoder produced no frame from GPU encode");
         assert_eq!((dw, dh), (encode_w, encode_h));
+    }
+
+    /// QSV via the zero-copy GPU submit path. The vendor-agnostic tests
+    /// pass `vendor_id=0` (→ MF), so this is the only coverage of QSV.
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    fn d3d11_qsv_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv");
+    }
+
+    /// AMF via the zero-copy GPU submit path — the only coverage of the
+    /// AMD backend (dynamic hw_frames pool, async session, `async_depth=1`).
+    #[test]
+    #[ignore = "requires AMD GPU with AMF (Windows)"]
+    fn d3d11_amf_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf");
+    }
+
+    /// NVENC via the zero-copy GPU submit path — the only coverage of the
+    /// NVIDIA backend (dynamic hw_frames pool, `delay=0` + `zerolatency`).
+    #[test]
+    #[ignore = "requires NVIDIA GPU with NVENC (Windows)"]
+    fn d3d11_nvenc_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "hevc_nvenc");
     }
 
     /// Diagnostic probe for QSV encode latency. Measures `submit_d3d11_texture`

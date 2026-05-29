@@ -11,8 +11,11 @@
 //! [`D3D11Device`] (an `Arc`-wrapped handle). The encoder must be
 //! constructed on the same device to avoid cross-device copies.
 //!
-//! Shutdown: dropping the returned receiver causes the next loop
-//! iteration to see a disconnected channel and exit cleanly.
+//! Shutdown: dropping the [`crate::FrameReceiver`] drops the consumer
+//! liveness token; the capture thread sees its strong count hit zero at
+//! the top of the loop and exits. (Channel `Disconnected` is no longer
+//! the signal — the thread holds an `evict_rx` clone for drop-oldest
+//! eviction, which keeps the channel connected.)
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
@@ -427,6 +430,10 @@ impl Drop for SlotReturn {
 /// enqueuing the newest, so the consumer always dequeues the freshest
 /// (invariant: at most one frame resident, freshest wins). Dropping the
 /// evicted frame runs its [`SlotReturn`], freeing the slot it held.
+///
+/// INVARIANT: single producer only. The evict-then-send is not atomic;
+/// a second producer could fill the mailbox in the gap. The DXGI capture
+/// thread is the sole sender, so this holds.
 fn send_latest<T>(tx: &Sender<T>, evict: &Receiver<T>, item: T) {
     let _ = evict.try_recv();
     let _ = tx.try_send(item);
@@ -478,7 +485,11 @@ fn run_capture_thread(
         // Shut down when the consumer has dropped its `FrameReceiver`.
         // Our `evict_rx` clone keeps the channel connected, so we can't
         // rely on `Disconnected`; the liveness token's strong count
-        // hitting zero is the signal.
+        // hitting zero is the signal. The final `Arc` drop decrements with
+        // release ordering and `Weak::strong_count` loads with SeqCst, so
+        // a zero observed here is globally ordered after the consumer's
+        // drop — no fence needed. Worst-case detection latency is one
+        // `AcquireNextFrame` timeout (checked once per loop iteration).
         if liveness.strong_count() == 0 {
             tracing::debug!("capture consumer dropped; shutting down");
             break;
@@ -505,6 +516,15 @@ fn run_capture_thread(
                         if new_w != width || new_h != height {
                             width = new_w;
                             height = new_h;
+                            // Drop any frame still queued from the OLD pool
+                            // before swapping pools, so the encoder never
+                            // dequeues an old-resolution texture against the
+                            // new-resolution pool. The dropped frame's
+                            // `SlotReturn` frees its slot immediately. (A
+                            // frame already inside the encoder is caught by
+                            // the VP input-dimension guard, which triggers an
+                            // encoder rebuild.)
+                            let _ = evict_rx.try_recv();
                             match create_texture_pool(&device.device, width, height) {
                                 Some(p) => pool = p,
                                 None => break,

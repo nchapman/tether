@@ -2878,6 +2878,9 @@ fn run_capture_and_send(
                 }
             }
         }
+        // Accumulated only for frames that complete encode + send;
+        // damage-skipped and rebuild-failed frames are excluded, so this
+        // is the handoff age of frames that actually reach the wire.
         stage_latency.record(capture_age_ns, send_t0.elapsed().as_nanos() as u64);
 
         if stats.should_emit() {

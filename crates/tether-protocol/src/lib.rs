@@ -34,6 +34,16 @@ use serde::{Deserialize, Serialize};
 /// payload chunk size that keeps the encoded packet under this budget.
 pub const MAX_DATAGRAM_PAYLOAD: usize = 1200;
 
+/// Wire-protocol version string. Bumped on any breaking change to the
+/// control/handshake/pairing wire contract.
+///
+/// Load-bearing for the pairing layer: it is folded byte-for-byte into the
+/// SPAKE2 key-confirmation transcript (`tether-pairing`), so a peer running a
+/// different version cannot complete pairing — closing a downgrade seam where
+/// an attacker forces an older, weaker pairing exchange. Changing this literal
+/// is a breaking change; keep it stable within a release line.
+pub const PROTOCOL_VERSION: &str = "tether/1";
+
 /// Monotonic nanoseconds since an arbitrary local epoch (the first call to
 /// [`MonoNanos::now`] in this process).
 ///
@@ -122,6 +132,14 @@ mod tests {
         InputEchoBatch, VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket,
         CONTINUATION_PAYLOAD_BUDGET, FEC_MAX_PRIMARY_SHARDS, FEC_SHARD_SIZE, FIRST_PAYLOAD_BUDGET,
     };
+
+    #[test]
+    fn protocol_version_literal_is_pinned() {
+        // The pairing transcript binds this byte-for-byte; a silent change
+        // would break pairing across builds and weaken the downgrade defense.
+        // Update deliberately, in lockstep with a wire-contract bump.
+        assert_eq!(PROTOCOL_VERSION, "tether/1");
+    }
 
     #[test]
     fn host_frame_timing_builder_finishes() {

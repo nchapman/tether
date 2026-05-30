@@ -1,0 +1,22 @@
+[package]
+name = "tether-pairing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SPAKE2 device-pairing crypto + paired-peer store for Tether. Zero network I/O."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+spake2 = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
+sha2 = "0.11"
+subtle = "2"
+hex = "0.4"
+
+[lints]
+workspace = true

@@ -9,6 +9,7 @@ members = [
     "crates/tether-gpuconvert",
     "crates/tether-input",
     "crates/tether-ipc",
+    "crates/tether-pairing",
     "crates/tether-probe",
     "crates/tether-render",
     "crates/tether-scaler",
@@ -38,6 +39,7 @@ tether-decode = { path = "crates/tether-decode" }
 tether-gpuconvert = { path = "crates/tether-gpuconvert" }
 tether-input = { path = "crates/tether-input" }
 tether-ipc = { path = "crates/tether-ipc" }
+tether-pairing = { path = "crates/tether-pairing" }
 tether-probe = { path = "crates/tether-probe" }
 tether-render = { path = "crates/tether-render" }
 tether-scaler = { path = "crates/tether-scaler" }

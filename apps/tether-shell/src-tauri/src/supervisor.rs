@@ -105,8 +105,23 @@ impl Supervisor {
             .take()
             .ok_or_else(|| "engine stdin was not piped".to_string())?;
 
+        // Register the handle *before* starting the reader. A child that exits
+        // immediately (e.g. a bind error) can reach stdout EOF before we'd
+        // otherwise get to the insert below; registering first guarantees the
+        // reader's generation check sees this engine, so it can emit
+        // `engine-exited` and reap it instead of silently leaving the UI think
+        // the role is still running.
+        self.engines.lock().unwrap().insert(
+            role.to_string(),
+            EngineHandle {
+                generation,
+                stdin: Arc::new(AsyncMutex::new(stdin)),
+                child,
+            },
+        );
+
         // Reader task: forward each JSON-line event to the webview, then
-        // emit `engine-exited` on EOF.
+        // reap the child and emit `engine-exited` on EOF.
         let app_for_reader = app.clone();
         let role_owned = role.to_string();
         tokio::spawn(async move {
@@ -144,19 +159,20 @@ impl Supervisor {
             // A replacement may have been spawned while our process was
             // still draining its stdout; clobbering its handle (or emitting
             // a spurious `engine-exited`) would orphan it in the UI.
-            let still_current = app_for_reader
-                .try_state::<Supervisor>()
-                .map(|sup| {
-                    let mut engines = sup.engines.lock().unwrap();
-                    if engines.get(&role_owned).map(|h| h.generation) == Some(generation) {
-                        engines.remove(&role_owned);
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false);
-            if still_current {
+            let removed = app_for_reader.try_state::<Supervisor>().and_then(|sup| {
+                let mut engines = sup.engines.lock().unwrap();
+                if engines.get(&role_owned).map(|h| h.generation) == Some(generation) {
+                    engines.remove(&role_owned)
+                } else {
+                    None
+                }
+            });
+            if let Some(mut handle) = removed {
+                // Reap the exited child so it doesn't linger as a zombie until
+                // the shell exits, then tell the UI the role is gone. An
+                // explicit `stop()` removes the handle itself, so this branch
+                // won't fire for that path — no double `wait()`.
+                let _ = handle.child.wait().await;
                 let _ = app_for_reader.emit(
                     "engine-exited",
                     ExitedPayload {
@@ -166,14 +182,6 @@ impl Supervisor {
             }
         });
 
-        self.engines.lock().unwrap().insert(
-            role.to_string(),
-            EngineHandle {
-                generation,
-                stdin: Arc::new(AsyncMutex::new(stdin)),
-                child,
-            },
-        );
         Ok(())
     }
 
@@ -227,9 +235,17 @@ impl Supervisor {
         drop(stdin);
 
         tokio::spawn(async move {
-            // Give the engine a moment to exit gracefully, then make sure.
-            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-            let _ = child.start_kill();
+            // Give the engine a moment to exit gracefully; if it overruns, kill
+            // it and then `wait()` so the process is reaped rather than left a
+            // zombie until the shell exits. (A clean exit within the grace
+            // window is already reaped by the `wait()` that the timeout drove.)
+            if tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
         });
     }
 

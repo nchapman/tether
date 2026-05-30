@@ -42,14 +42,25 @@ cd apps/tether-shell && pnpm tauri dev
 ```
 
 The supervisor finds the engines in the workspace `target/debug` (override with
-`TETHER_ENGINE_DIR`). To exercise the full loopback on one machine: **Start
-hosting** with "Test pattern" on → copy the fingerprint → paste the address +
-fingerprint into the client panel → **Connect**. The client opens its own
-native video window. **Disconnect** / closing the shell tears the engines down.
+`TETHER_ENGINE_DIR`). To exercise the full loopback on one machine:
+
+1. **Start hosting** (leave "Test pattern" **off** — real capture negotiates
+   HEVC, which works on the Windows/QSV path; the test pattern forces the H.264
+   floor, whose only Windows encoder fails the self-decodable-IDR check and
+   shows a black window).
+2. On the host, **Add a device** → a PIN appears with a countdown.
+3. In the client panel, enter the host **address + PIN** → **Pair & connect**.
+   The client opens its own native video window.
+4. Later runs are one-click: enter just the **address** (no PIN) and
+   **Connect** — the host is pinned in known-hosts from the first pairing.
+
+**Disconnect** / closing the shell tears the engines down. **Revoke** a device
+on the host to drop its access (and any live session) immediately.
 
 ## Layout
 
 - `src/` — React frontend (`App.tsx` = host + client panels).
 - `src-tauri/src/lib.rs` — Tauri commands (`start_host`, `connect_client`,
-  `stop_engine`) + tray + exit cleanup.
+  `stop_engine`, `start_pairing`, `revoke_peer`, `list_peers`) + tray + exit
+  cleanup.
 - `src-tauri/src/supervisor.rs` — engine spawn / stdout-reader / stop.

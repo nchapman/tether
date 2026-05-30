@@ -113,10 +113,13 @@ fn load_or_generate_named(
     let fresh = generate_self_signed(subject_alt_names)?;
     std::fs::create_dir_all(dir)?;
     // Write both files to temp siblings, then rename into place. A crash
-    // between the two writes must not leave a fresh cert paired with a stale
+    // between the two renames must not leave a fresh cert paired with a stale
     // (or missing) key: on the next run both `exists()` checks would pass and
     // we'd load a mismatched pair that fails every TLS handshake until the
-    // operator manually deletes the files.
+    // operator manually deletes the files. We only reach here when at least one
+    // final file is missing; remove any surviving one first so a mid-rename
+    // crash can leave *at most one* fresh file — which the both-exist guard
+    // above treats as "incomplete" and regenerates — never a mixed pair.
     let tmp_cert = dir.join(format!("{cert_file}.tmp"));
     let tmp_key = dir.join(format!("{key_file}.tmp"));
     // The cert is a public artifact (it carries only the public key + SAN, and
@@ -127,6 +130,9 @@ fn load_or_generate_named(
     // not forge an identity — that needs the key, which is locked down.
     std::fs::write(&tmp_cert, fresh.chain[0].as_ref())?;
     write_key_file(&tmp_key, fresh.key.secret_pkcs8_der())?;
+    // Clear any stale survivor from an earlier incomplete run before publishing.
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
     std::fs::rename(&tmp_cert, &cert_path)?;
     std::fs::rename(&tmp_key, &key_path)?;
     Ok(fresh)

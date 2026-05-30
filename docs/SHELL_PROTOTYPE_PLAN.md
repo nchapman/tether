@@ -37,8 +37,10 @@ boundary is proven.
 
 ## Explicitly out of scope for the prototype
 
-- Pairing/auth crypto (addr + fingerprint entered manually). The IPC `connect`
-  command carries an optional `token` field so adding it later is additive.
+- ~~Pairing/auth crypto~~ — **now implemented** (landed after this plan was
+  written): PIN-based first-contact pairing over the `start_pairing` /
+  `revoke_peer` shell commands and the client's `--pin` flag, backed by SPAKE2 +
+  mutual TLS. There is no `token` field; see `crates/tether-pairing`.
 - Code signing / notarization.
 - Audio, clipboard, gamepad — no new engine features at all.
 - Windows service / session-0 secure desktop.

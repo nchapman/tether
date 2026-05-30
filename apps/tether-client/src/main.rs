@@ -1009,12 +1009,19 @@ async fn main() -> anyhow::Result<()> {
     reporter.emit(&EngineEvent::Disconnected { reason });
     say_goodbye(&conn, "client closing").await;
 
-    // Exit the process explicitly rather than returning. The IPC stdin
-    // stop-watcher (spawned in `--ipc` mode) parks a `tokio::io::stdin()`
-    // blocking read that can't be cancelled, so letting `main` return
-    // would hang the runtime's drop on that stuck thread. We own no state
-    // needing cleanup here (same rationale as the Ctrl-C handler above).
-    std::process::exit(if render_result.is_ok() { 0 } else { 1 });
+    // In `--ipc` mode the stdin stop-watcher parks a `tokio::io::stdin()`
+    // blocking read that can't be cancelled, so letting `main` return would
+    // hang the runtime's drop on that stuck thread — exit the process directly
+    // instead (same rationale as the Ctrl-C handler above). In plain CLI mode
+    // there's no such watcher, so return normally and let destructors run —
+    // notably `_tracing_guard`, whose drop flushes buffered log lines.
+    if ipc {
+        std::process::exit(if render_result.is_ok() { 0 } else { 1 });
+    }
+    match render_result {
+        Ok(()) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("render error: {e}")),
+    }
 }
 
 /// Block until the shell sends a `Stop` command, closes our stdin (the

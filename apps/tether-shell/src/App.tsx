@@ -268,6 +268,12 @@ function ClientPanel() {
         case "connected":
           setState("connected");
           setDetail(`Streaming ${payload.profile ?? ""}`.trim());
+          // First contact is done: the host is now pinned in known-hosts, so
+          // clear the PIN/label fields. Otherwise a later disconnect+reconnect
+          // would re-take the `--pin` path with a now-expired PIN instead of
+          // the one-click known-hosts reconnect.
+          setPin("");
+          setLabel("");
           break;
         case "disconnected":
           setState("idle");

@@ -108,11 +108,7 @@ impl Connection {
     /// paired-clients allowlist; on the client side it's the host's cert to
     /// record in `known_hosts`.
     pub fn peer_cert_fingerprint(&self) -> Option<CertFingerprint> {
-        let identity = self.conn.peer_identity()?;
-        let certs = identity
-            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-            .ok()?;
-        certs.first().map(|c| crate::tls::sha256(c.as_ref()))
+        peer_cert_fingerprint(&self.conn)
     }
 
     /// Export `len` bytes of TLS 1.3 keying material (RFC 5705) bound to this
@@ -131,16 +127,7 @@ impl Connection {
         context: &[u8],
         len: usize,
     ) -> Result<Vec<u8>> {
-        // A zero-length export would hand back an empty "key"; reject it up
-        // front so a caller bug can't silently produce a vacuous binding.
-        if len == 0 {
-            return Err(TransportError::ExporterUnavailable);
-        }
-        let mut out = vec![0u8; len];
-        self.conn
-            .export_keying_material(&mut out, label, context)
-            .map_err(|_| TransportError::ExporterUnavailable)?;
-        Ok(out)
+        export_keying_material(&self.conn, label, context, len)
     }
 
     /// Snapshot of the quinn path stats relevant to adaptive bitrate.
@@ -406,7 +393,35 @@ impl ConnectionInfo for Connection {
     }
 }
 
-async fn write_framed(send: &mut quinn::SendStream, body: &[u8]) -> Result<()> {
+/// SHA-256 fingerprint of the peer's leaf certificate from a raw quinn
+/// connection, or `None` if the peer presented no cert. Shared by
+/// [`Connection`] and [`crate::PendingConnection`].
+pub(crate) fn peer_cert_fingerprint(conn: &quinn::Connection) -> Option<CertFingerprint> {
+    let identity = conn.peer_identity()?;
+    let certs = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    certs.first().map(|c| crate::tls::sha256(c.as_ref()))
+}
+
+/// Export `len` bytes of RFC 5705 keying material from a raw quinn connection.
+/// Rejects `len == 0` so a caller bug can't produce a vacuous channel binding.
+pub(crate) fn export_keying_material(
+    conn: &quinn::Connection,
+    label: &[u8],
+    context: &[u8],
+    len: usize,
+) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Err(TransportError::ExporterUnavailable);
+    }
+    let mut out = vec![0u8; len];
+    conn.export_keying_material(&mut out, label, context)
+        .map_err(|_| TransportError::ExporterUnavailable)?;
+    Ok(out)
+}
+
+pub(crate) async fn write_framed(send: &mut quinn::SendStream, body: &[u8]) -> Result<()> {
     write_framed_with_max(send, body, MAX_FRAMED_MESSAGE).await
 }
 
@@ -430,7 +445,7 @@ async fn write_framed_with_max(
     Ok(())
 }
 
-async fn read_framed(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+pub(crate) async fn read_framed(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
     read_framed_with_max(recv, MAX_FRAMED_MESSAGE).await
 }
 

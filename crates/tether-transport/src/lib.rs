@@ -24,6 +24,7 @@ mod channel;
 mod client;
 mod connection;
 mod handshake;
+mod pending;
 mod server;
 pub mod tls;
 
@@ -32,9 +33,10 @@ pub mod tls;
 pub mod test_support;
 
 pub use channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
-pub use client::Client;
+pub use client::{Client, ServerAuth};
 pub use connection::{Connection, Datagram};
 pub use handshake::{ClientHelloReceived, HostHandshake};
+pub use pending::PendingConnection;
 pub use server::Server;
 pub use tls::CertFingerprint;
 

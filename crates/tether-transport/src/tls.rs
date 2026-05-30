@@ -210,6 +210,62 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
+/// Client-side server-cert verifier that accepts **any** well-formed server
+/// certificate. Used only during **first-contact pairing**, when the client
+/// does not yet know the host's fingerprint — the SPAKE2 key-confirmation
+/// (bound to the TLS exporter) is what authenticates the host, after which the
+/// client persists the observed cert fingerprint to known-hosts and switches
+/// to [`PinnedCertVerifier`] on every reconnect. Like the permissive
+/// client-cert verifier, it still proves key-possession via the signature
+/// delegation, so it's "any host that owns its cert", not "any bytes".
+#[derive(Debug)]
+pub struct PermissiveServerCertVerifier {
+    supported_schemes: WebPkiSupportedAlgorithms,
+}
+
+impl PermissiveServerCertVerifier {
+    pub fn new() -> Arc<Self> {
+        let supported_schemes =
+            rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        Arc::new(Self { supported_schemes })
+    }
+}
+
+impl ServerCertVerifier for PermissiveServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_schemes)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_schemes)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported_schemes.supported_schemes()
+    }
+}
+
 /// Server-side client-cert verifier that accepts **any** well-formed client
 /// certificate, deferring the actual authorization decision to the
 /// application layer (the paired-clients allowlist).

@@ -7,6 +7,7 @@ use tracing::{info, trace};
 
 use crate::{
     connection::{Connection, STREAM_PREAMBLE_LEN},
+    pending::PendingConnection,
     tls::{
         ensure_crypto_provider, generate_self_signed, load_or_generate_persistent,
         CertFingerprint, PermissiveClientCertVerifier, SelfSignedCert,
@@ -79,11 +80,36 @@ impl Server {
         Ok(self.endpoint.local_addr()?)
     }
 
-    /// Accept the next incoming connection. Returns `None` when the
+    /// Accept the next incoming connection as a [`PendingConnection`] — the
+    /// TLS handshake is complete and the pairing stream is wired, but no
+    /// session exists yet. The caller authorizes the peer (allowlist check
+    /// and/or a pairing exchange) and then either
+    /// [`PendingConnection::into_connection`] or
+    /// [`PendingConnection::reject`]s it. The host binary uses this path so an
+    /// unauthorized client never reaches a session. Returns `None` when the
     /// endpoint has been closed.
-    pub async fn accept(&self) -> Option<Result<Connection>> {
+    pub async fn accept_pending(&self) -> Option<Result<PendingConnection>> {
         let incoming = self.endpoint.accept().await?;
-        Some(handle_incoming(incoming).await)
+        Some(handle_incoming_pending(incoming).await)
+    }
+
+    /// Convenience: accept the next connection and immediately promote it to a
+    /// session with **NO authentication and no pairing exchange**.
+    ///
+    /// This performs no allowlist check — any peer that completes the TLS
+    /// handshake gets a session and can inject input. It exists only for
+    /// transport-mechanics tests and simple peers. **Production code must use
+    /// [`Self::accept_pending`]** and authorize the peer before
+    /// [`PendingConnection::into_connection`]. The peer must use the matching
+    /// convenience path ([`Client::connect`]): mixing a convenience side with a
+    /// `*_pending` side that runs a pairing exchange will hang, because one
+    /// side waits for pairing messages the other never sends. Returns `None`
+    /// when the endpoint has been closed.
+    pub async fn accept(&self) -> Option<Result<Connection>> {
+        match self.accept_pending().await? {
+            Ok(pending) => Some(pending.into_connection().await),
+            Err(e) => Some(Err(e)),
+        }
     }
 
     /// Stop accepting new connections and close the endpoint immediately,
@@ -103,30 +129,21 @@ impl Server {
     }
 }
 
-async fn handle_incoming(incoming: quinn::Incoming) -> Result<Connection> {
+async fn handle_incoming_pending(incoming: quinn::Incoming) -> Result<PendingConnection> {
     let conn = incoming.await?;
     trace!(remote = %conn.remote_address(), "incoming connection accepted");
-    // Client opens streams in a fixed order, each followed by a
-    // four-byte preamble (the bytes themselves are unused — see Client).
-    //   1. bidirectional control stream
-    //   2. unidirectional input stream
-    let (control_send, mut control_recv) = conn.accept_bi().await?;
+    // The client opens streams in a fixed order, each preceded by a four-byte
+    // preamble (unused bytes — see Client) that forces a STREAM frame so our
+    // `accept_*` completes. Stream #1 is the pairing stream; control and input
+    // come later, only once the peer is authorized (see
+    // `PendingConnection::into_connection`).
+    let (pairing_send, mut pairing_recv) = conn.accept_bi().await?;
     let mut preamble = [0u8; STREAM_PREAMBLE_LEN];
-    control_recv
+    pairing_recv
         .read_exact(&mut preamble)
         .await
         .map_err(crate::TransportError::from_read_exact)?;
-    let mut input_recv = conn.accept_uni().await?;
-    input_recv
-        .read_exact(&mut preamble)
-        .await
-        .map_err(crate::TransportError::from_read_exact)?;
-    Ok(Connection::new_host(
-        conn,
-        control_send,
-        control_recv,
-        input_recv,
-    ))
+    Ok(PendingConnection::new_host(conn, pairing_send, pairing_recv))
 }
 
 fn default_subject_alt_names() -> Vec<String> {

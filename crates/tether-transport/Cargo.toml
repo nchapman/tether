@@ -44,6 +44,9 @@ test-support = ["dep:rand"]
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
+# Drives a real SPAKE2 pairing exchange in the PendingConnection loopback test.
+tether-pairing = { workspace = true }
+tether-protocol = { workspace = true }
 
 [lints]
 workspace = true

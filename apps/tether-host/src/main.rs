@@ -57,6 +57,36 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+mod pairing;
+use pairing::{ActiveSession, Authorized, PairingState, RefusedReason};
+
+/// Registers the live session in the shared `active` slot on creation and
+/// clears it on drop. Using a guard keeps the invariant "the slot is `Some`
+/// iff a session is live" on *every* exit path — clean end, revocation, a
+/// handshake-failure `continue`, or a ctrl-c / shutdown `break` — without a
+/// manual clear on each.
+struct ActiveSessionGuard {
+    slot: Arc<StdMutex<Option<ActiveSession>>>,
+}
+
+impl ActiveSessionGuard {
+    fn register(slot: Arc<StdMutex<Option<ActiveSession>>>, session: ActiveSession) -> Self {
+        if let Ok(mut g) = slot.lock() {
+            *g = Some(session);
+        }
+        Self { slot }
+    }
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        // Tolerate a poisoned lock rather than double-panicking on the way out.
+        if let Ok(mut g) = self.slot.lock() {
+            *g = None;
+        }
+    }
+}
+
 /// Default target frame rate. Sunshine and Apollo run desktop / game
 /// streaming at 60 fps by default; tether matches. The host's encoder
 /// time_base, the test-pattern source, and (in the future) the
@@ -77,6 +107,21 @@ const ENCODER_BITRATE_KBPS: u32 = 8_000;
 const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
 const TEST_PATTERN_FPS: u32 = 60;
+
+/// Upper bound on the per-connection authorization exchange (allowlist resume
+/// or first-contact pairing). A peer that stalls mid-exchange is dropped so it
+/// can't wedge the accept loop indefinitely. The client connects only *after*
+/// the user has entered the PIN (the PIN is a launch argument, not typed mid-
+/// connection), so the exchange itself runs at machine speed — 30 s is ample
+/// headroom for a slow link without inviting a long stall.
+///
+/// The accept loop authorizes one peer at a time, so a hostile peer that opens
+/// a connection and stalls holds *this* slot for the full timeout. If it stalls
+/// a first-contact `Pair` after the window was taken (burn-on-attempt), the
+/// window is also spent for the duration, so a legitimate device can't pair
+/// until the stall clears and the operator re-opens the window. Acceptable for
+/// the single-client alpha; concurrent authorization is the planned fix.
+const AUTHORIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Latest `ClientStats` observation, drained by the encode-and-send
 /// thread on each loop iteration. The control recv task writes here
@@ -129,13 +174,11 @@ async fn main() -> anyhow::Result<()> {
     // thread libavcodec calls into.
     let _tracing_guard = init_tracing(reporter.is_json());
 
-    // When the shell drives us, watch stdin for a `Stop` command (or EOF,
-    // i.e. the shell died) and trip a shutdown notify that both the
-    // accept loop and the in-session select race below.
+    // When the shell drives us, watch stdin for commands (or EOF, i.e. the
+    // shell died, which trips a shutdown notify that both the accept loop and
+    // the in-session select race below). The watcher is spawned once the
+    // pairing state exists — it also handles `StartPairing` / `RevokePeer`.
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    if reporter.is_json() {
-        spawn_stdin_stop_watcher(shutdown.clone());
-    }
 
     let cert_dir = persistent_cert_dir()?;
     let server = match Server::bind_persistent(bind, &cert_dir).await {
@@ -159,6 +202,39 @@ async fn main() -> anyhow::Result<()> {
     let local = server.local_addr()?;
     let fingerprint = server.fingerprint();
     let fp_hex = hex_encode(&fingerprint);
+
+    // Load the paired-clients allowlist. A corrupt file is fatal (fail closed):
+    // silently treating a damaged allowlist as empty would force re-pairing and
+    // mask tampering. A missing file is first-run (empty store).
+    let paired_path = cert_dir.join("paired_clients.json");
+    let paired_store = match tether_pairing::PairedStore::load(&paired_path) {
+        Ok(s) => s,
+        Err(e) => {
+            reporter.emit(&EngineEvent::Error {
+                message: format!(
+                    "failed to load paired-clients allowlist {}: {e}",
+                    paired_path.display()
+                ),
+            });
+            if reporter.is_json() {
+                std::process::exit(1);
+            }
+            return Err(e.into());
+        }
+    };
+    let pairing_state = PairingState {
+        paired: Arc::new(StdMutex::new(paired_store)),
+        paired_path: Arc::new(paired_path),
+        window: Arc::new(StdMutex::new(None)),
+        active: Arc::new(StdMutex::new(None)),
+        host_fp: fingerprint,
+    };
+
+    // Now that the pairing state exists, start the stdin command watcher in
+    // IPC mode (Stop / StartPairing / RevokePeer).
+    if reporter.is_json() {
+        spawn_stdin_command_watcher(shutdown.clone(), pairing_state.clone(), reporter);
+    }
 
     reporter.emit(&EngineEvent::Listening {
         addr: local.to_string(),
@@ -244,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
     // installed it stays installed) and subsequent Ctrl-Cs are
     // silently queued.
     loop {
-        let conn = tokio::select! {
+        let pending = tokio::select! {
             biased;
             ctrl_c = tokio::signal::ctrl_c() => {
                 if let Err(e) = ctrl_c {
@@ -258,10 +334,10 @@ async fn main() -> anyhow::Result<()> {
                 info!("shell stop received at main loop; shutting down");
                 break;
             }
-            accept_res = server.accept() => match accept_res {
-                Some(Ok(c)) => Arc::new(c),
+            accept_res = server.accept_pending() => match accept_res {
+                Some(Ok(p)) => p,
                 Some(Err(e)) => {
-                    warn!(error = ?e, "server.accept failed; continuing");
+                    warn!(error = ?e, "server.accept_pending failed; continuing");
                     continue;
                 }
                 None => {
@@ -270,11 +346,74 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         };
-        let peer = conn.remote_address();
-        info!(remote = %peer, "client connected");
+        let peer = pending.remote_address();
+        info!(remote = %peer, "incoming connection; authorizing");
+
+        // Authorize before any session exists: allowlist hit (Resume) or a
+        // windowed first-contact pairing. An unpaired client with no open
+        // window is refused here, so the input-injection path is structurally
+        // unreachable for it. The timeout stops a stalled or hostile peer from
+        // wedging the accept loop — dropping the future closes its connection.
+        let (conn, fp) = match tokio::time::timeout(
+            AUTHORIZE_TIMEOUT,
+            pairing::authorize(pending, &pairing_state, Instant::now()),
+        )
+        .await
+        {
+            Ok(Authorized::Session {
+                pending,
+                fp,
+                newly_paired,
+            }) => {
+                // Authorized: promote to a full session (wire control + input).
+                let conn = match pending.into_connection().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(remote = %peer, error = ?e, "promoting authorized peer failed");
+                        continue;
+                    }
+                };
+                if let Some(label) = newly_paired {
+                    reporter.emit(&EngineEvent::Paired {
+                        peer: peer.to_string(),
+                        label,
+                    });
+                }
+                (Arc::new(conn), fp)
+            }
+            Ok(Authorized::Refused(RefusedReason::PairingRequired)) => {
+                info!(remote = %peer, "unpaired client refused (no pairing window)");
+                reporter.emit(&EngineEvent::PairingRequired {
+                    peer: peer.to_string(),
+                });
+                continue;
+            }
+            Ok(Authorized::Refused(RefusedReason::Protocol(msg))) => {
+                warn!(remote = %peer, reason = %msg, "pending connection refused");
+                continue;
+            }
+            Err(_elapsed) => {
+                warn!(remote = %peer, "authorization timed out; dropping connection");
+                continue;
+            }
+        };
+
+        info!(remote = %peer, "client authorized");
         reporter.emit(&EngineEvent::PeerConnected {
             peer: peer.to_string(),
         });
+
+        // Register the live session so `RevokePeer` can tear it down. The kill
+        // notify is raced in the in-session select below; the guard clears the
+        // slot when this loop iteration ends, however it ends.
+        let session_kill = Arc::new(tokio::sync::Notify::new());
+        let _active_guard = ActiveSessionGuard::register(
+            pairing_state.active.clone(),
+            ActiveSession {
+                fp,
+                kill: session_kill.clone(),
+            },
+        );
 
         let host_encode_profiles: Vec<VideoProfile> = if use_test_pattern {
             vec![VideoProfile::H264_8BIT_420]
@@ -345,6 +484,14 @@ async fn main() -> anyhow::Result<()> {
                 info!("shell stop received during session; shutting down");
                 break;
             }
+            _ = session_kill.notified() => {
+                // The operator revoked this peer mid-session. Dropping the
+                // session graph (handle_client's future) closes the connection.
+                info!(remote = %peer, "peer revoked; dropping live session");
+                reporter.emit(&EngineEvent::PeerDisconnected {
+                    reason: "revoked".to_string(),
+                });
+            }
             res = handle_client(session, conn, use_test_pattern) => {
                 let reason = match res {
                     Ok(()) => "clean".to_string(),
@@ -356,6 +503,9 @@ async fn main() -> anyhow::Result<()> {
                 reporter.emit(&EngineEvent::PeerDisconnected { reason });
             }
         }
+
+        // `_active_guard` drops here (or on any `continue`/`break` above),
+        // clearing the active-session slot.
     }
 
     server.close_and_wait(0, b"host shutdown").await;
@@ -3029,11 +3179,16 @@ fn parse_args() -> anyhow::Result<(SocketAddr, bool, bool)> {
     Ok((bind, use_test_pattern, ipc))
 }
 
-/// In `--ipc` mode, watch stdin for shell commands. A `Stop` line, stdin
-/// EOF (the shell process died), or a read error all trip `shutdown` so
-/// no engine is ever orphaned by a crashed shell. Unrecognized lines are
-/// logged and skipped.
-fn spawn_stdin_stop_watcher(shutdown: Arc<tokio::sync::Notify>) {
+/// In `--ipc` mode, watch stdin for shell commands. `Stop` (or stdin EOF / a
+/// read error — the shell process died) trips `shutdown` so no engine is ever
+/// orphaned by a crashed shell. `StartPairing` opens a pairing window and emits
+/// the PIN; `RevokePeer` removes a paired client and drops any live session
+/// from it. Unrecognized lines are logged and skipped.
+fn spawn_stdin_command_watcher(
+    shutdown: Arc<tokio::sync::Notify>,
+    pairing_state: PairingState,
+    reporter: Reporter,
+) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -3049,6 +3204,18 @@ fn spawn_stdin_stop_watcher(shutdown: Arc<tokio::sync::Notify>) {
                             info!("shell sent stop");
                             shutdown.notify_one();
                             return;
+                        }
+                        Ok(tether_ipc::ShellCommand::StartPairing { label }) => {
+                            let pin = pairing_state.open_window(label);
+                            info!("pairing window opened");
+                            reporter.emit(&EngineEvent::PairingPin {
+                                pin,
+                                expires_in_secs: pairing::PAIRING_WINDOW.as_secs(),
+                            });
+                        }
+                        Ok(tether_ipc::ShellCommand::RevokePeer { fingerprint }) => {
+                            let removed = pairing_state.revoke(&fingerprint);
+                            info!(removed, "revoke peer requested");
                         }
                         Err(e) => {
                             warn!(error = %e, line, "ignoring unrecognized stdin command");

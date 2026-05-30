@@ -35,6 +35,20 @@
 //! The SPAKE2 key itself already commits to the password, both identities, and
 //! both wire messages (verified against the crate's `finish()` transcript), so
 //! the confirmation layer adds exactly the bindings SPAKE2 omits.
+//!
+//! ## Swapping the PAKE primitive
+//!
+//! The PAKE is confined to two functions ([`PairingStart::new`] and
+//! [`PairingStart::into_keyed`]); everything security-load-bearing against a
+//! relay/MITM — the TLS-exporter channel binding, the direction-tagged
+//! confirmation MAC, the [`Transcript`] — is PAKE-agnostic and unaffected by the
+//! choice. **CPace** is the CFRG-preferred balanced PAKE and the natural
+//! successor (no fixed M/N generators, cleaner security argument); we stay on
+//! SPAKE2 for now because RustCrypto's `spake2` is the more mature/maintained
+//! Rust option and the wire envelopes already carry the PAKE message as opaque
+//! bytes. Revisit before GA: if an audited, maintained CPace crate exists, the
+//! swap is a contained change to those two functions and the dependency, with no
+//! wire-format or re-pairing impact.
 
 mod store;
 
@@ -63,12 +77,54 @@ pub const CONFIRM_INFO: &[u8] = b"tether pairing v1 confirm";
 /// host and client or the channel binding (and thus pairing) fails.
 pub const EXPORTER_LABEL: &[u8] = b"tether pairing exporter v1";
 
+/// `context` passed to the TLS exporter on both ends. Empty is a valid RFC 5705
+/// context; the label already domain-separates this export. Shared here so the
+/// host and client can't drift (a mismatch silently breaks the channel binding,
+/// which would read as a wrong-PIN failure).
+pub const EXPORTER_CONTEXT: &[u8] = b"";
+
 /// Length of the exporter value bound into the transcript. Fixed so the
 /// confirmation transcript's field layout is unambiguous.
 pub const EXPORTER_LEN: usize = 32;
 
 /// Length of a confirmation MAC (HMAC-SHA256).
 pub const CONFIRM_LEN: usize = 32;
+
+/// Number of decimal digits in a pairing PIN. Eight digits is the
+/// magic-wormhole-class short code: short enough to read aloud or type, with
+/// the actual security resting on burn-on-attempt single-flight (the online
+/// guessing limit), not the PIN's entropy.
+pub const PIN_DIGITS: usize = 8;
+
+/// Generate a fresh random pairing PIN: [`PIN_DIGITS`] decimal digits,
+/// zero-padded, drawn from the OS CSPRNG. Uses rejection sampling so every
+/// value in `0..10^PIN_DIGITS` is equally likely (a plain modulo would bias
+/// the low digits). Panics only if the OS RNG is unavailable — an
+/// unrecoverable platform fault, not a condition a caller can sensibly handle.
+pub fn generate_pin() -> String {
+    // 8 digits → [0, 100_000_000). Reject u32 draws at or above the largest
+    // multiple of the range so the modulo is unbiased. 100_000_000 * 42 =
+    // 4_200_000_000 ≤ u32::MAX (4_294_967_295), so the reject band is tiny
+    // (~2.2%) and the loop almost always takes one iteration.
+    const RANGE: u32 = 100_000_000; // 10^8
+    const REJECT_AT: u32 = RANGE * (u32::MAX / RANGE); // 4_200_000_000
+    // Make the rejection-sampling invariants unmistakable: the threshold must
+    // be an exact multiple of RANGE (so `draw % RANGE` is unbiased over the
+    // accepted band) and must not exceed u32::MAX.
+    const _: () = assert!(REJECT_AT % RANGE == 0, "REJECT_AT must be a multiple of RANGE");
+    // The largest multiple of RANGE that is ≤ u32::MAX, so the rejected band
+    // (REJECT_AT..=u32::MAX) is narrower than one RANGE — the loop rejects at
+    // most ~RANGE/2^32 of draws.
+    const _: () = assert!(REJECT_AT > u32::MAX - RANGE, "REJECT_AT must be the largest RANGE multiple ≤ u32::MAX");
+    loop {
+        let mut bytes = [0u8; 4];
+        getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
+        let draw = u32::from_le_bytes(bytes);
+        if draw < REJECT_AT {
+            return format!("{:0width$}", draw % RANGE, width = PIN_DIGITS);
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PairingError {
@@ -300,6 +356,20 @@ mod tests {
             protocol_version: "tether/2",
         };
         assert!(!client.verify_confirmation(Direction::HostToClient, &t_ver, &mh));
+    }
+
+    #[test]
+    fn generated_pin_is_eight_digits() {
+        // Run many draws: every PIN must be exactly PIN_DIGITS ASCII digits and
+        // parse as a value inside the range. This also exercises the rejection
+        // loop across many iterations.
+        for _ in 0..1000 {
+            let pin = generate_pin();
+            assert_eq!(pin.len(), PIN_DIGITS);
+            assert!(pin.chars().all(|c| c.is_ascii_digit()), "pin {pin} not all digits");
+            let value: u32 = pin.parse().expect("pin parses as a number");
+            assert!(value < 100_000_000);
+        }
     }
 
     #[test]

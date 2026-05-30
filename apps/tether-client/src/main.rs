@@ -961,6 +961,12 @@ async fn wait_for_stdin_stop() {
                 }
                 match tether_ipc::ShellCommand::from_line(line) {
                     Ok(tether_ipc::ShellCommand::Stop) => return,
+                    // Host-only pairing commands: a well-formed command that
+                    // doesn't apply to the client. Ignore rather than error.
+                    Ok(tether_ipc::ShellCommand::StartPairing { .. })
+                    | Ok(tether_ipc::ShellCommand::RevokePeer { .. }) => {
+                        warn!(?line, "ignoring host-only command on client stdin");
+                    }
                     Err(e) => {
                         warn!(error = %e, line, "ignoring unrecognized stdin command");
                     }

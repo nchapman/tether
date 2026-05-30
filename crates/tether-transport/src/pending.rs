@@ -111,6 +111,14 @@ impl PendingConnection {
     /// Refuse this peer: close the QUIC connection without ever wiring the
     /// control or input streams. No [`Connection`] is produced, so no session
     /// or input task can exist for it.
+    ///
+    /// The close is the **authoritative** refusal signal. If the caller sent a
+    /// terminal pairing message (e.g. `Rejected`) just before calling this, that
+    /// message is best-effort: `close` puts the connection into draining and
+    /// outstanding stream data may not be delivered, so the peer can observe the
+    /// refusal as a `ConnectionLost(ApplicationClosed { code, reason })` instead
+    /// of reading the message. Peers must treat a closed connection during
+    /// pairing as a rejection. `code`/`reason` are advisory diagnostics.
     pub fn reject(self, code: u32, reason: &[u8]) {
         self.conn.close(code.into(), reason);
     }

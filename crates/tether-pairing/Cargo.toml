@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 spake2 = "0.4"
+getrandom = "0.3"
 hkdf = "0.13"
 hmac = "0.13"
 sha2 = "0.11"

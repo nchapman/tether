@@ -3761,6 +3761,7 @@ dependencies = [
  "tether-gpuconvert",
  "tether-input",
  "tether-ipc",
+ "tether-pairing",
  "tether-probe",
  "tether-protocol",
  "tether-render",
@@ -3800,6 +3801,7 @@ dependencies = [
 name = "tether-pairing"
 version = "0.0.1"
 dependencies = [
+ "getrandom 0.3.4",
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
@@ -3906,6 +3908,7 @@ dependencies = [
  "serde",
  "sha2 0.11.0",
  "socket2 0.5.10",
+ "tether-pairing",
  "tether-protocol",
  "thiserror 2.0.18",
  "tokio",

@@ -3812,6 +3812,7 @@ dependencies = [
  "spake2",
  "subtle",
  "thiserror 2.0.18",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -3915,6 +3916,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows 0.61.3",
 ]
 
 [[package]]

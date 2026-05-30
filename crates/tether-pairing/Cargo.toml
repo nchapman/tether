@@ -19,5 +19,16 @@ sha2 = "0.11"
 subtle = "2"
 hex = "0.4"
 
+# Windows owner-only file ACLs (the analogue of the Unix `0o600` we set on the
+# trust-store files). See `store::write_private`.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 [lints]
 workspace = true

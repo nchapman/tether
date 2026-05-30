@@ -222,16 +222,135 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     f.write_all(bytes)
 }
 
-// SECURITY: on Windows we rely on the inherited ACL of the per-user profile
-// directory (`%USERPROFILE%\.tether`), which by default grants access only to
-// the owner, SYSTEM, and Administrators — not other standard users. We do not
-// yet set an explicit owner-only DACL, so on a machine whose profile ACL has
-// been loosened this trust-root file could be read or written by another local
-// user (who could then self-authorize for input injection). Acceptable for the
-// single-user alpha; harden with SetNamedSecurityInfoW before multi-user use.
-#[cfg(not(unix))]
+// SECURITY: the Windows analogue of the `0o600` above. We create the file with
+// an explicit owner-only, inheritance-protected DACL rather than inheriting the
+// profile directory's ACL — so even on a machine whose `%USERPROFILE%\.tether`
+// ACL has been loosened, this trust-root file can't be read or written by
+// another local user (who could otherwise self-authorize for input injection).
+// Building the descriptor at CreateFile time (not tightening after a normal
+// write) means the file never exists with a looser ACL, even for an instant.
+// The DACL grants *only* the current user — no SYSTEM/Administrators ACE,
+// mirroring how Unix `0o600` excludes root from the explicit mode bits (admins
+// can still take ownership, so restricting them would be theater; the threat is
+// another standard user). A side effect, as on Unix, is that a backup agent
+// running as SYSTEM can't read the file without a privilege that bypasses DACLs.
+//
+// NOTE: byte-for-byte identical to `tether_transport::tls::write_key_file`'s
+// Windows arm; the two live in separate crates (this one stays free of quinn,
+// that one of spake2) so the shim is duplicated rather than shared. Keep in sync.
+#[cfg(windows)]
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    std::fs::write(path, bytes)
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
+    };
+
+    // The DACL grants exactly the current user, so resolve their SID first.
+    // `D:` DACL, `P` protected (don't inherit looser ACEs from the parent dir),
+    // `(A;;FA;;;<sid>)` allow full access to just this user.
+    let sid = current_user_sid_string()?;
+    let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid})\0").encode_utf16().collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        let mut psd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+        .map_err(io::Error::other)?;
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                .expect("SECURITY_ATTRIBUTES size fits u32"),
+            lpSecurityDescriptor: psd.0,
+            bInheritHandle: false.into(),
+        };
+        let handle = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            Some(&sa),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        );
+        // Free the descriptor regardless of how CreateFile fared.
+        let _ = LocalFree(Some(HLOCAL(psd.0)));
+        let handle = handle.map_err(io::Error::other)?;
+
+        // Adopt the raw handle into a std `File` so the write + close are
+        // ordinary std I/O (and the handle is closed on drop).
+        let mut file = std::fs::File::from_raw_handle(handle.0 as *mut _);
+        file.write_all(bytes)
+    }
+}
+
+/// The current process user's SID in string form (`S-1-5-21-…`), for building
+/// the owner-only DACL above.
+#[cfg(windows)]
+fn current_user_sid_string() -> io::Result<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree,
+    };
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(io::Error::other)?;
+
+        // First call sizes the buffer; it must fail with ERROR_INSUFFICIENT_BUFFER.
+        // Any other outcome (a restricted token, or an unexpected success that
+        // leaves `len` at 0) we surface rather than pressing on and dereferencing
+        // a zero-length allocation.
+        let mut len = 0u32;
+        if let Err(e) = GetTokenInformation(token, TokenUser, None, 0, &mut len) {
+            if e.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult() {
+                let _ = CloseHandle(token);
+                return Err(io::Error::other(e));
+            }
+        }
+        if len == 0 {
+            let _ = CloseHandle(token);
+            return Err(io::Error::other("could not size token information"));
+        }
+
+        // Back the buffer with `u64` so it's 8-byte aligned for the `TOKEN_USER`
+        // cast below — the struct holds a pointer, and a `Vec<u8>` would only be
+        // 1-byte aligned (an unaligned read of the pointer field is UB).
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        let filled = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut _),
+            len,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        filled.map_err(io::Error::other)?;
+
+        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut sid_w = PWSTR::null();
+        ConvertSidToStringSidW(token_user.User.Sid, &mut sid_w).map_err(io::Error::other)?;
+        // Free the LocalAlloc'd SID string on every path, including a to_string error.
+        let result = sid_w.to_string().map_err(io::Error::other);
+        let _ = LocalFree(Some(HLOCAL(sid_w.0 as *mut _)));
+        result
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +481,58 @@ mod tests {
         assert_eq!(loaded.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The hardening this test guards is the *DACL*, not the write: a plain
+    // `fs::write` would still round-trip bytes. Verify the file's DACL is
+    // inheritance-protected (`SE_DACL_PROTECTED`), so a loosened parent-dir ACL
+    // cannot grant another local user access to this trust root.
+    #[cfg(windows)]
+    #[test]
+    fn write_private_sets_protected_dacl() {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows::Win32::Security::{
+            GetSecurityDescriptorControl, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            SE_DACL_PROTECTED,
+        };
+
+        let path =
+            std::env::temp_dir().join(format!("tether-dacl-test-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        write_private(&path, b"secret").expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"secret");
+
+        unsafe {
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut psd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                None,
+                &mut psd,
+            )
+            .ok()
+            .expect("GetNamedSecurityInfo");
+
+            let mut control: u16 = 0;
+            let mut revision = 0u32;
+            GetSecurityDescriptorControl(psd, &mut control, &mut revision).expect("control");
+            let _ = LocalFree(Some(HLOCAL(psd.0)));
+            // Clean up before asserting so a failure doesn't strand the file.
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                control & SE_DACL_PROTECTED.0 != 0,
+                "file DACL must be inheritance-protected"
+            );
+        }
     }
 
     #[test]

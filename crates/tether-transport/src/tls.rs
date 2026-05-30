@@ -119,6 +119,12 @@ fn load_or_generate_named(
     // operator manually deletes the files.
     let tmp_cert = dir.join(format!("{cert_file}.tmp"));
     let tmp_key = dir.join(format!("{key_file}.tmp"));
+    // The cert is a public artifact (it carries only the public key + SAN, and
+    // its fingerprint is exchanged on the wire anyway), so it's written with
+    // default permissions on both platforms; only the private key gets the
+    // owner-only treatment. Tampering with the public cert under a loosened dir
+    // ACL can at worst desync it from the protected key (a load-time failure),
+    // not forge an identity — that needs the key, which is locked down.
     std::fs::write(&tmp_cert, fresh.chain[0].as_ref())?;
     write_key_file(&tmp_key, fresh.key.secret_pkcs8_der())?;
     std::fs::rename(&tmp_cert, &cert_path)?;
@@ -139,16 +145,135 @@ fn write_key_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
-// SECURITY: on Windows the private key relies on the inherited ACL of the
-// per-user cert directory (`%USERPROFILE%\.tether`), which by default excludes
-// other standard users. We do not yet set an explicit owner-only DACL, so a
-// process running as a *different* local user on a machine with a loosened
-// profile ACL could read the key and impersonate this identity. Acceptable for
-// the single-user alpha; harden with SetNamedSecurityInfoW before multi-user
-// use. Same gap applies to the paired-peer store in tether-pairing.
-#[cfg(not(unix))]
+// SECURITY: the Windows analogue of the `0o600` above. We create the key file
+// with an explicit owner-only, inheritance-protected DACL rather than inheriting
+// the cert directory's ACL — so even on a machine whose `%USERPROFILE%\.tether`
+// ACL has been loosened, a different local user can't read this private key and
+// impersonate the identity. Building the descriptor at CreateFile time (not
+// tightening after a normal write) means the key never exists with a looser ACL.
+// The DACL grants *only* the current user — no SYSTEM/Administrators ACE,
+// mirroring how Unix `0o600` excludes root from the explicit mode bits (admins
+// can still take ownership, so restricting them would be theater). A side effect,
+// as on Unix, is that a backup agent running as SYSTEM can't read the key without
+// a privilege that bypasses DACLs.
+//
+// NOTE: byte-for-byte identical to `tether_pairing::store::write_private`'s
+// Windows arm; the two live in separate crates (this one stays free of spake2,
+// that one of quinn) so the shim is duplicated rather than shared. Keep in sync.
+#[cfg(windows)]
 fn write_key_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
+    };
+
+    // The DACL grants exactly the current user, so resolve their SID first.
+    // `D:` DACL, `P` protected (don't inherit looser ACEs from the parent dir),
+    // `(A;;FA;;;<sid>)` allow full access to just this user.
+    let sid = current_user_sid_string()?;
+    let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid})\0").encode_utf16().collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        let mut psd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+        .map_err(std::io::Error::other)?;
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                .expect("SECURITY_ATTRIBUTES size fits u32"),
+            lpSecurityDescriptor: psd.0,
+            bInheritHandle: false.into(),
+        };
+        let handle = CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            FILE_GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            Some(&sa),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        );
+        // Free the descriptor regardless of how CreateFile fared.
+        let _ = LocalFree(Some(HLOCAL(psd.0)));
+        let handle = handle.map_err(std::io::Error::other)?;
+
+        // Adopt the raw handle into a std `File` so the write + close are
+        // ordinary std I/O (and the handle is closed on drop).
+        let mut file = std::fs::File::from_raw_handle(handle.0 as *mut _);
+        file.write_all(bytes)
+    }
+}
+
+/// The current process user's SID in string form (`S-1-5-21-…`), for building
+/// the owner-only DACL above.
+#[cfg(windows)]
+fn current_user_sid_string() -> std::io::Result<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree,
+    };
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(std::io::Error::other)?;
+
+        // First call sizes the buffer; it must fail with ERROR_INSUFFICIENT_BUFFER.
+        // Any other outcome (a restricted token, or an unexpected success that
+        // leaves `len` at 0) we surface rather than pressing on and dereferencing
+        // a zero-length allocation.
+        let mut len = 0u32;
+        if let Err(e) = GetTokenInformation(token, TokenUser, None, 0, &mut len) {
+            if e.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult() {
+                let _ = CloseHandle(token);
+                return Err(std::io::Error::other(e));
+            }
+        }
+        if len == 0 {
+            let _ = CloseHandle(token);
+            return Err(std::io::Error::other("could not size token information"));
+        }
+
+        // Back the buffer with `u64` so it's 8-byte aligned for the `TOKEN_USER`
+        // cast below — the struct holds a pointer, and a `Vec<u8>` would only be
+        // 1-byte aligned (an unaligned read of the pointer field is UB).
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        let filled = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut _),
+            len,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        filled.map_err(std::io::Error::other)?;
+
+        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut sid_w = PWSTR::null();
+        ConvertSidToStringSidW(token_user.User.Sid, &mut sid_w).map_err(std::io::Error::other)?;
+        // Free the LocalAlloc'd SID string on every path, including a to_string error.
+        let result = sid_w.to_string().map_err(std::io::Error::other);
+        let _ = LocalFree(Some(HLOCAL(sid_w.0 as *mut _)));
+        result
+    }
 }
 
 #[derive(Debug)]

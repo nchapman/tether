@@ -26,6 +26,17 @@ sha2 = "0.11"
 # `optional` so production builds never compile rand.
 rand = { version = "0.9", features = ["small_rng"], optional = true }
 
+# Windows owner-only file ACLs for the persisted identity key (the analogue of
+# the Unix `0o600` we set on `*_key.der`). See `tls::write_key_file`.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 [features]
 # Exposes `test_support::DuplexControlChannel` for downstream crates'
 # integration tests. The feature gates only the items inside the

@@ -14,9 +14,9 @@
 //! convention (see `tether-protocol`), every message has a round-trip
 //! test below.
 //!
-//! Scope is deliberately the connection lifecycle the prototype shell
+//! Scope is deliberately the connection lifecycle + pairing the shell
 //! reflects in its UI + tray. Variants land only when a binary actually
-//! emits them — no speculative `Stats`/pairing fields ahead of the
+//! emits them — no speculative variants (e.g. a `Stats` event) ahead of the
 //! feature that drives them.
 
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,16 @@ pub enum EngineEvent {
     /// A fatal error the UI should surface. The engine exits shortly
     /// after emitting this.
     Error { message: String },
+    /// Host opened a pairing window: show this PIN for the user to type on
+    /// the new device. `expires_in_secs` drives the UI countdown; the PIN is
+    /// single-use and the window closes when it elapses.
+    PairingPin { pin: String, expires_in_secs: u64 },
+    /// A device completed pairing and was added to the allowlist. `label` is
+    /// the name recorded for it; `peer` is its address.
+    Paired { peer: String, label: String },
+    /// An unpaired client tried to connect while no pairing window was open;
+    /// it was refused. The UI prompts the user to start pairing to allow it.
+    PairingRequired { peer: String },
 }
 
 /// Shell → engine, written one-per-line to the engine's stdin.
@@ -59,6 +69,14 @@ pub enum EngineEvent {
 pub enum ShellCommand {
     /// Tear down the session and exit gracefully.
     Stop,
+    /// Open a pairing window (host only): generate a PIN and accept one
+    /// pairing attempt. `label` is the name to record for the device that
+    /// pairs in this window. The host replies with [`EngineEvent::PairingPin`].
+    StartPairing { label: String },
+    /// Remove a paired device from the allowlist (host only), keyed by its
+    /// algorithm-tagged fingerprint (`"sha256:<hex>"`). Any live session from
+    /// that device is also dropped.
+    RevokePeer { fingerprint: String },
 }
 
 impl ShellCommand {
@@ -146,6 +164,16 @@ impl EngineEvent {
             }
             EngineEvent::Disconnected { reason } => vec![format!("disconnected: {reason}")],
             EngineEvent::Error { message } => vec![format!("error: {message}")],
+            EngineEvent::PairingPin {
+                pin,
+                expires_in_secs,
+            } => vec![format!("pairing PIN: {pin} (expires in {expires_in_secs}s)")],
+            EngineEvent::Paired { peer, label } => {
+                vec![format!("paired with {label} ({peer})")]
+            }
+            EngineEvent::PairingRequired { peer } => vec![format!(
+                "unpaired client {peer} refused; start pairing to allow it"
+            )],
         }
     }
 }
@@ -188,14 +216,63 @@ mod tests {
         assert_event_roundtrip(EngineEvent::Error {
             message: "no decoder".into(),
         });
+        assert_event_roundtrip(EngineEvent::PairingPin {
+            pin: "48271930".into(),
+            expires_in_secs: 120,
+        });
+        assert_event_roundtrip(EngineEvent::Paired {
+            peer: "127.0.0.1:5000".into(),
+            label: "Nick's laptop".into(),
+        });
+        assert_event_roundtrip(EngineEvent::PairingRequired {
+            peer: "127.0.0.1:5000".into(),
+        });
     }
 
     #[test]
     fn shell_command_roundtrips() {
-        let cmd = ShellCommand::Stop;
-        let line = serde_json::to_string(&cmd).expect("serialize");
-        let back: ShellCommand = serde_json::from_str(&line).expect("deserialize");
-        assert_eq!(cmd, back);
+        for cmd in [
+            ShellCommand::Stop,
+            ShellCommand::StartPairing {
+                label: "Nick's laptop".into(),
+            },
+            ShellCommand::RevokePeer {
+                fingerprint: "sha256:abcd".into(),
+            },
+        ] {
+            let line = serde_json::to_string(&cmd).expect("serialize");
+            let back: ShellCommand = serde_json::from_str(&line).expect("deserialize");
+            assert_eq!(cmd, back);
+        }
+    }
+
+    /// Pin the flat command tag the supervisor writes to engine stdin.
+    #[test]
+    fn start_pairing_has_flat_cmd_tag() {
+        let line = serde_json::to_string(&ShellCommand::StartPairing {
+            label: "laptop".into(),
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"cmd":"start_pairing","label":"laptop"}"#);
+        let revoke = serde_json::to_string(&ShellCommand::RevokePeer {
+            fingerprint: "sha256:abcd".into(),
+        })
+        .unwrap();
+        assert_eq!(revoke, r#"{"cmd":"revoke_peer","fingerprint":"sha256:abcd"}"#);
+    }
+
+    #[test]
+    fn from_line_parses_pairing_commands() {
+        assert_eq!(
+            ShellCommand::from_line(r#"{"cmd":"start_pairing","label":"x"}"#).unwrap(),
+            ShellCommand::StartPairing { label: "x".into() }
+        );
+        assert_eq!(
+            ShellCommand::from_line(r#"{"cmd":"revoke_peer","fingerprint":"sha256:ab"}"#).unwrap(),
+            ShellCommand::RevokePeer {
+                fingerprint: "sha256:ab".into()
+            }
+        );
     }
 
     /// The flat `event` tag is the shape the shell's TS switches on; pin

@@ -242,8 +242,10 @@ fn transport_config() -> quinn::TransportConfig {
     // host could open enough streams to pin 2 MiB of receive buffer
     // per stream (see MAX_VIDEO_STREAM_MESSAGE).
     t.max_concurrent_uni_streams(crate::MAX_CONCURRENT_UNI_STREAMS.into());
-    // Cap host→client bidi streams. The control stream the host
-    // opens at handshake is the only legitimate bidi stream.
+    // Cap host→client bidi streams. A well-behaved host opens none —
+    // both bidi streams (pairing, control) are client-initiated — so
+    // this is pure defense against a hostile host. Shares the
+    // client→host constant; see MAX_CONCURRENT_BIDI_STREAMS.
     t.max_concurrent_bidi_streams(crate::MAX_CONCURRENT_BIDI_STREAMS.into());
     t
 }

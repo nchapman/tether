@@ -67,13 +67,27 @@ pub const MAX_VIDEO_STREAM_MESSAGE: usize = 2 * 1024 * 1024;
 /// the receive-side allocations.
 pub const MAX_CONCURRENT_UNI_STREAMS: u32 = 4;
 
-/// Cap on concurrent peer-initiated bidirectional streams. Tether
-/// opens exactly one bidi stream per connection (the control stream
-/// at handshake time); a cap of 1 closes a low-grade resource-
-/// exhaustion surface where a hostile peer could open the QUIC
-/// default of 100 half-open bidi streams and pin connection-table
-/// state until the idle timeout fires.
-pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 1;
+/// Cap on concurrent peer-initiated bidirectional streams. Tether opens
+/// two client-initiated bidi streams over a connection's life: the
+/// pairing stream at connect time, then the control stream in
+/// `PendingConnection::into_connection`. The two transiently overlap —
+/// `into_connection` calls `open_bi()` for control immediately after the
+/// pairing stream's `finish()`/drop, before it has retired and freed its
+/// flow-control slot — so the cap must be at least 2 or the control
+/// `open_bi()` deadlocks waiting for a `MAX_STREAMS` credit the peer can't
+/// grant yet. 2 still closes the low-grade resource-exhaustion surface
+/// where a hostile peer could open the QUIC default of 100 half-open bidi
+/// streams and pin connection-table state until the idle timeout fires.
+pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 2;
+
+// Deadlock mechanics are on the constant's doc comment above. Guarded at
+// compile time because the only runtime coverage — the `client_pairing`
+// success-path tests — catches a regression by hanging (30 s timeout)
+// rather than failing cleanly.
+const _: () = assert!(
+    MAX_CONCURRENT_BIDI_STREAMS >= 2,
+    "bidi cap must cover the pairing + control streams (see into_connection)"
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {

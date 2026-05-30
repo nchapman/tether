@@ -169,10 +169,10 @@ fn transport_config() -> quinn::TransportConfig {
     // opened in this direction at handshake time; the cap denies a
     // hostile client the ability to open many concurrent streams.
     t.max_concurrent_uni_streams(crate::MAX_CONCURRENT_UNI_STREAMS.into());
-    // Cap client→host bidi streams. Tether opens exactly one bidi
-    // stream (the control stream at handshake time); without this
-    // a hostile client could open quinn's default 100 half-open
-    // bidi streams and pin connection-table state.
+    // Cap client→host bidi streams. The client opens two (pairing,
+    // then control) that transiently overlap during into_connection;
+    // see MAX_CONCURRENT_BIDI_STREAMS for why the cap must be ≥ 2 and
+    // how it still bounds a hostile client's stream count.
     t.max_concurrent_bidi_streams(crate::MAX_CONCURRENT_BIDI_STREAMS.into());
     t
 }

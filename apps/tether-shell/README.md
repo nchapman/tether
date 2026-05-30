@@ -64,3 +64,23 @@ on the host to drop its access (and any live session) immediately.
   `stop_engine`, `start_pairing`, `revoke_peer`, `list_peers`) + tray + exit
   cleanup.
 - `src-tauri/src/supervisor.rs` — engine spawn / stdout-reader / stop.
+
+## Linux prerequisites
+
+The shell lives in the system tray (`TrayIconBuilder` in `src-tauri/src/lib.rs`),
+so Tauri `dlopen`s the Ayatana app-indicator library at startup. If it's missing,
+`make shell` builds and launches but then panics with:
+
+```
+Failed to load ayatana-appindicator3 or appindicator3 dynamic library
+libayatana-appindicator3.so.1: cannot open shared object file: No such file or directory
+```
+
+Install the library before running the shell:
+
+- **Arch / CachyOS:** `sudo pacman -S libayatana-appindicator`
+- **Debian / Ubuntu:** `sudo apt install libayatana-appindicator3-1`
+- **Fedora:** `sudo dnf install libayatana-appindicator-gtk3`
+
+(The standard Tauri Linux prerequisites — `webkit2gtk-4.1`, `libsoup-3.0`, etc. —
+are also required; see the Tauri docs.)

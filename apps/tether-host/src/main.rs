@@ -47,6 +47,7 @@ use tether_protocol::control::{
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
+use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::MonoNanos;
 use tether_session::{
     AbrConfig, AbrController, AbrSample, AcceptError, HostSession, HostSessionConfig,
@@ -115,14 +116,26 @@ struct ClientStatsObservation {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Parse args first so `--ipc` can route tracing off stdout *before*
+    // the subscriber is installed: in IPC mode stdout is reserved for the
+    // JSON-lines protocol the shell parses, so logs go to stderr instead.
+    let (bind, use_test_pattern, ipc) = parse_args()?;
+    let reporter = Reporter::from_ipc_flag(ipc);
+
     // Both host (encoder) and client (decoder) call av_log::install(),
     // so FFmpeg messages can land on either side's hot thread. The
     // encoder is quieter in steady state but the same non-blocking
-    // rationale applies — a synchronous stdout writer would stall
-    // whichever thread libavcodec calls into.
-    let _tracing_guard = init_tracing();
+    // rationale applies — a synchronous writer would stall whichever
+    // thread libavcodec calls into.
+    let _tracing_guard = init_tracing(reporter.is_json());
 
-    let (bind, use_test_pattern) = parse_args()?;
+    // When the shell drives us, watch stdin for a `Stop` command (or EOF,
+    // i.e. the shell died) and trip a shutdown notify that both the
+    // accept loop and the in-session select race below.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    if reporter.is_json() {
+        spawn_stdin_stop_watcher(shutdown.clone());
+    }
 
     let cert_dir = persistent_cert_dir()?;
     let server = Server::bind_persistent(bind, &cert_dir).await?;
@@ -130,10 +143,14 @@ async fn main() -> anyhow::Result<()> {
     let fingerprint = server.fingerprint();
     let fp_hex = hex_encode(&fingerprint);
 
-    println!("tether-host listening on {local}");
-    println!("cert fingerprint: {fp_hex}");
-    println!("cert dir:        {} (rm to rotate)", cert_dir.display());
-    println!("client cmd:      tether-client {local} {fp_hex}");
+    reporter.emit(&EngineEvent::Listening {
+        addr: local.to_string(),
+        fingerprint: fp_hex.clone(),
+    });
+    if !reporter.is_json() {
+        // Human-only flavor with no IPC-event equivalent.
+        println!("cert dir:        {} (rm to rotate)", cert_dir.display());
+    }
 
     // Warm the SCK capture-capability cache *before* the first client
     // connects. The probe runs eight short `SCStream::start_capture`
@@ -220,6 +237,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 break;
             }
+            _ = shutdown.notified() => {
+                info!("shell stop received at main loop; shutting down");
+                break;
+            }
             accept_res = server.accept() => match accept_res {
                 Some(Ok(c)) => Arc::new(c),
                 Some(Err(e)) => {
@@ -232,7 +253,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         };
-        info!(remote = %conn.remote_address(), "client connected");
+        let peer = conn.remote_address();
+        info!(remote = %peer, "client connected");
+        reporter.emit(&EngineEvent::PeerConnected {
+            peer: peer.to_string(),
+        });
 
         let host_encode_profiles: Vec<VideoProfile> = if use_test_pattern {
             vec![VideoProfile::H264_8BIT_420]
@@ -271,10 +296,16 @@ async fn main() -> anyhow::Result<()> {
                     client_decode_profiles = ?client,
                     "no mutual video profile; session ended"
                 );
+                reporter.emit(&EngineEvent::PeerDisconnected {
+                    reason: "no mutual video profile".to_string(),
+                });
                 continue;
             }
             Err(AcceptError::Transport(e)) => {
                 warn!(error = ?e, "handshake transport error; session ended");
+                reporter.emit(&EngineEvent::PeerDisconnected {
+                    reason: format!("handshake error: {e}"),
+                });
                 continue;
             }
         };
@@ -293,10 +324,19 @@ async fn main() -> anyhow::Result<()> {
                 // `Arc<Connection>` notifies the client.
                 break;
             }
+            _ = shutdown.notified() => {
+                info!("shell stop received during session; shutting down");
+                break;
+            }
             res = handle_client(session, conn, use_test_pattern) => {
-                if let Err(e) = res {
-                    warn!(error = ?e, "session ended with error; accepting next client");
-                }
+                let reason = match res {
+                    Ok(()) => "clean".to_string(),
+                    Err(e) => {
+                        warn!(error = ?e, "session ended with error; accepting next client");
+                        e.to_string()
+                    }
+                };
+                reporter.emit(&EngineEvent::PeerDisconnected { reason });
             }
         }
     }
@@ -2953,20 +2993,64 @@ fn persistent_cert_dir() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".tether"))
 }
 
-fn parse_args() -> anyhow::Result<(SocketAddr, bool)> {
+fn parse_args() -> anyhow::Result<(SocketAddr, bool, bool)> {
     let mut bind: SocketAddr = "127.0.0.1:7654".parse().expect("static literal");
     let mut use_test_pattern = false;
+    let mut ipc = false;
     for arg in std::env::args().skip(1) {
         if arg == "--test-pattern" {
             use_test_pattern = true;
+        } else if arg == "--ipc" {
+            ipc = true;
         } else if arg == "--help" || arg == "-h" {
-            eprintln!("usage: tether-host [--test-pattern] [bind_addr]");
+            eprintln!("usage: tether-host [--test-pattern] [--ipc] [bind_addr]");
             std::process::exit(0);
         } else {
             bind = arg.parse()?;
         }
     }
-    Ok((bind, use_test_pattern))
+    Ok((bind, use_test_pattern, ipc))
+}
+
+/// In `--ipc` mode, watch stdin for shell commands. A `Stop` line, stdin
+/// EOF (the shell process died), or a read error all trip `shutdown` so
+/// no engine is ever orphaned by a crashed shell. Unrecognized lines are
+/// logged and skipped.
+fn spawn_stdin_stop_watcher(shutdown: Arc<tokio::sync::Notify>) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match tether_ipc::ShellCommand::from_line(line) {
+                        Ok(tether_ipc::ShellCommand::Stop) => {
+                            info!("shell sent stop");
+                            shutdown.notify_one();
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, line, "ignoring unrecognized stdin command");
+                        }
+                    }
+                }
+                Ok(None) => {
+                    info!("stdin closed; treating as stop");
+                    shutdown.notify_one();
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "stdin read error; treating as stop");
+                    shutdown.notify_one();
+                    return;
+                }
+            }
+        }
+    });
 }
 
 async fn pick_capture_source(
@@ -3083,10 +3167,18 @@ async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_ca
     ))
 }
 
-fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
+fn init_tracing(ipc: bool) -> tracing_appender::non_blocking::WorkerGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    // In IPC mode stdout is reserved for the JSON-lines protocol, so logs
+    // go to stderr; the standalone CLI keeps logs on stdout as before.
+    // Both branches yield the same `(NonBlocking, WorkerGuard)` type — the
+    // inner writer is erased behind `non_blocking`'s channel.
+    let (writer, guard) = if ipc {
+        tracing_appender::non_blocking(std::io::stderr())
+    } else {
+        tracing_appender::non_blocking(std::io::stdout())
+    };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(writer)

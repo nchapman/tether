@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use crossbeam_channel::bounded;
 use tether_decode::{DecodeCompletion, DecodeJob};
+use tether_ipc::{EngineEvent, Reporter};
 use tether_render::LatestFrame;
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{ControlMessage, GoodbyeCode, Viewport};
@@ -37,25 +38,44 @@ const INITIAL_HEIGHT: u32 = 720;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
+    // Parse args first so `--ipc` routes tracing off stdout (reserved for
+    // the JSON-lines protocol) before the subscriber is installed.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let ipc = raw_args.iter().any(|a| a == "--ipc");
+    let reporter = Reporter::from_ipc_flag(ipc);
+
     // `_tracing_guard` keeps the non-blocking writer's worker thread
     // alive. Dropping it flushes pending log lines and shuts the
     // worker down; binding it for the duration of `main` ensures
     // logs aren't truncated at process exit.
-    let _tracing_guard = init_tracing();
+    let _tracing_guard = init_tracing(reporter.is_json());
 
-    let mut args = std::env::args().skip(1);
-    let addr: SocketAddr = args
+    // Positional args (host addr, fingerprint hex) are everything that
+    // isn't a `--flag`.
+    let mut positional = raw_args.iter().filter(|a| !a.starts_with("--"));
+    let addr: SocketAddr = positional
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing host address argument"))?
         .parse()?;
-    let fingerprint_hex = args
+    let fingerprint_hex = positional
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing fingerprint argument"))?;
-    let fingerprint = hex_decode(&fingerprint_hex)?;
+    let fingerprint = hex_decode(fingerprint_hex)?;
+
+    reporter.emit(&EngineEvent::Connecting {
+        host: addr.to_string(),
+    });
 
     let client = Client::new()?;
-    let conn = client.connect(addr, "tether-host", fingerprint).await?;
-    let conn = Arc::new(conn);
+    let conn = match client.connect(addr, "tether-host", fingerprint).await {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            reporter.emit(&EngineEvent::Error {
+                message: format!("connect failed: {e}"),
+            });
+            return Err(e.into());
+        }
+    };
     info!(remote = %conn.remote_address(), "connected to host");
 
     // Client video decode capabilities. The probe in tether-probe does
@@ -89,11 +109,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if client_decode_profiles.is_empty() {
-        anyhow::bail!(
-            "no hardware video decoder is available on this client \
+        let message = "no hardware video decoder is available on this client \
              (no codec in PROFILE_PREFERENCE constructed). Tether requires \
              GPU decode; there is no software fallback."
-        );
+            .to_string();
+        reporter.emit(&EngineEvent::Error {
+            message: message.clone(),
+        });
+        anyhow::bail!(message);
     }
 
     // Application-layer handshake: identify ourselves, advertise our
@@ -123,13 +146,22 @@ async fn main() -> anyhow::Result<()> {
             viewport: Some(Viewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)),
         },
     )
-    .await
-    .map_err(|e| match e {
-        ConnectError::ProfileNotAdvertised { .. }
-        | ConnectError::InvalidEncodeProfile { .. }
-        | ConnectError::UnknownBitDepth(_, _) => anyhow::anyhow!("{e}"),
-        ConnectError::Transport(t) => anyhow::Error::from(t),
-    })?;
+    .await;
+    let session = match session {
+        Ok(s) => s,
+        Err(e) => {
+            let err = match e {
+                ConnectError::ProfileNotAdvertised { .. }
+                | ConnectError::InvalidEncodeProfile { .. }
+                | ConnectError::UnknownBitDepth(_, _) => anyhow::anyhow!("{e}"),
+                ConnectError::Transport(t) => anyhow::Error::from(t),
+            };
+            reporter.emit(&EngineEvent::Error {
+                message: format!("handshake failed: {err}"),
+            });
+            return Err(err);
+        }
+    };
     let ClientSession {
         channel: _,
         negotiated: negotiated_profile,
@@ -137,6 +169,14 @@ async fn main() -> anyhow::Result<()> {
         clock_sync,
         client_decode_profiles: _,
     } = session;
+
+    reporter.emit(&EngineEvent::Connected {
+        host: addr.to_string(),
+        profile: format!(
+            "{:?} {:?} {}-bit",
+            negotiated_profile.codec, negotiated_profile.chroma, negotiated_profile.bit_depth
+        ),
+    });
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -844,7 +884,28 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             info!("ctrl-c received, sending Goodbye and exiting");
+            reporter.emit(&EngineEvent::Disconnected {
+                reason: "interrupted".to_string(),
+            });
             say_goodbye(&conn, "client interrupted").await;
+            std::process::exit(0);
+        });
+    }
+
+    // When shell-driven, a `Stop` on stdin (or stdin EOF — the shell
+    // died) closes the session the same way Ctrl-C does: the render loop
+    // owns the main thread, so like the Ctrl-C handler this task sends
+    // Goodbye and exits the process directly rather than trying to unwind
+    // through winit.
+    if reporter.is_json() {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            wait_for_stdin_stop().await;
+            info!("shell stop received; sending Goodbye and exiting");
+            reporter.emit(&EngineEvent::Disconnected {
+                reason: "stopped by shell".to_string(),
+            });
+            say_goodbye(&conn, "client stopped").await;
             std::process::exit(0);
         });
     }
@@ -868,8 +929,39 @@ async fn main() -> anyhow::Result<()> {
     // Normal window-close path. Notify the host so it can tear down its
     // capture, encoder, and libei session immediately instead of waiting
     // for QUIC's idle timeout.
+    reporter.emit(&EngineEvent::Disconnected {
+        reason: "window closed".to_string(),
+    });
     say_goodbye(&conn, "client closing").await;
     Ok(())
+}
+
+/// Block until the shell sends a `Stop` command, closes our stdin (the
+/// shell process died), or stdin errors — all three mean "shut down."
+/// Mirrors the host's `spawn_stdin_stop_watcher`, but the client races it
+/// against the render loop via a direct process exit rather than a
+/// shutdown notify.
+async fn wait_for_stdin_stop() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match tether_ipc::ShellCommand::from_line(line) {
+                    Ok(tether_ipc::ShellCommand::Stop) => return,
+                    Err(e) => {
+                        warn!(error = %e, line, "ignoring unrecognized stdin command");
+                    }
+                }
+            }
+            // EOF or read error: the shell is gone — treat as stop.
+            Ok(None) | Err(_) => return,
+        }
+    }
 }
 
 /// Send a `ControlMessage::Goodbye` and close the connection. The
@@ -914,16 +1006,25 @@ async fn say_goodbye_with_code(
     conn.close(0, reason.as_bytes());
 }
 
-fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
+fn init_tracing(ipc: bool) -> tracing_appender::non_blocking::WorkerGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     // Non-blocking writer offloads formatting and the write syscall
     // to a dedicated worker thread. Critical for the client because
     // the FFmpeg log callback bridges into tracing from the decoder
     // thread (which is also the QUIC datagram recv loop's thread);
-    // a synchronous stdout writer there would stall the recv loop
-    // and the input-send task during decode-error storms.
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    // a synchronous writer there would stall the recv loop and the
+    // input-send task during decode-error storms.
+    //
+    // In IPC mode stdout is reserved for the JSON-lines protocol the
+    // shell parses, so logs go to stderr instead. Both branches yield
+    // the same `(NonBlocking, WorkerGuard)` type — `non_blocking` erases
+    // the inner writer behind its channel.
+    let (writer, guard) = if ipc {
+        tracing_appender::non_blocking(std::io::stderr())
+    } else {
+        tracing_appender::non_blocking(std::io::stdout())
+    };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(writer)

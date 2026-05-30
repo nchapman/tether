@@ -8,6 +8,7 @@ members = [
     "crates/tether-decode",
     "crates/tether-gpuconvert",
     "crates/tether-input",
+    "crates/tether-ipc",
     "crates/tether-probe",
     "crates/tether-render",
     "crates/tether-scaler",
@@ -31,6 +32,7 @@ tether-codec = { path = "crates/tether-codec" }
 tether-decode = { path = "crates/tether-decode" }
 tether-gpuconvert = { path = "crates/tether-gpuconvert" }
 tether-input = { path = "crates/tether-input" }
+tether-ipc = { path = "crates/tether-ipc" }
 tether-probe = { path = "crates/tether-probe" }
 tether-render = { path = "crates/tether-render" }
 tether-scaler = { path = "crates/tether-scaler" }
@@ -43,8 +45,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal", "io-util", "io-std"] }
 crossbeam-channel = "0.5"
 socket2 = "0.5"
 winit = "0.30"

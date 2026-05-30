@@ -3520,6 +3520,7 @@ dependencies = [
  "tether-codec",
  "tether-decode",
  "tether-input",
+ "tether-ipc",
  "tether-probe",
  "tether-protocol",
  "tether-render",
@@ -3594,6 +3595,7 @@ dependencies = [
  "tether-codec",
  "tether-gpuconvert",
  "tether-input",
+ "tether-ipc",
  "tether-probe",
  "tether-protocol",
  "tether-render",
@@ -3619,6 +3621,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "tether-ipc"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

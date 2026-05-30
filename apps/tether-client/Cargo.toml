@@ -16,6 +16,7 @@ crossbeam-channel.workspace = true
 
 tether-protocol = { workspace = true }
 tether-transport = { workspace = true }
+tether-ipc = { workspace = true }
 tether-render = { workspace = true }
 tether-input = { workspace = true }
 tether-codec = { workspace = true }

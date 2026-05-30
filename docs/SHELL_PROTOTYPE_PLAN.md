@@ -91,35 +91,40 @@ drops). Held back to honor the no-scaffolding rule — it lands when the shell's
 panel actually consumes it. The host already logs a "client stats" cadence to
 hook.
 
-### Phase 2 — Tauri shell skeleton
-5. **New app `apps/tether-shell`** (Tauri 2). Cargo crate at
-   `apps/tether-shell/src-tauri` added to the workspace `members`. Frontend:
-   **vanilla TS + Vite** (no UI framework — keep the prototype light).
-6. **Supervisor module (Rust backend).** `std::process::Command` (full control
-   over stdin/stdout, simpler than the shell plugin): spawn engine, reader task
-   parses stdout JSON-lines → `app.emit("engine-status", …)`, writer holds stdin
-   for `stop`, tracks the child handle, kills on stop + on app exit.
-7. **Tauri commands:** `start_host(opts)`, `connect_client(addr, fp)`,
-   `stop(role)`. Binary discovery: dev → `target/debug/`; bundled → Tauri
-   **sidecar/externalBin** alongside the shell exe (note for bundling, not
-   wired yet).
+### Phase 2 — Tauri shell skeleton — DONE
+5. **`apps/tether-shell`** (Tauri 2, **React + TS + Vite**, pnpm). The
+   `src-tauri` crate is **excluded** from the Cargo workspace (not a member) so
+   `cargo build --workspace` and Linux CI stay free of the webview/Tauri tree;
+   it depends on `tether-ipc` by path. node/pnpm are pinned in `mise.toml`. ✓
+6. **Supervisor module** (`src-tauri/src/supervisor.rs`). `tokio::process`:
+   spawns an engine, a reader task parses stdout JSON-lines → `EngineEvent` →
+   `app.emit("engine-status", {role, …})`; stop sends `{"cmd":"stop"}` on stdin
+   + closes it (EOF backstop) + reaps with a 3 s force-kill; `kill_all` on app
+   exit. Engine stderr inherited (logs in the dev terminal). ✓
+7. **Tauri commands:** `start_host(test_pattern)`, `connect_client(addr, fp)`,
+   `stop_engine(role)`. Binary discovery: `TETHER_ENGINE_DIR` env or the
+   workspace `target/debug` relative to the `tauri dev` CWD. Bundled sidecar
+   resolution is a follow-up. ✓
 
-### Phase 3 — Tray
-8. Tauri 2 built-in tray: menu = Show/Hide window, hosting/connection status
-   line, Quit. Tooltip/icon reflects state from `engine-status` events. Quit
-   kills supervised engines.
+### Phase 3 — Tray — DONE
+8. Tauri tray with Show/Quit menu and a "Tether" tooltip; Quit triggers
+   `RunEvent::Exit` → `kill_all`. (Live status-in-tooltip is a small
+   follow-up — the state already flows via `engine-status`.) ✓
 
-### Phase 4 — Frontend (functional only)
-9. **Host panel:** Start/Stop hosting; show listening addr + fingerprint
-   (copyable) + connected-peer status.
-10. **Client panel:** addr + fingerprint fields; Connect/Disconnect; live
-    status + stats. Subscribe to `engine-status`, render state.
+### Phase 4 — Frontend (functional) — DONE
+9. **Host panel:** test-pattern toggle, Start/Stop hosting, shows listening
+   addr + fingerprint (mono) + connected-peer status, surfaces errors. ✓
+10. **Client panel:** addr + fingerprint fields, Connect/Disconnect, live
+    connecting/connected/disconnected/error status. ✓ (Stats deferred with the
+    engine-side `Stats` event.)
 
-### Phase 5 — Loopback validation (Windows, one machine)
-11. Start host in shell → copy fingerprint → connect client in same shell →
-    native video window appears (start with `--test-pattern`, then real capture)
-    → stats flow back into the UI → Disconnect closes the window → Quit shell
-    kills both engines. Document the steps in `docs/SHELL.md`.
+### Phase 5 — Loopback validation (Windows, one machine) — NEXT
+11. Build engines (`cargo build -p tether-host -p tether-client`), run
+    `pnpm tauri dev`, Start hosting (test-pattern) → copy fingerprint → Connect
+    → native video window appears → Disconnect closes it → Quit kills both
+    engines. This is interactive (click-through in the webview); see
+    `apps/tether-shell/README.md`. The Rust + frontend both compile and the
+    shell launches with window + tray; the click-through pass is pending.
 
 ### Phase 6 — Tidy / CI note
 12. Ensure `cargo build -p tether-host -p tether-client` (with `--ipc`) and the

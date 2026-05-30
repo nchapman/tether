@@ -1,0 +1,29 @@
+[package]
+name = "tether-shell"
+version = "0.0.1"
+description = "Tether shell — control-plane UI and engine-process supervisor."
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin name; on
+# Windows a same-named lib + bin collide (rust-lang/cargo#8519).
+name = "tether_shell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `tray-icon` gates Tauri's system-tray support; the shell lives in the
+# tray, so it's required.
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Supervisor: spawn the engine binaries and read their stdout JSON-lines.
+# Tauri's async runtime is tokio, so these tasks run on its executor.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+tether-ipc = { path = "../../../crates/tether-ipc" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

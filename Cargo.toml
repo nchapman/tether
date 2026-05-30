@@ -17,6 +17,11 @@ members = [
     "apps/tether-host",
     "apps/tether-client",
 ]
+# The Tauri shell is built by its own `tauri`/`pnpm` pipeline, not
+# `cargo build --workspace`. Excluding it keeps the core workspace (and
+# Linux CI) free of the webview/Tauri dependency tree and system libs
+# (webkit2gtk etc.). It still depends on `tether-ipc` by path.
+exclude = ["apps/tether-shell/src-tauri"]
 
 [workspace.package]
 version = "0.0.1"

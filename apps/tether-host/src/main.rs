@@ -407,15 +407,17 @@ async fn main() -> anyhow::Result<()> {
             peer: peer.to_string(),
         });
 
-        // Register the live session so `RevokePeer` can tear it down. The kill
-        // notify is raced in the in-session select below; the guard clears the
-        // slot when this loop iteration ends, however it ends.
-        let session_kill = Arc::new(tokio::sync::Notify::new());
+        // Register the live session so `RevokePeer` can tear it down (by closing
+        // its connection). The guard clears the slot when this loop iteration
+        // ends, however it ends. `revoked` lets the session-end path below
+        // attribute the disconnect to a revocation rather than a clean exit.
+        let revoked = Arc::new(AtomicBool::new(false));
         let _active_guard = ActiveSessionGuard::register(
             pairing_state.active.clone(),
             ActiveSession {
                 fp,
-                kill: session_kill.clone(),
+                conn: conn.clone(),
+                revoked: revoked.clone(),
             },
         );
 
@@ -488,20 +490,18 @@ async fn main() -> anyhow::Result<()> {
                 info!("shell stop received during session; shutting down");
                 break;
             }
-            _ = session_kill.notified() => {
-                // The operator revoked this peer mid-session. Dropping the
-                // session graph (handle_client's future) closes the connection.
-                info!(remote = %peer, "peer revoked; dropping live session");
-                reporter.emit(&EngineEvent::PeerDisconnected {
-                    reason: "revoked".to_string(),
-                });
-            }
             res = handle_client(session, conn, use_test_pattern) => {
-                let reason = match res {
-                    Ok(()) => "clean".to_string(),
-                    Err(e) => {
-                        warn!(error = ?e, "session ended with error; accepting next client");
-                        e.to_string()
+                let reason = if revoked.load(Ordering::Relaxed) {
+                    // The session ended because the operator revoked this peer
+                    // (its connection was closed out from under handle_client).
+                    "revoked".to_string()
+                } else {
+                    match res {
+                        Ok(()) => "clean".to_string(),
+                        Err(e) => {
+                            warn!(error = ?e, "session ended with error; accepting next client");
+                            e.to_string()
+                        }
                     }
                 };
                 reporter.emit(&EngineEvent::PeerDisconnected { reason });

@@ -19,6 +19,7 @@
 //! arrives), not on success, so wrong guesses are not free: each open window
 //! permits exactly one pairing attempt.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -30,8 +31,7 @@ use tether_protocol::pairing::{
     PairingClientMsg, PairingConfirm, PairingResult, PairingServerMsg,
 };
 use tether_protocol::PROTOCOL_VERSION;
-use tether_transport::{CertFingerprint, PendingConnection};
-use tokio::sync::Notify;
+use tether_transport::{CertFingerprint, Connection, PendingConnection};
 use tracing::{info, warn};
 
 /// How long a pairing window stays open before it expires. Long enough for the
@@ -52,6 +52,10 @@ mod close_code {
     /// authorization decision, so it carries no auth signal.
     pub const PROTOCOL_ERROR: u32 = 4;
 }
+
+/// QUIC application close code used when revoking a live session. Advisory —
+/// the client treats any connection close as a disconnect regardless.
+const REVOKED_CLOSE_CODE: u32 = 5;
 
 /// The single on-wire refusal reason. Uniform across every refusal cause so the
 /// peer (or a passive observer) can't distinguish wrong-PIN from a detected
@@ -87,13 +91,21 @@ impl PairingWindow {
     }
 }
 
-/// The currently-connected session, tracked so `RevokePeer` can drop a live
-/// session whose fingerprint it removes from the allowlist.
+/// The currently-connected session, tracked so `RevokePeer` can tear down a
+/// live session whose fingerprint it removes from the allowlist. Holds the
+/// connection so revoke can close it directly: the encode/send work runs on a
+/// detached `std::thread` that only stops when the QUIC connection closes
+/// (`send_datagram` then errors), so *dropping* the session future is not
+/// enough — the connection must actually be closed, exactly as the session's
+/// own teardown does.
 #[derive(Clone)]
 pub struct ActiveSession {
     pub fp: CertFingerprint,
-    /// Tripped to tear the session down out-of-band (revocation).
-    pub kill: Arc<Notify>,
+    pub conn: Arc<Connection>,
+    /// Set by [`PairingState::revoke`] when it closes this session, so the
+    /// session-end path can report a "revoked" reason instead of a generic
+    /// close. Attribution only — closing the connection is what tears down.
+    pub revoked: Arc<AtomicBool>,
 }
 
 /// Shared pairing state, held by both the accept loop and the stdin command
@@ -153,12 +165,21 @@ impl PairingState {
             }
             removed
         };
-        // Drop a live session from the revoked peer, if it matches.
+        // Tear down a live session from the revoked peer, if it matches, by
+        // closing its connection. That breaks the encode/send thread out of its
+        // loop and errors the recv tasks, so the session ends through the normal
+        // path (and the client sees the disconnect). The accept loop's
+        // `ActiveSessionGuard` clears the slot when that session ends.
         if let Some(fp) = tether_pairing::parse_tagged_fingerprint(tagged_fp) {
             if let Some(active) = self.active.lock().expect("active session lock").as_ref() {
                 if active.fp == fp {
-                    info!("revoked peer has a live session; tearing it down");
-                    active.kill.notify_one();
+                    info!("revoked peer has a live session; closing it");
+                    active.revoked.store(true, Ordering::Relaxed);
+                    // `Connection::close` is a non-blocking, idempotent local
+                    // state change (no I/O, no await), so calling it under the
+                    // active-session lock is safe; a concurrent close from the
+                    // session's own teardown is harmless.
+                    active.conn.close(REVOKED_CLOSE_CODE, b"revoked");
                 }
             }
         }
@@ -446,8 +467,9 @@ const _: () = assert!(CONFIRM_LEN == 32);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    use tether_protocol::control::ControlMessage;
     use tether_transport::{Client, Server, ServerAuth};
 
     #[test]
@@ -471,26 +493,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoke_removes_peer_and_kills_matching_session() {
-        let state = test_state([9u8; 32]);
-        let fp = [4u8; 32];
+    async fn revoke_removes_peer_and_closes_matching_session() {
+        // Stand up a real session connection so we can prove revoke actually
+        // closes it (the bug this guards against: revoke removed the allowlist
+        // entry but left the live stream running).
+        let (server, client, host_pending, client_pending) = loopback().await;
+        let (host_conn, client_conn) =
+            tokio::join!(host_pending.into_connection(), client_pending.into_connection());
+        let host_conn = Arc::new(host_conn.expect("host promote"));
+        let client_conn = client_conn.expect("client promote");
+
+        let state = test_state(server.fingerprint());
+        let fp = client.fingerprint();
         state.paired.lock().unwrap().insert(&fp, "laptop".into(), 0);
-        let kill = Arc::new(Notify::new());
+        let revoked = Arc::new(AtomicBool::new(false));
         *state.active.lock().unwrap() = Some(ActiveSession {
             fp,
-            kill: kill.clone(),
+            conn: host_conn.clone(),
+            revoked: revoked.clone(),
         });
 
         let removed = state.revoke(&tether_pairing::tag_fingerprint(&fp));
 
         assert!(removed);
         assert!(!state.paired.lock().unwrap().contains(&fp));
-        // The matching live session was signalled to drop.
+        assert!(revoked.load(Ordering::Relaxed), "revoke must flag the session for attribution");
+        // The peer must observe the connection close — the live session is
+        // actually torn down, not just delisted.
+        let recv = tokio::time::timeout(Duration::from_secs(2), client_conn.recv_control()).await;
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), kill.notified())
-                .await
-                .is_ok(),
-            "revoke must notify the live session's kill"
+            matches!(recv, Ok(Err(_))),
+            "revoke must close the live session so the peer disconnects (got {recv:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_does_not_close_a_non_matching_session() {
+        // A revoke for a different fingerprint must leave the live session up.
+        let (server, client, host_pending, client_pending) = loopback().await;
+        let (host_conn, client_conn) =
+            tokio::join!(host_pending.into_connection(), client_pending.into_connection());
+        let host_conn = Arc::new(host_conn.expect("host promote"));
+        let client_conn = client_conn.expect("client promote");
+
+        let state = test_state(server.fingerprint());
+        let revoked = Arc::new(AtomicBool::new(false));
+        *state.active.lock().unwrap() = Some(ActiveSession {
+            fp: client.fingerprint(),
+            conn: host_conn.clone(),
+            revoked: revoked.clone(),
+        });
+
+        // Revoke some other (unpaired) fingerprint.
+        let _ = state.revoke(&tether_pairing::tag_fingerprint(&[0xEEu8; 32]));
+
+        assert!(!revoked.load(Ordering::Relaxed), "non-matching revoke must not flag this session");
+        // Positively prove the session is still alive: a control message sent
+        // host->client still arrives. (A flaky "recv times out" check would only
+        // prove nothing happened *fast enough*.)
+        host_conn
+            .send_control(&ControlMessage::ForceIdr)
+            .await
+            .expect("send on a live session");
+        let recv = tokio::time::timeout(Duration::from_secs(2), client_conn.recv_control()).await;
+        assert!(
+            matches!(recv, Ok(Ok(ControlMessage::ForceIdr))),
+            "non-matching revoke must leave the session usable (got {recv:?})"
         );
     }
 

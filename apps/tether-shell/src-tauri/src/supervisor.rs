@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -32,7 +33,10 @@ pub const ROLE_CLIENT: &str = "client";
 
 /// A live engine child: its stdin (to send `Stop`) and the handle (to
 /// reap / force-kill). Stdout was taken at spawn time by the reader task.
+/// `generation` distinguishes successive engines in the same role so a
+/// slow-exiting old reader can't clobber a freshly spawned replacement.
 struct EngineHandle {
+    generation: u64,
     stdin: ChildStdin,
     child: Child,
 }
@@ -42,6 +46,8 @@ struct EngineHandle {
 #[derive(Default)]
 pub struct Supervisor {
     engines: Mutex<HashMap<String, EngineHandle>>,
+    /// Monotonic id stamped on each spawn; see [`EngineHandle::generation`].
+    next_generation: AtomicU64,
 }
 
 /// `engine-status` payload: the engine's [`EngineEvent`] flattened
@@ -73,8 +79,9 @@ impl Supervisor {
         // Tear down a prior engine in this role so we never leak one.
         self.stop(role).await;
 
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let bin = engine_binary(role)?;
-        tracing::info!(?bin, role, ?args, "spawning engine");
+        tracing::info!(?bin, role, generation, ?args, "spawning engine");
 
         let mut child = Command::new(&bin)
             .args(args)
@@ -128,23 +135,41 @@ impl Supervisor {
                     Ok(None) | Err(_) => break,
                 }
             }
-            tracing::info!(role = role_owned, "engine stdout closed; engine exited");
-            let _ = app_for_reader.emit(
-                "engine-exited",
-                ExitedPayload {
-                    role: role_owned.clone(),
-                },
-            );
-            // Drop our handle so the role reads as idle again.
-            if let Some(sup) = app_for_reader.try_state::<Supervisor>() {
-                sup.engines.lock().unwrap().remove(&role_owned);
+            tracing::info!(role = role_owned, generation, "engine stdout closed; engine exited");
+            // Only retire the role if *we* are still the current engine.
+            // A replacement may have been spawned while our process was
+            // still draining its stdout; clobbering its handle (or emitting
+            // a spurious `engine-exited`) would orphan it in the UI.
+            let still_current = app_for_reader
+                .try_state::<Supervisor>()
+                .map(|sup| {
+                    let mut engines = sup.engines.lock().unwrap();
+                    if engines.get(&role_owned).map(|h| h.generation) == Some(generation) {
+                        engines.remove(&role_owned);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if still_current {
+                let _ = app_for_reader.emit(
+                    "engine-exited",
+                    ExitedPayload {
+                        role: role_owned.clone(),
+                    },
+                );
             }
         });
 
-        self.engines
-            .lock()
-            .unwrap()
-            .insert(role.to_string(), EngineHandle { stdin, child });
+        self.engines.lock().unwrap().insert(
+            role.to_string(),
+            EngineHandle {
+                generation,
+                stdin,
+                child,
+            },
+        );
         Ok(())
     }
 
@@ -156,6 +181,7 @@ impl Supervisor {
         let Some(EngineHandle {
             mut stdin,
             mut child,
+            ..
         }) = handle
         else {
             return;

@@ -54,6 +54,10 @@ function HostPanel() {
           setPeer(null);
           break;
         case "error":
+          // A host error (e.g. bind failure) means it isn't hosting; the
+          // engine exits right after, but reset now so the UI doesn't
+          // strand the "Stop hosting" button alongside the error.
+          setRunning(false);
           setError(payload.message ?? "unknown error");
           break;
       }
@@ -139,7 +143,7 @@ function ClientPanel() {
       switch (payload.event) {
         case "connecting":
           setState("connecting");
-          setDetail(`Connecting to ${payload.host ?? addr}…`);
+          setDetail(`Connecting to ${payload.host}…`);
           break;
         case "connected":
           setState("connected");
@@ -163,7 +167,9 @@ function ClientPanel() {
       unstatus.then((f) => f());
       unexit.then((f) => f());
     };
-  }, [addr]);
+    // Register once on mount: re-running on every `addr` keystroke would
+    // churn the listeners and (under StrictMode) double-fire events.
+  }, []);
 
   async function connect() {
     setDetail(null);

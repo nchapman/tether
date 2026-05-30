@@ -91,6 +91,8 @@ pub enum TransportError {
     FrameTooLarge { size: usize, max: usize },
     #[error("input stream not available on this side of the connection")]
     InputStreamWrongRole,
+    #[error("TLS keying-material exporter unavailable")]
+    ExporterUnavailable,
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

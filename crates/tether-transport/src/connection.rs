@@ -15,6 +15,7 @@ use tether_protocol::{
 use tether_protocol::MonoNanos;
 
 use crate::channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
+use crate::tls::CertFingerprint;
 use crate::{Result, TransportError, MAX_FRAMED_MESSAGE, MAX_VIDEO_STREAM_MESSAGE};
 
 /// Length of the per-stream preamble written by the client and consumed by
@@ -99,6 +100,47 @@ impl Connection {
 
     pub fn remote_address(&self) -> SocketAddr {
         self.conn.remote_address()
+    }
+
+    /// SHA-256 fingerprint of the peer's leaf certificate, or `None` if the
+    /// peer presented no cert (only possible if mutual TLS is ever relaxed).
+    /// On the host side this is the client's identity to check against the
+    /// paired-clients allowlist; on the client side it's the host's cert to
+    /// record in `known_hosts`.
+    pub fn peer_cert_fingerprint(&self) -> Option<CertFingerprint> {
+        let identity = self.conn.peer_identity()?;
+        let certs = identity
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        certs.first().map(|c| crate::tls::sha256(c.as_ref()))
+    }
+
+    /// Export `len` bytes of TLS 1.3 keying material (RFC 5705) bound to this
+    /// connection's handshake secrets. Both ends derive the *same* value for
+    /// the same `label`/`context`, and a relay terminating its own TLS to each
+    /// side derives a *different* value — which is exactly what the pairing
+    /// key-confirmation binds to, defeating a man-in-the-middle. `label` and
+    /// `context` must therefore be byte-identical on both peers.
+    ///
+    /// Returns [`TransportError::ExporterUnavailable`] if the handshake hasn't
+    /// completed, if `len` is zero, or if `len` exceeds the exporter's output
+    /// limit — never a short or empty key.
+    pub fn export_keying_material(
+        &self,
+        label: &[u8],
+        context: &[u8],
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        // A zero-length export would hand back an empty "key"; reject it up
+        // front so a caller bug can't silently produce a vacuous binding.
+        if len == 0 {
+            return Err(TransportError::ExporterUnavailable);
+        }
+        let mut out = vec![0u8; len];
+        self.conn
+            .export_keying_material(&mut out, label, context)
+            .map_err(|_| TransportError::ExporterUnavailable)?;
+        Ok(out)
     }
 
     /// Snapshot of the quinn path stats relevant to adaptive bitrate.

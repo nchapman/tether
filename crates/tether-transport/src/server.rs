@@ -9,7 +9,7 @@ use crate::{
     connection::{Connection, STREAM_PREAMBLE_LEN},
     tls::{
         ensure_crypto_provider, generate_self_signed, load_or_generate_persistent,
-        CertFingerprint, SelfSignedCert,
+        CertFingerprint, PermissiveClientCertVerifier, SelfSignedCert,
     },
     Result, TransportError,
 };
@@ -49,8 +49,18 @@ impl Server {
             fingerprint,
         } = cert;
 
-        let mut server_config = quinn::ServerConfig::with_single_cert(chain, key.into())
+        // Mutual TLS: require a client cert so the host can read the peer's
+        // fingerprint via `peer_identity()`. The verifier accepts any
+        // well-formed cert; authorization against the paired-clients allowlist
+        // happens at the app layer (default-deny). TLS 1.3 only, as quinn
+        // requires.
+        let crypto =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_client_cert_verifier(PermissiveClientCertVerifier::new())
+                .with_single_cert(chain, key.into())?;
+        let quic = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
             .map_err(|e| TransportError::Rustls(rustls::Error::General(format!("{e}"))))?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
         server_config.transport_config(Arc::new(transport_config()));
 
         let endpoint = quinn::Endpoint::server(server_config, addr)?;

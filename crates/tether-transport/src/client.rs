@@ -1,13 +1,18 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::{trace, warn};
 
 use crate::{
     connection::{Connection, STREAM_PREAMBLE},
-    tls::{ensure_crypto_provider, CertFingerprint, PinnedCertVerifier},
+    tls::{
+        ensure_crypto_provider, generate_self_signed, load_or_generate_client_identity,
+        CertFingerprint, PinnedCertVerifier, SelfSignedCert,
+    },
     Result, TransportError,
 };
 
@@ -34,11 +39,37 @@ const UDP_RECV_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct Client {
     endpoint: quinn::Endpoint,
+    /// The client's own self-signed identity, presented to the host under
+    /// mutual TLS. The host fingerprints it for the paired-clients allowlist.
+    identity: SelfSignedCert,
 }
 
 impl Client {
-    /// Create a new client endpoint bound to an OS-chosen local UDP port.
+    /// Create a new client endpoint bound to an OS-chosen local UDP port with
+    /// a fresh **ephemeral** client identity. The identity changes on every
+    /// call — fine for tests and one-shot processes. Long-running clients that
+    /// want stable pairing should use [`Self::with_identity`].
     pub fn new() -> Result<Self> {
+        let identity = generate_self_signed(vec!["tether-client".into()])?;
+        Self::with_identity_cert(identity)
+    }
+
+    /// Create a client endpoint with a **persistent** identity loaded from (or
+    /// generated into) `identity_dir` as `client_cert.der` / `client_key.der`.
+    /// Stable fingerprint across runs, so a host that paired this client once
+    /// keeps recognizing it.
+    pub fn with_identity(identity_dir: &Path) -> Result<Self> {
+        let identity = load_or_generate_client_identity(identity_dir)?;
+        Self::with_identity_cert(identity)
+    }
+
+    /// SHA-256 fingerprint of this client's certificate — the identity the
+    /// host stores in its allowlist when pairing.
+    pub fn fingerprint(&self) -> CertFingerprint {
+        self.identity.fingerprint
+    }
+
+    fn with_identity_cert(identity: SelfSignedCert) -> Result<Self> {
         ensure_crypto_provider();
         let bind: SocketAddr = "0.0.0.0:0".parse().expect("static literal");
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -77,7 +108,7 @@ impl Client {
             std_socket,
             runtime,
         )?;
-        Ok(Self { endpoint })
+        Ok(Self { endpoint, identity })
     }
 
     /// Connect to a server. `server_name` is the SNI / TLS server name —
@@ -90,7 +121,14 @@ impl Client {
         server_name: &str,
         expected_fingerprint: CertFingerprint,
     ) -> Result<Connection> {
-        let client_config = make_client_config(expected_fingerprint)?;
+        // Present our identity under mutual TLS. Rebuild the key from its DER
+        // bytes (PrivatePkcs8KeyDer isn't trivially cloneable) so `connect`
+        // can be called more than once on the same Client.
+        let client_chain = self.identity.chain.clone();
+        let client_key =
+            PrivatePkcs8KeyDer::from(self.identity.key.secret_pkcs8_der().to_vec());
+        let client_config =
+            make_client_config(expected_fingerprint, client_chain, client_key.into())?;
         let connecting = self.endpoint.connect_with(client_config, addr, server_name)?;
         let conn = connecting.await?;
         trace!(remote = %conn.remote_address(), "client connection established");
@@ -132,11 +170,19 @@ impl Client {
     }
 }
 
-fn make_client_config(fingerprint: CertFingerprint) -> Result<quinn::ClientConfig> {
-    let crypto = rustls::ClientConfig::builder()
+fn make_client_config(
+    fingerprint: CertFingerprint,
+    client_chain: Vec<CertificateDer<'static>>,
+    client_key: PrivateKeyDer<'static>,
+) -> Result<quinn::ClientConfig> {
+    // Pin TLS 1.3 explicitly (matching the server). QUIC already mandates 1.3
+    // at the protocol layer, but being explicit keeps the exporter's RFC 8446
+    // channel-binding guarantee from silently weakening if this config is ever
+    // reused over a non-QUIC transport.
+    let crypto = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .dangerous()
         .with_custom_certificate_verifier(PinnedCertVerifier::new(fingerprint))
-        .with_no_client_auth();
+        .with_client_auth_cert(client_chain, client_key)?;
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|e| TransportError::Rustls(rustls::Error::General(format!("{e}"))))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic));

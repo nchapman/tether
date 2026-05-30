@@ -8,6 +8,8 @@
 //! plane copies per frame avoid the PCIe roundtrip of the previous CPU
 //! download path.
 
+use std::sync::Arc;
+
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
@@ -87,7 +89,7 @@ pub struct D3D11Decoder {
     _hw_device: AVHWDeviceContext,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    staging: Option<PlaneStaging>,
+    staging: Option<Arc<PlaneStaging>>,
     /// When true we export decoded frames GPU-resident as a shared-handle
     /// `Frame::Gpu` (the native D3D11 renderer opens the handle on its own
     /// device — see `tether_render::d3d11`); when false we download to a
@@ -129,6 +131,37 @@ impl Drop for PlaneStaging {
             unsafe { let _ = CloseHandle(self.handle); }
         }
     }
+}
+
+// SAFETY: `PlaneStaging` owns COM (`ID3D11Texture2D`) and an NT `HANDLE`,
+// neither of which is auto-`Send`/`Sync`. Moving and sharing it is sound
+// because the texture is only ever method-called
+// (`CopySubresourceRegion`) on the decoder thread that created it; every
+// other holder (an exported frame's `ExportGuard`, parked on the renderer
+// thread) merely keeps it alive, reads the plain `handle`/`format` data,
+// or drops it — and D3D11 resource release plus `CloseHandle` are both
+// thread-agnostic. This lets the staging ride in a `GpuFrame` guard
+// across the decode→render thread boundary.
+unsafe impl Send for PlaneStaging {}
+unsafe impl Sync for PlaneStaging {}
+
+/// Guard bundled into each exported `GpuFrame`. Keeps both the decode
+/// pool surface (`AVFrame`) and the shared staging texture alive until
+/// the renderer is done with the frame.
+///
+/// The staging `Arc` is the load-bearing part: the decoder reuses one
+/// `PlaneStaging` across frames, but a rebuild (resolution/format change)
+/// or decoder teardown drops it — and `PlaneStaging::drop` closes the
+/// shared NT handle. A frame can still be parked in the renderer's
+/// single-slot `LatestFrame` at that moment, and the renderer opens the
+/// handle lazily (`OpenSharedResource1` on first import), so a closed
+/// handle would fail that import. Holding an `Arc` clone here defers the
+/// close until the last holder (decoder or this guard) drops. The handle
+/// *value* is unchanged, so the renderer's handle-keyed import cache
+/// still hits across frames that share the same staging.
+struct ExportGuard {
+    _hw_frame: AVFrame,
+    _staging: Arc<PlaneStaging>,
 }
 
 unsafe impl Send for D3D11Decoder {}
@@ -257,7 +290,8 @@ impl D3D11Decoder {
         if self.staging.as_ref().map_or(true, |s| {
             s.width != width || s.height != height || s.format != src_format
         }) {
-            self.staging = Some(Self::create_staging(&self.device, width, height, src_format)?);
+            self.staging =
+                Some(Arc::new(Self::create_staging(&self.device, width, height, src_format)?));
         }
         let staging = self.staging.as_ref().unwrap();
 
@@ -297,7 +331,10 @@ impl D3D11Decoder {
                 height,
                 format: staging.format.0 as u32,
             }),
-            hw_frame.clone(),
+            ExportGuard {
+                _hw_frame: hw_frame.clone(),
+                _staging: Arc::clone(staging),
+            },
         )))
     }
 

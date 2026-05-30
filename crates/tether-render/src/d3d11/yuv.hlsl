@@ -5,9 +5,10 @@
 // EOTF — and the same letterbox-scaled fullscreen quad. Keeping the math
 // identical is what lets a frame look the same on either backend.
 //
-// NV12 8-bit limited-range only (Windows is 4:2:0 today). The Y plane is
-// an R8 SRV (t0), the UV plane an R8G8 SRV (t1), both opened from the
-// decoder's shared NT handles. Output is **linear light**; the render
+// NV12 8-bit or P010 10-bit, limited-range (Windows is 4:2:0 today). The
+// Y plane is an R8/R16 SRV (t0), the UV plane an R8G8/R16G16 SRV (t1) —
+// the SRV format follows the bit depth — both opened from the decoder's
+// shared NT handles. Output is **linear light**; the render
 // target is a `*_SRGB` view so the hardware applies the sRGB OETF on
 // store — the exact parity with wgpu's sRGB surface write.
 

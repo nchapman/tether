@@ -683,17 +683,23 @@ impl Encoder for D3D11Encoder {
 }
 
 impl D3D11Encoder {
-    /// Flush the encoder so AMF's hardware session is idle before the
-    /// context is destroyed. Without this, AMF's async session cleanup
-    /// may cause subsequent encoder construction to fail with a
-    /// single-session-limit error.
-    pub fn shutdown(&mut self) {
-        self.encoder.flush_buffers();
-    }
-
     #[cfg(test)]
     pub fn extradata(&self) -> &[u8] {
         &self.extradata
+    }
+}
+
+impl Drop for D3D11Encoder {
+    /// Flush the encoder so the vendor's hardware session goes idle before
+    /// the `AVCodecContext` (and its borrowed D3D11VA device) is freed.
+    /// The host swaps encoders by dropping the old `Box<dyn Encoder>`
+    /// before constructing the replacement (`slot.take()` in the resize
+    /// path); without this flush, AMF's async session cleanup can leave
+    /// its single hardware session busy and fail the next encoder's
+    /// construction with a single-session-limit error. QSV/NVENC release
+    /// synchronously, so the flush is a cheap no-op for them.
+    fn drop(&mut self) {
+        self.encoder.flush_buffers();
     }
 }
 

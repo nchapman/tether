@@ -168,9 +168,11 @@ async fn main() -> anyhow::Result<()> {
     // profile, so a broken-encoder host still fails loud.
     // On Windows, pre-create the DXGI capture device BEFORE the codec
     // probe. AMF's probe activity corrupts in-process DXGI output
-    // enumeration (EnumOutputs returns 0 outputs after AMF runs).
-    // The capture device is kept separate from the encoder device —
-    // AMF destroys any D3D11 device it touches on encoder drop.
+    // enumeration (EnumOutputs returns 0 outputs after AMF runs), so the
+    // capture device must be enumerated first. That same device is later
+    // stored in `SHARED_D3D11_DEVICE` (see `real_capture`) and reused as
+    // the encoder's D3D11 device, so capture and encode share one device
+    // and the VP blit needs no cross-device texture copy.
     #[cfg(target_os = "windows")]
     if !use_test_pattern {
         match tether_capture::windows::pre_create() {
@@ -2535,14 +2537,27 @@ fn run_capture_and_send(
                 derive_bitrate_kbps(chosen_profile, encode_width, encode_height, ENCODER_FPS);
             #[cfg(target_os = "windows")]
             let encoder_result = {
-                let dev = SHARED_D3D11_DEVICE.get()
-                    .expect("SHARED_D3D11_DEVICE must be set before encoder construction");
-                let (dev_ptr, ctx_ptr) = dev.device_ptrs();
+                // Real capture stores the shared DXGI device in
+                // SHARED_D3D11_DEVICE (`real_capture`), and the encoder
+                // reuses it for a zero-copy VP blit. Test-pattern mode
+                // never runs `real_capture`, so no shared device exists —
+                // fall back to null device pointers (FFmpeg self-creates a
+                // d3d11va device, as on the probe path) and vendor 0,
+                // which selects the vendor-agnostic Media Foundation
+                // encoder. The CPU test-pattern frames take the
+                // `encode_bgra` path either way, so this stays correct.
+                let (dev_ptr, ctx_ptr, vendor_id) = match SHARED_D3D11_DEVICE.get() {
+                    Some(dev) => {
+                        let (dev_ptr, ctx_ptr) = dev.device_ptrs();
+                        (dev_ptr, ctx_ptr, dev.vendor_id)
+                    }
+                    None => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+                };
                 build_encoder_d3d11(
                     chosen_profile, encode_width, encode_height,
                     ENCODER_FPS, baseline_kbps,
                     dev_ptr, ctx_ptr,
-                    dev.vendor_id,
+                    vendor_id,
                 )
             };
             #[cfg(not(target_os = "windows"))]

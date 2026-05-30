@@ -249,16 +249,24 @@ fn probe_host() -> Vec<ProfileSupport> {
             // the driver loaded). The live encoder will fail-fast with
             // a clear error if the hardware genuinely can't encode.
             //
-            // 4:4:4 is the one exception: the D3D11 Video Processor only
-            // outputs 4:2:0 (NV12/P010), so there is no 4:4:4 encode path
-            // at all — a code-path absence, not a hardware question (cf.
-            // VAAPI H.264 4:4:4). Exclude it explicitly so negotiation
-            // never picks a profile the encoder would reject at
-            // construction and silently downsample. See `D3D11Encoder::new`.
+            // Two profiles are code-path absences (not hardware
+            // questions) that the static probe must still exclude, so
+            // negotiation never picks one the live encoder would reject at
+            // construction and then fail the session:
+            //   - AV1: `backends_for_vendor` returns no encoder for any
+            //     vendor — D3D11 AV1 encode isn't wired. Mirrors the
+            //     decoder-side AV1 rejection in `d3d11_av_codec_id`.
+            //   - 4:4:4: the D3D11 Video Processor only outputs 4:2:0
+            //     (NV12/P010), so there is no 4:4:4 encode path at all
+            //     (cf. VAAPI H.264 4:4:4). See `D3D11Encoder::new`.
             #[cfg(target_os = "windows")]
-            let encode = if profile.chroma
-                == tether_protocol::control::ChromaSubsampling::Yuv444
-            {
+            let encode = if profile.codec == tether_protocol::control::CodecKind::Av1 {
+                SupportStatus::Unsupported {
+                    stage: PipelineStage::Construct,
+                    reason: "D3D11 encode has no AV1 backend (backends_for_vendor returns none)"
+                        .into(),
+                }
+            } else if profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv444 {
                 SupportStatus::Unsupported {
                     stage: PipelineStage::Construct,
                     reason: "D3D11 Video Processor has no 4:4:4 encode path (NV12/P010 only)"
@@ -574,6 +582,34 @@ mod tests {
                 .iter()
                 .any(|s| s.profile.chroma == ChromaSubsampling::Yuv420 && s.is_encode_supported()),
             "host should still advertise at least one 4:2:0 encode profile"
+        );
+    }
+
+    /// D3D11 has no AV1 encode backend (`backends_for_vendor` returns an
+    /// empty list for `CodecKind::Av1`), so the host must never advertise
+    /// AV1 encode even though `PROFILE_PREFERENCE` lists AV1 4:2:0 —
+    /// otherwise negotiation could pick AV1 and the live encoder would
+    /// fail at construction. Mirrors the decoder-side AV1 rejection in
+    /// `d3d11_av_codec_id`. Pure logic on Windows; no GPU.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_host_never_advertises_av1_encode() {
+        use tether_protocol::control::CodecKind;
+        let profiles = host_supported_profiles();
+        let mut saw_av1 = false;
+        for s in profiles {
+            if s.profile.codec == CodecKind::Av1 {
+                saw_av1 = true;
+                assert!(
+                    !s.is_encode_supported(),
+                    "host must not advertise AV1 encode (no D3D11 AV1 backend); got: {:?}",
+                    s.profile
+                );
+            }
+        }
+        assert!(
+            saw_av1,
+            "PROFILE_PREFERENCE should surface AV1 entries for this test to be meaningful"
         );
     }
 

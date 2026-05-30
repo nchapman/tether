@@ -125,6 +125,20 @@ impl PairingState {
         pin
     }
 
+    /// Snapshot the allowlist as IPC peer entries for the shell's device list.
+    pub fn peer_list(&self) -> Vec<tether_ipc::PairedPeer> {
+        self.paired
+            .lock()
+            .expect("paired store lock")
+            .iter()
+            .map(|(fingerprint, entry)| tether_ipc::PairedPeer {
+                fingerprint: fingerprint.to_string(),
+                label: entry.label.clone(),
+                paired_at_unix: entry.paired_at_unix,
+            })
+            .collect()
+    }
+
     /// Revoke a paired peer by its tagged fingerprint (`"sha256:<hex>"`),
     /// persisting the change and tearing down any live session from that peer.
     /// Returns whether the peer was present in the allowlist.

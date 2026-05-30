@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -25,6 +25,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tether_ipc::{EngineEvent, ShellCommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Which engine a child process is. Used as the map key and echoed to the
 /// frontend so one `engine-status` listener can route both panels.
@@ -37,7 +38,10 @@ pub const ROLE_CLIENT: &str = "client";
 /// slow-exiting old reader can't clobber a freshly spawned replacement.
 struct EngineHandle {
     generation: u64,
-    stdin: ChildStdin,
+    /// Behind an `AsyncMutex` + `Arc` so [`Supervisor::send_command`] can write
+    /// a line to a *running* engine without removing its handle, while `spawn`
+    /// / `stop` still own the rest of the struct under the outer `std::Mutex`.
+    stdin: Arc<AsyncMutex<ChildStdin>>,
     child: Child,
 }
 
@@ -166,10 +170,34 @@ impl Supervisor {
             role.to_string(),
             EngineHandle {
                 generation,
-                stdin,
+                stdin: Arc::new(AsyncMutex::new(stdin)),
                 child,
             },
         );
+        Ok(())
+    }
+
+    /// Write one [`ShellCommand`] to a running engine's stdin without tearing it
+    /// down (the channel for `StartPairing` / `RevokePeer` / `ListPeers`).
+    /// Errors if no engine is running in that role or the write fails.
+    pub async fn send_command(&self, role: &str, cmd: &ShellCommand) -> Result<(), String> {
+        // Clone out the stdin handle under the brief std lock, then write under
+        // the async lock — never hold the std mutex across an await.
+        let stdin = {
+            let engines = self.engines.lock().unwrap();
+            engines.get(role).map(|h| h.stdin.clone())
+        };
+        let Some(stdin) = stdin else {
+            return Err(format!("no {role} engine is running"));
+        };
+        let line = serde_json::to_string(cmd).map_err(|e| format!("serialize command: {e}"))?;
+        let mut guard = stdin.lock().await;
+        guard
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("write to {role} stdin: {e}"))?;
+        guard.write_all(b"\n").await.map_err(|e| e.to_string())?;
+        guard.flush().await.map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -179,20 +207,24 @@ impl Supervisor {
     pub async fn stop(&self, role: &str) {
         let handle = self.engines.lock().unwrap().remove(role);
         let Some(EngineHandle {
-            mut stdin,
-            mut child,
-            ..
+            stdin, mut child, ..
         }) = handle
         else {
             return;
         };
 
         if let Ok(line) = serde_json::to_string(&ShellCommand::Stop) {
-            let _ = stdin.write_all(line.as_bytes()).await;
-            let _ = stdin.write_all(b"\n").await;
-            let _ = stdin.flush().await;
+            let mut guard = stdin.lock().await;
+            let _ = guard.write_all(line.as_bytes()).await;
+            let _ = guard.write_all(b"\n").await;
+            let _ = guard.flush().await;
         }
-        drop(stdin); // EOF: backup stop signal even if the write was lost.
+        // Dropping our handle closes ChildStdin (EOF) as a backup stop signal.
+        // The explicit `Stop` line above is the *reliable* signal; if a
+        // concurrent `send_command` still holds an Arc clone, EOF is merely
+        // delayed until that write finishes — harmless, the engine already
+        // received Stop.
+        drop(stdin);
 
         tokio::spawn(async move {
             // Give the engine a moment to exit gracefully, then make sure.

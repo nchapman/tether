@@ -57,6 +57,21 @@ pub enum EngineEvent {
     /// An unpaired client tried to connect while no pairing window was open;
     /// it was refused. The UI prompts the user to start pairing to allow it.
     PairingRequired { peer: String },
+    /// The host's current paired-clients allowlist, sent in reply to
+    /// [`ShellCommand::ListPeers`] and also pushed after a pairing or
+    /// revocation so the UI's device list stays current without polling.
+    PeerList { peers: Vec<PairedPeer> },
+}
+
+/// One entry in [`EngineEvent::PeerList`]: a paired client the host will admit.
+/// `fingerprint` is the algorithm-tagged (`"sha256:<hex>"`) identity the UI
+/// passes back to [`ShellCommand::RevokePeer`]; `label` is its display name and
+/// `paired_at_unix` is when it was paired (Unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedPeer {
+    pub fingerprint: String,
+    pub label: String,
+    pub paired_at_unix: u64,
 }
 
 /// Shell → engine, written one-per-line to the engine's stdin.
@@ -77,6 +92,9 @@ pub enum ShellCommand {
     /// algorithm-tagged fingerprint (`"sha256:<hex>"`). Any live session from
     /// that device is also dropped.
     RevokePeer { fingerprint: String },
+    /// Ask the host (host only) to report its paired-clients allowlist; it
+    /// replies with [`EngineEvent::PeerList`].
+    ListPeers,
 }
 
 impl ShellCommand {
@@ -174,6 +192,15 @@ impl EngineEvent {
             EngineEvent::PairingRequired { peer } => vec![format!(
                 "unpaired client {peer} refused; start pairing to allow it"
             )],
+            EngineEvent::PeerList { peers } => {
+                let mut lines = vec![format!("paired devices ({}):", peers.len())];
+                lines.extend(
+                    peers
+                        .iter()
+                        .map(|p| format!("  {} ({})", p.label, p.fingerprint)),
+                );
+                lines
+            }
         }
     }
 }
@@ -227,6 +254,15 @@ mod tests {
         assert_event_roundtrip(EngineEvent::PairingRequired {
             peer: "127.0.0.1:5000".into(),
         });
+        assert_event_roundtrip(EngineEvent::PeerList {
+            peers: vec![PairedPeer {
+                fingerprint: "sha256:abcd".into(),
+                label: "Nick's laptop".into(),
+                paired_at_unix: 1_700_000_000,
+            }],
+        });
+        // Empty list must round-trip too (no devices paired yet).
+        assert_event_roundtrip(EngineEvent::PeerList { peers: vec![] });
     }
 
     #[test]
@@ -239,6 +275,7 @@ mod tests {
             ShellCommand::RevokePeer {
                 fingerprint: "sha256:abcd".into(),
             },
+            ShellCommand::ListPeers,
         ] {
             let line = serde_json::to_string(&cmd).expect("serialize");
             let back: ShellCommand = serde_json::from_str(&line).expect("deserialize");
@@ -259,6 +296,25 @@ mod tests {
         })
         .unwrap();
         assert_eq!(revoke, r#"{"cmd":"revoke_peer","fingerprint":"sha256:abcd"}"#);
+        let list = serde_json::to_string(&ShellCommand::ListPeers).unwrap();
+        assert_eq!(list, r#"{"cmd":"list_peers"}"#);
+    }
+
+    /// Pin the flat `event` tag + nested peer shape the shell's TS reads.
+    #[test]
+    fn peer_list_has_flat_event_tag() {
+        let line = serde_json::to_string(&EngineEvent::PeerList {
+            peers: vec![PairedPeer {
+                fingerprint: "sha256:ab".into(),
+                label: "x".into(),
+                paired_at_unix: 7,
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            line,
+            r#"{"event":"peer_list","peers":[{"fingerprint":"sha256:ab","label":"x","paired_at_unix":7}]}"#
+        );
     }
 
     #[test]

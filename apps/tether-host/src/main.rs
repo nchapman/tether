@@ -378,6 +378,10 @@ async fn main() -> anyhow::Result<()> {
                         peer: peer.to_string(),
                         label,
                     });
+                    // Refresh the shell's device list with the new entry.
+                    reporter.emit(&EngineEvent::PeerList {
+                        peers: pairing_state.peer_list(),
+                    });
                 }
                 (Arc::new(conn), fp)
             }
@@ -3216,6 +3220,15 @@ fn spawn_stdin_command_watcher(
                         Ok(tether_ipc::ShellCommand::RevokePeer { fingerprint }) => {
                             let removed = pairing_state.revoke(&fingerprint);
                             info!(removed, "revoke peer requested");
+                            // Push the updated list so the UI reflects the removal.
+                            reporter.emit(&EngineEvent::PeerList {
+                                peers: pairing_state.peer_list(),
+                            });
+                        }
+                        Ok(tether_ipc::ShellCommand::ListPeers) => {
+                            reporter.emit(&EngineEvent::PeerList {
+                                peers: pairing_state.peer_list(),
+                            });
                         }
                         Err(e) => {
                             warn!(error = %e, line, "ignoring unrecognized stdin command");

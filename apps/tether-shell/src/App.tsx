@@ -3,6 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
+// One paired device, mirroring tether_ipc::PairedPeer.
+type PairedPeer = {
+  fingerprint: string;
+  label: string;
+  paired_at_unix: number;
+};
+
 // Mirrors tether_ipc::EngineEvent (flattened) plus the `role` the
 // supervisor tags each line with. Only the fields the UI reads are typed.
 type StatusEvent = {
@@ -14,7 +21,11 @@ type StatusEvent = {
     | "connecting"
     | "connected"
     | "disconnected"
-    | "error";
+    | "error"
+    | "pairing_pin"
+    | "paired"
+    | "pairing_required"
+    | "peer_list";
   addr?: string;
   fingerprint?: string;
   peer?: string;
@@ -22,6 +33,10 @@ type StatusEvent = {
   profile?: string;
   reason?: string;
   message?: string;
+  pin?: string;
+  expires_in_secs?: number;
+  label?: string;
+  peers?: PairedPeer[];
 };
 
 type ExitedEvent = { role: "host" | "client" };
@@ -38,6 +53,14 @@ function HostPanel() {
   const [peer, setPeer] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Pairing window: the PIN to read out and a live countdown.
+  const [newLabel, setNewLabel] = useState("");
+  const [pin, setPin] = useState<string | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState(0);
+  // A device tried to connect while no window was open.
+  const [pendingPeer, setPendingPeer] = useState<string | null>(null);
+  const [peers, setPeers] = useState<PairedPeer[]>([]);
+
   useEffect(() => {
     const unstatus = listen<StatusEvent>("engine-status", ({ payload }) => {
       if (payload.role !== "host") return;
@@ -46,12 +69,30 @@ function HostPanel() {
           setAddr(payload.addr ?? "");
           setFingerprint(payload.fingerprint ?? "");
           setError(null);
+          // Populate the paired-devices list once we're hosting. Best-effort:
+          // the host also pushes peer_list after every pair/revoke.
+          invoke("list_peers").catch((e) => console.warn("list_peers failed", e));
           break;
         case "peer_connected":
           setPeer(payload.peer ?? "a client");
           break;
         case "peer_disconnected":
           setPeer(null);
+          break;
+        case "pairing_pin":
+          setPin(payload.pin ?? null);
+          setSecondsLeft(payload.expires_in_secs ?? 0);
+          break;
+        case "paired":
+          // Window consumed; clear the PIN. A peer_list refresh follows.
+          setPin(null);
+          setPendingPeer(null);
+          break;
+        case "pairing_required":
+          setPendingPeer(payload.peer ?? "a device");
+          break;
+        case "peer_list":
+          setPeers(payload.peers ?? []);
           break;
         case "error":
           // A host error (e.g. bind failure) means it isn't hosting; the
@@ -68,12 +109,27 @@ function HostPanel() {
       setAddr("");
       setFingerprint("");
       setPeer(null);
+      setPin(null);
+      setPendingPeer(null);
+      setPeers([]);
     });
     return () => {
       unstatus.then((f) => f());
       unexit.then((f) => f());
     };
   }, []);
+
+  // Tick the PIN countdown once a second; clear the PIN when it elapses
+  // (the host closed the window on its side too).
+  useEffect(() => {
+    if (pin === null) return;
+    if (secondsLeft <= 0) {
+      setPin(null);
+      return;
+    }
+    const t = setTimeout(() => setSecondsLeft((s) => s - 1), 1000);
+    return () => clearTimeout(t);
+  }, [pin, secondsLeft]);
 
   async function start() {
     setError(null);
@@ -88,6 +144,24 @@ function HostPanel() {
   async function stop() {
     await invoke("stop_engine", { role: "host" });
     setRunning(false);
+  }
+
+  async function addDevice() {
+    setError(null);
+    try {
+      await invoke("start_pairing", { label: newLabel || "New device" });
+      setNewLabel("");
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function revoke(fp: string) {
+    try {
+      await invoke("revoke_peer", { fingerprint: fp });
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   return (
@@ -119,6 +193,51 @@ function HostPanel() {
               <dd className="mono break">{fingerprint}</dd>
             </dl>
           )}
+
+          <div className="pairing">
+            <h3>Add a device</h3>
+            {pin ? (
+              <div className="pin-box">
+                <span className="pin">{pin}</span>
+                <span className="pin-hint">
+                  Enter this PIN on the new device — expires in {secondsLeft}s
+                </span>
+              </div>
+            ) : (
+              <div className="add-device">
+                <input
+                  placeholder="Device name (e.g. my laptop)"
+                  value={newLabel}
+                  onChange={(e) => setNewLabel(e.currentTarget.value)}
+                />
+                <button onClick={addDevice}>Add a device</button>
+              </div>
+            )}
+            {pendingPeer && !pin && (
+              <p className="hint">
+                {pendingPeer} tried to connect but isn’t paired. Click “Add a
+                device”, then enter the PIN on it.
+              </p>
+            )}
+          </div>
+
+          {peers.length > 0 && (
+            <div className="devices">
+              <h3>Paired devices</h3>
+              <ul>
+                {peers.map((p) => (
+                  <li key={p.fingerprint}>
+                    <span className="device-label">{p.label}</span>
+                    <span className="mono break device-fp">{p.fingerprint}</span>
+                    <button className="link danger" onClick={() => revoke(p.fingerprint)}>
+                      Revoke
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <button className="secondary" onClick={stop}>
             Stop hosting
           </button>
@@ -131,7 +250,8 @@ function HostPanel() {
 
 function ClientPanel() {
   const [addr, setAddr] = useState("");
-  const [fingerprint, setFingerprint] = useState("");
+  const [pin, setPin] = useState("");
+  const [label, setLabel] = useState("");
   const [state, setState] = useState<
     "idle" | "connecting" | "connected" | "error"
   >("idle");
@@ -174,7 +294,13 @@ function ClientPanel() {
   async function connect() {
     setDetail(null);
     try {
-      await invoke("connect_client", { addr, fingerprint });
+      // A PIN means first-contact pairing; without one the client reconnects
+      // using the host fingerprint it pinned last time (known-hosts).
+      await invoke("connect_client", {
+        addr,
+        pin: pin.trim() || null,
+        label: label.trim() || null,
+      });
     } catch (e) {
       setState("error");
       setDetail(String(e));
@@ -202,18 +328,29 @@ function ClientPanel() {
         />
       </label>
       <label>
-        Fingerprint
+        PIN <span className="optional">(only for a new host)</span>
         <input
           className="mono"
-          placeholder="64 hex chars"
-          value={fingerprint}
+          placeholder="leave blank to reconnect"
+          value={pin}
           disabled={busy}
-          onChange={(e) => setFingerprint(e.currentTarget.value)}
+          onChange={(e) => setPin(e.currentTarget.value)}
         />
       </label>
+      {pin.trim() && (
+        <label>
+          Name for this host <span className="optional">(optional)</span>
+          <input
+            placeholder="e.g. office desktop"
+            value={label}
+            disabled={busy}
+            onChange={(e) => setLabel(e.currentTarget.value)}
+          />
+        </label>
+      )}
       {!busy ? (
-        <button onClick={connect} disabled={!addr || !fingerprint}>
-          Connect
+        <button onClick={connect} disabled={!addr}>
+          {pin.trim() ? "Pair & connect" : "Connect"}
         </button>
       ) : (
         <button className="secondary" onClick={disconnect}>

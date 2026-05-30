@@ -5,14 +5,21 @@
 
 pub mod color;
 mod cursor_overlay;
+// Render backend is platform-specialized: wgpu (Vulkan/Metal) on
+// Linux/macOS, native D3D11 on Windows (decode + present stay in one
+// API — see `d3d11`). The shared `App` event loop drives whichever
+// through the `Backend` alias below.
+#[cfg(not(target_os = "windows"))]
 mod gpu;
+#[cfg(target_os = "windows")]
+mod d3d11;
 pub mod present_policy;
 pub mod relative_mouse;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod dmabuf_test;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod iosurface_test;
 
 #[cfg(all(test, target_os = "linux"))]
@@ -32,7 +39,13 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use gpu::GpuState;
+// The active render backend. Both expose the same method surface
+// (`new`, `resize`, `apply_frame`, `render`, `dimensions`) so the `App`
+// loop is identical across platforms.
+#[cfg(not(target_os = "windows"))]
+use gpu::GpuState as Backend;
+#[cfg(target_os = "windows")]
+use d3d11::D3D11RenderState as Backend;
 
 // Re-exported so tether-input / tether-client can match on render events
 // without having to add their own winit dep at a possibly-different
@@ -50,7 +63,14 @@ pub use winit::keyboard::{KeyCode, ModifiersState};
 #[cfg(target_os = "macos")]
 pub use gpu::accepts_iosurface_fourcc;
 
+#[cfg(not(target_os = "windows"))]
 pub use gpu::supports_10bit_render;
+#[cfg(target_os = "windows")]
+pub use d3d11::supports_10bit_render;
+// Windows decode-format accept table, exported for the cross-crate
+// consistency test in tether-client (see `decode_plane_srv_formats`).
+#[cfg(target_os = "windows")]
+pub use d3d11::decode_plane_srv_formats;
 
 /// Shared cursor state for the overlay render pass. Construct one,
 /// hand a clone to the wire-receive side (call `with(|s| s.set_position(...))`
@@ -229,6 +249,11 @@ pub enum RenderError {
     /// dropped; the next decoded frame will try again.
     #[error("dma-buf import: {0}")]
     DmaBufImport(String),
+    /// A platform graphics-API call failed outside the import path —
+    /// device/swapchain creation, shader compilation, present. Used by
+    /// the Windows D3D11 backend, whose errors have no DMA-BUF analogue.
+    #[error("graphics API: {0}")]
+    GraphicsApi(String),
 }
 
 pub type Result<T> = std::result::Result<T, RenderError>;
@@ -296,7 +321,7 @@ struct App {
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
     window: Option<Arc<Window>>,
-    gpu: Option<GpuState>,
+    gpu: Option<Backend>,
     frames: LatestFrame,
     latest: Option<Frame>,
     on_event: Option<EventSink>,
@@ -434,7 +459,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let gpu = match pollster::block_on(GpuState::new(
+        let gpu = match pollster::block_on(Backend::new(
             win.clone(),
             self.color_space,
             self.chroma,
@@ -443,7 +468,7 @@ impl ApplicationHandler for App {
         )) {
             Ok(g) => g,
             Err(e) => {
-                tracing::error!(error = %e, "failed to initialise wgpu");
+                tracing::error!(error = %e, "failed to initialise render backend");
                 event_loop.exit();
                 return;
             }
@@ -704,7 +729,7 @@ fn cursor_to_video_normalized(
     if surface.0 == 0 || surface.1 == 0 || texture.0 == 0 || texture.1 == 0 {
         return None;
     }
-    let (sx, sy) = letterbox_scale_for_cursor(texture, surface);
+    let (sx, sy) = letterbox_scale(texture, surface);
     let sw = f64::from(surface.0);
     let sh = f64::from(surface.1);
     let (sx, sy) = (f64::from(sx), f64::from(sy));
@@ -721,11 +746,14 @@ fn cursor_to_video_normalized(
     Some((nx as f32, ny as f32))
 }
 
-/// Local copy of `gpu::letterbox_scale` — the GPU module's version is
-/// private and we don't want to widen its visibility just for the cursor
-/// math. If these ever drift, the cursor will land in the wrong place.
+/// Aspect-preserving letterbox / pillarbox scale: the `(x, y)` NDC scale
+/// that fits a `src`-sized image inside a `dst`-sized surface centered,
+/// shrinking one axis by `min_aspect / max_aspect`. Shared by the cursor
+/// mapping above and the Windows D3D11 backend's vertex scale so the two
+/// can't drift; the wgpu backend keeps its own private copy (it's cfg'd
+/// out on Windows, and widening its visibility buys nothing there).
 #[allow(clippy::cast_precision_loss)]
-fn letterbox_scale_for_cursor(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
+pub(crate) fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
     let src_aspect = src.0 as f32 / src.1 as f32;
     let dst_aspect = dst.0 as f32 / dst.1 as f32;
     if (src_aspect - dst_aspect).abs() < f32::EPSILON {

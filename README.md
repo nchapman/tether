@@ -4,13 +4,18 @@ Low-latency, open-source remote desktop in Rust. Inspired by
 [Parsec](https://parsec.app/), [Moonlight](https://moonlight-stream.org/),
 and [Sunshine](https://github.com/LizardByte/Sunshine).
 
-**Status:** pre-MVP. Linux host → Linux client works end-to-end over QUIC
-with VAAPI hardware encode, PipeWire DMA-BUF capture, and wgpu present.
-macOS host (ScreenCaptureKit capture + VideoToolbox encode + CGEvent
-input injection) compiles and the encoder round-trips on Apple Silicon;
-end-to-end LAN streaming to a Linux client is the next demo milestone.
-macOS client (VideoToolbox decode + Metal render) and the audio pipeline
-follow after that.
+**Status:** pre-MVP, three platforms wired end-to-end over QUIC:
+
+- **Linux** host → client — VAAPI hardware encode, PipeWire DMA-BUF
+  capture, wgpu present (the most-exercised path; negotiates up to
+  HEVC Main 4:4:4 10-bit).
+- **macOS** host and client — ScreenCaptureKit capture + VideoToolbox
+  encode + CGEvent input; VideoToolbox decode + Metal render.
+- **Windows** host and client — DXGI Desktop Duplication capture +
+  vendor-selected D3D11 encode (QSV / AMF / NVENC, Media Foundation
+  fallback) + D3D11VA decode; loopback-verified, 4:2:0 only.
+
+The audio pipeline is deferred on all platforms.
 
 ## Layout
 

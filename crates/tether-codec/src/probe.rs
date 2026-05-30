@@ -24,7 +24,10 @@
 
 use crate::{CodecError, Decoder, Encoder, Result};
 #[cfg_attr(target_os = "macos", allow(unused_imports))]
-use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+use tether_protocol::control::{CodecKind, VideoProfile};
+// Only the Linux `no_hw_encoder` VAAPI-profile hint matches on chroma.
+#[cfg(target_os = "linux")]
+use tether_protocol::control::ChromaSubsampling;
 
 /// Verify that a host's chosen `VideoProfile` is one this client
 /// actually advertised it could decode. Returns `Ok(())` if `chosen`
@@ -103,10 +106,55 @@ pub fn build_encoder(
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        build_encoder_d3d11(profile, width, height, fps, bitrate_kbps, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (profile, width, height, fps, bitrate_kbps);
         Err(no_hw_encoder_for_platform())
+    }
+}
+
+/// Windows-specific encoder construction that accepts a shared D3D11
+/// device from the capture layer. When `device_ptr` is non-null, the
+/// encoder reuses the capture device (zero-copy texture sharing);
+/// when null, FFmpeg creates its own device (probe path, or fallback).
+#[cfg(target_os = "windows")]
+pub fn build_encoder_d3d11(
+    profile: VideoProfile,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    device_ptr: *mut std::ffi::c_void,
+    device_ctx_ptr: *mut std::ffi::c_void,
+    vendor_id: u32,
+) -> Result<(VideoProfile, Box<dyn Encoder>)> {
+    match crate::d3d11::D3D11Encoder::new(
+        profile,
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+        device_ptr,
+        device_ctx_ptr,
+        vendor_id,
+    ) {
+        Ok(enc) => Ok((profile, Box::new(enc))),
+        Err(e) => {
+            tracing::warn!(
+                backend = "d3d11",
+                codec = ?profile.codec,
+                chroma = ?profile.chroma,
+                bit_depth = profile.bit_depth,
+                error = %e,
+                "D3D11 encoder construction failed"
+            );
+            Err(no_hw_encoder_d3d11(profile.codec, e))
+        }
     }
 }
 
@@ -118,9 +166,14 @@ pub fn build_encoder(
 /// doesn't need them at construction. Future chroma-aware decoder
 /// backends won't require a signature change.
 ///
+/// `gpu_export` is the renderer's zero-copy import capability, consumed
+/// only by the Windows D3D11 decoder (other backends always export
+/// GPU-resident frames). See [`crate::d3d11::D3D11Decoder::new`].
+///
 /// Errors if no GPU decoder is available for `profile.codec` on this
 /// client.
-pub fn build_decoder(profile: VideoProfile) -> Result<Box<dyn Decoder>> {
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+pub fn build_decoder(profile: VideoProfile, gpu_export: bool) -> Result<Box<dyn Decoder>> {
     let kind = profile.codec;
     #[cfg(target_os = "linux")]
     {
@@ -158,7 +211,25 @@ pub fn build_decoder(profile: VideoProfile) -> Result<Box<dyn Decoder>> {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        match crate::d3d11::D3D11Decoder::new(kind, gpu_export) {
+            Ok(dec) => return Ok(Box::new(dec)),
+            Err(e) => {
+                tracing::error!(
+                    backend = "d3d11va",
+                    codec = ?kind,
+                    chroma = ?profile.chroma,
+                    bit_depth = profile.bit_depth,
+                    error = %e,
+                    "D3D11VA decoder construction failed"
+                );
+                return Err(no_hw_decoder_d3d11(kind, e));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = profile;
         Err(no_hw_decoder_for_platform())
@@ -214,22 +285,42 @@ fn no_hw_decoder_vt(kind: CodecKind, source: CodecError) -> CodecError {
     ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn no_hw_encoder_d3d11(kind: CodecKind, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "D3D11 encoder unavailable for {kind:?} ({source}). \
+         Check that FFmpeg was built with Media Foundation, QSV, NVENC, or AMF support \
+         (`ffmpeg -encoders | grep -E 'mf|nvenc|amf|qsv'`). \
+         Tether requires GPU encode — there is no software fallback."
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn no_hw_encoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
-        "Tether currently supports hardware encode on Linux (VAAPI) and \
-         macOS (VideoToolbox). Windows/NVENC and Windows/AMF backends are \
-         not yet implemented."
+        "Tether currently supports hardware encode on Linux (VAAPI), \
+         macOS (VideoToolbox), and Windows (D3D11VA). No backend is \
+         available for this platform."
             .to_string(),
     )
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn no_hw_decoder_d3d11(kind: CodecKind, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "D3D11VA decoder unavailable for {kind:?} ({source}). \
+         Check that FFmpeg was built with d3d11va support \
+         (`ffmpeg -hwaccels | grep d3d11va`). \
+         Tether requires GPU decode — there is no software fallback."
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn no_hw_decoder_for_platform() -> CodecError {
     CodecError::NoHardwareCodec(
-        "Tether currently supports hardware decode on Linux (VAAPI) and \
-         macOS (VideoToolbox). Windows/NVDEC and Windows/D3D11VA backends \
-         are not yet implemented."
+        "Tether currently supports hardware decode on Linux (VAAPI), \
+         macOS (VideoToolbox), and Windows (D3D11VA). No backend is \
+         available for this platform."
             .to_string(),
     )
 }

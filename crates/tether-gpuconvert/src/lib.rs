@@ -28,6 +28,16 @@
 //! - This crate's surface is one wgpu device + one compute pipeline.
 //!   Small, focused, easy to test in isolation.
 
+// Host-side GPU conversion is a Linux + macOS concern: the Windows host
+// converts BGRA→NV12/P010 with `ID3D11VideoProcessor` inside
+// `tether-codec` instead and never links this crate (its `wgpu`
+// dependency is declared only for Linux/macOS targets). The crate is a
+// workspace member, so `cargo build --workspace` on Windows still
+// compiles it — gate the whole crate to Linux/macOS so it resolves to an
+// empty rlib on Windows rather than failing on the unconditional `wgpu`
+// references in the conversion path below.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+
 #[cfg(target_os = "linux")]
 pub mod bgra_to_p010_dmabuf;
 #[cfg(target_os = "linux")]

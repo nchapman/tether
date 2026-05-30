@@ -449,6 +449,7 @@ impl GpuState {
         // If the adapter doesn't advertise it (lavapipe, very old
         // Mesa, missing VK_EXT_image_drm_format_modifier), fail loudly
         // here rather than silently dropping every frame later.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let info = adapter.get_info();
         let adapter_features = adapter.features();
         #[cfg(target_os = "linux")]
@@ -1191,11 +1192,10 @@ impl GpuState {
         Ok(())
     }
 
+    // Windows renders natively in D3D11 (`crate::d3d11`), not through this
+    // wgpu backend, so there is no Windows `apply_gpu` here.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn apply_gpu(&mut self, _frame: GpuFrame) -> Result<()> {
-        // GpuFrameSource has no variants off-Linux/macOS, so a GpuFrame
-        // is type-level uninhabitable here; this stub exists to keep
-        // the match in `apply_frame` exhaustive across cfgs.
         unreachable!("GpuFrame cannot be constructed on this platform")
     }
 

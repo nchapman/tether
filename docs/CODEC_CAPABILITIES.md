@@ -36,14 +36,15 @@ limits:
 ```
 HOST                                      CLIENT
 ─────────────────────────────────         ─────────────────────────────
-1. Capture (SCK / PipeWire)               5. Decoder (VT / VAAPI)
+1. Capture (SCK / PipeWire / DXGI)        5. Decoder (VT / VAAPI / D3D11VA)
    → what the OS lets us scrape              → what the GPU lets us decode
                                               and what fourcc it emits
-2. GPU convert (wgpu compute)
-   → what shader formats we support       6. Renderer import (wgpu HAL)
-                                              → what texture formats can
-3. Encoder (VAAPI / VT)                      come in via dma-buf or
-   → what the silicon + driver               IOSurface
+2. GPU convert (wgpu compute,
+   ID3D11VideoProcessor on Windows)       6. Renderer import (wgpu HAL)
+   → what shader formats we support          → what texture formats can
+                                              come in via dma-buf or
+3. Encoder (VAAPI / VT / D3D11)              IOSurface
+   → what the silicon + driver
    + FFmpeg wrapper accept
                                           7. Sampler / shader
 4. Wire (negotiated profile)                  → numeric range correctness
@@ -473,6 +474,154 @@ for the hardware test that gates it on RADV/NVK.
 
 ---
 
+## Layer 2 (Windows) — DXGI Desktop Duplication (capture)
+
+`IDXGIOutputDuplication` hands us the composited desktop as a single
+`ID3D11Texture2D`. We `CopyResource` it into a pool of owned
+`DXGI_FORMAT_B8G8R8A8_UNORM` textures (so `ReleaseFrame` can be called
+promptly) and pass the pool texture to the encoder on the **same**
+shared `ID3D11Device`. Capture is therefore always **BGRA 8-bit** —
+the same 4:4:4 RGB starting point as macOS's `BGRA`.
+
+### What's hard-limited
+
+- **BGRA 8-bit only.** Desktop Duplication delivers SDR desktops as
+  B8G8R8A8. (HDR duplication via `R16G16B16A16_FLOAT` exists but we
+  don't capture it — there is no HDR encode path on Windows yet.)
+  Chroma/bit-depth is decided entirely at the encode layer below.
+
+### What's probed
+
+- Nothing format-wise — BGRA is unconditional. The one thing read from
+  the capture device is the DXGI adapter's **PCI vendor ID**
+  (`GetDesc1().VendorId`), which selects the encoder backend (below).
+
+### Capture→encode handoff (not a capability, but load-bearing)
+
+The capture thread and the encode loop run on separate threads sharing
+one D3D11 immediate context. The handoff is a single-slot **drop-oldest**
+mailbox plus a texture-pool free-list with an ownership handshake: a pool
+slot is reused only once the frame's `release_guard` (`SlotReturn`) drops,
+so the capture thread never overwrites a texture the encoder's Video
+Processor is still sampling. Because both sides share one immediate
+context, GPU commands execute in submission order and the channel's
+happens-before edge orders the `CopyResource` ahead of the blit — no GPU
+fence/keyed-mutex needed (Apollo needs a keyed mutex only because it uses
+separate devices per component). This closed an earlier progressive-
+corruption regression; see `tether-capture/src/windows.rs`.
+
+---
+
+## Layer 3 (Windows) — D3D11 encode (host)
+
+The host converts the captured BGRA texture to NV12 (8-bit) or P010
+(10-bit) with the fixed-function `ID3D11VideoProcessor`, then feeds it to
+an FFmpeg hardware encoder selected by GPU vendor in
+`backends_for_vendor(codec, vendor_id)`:
+
+| Vendor (PCI ID)   | HEVC chain              | H.264 chain             |
+| ----------------- | ----------------------- | ----------------------- |
+| Intel (`0x8086`)  | `hevc_qsv` → `hevc_mf`  | `h264_qsv` → `h264_mf`  |
+| AMD (`0x1002`)    | `hevc_amf` → `hevc_mf`  | `h264_amf` → `h264_mf`  |
+| NVIDIA (`0x10de`) | `hevc_nvenc` → `hevc_mf`| `h264_nvenc` → `h264_mf`|
+| unknown           | `hevc_mf` **only**      | `h264_mf` **only**      |
+
+Unknown-vendor is MF-only on purpose: speculatively constructing a
+foreign vendor's encoder (e.g. `hevc_amf` on an Intel GPU) faults inside
+that vendor's runtime (`STATUS_ACCESS_VIOLATION`), not a recoverable
+error. Media Foundation is the vendor-agnostic encoder and works on any
+D3D11 GPU. (Production always passes a real `vendor_id` from DXGI, so the
+live path only ever falls back to MF.)
+
+### What's hard-limited
+
+- **No 4:4:4.** The Video Processor's BGRA→YUV blit only produces 4:2:0
+  surfaces (NV12 / P010). `D3D11Encoder::new` rejects 4:4:4 at
+  construction, and the Windows host probe excludes it from the
+  advertised set, so negotiation never picks a profile we'd silently
+  downsample. A real 4:4:4 path needs custom HLSL conversion shaders
+  (AYUV / Y410, as in Apollo) — not wired. This mirrors the macOS-encode
+  4:4:4 gap exactly.
+- **QSV hw_frames pool size = 1.** The Intel D3D11 driver rejects
+  multi-slice NV12 texture arrays (`DXGI_ERROR_INVALID_CALL`), so the QSV
+  path allocates one surface and reuses it every frame (`av_hwframe_map`,
+  Apollo's pattern; `async_depth=1` keeps it synchronous).
+- **QSV `low_power` / `low_delay_brc` are off.** Both put the media
+  driver into a mode that demands an explicit per-frame
+  `mfxEncodeCtrl.FrameType`, which our `pict_type`-only path doesn't
+  supply — every frame is rejected `Invalid FrameType:0`
+  (`AVERROR_INVALIDDATA`). They gave no measured latency win either (the
+  real cost is GPU contention, below). Verified by
+  `d3d11_qsv_gpu_encode_decode_roundtrip`.
+- **AV1: not wired** (`backends_for_vendor` returns empty).
+
+### Low-latency option set (per backend)
+
+B-frames are off everywhere (`max_b_frames=0`, no reorder delay). Beyond
+that, grounded in `ffmpeg -h encoder=…` on the linked build:
+
+- **QSV**: `forced_idr=1`, `async_depth=1` (default would be 4).
+- **AMF**: `usage=ultralowlatency`, `quality=speed`, `latency=1`,
+  **`async_depth=1`** (amfenc defaults this to **16** — "higher values
+  increase output latency"; this was a real latency bug), `forced_idr=1`,
+  `gops_per_idr=1`.
+- **NVENC**: **`delay=0`** (default is `INT_MAX`), `zerolatency=1`,
+  `tune=ull`, `rc=cbr`, `surfaces=1`, `forced-idr=1`.
+- **MF**: `hw_encoding=1`.
+
+### What's probed
+
+Unlike VAAPI/VideoToolbox, the Windows host does **not** run a
+destructive per-profile encode probe: AMF has a single-session limit and
+doesn't reliably release sessions on drop, so probing N profiles would
+exhaust it for the live encoder. Instead `probe_host()` reports every
+4:2:0 profile (H.264, HEVC Main, HEVC Main10) as supported and excludes
+4:4:4; the live encoder fail-fasts with a clear error if the hardware
+genuinely can't encode the negotiated profile. The QSV/AMF/NVENC GPU
+round-trip *is* covered by hardware tests
+(`d3d11_{qsv,amf,nvenc}_gpu_encode_decode_roundtrip`), each gated on the
+present GPU vendor so it asserts on matching hardware and SKIPs elsewhere.
+
+### Latency note (loopback)
+
+A measured single-iGPU loopback session (host encode + client
+decode/render/present on the same GPU) shows the encode stage dominating
+at ~85–128 ms `avg_encode_ms`, while capture handoff (~30–50 ms), wire
+send (~0.1 ms), and client decode (~4–8 ms) are all minor. This is GPU-
+queue contention, not an encoder-config problem (isolated QSV encode is
+~5 ms): `receive_packet`'s blocking MFX `SyncOperation` waits behind the
+client's GPU work on the shared chip. The decisive next step is a
+two-machine test, where the encode stage is expected to collapse. A
+native oneVPL / NvEncodeAPI path is the lever if it doesn't.
+
+---
+
+## Layer 5 (Windows) — D3D11VA decode (client)
+
+`D3D11Decoder` decodes H.264 / HEVC via D3D11VA and exports each decoded
+surface **GPU-resident**: it `CopySubresourceRegion`s both planes of the
+decode pool slice into a single `MISC_SHARED` biplanar staging texture
+and hands the renderer a shared NT handle (`Frame::Gpu`). The format
+follows the decode surface — `DXGI_FORMAT_NV12` for 4:2:0 8-bit,
+`DXGI_FORMAT_P010` for 4:2:0 10-bit (Main10) — and is carried in
+`D3D11DecodedTexture::format` so the native D3D11 renderer
+(`tether_render::d3d11`) opens the matching per-plane SRVs (R8 + R8G8 for
+NV12, R16 + R16G16 for P010) on its own device. There is no wgpu/Vulkan
+bridge. The `download_frame_cpu` path remains only as an 8-bit NV12
+fallback for the null-decode-texture anomaly.
+
+Decode matches the encode side: 4:2:0 (NV12 / P010), no 4:4:4. The client
+decode probe (`tether-probe/src/host/d3d11.rs`) routes through this GPU
+export path, so a Main10 fixture decodes to P010 and comes back as
+`Frame::Gpu` — confirming the full chain per profile. The renderer's
+`supports_10bit_render` probes D3D11 P010 texture support to gate the
+10-bit decode advert (R16/R16G16 plane sampling is an FL11.0 baseline, so
+P010 texture support is the only real variable). Both 8-bit and 10-bit
+are exercised end-to-end by `d3d11_coord_fixture_decode_render_roundtrip_8bit`
+/ `_10bit` in `tether-render/src/d3d11/mod.rs`.
+
+---
+
 ## Layer 5 — VideoToolbox decode (macOS client)
 
 The Apple Silicon HEVC decoder block is *much* more capable than
@@ -649,6 +798,8 @@ previous three-cache scaffolding.
 | macOS M-series | Linux  | HEVC 4:2:0 10-bit (Main10)       | SCK delivers `'x420'` → VT encodes P010 → client decodes via VAAPI |
 | macOS M-series | macOS  | HEVC 4:2:0 10-bit (Main10)       | Same encode side; client decodes back to `'x420'` IOSurface |
 | Linux      | macOS      | HEVC 4:4:4 8-bit                 | VT client decodes 4:4:4 via NV24 even though encode side is 4:2:0-only |
+| Windows    | Windows    | HEVC 4:2:0 (Main10 / Main)       | Vendor-selected encode (QSV/AMF/NVENC, MF fallback) → D3D11VA decode; loopback-verified. **4:2:0 only — 4:4:4 excluded** (no VP path). Encode profiles are advertised without a per-profile probe (AMF single-session limit), so a 10-bit pick relies on the live encoder, not a warm-time round-trip. |
+| Windows    | any        | HEVC 4:2:0 or H.264              | Host advertises H.264 + HEVC Main + Main10; intersection with the client's decode set picks the best 4:2:0 rung. |
 | any        | legacy 8-bit only | H.264 4:2:0 8-bit         | Universal floor; legacy client without decode-profiles extension |
 
 HEVC 4:2:2 8/10-bit is *not* yet in the matrix — it requires

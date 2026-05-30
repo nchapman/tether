@@ -104,10 +104,11 @@ async fn pframes_flow_through_full_chain_to_latest_frame() {
     let (mut worker, frames, idr_calls) = make_worker_with(outcomes);
 
     let mut render_drops_total = 0u32;
-    for body in bodies_in {
+    for (i, body) in bodies_in.into_iter().enumerate() {
         let job = tether_decode::DecodeJob {
             body,
             host_in_client_clock: MonoNanos::now(),
+            keyframe: i == 0,
         };
         let c = worker.process_job(job, MonoNanos::now());
         assert!(!c.decode_err);
@@ -154,6 +155,7 @@ async fn render_drops_accounting_is_exact() {
         let job = tether_decode::DecodeJob {
             body: Bytes::from(vec![0u8; 32]),
             host_in_client_clock: MonoNanos::now(),
+            keyframe: i == 0,
         };
         let c = worker.process_job(job, MonoNanos::now());
         produced += 1;

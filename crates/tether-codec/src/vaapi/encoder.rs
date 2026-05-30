@@ -472,7 +472,7 @@ impl VaapiEncoder {
         // h264_vaapi/hevc_vaapi at Main this is the Annex-B SPS/PPS
         // (HEVC also includes VPS). See `encoder_common` for why we
         // do this.
-        let extradata = snapshot_extradata(&encoder, vaapi_codec_name(kind))?;
+        let extradata = snapshot_extradata(&encoder, vaapi_codec_name(kind), kind)?;
 
         Ok(Self {
             kind,

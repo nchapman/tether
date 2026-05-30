@@ -51,10 +51,10 @@ use std::sync::OnceLock;
 
 use tether_protocol::control::VideoProfile;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod host;
 mod preference;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod profile_probe;
 
 pub use preference::{pick_supported_profile, PROFILE_PREFERENCE};
@@ -209,15 +209,73 @@ pub fn client_decode_profiles() -> Vec<VideoProfile> {
 /// [`profile_probe::ProbeError`] carries the [`PipelineStage`] tag
 /// for each rejection, so a log dump names exactly which stage
 /// rejected each profile.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn probe_host() -> Vec<ProfileSupport> {
+    // Windows reports host encode/decode support statically (see the
+    // per-branch comments below), so it never touches the live probe
+    // backend or fixtures.
+    #[cfg(not(target_os = "windows"))]
     use host::ActiveProbe;
+    #[cfg(not(target_os = "windows"))]
     use profile_probe::{fixture_for, ProfileProbe};
 
-    PROFILE_PREFERENCE
+    // On Windows/AMF, the encoder has a single-session limit and releases
+    // asynchronously on drop. Probe H.264 first so the floor codec always
+    // gets a fresh session; higher profiles can fail without breaking
+    // negotiation. Probe order doesn't affect negotiation priority (that's
+    // PROFILE_PREFERENCE in pick_supported_profile).
+    #[cfg(target_os = "windows")]
+    let probe_order = {
+        let mut order: Vec<_> = PROFILE_PREFERENCE.to_vec();
+        // Move H.264 to front.
+        if let Some(pos) = order.iter().position(|p| p.codec == tether_protocol::control::CodecKind::H264) {
+            let h264 = order.remove(pos);
+            order.insert(0, h264);
+        }
+        order
+    };
+    #[cfg(not(target_os = "windows"))]
+    let probe_order = PROFILE_PREFERENCE.to_vec();
+
+    probe_order
         .iter()
         .copied()
         .map(|profile| {
+            // On Windows/AMF, the deep encode probe is destructive: AMF
+            // has a single-session limit and doesn't reliably release
+            // sessions on drop, so probing N profiles exhausts AMF for
+            // the live encoder. Skip the encode probe and report
+            // H.264/HEVC as supported (AMF hardware is known-good if
+            // the driver loaded). The live encoder will fail-fast with
+            // a clear error if the hardware genuinely can't encode.
+            //
+            // Two profiles are code-path absences (not hardware
+            // questions) that the static probe must still exclude, so
+            // negotiation never picks one the live encoder would reject at
+            // construction and then fail the session:
+            //   - AV1: `backends_for_vendor` returns no encoder for any
+            //     vendor — D3D11 AV1 encode isn't wired. Mirrors the
+            //     decoder-side AV1 rejection in `d3d11_av_codec_id`.
+            //   - 4:4:4: the D3D11 Video Processor only outputs 4:2:0
+            //     (NV12/P010), so there is no 4:4:4 encode path at all
+            //     (cf. VAAPI H.264 4:4:4). See `D3D11Encoder::new`.
+            #[cfg(target_os = "windows")]
+            let encode = if profile.codec == tether_protocol::control::CodecKind::Av1 {
+                SupportStatus::Unsupported {
+                    stage: PipelineStage::Construct,
+                    reason: "D3D11 encode has no AV1 backend (backends_for_vendor returns none)"
+                        .into(),
+                }
+            } else if profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv444 {
+                SupportStatus::Unsupported {
+                    stage: PipelineStage::Construct,
+                    reason: "D3D11 Video Processor has no 4:4:4 encode path (NV12/P010 only)"
+                        .into(),
+                }
+            } else {
+                SupportStatus::Supported
+            };
+            #[cfg(not(target_os = "windows"))]
             let encode = match ActiveProbe::probe_encode(profile) {
                 Ok(()) => SupportStatus::Supported,
                 Err(e) => {
@@ -233,6 +291,14 @@ fn probe_host() -> Vec<ProfileSupport> {
                     }
                 }
             };
+            // On Windows, skip the decode probe on the host side.
+            // Creating multiple D3D11VA decoder contexts triggers
+            // DXGI_ERROR_DEVICE_REMOVED on the pre-created capture
+            // device (AMD RDNA 4 driver bug). The client runs its own
+            // decode probe independently.
+            #[cfg(target_os = "windows")]
+            let decode = SupportStatus::Supported;
+            #[cfg(not(target_os = "windows"))]
             let decode = match fixture_for(profile) {
                 Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
                     Ok(()) => SupportStatus::Supported,
@@ -266,7 +332,7 @@ fn probe_host() -> Vec<ProfileSupport> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn probe_host() -> Vec<ProfileSupport> {
     PROFILE_PREFERENCE
         .iter()
@@ -292,7 +358,7 @@ fn probe_host() -> Vec<ProfileSupport> {
 /// decode half of the trait per profile, and report encode as
 /// `Unsupported{Construct, "client-side encode not probed"}` — callers
 /// asking the client about encode are asking the wrong question.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn probe_client() -> Vec<ProfileSupport> {
     use host::ActiveProbe;
     use profile_probe::{fixture_for, ProfileProbe};
@@ -304,10 +370,18 @@ fn probe_client() -> Vec<ProfileSupport> {
             let decode = match fixture_for(profile) {
                 Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
                     Ok(()) => SupportStatus::Supported,
-                    Err(e) => SupportStatus::Unsupported {
-                        stage: e.stage,
-                        reason: e.reason,
-                    },
+                    Err(e) => {
+                        tracing::debug!(
+                            ?profile,
+                            stage = ?e.stage,
+                            reason = %e.reason,
+                            "client decode probe rejected profile"
+                        );
+                        SupportStatus::Unsupported {
+                            stage: e.stage,
+                            reason: e.reason,
+                        }
+                    }
                 },
                 None => SupportStatus::Unsupported {
                     stage: PipelineStage::Decode,
@@ -329,14 +403,8 @@ fn probe_client() -> Vec<ProfileSupport> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn probe_client() -> Vec<ProfileSupport> {
-    // Independent of the platform stub for `probe_host` — the Mac
-    // 4:4:4 invariant says encode bits must not be inherited from the
-    // host probe. The two stubs happen to return the same shape today,
-    // but expressing them independently makes the contract
-    // self-documenting and immune to a future hypothetical-platform
-    // backend that grew encode capability without growing decode.
     PROFILE_PREFERENCE
         .iter()
         .copied()
@@ -438,12 +506,6 @@ mod tests {
     /// asymmetry as an explicit invariant.
     #[test]
     fn probe_client_does_not_mirror_encode_bit_into_decode_field() {
-        // Drive the real cached probe — we can't inject a mock
-        // ProfileCapability from outside tether-codec, so this test is
-        // a structural assertion: for every profile, the client's
-        // encode field must be Unsupported with the "not probed"
-        // reason. That fingerprint can only hold if probe_client is
-        // reading c.decode (not c.encode) into the decode field.
         for support in client_supported_profiles() {
             match &support.encode {
                 SupportStatus::Unsupported { reason, .. }
@@ -455,5 +517,176 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_host_includes_h264_encode() {
+        let profiles = host_supported_profiles();
+        let h264 = profiles.iter().find(|s| {
+            s.profile.codec == tether_protocol::control::CodecKind::H264
+                && s.profile.bit_depth == 8
+        });
+        assert!(
+            h264.is_some(),
+            "H.264 8-bit not found in host probe results: {profiles:?}"
+        );
+        assert!(
+            h264.unwrap().is_encode_supported(),
+            "H.264 8-bit encode should be supported; got: {:?}",
+            h264.unwrap().encode
+        );
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_host_includes_hevc_420_encode() {
+        let profiles = host_supported_profiles();
+        let hevc = profiles.iter().find(|s| {
+            s.profile.codec == tether_protocol::control::CodecKind::Hevc
+                && s.profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv420
+                && s.profile.bit_depth == 8
+        });
+        assert!(
+            hevc.is_some(),
+            "HEVC 4:2:0 8-bit not found in host probe results"
+        );
+        assert!(
+            hevc.unwrap().is_encode_supported(),
+            "HEVC 4:2:0 8-bit encode should be supported; got: {:?}",
+            hevc.unwrap().encode
+        );
+    }
+
+    /// The D3D11 Video Processor can't output 4:4:4, so the host must
+    /// never advertise a 4:4:4 encode profile — negotiation would pick it
+    /// and the encoder would silently downsample (or now, reject). On
+    /// Windows `probe_host()` is pure logic (encode/decode are not
+    /// hardware-probed), so this needs no GPU.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_host_never_advertises_444_encode() {
+        use tether_protocol::control::ChromaSubsampling;
+        let profiles = host_supported_profiles();
+        for s in profiles {
+            if s.profile.chroma == ChromaSubsampling::Yuv444 {
+                assert!(
+                    !s.is_encode_supported(),
+                    "host must not advertise 4:4:4 encode (no VP path); got: {:?}",
+                    s.profile
+                );
+            }
+        }
+        assert!(
+            profiles
+                .iter()
+                .any(|s| s.profile.chroma == ChromaSubsampling::Yuv420 && s.is_encode_supported()),
+            "host should still advertise at least one 4:2:0 encode profile"
+        );
+    }
+
+    /// D3D11 has no AV1 encode backend (`backends_for_vendor` returns an
+    /// empty list for `CodecKind::Av1`), so the host must never advertise
+    /// AV1 encode even though `PROFILE_PREFERENCE` lists AV1 4:2:0 —
+    /// otherwise negotiation could pick AV1 and the live encoder would
+    /// fail at construction. Mirrors the decoder-side AV1 rejection in
+    /// `d3d11_av_codec_id`. Pure logic on Windows; no GPU.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_host_never_advertises_av1_encode() {
+        use tether_protocol::control::CodecKind;
+        let profiles = host_supported_profiles();
+        let mut saw_av1 = false;
+        for s in profiles {
+            if s.profile.codec == CodecKind::Av1 {
+                saw_av1 = true;
+                assert!(
+                    !s.is_encode_supported(),
+                    "host must not advertise AV1 encode (no D3D11 AV1 backend); got: {:?}",
+                    s.profile
+                );
+            }
+        }
+        assert!(
+            saw_av1,
+            "PROFILE_PREFERENCE should surface AV1 entries for this test to be meaningful"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_client_includes_h264_decode() {
+        let profiles = client_supported_profiles();
+        let h264 = profiles.iter().find(|s| {
+            s.profile.codec == tether_protocol::control::CodecKind::H264
+                && s.profile.bit_depth == 8
+        });
+        assert!(
+            h264.is_some(),
+            "H.264 8-bit not found in client probe results"
+        );
+        assert!(
+            h264.unwrap().is_decode_supported(),
+            "H.264 8-bit decode should be supported; got: {:?}",
+            h264.unwrap().decode
+        );
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_client_includes_hevc_420_decode() {
+        let profiles = client_supported_profiles();
+        let hevc = profiles.iter().find(|s| {
+            s.profile.codec == tether_protocol::control::CodecKind::Hevc
+                && s.profile.chroma == tether_protocol::control::ChromaSubsampling::Yuv420
+                && s.profile.bit_depth == 8
+        });
+        assert!(
+            hevc.is_some(),
+            "HEVC 4:2:0 8-bit not found in client probe results"
+        );
+        assert!(
+            hevc.unwrap().is_decode_supported(),
+            "HEVC 4:2:0 8-bit decode should be supported; got: {:?}",
+            hevc.unwrap().decode
+        );
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    fn probe_host_and_client_intersect_on_at_least_one_profile() {
+        let host = host_encode_profiles();
+        let client: Vec<_> = client_supported_profiles()
+            .iter()
+            .filter(|s| s.is_decode_supported())
+            .map(|s| s.profile)
+            .collect();
+        let intersection = host.iter().any(|p| client.contains(p));
+        assert!(
+            intersection,
+            "host and client must share at least one profile for sessions to work.\n\
+             host encode: {host:?}\n\
+             client decode: {client:?}"
+        );
+    }
+
+    /// On a GPU that decodes HEVC Main10, the client must advertise it.
+    /// Regression guard for the 10-bit unlock: the Windows decode probe
+    /// routes through the production P010 GPU-export path, so a Main10
+    /// fixture decodes to P010 and comes back as a `Frame::Gpu`. The old
+    /// CPU-download probe forced NV12 on that P010 surface, silently
+    /// dropping Main10 from the advert before it could ever negotiate.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires D3D11 GPU with HEVC Main10 decode (Windows)"]
+    fn client_offers_hevc_main10() {
+        let profiles = client_decode_profiles();
+        eprintln!("client decode profiles: {profiles:?}");
+        assert!(
+            profiles.iter().any(|p| p.codec == CodecKind::Hevc
+                && p.chroma == ChromaSubsampling::Yuv420
+                && p.bit_depth == 10),
+            "HEVC Main10 should be offered on a Main10-capable GPU; got {profiles:?}"
+        );
     }
 }

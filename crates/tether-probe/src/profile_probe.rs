@@ -73,13 +73,19 @@ pub(crate) type Result<T> = std::result::Result<T, ProbeError>;
 /// driver, not in the probe object. A trait (rather than two
 /// platform-specific free functions) keeps the contract explicit when
 /// adding a new backend.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) trait ProfileProbe {
     /// Construct an encoder at `profile` (128×128 floor — satisfies
     /// HEVC's minimum-block constraint on Intel hardware) and verify
     /// it actually produces a non-empty IDR packet. Returns `Err` if
     /// any step fails; the caller treats either outcome as a single
     /// "encode supported" bit.
+    ///
+    /// Not required on Windows: the D3D11 host reports encode support
+    /// statically (the AMF session limit makes a destructive per-profile
+    /// encode probe unsafe — see `probe_host`), so no backend implements
+    /// this there.
+    #[cfg(not(target_os = "windows"))]
     fn probe_encode(profile: VideoProfile) -> Result<()>;
 
     /// Submit `fixture` (an IDR bitstream pre-generated at this
@@ -97,7 +103,7 @@ pub(crate) trait ProfileProbe {
 ///
 /// Fixtures are tiny single-IDR bitstreams generated offline at
 /// 128×128 grey. Regeneration commands live in `fixtures/probe/README.md`.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) fn fixture_for(profile: VideoProfile) -> Option<&'static [u8]> {
     match (profile.codec, profile.chroma, profile.bit_depth) {
         (CodecKind::H264, ChromaSubsampling::Yuv420, 8) => {

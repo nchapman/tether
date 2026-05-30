@@ -12,9 +12,9 @@ pub mod av_log;
 pub mod h264;
 pub mod probe;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod bitstream_sps;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod encoder_common;
 
 #[cfg(target_os = "linux")]
@@ -26,7 +26,12 @@ pub mod videotoolbox;
 #[cfg(target_os = "macos")]
 pub mod macos_interop;
 
+#[cfg(target_os = "windows")]
+pub mod d3d11;
+
 pub use probe::{build_decoder, build_encoder, validate_chosen_profile};
+#[cfg(target_os = "windows")]
+pub use probe::build_encoder_d3d11;
 
 // Re-exported so downstream crates can name the payload type on
 // [`EncodedPacket::data`] without independently depending on `bytes`
@@ -42,13 +47,12 @@ pub use tether_protocol::GpuResourceGuard as GpuFrameGuard;
 
 
 /// GOP length used by every H.264 encoder we ship. Long enough that
-/// keyframes don't dominate the bitrate envelope (1 IDR every ~240
-/// frames at 30 fps), short enough that a client joining mid-stream
-/// after our handshake's eager-IDR request never has to wait more
-/// than this for a periodic recovery point. Loss recovery between
-/// IDRs is handled by the client's on-demand `ForceIdr` plumbing,
-/// not by GOP cadence.
-pub(crate) const GOP_SECONDS: u32 = 8;
+/// GOP length in seconds. Safety-net cadence for decoder recovery —
+/// even if on-demand `ForceIdr` fails (some AMF driver versions
+/// silently ignore forced IDR), a natural keyframe arrives within
+/// this interval. Two seconds balances recovery latency against
+/// keyframe bitrate overhead on mostly-static desktop content.
+pub(crate) const GOP_SECONDS: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
@@ -251,10 +255,15 @@ pub enum GpuEncoderFrame<'a> {
     /// IOSurface).
     #[cfg(target_os = "macos")]
     IOSurface(&'a IOSurfaceFrame),
+    /// Windows D3D11 texture from DXGI Desktop Duplication. Consumed
+    /// zero-copy by the encoder via FFmpeg's `d3d11va` hwaccel
+    /// (`AVFrame` mapped from the shared `ID3D11Texture2D`).
+    #[cfg(target_os = "windows")]
+    D3D11Texture(&'a D3D11TextureFrame),
     // Keeps the enum inhabited on platforms where no cfg branch above
-    // fires (e.g. Windows until D3D11 lands). On platforms that have
-    // a real variant (`linux`, `macos`) this is unreachable by safe
-    // code; the encoder's `encode_gpu` default body never matches it.
+    // fires. On platforms that have a real variant this is unreachable
+    // by safe code; the encoder's `encode_gpu` default body never
+    // matches it.
     #[doc(hidden)]
     _Phantom(std::marker::PhantomData<&'a ()>),
 }
@@ -349,12 +358,45 @@ pub enum GpuFrameSource {
     /// macOS VideoToolbox-decoded `CVPixelBuffer` (typically with an
     /// IOSurface backing). The renderer imports the IOSurface as a
     /// Metal texture via wgpu's Metal HAL `texture_from_raw` path.
-    /// Carried here so the protocol/codec contract is symmetric with
-    /// the encoder side; the client-side decoder implementation is a
-    /// follow-up plan.
     #[cfg(target_os = "macos")]
     IOSurface(IOSurfaceFrame),
+    /// Windows D3D11VA decoded biplanar texture (NV12 8-bit or P010
+    /// 10-bit) with a shared NT handle for cross-device import into the
+    /// native D3D11 renderer, which opens it on its own device. The
+    /// texture is a GPU-side copy from the decoder's pool surface into a
+    /// shared-handle-enabled staging texture.
+    #[cfg(target_os = "windows")]
+    D3D11Texture(D3D11DecodedTexture),
 }
+
+/// Decoded D3D11 biplanar frame exported as a single shared NT handle
+/// to a staging texture. The consumer opens it and creates two SRVs over
+/// the one texture, one per plane (the SRV format selects the plane):
+/// `DXGI_FORMAT_NV12` → `R8_UNORM` luma + `R8G8_UNORM` chroma (8-bit);
+/// `DXGI_FORMAT_P010` → `R16_UNORM` luma + `R16G16_UNORM` chroma (10-bit
+/// MSB-aligned in 16-bit cells).
+///
+/// A single biplanar texture (not two split-plane textures) is required
+/// because the decode→staging copy is `CopySubresourceRegion` per plane,
+/// and D3D11 only permits that between same-format subresources — an
+/// NV12-plane → R8 copy is silently dropped, leaving the export blank.
+/// The handle is owned by `CreateSharedHandle` and stays valid as long
+/// as the backing staging texture (held by the decoder) exists.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct D3D11DecodedTexture {
+    /// Shared NT handle to the staging texture.
+    pub handle: *mut std::ffi::c_void,
+    pub width: u32,
+    pub height: u32,
+    /// `DXGI_FORMAT` of the staging texture (`NV12` for 8-bit, `P010`
+    /// for 10-bit). The renderer picks its plane-SRV formats from this
+    /// so the import can't drift from what the decoder actually copied.
+    pub format: u32,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for D3D11DecodedTexture {}
 
 /// DMA-BUF descriptor as returned by `vaExportSurfaceHandle`. Mirrors
 /// `tether_vaapi::DrmPrimeSurface` but is owned by `tether-codec` so
@@ -551,6 +593,35 @@ pub struct IOSurfaceFrame {
 // would conflict with crossing a thread boundary.
 #[cfg(target_os = "macos")]
 unsafe impl Send for IOSurfaceFrame {}
+
+/// Windows D3D11 texture descriptor for encoder input. Carries the
+/// raw COM pointer to an `ID3D11Texture2D` on the shared device plus
+/// the device/context pointers needed for the encoder to map the
+/// texture into an FFmpeg `AVFrame` via `d3d11va` hwaccel.
+///
+/// Lifetime: the texture stays valid for the duration of the
+/// `encode_gpu` call (guarded by the capture-side `release_guard`
+/// or the pool's reference semantics). The device and context are
+/// `Arc`-shared and outlive any single frame.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct D3D11TextureFrame {
+    /// `ID3D11Texture2D` — the BGRA (or NV12) texture to encode.
+    /// Non-owning: lifetime is the capture pool or the guard.
+    pub texture: *mut std::ffi::c_void,
+    /// `ID3D11Device` — shared device between capture and encoder.
+    pub device: *mut std::ffi::c_void,
+    /// `ID3D11DeviceContext` — immediate context on the shared device.
+    pub device_context: *mut std::ffi::c_void,
+    pub width: u32,
+    pub height: u32,
+    /// DXGI_FORMAT value (e.g. `DXGI_FORMAT_B8G8R8A8_UNORM` = 87,
+    /// `DXGI_FORMAT_NV12` = 103).
+    pub format: u32,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for D3D11TextureFrame {}
 
 /// Pluggable video-decoder backend. Same probe pattern as `Encoder` —
 /// the client probes available backends at startup, picks the best

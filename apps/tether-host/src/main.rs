@@ -15,16 +15,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
-use crossbeam_channel::Receiver;
 #[cfg(target_os = "linux")]
 use tether_capture::GpuCapturedSource;
 use tether_capture::{
-    CapturedFrame, CursorEvent, CursorSource, DamageHint, DamageSignal, HashDamage,
+    CapturedFrame, CursorEvent, CursorSource, DamageHint, DamageSignal, FrameReceiver, HashDamage,
     PixelFormat, PlaceholderCursorSource,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use tether_codec::GpuEncoderFrame;
-use tether_codec::{build_encoder, Encoder};
+#[cfg(not(target_os = "windows"))]
+use tether_codec::build_encoder;
+use tether_codec::Encoder;
+#[cfg(target_os = "windows")]
+use tether_codec::build_encoder_d3d11;
 #[cfg(target_os = "linux")]
 use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 #[cfg(target_os = "linux")]
@@ -163,6 +166,25 @@ async fn main() -> anyhow::Result<()> {
     // a hardcoded conservative profile set (the H.264 4:2:0 8-bit
     // floor) — the encoder still constructs lazily for that single
     // profile, so a broken-encoder host still fails loud.
+    // On Windows, pre-create the DXGI capture device BEFORE the codec
+    // probe. AMF's probe activity corrupts in-process DXGI output
+    // enumeration (EnumOutputs returns 0 outputs after AMF runs), so the
+    // capture device must be enumerated first. That same device is later
+    // stored in `SHARED_D3D11_DEVICE` (see `real_capture`) and reused as
+    // the encoder's D3D11 device, so capture and encode share one device
+    // and the VP blit needs no cross-device texture copy.
+    #[cfg(target_os = "windows")]
+    if !use_test_pattern {
+        match tether_capture::windows::pre_create() {
+            Ok(pre) => {
+                *PRECREATED_CAPTURE.lock().unwrap() = Some(pre);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DXGI pre-create failed; capture will retry later");
+            }
+        }
+    }
+
     if !use_test_pattern {
         tokio::task::spawn_blocking(|| {
             let _ = tether_probe::host_supported_profiles();
@@ -643,8 +665,8 @@ async fn handle_client(
                             width = v.width,
                             height = v.height,
                             "SetClientViewport: forcing IDR; encoder rebuild fires only if \
-                             encode dims change (GPU sessions stay at capture dims until the \
-                             wgpu scaler lands)"
+                             encode dims change (GPU sessions stay at capture dims until a \
+                             GPU-path scaler lands)"
                         );
                         force_idr_for_viewport.raise();
                     }
@@ -2301,9 +2323,41 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
     }
 }
 
+/// Host-local per-stage latency accumulator. Complements
+/// `EncodeStatsWindow::avg_encode_ms` (the encode stage) with the two
+/// stages it doesn't see: the capture→dequeue handoff age (time a frame
+/// waited between capture and the encode loop picking it up) and the
+/// fragment+send duration. Averaged over the stats window and logged
+/// beside `avg_encode_ms`, this shows which stage owns end-to-end host
+/// latency — the breakdown the native-encode pass needs to know whether
+/// the FFmpeg async floor or something else dominates.
+#[derive(Default)]
+struct StageLatency {
+    frames: u64,
+    capture_age_ns: u64,
+    send_ns: u64,
+}
+
+impl StageLatency {
+    fn record(&mut self, capture_age_ns: u64, send_ns: u64) {
+        self.frames += 1;
+        self.capture_age_ns += capture_age_ns;
+        self.send_ns += send_ns;
+    }
+
+    /// Mean of `sum_ns` over recorded frames, in milliseconds.
+    fn avg_ms(sum_ns: u64, frames: u64) -> f64 {
+        if frames == 0 {
+            0.0
+        } else {
+            sum_ns as f64 / frames as f64 / 1_000_000.0
+        }
+    }
+}
+
 fn run_capture_and_send(
     conn: Arc<Connection>,
-    frames: Receiver<CapturedFrame>,
+    frames: FrameReceiver,
     force_idr: tether_session::IdrSignal,
     display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
     cursor_frame_tx: tokio::sync::watch::Sender<Option<CursorFrameDims>>,
@@ -2333,6 +2387,9 @@ fn run_capture_and_send(
     const FEC_PERCENTAGE: u8 = 20;
     let mut fragmenter = FrameFragmenter::new_with_fec(0, FEC_PERCENTAGE);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
+    // Per-stage latency (handoff + send), averaged over the same window
+    // as `stats` and logged alongside it. See [`StageLatency`].
+    let mut stage_latency = StageLatency::default();
     let mut slot: Option<EncoderSlot> = None;
     // macOS-only host GPU state: shared wgpu Metal device + queue for
     // the NV12 IOSurface scaler bridge. Lazily initialised on the
@@ -2376,10 +2433,13 @@ fn run_capture_and_send(
         }
         let frame_width = frame.width();
         let frame_height = frame.height();
-        let mut timing = {
-            let (k, u) = frame.timestamps();
-            HostFrameTimingBuilder::captured(k, u)
-        };
+        let (k, u) = frame.timestamps();
+        // Handoff age: how long this frame waited between capture and the
+        // encode loop dequeuing it. With the single-slot drop-oldest
+        // mailbox this should stay near zero; a rising value means the
+        // encoder can't keep up and frames are queuing (or being evicted).
+        let capture_age_ns = MonoNanos::now().0.saturating_sub(u.0);
+        let mut timing = HostFrameTimingBuilder::captured(k, u);
 
         // Reject CPU frames in non-BGRA formats up front (no encoder
         // path consumes them today). GPU frames already passed format
@@ -2441,7 +2501,14 @@ fn run_capture_and_send(
                 || s.height != encode_height
         });
         if needs_recreate {
-            if let Some(old) = slot.as_ref() {
+            // Drop the previous encoder BEFORE constructing its
+            // replacement. `slot.take()` moves the old `EncoderSlot` out
+            // (slot = None) and it drops at the end of this block —
+            // releasing its hardware session and D3D11 frame pool before
+            // the new encoder allocates its own. Required for QSV: two
+            // live QSV sessions on one D3D11 device fail child-texture
+            // creation with DXGI_ERROR_INVALID_CALL.
+            if let Some(old) = slot.take() {
                 info!(
                     old_capture = old.capture_width,
                     new_capture = frame_width,
@@ -2468,13 +2535,40 @@ fn run_capture_and_send(
             // probe; per-resize cost is one construction attempt.
             let baseline_kbps =
                 derive_bitrate_kbps(chosen_profile, encode_width, encode_height, ENCODER_FPS);
-            slot = match build_encoder(
+            #[cfg(target_os = "windows")]
+            let encoder_result = {
+                // Real capture stores the shared DXGI device in
+                // SHARED_D3D11_DEVICE (`real_capture`), and the encoder
+                // reuses it for a zero-copy VP blit. Test-pattern mode
+                // never runs `real_capture`, so no shared device exists —
+                // fall back to null device pointers (FFmpeg self-creates a
+                // d3d11va device, as on the probe path) and vendor 0,
+                // which selects the vendor-agnostic Media Foundation
+                // encoder. The CPU test-pattern frames take the
+                // `encode_bgra` path either way, so this stays correct.
+                let (dev_ptr, ctx_ptr, vendor_id) = match SHARED_D3D11_DEVICE.get() {
+                    Some(dev) => {
+                        let (dev_ptr, ctx_ptr) = dev.device_ptrs();
+                        (dev_ptr, ctx_ptr, dev.vendor_id)
+                    }
+                    None => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
+                };
+                build_encoder_d3d11(
+                    chosen_profile, encode_width, encode_height,
+                    ENCODER_FPS, baseline_kbps,
+                    dev_ptr, ctx_ptr,
+                    vendor_id,
+                )
+            };
+            #[cfg(not(target_os = "windows"))]
+            let encoder_result = build_encoder(
                 chosen_profile,
                 encode_width,
                 encode_height,
                 ENCODER_FPS,
                 baseline_kbps,
-            ) {
+            );
+            slot = match encoder_result {
                 Ok((_profile, e)) => {
                     info!(
                         backend = e.name(),
@@ -2697,7 +2791,29 @@ fn run_capture_and_send(
                     }
                 }
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(target_os = "windows")]
+            CapturedFrame::Gpu(gpu) => {
+                use windows::core::Interface;
+                let tether_capture::GpuCapturedSource::D3D11Texture(ref tex) = gpu.source;
+                let frame = tether_codec::D3D11TextureFrame {
+                    texture: tex.texture.as_raw() as *mut std::ffi::c_void,
+                    device: tex.device.device.as_raw() as *mut std::ffi::c_void,
+                    device_context: tex.device.context.as_raw() as *mut std::ffi::c_void,
+                    width: tex.width,
+                    height: tex.height,
+                    format: tex.format.0 as u32,
+                };
+                match slot_mut.encoder.encode_gpu(
+                    GpuEncoderFrame::D3D11Texture(&frame), pts, force_kf,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(error = %e, "D3D11 GPU encode failed; dropping frame");
+                        continue;
+                    }
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             CapturedFrame::Gpu(_) => {
                 warn!("Gpu CapturedFrame on an unsupported build; dropping");
                 continue;
@@ -2746,6 +2862,7 @@ fn run_capture_and_send(
             dimensions: (frame_width, frame_height),
         };
 
+        let send_t0 = std::time::Instant::now();
         if keyframe {
             // Keyframes ride a reliable per-IDR QUIC uni stream. The
             // single_packet path doesn't chunk into datagram-sized
@@ -2776,6 +2893,10 @@ fn run_capture_and_send(
                 }
             }
         }
+        // Accumulated only for frames that complete encode + send;
+        // damage-skipped and rebuild-failed frames are excluded, so this
+        // is the handoff age of frames that actually reach the wire.
+        stage_latency.record(capture_age_ns, send_t0.elapsed().as_nanos() as u64);
 
         if stats.should_emit() {
             if let Some(snap) = stats.snapshot_and_reset() {
@@ -2784,13 +2905,26 @@ fn run_capture_and_send(
                 } else {
                     0.0
                 };
+                // Per-stage host latency breakdown: capture_age_ms is the
+                // handoff (capture→dequeue), avg_encode_ms is the encoder
+                // (the FFmpeg send_frame→packet floor), send_ms is
+                // fragment+wire. Their sum ≈ host-side end-to-end latency.
                 info!(
                     frames = snap.frame_count,
+                    capture_age_ms = format!(
+                        "{:.2}",
+                        StageLatency::avg_ms(stage_latency.capture_age_ns, stage_latency.frames)
+                    ),
                     avg_encode_ms = format!("{:.2}", snap.avg_encode_ms),
+                    send_ms = format!(
+                        "{:.2}",
+                        StageLatency::avg_ms(stage_latency.send_ns, stage_latency.frames)
+                    ),
                     kbps_out = format!("{:.0}", snap.kbps_out),
                     kf_per_s = format!("{kf_per_s:.2}"),
                     "send stats"
                 );
+                stage_latency = StageLatency::default();
             }
         }
     }
@@ -2807,9 +2941,15 @@ fn persistent_cert_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        anyhow::anyhow!("neither $TETHER_CERT_DIR nor $HOME is set; can't choose a cert directory")
-    })?;
+    // $HOME on Unix, $USERPROFILE on Windows.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "neither $TETHER_CERT_DIR nor $HOME/$USERPROFILE is set; \
+                 can't choose a cert directory"
+            )
+        })?;
     Ok(PathBuf::from(home).join(".tether"))
 }
 
@@ -2910,7 +3050,30 @@ async fn real_capture(chosen_profile: VideoProfile) -> anyhow::Result<tether_cap
         .map_err(anyhow::Error::from)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+static SHARED_D3D11_DEVICE: std::sync::OnceLock<tether_capture::windows::D3D11Device> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static PRECREATED_CAPTURE: std::sync::Mutex<Option<tether_capture::windows::PreCreatedCapture>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
+    info!("capture source: windows (DXGI Desktop Duplication)");
+    let pre = PRECREATED_CAPTURE.lock().unwrap().take();
+    let (handle, d3d11_device) = match pre {
+        Some(p) => tether_capture::windows::start_with(p)
+            .map_err(anyhow::Error::from)?,
+        None => tether_capture::windows::start_with(
+            tether_capture::windows::pre_create().map_err(anyhow::Error::from)?
+        ).map_err(anyhow::Error::from)?,
+    };
+    let _ = SHARED_D3D11_DEVICE.set(d3d11_device);
+    Ok(handle)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
     warn!("no real capture backend on this platform yet; falling back to test-pattern");
     Ok(tether_capture::test_pattern::start(
@@ -3012,6 +3175,20 @@ mod tests {
     //! see the project task list.
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn stage_latency_averages_over_recorded_frames() {
+        let mut s = StageLatency::default();
+        // No frames recorded → zero, not a divide-by-zero.
+        assert_eq!(StageLatency::avg_ms(s.capture_age_ns, s.frames), 0.0);
+
+        // 1 ms + 3 ms handoff, 2 ms + 4 ms send over two frames.
+        s.record(1_000_000, 2_000_000);
+        s.record(3_000_000, 4_000_000);
+        assert_eq!(s.frames, 2);
+        assert!((StageLatency::avg_ms(s.capture_age_ns, s.frames) - 2.0).abs() < 1e-9);
+        assert!((StageLatency::avg_ms(s.send_ns, s.frames) - 3.0).abs() < 1e-9);
+    }
     use std::sync::Arc;
     use tokio::task::JoinSet;
 

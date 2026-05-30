@@ -56,6 +56,13 @@ wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["
 # Nv12DmaBuf::new path.
 pollster = "0.4"
 
+# Windows: D3D11 COM interface types for passing raw texture pointers
+# between capture and encoder. Same crate version as tether-capture.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Graphics_Direct3D11",
+] }
+
 # dev-dep on tether-render so the macOS fourcc-table cross-check unit
 # test (`macos_iosurface_fourcc_tables_agree_across_crates`) can call
 # `tether_render::accepts_iosurface_fourcc` alongside the encoder /

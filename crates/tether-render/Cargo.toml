@@ -56,6 +56,23 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
 ] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Native D3D11 client renderer (decode + present both in D3D11, no
+# cross-API bridge — Moonlight's model). The decoder hands us NV12/P010
+# as an NT shared handle which we open via IDXGIResource1; render with a
+# YUV→RGB HLSL pixel shader to a DXGI swapchain on the winit HWND.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+# winit hands us the HWND through raw-window-handle 0.6 (the version
+# winit 0.30 implements); we build the swapchain against it.
+raw-window-handle = "0.6"
+
 [dev-dependencies]
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }

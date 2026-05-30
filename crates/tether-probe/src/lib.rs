@@ -633,4 +633,24 @@ mod tests {
              client decode: {client:?}"
         );
     }
+
+    /// On a GPU that decodes HEVC Main10, the client must advertise it.
+    /// Regression guard for the 10-bit unlock: the Windows decode probe
+    /// routes through the production P010 GPU-export path, so a Main10
+    /// fixture decodes to P010 and comes back as a `Frame::Gpu`. The old
+    /// CPU-download probe forced NV12 on that P010 surface, silently
+    /// dropping Main10 from the advert before it could ever negotiate.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires D3D11 GPU with HEVC Main10 decode (Windows)"]
+    fn client_offers_hevc_main10() {
+        let profiles = client_decode_profiles();
+        eprintln!("client decode profiles: {profiles:?}");
+        assert!(
+            profiles.iter().any(|p| p.codec == CodecKind::Hevc
+                && p.chroma == ChromaSubsampling::Yuv420
+                && p.bit_depth == 10),
+            "HEVC Main10 should be offered on a Main10-capable GPU; got {profiles:?}"
+        );
+    }
 }

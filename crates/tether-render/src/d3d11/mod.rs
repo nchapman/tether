@@ -38,6 +38,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
     D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_TEX2D_RTV,
     D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT, ID3D11RasterizerState,
+    D3D11_FORMAT_SUPPORT_TEXTURE2D,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_SHADER_RESOURCE_VIEW_DESC,
@@ -49,8 +50,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R16G16_UNORM,
+    DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
@@ -108,11 +109,47 @@ fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
 /// Windows counterpart to the wgpu backend's `supports_10bit_render`,
 /// queried by the client to gate 10-bit profiles in its decode advert.
 ///
-/// Bring-up stance: the D3D11 renderer ships 8-bit (NV12) first, so we
-/// advertise 8-bit only and the host negotiator never picks Main10. Flip
-/// to `true` once the P010 sample path lands (plan step 4).
+/// 10-bit render means decoding P010 and sampling it through R16 / R16G16
+/// plane SRVs (the shader's `RANGE_KIND_LIMITED_10` branch normalises the
+/// MSB-aligned values). R16-norm formats are mandatory on any D3D11 11.0
+/// device, so the only real variable is whether the GPU supports P010
+/// textures at all — probe a throwaway hardware device for that. The
+/// client's per-profile decode probe is the authoritative Main10 gate;
+/// this just keeps the renderer from advertising a format it can't open
+/// (and returns `false` if no D3D11 device can be created — negotiation
+/// then settles on an 8-bit profile).
 pub async fn supports_10bit_render() -> bool {
-    false
+    unsafe {
+        // Throwaway device: the renderer's own device isn't created until
+        // `D3D11RenderState::new`, well after this startup-time probe.
+        let mut device: Option<ID3D11Device> = None;
+        if D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            Default::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let Some(device) = device else { return false };
+        // Check P010 TEXTURE2D support only — NOT SHADER_SAMPLE on P010
+        // itself, which would be wrong: we never sample P010 directly, we
+        // sample its R16 / R16G16 plane SRVs, and those norm formats are a
+        // mandatory FL11.0 baseline. So "can a P010 texture exist" is the
+        // only real variable.
+        match device.CheckFormatSupport(DXGI_FORMAT_P010) {
+            #[allow(clippy::cast_sign_loss)]
+            Ok(flags) => (flags & D3D11_FORMAT_SUPPORT_TEXTURE2D.0 as u32) != 0,
+            Err(_) => false,
+        }
+    }
 }
 
 /// Render pipeline objects built once at construction and reused every
@@ -148,7 +185,7 @@ enum SourceKey {
     /// dims makes a false cache hit require both an identical recycled
     /// handle value AND identical dims (the decoder closes the old handle
     /// on `Drop`, so the recycling window is a single resolution flip).
-    Gpu { handle: *mut c_void, width: u32, height: u32 },
+    Gpu { handle: *mut c_void, width: u32, height: u32, format: u32 },
     /// CPU fallback: dims of the dynamic upload textures. Pixels are
     /// re-mapped every frame; the textures are recreated only on resize.
     Cpu { width: u32, height: u32 },
@@ -372,7 +409,7 @@ impl D3D11RenderState {
                 // compiled on Windows (dma-buf / IOSurface are cfg-gated
                 // to Linux/macOS), so this destructure is irrefutable.
                 let GpuFrameSource::D3D11Texture(tex) = &g.source;
-                self.import_shared_nv12(tex.handle, tex.width, tex.height)?;
+                self.import_shared_biplanar(tex.handle, tex.width, tex.height, tex.format)?;
             }
             Frame::Cpu(c) => self.upload_cpu_frame(c)?,
         }
@@ -380,12 +417,14 @@ impl D3D11RenderState {
         Ok(())
     }
 
-    /// Open the decoder's NV12 shared NT handle onto our device and build
-    /// the two plane SRVs (R8 luma + R8G8 chroma — the SRV format selects
-    /// the NV12 plane). No-op when the handle matches what's already
-    /// imported — the decoder reuses its staging texture across frames at
-    /// a fixed resolution, so this opens once per resolution and resamples
-    /// after.
+    /// Open the decoder's biplanar shared NT handle onto our device and
+    /// build the two plane SRVs. The SRV format selects the plane and
+    /// depends on the decode format: NV12 → R8 luma + R8G8 chroma (8-bit),
+    /// P010 → R16 luma + R16G16 chroma (10-bit MSB-aligned, normalised by
+    /// the shader's `RANGE_KIND_LIMITED_10` branch). No-op when the
+    /// (handle, dims, format) match what's already imported — the decoder
+    /// reuses its staging texture across frames at a fixed resolution, so
+    /// this opens once per resolution and resamples after.
     ///
     /// Synchronization: the staging texture carries no keyed mutex, so
     /// there is no cross-device GPU fence between the decoder's
@@ -396,33 +435,35 @@ impl D3D11RenderState {
     /// (Moonlight's model) — not a keyed mutex on this single staging
     /// texture, which would serialize producer/consumer and defeat the
     /// drop-oldest `LatestFrame` handoff.
-    fn import_shared_nv12(
+    fn import_shared_biplanar(
         &mut self,
         handle: *mut c_void,
         width: u32,
         height: u32,
+        format: u32,
     ) -> Result<()> {
         if handle.is_null() {
             return Err(RenderError::GraphicsApi("null D3D11 shared handle".into()));
         }
-        let key = SourceKey::Gpu { handle, width, height };
+        let key = SourceKey::Gpu { handle, width, height, format };
         if self.imported.as_ref().is_some_and(|i| i.key == key) {
             return Ok(());
         }
 
-        let nv12: ID3D11Texture2D = unsafe { self.device1.OpenSharedResource1(HANDLE(handle)) }
-            .map_err(|e| d3d_err("OpenSharedResource1(NV12)", e))?;
+        // Per-plane SRV formats from the staging texture's DXGI format.
+        let (y_fmt, uv_fmt) = plane_srv_formats(format)?;
 
-        // Two SRVs over the one NV12 texture: R8 reads the luma plane,
-        // R8G8 the (half-res) chroma plane.
-        let y_srv = create_plane_srv(&self.device, &nv12, DXGI_FORMAT_R8_UNORM)?;
-        let uv_srv = create_plane_srv(&self.device, &nv12, DXGI_FORMAT_R8G8_UNORM)?;
+        let tex: ID3D11Texture2D = unsafe { self.device1.OpenSharedResource1(HANDLE(handle)) }
+            .map_err(|e| d3d_err("OpenSharedResource1(biplanar)", e))?;
 
-        tracing::debug!(width, height, "opened decoder NV12 shared handle");
+        let y_srv = create_plane_srv(&self.device, &tex, y_fmt)?;
+        let uv_srv = create_plane_srv(&self.device, &tex, uv_fmt)?;
+
+        tracing::debug!(width, height, format, "opened decoder biplanar shared handle");
         self.imported = Some(Imported {
             key,
-            y_tex: nv12.clone(),
-            uv_tex: nv12,
+            y_tex: tex.clone(),
+            uv_tex: tex,
             srvs: [Some(y_srv), Some(uv_srv)],
         });
         Ok(())
@@ -802,10 +843,28 @@ fn create_srv(
     srv.ok_or_else(|| RenderError::GraphicsApi("null shader resource view".into()))
 }
 
-/// Format-explicit SRV used to view one plane of an NV12 texture:
-/// `R8_UNORM` reads the luma plane, `R8G8_UNORM` the chroma plane. A
-/// default SRV on an NV12 texture is invalid — the plane format must be
-/// stated explicitly.
+/// Map a biplanar staging `DXGI_FORMAT` (as a raw `u32`) to its
+/// `(luma, chroma)` plane SRV formats. NV12 is 8-bit (R8 + R8G8); P010 is
+/// 10-bit stored MSB-aligned in 16-bit cells (R16 + R16G16), normalised
+/// back by the shader's limited-range-10 branch. Any other format is a
+/// negotiation/decoder bug — fail loudly rather than sample garbage.
+#[allow(clippy::cast_sign_loss)]
+fn plane_srv_formats(format: u32) -> Result<(DXGI_FORMAT, DXGI_FORMAT)> {
+    if format == DXGI_FORMAT_NV12.0 as u32 {
+        Ok((DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM))
+    } else if format == DXGI_FORMAT_P010.0 as u32 {
+        Ok((DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM))
+    } else {
+        Err(RenderError::GraphicsApi(format!(
+            "unsupported decode texture format {format:#x}; expected NV12 (8-bit) or P010 (10-bit)"
+        )))
+    }
+}
+
+/// Format-explicit SRV used to view one plane of a biplanar texture:
+/// e.g. NV12 luma as `R8_UNORM`, chroma as `R8G8_UNORM`. A default SRV
+/// on a biplanar (NV12/P010) texture is invalid — the plane format must
+/// be stated explicitly.
 fn create_plane_srv(
     device: &ID3D11Device,
     texture: &ID3D11Texture2D,
@@ -1123,13 +1182,27 @@ mod tests {
     /// gradient fixture, the D3D11VA decoder exports it GPU-resident
     /// (shared NT handles), the renderer opens those handles on its own
     /// device and renders offscreen. The geometric residual catches both
-    /// decoder-export corruption (wrong array slice / plane) and renderer
-    /// sampling bugs — a uniform-green or scrambled result blows the
-    /// residual far past the quantisation floor. Windows analog of the
+    /// decoder-export corruption (wrong array slice / plane / format) and
+    /// renderer sampling bugs — a uniform-green or scrambled result blows
+    /// the residual far past the quantisation floor. Windows analog of the
     /// Linux `dmabuf_test` roundtrip. Intel-only (QSV); SKIPs elsewhere.
+    ///
+    /// Run at both bit depths via the two `#[test]` wrappers below: 8-bit
+    /// exercises the NV12 → R8/R8G8 path, 10-bit the P010 → R16/R16G16
+    /// path (Main10 decode + the shader's limited-range-10 branch).
     #[test]
     #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
-    fn d3d11_coord_fixture_decode_render_roundtrip() {
+    fn d3d11_coord_fixture_decode_render_roundtrip_8bit() {
+        coord_fixture_roundtrip(8);
+    }
+
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10)"]
+    fn d3d11_coord_fixture_decode_render_roundtrip_10bit() {
+        coord_fixture_roundtrip(10);
+    }
+
+    fn coord_fixture_roundtrip(bit_depth: u8) {
         use tether_codec::d3d11::{D3D11Decoder, D3D11Encoder};
         use tether_codec::{Decoder, Encoder, D3D11TextureFrame, Frame as CodecFrame};
         use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
@@ -1209,7 +1282,7 @@ mod tests {
             .expect("fixture CreateTexture2D");
         let src = src.unwrap();
 
-        let profile = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 8 };
+        let profile = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth };
         let mut enc = D3D11Encoder::new(
             profile,
             w,
@@ -1259,8 +1332,8 @@ mod tests {
 
         // Render through the production import/SRV/shader path on a fresh
         // device (cross-device, like the real client), read back, measure.
-        let mut state =
-            D3D11RenderState::new_headless(w, h, VideoColorSpec::sdr_desktop(), 8).expect("headless");
+        let mut state = D3D11RenderState::new_headless(w, h, VideoColorSpec::sdr_desktop(), bit_depth)
+            .expect("headless");
         state.apply_frame(render_frame).expect("apply_frame");
         state.render().expect("render");
         let bgra = state.read_back_bgra();

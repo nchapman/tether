@@ -368,24 +368,30 @@ pub enum GpuFrameSource {
     D3D11Texture(D3D11DecodedTexture),
 }
 
-/// Decoded D3D11 NV12 frame exported as a single shared NT handle to a
-/// `DXGI_FORMAT_NV12` staging texture. The consumer opens it and creates
-/// two SRVs over the one texture — `R8_UNORM` reads the luma plane,
-/// `R8G8_UNORM` the chroma plane (the SRV format selects the plane).
+/// Decoded D3D11 biplanar frame exported as a single shared NT handle
+/// to a staging texture. The consumer opens it and creates two SRVs over
+/// the one texture, one per plane (the SRV format selects the plane):
+/// `DXGI_FORMAT_NV12` → `R8_UNORM` luma + `R8G8_UNORM` chroma (8-bit);
+/// `DXGI_FORMAT_P010` → `R16_UNORM` luma + `R16G16_UNORM` chroma (10-bit
+/// MSB-aligned in 16-bit cells).
 ///
-/// A single NV12 texture (not two R8/R8G8 textures) is required because
-/// the decode→staging copy is `CopySubresourceRegion` per plane, and
-/// D3D11 only permits that between same-format subresources — an
+/// A single biplanar texture (not two split-plane textures) is required
+/// because the decode→staging copy is `CopySubresourceRegion` per plane,
+/// and D3D11 only permits that between same-format subresources — an
 /// NV12-plane → R8 copy is silently dropped, leaving the export blank.
 /// The handle is owned by `CreateSharedHandle` and stays valid as long
 /// as the backing staging texture (held by the decoder) exists.
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
 pub struct D3D11DecodedTexture {
-    /// Shared NT handle to the NV12 staging texture.
+    /// Shared NT handle to the staging texture.
     pub handle: *mut std::ffi::c_void,
     pub width: u32,
     pub height: u32,
+    /// `DXGI_FORMAT` of the staging texture (`NV12` for 8-bit, `P010`
+    /// for 10-bit). The renderer picks its plane-SRV formats from this
+    /// so the import can't drift from what the decoder actually copied.
+    pub format: u32,
 }
 
 #[cfg(target_os = "windows")]

@@ -22,9 +22,13 @@ impl ProfileProbe for D3D11Probe {
 }
 
 fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
-    // The probe never renders — CPU download is fine and avoids needing
-    // a renderer capability here.
-    let mut dec = D3D11Decoder::new(profile.codec, false)
+    // Probe with `gpu_export = true` so it exercises the production export
+    // path (`export_gpu_frame`), not the 8-bit-only CPU download. This is
+    // load-bearing for 10-bit: a Main10 fixture decodes to a P010 surface,
+    // which the CPU path can't represent (it would fail) — only the GPU
+    // staging export handles P010. The export is self-contained in the
+    // decoder's own D3D11 device; no renderer is needed here.
+    let mut dec = D3D11Decoder::new(profile.codec, true)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
     dec.submit(fixture)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
@@ -32,10 +36,8 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
     // arrives (same as VideoToolbox). Signal EOF to drain.
     dec.signal_eof()
         .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
-    // Accept Frame::Cpu: D3D11Decoder::next_frame currently always
-    // downloads to CPU (GPU export pending Vulkan external-memory
-    // support). Tighten to require Frame::Gpu when GPU export lands,
-    // matching the VAAPI/VideoToolbox probe contract.
+    // A decoded frame (now a shared-handle `Frame::Gpu`) means the codec +
+    // export path work for this profile.
     for _ in 0..4 {
         match dec
             .next_frame()

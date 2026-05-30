@@ -725,12 +725,15 @@ needs a re-`set_param`).
 Listed to set expectations; each is a real follow-up, not a "never":
 
 - **Windows: remaining gaps.** The Windows host (DXGI capture, D3D11
-  vendor-selected encode) and client (D3D11VA decode → render) are wired
-  and loopback-verified. What's still open: the decoder downloads frames
-  to CPU before the renderer (zero-copy GPU export pending Vulkan
-  external-memory support — see the D3D11 probe note in
-  `CODEC_CAPABILITIES.md`); there is no 4:4:4 encode path (the Video
-  Processor only outputs 4:2:0); and audio is deferred everywhere.
+  vendor-selected encode) and client (D3D11VA decode → native D3D11
+  render) are wired and loopback-verified, with the decoder exporting
+  GPU-resident shared-handle frames (no CPU download, no wgpu/Vulkan
+  bridge) at 4:2:0 8-bit (NV12) and 10-bit (P010 / Main10). What's still
+  open: there is no 4:4:4 encode path (the Video Processor only outputs
+  4:2:0); cross-device decode→present sync currently relies on the
+  handoff latency rather than a shared device, validated on shared iGPUs
+  (discrete GPUs may need the single-device model — see the
+  `import_shared_biplanar` note); and audio is deferred everywhere.
 - **AV1.** H.264 and HEVC are supported; AV1 needs a different VAAPI
   decoder probe (no `vaapi_av1` encode entrypoint on most current
   Intel iGPUs) and a separate codec_id path. The probe stub returns
@@ -742,9 +745,11 @@ Listed to set expectations; each is a real follow-up, not a "never":
   4:2:0 (R16 + Rg16 biplanar) and packed XV30 dma-buf for 4:4:4
   (Rgb10a2Unorm, via `Bgra2Xv30DmaBuf`); the renderer has an
   R16/Rg16 biplanar `RenderLayout::Biplanar16` for both Linux
-  dma-buf and macOS IOSurface (`'P010'`/`'P410'`/`'xf44'`) paths;
-  the shader carries a `luma_scale` uniform that compensates 10-in-16
-  MSB-aligned sampler reads. What's *not* yet in place is HDR
+  dma-buf and macOS IOSurface (`'P010'`/`'P410'`/`'xf44'`) paths, and the
+  Windows native D3D11 renderer samples P010 via R16/R16G16 plane SRVs
+  (Main10 4:2:0); the shader carries a `luma_scale` uniform (D3D11: a
+  `RANGE_KIND_LIMITED_10` branch) that compensates 10-in-16 MSB-aligned
+  sampler reads. What's *not* yet in place is HDR
   signalling proper (BT.2020 primaries, PQ / HLG transfer curves in
   the EOTF dispatch, HDR-capable surface format) — the renderer
   hard-pins BT.709 limited range regardless of `bit_depth`. 10-bit

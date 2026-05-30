@@ -598,13 +598,27 @@ native oneVPL / NvEncodeAPI path is the lever if it doesn't.
 
 ## Layer 5 (Windows) — D3D11VA decode (client)
 
-`D3D11Decoder` decodes H.264 / HEVC via D3D11VA and currently copies each
-NV12 plane (Y as R8, UV as RG8) into staging textures and **downloads to
-CPU** before the renderer. Zero-copy GPU export (shared DXGI handle →
-Vulkan `VK_KHR_external_memory_win32`) is pending Vulkan external-memory
-support — the host probe-decode path accepts `Frame::Cpu` for now and the
-comment in `d3d11/decoder.rs` marks where to tighten it to `Frame::Gpu`.
-Decode matches the encode side: 4:2:0 (NV12 / P010), no 4:4:4.
+`D3D11Decoder` decodes H.264 / HEVC via D3D11VA and exports each decoded
+surface **GPU-resident**: it `CopySubresourceRegion`s both planes of the
+decode pool slice into a single `MISC_SHARED` biplanar staging texture
+and hands the renderer a shared NT handle (`Frame::Gpu`). The format
+follows the decode surface — `DXGI_FORMAT_NV12` for 4:2:0 8-bit,
+`DXGI_FORMAT_P010` for 4:2:0 10-bit (Main10) — and is carried in
+`D3D11DecodedTexture::format` so the native D3D11 renderer
+(`tether_render::d3d11`) opens the matching per-plane SRVs (R8 + R8G8 for
+NV12, R16 + R16G16 for P010) on its own device. There is no wgpu/Vulkan
+bridge. The `download_frame_cpu` path remains only as an 8-bit NV12
+fallback for the null-decode-texture anomaly.
+
+Decode matches the encode side: 4:2:0 (NV12 / P010), no 4:4:4. The client
+decode probe (`tether-probe/src/host/d3d11.rs`) routes through this GPU
+export path, so a Main10 fixture decodes to P010 and comes back as
+`Frame::Gpu` — confirming the full chain per profile. The renderer's
+`supports_10bit_render` probes D3D11 P010 texture support to gate the
+10-bit decode advert (R16/R16G16 plane sampling is an FL11.0 baseline, so
+P010 texture support is the only real variable). Both 8-bit and 10-bit
+are exercised end-to-end by `d3d11_coord_fixture_decode_render_roundtrip_8bit`
+/ `_10bit` in `tether-render/src/d3d11/mod.rs`.
 
 ---
 

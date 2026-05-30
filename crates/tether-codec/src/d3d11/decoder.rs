@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIResource1, DXGI_SHARED_RESOURCE_READ};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
 use tether_protocol::control::CodecKind;
 
@@ -47,22 +47,25 @@ pub struct D3D11Decoder {
     _hw_device: AVHWDeviceContext,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    staging: Option<Nv12Staging>,
-    /// Whether the renderer can import D3D11 shared-handle textures into
-    /// wgpu (Vulkan `VK_KHR_external_memory_win32`). When true we export
-    /// decoded frames GPU-resident (`Frame::Gpu`); when false — the
-    /// driver lacks the extension (some AMD Vulkan stacks) — we fall back
-    /// to a CPU download. GPU-resident is the rule; CPU is the exception.
+    staging: Option<PlaneStaging>,
+    /// When true we export decoded frames GPU-resident as a shared-handle
+    /// `Frame::Gpu` (the native D3D11 renderer opens the handle on its own
+    /// device — see `tether_render::d3d11`); when false we download to a
+    /// CPU `Frame::Cpu`. GPU-resident is the rule for the live client; the
+    /// CPU path is the `download_frame_cpu` fallback for the null-decode-
+    /// texture anomaly, and is 8-bit NV12 only.
     gpu_export: bool,
 }
 
-/// Single NV12 staging texture for GPU-side plane extraction. The decode
-/// pool surface (an NV12 texture array) is copied slice→staging per plane
-/// — `CopySubresourceRegion` only works between same-format subresources,
-/// so the staging must itself be NV12 (a separate R8 / R8G8 destination
-/// would make the copy a silent no-op). The consumer opens the shared
-/// handle and views plane 0 as R8 and plane 1 as R8G8.
-struct Nv12Staging {
+/// Single biplanar staging texture for GPU-side plane extraction. The
+/// decode pool surface (an NV12 or P010 texture array) is copied
+/// slice→staging per plane — `CopySubresourceRegion` only works between
+/// same-format subresources, so the staging must itself match the decode
+/// format (a separate split-plane destination would make the copy a
+/// silent no-op). The consumer opens the shared handle and views plane 0
+/// and plane 1 with the format's per-plane SRV formats (R8/R8G8 for NV12,
+/// R16/R16G16 for P010).
+struct PlaneStaging {
     tex: ID3D11Texture2D,
     /// NT handle from `CreateSharedHandle` — owned by us, closed on drop.
     /// (`tex` is allocated at even-rounded dims; `width`/`height` are the
@@ -71,9 +74,12 @@ struct Nv12Staging {
     handle: HANDLE,
     width: u32,
     height: u32,
+    /// `DXGI_FORMAT` of the staging texture (NV12 or P010). Part of the
+    /// staleness key and reported to the renderer.
+    format: DXGI_FORMAT,
 }
 
-impl Drop for Nv12Staging {
+impl Drop for PlaneStaging {
     fn drop(&mut self) {
         // `CreateSharedHandle` returns an owned NT handle; without this it
         // leaks one kernel handle per resolution change / decoder teardown.
@@ -167,9 +173,10 @@ impl D3D11Decoder {
         Ok(())
     }
 
-    /// Export a D3D11VA surface as `Frame::Gpu` with per-plane shared
-    /// handles. Copies each NV12 plane (Y and UV) from the decode pool
-    /// into separate MISC_SHARED staging textures, entirely on the GPU.
+    /// Export a D3D11VA surface as `Frame::Gpu` backed by a single shared
+    /// handle. Copies both planes (Y and UV) from the decode pool slice
+    /// into a MISC_SHARED biplanar staging texture (NV12 or P010, matching
+    /// the decode format), entirely on the GPU.
     fn export_gpu_frame(&mut self, hw_frame: &AVFrame) -> Result<Frame> {
         let width = hw_frame.width as u32;
         let height = hw_frame.height as u32;
@@ -193,27 +200,35 @@ impl D3D11Decoder {
                 .clone()
         };
 
-        // Rebuild staging if dimensions changed.
-        if self.staging.as_ref().map_or(true, |s| s.width != width || s.height != height) {
-            self.staging = Some(Self::create_nv12_staging(&self.device, width, height)?);
+        // Read the decode surface descriptor once: its format drives the
+        // staging format (NV12 8-bit vs P010 10-bit) and its ArraySize
+        // drives the plane-subresource calc below.
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { src_texture.GetDesc(&mut desc) };
+        let src_format = desc.Format;
+        let array_size = desc.ArraySize;
+
+        // Rebuild staging if dimensions or the decode format changed. The
+        // format only changes across a session/codec restart, but keying
+        // on it keeps the staging in lock-step with the decode surface so
+        // an 8↔10-bit reconfigure can't sample a stale NV12 staging.
+        if self.staging.as_ref().map_or(true, |s| {
+            s.width != width || s.height != height || s.format != src_format
+        }) {
+            self.staging = Some(Self::create_staging(&self.device, width, height, src_format)?);
         }
         let staging = self.staging.as_ref().unwrap();
 
-        // NV12 texture-array subresource layout is PLANE-MAJOR:
+        // Biplanar texture-array subresource layout is PLANE-MAJOR:
         // D3D11CalcSubresource(plane, slice) =
         // planeSlice * (MipLevels * ArraySize) + arraySlice * MipLevels.
         // With MipLevels == 1 that's Y of slice N = N, UV of slice N =
         // ArraySize + N. We copy each plane of the decode slice into the
-        // matching plane subresource of the single-slice NV12 staging
-        // (subresource 0 = Y, 1 = UV). Both endpoints are NV12 plane
-        // subresources, so the formats match and the copy is honoured —
-        // copying an NV12 plane into a separate R8/R8G8 texture is a
-        // silent no-op (the all-zero "green screen" bug).
-        let array_size = {
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            unsafe { src_texture.GetDesc(&mut desc) };
-            desc.ArraySize
-        };
+        // matching plane subresource of the single-slice staging
+        // (subresource 0 = Y, 1 = UV). Both endpoints are same-format
+        // plane subresources, so the copy is honoured — copying a plane
+        // into a separate split-plane texture is a silent no-op (the
+        // all-zero "green screen" bug).
         let y_subresource = array_index;
         let uv_subresource = array_size + array_index;
 
@@ -238,24 +253,26 @@ impl D3D11Decoder {
                 handle: staging.handle.0 as *mut std::ffi::c_void,
                 width,
                 height,
+                format: staging.format.0 as u32,
             }),
             hw_frame.clone(),
         )))
     }
 
-    fn create_nv12_staging(
+    fn create_staging(
         device: &ID3D11Device,
         width: u32,
         height: u32,
-    ) -> Result<Nv12Staging> {
-        // NV12 requires even dimensions; round up so the chroma plane is
-        // whole. The decoder declares the real width/height downstream, so
-        // a 1px pad on odd inputs is harmless.
+        format: DXGI_FORMAT,
+    ) -> Result<PlaneStaging> {
+        // NV12/P010 require even dimensions; round up so the chroma plane
+        // is whole. The decoder declares the real width/height downstream,
+        // so a 1px pad on odd inputs is harmless.
         let w = (width + 1) & !1;
         let h = (height + 1) & !1;
-        let tex = Self::create_shared_texture(device, w, h, DXGI_FORMAT_NV12)?;
+        let tex = Self::create_shared_texture(device, w, h, format)?;
         let handle = Self::get_shared_handle(&tex)?;
-        Ok(Nv12Staging { tex, handle, width, height })
+        Ok(PlaneStaging { tex, handle, width, height, format })
     }
 
     fn create_shared_texture(
@@ -278,7 +295,7 @@ impl D3D11Decoder {
         };
         let mut texture = None;
         unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-            .map_err(|_| CodecError::CodecNotFound("staging texture creation failed"))?;
+            .map_err(|_| CodecError::CodecNotFound("D3D11 staging CreateTexture2D failed (NV12/P010 shared)"))?;
         Ok(texture.unwrap())
     }
 
@@ -300,17 +317,28 @@ impl D3D11Decoder {
         .map_err(|_| CodecError::CodecNotFound("CreateSharedHandle failed"))
     }
 
-    /// Fallback: download to CPU when GPU export isn't possible.
+    /// Fallback: download to CPU when GPU export isn't possible. 8-bit
+    /// NV12 only — the `DecodedFrame` plane buffers are `Vec<u8>`, so a
+    /// 10-bit P010 surface can't be represented faithfully. The live
+    /// client always exports GPU-resident (`gpu_export = true`), so this
+    /// path is reached only on the null-decode-texture anomaly; a 10-bit
+    /// stream there fails loudly rather than emitting downscaled garbage.
+    /// 10-bit goes through `export_gpu_frame` (P010 staging) instead.
     #[allow(clippy::cast_sign_loss)]
     fn download_frame_cpu(&self, hw_frame: &AVFrame) -> Result<Frame> {
         let mut sw_frame = AVFrame::new();
-        sw_frame.set_format(ffi::AV_PIX_FMT_NV12);
-
+        // Leave the format unset so `av_hwframe_transfer_data` picks the
+        // surface's native sw format (NV12 for 8-bit, P010 for 10-bit) —
+        // forcing NV12 on a P010 surface is rejected by the transfer.
         let rc = unsafe {
             ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), hw_frame.as_ptr(), 0)
         };
         if rc < 0 {
             return Err(CodecError::Ffmpeg(RsmpegError::AVError(rc)));
+        }
+        if sw_frame.format != ffi::AV_PIX_FMT_NV12 {
+            // P010 (or anything else): the 8-bit CPU path can't carry it.
+            return Err(CodecError::UnsupportedInputFormat);
         }
 
         let width = sw_frame.width as u32;

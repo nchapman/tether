@@ -68,14 +68,14 @@ async fn main() -> anyhow::Result<()> {
     // function returns profiles in PROFILE_PREFERENCE order so logs
     // look natural.
     let mut client_decode_profiles = tether_probe::client_decode_profiles();
-    // Renderer capability gate: the 10-bit biplanar (`Biplanar16`) layout
-    // allocates `R16Unorm` Y + `Rg16Unorm` UV textures which require the
-    // adapter to advertise `TEXTURE_FORMAT_16BIT_NORM`. On adapters that
-    // don't (lavapipe, SwiftShader, very old mobile GPUs) the renderer
-    // would panic on the first 10-bit frame allocation. The codec probe
-    // alone can't see this — it doesn't build a wgpu adapter. Filter
-    // 10-bit profiles out of our advert so the host's negotiator never
-    // picks one we can't actually render.
+    // Renderer capability gate for 10-bit. The codec decode probe can't
+    // see whether the *renderer* can present 10-bit, so each backend's
+    // `supports_10bit_render` answers that (the platform-specific reason
+    // lives in its doc comment): on Linux/macOS it's the wgpu adapter's
+    // `TEXTURE_FORMAT_16BIT_NORM`; on Windows it's D3D11 P010 texture
+    // support. Filter 10-bit profiles out of our advert when the renderer
+    // can't present them so the host's negotiator never picks one we
+    // can't actually render.
     if !tether_render::supports_10bit_render().await {
         let before = client_decode_profiles.len();
         client_decode_profiles.retain(|p| p.bit_depth == 8);
@@ -83,8 +83,8 @@ async fn main() -> anyhow::Result<()> {
         if dropped > 0 {
             info!(
                 dropped_profiles = dropped,
-                "renderer adapter lacks TEXTURE_FORMAT_16BIT_NORM; \
-                 dropping 10-bit profiles from the decode-capability advert"
+                "renderer cannot present 10-bit; dropping 10-bit profiles \
+                 from the decode-capability advert"
             );
         }
     }

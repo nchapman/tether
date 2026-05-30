@@ -25,12 +25,20 @@
 //! 2. Each side [`KeyedPairing::make_confirmation`] for its own direction and
 //!    [`KeyedPairing::verify_confirmation`] the peer's. The confirmation is
 //!    **direction-tagged** (`H2C` / `C2H`) and keyed by an HKDF-derived
-//!    subkey, not the raw SPAKE2 output. The direction tag is the
-//!    anti-reflection defense that symmetric SPAKE2 requires: without it a
-//!    network attacker could echo a party's own message back and complete
-//!    pairing against it. The [`Transcript`] folds in the TLS exporter
-//!    (channel binding) and both cert fingerprints (kills unknown-key-share),
-//!    plus the protocol version (downgrade defense).
+//!    subkey, not the raw SPAKE2 output. Symmetric SPAKE2 is reflection-prone
+//!    (the key is message-order-independent), and the two defenses cover
+//!    distinct attackers:
+//!      - The **direction tag** stops a *passive relay* that forwards SPAKE2
+//!        bytes unmodified but can't terminate TLS: it can't replay one party's
+//!        confirmation as the other direction's reply, because the tag is the
+//!        first thing fed into the MAC.
+//!      - The **TLS exporter** (channel binding) in the [`Transcript`] stops a
+//!        *TLS-terminating MITM*: two TLS legs yield two different exporters, so
+//!        the confirmation MACs can't agree. This is the load-bearing defense
+//!        once an attacker can terminate TLS (a reflection attacker becomes
+//!        exactly that case).
+//!    The transcript also folds in both cert fingerprints (kills
+//!    unknown-key-share) and the protocol version (downgrade defense).
 //!
 //! The SPAKE2 key itself already commits to the password, both identities, and
 //! both wire messages (verified against the crate's `finish()` transcript), so
@@ -138,7 +146,9 @@ pub enum PairingError {
 }
 
 /// Which side of the exchange a confirmation MAC authenticates. The tag is
-/// mixed into the MAC so a reflected message can never validate as the reply.
+/// mixed into the MAC so a *passive relay* can't replay one party's
+/// confirmation as the other direction's reply. (A TLS-terminating MITM is
+/// caught by the exporter binding in the [`Transcript`], not by this tag.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     HostToClient,

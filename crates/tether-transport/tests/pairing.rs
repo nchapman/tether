@@ -8,15 +8,13 @@
 use std::net::Ipv4Addr;
 
 use tether_pairing::{
-    Direction, Fingerprint, PairingStart, Transcript, EXPORTER_LABEL, EXPORTER_LEN,
+    Direction, Fingerprint, PairingStart, Transcript, EXPORTER_CONTEXT, EXPORTER_LABEL,
+    EXPORTER_LEN,
 };
 use tether_protocol::control::ControlMessage;
 use tether_protocol::pairing::{PairingClientMsg, PairingConfirm, PairingResult, PairingServerMsg};
 use tether_protocol::PROTOCOL_VERSION;
 use tether_transport::{Client, Server, ServerAuth};
-
-/// Empty exporter context; both ends must pass identical label + context.
-const EXPORTER_CONTEXT: &[u8] = b"";
 
 fn transcript<'a>(
     exporter: &'a [u8; EXPORTER_LEN],

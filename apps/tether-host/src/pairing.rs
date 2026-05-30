@@ -257,11 +257,13 @@ async fn authorize_resume(
 /// with a fresh random PIN, so it can never accidentally succeed.
 async fn decoy_reject(mut pending: PendingConnection, client_spake2: Vec<u8>) -> Authorized {
     let start = PairingStart::new(tether_pairing::generate_pin().as_bytes());
-    let challenge = PairingServerMsg::PairChallenge {
-        spake2: start.outbound_msg().to_vec(),
-    };
-    // Mirror the real flow's message shape; ignore the cryptographic outcome.
+    let host_spake2 = start.outbound_msg().to_vec();
+    // Do the SPAKE2 scalar-mult *before* sending the challenge, exactly as the
+    // real path does — otherwise the decoy's challenge would arrive a curve-op
+    // sooner and the timing itself would be the oracle we built this to hide.
+    // The cryptographic outcome is ignored (a fresh random PIN can't succeed).
     let _ = start.into_keyed(&client_spake2);
+    let challenge = PairingServerMsg::PairChallenge { spake2: host_spake2 };
     if pending.send_pairing(&challenge).await.is_ok() {
         // Consume the client's confirmation if it sends one, so the timing and
         // message count match a genuine failed attempt.
@@ -304,14 +306,13 @@ async fn authorize_pair(
     let keyed = match start.into_keyed(&client_spake2) {
         Ok(k) => k,
         Err(e) => {
-            // Malformed client SPAKE2 message. Uniform failure on the wire (the
-            // window is already burned above). Sending a challenge here would
-            // require a valid key we don't have, so this is the one refusal that
-            // can't reach the challenge stage — but it's only reachable with a
-            // window open, so it leaks nothing about window state.
-            let _ = pending.send_pairing(&reject_result()).await;
-            pending.reject(close_code::REFUSED, b"refused");
-            return Authorized::Refused(RefusedReason::Protocol(format!("client SPAKE2: {e}")));
+            // Malformed client SPAKE2 message. Refuse via the decoy so the wire
+            // shape (challenge → reject) matches a wrong-PIN attempt rather than
+            // an early bare reject — the message count would otherwise be an
+            // oracle. The window is already burned above; the decoy seeds its
+            // own fresh key, so the malformed bytes simply fail inside it.
+            tracing::warn!(error = %e, "malformed client SPAKE2 message; refusing");
+            return decoy_reject(pending, client_spake2).await;
         }
     };
     if let Err(e) = pending
@@ -641,9 +642,12 @@ mod tests {
             let _ = p.recv_pairing::<PairingServerMsg>().await; // message or close
         });
 
-        // Refused as a protocol error (not a clean PairingRequired), window
-        // burned, nothing persisted.
-        assert!(matches!(auth, Authorized::Refused(RefusedReason::Protocol(_))));
+        // Refused (via the decoy, so it's wire-indistinguishable from a
+        // wrong-PIN attempt), window burned, nothing persisted.
+        assert!(matches!(
+            auth,
+            Authorized::Refused(RefusedReason::PairingRequired)
+        ));
         assert!(
             state.window.lock().unwrap().is_none(),
             "window burned even on a malformed message"

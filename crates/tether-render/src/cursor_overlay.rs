@@ -501,7 +501,7 @@ mod wgpu_overlay {
         /// Upload `snap`'s pixels into a fresh `Rgba8Unorm` texture and
         /// make it the active sprite. Called only when the active id
         /// changes, so a static cursor pays nothing here.
-        fn upload_sprite(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, snap: &CursorSnapshot) {
+        fn upload_sprite(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, snap: &CursorSnapshot<'_>) {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("tether-render cursor sprite"),
                 size: wgpu::Extent3d {

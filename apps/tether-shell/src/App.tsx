@@ -28,7 +28,11 @@ type ExitedEvent = { role: "host" | "client" };
 
 function HostPanel() {
   const [running, setRunning] = useState(false);
-  const [testPattern, setTestPattern] = useState(true);
+  // Default off: real screen capture negotiates HEVC, which works on the
+  // verified Windows/QSV path. Test pattern forces the H.264 floor, whose
+  // only Windows encoder (h264_mf) fails the self-decodable-IDR check — a
+  // black window. Keep the toggle for cross-platform dev.
+  const [testPattern, setTestPattern] = useState(false);
   const [addr, setAddr] = useState("");
   const [fingerprint, setFingerprint] = useState("");
   const [peer, setPeer] = useState<string | null>(null);

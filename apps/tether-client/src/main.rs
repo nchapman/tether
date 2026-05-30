@@ -915,7 +915,7 @@ async fn main() -> anyhow::Result<()> {
     // dispatch — for desktop captures (`sdr_desktop`) this is the
     // sRGB path, eliminating the BT.709-vs-sRGB transfer-curve
     // mismatch the spec-blind chain previously had to absorb.
-    tether_render::run(
+    let render_result = tether_render::run(
         "tether-client",
         (INITIAL_WIDTH, INITIAL_HEIGHT),
         server_hello.color_space,
@@ -924,16 +924,24 @@ async fn main() -> anyhow::Result<()> {
         frames,
         cursor_channel,
         Some(on_event),
-    )?;
+    );
 
     // Normal window-close path. Notify the host so it can tear down its
     // capture, encoder, and libei session immediately instead of waiting
     // for QUIC's idle timeout.
-    reporter.emit(&EngineEvent::Disconnected {
-        reason: "window closed".to_string(),
-    });
+    let reason = match &render_result {
+        Ok(()) => "window closed".to_string(),
+        Err(e) => format!("render error: {e}"),
+    };
+    reporter.emit(&EngineEvent::Disconnected { reason });
     say_goodbye(&conn, "client closing").await;
-    Ok(())
+
+    // Exit the process explicitly rather than returning. The IPC stdin
+    // stop-watcher (spawned in `--ipc` mode) parks a `tokio::io::stdin()`
+    // blocking read that can't be cancelled, so letting `main` return
+    // would hang the runtime's drop on that stuck thread. We own no state
+    // needing cleanup here (same rationale as the Ctrl-C handler above).
+    std::process::exit(if render_result.is_ok() { 0 } else { 1 });
 }
 
 /// Block until the shell sends a `Stop` command, closes our stdin (the

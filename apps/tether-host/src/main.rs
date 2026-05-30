@@ -138,7 +138,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cert_dir = persistent_cert_dir()?;
-    let server = Server::bind_persistent(bind, &cert_dir).await?;
+    let server = match Server::bind_persistent(bind, &cert_dir).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Surface bind failures (e.g. the port already in use) to the
+            // shell instead of dying silently.
+            reporter.emit(&EngineEvent::Error {
+                message: format!("failed to bind {bind}: {e}"),
+            });
+            // In IPC mode the stdin stop-watcher's blocking read would hang
+            // the runtime drop, so exit the process directly; the
+            // standalone CLI has no such thread and returns for a clean
+            // anyhow-formatted error.
+            if reporter.is_json() {
+                std::process::exit(1);
+            }
+            return Err(e.into());
+        }
+    };
     let local = server.local_addr()?;
     let fingerprint = server.fingerprint();
     let fp_hex = hex_encode(&fingerprint);

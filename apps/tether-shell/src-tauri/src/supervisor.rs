@@ -107,15 +107,18 @@ impl Supervisor {
                         if line.is_empty() {
                             continue;
                         }
+                        tracing::debug!(role = role_owned, line, "engine stdout line");
                         match serde_json::from_str::<EngineEvent>(line) {
                             Ok(event) => {
-                                let _ = app_for_reader.emit(
+                                if let Err(e) = app_for_reader.emit(
                                     "engine-status",
                                     StatusPayload {
                                         role: role_owned.clone(),
                                         event,
                                     },
-                                );
+                                ) {
+                                    tracing::error!(error = %e, role = role_owned, "emit engine-status failed");
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, line, role = role_owned, "unparseable engine line");

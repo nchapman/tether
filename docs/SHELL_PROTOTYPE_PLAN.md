@@ -118,13 +118,26 @@ hook.
     connecting/connected/disconnected/error status. ✓ (Stats deferred with the
     engine-side `Stats` event.)
 
-### Phase 5 — Loopback validation (Windows, one machine) — NEXT
-11. Build engines (`cargo build -p tether-host -p tether-client`), run
-    `pnpm tauri dev`, Start hosting (test-pattern) → copy fingerprint → Connect
-    → native video window appears → Disconnect closes it → Quit kills both
-    engines. This is interactive (click-through in the webview); see
-    `apps/tether-shell/README.md`. The Rust + frontend both compile and the
-    shell launches with window + tray; the click-through pass is pending.
+### Phase 5 — Loopback validation (Windows, one machine) — DONE
+11. Verified end-to-end on one Windows box: `pnpm tauri dev`, **Start hosting
+    (real capture)** → copy addr + fingerprint → Connect → native client window
+    shows live desktop (HEVC/QSV) → close window exits cleanly → engines reaped.
+    Full IPC lifecycle (`listening` → `connecting` → `peer_connected` →
+    `connected` → `disconnected`) round-tripped through the supervisor into the
+    UI. See `apps/tether-shell/README.md`.
+
+    Two bugs found and fixed during validation:
+    - **Client hung on window close.** The `--ipc` stdin stop-watcher parks a
+      `tokio::io::stdin()` blocking read that can't be cancelled, so returning
+      from `main` hung the runtime drop. Fixed: the normal-close + render-error
+      paths now `std::process::exit` (matching the Ctrl-C handler). The host
+      bind-failure path exits explicitly in IPC mode for the same reason.
+    - **Black window with test pattern.** Test pattern forces the H.264 floor;
+      this box's only H.264 encoder (`h264_mf`) fails the self-decodable-IDR
+      check, so the host sent `Goodbye(InternalError)` immediately. Not a shell
+      bug — real capture negotiates HEVC/QSV and works. The UI's test-pattern
+      toggle now defaults **off**, and host bind failures surface as an
+      `error` IPC event instead of dying silently.
 
 ### Phase 6 — Tidy / CI note
 12. Ensure `cargo build -p tether-host -p tether-client` (with `--ipc`) and the

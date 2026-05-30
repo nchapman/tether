@@ -37,8 +37,7 @@ use crate::{
 
 use super::video_processor::VideoProcessorState;
 
-/// Matches FFmpeg's `AVD3D11VAFramesContext` from `hwcontext_d3d11va.h`.
-/// Matches FFmpeg 8.x `AVD3D11VAFramesContext` from hwcontext_d3d11va.h.
+/// Matches FFmpeg 8.x `AVD3D11VAFramesContext` from `hwcontext_d3d11va.h`.
 /// Size assertion guards against layout drift across FFmpeg versions.
 #[repr(C)]
 struct AvD3D11VAFramesContext {
@@ -354,6 +353,9 @@ impl D3D11Encoder {
             Some(AVDictionary::new(c"forced_idr", c"1", 0)
                 .set(c"async_depth", c"1", 0))
         } else if backend_name.contains("mf") {
+            // Force the hardware MFT (`hw_encoding=1`). Without it
+            // `hevc_mf` / `h264_mf` may select a software MFT, which
+            // defeats the zero-copy D3D11 texture input path.
             Some(AVDictionary::new(c"hw_encoding", c"1", 0))
         } else {
             None

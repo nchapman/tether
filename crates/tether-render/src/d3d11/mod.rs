@@ -874,6 +874,7 @@ fn plane_srv_formats(format: u32) -> Result<(DXGI_FORMAT, DXGI_FORMAT)> {
 /// `621badc` (Main10's `'x420'` rejected by the renderer), so catching the
 /// drift in default CI is cheaper than on a user's desk. The neutral `u32`
 /// currency keeps `tether-client` free of a `windows`-crate dependency.
+#[allow(clippy::cast_sign_loss)]
 pub fn decode_plane_srv_formats(format: u32) -> Option<(u32, u32)> {
     plane_srv_formats(format)
         .ok()
@@ -1102,16 +1103,22 @@ fn make_immutable_texture(
 }
 
 #[cfg(test)]
+// DXGI_FORMAT newtypes wrap i32; comparing/forwarding them as raw u32 (the
+// cross-crate currency) is the same cast the production helpers above
+// silence. Scope the allow to the test module rather than dotting it on
+// each assertion.
+#[allow(clippy::cast_sign_loss)]
 mod tests {
     use super::*;
     use tether_protocol::control::VideoColorSpec;
 
     /// Pins the renderer's decode-format → plane-SRV table against the
     /// real `DXGI_FORMAT` constants: NV12 (8-bit) samples through R8 luma
-    /// + R8G8 chroma; P010 (10-bit MSB-aligned) through R16 + R16G16.
-    /// Anything else is a negotiation/decoder bug and must be rejected
-    /// rather than sampled as garbage. No GPU — pure table check, the
-    /// renderer side of the cross-crate agreement asserted in tether-client's
+    /// plus R8G8 chroma; P010 (10-bit MSB-aligned) through R16 plus R16G16
+    /// chroma. Anything else is a negotiation/decoder bug and must be
+    /// rejected rather than sampled as garbage. No GPU — pure table check,
+    /// the renderer side of the cross-crate agreement asserted in
+    /// tether-client's
     /// `windows_format_tables::decoder_output_is_subset_of_renderer_accept`.
     #[test]
     fn plane_srv_formats_maps_nv12_and_p010_rejects_others() {

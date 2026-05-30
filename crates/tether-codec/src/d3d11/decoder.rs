@@ -2,10 +2,11 @@
 //! `hevc` decoder with D3D11VA hwaccel for GPU-accelerated decode.
 //!
 //! Decoded D3D11 surfaces are copied to a shared-handle-enabled
-//! staging texture, exported via DXGI shared handle, and returned as
-//! `Frame::Gpu` for zero-copy import into wgpu's Vulkan backend via
-//! `VK_KHR_external_memory_win32`. The one GPU-side CopyResource per
-//! frame avoids the PCIe roundtrip of the previous CPU download path.
+//! staging texture, exported via a DXGI shared NT handle, and returned
+//! as `Frame::Gpu` for the native D3D11 renderer to open on its own
+//! device (`tether_render::d3d11`) — no wgpu/Vulkan bridge. The GPU-side
+//! plane copies per frame avoid the PCIe roundtrip of the previous CPU
+//! download path.
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
@@ -32,13 +33,12 @@ use crate::{
 };
 
 const DECODE_EXTRA_HW_FRAMES: i32 = 4;
-// Shareable so a separate device (wgpu's Vulkan backend) can open the
-// staging texture. `SHARED_NTHANDLE` produces an NT handle via
-// `IDXGIResource1::CreateSharedHandle`, which is what Vulkan's
-// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT` import expects — the
-// legacy `GetSharedHandle` KMT handle is the wrong type for that import.
-// Matches Moonlight's cross-device share (d3d11va.cpp). `SHARED` must be
-// set alongside `SHARED_NTHANDLE`.
+// Shareable so the renderer's separate D3D11 device can open the staging
+// texture via `ID3D11Device1::OpenSharedResource1`. `SHARED_NTHANDLE`
+// produces an NT handle via `IDXGIResource1::CreateSharedHandle`, which is
+// what `OpenSharedResource1` expects — the legacy `GetSharedHandle` KMT
+// handle is the wrong type. Matches Moonlight's cross-device share
+// (d3d11va.cpp). `SHARED` must be set alongside `SHARED_NTHANDLE`.
 const D3D11_RESOURCE_MISC_SHARED: u32 = 0x2;
 const D3D11_RESOURCE_MISC_SHARED_NTHANDLE: u32 = 0x800;
 const D3D11_BIND_SHADER_RESOURCE: u32 = 0x8;
@@ -134,9 +134,11 @@ impl Drop for PlaneStaging {
 unsafe impl Send for D3D11Decoder {}
 
 impl D3D11Decoder {
-    /// `gpu_export` is the renderer's D3D11→Vulkan import capability (see
-    /// the field doc). The host probe builds a decoder with `false` — it
-    /// only checks that decode produces a frame and never renders.
+    /// `gpu_export` selects GPU-resident shared-handle export (the native
+    /// D3D11 renderer opens the handle on its own device) over CPU
+    /// download. Both the live client and the host decode probe pass
+    /// `true`; the probe only checks that decode produces a frame and
+    /// never renders.
     pub fn new(kind: CodecKind, gpu_export: bool) -> Result<Self> {
         init_ffmpeg();
 
@@ -340,10 +342,10 @@ impl D3D11Decoder {
     }
 
     fn get_shared_handle(texture: &ID3D11Texture2D) -> Result<HANDLE> {
-        // NT handle (not the legacy `GetSharedHandle` KMT handle): Vulkan's
-        // `D3D11_TEXTURE` external-memory import opens an NT handle, and
-        // the texture is created with `SHARED_NTHANDLE` above. Read-only
-        // because the renderer only samples it.
+        // NT handle (not the legacy `GetSharedHandle` KMT handle): the
+        // renderer's `ID3D11Device1::OpenSharedResource1` opens an NT
+        // handle, and the texture is created with `SHARED_NTHANDLE` above.
+        // Read-only because the renderer only samples it.
         let dxgi_resource: IDXGIResource1 = texture
             .cast()
             .map_err(|_| CodecError::CodecNotFound("IDXGIResource1 cast failed"))?;
@@ -436,12 +438,10 @@ impl Decoder for D3D11Decoder {
         match self.decoder.receive_frame() {
             Ok(frame) => {
                 // GPU-resident by default: export the decoded D3D11
-                // surface as a shared-handle `Frame::Gpu` for zero-copy
-                // import into wgpu's Vulkan backend
-                // (VK_KHR_external_memory_win32). `gpu_export` is false
-                // only when the renderer's driver lacks that extension
-                // (some AMD Vulkan stacks); then we download to CPU.
-                // `export_gpu_frame` itself also falls back to CPU if the
+                // surface as a shared-handle `Frame::Gpu` for the native
+                // D3D11 renderer to open on its own device. `gpu_export`
+                // is `false` only on the CPU-download path (8-bit NV12
+                // only); `export_gpu_frame` also falls back to CPU if the
                 // decode surface pointer is unexpectedly null.
                 let decoded = if self.gpu_export {
                     self.export_gpu_frame(&frame)?
@@ -531,10 +531,10 @@ mod tests {
 
     /// The decoder's expected GPU-export `DXGI_FORMAT` and the encoder's
     /// `sw_format` (the FFmpeg pixel format fed to the hw_frames pool) are
-    /// two parallel `profile → format` tables for the same physical chroma
-    /// + bit depth. They must agree, or the renderer would import a P010
-    /// surface while the host encoded NV12 (or vice versa). This is the
-    /// encoder↔decoder half of the cross-table consistency check; the
+    /// two parallel `profile → format` tables for the same physical
+    /// (chroma, bit depth). They must agree, or the renderer would import
+    /// a P010 surface while the host encoded NV12 (or vice versa). This is
+    /// the encoder↔decoder half of the cross-table consistency check; the
     /// decoder↔renderer half lives in tether-client. No GPU.
     #[test]
     fn expected_decode_format_agrees_with_encoder_sw_format() {
@@ -562,6 +562,7 @@ mod tests {
     ///   * **4:4:4** — rejected at encoder construction.
     ///   * **Out-of-range bit depth** (12-bit 4:2:0) — D3D11VA emits neither
     ///     NV12 nor P010 for it.
+    ///
     /// The encoder's `d3d11_sw_format` falls back to NV12 for some of these,
     /// but that fallback is unreachable: 4:4:4 is rejected at construction
     /// and the negotiator never selects AV1 or an unmodeled bit depth on

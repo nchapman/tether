@@ -1,9 +1,10 @@
-//! Windows D3D11-accelerated video encoder via FFmpeg's `d3d11va`
-//! hardware device. Supports multiple backend encoders (Media
-//! Foundation `h264_mf`/`hevc_mf`, NVENC `h264_nvenc`/`hevc_nvenc`,
-//! AMF `h264_amf`/`hevc_amf`) — the first one that successfully
-//! opens wins. All share the same D3D11 device for zero-copy texture
-//! input from DXGI Desktop Duplication.
+//! Windows D3D11 video encode + decode via FFmpeg's `d3d11va` hardware
+//! device. The encoder backend is selected by GPU vendor (Intel → QSV,
+//! AMD → AMF, NVIDIA → NVENC, unknown → Media Foundation fallback); see
+//! `encoder::backends_for_vendor`. The decoder uses the generic `h264` /
+//! `hevc` D3D11VA hwaccel. Encode takes zero-copy texture input from DXGI
+//! Desktop Duplication; decode exports shared NT handles to the native
+//! D3D11 renderer.
 
 pub mod decoder;
 pub mod encoder;

@@ -360,10 +360,11 @@ pub enum GpuFrameSource {
     /// Metal texture via wgpu's Metal HAL `texture_from_raw` path.
     #[cfg(target_os = "macos")]
     IOSurface(IOSurfaceFrame),
-    /// Windows D3D11VA decoded NV12 texture with a shared DXGI handle
-    /// for cross-API import into wgpu's Vulkan backend. The texture is
-    /// a GPU-side copy from the decoder's pool surface into a shared-
-    /// handle-enabled staging texture.
+    /// Windows D3D11VA decoded biplanar texture (NV12 8-bit or P010
+    /// 10-bit) with a shared NT handle for cross-device import into the
+    /// native D3D11 renderer, which opens it on its own device. The
+    /// texture is a GPU-side copy from the decoder's pool surface into a
+    /// shared-handle-enabled staging texture.
     #[cfg(target_os = "windows")]
     D3D11Texture(D3D11DecodedTexture),
 }

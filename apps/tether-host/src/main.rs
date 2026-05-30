@@ -663,8 +663,8 @@ async fn handle_client(
                             width = v.width,
                             height = v.height,
                             "SetClientViewport: forcing IDR; encoder rebuild fires only if \
-                             encode dims change (GPU sessions stay at capture dims until the \
-                             wgpu scaler lands)"
+                             encode dims change (GPU sessions stay at capture dims until a \
+                             GPU-path scaler lands)"
                         );
                         force_idr_for_viewport.raise();
                     }

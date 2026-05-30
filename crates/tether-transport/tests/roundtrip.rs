@@ -122,6 +122,62 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutual_tls_exposes_peer_fingerprint_and_matching_exporter() -> anyhow::Result<()> {
+    // With mutual TLS the host must see the client's cert fingerprint (the
+    // identity it will check against the paired-clients allowlist), and both
+    // ends must derive the *same* TLS exporter for the same label/context —
+    // the channel binding the pairing key-confirmation rides on. A mismatch
+    // here would silently break MITM resistance, so pin both.
+    let server = Server::bind((Ipv4Addr::LOCALHOST, 0).into()).await?;
+    let server_addr = server.local_addr()?;
+    let host_fingerprint = server.fingerprint();
+
+    let client = Client::new()?;
+    let client_fingerprint = client.fingerprint();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("server closed")?;
+        let exporter = conn.export_keying_material(b"tether test label", b"ctx", 32)?;
+        let peer_fp = conn.peer_cert_fingerprint();
+        // Keep the connection alive until the client has read its own
+        // exporter, then hand both observations back.
+        conn.send_control(&ControlMessage::ForceIdr).await?;
+        let _ = conn.recv_control().await?;
+        anyhow::Ok((exporter, peer_fp))
+    });
+
+    let conn = client
+        .connect(server_addr, "tether-host", host_fingerprint)
+        .await?;
+    let client_exporter = conn.export_keying_material(b"tether test label", b"ctx", 32)?;
+    // The host's cert fingerprint, observed from the client side.
+    let observed_host_fp = conn.peer_cert_fingerprint();
+    let _ = conn.recv_control().await?;
+    conn.send_control(&ControlMessage::ForceIdr).await?;
+
+    let (host_exporter, observed_client_fp) = server_task.await??;
+
+    assert_eq!(
+        host_exporter, client_exporter,
+        "TLS exporter must agree on both ends of the same connection"
+    );
+    assert_eq!(
+        observed_client_fp,
+        Some(client_fingerprint),
+        "host must observe the client's cert fingerprint"
+    );
+    assert_eq!(
+        observed_host_fp,
+        Some(host_fingerprint),
+        "client must observe the host's cert fingerprint"
+    );
+    // A different label must yield a different exporter (binding is real).
+    let other = conn.export_keying_material(b"different label", b"ctx", 32)?;
+    assert_ne!(other, client_exporter);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_fingerprint_rejects_wrong_cert() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 

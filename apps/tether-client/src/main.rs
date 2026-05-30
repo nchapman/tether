@@ -12,11 +12,13 @@
 //! Usage: `tether-client <host_addr> <cert_fingerprint_hex>`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::bounded;
 use tether_decode::{DecodeCompletion, DecodeJob};
+use tether_ipc::{EngineEvent, Reporter};
 use tether_render::LatestFrame;
 use tether_input::{WinitTranslator, WireEvent};
 use tether_protocol::control::{ControlMessage, GoodbyeCode, Viewport};
@@ -24,9 +26,12 @@ use tether_session::{ClientSession, ClientSessionConfig, ConnectError};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::RenderEvent;
-use tether_transport::{Client, Datagram};
+use tether_transport::{Client, Datagram, ServerAuth};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+mod client_pairing;
+use client_pairing::HostAuth;
 
 // Initial window size — the actual frame dimensions come from
 // `VideoFrameMeta::dimensions` once frames start arriving and the window
@@ -37,24 +42,112 @@ const INITIAL_HEIGHT: u32 = 720;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
+    // Parse args first so `--ipc` routes tracing off stdout (reserved for
+    // the JSON-lines protocol) before the subscriber is installed.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let ipc = raw_args.iter().any(|a| a == "--ipc");
+    let reporter = Reporter::from_ipc_flag(ipc);
+
     // `_tracing_guard` keeps the non-blocking writer's worker thread
     // alive. Dropping it flushes pending log lines and shuts the
     // worker down; binding it for the duration of `main` ensures
     // logs aren't truncated at process exit.
-    let _tracing_guard = init_tracing();
+    let _tracing_guard = init_tracing(reporter.is_json());
 
-    let mut args = std::env::args().skip(1);
-    let addr: SocketAddr = args
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing host address argument"))?
-        .parse()?;
-    let fingerprint_hex = args
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing fingerprint argument"))?;
-    let fingerprint = hex_decode(&fingerprint_hex)?;
+    // Parse args: positional host addr (and optional explicit fingerprint),
+    // plus `--pin <PIN>` (first-contact pairing) and `--label <name>` (display
+    // name to record for the host). `--ipc` was already consumed above.
+    let CliArgs {
+        addr,
+        fingerprint_hex,
+        pin,
+        label,
+    } = parse_cli_args(&raw_args)?;
 
-    let client = Client::new()?;
-    let conn = client.connect(addr, "tether-host", fingerprint).await?;
+    // Decide how to authenticate the host. Precedence: an explicit `--pin`
+    // means first-contact pairing; otherwise an explicit fingerprint or a
+    // known-hosts entry for this address means a pinned reconnect.
+    let config_dir = client_config_dir()?;
+    let known_hosts_path = config_dir.join("known_hosts.json");
+    let known_hosts = tether_pairing::KnownHosts::load(&known_hosts_path).map_err(|e| {
+        // Fail closed: a corrupt known-hosts file could otherwise drop pinning.
+        let msg = format!("failed to load {}: {e}", known_hosts_path.display());
+        reporter.emit(&EngineEvent::Error {
+            message: msg.clone(),
+        });
+        anyhow::anyhow!(msg)
+    })?;
+
+    let (server_auth, mode) = if let Some(pin) = pin {
+        (ServerAuth::TrustOnFirstPair, HostAuth::FirstContact { pin })
+    } else if let Some(fp_hex) = &fingerprint_hex {
+        // Explicit fingerprint reconnect. If this address is already pinned,
+        // the supplied value must match — otherwise this would be a silent
+        // trust downgrade (re-pinning a known host to an attacker-supplied
+        // fingerprint without a PIN). Re-pairing requires --pin.
+        let supplied = hex_decode(fp_hex)?;
+        if let Some(known) = known_hosts.fingerprint(&addr.to_string()) {
+            if known != supplied {
+                let msg = format!(
+                    "supplied fingerprint for {addr} does not match the pinned one; \
+                     use --pin to re-pair after verifying the host"
+                );
+                reporter.emit(&EngineEvent::Error {
+                    message: msg.clone(),
+                });
+                anyhow::bail!(msg);
+            }
+        }
+        (ServerAuth::Pinned(supplied), HostAuth::Resume)
+    } else if let Some(fp) = known_hosts.fingerprint(&addr.to_string()) {
+        (ServerAuth::Pinned(fp), HostAuth::Resume)
+    } else {
+        let msg = format!(
+            "unknown host {addr}: pass --pin <PIN> to pair (the host shows a PIN \
+             under \"Add a device\"), or pass the host fingerprint"
+        );
+        reporter.emit(&EngineEvent::Error {
+            message: msg.clone(),
+        });
+        anyhow::bail!(msg);
+    };
+
+    reporter.emit(&EngineEvent::Connecting {
+        host: addr.to_string(),
+    });
+
+    let client = Client::with_identity(&config_dir)?;
+    let client_fp = client.fingerprint();
+    let pending = match client.connect_pending(addr, "tether-host", server_auth).await {
+        Ok(p) => p,
+        Err(e) => {
+            reporter.emit(&EngineEvent::Error {
+                message: format!("connect failed: {e}"),
+            });
+            return Err(e.into());
+        }
+    };
+    let is_first_contact = matches!(mode, HostAuth::FirstContact { .. });
+    let (conn, host_fp) = match client_pairing::establish(pending, &mode, client_fp).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            reporter.emit(&EngineEvent::Error {
+                message: format!("pairing failed: {e}"),
+            });
+            return Err(e);
+        }
+    };
+
+    // On first contact, pin the host so the next connect is one-click.
+    if is_first_contact {
+        let mut known_hosts = known_hosts;
+        let label = label.unwrap_or_else(|| addr.to_string());
+        known_hosts.insert(addr.to_string(), &host_fp, label, unix_now());
+        if let Err(e) = known_hosts.save(&known_hosts_path) {
+            warn!(error = %e, "paired but failed to persist known-hosts; next connect needs --pin again");
+        }
+    }
+
     let conn = Arc::new(conn);
     info!(remote = %conn.remote_address(), "connected to host");
 
@@ -89,11 +182,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if client_decode_profiles.is_empty() {
-        anyhow::bail!(
-            "no hardware video decoder is available on this client \
+        let message = "no hardware video decoder is available on this client \
              (no codec in PROFILE_PREFERENCE constructed). Tether requires \
              GPU decode; there is no software fallback."
-        );
+            .to_string();
+        reporter.emit(&EngineEvent::Error {
+            message: message.clone(),
+        });
+        anyhow::bail!(message);
     }
 
     // Application-layer handshake: identify ourselves, advertise our
@@ -123,13 +219,22 @@ async fn main() -> anyhow::Result<()> {
             viewport: Some(Viewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)),
         },
     )
-    .await
-    .map_err(|e| match e {
-        ConnectError::ProfileNotAdvertised { .. }
-        | ConnectError::InvalidEncodeProfile { .. }
-        | ConnectError::UnknownBitDepth(_, _) => anyhow::anyhow!("{e}"),
-        ConnectError::Transport(t) => anyhow::Error::from(t),
-    })?;
+    .await;
+    let session = match session {
+        Ok(s) => s,
+        Err(e) => {
+            let err = match e {
+                ConnectError::ProfileNotAdvertised { .. }
+                | ConnectError::InvalidEncodeProfile { .. }
+                | ConnectError::UnknownBitDepth(_, _) => anyhow::anyhow!("{e}"),
+                ConnectError::Transport(t) => anyhow::Error::from(t),
+            };
+            reporter.emit(&EngineEvent::Error {
+                message: format!("handshake failed: {err}"),
+            });
+            return Err(err);
+        }
+    };
     let ClientSession {
         channel: _,
         negotiated: negotiated_profile,
@@ -137,6 +242,14 @@ async fn main() -> anyhow::Result<()> {
         clock_sync,
         client_decode_profiles: _,
     } = session;
+
+    reporter.emit(&EngineEvent::Connected {
+        host: addr.to_string(),
+        profile: format!(
+            "{:?} {:?} {}-bit",
+            negotiated_profile.codec, negotiated_profile.chroma, negotiated_profile.bit_depth
+        ),
+    });
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -844,7 +957,28 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             info!("ctrl-c received, sending Goodbye and exiting");
+            reporter.emit(&EngineEvent::Disconnected {
+                reason: "interrupted".to_string(),
+            });
             say_goodbye(&conn, "client interrupted").await;
+            std::process::exit(0);
+        });
+    }
+
+    // When shell-driven, a `Stop` on stdin (or stdin EOF — the shell
+    // died) closes the session the same way Ctrl-C does: the render loop
+    // owns the main thread, so like the Ctrl-C handler this task sends
+    // Goodbye and exits the process directly rather than trying to unwind
+    // through winit.
+    if reporter.is_json() {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            wait_for_stdin_stop().await;
+            info!("shell stop received; sending Goodbye and exiting");
+            reporter.emit(&EngineEvent::Disconnected {
+                reason: "stopped by shell".to_string(),
+            });
+            say_goodbye(&conn, "client stopped").await;
             std::process::exit(0);
         });
     }
@@ -854,7 +988,7 @@ async fn main() -> anyhow::Result<()> {
     // dispatch — for desktop captures (`sdr_desktop`) this is the
     // sRGB path, eliminating the BT.709-vs-sRGB transfer-curve
     // mismatch the spec-blind chain previously had to absorb.
-    tether_render::run(
+    let render_result = tether_render::run(
         "tether-client",
         (INITIAL_WIDTH, INITIAL_HEIGHT),
         server_hello.color_space,
@@ -863,13 +997,66 @@ async fn main() -> anyhow::Result<()> {
         frames,
         cursor_channel,
         Some(on_event),
-    )?;
+    );
 
     // Normal window-close path. Notify the host so it can tear down its
     // capture, encoder, and libei session immediately instead of waiting
     // for QUIC's idle timeout.
+    let reason = match &render_result {
+        Ok(()) => "window closed".to_string(),
+        Err(e) => format!("render error: {e}"),
+    };
+    reporter.emit(&EngineEvent::Disconnected { reason });
     say_goodbye(&conn, "client closing").await;
-    Ok(())
+
+    // In `--ipc` mode the stdin stop-watcher parks a `tokio::io::stdin()`
+    // blocking read that can't be cancelled, so letting `main` return would
+    // hang the runtime's drop on that stuck thread — exit the process directly
+    // instead (same rationale as the Ctrl-C handler above). In plain CLI mode
+    // there's no such watcher, so return normally and let destructors run —
+    // notably `_tracing_guard`, whose drop flushes buffered log lines.
+    if ipc {
+        std::process::exit(if render_result.is_ok() { 0 } else { 1 });
+    }
+    match render_result {
+        Ok(()) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("render error: {e}")),
+    }
+}
+
+/// Block until the shell sends a `Stop` command, closes our stdin (the
+/// shell process died), or stdin errors — all three mean "shut down."
+/// Mirrors the host's `spawn_stdin_stop_watcher`, but the client races it
+/// against the render loop via a direct process exit rather than a
+/// shutdown notify.
+async fn wait_for_stdin_stop() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match tether_ipc::ShellCommand::from_line(line) {
+                    Ok(tether_ipc::ShellCommand::Stop) => return,
+                    // Host-only pairing commands: a well-formed command that
+                    // doesn't apply to the client. Ignore rather than error.
+                    Ok(tether_ipc::ShellCommand::StartPairing { .. })
+                    | Ok(tether_ipc::ShellCommand::RevokePeer { .. })
+                    | Ok(tether_ipc::ShellCommand::ListPeers) => {
+                        warn!(?line, "ignoring host-only command on client stdin");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, line, "ignoring unrecognized stdin command");
+                    }
+                }
+            }
+            // EOF or read error: the shell is gone — treat as stop.
+            Ok(None) | Err(_) => return,
+        }
+    }
 }
 
 /// Send a `ControlMessage::Goodbye` and close the connection. The
@@ -914,21 +1101,124 @@ async fn say_goodbye_with_code(
     conn.close(0, reason.as_bytes());
 }
 
-fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
+fn init_tracing(ipc: bool) -> tracing_appender::non_blocking::WorkerGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     // Non-blocking writer offloads formatting and the write syscall
     // to a dedicated worker thread. Critical for the client because
     // the FFmpeg log callback bridges into tracing from the decoder
     // thread (which is also the QUIC datagram recv loop's thread);
-    // a synchronous stdout writer there would stall the recv loop
-    // and the input-send task during decode-error storms.
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    // a synchronous writer there would stall the recv loop and the
+    // input-send task during decode-error storms.
+    //
+    // In IPC mode stdout is reserved for the JSON-lines protocol the
+    // shell parses, so logs go to stderr instead. Both branches yield
+    // the same `(NonBlocking, WorkerGuard)` type — `non_blocking` erases
+    // the inner writer behind its channel.
+    let (writer, guard) = if ipc {
+        tracing_appender::non_blocking(std::io::stderr())
+    } else {
+        tracing_appender::non_blocking(std::io::stdout())
+    };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(writer)
         .init();
     guard
+}
+
+/// Parsed command-line arguments for the client.
+#[derive(Debug)]
+struct CliArgs {
+    addr: SocketAddr,
+    /// Explicit host fingerprint (optional): pins the host cert for a reconnect
+    /// without consulting known-hosts. Mutually informative with `--pin`, which
+    /// takes precedence.
+    fingerprint_hex: Option<String>,
+    /// `--pin <PIN>`: present ⇒ first-contact pairing mode.
+    pin: Option<String>,
+    /// `--label <name>`: display name to record for the host on first pair.
+    label: Option<String>,
+}
+
+/// Parse the client CLI. Positional[0] is the host address (required);
+/// positional[1] is an optional explicit fingerprint. `--pin`/`--label` consume
+/// the following token as their value; `--ipc` is handled earlier and ignored
+/// here; other `--flags` are ignored with a warning.
+fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut pin = None;
+    let mut label = None;
+    let mut it = raw_args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--ipc" => {}
+            "--pin" => pin = Some(take_flag_value(&mut it, "--pin")?),
+            "--label" => label = Some(take_flag_value(&mut it, "--label")?),
+            other if other.starts_with("--") => {
+                warn!(flag = other, "ignoring unknown flag");
+            }
+            other => positional.push(other),
+        }
+    }
+    if matches!(pin.as_deref(), Some("")) {
+        anyhow::bail!("--pin value must not be empty");
+    }
+    let addr: SocketAddr = positional
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing host address argument"))?
+        .parse()?;
+    let fingerprint_hex = positional.get(1).map(|s| s.to_string());
+    Ok(CliArgs {
+        addr,
+        fingerprint_hex,
+        pin,
+        label,
+    })
+}
+
+/// Consume the next token as a flag's value. Rejects a missing value and a
+/// value that looks like another flag (e.g. `--pin --label x`), which would
+/// otherwise silently swallow the next flag as the value.
+fn take_flag_value<'a>(
+    it: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> anyhow::Result<String> {
+    match it.next() {
+        Some(v) if v.starts_with("--") => {
+            anyhow::bail!("{flag} requires a value, but got the flag '{v}'")
+        }
+        Some(v) => Ok(v.clone()),
+        None => anyhow::bail!("{flag} requires a value"),
+    }
+}
+
+/// Directory the client caches its identity (`client_cert.der`/`client_key.der`)
+/// and `known_hosts.json` in. Mirrors the host's `persistent_cert_dir`: default
+/// `$HOME/.tether` (or `$USERPROFILE` on Windows), overridable with
+/// `$TETHER_CERT_DIR` for testing or sharing between instances.
+fn client_config_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "neither $TETHER_CERT_DIR nor $HOME/$USERPROFILE is set; \
+                 can't choose a config directory"
+            )
+        })?;
+    Ok(PathBuf::from(home).join(".tether"))
+}
+
+/// Seconds since the Unix epoch, for stamping when a host was paired. A
+/// pre-epoch clock clamps to 0 rather than failing the connect.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn hex_decode(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -1001,5 +1291,61 @@ mod windows_format_tables {
             "expected ≥2 Windows-decodable profiles (NV12 8-bit + P010 10-bit) in \
              PROFILE_PREFERENCE, only {covered} produced a decode format"
         );
+    }
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn positional_addr_and_optional_fingerprint() {
+        let parsed = parse_cli_args(&args(&["127.0.0.1:7654"])).expect("addr only");
+        assert_eq!(parsed.addr.to_string(), "127.0.0.1:7654");
+        assert!(parsed.fingerprint_hex.is_none());
+        assert!(parsed.pin.is_none());
+
+        let parsed = parse_cli_args(&args(&["127.0.0.1:7654", "deadbeef"])).expect("addr + fp");
+        assert_eq!(parsed.fingerprint_hex.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn pin_and_label_consume_their_values() {
+        let parsed = parse_cli_args(&args(&[
+            "--pin", "12345678", "127.0.0.1:7654", "--label", "my laptop",
+        ]))
+        .expect("flags + positional");
+        assert_eq!(parsed.pin.as_deref(), Some("12345678"));
+        assert_eq!(parsed.label.as_deref(), Some("my laptop"));
+        assert_eq!(parsed.addr.to_string(), "127.0.0.1:7654");
+    }
+
+    #[test]
+    fn flag_as_pin_value_is_rejected() {
+        // `--pin --label x` must not swallow `--label` as the PIN.
+        let err = parse_cli_args(&args(&["--pin", "--label", "x", "127.0.0.1:7654"]))
+            .expect_err("flag-as-value must error");
+        assert!(err.to_string().contains("--pin"));
+    }
+
+    #[test]
+    fn empty_pin_is_rejected() {
+        let err =
+            parse_cli_args(&args(&["--pin", "", "127.0.0.1:7654"])).expect_err("empty pin errors");
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn missing_addr_is_rejected() {
+        assert!(parse_cli_args(&args(&["--pin", "12345678"])).is_err());
+    }
+
+    #[test]
+    fn missing_flag_value_is_rejected() {
+        assert!(parse_cli_args(&args(&["127.0.0.1:7654", "--pin"])).is_err());
     }
 }

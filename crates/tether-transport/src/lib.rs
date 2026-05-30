@@ -24,6 +24,7 @@ mod channel;
 mod client;
 mod connection;
 mod handshake;
+mod pending;
 mod server;
 pub mod tls;
 
@@ -32,9 +33,10 @@ pub mod tls;
 pub mod test_support;
 
 pub use channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
-pub use client::Client;
+pub use client::{Client, ServerAuth};
 pub use connection::{Connection, Datagram};
 pub use handshake::{ClientHelloReceived, HostHandshake};
+pub use pending::PendingConnection;
 pub use server::Server;
 pub use tls::CertFingerprint;
 
@@ -91,6 +93,8 @@ pub enum TransportError {
     FrameTooLarge { size: usize, max: usize },
     #[error("input stream not available on this side of the connection")]
     InputStreamWrongRole,
+    #[error("TLS keying-material exporter unavailable")]
+    ExporterUnavailable,
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;

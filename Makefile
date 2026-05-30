@@ -4,7 +4,8 @@
 # description. Targets are documentation; the real cost-of-truth is
 # the cargo invocation each one wraps.
 
-.PHONY: help build release test test-hw test-correctness bench probe clippy fmt check clean
+.PHONY: help build release test test-hw test-correctness bench probe clippy fmt check clean \
+        engines shell shell-install shell-check
 
 help:
 	@awk 'BEGIN { FS = ":.*##"; printf "\nTether dev targets:\n\n" } \
@@ -44,3 +45,21 @@ fmt: ## Format the workspace
 
 clean: ## Cargo clean
 	cargo clean
+
+# --- Tauri shell (control-plane UI) ---------------------------------------
+# The shell is excluded from the cargo workspace and builds via pnpm + the
+# Tauri CLI. It spawns the host/client binaries from target/debug, so those
+# must be built first (the `shell` target does this for you).
+
+engines: ## Build the host + client binaries the shell spawns (target/debug)
+	cargo build -p tether-host -p tether-client
+
+shell-install: ## Install the shell's frontend dependencies (run once, or after dep changes)
+	pnpm --dir apps/tether-shell install
+
+shell: engines ## Run the Tauri shell in dev mode (builds the engines first)
+	pnpm --dir apps/tether-shell tauri dev
+
+shell-check: ## Typecheck the shell without running it (TypeScript + src-tauri Rust)
+	pnpm --dir apps/tether-shell exec tsc --noEmit
+	cargo check --manifest-path apps/tether-shell/src-tauri/Cargo.toml

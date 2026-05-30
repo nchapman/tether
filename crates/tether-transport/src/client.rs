@@ -1,15 +1,33 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::{trace, warn};
 
 use crate::{
     connection::{Connection, STREAM_PREAMBLE},
-    tls::{ensure_crypto_provider, CertFingerprint, PinnedCertVerifier},
+    pending::PendingConnection,
+    tls::{
+        ensure_crypto_provider, generate_self_signed, load_or_generate_client_identity,
+        CertFingerprint, PermissiveServerCertVerifier, PinnedCertVerifier, SelfSignedCert,
+    },
     Result, TransportError,
 };
+
+/// How the client authenticates the host's certificate.
+pub enum ServerAuth {
+    /// Reconnect to a known host: pin its cert to this fingerprint (from
+    /// known-hosts). The normal, post-pairing path.
+    Pinned(CertFingerprint),
+    /// First-contact pairing: the host's fingerprint isn't known yet, so accept
+    /// any cert at the TLS layer. The SPAKE2 key-confirmation (bound to the TLS
+    /// exporter) authenticates the host; the caller then persists the observed
+    /// fingerprint to known-hosts for future [`ServerAuth::Pinned`] connects.
+    TrustOnFirstPair,
+}
 
 /// Target size for the UDP receive buffer (`SO_RCVBUF`). Linux's
 /// default of ~208 KB overflows in milliseconds when a bursty H.265
@@ -34,11 +52,37 @@ const UDP_RECV_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct Client {
     endpoint: quinn::Endpoint,
+    /// The client's own self-signed identity, presented to the host under
+    /// mutual TLS. The host fingerprints it for the paired-clients allowlist.
+    identity: SelfSignedCert,
 }
 
 impl Client {
-    /// Create a new client endpoint bound to an OS-chosen local UDP port.
+    /// Create a new client endpoint bound to an OS-chosen local UDP port with
+    /// a fresh **ephemeral** client identity. The identity changes on every
+    /// call — fine for tests and one-shot processes. Long-running clients that
+    /// want stable pairing should use [`Self::with_identity`].
     pub fn new() -> Result<Self> {
+        let identity = generate_self_signed(vec!["tether-client".into()])?;
+        Self::with_identity_cert(identity)
+    }
+
+    /// Create a client endpoint with a **persistent** identity loaded from (or
+    /// generated into) `identity_dir` as `client_cert.der` / `client_key.der`.
+    /// Stable fingerprint across runs, so a host that paired this client once
+    /// keeps recognizing it.
+    pub fn with_identity(identity_dir: &Path) -> Result<Self> {
+        let identity = load_or_generate_client_identity(identity_dir)?;
+        Self::with_identity_cert(identity)
+    }
+
+    /// SHA-256 fingerprint of this client's certificate — the identity the
+    /// host stores in its allowlist when pairing.
+    pub fn fingerprint(&self) -> CertFingerprint {
+        self.identity.fingerprint
+    }
+
+    fn with_identity_cert(identity: SelfSignedCert) -> Result<Self> {
         ensure_crypto_provider();
         let bind: SocketAddr = "0.0.0.0:0".parse().expect("static literal");
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -77,44 +121,61 @@ impl Client {
             std_socket,
             runtime,
         )?;
-        Ok(Self { endpoint })
+        Ok(Self { endpoint, identity })
     }
 
     /// Connect to a server. `server_name` is the SNI / TLS server name —
     /// our self-signed cert is issued with SANs `["tether-host",
     /// "localhost"]` so either works. `expected_fingerprint` is the
     /// SHA-256 of the server's DER cert, exchanged out of band.
+    /// Connect and return a [`PendingConnection`] — the TLS handshake is
+    /// complete and the pairing stream is wired, but no session exists yet. The
+    /// caller drives the pairing exchange (or a `Resume`) and then promotes it
+    /// via [`PendingConnection::into_connection`]. `server_auth` selects
+    /// whether the host cert is pinned (reconnect) or trusted-on-first-pair.
+    pub async fn connect_pending(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        server_auth: ServerAuth,
+    ) -> Result<PendingConnection> {
+        // Present our identity under mutual TLS. Rebuild the key from its DER
+        // bytes (PrivatePkcs8KeyDer isn't trivially cloneable) so this can be
+        // called more than once on the same Client.
+        let client_chain = self.identity.chain.clone();
+        let client_key = PrivatePkcs8KeyDer::from(self.identity.key.secret_pkcs8_der().to_vec());
+        let client_config = make_client_config(server_auth, client_chain, client_key.into())?;
+        let connecting = self.endpoint.connect_with(client_config, addr, server_name)?;
+        let conn = connecting.await?;
+        trace!(remote = %conn.remote_address(), "client connection established");
+        // Open the pairing stream (stream #1) and write its preamble. In QUIC,
+        // opening a stream is local-only — the peer doesn't see it until the
+        // first STREAM frame arrives — so the four-byte preamble forces a frame
+        // that unblocks the host's `accept_bi`. Control and input open later,
+        // in `into_connection`, only once authorized.
+        let (mut pairing_send, pairing_recv) = conn.open_bi().await?;
+        pairing_send.write_all(STREAM_PREAMBLE).await?;
+        Ok(PendingConnection::new_client(conn, pairing_send, pairing_recv))
+    }
+
+    /// Convenience: connect and immediately promote to a session with **no
+    /// pairing exchange**, pinning the host cert to `expected_fingerprint`.
+    ///
+    /// For transport-mechanics tests and simple peers only; the production
+    /// client uses [`Self::connect_pending`] so it can pair or resume first.
+    /// The host must use the matching convenience path ([`Server::accept`]) —
+    /// pointing this at a host that runs a pairing exchange will hang (the host
+    /// waits for pairing messages this path never sends).
     pub async fn connect(
         &self,
         addr: SocketAddr,
         server_name: &str,
         expected_fingerprint: CertFingerprint,
     ) -> Result<Connection> {
-        let client_config = make_client_config(expected_fingerprint)?;
-        let connecting = self.endpoint.connect_with(client_config, addr, server_name)?;
-        let conn = connecting.await?;
-        trace!(remote = %conn.remote_address(), "client connection established");
-        // Match the stream-open order the server expects:
-        //   1. bidirectional control stream
-        //   2. unidirectional input stream
-        //
-        // In QUIC, opening a stream is local-only — the peer doesn't see
-        // the stream until the first STREAM frame arrives. We write a
-        // four-byte zero "length prefix" on each newly opened stream as a
-        // preamble, which the server consumes and discards. This unblocks
-        // the server's accept_*() calls so the Connection is fully wired
-        // by the time both constructors return, even when no real
-        // application data is ready yet.
-        let (mut control_send, control_recv) = conn.open_bi().await?;
-        control_send.write_all(STREAM_PREAMBLE).await?;
-        let mut input_send = conn.open_uni().await?;
-        input_send.write_all(STREAM_PREAMBLE).await?;
-        Ok(Connection::new_client(
-            conn,
-            control_send,
-            control_recv,
-            input_send,
-        ))
+        let pending = self
+            .connect_pending(addr, server_name, ServerAuth::Pinned(expected_fingerprint))
+            .await?;
+        pending.into_connection().await
     }
 
     /// Close the endpoint immediately, without waiting for in-flight
@@ -132,11 +193,26 @@ impl Client {
     }
 }
 
-fn make_client_config(fingerprint: CertFingerprint) -> Result<quinn::ClientConfig> {
-    let crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(PinnedCertVerifier::new(fingerprint))
-        .with_no_client_auth();
+fn make_client_config(
+    server_auth: ServerAuth,
+    client_chain: Vec<CertificateDer<'static>>,
+    client_key: PrivateKeyDer<'static>,
+) -> Result<quinn::ClientConfig> {
+    // Pin TLS 1.3 explicitly (matching the server). QUIC already mandates 1.3
+    // at the protocol layer, but being explicit keeps the exporter's RFC 8446
+    // channel-binding guarantee from silently weakening if this config is ever
+    // reused over a non-QUIC transport.
+    let dangerous = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous();
+    let crypto = match server_auth {
+        ServerAuth::Pinned(fingerprint) => {
+            dangerous.with_custom_certificate_verifier(PinnedCertVerifier::new(fingerprint))
+        }
+        ServerAuth::TrustOnFirstPair => {
+            dangerous.with_custom_certificate_verifier(PermissiveServerCertVerifier::new())
+        }
+    }
+    .with_client_auth_cert(client_chain, client_key)?;
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|e| TransportError::Rustls(rustls::Error::General(format!("{e}"))))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic));

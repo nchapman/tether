@@ -17,6 +17,7 @@ pub mod control;
 pub mod cursor;
 pub mod guard;
 pub mod input;
+pub mod pairing;
 pub mod video;
 
 pub use guard::GpuResourceGuard;
@@ -33,6 +34,16 @@ use serde::{Deserialize, Serialize};
 /// `fragment_index`, and the `InputEchoBatch` size) and choosing an actual
 /// payload chunk size that keeps the encoded packet under this budget.
 pub const MAX_DATAGRAM_PAYLOAD: usize = 1200;
+
+/// Wire-protocol version string. Bumped on any breaking change to the
+/// control/handshake/pairing wire contract.
+///
+/// Load-bearing for the pairing layer: it is folded byte-for-byte into the
+/// SPAKE2 key-confirmation transcript (`tether-pairing`), so a peer running a
+/// different version cannot complete pairing — closing a downgrade seam where
+/// an attacker forces an older, weaker pairing exchange. Changing this literal
+/// is a breaking change; keep it stable within a release line.
+pub const PROTOCOL_VERSION: &str = "tether/1";
 
 /// Monotonic nanoseconds since an arbitrary local epoch (the first call to
 /// [`MonoNanos::now`] in this process).
@@ -122,6 +133,92 @@ mod tests {
         InputEchoBatch, VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket,
         CONTINUATION_PAYLOAD_BUDGET, FEC_MAX_PRIMARY_SHARDS, FEC_SHARD_SIZE, FIRST_PAYLOAD_BUDGET,
     };
+
+    #[test]
+    fn pairing_messages_round_trip() {
+        use crate::pairing::*;
+
+        let cases_client = [
+            PairingClientMsg::Pair {
+                spake2: vec![1, 2, 3, 4],
+            },
+            PairingClientMsg::Resume,
+        ];
+        for m in &cases_client {
+            let bytes = encode(m).unwrap();
+            let back: PairingClientMsg = decode(&bytes).unwrap();
+            assert_eq!(*m, back);
+        }
+
+        let cases_server = [
+            PairingServerMsg::PairChallenge {
+                spake2: vec![9, 8, 7],
+            },
+            PairingServerMsg::Authorized,
+            PairingServerMsg::Rejected {
+                reason: "no pairing window open".into(),
+            },
+        ];
+        for m in &cases_server {
+            let bytes = encode(m).unwrap();
+            let back: PairingServerMsg = decode(&bytes).unwrap();
+            assert_eq!(*m, back);
+        }
+
+        let confirm = PairingConfirm {
+            mac: vec![0xAB; 32],
+        };
+        assert_eq!(confirm, decode(&encode(&confirm).unwrap()).unwrap());
+
+        let cases_result = [
+            PairingResult::Confirmed { mac: vec![0xCD; 32] },
+            PairingResult::Rejected {
+                reason: "confirmation failed".into(),
+            },
+        ];
+        for m in &cases_result {
+            let bytes = encode(m).unwrap();
+            let back: PairingResult = decode(&bytes).unwrap();
+            assert_eq!(*m, back);
+        }
+    }
+
+    #[test]
+    fn unknown_pairing_client_variant_fails_decode() {
+        // Forward-compat probe (mirrors unknown_client_hello_variant_fails_decode):
+        // a future PairingClientMsg variant must fail decode on an older peer,
+        // not silently misparse. Variants 0 (Pair) and 1 (Resume) are assigned;
+        // a hand-crafted discriminator of 5 is unassigned.
+        let bytes = [5u8];
+        let result = decode::<crate::pairing::PairingClientMsg>(&bytes);
+        assert!(
+            result.is_err(),
+            "unknown PairingClientMsg variant must fail decode, not silently succeed"
+        );
+    }
+
+    #[test]
+    fn unknown_pairing_server_and_result_variants_fail_decode() {
+        // Same forward-compat guard for the host→client enums: an unassigned
+        // discriminator must fail decode on an older peer.
+        let bytes = [9u8];
+        assert!(
+            decode::<crate::pairing::PairingServerMsg>(&bytes).is_err(),
+            "unknown PairingServerMsg variant must fail decode"
+        );
+        assert!(
+            decode::<crate::pairing::PairingResult>(&bytes).is_err(),
+            "unknown PairingResult variant must fail decode"
+        );
+    }
+
+    #[test]
+    fn protocol_version_literal_is_pinned() {
+        // The pairing transcript binds this byte-for-byte; a silent change
+        // would break pairing across builds and weaken the downgrade defense.
+        // Update deliberately, in lockstep with a wire-contract bump.
+        assert_eq!(PROTOCOL_VERSION, "tether/1");
+    }
 
     #[test]
     fn host_frame_timing_builder_finishes() {

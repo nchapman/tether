@@ -12,6 +12,7 @@
 //! Usage: `tether-client <host_addr> <cert_fingerprint_hex>`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,9 +26,12 @@ use tether_session::{ClientSession, ClientSessionConfig, ConnectError};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::RenderEvent;
-use tether_transport::{Client, Datagram};
+use tether_transport::{Client, Datagram, ServerAuth};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+mod client_pairing;
+use client_pairing::HostAuth;
 
 // Initial window size — the actual frame dimensions come from
 // `VideoFrameMeta::dimensions` once frames start arriving and the window
@@ -50,25 +54,72 @@ async fn main() -> anyhow::Result<()> {
     // logs aren't truncated at process exit.
     let _tracing_guard = init_tracing(reporter.is_json());
 
-    // Positional args (host addr, fingerprint hex) are everything that
-    // isn't a `--flag`.
-    let mut positional = raw_args.iter().filter(|a| !a.starts_with("--"));
-    let addr: SocketAddr = positional
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing host address argument"))?
-        .parse()?;
-    let fingerprint_hex = positional
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing fingerprint argument"))?;
-    let fingerprint = hex_decode(fingerprint_hex)?;
+    // Parse args: positional host addr (and optional explicit fingerprint),
+    // plus `--pin <PIN>` (first-contact pairing) and `--label <name>` (display
+    // name to record for the host). `--ipc` was already consumed above.
+    let CliArgs {
+        addr,
+        fingerprint_hex,
+        pin,
+        label,
+    } = parse_cli_args(&raw_args)?;
+
+    // Decide how to authenticate the host. Precedence: an explicit `--pin`
+    // means first-contact pairing; otherwise an explicit fingerprint or a
+    // known-hosts entry for this address means a pinned reconnect.
+    let config_dir = client_config_dir()?;
+    let known_hosts_path = config_dir.join("known_hosts.json");
+    let known_hosts = tether_pairing::KnownHosts::load(&known_hosts_path).map_err(|e| {
+        // Fail closed: a corrupt known-hosts file could otherwise drop pinning.
+        let msg = format!("failed to load {}: {e}", known_hosts_path.display());
+        reporter.emit(&EngineEvent::Error {
+            message: msg.clone(),
+        });
+        anyhow::anyhow!(msg)
+    })?;
+
+    let (server_auth, mode) = if let Some(pin) = pin {
+        (ServerAuth::TrustOnFirstPair, HostAuth::FirstContact { pin })
+    } else if let Some(fp_hex) = &fingerprint_hex {
+        // Explicit fingerprint reconnect. If this address is already pinned,
+        // the supplied value must match — otherwise this would be a silent
+        // trust downgrade (re-pinning a known host to an attacker-supplied
+        // fingerprint without a PIN). Re-pairing requires --pin.
+        let supplied = hex_decode(fp_hex)?;
+        if let Some(known) = known_hosts.fingerprint(&addr.to_string()) {
+            if known != supplied {
+                let msg = format!(
+                    "supplied fingerprint for {addr} does not match the pinned one; \
+                     use --pin to re-pair after verifying the host"
+                );
+                reporter.emit(&EngineEvent::Error {
+                    message: msg.clone(),
+                });
+                anyhow::bail!(msg);
+            }
+        }
+        (ServerAuth::Pinned(supplied), HostAuth::Resume)
+    } else if let Some(fp) = known_hosts.fingerprint(&addr.to_string()) {
+        (ServerAuth::Pinned(fp), HostAuth::Resume)
+    } else {
+        let msg = format!(
+            "unknown host {addr}: pass --pin <PIN> to pair (the host shows a PIN \
+             under \"Add a device\"), or pass the host fingerprint"
+        );
+        reporter.emit(&EngineEvent::Error {
+            message: msg.clone(),
+        });
+        anyhow::bail!(msg);
+    };
 
     reporter.emit(&EngineEvent::Connecting {
         host: addr.to_string(),
     });
 
-    let client = Client::new()?;
-    let conn = match client.connect(addr, "tether-host", fingerprint).await {
-        Ok(c) => Arc::new(c),
+    let client = Client::with_identity(&config_dir)?;
+    let client_fp = client.fingerprint();
+    let pending = match client.connect_pending(addr, "tether-host", server_auth).await {
+        Ok(p) => p,
         Err(e) => {
             reporter.emit(&EngineEvent::Error {
                 message: format!("connect failed: {e}"),
@@ -76,6 +127,28 @@ async fn main() -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
+    let is_first_contact = matches!(mode, HostAuth::FirstContact { .. });
+    let (conn, host_fp) = match client_pairing::establish(pending, &mode, client_fp).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            reporter.emit(&EngineEvent::Error {
+                message: format!("pairing failed: {e}"),
+            });
+            return Err(e);
+        }
+    };
+
+    // On first contact, pin the host so the next connect is one-click.
+    if is_first_contact {
+        let mut known_hosts = known_hosts;
+        let label = label.unwrap_or_else(|| addr.to_string());
+        known_hosts.insert(addr.to_string(), &host_fp, label, unix_now());
+        if let Err(e) = known_hosts.save(&known_hosts_path) {
+            warn!(error = %e, "paired but failed to persist known-hosts; next connect needs --pin again");
+        }
+    }
+
+    let conn = Arc::new(conn);
     info!(remote = %conn.remote_address(), "connected to host");
 
     // Client video decode capabilities. The probe in tether-probe does
@@ -1046,6 +1119,100 @@ fn init_tracing(ipc: bool) -> tracing_appender::non_blocking::WorkerGuard {
     guard
 }
 
+/// Parsed command-line arguments for the client.
+#[derive(Debug)]
+struct CliArgs {
+    addr: SocketAddr,
+    /// Explicit host fingerprint (optional): pins the host cert for a reconnect
+    /// without consulting known-hosts. Mutually informative with `--pin`, which
+    /// takes precedence.
+    fingerprint_hex: Option<String>,
+    /// `--pin <PIN>`: present ⇒ first-contact pairing mode.
+    pin: Option<String>,
+    /// `--label <name>`: display name to record for the host on first pair.
+    label: Option<String>,
+}
+
+/// Parse the client CLI. Positional[0] is the host address (required);
+/// positional[1] is an optional explicit fingerprint. `--pin`/`--label` consume
+/// the following token as their value; `--ipc` is handled earlier and ignored
+/// here; other `--flags` are ignored with a warning.
+fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut pin = None;
+    let mut label = None;
+    let mut it = raw_args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--ipc" => {}
+            "--pin" => pin = Some(take_flag_value(&mut it, "--pin")?),
+            "--label" => label = Some(take_flag_value(&mut it, "--label")?),
+            other if other.starts_with("--") => {
+                warn!(flag = other, "ignoring unknown flag");
+            }
+            other => positional.push(other),
+        }
+    }
+    if matches!(pin.as_deref(), Some("")) {
+        anyhow::bail!("--pin value must not be empty");
+    }
+    let addr: SocketAddr = positional
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing host address argument"))?
+        .parse()?;
+    let fingerprint_hex = positional.get(1).map(|s| s.to_string());
+    Ok(CliArgs {
+        addr,
+        fingerprint_hex,
+        pin,
+        label,
+    })
+}
+
+/// Consume the next token as a flag's value. Rejects a missing value and a
+/// value that looks like another flag (e.g. `--pin --label x`), which would
+/// otherwise silently swallow the next flag as the value.
+fn take_flag_value<'a>(
+    it: &mut impl Iterator<Item = &'a String>,
+    flag: &str,
+) -> anyhow::Result<String> {
+    match it.next() {
+        Some(v) if v.starts_with("--") => {
+            anyhow::bail!("{flag} requires a value, but got the flag '{v}'")
+        }
+        Some(v) => Ok(v.clone()),
+        None => anyhow::bail!("{flag} requires a value"),
+    }
+}
+
+/// Directory the client caches its identity (`client_cert.der`/`client_key.der`)
+/// and `known_hosts.json` in. Mirrors the host's `persistent_cert_dir`: default
+/// `$HOME/.tether` (or `$USERPROFILE` on Windows), overridable with
+/// `$TETHER_CERT_DIR` for testing or sharing between instances.
+fn client_config_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "neither $TETHER_CERT_DIR nor $HOME/$USERPROFILE is set; \
+                 can't choose a config directory"
+            )
+        })?;
+    Ok(PathBuf::from(home).join(".tether"))
+}
+
+/// Seconds since the Unix epoch, for stamping when a host was paired. A
+/// pre-epoch clock clamps to 0 rather than failing the connect.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn hex_decode(s: &str) -> anyhow::Result<[u8; 32]> {
     if s.len() != 64 {
         anyhow::bail!("fingerprint must be 64 hex chars, got {}", s.len());
@@ -1116,5 +1283,61 @@ mod windows_format_tables {
             "expected ≥2 Windows-decodable profiles (NV12 8-bit + P010 10-bit) in \
              PROFILE_PREFERENCE, only {covered} produced a decode format"
         );
+    }
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn positional_addr_and_optional_fingerprint() {
+        let parsed = parse_cli_args(&args(&["127.0.0.1:7654"])).expect("addr only");
+        assert_eq!(parsed.addr.to_string(), "127.0.0.1:7654");
+        assert!(parsed.fingerprint_hex.is_none());
+        assert!(parsed.pin.is_none());
+
+        let parsed = parse_cli_args(&args(&["127.0.0.1:7654", "deadbeef"])).expect("addr + fp");
+        assert_eq!(parsed.fingerprint_hex.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn pin_and_label_consume_their_values() {
+        let parsed = parse_cli_args(&args(&[
+            "--pin", "12345678", "127.0.0.1:7654", "--label", "my laptop",
+        ]))
+        .expect("flags + positional");
+        assert_eq!(parsed.pin.as_deref(), Some("12345678"));
+        assert_eq!(parsed.label.as_deref(), Some("my laptop"));
+        assert_eq!(parsed.addr.to_string(), "127.0.0.1:7654");
+    }
+
+    #[test]
+    fn flag_as_pin_value_is_rejected() {
+        // `--pin --label x` must not swallow `--label` as the PIN.
+        let err = parse_cli_args(&args(&["--pin", "--label", "x", "127.0.0.1:7654"]))
+            .expect_err("flag-as-value must error");
+        assert!(err.to_string().contains("--pin"));
+    }
+
+    #[test]
+    fn empty_pin_is_rejected() {
+        let err =
+            parse_cli_args(&args(&["--pin", "", "127.0.0.1:7654"])).expect_err("empty pin errors");
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn missing_addr_is_rejected() {
+        assert!(parse_cli_args(&args(&["--pin", "12345678"])).is_err());
+    }
+
+    #[test]
+    fn missing_flag_value_is_rejected() {
+        assert!(parse_cli_args(&args(&["127.0.0.1:7654", "--pin"])).is_err());
     }
 }

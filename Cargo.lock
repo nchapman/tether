@@ -3686,6 +3686,7 @@ dependencies = [
  "tether-decode",
  "tether-input",
  "tether-ipc",
+ "tether-pairing",
  "tether-probe",
  "tether-protocol",
  "tether-render",

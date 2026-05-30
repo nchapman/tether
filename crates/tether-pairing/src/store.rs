@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::Fingerprint;
@@ -36,30 +37,12 @@ impl PairedStore {
     /// error. A present-but-corrupt file *is* an error — refusing to silently
     /// treat a damaged allowlist as "trust nobody" surfaces the problem.
     pub fn load(path: &Path) -> io::Result<Self> {
-        match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
+        load_json(path)
     }
 
-    /// Persist atomically: write a sibling temp file, then rename over the
-    /// target (rename replaces on both Unix and Windows). On Unix the file is
-    /// created `0o600` — it's a trust root, readable only by its owner.
+    /// Persist atomically with owner-only permissions. See [`save_json_private`].
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_vec_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // Single-writer assumption: the store is written only by the one
-        // engine process that owns this role, so a fixed sibling temp name is
-        // safe. If concurrent writers ever appear, switch to a unique temp
-        // name (e.g. tempfile::NamedTempFile) to avoid clobbering.
-        let tmp = path.with_extension("json.tmp");
-        write_private(&tmp, &json)?;
-        std::fs::rename(&tmp, path)
+        save_json_private(path, self)
     }
 
     /// Whether `fp` is paired.
@@ -102,6 +85,115 @@ impl PairedStore {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &PeerEntry)> {
         self.peers.iter().map(|(k, v)| (k.as_str(), v))
     }
+}
+
+/// One known host the client has paired with. `fingerprint` is the
+/// algorithm-tagged (`"sha256:<hex>"`) host cert fingerprint the client pins on
+/// reconnect; `label` is a display name; `paired_at_unix` is when it was first
+/// paired (caller-stamped, so the store is deterministic for tests).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostEntry {
+    pub fingerprint: String,
+    pub label: String,
+    pub paired_at_unix: u64,
+}
+
+/// The client's pinned-host list, serialized as JSON, keyed by the host's
+/// socket-address string. Unlike the host's fingerprint-keyed [`PairedStore`],
+/// the client looks hosts up by the address it dials, so reconnecting to a
+/// known address can pin the host cert without the user re-entering a PIN or
+/// fingerprint. It is a client-side trust root (a tampered entry could redirect
+/// a reconnect to an attacker's cert), so it gets the same atomic, owner-only
+/// persistence as [`PairedStore`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnownHosts {
+    hosts: BTreeMap<String, HostEntry>,
+}
+
+impl KnownHosts {
+    /// Load from `path`; missing file is empty, corrupt file is an error.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        load_json(path)
+    }
+
+    /// Persist atomically with owner-only permissions. See [`save_json_private`].
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        save_json_private(path, self)
+    }
+
+    /// The pinned fingerprint for `addr`, decoded from its tagged form, if the
+    /// host is known (and its stored tag parses).
+    pub fn fingerprint(&self, addr: &str) -> Option<Fingerprint> {
+        self.hosts
+            .get(addr)
+            .and_then(|e| parse_tagged_fingerprint(&e.fingerprint))
+    }
+
+    /// Whether `addr` is a known host.
+    pub fn contains(&self, addr: &str) -> bool {
+        self.hosts.contains_key(addr)
+    }
+
+    /// Record (or replace) the host pinned at `addr`.
+    pub fn insert(&mut self, addr: String, fp: &Fingerprint, label: String, paired_at_unix: u64) {
+        self.hosts.insert(
+            addr,
+            HostEntry {
+                fingerprint: tag_fingerprint(fp),
+                label,
+                paired_at_unix,
+            },
+        );
+    }
+
+    /// Forget the host at `addr`; returns whether it was present.
+    pub fn remove(&mut self, addr: &str) -> bool {
+        self.hosts.remove(addr).is_some()
+    }
+
+    /// Iterate `(addr, entry)` for listing in the UI.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &HostEntry)> {
+        self.hosts.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub fn len(&self) -> usize {
+        self.hosts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+    }
+}
+
+/// Load a JSON file into `T`. A missing file yields `T::default()` (first run);
+/// a present-but-corrupt file is an error — both stores fail closed rather than
+/// silently discarding a damaged trust root.
+fn load_json<T: Default + DeserializeOwned>(path: &Path) -> io::Result<T> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Persist `value` as pretty JSON to `path` atomically and owner-only: write a
+/// sibling temp file (created `0o600` on Unix), then rename over the target
+/// (rename replaces on both Unix and Windows). Single-writer assumption: each
+/// file path is written by at most one writer process (host → its allowlist,
+/// client → its known-hosts, in separate files), so the fixed sibling temp name
+/// (`<file>.tmp`) is safe; switch to a unique temp name if two writers ever
+/// share a path.
+fn save_json_private<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json =
+        serde_json::to_vec_pretty(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.tmp");
+    write_private(&tmp, &json)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Render a fingerprint as `"sha256:<lowercase-hex>"`.
@@ -236,5 +328,48 @@ mod tests {
         let tagged = tag_fingerprint(&fp);
         assert!(store.remove_tagged(&tagged));
         assert!(!store.contains(&fp));
+    }
+
+    #[test]
+    fn known_hosts_insert_lookup_remove() {
+        let mut hosts = KnownHosts::default();
+        let fp = [6u8; 32];
+        assert!(!hosts.contains("192.168.1.5:7654"));
+        hosts.insert("192.168.1.5:7654".to_string(), &fp, "desktop".to_string(), 1_700_000_000);
+        assert!(hosts.contains("192.168.1.5:7654"));
+        // Lookup returns the decoded fingerprint to pin on reconnect.
+        assert_eq!(hosts.fingerprint("192.168.1.5:7654"), Some(fp));
+        assert_eq!(hosts.fingerprint("10.0.0.1:7654"), None);
+        assert!(hosts.remove("192.168.1.5:7654"));
+        assert!(!hosts.contains("192.168.1.5:7654"));
+        assert!(!hosts.remove("192.168.1.5:7654")); // idempotent
+    }
+
+    #[test]
+    fn known_hosts_save_then_load_round_trips() {
+        let dir =
+            std::env::temp_dir().join(format!("tether-known-hosts-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("known_hosts.json");
+
+        let mut hosts = KnownHosts::default();
+        let fp = [7u8; 32];
+        hosts.insert("host.local:7654".to_string(), &fp, "work".to_string(), 1_700_000_010);
+        hosts.save(&path).expect("save");
+
+        let loaded = KnownHosts::load(&path).expect("load");
+        assert_eq!(loaded.fingerprint("host.local:7654"), Some(fp));
+        assert_eq!(loaded.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn known_hosts_corrupt_file_is_an_error() {
+        let path = std::env::temp_dir()
+            .join(format!("tether-known-hosts-corrupt-{}.json", std::process::id()));
+        std::fs::write(&path, b"not json at all").expect("write corrupt");
+        assert!(KnownHosts::load(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

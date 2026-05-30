@@ -52,7 +52,9 @@
 
 mod store;
 
-pub use store::{parse_tagged_fingerprint, tag_fingerprint, PairedStore, PeerEntry};
+pub use store::{
+    parse_tagged_fingerprint, tag_fingerprint, HostEntry, KnownHosts, PairedStore, PeerEntry,
+};
 
 use hkdf::Hkdf;
 use hmac::digest::KeyInit;

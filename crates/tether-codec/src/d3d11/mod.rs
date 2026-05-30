@@ -11,5 +11,5 @@ pub mod encoder;
 mod tests;
 mod video_processor;
 
-pub use decoder::D3D11Decoder;
+pub use decoder::{expected_decode_dxgi_format, D3D11Decoder};
 pub use encoder::D3D11Encoder;

@@ -754,7 +754,7 @@ fn create_d3d11va_hw_device(
 /// reach here. The NV12 fallback therefore only ever covers 4:2:0 with
 /// an unexpected bit depth — it is NOT a silent 4:4:4→4:2:0 downsample
 /// (that path is closed at construction).
-fn d3d11_sw_format(profile: VideoProfile) -> ffi::AVPixelFormat {
+pub(crate) fn d3d11_sw_format(profile: VideoProfile) -> ffi::AVPixelFormat {
     match (profile.chroma, profile.bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => ffi::AV_PIX_FMT_NV12,
         (ChromaSubsampling::Yuv420, 10) => ffi::AV_PIX_FMT_P010LE,

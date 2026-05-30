@@ -945,3 +945,61 @@ fn hex_decode(s: &str) -> anyhow::Result<[u8; 32]> {
     }
     Ok(out)
 }
+
+/// Cross-crate decode→render format-agreement check for the Windows
+/// native D3D11 client. Two crates each carry a `profile → DXGI_FORMAT`
+/// table for the GPU-resident decode path:
+///
+///   * `tether_codec::d3d11::expected_decode_dxgi_format` — the
+///     `DXGI_FORMAT` the D3D11VA decoder emits as `D3D11DecodedTexture`
+///     for a negotiated profile (NV12 for 8-bit, P010 for 10-bit; `None`
+///     for the 4:2:0-only platform's unsupported chromas).
+///   * `tether_render::decode_plane_srv_formats` — the plane-SRV formats
+///     the native D3D11 renderer binds to sample that texture, or `None`
+///     if it rejects the format.
+///
+/// The chain is `D3D11VA decode → shared handle → renderer import`. The
+/// invariant: **every format the decoder can emit for a negotiable
+/// profile is one the renderer accepts.** A miss silently drops (or
+/// errors out) every frame after decode — the exact shape of macOS bug
+/// `621badc`, where the renderer rejected the decoder's `'x420'` for the
+/// first live Main10 session. The two tables sit on parallel tracks
+/// (different crates, only joined at runtime), so the `#[ignore]`d
+/// hardware roundtrip can't catch their drift in default CI — this
+/// no-GPU unit test does, communicating via the neutral `DXGI_FORMAT`
+/// `u32` so neither test crate needs the `windows` dependency.
+#[cfg(all(test, target_os = "windows"))]
+mod windows_format_tables {
+    use tether_codec::d3d11::expected_decode_dxgi_format;
+    use tether_probe::PROFILE_PREFERENCE;
+    use tether_render::decode_plane_srv_formats;
+
+    #[test]
+    fn decoder_output_is_subset_of_renderer_accept() {
+        let mut covered = 0;
+        for profile in PROFILE_PREFERENCE {
+            let Some(fmt) = expected_decode_dxgi_format(*profile) else {
+                // 4:4:4 / unsupported: no Windows decode path, nothing to
+                // hand the renderer. Verified in tether-codec's co-located
+                // `expected_decode_format_rejects_unmodeled_profiles`.
+                continue;
+            };
+            assert!(
+                decode_plane_srv_formats(fmt).is_some(),
+                "D3D11VA decoder emits DXGI format {fmt:#x} for profile {profile:?}, but the \
+                 native D3D11 renderer's import path rejects it — every frame of a negotiated \
+                 session would be dropped after decode (bug 621badc shape)."
+            );
+            covered += 1;
+        }
+        // Guard against a vacuous pass: the negotiator's preference list
+        // must contain at least the 8-bit and 10-bit 4:2:0 profiles the
+        // Windows client actually decodes, or the loop above asserts
+        // nothing.
+        assert!(
+            covered >= 2,
+            "expected ≥2 Windows-decodable profiles (NV12 8-bit + P010 10-bit) in \
+             PROFILE_PREFERENCE, only {covered} produced a decode format"
+        );
+    }
+}

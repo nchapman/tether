@@ -861,6 +861,25 @@ fn plane_srv_formats(format: u32) -> Result<(DXGI_FORMAT, DXGI_FORMAT)> {
     }
 }
 
+/// Cross-crate accessor for the renderer's decode-format accept table.
+/// Returns the `(luma, chroma)` plane-SRV `DXGI_FORMAT`s (as raw `u32`s)
+/// the native D3D11 renderer would bind to sample a decoded biplanar
+/// texture of `format`, or `None` if the renderer rejects it.
+///
+/// Exists so a no-hardware unit test in `tether-client` can confirm this
+/// accept table agrees with the decoder's
+/// `tether_codec::d3d11::expected_decode_dxgi_format` — the Windows analog
+/// of the macOS `accepts_iosurface_fourcc` cross-table check. A decoder
+/// that emits a format the renderer silently drops is exactly bug
+/// `621badc` (Main10's `'x420'` rejected by the renderer), so catching the
+/// drift in default CI is cheaper than on a user's desk. The neutral `u32`
+/// currency keeps `tether-client` free of a `windows`-crate dependency.
+pub fn decode_plane_srv_formats(format: u32) -> Option<(u32, u32)> {
+    plane_srv_formats(format)
+        .ok()
+        .map(|(y, uv)| (y.0 as u32, uv.0 as u32))
+}
+
 /// Format-explicit SRV used to view one plane of a biplanar texture:
 /// e.g. NV12 luma as `R8_UNORM`, chroma as `R8G8_UNORM`. A default SRV
 /// on a biplanar (NV12/P010) texture is invalid — the plane format must
@@ -1086,6 +1105,44 @@ fn make_immutable_texture(
 mod tests {
     use super::*;
     use tether_protocol::control::VideoColorSpec;
+
+    /// Pins the renderer's decode-format → plane-SRV table against the
+    /// real `DXGI_FORMAT` constants: NV12 (8-bit) samples through R8 luma
+    /// + R8G8 chroma; P010 (10-bit MSB-aligned) through R16 + R16G16.
+    /// Anything else is a negotiation/decoder bug and must be rejected
+    /// rather than sampled as garbage. No GPU — pure table check, the
+    /// renderer side of the cross-crate agreement asserted in tether-client's
+    /// `windows_format_tables::decoder_output_is_subset_of_renderer_accept`.
+    #[test]
+    fn plane_srv_formats_maps_nv12_and_p010_rejects_others() {
+        assert_eq!(
+            plane_srv_formats(DXGI_FORMAT_NV12.0 as u32).unwrap(),
+            (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM),
+            "NV12 must sample as R8 luma + R8G8 chroma"
+        );
+        assert_eq!(
+            plane_srv_formats(DXGI_FORMAT_P010.0 as u32).unwrap(),
+            (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM),
+            "P010 must sample as R16 luma + R16G16 chroma"
+        );
+        // A 4:2:0 8-bit *render-target* format and an unrelated format both
+        // stand in for "anything the decoder should never emit": rejected.
+        assert!(plane_srv_formats(DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32).is_err());
+        assert!(plane_srv_formats(0).is_err());
+    }
+
+    /// The public `u32`-currency accessor must agree with the internal
+    /// `plane_srv_formats`: `Some` exactly when the internal table accepts,
+    /// carrying the same plane formats. Guards against the wrapper drifting
+    /// from the table it exposes to the cross-crate test.
+    #[test]
+    fn decode_plane_srv_formats_mirrors_internal_table() {
+        for fmt in [DXGI_FORMAT_NV12.0 as u32, DXGI_FORMAT_P010.0 as u32] {
+            let (y, uv) = plane_srv_formats(fmt).unwrap();
+            assert_eq!(decode_plane_srv_formats(fmt), Some((y.0 as u32, uv.0 as u32)));
+        }
+        assert_eq!(decode_plane_srv_formats(0), None);
+    }
 
     /// Drives the real `render` path headlessly with synthetic NV12 planes
     /// (mid-luma + neutral chroma) and reads back the result. Isolates the

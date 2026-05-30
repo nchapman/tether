@@ -67,6 +67,10 @@ pub use gpu::accepts_iosurface_fourcc;
 pub use gpu::supports_10bit_render;
 #[cfg(target_os = "windows")]
 pub use d3d11::supports_10bit_render;
+// Windows decode-format accept table, exported for the cross-crate
+// consistency test in tether-client (see `decode_plane_srv_formats`).
+#[cfg(target_os = "windows")]
+pub use d3d11::decode_plane_srv_formats;
 
 /// Shared cursor state for the overlay render pass. Construct one,
 /// hand a clone to the wire-receive side (call `with(|s| s.set_position(...))`

@@ -44,10 +44,22 @@ pnpm --dir apps/tether-shell tauri signer generate -w /path/outside/repo/tether-
 Then put the printed public key into `tauri.conf.json` and the private key into
 the secret above. **Never commit the private key.**
 
-> OS code signing (Apple notarization, Windows Authenticode) is **not** set up
-> yet — installers are unsigned, so macOS shows a Gatekeeper warning and Windows
-> a SmartScreen prompt on first run. The updater manifest is still signed, so
-> auto-update integrity is protected regardless.
+> OS code signing with a real certificate (Apple Developer ID + notarization,
+> Windows Authenticode) is **not** set up yet:
+>
+> - **macOS** uses **ad-hoc signing** (`bundle.macOS.signingIdentity: "-"` in
+>   `tauri.conf.json`). This is required, not cosmetic: Apple Silicon refuses to
+>   run unsigned code, and the bundle ships the `tether-host` / `tether-client`
+>   sidecars whose nested code Gatekeeper validates. Ad-hoc signing makes the
+>   download runnable; first launch still needs **right-click → Open** to clear
+>   the quarantine/Gatekeeper prompt. When you get an Apple Developer ID,
+>   replace `"-"` with the identity (or set `APPLE_SIGNING_IDENTITY` in CI) and
+>   add notarization.
+> - **Windows** ships unsigned (SmartScreen prompt on first run) until an
+>   Authenticode cert is available.
+>
+> The updater manifest is signed independently (minisign), so auto-update
+> integrity is protected regardless of OS code signing.
 
 ## Cutting a release
 

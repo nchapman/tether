@@ -45,6 +45,13 @@ runs:
 
     - name: Set up toolchains (rust/node/pnpm via mise.toml)
       uses: jdx/mise-action@v2
+      with:
+        # Don't cache the mise tool install: it snapshots mise's data dir but
+        # not the rustup toolchain components (~/.rustup), so a cache hit
+        # restores rust without the rustfmt/clippy components mise.toml asks
+        # for. Reinstalling each run keeps the declared toolchain complete; the
+        # cargo build cache (Swatinem/rust-cache) is separate and untouched.
+        cache: false
 
     - name: Cache static FFmpeg
       if: inputs.ffmpeg == 'true'

@@ -20,7 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Formatting doesn't compile, so skip the FFmpeg/system-dep setup.
+      # cache: false — see .github/actions/setup for why (rustfmt component).
       - uses: jdx/mise-action@v2
+        with:
+          cache: false
       - run: cargo fmt --all --check
       # The Tauri shell is excluded from the workspace, so `--all` skips it.
       - run: cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check

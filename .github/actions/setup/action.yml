@@ -44,7 +44,7 @@ runs:
           libssl-dev
 
     - name: Set up toolchains (rust/node/pnpm via mise.toml)
-      uses: jdx/mise-action@v2
+      uses: jdx/mise-action@v4
       with:
         # Don't cache the mise tool install: it snapshots mise's data dir but
         # not the rustup toolchain components (~/.rustup), so a cache hit
@@ -55,7 +55,7 @@ runs:
 
     - name: Cache static FFmpeg
       if: inputs.ffmpeg == 'true'
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: vendor/ffmpeg
         key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ffmpeg-version') }}

@@ -84,8 +84,15 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
         .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
     dec.submit(fixture)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
+    // Signal EOF to drain: ffmpeg's HEVC/AV1 decoders buffer the first
+    // frame in the reorder DPB until a subsequent packet or EOF arrives.
+    // The probe submits a lone IDR, so without this drain HEVC never
+    // emits (H.264 happens to flush immediately). Matches the D3D11 and
+    // VideoToolbox decode probes.
+    dec.signal_eof()
+        .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
     // Loop a few times — VAAPI sometimes needs a couple of
-    // `receive_frame` polls before a single-IDR submit emits.
+    // `receive_frame` polls before the drained frame surfaces.
     for _ in 0..4 {
         match dec
             .next_frame()
@@ -104,7 +111,7 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
     }
     Err(ProbeError::new(
         PipelineStage::Decode,
-        "decoder produced no frames after submit + 4 polls",
+        "decoder produced no frames after submit + eof + 4 polls",
     ))
 }
 

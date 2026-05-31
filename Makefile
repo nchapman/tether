@@ -46,8 +46,8 @@ test-correctness: ffmpeg ## Hardware-backed correctness tests (VAAPI codec, rend
 bench: ffmpeg ## VAAPI benchmark matrix (codec x resolution x layer; prints p50/p99/max ms)
 	cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1
 
-probe: ffmpeg ## Print which VAAPI codecs are buildable on this host
-	cargo test -p tether-codec --lib probe_encoder_kind_smoke -- --ignored --nocapture
+probe: ffmpeg ## Print the host codec capability matrix (encode/decode per profile)
+	cargo test -p tether-probe --lib print_host_supported_profiles -- --ignored --nocapture
 
 clippy: ffmpeg ## Lint the workspace (advisory — some pre-existing warnings exist)
 	cargo clippy --workspace --all-targets

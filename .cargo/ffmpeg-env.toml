@@ -5,13 +5,19 @@
 # is machine-independent and committed once — cargo resolves them to absolute
 # paths (rooted at the workspace dir) before handing them to the build script.
 #
-# Linking model (see crates/tether-codec/Cargo.toml):
+# Linking model (see crates/tether-codec/Cargo.toml and build.rs):
 #   * FFMPEG_PKG_CONFIG_PATH — rusty_ffmpeg sets PKG_CONFIG_PATH to this and
-#     probes our relocated .pc files. On Linux/macOS this path takes effect
-#     regardless of the `link_system_ffmpeg` feature.
-#   * FFMPEG_LINK_MODE=static — without it rusty_ffmpeg defaults to dynamic.
-#     Static pulls libav*.a in; system libs (libva/libdrm, OS frameworks) stay
-#     dynamic via the .pc `Libs:` entries.
+#     probes our relocated .pc files. Used on Linux/macOS, where it takes
+#     precedence over FFMPEG_LIBS_DIR; rusty_ffmpeg IGNORES it on Windows.
+#   * FFMPEG_LIBS_DIR — the link-search dir rusty_ffmpeg uses on Windows (the
+#     only linking path it offers there). It emits link directives for the 7
+#     FFmpeg libs only; tether-codec's build.rs adds the transitive system/
+#     static libs (vpl + Win32 import libs) the static archives reference.
+#     Inert on Linux/macOS (the pkg-config branch wins).
+#   * FFMPEG_LINK_MODE=static — without it rusty_ffmpeg defaults to dynamic on
+#     Unix. Static pulls libav*.a / *.lib in; truly system libs (libva/libdrm,
+#     OS frameworks, Win32 import libs) stay dynamic via the .pc `Libs:` /
+#     build.rs entries.
 #   * FFMPEG_INCLUDE_DIR — pin bindgen's headers to the staged tree rather than
 #     whatever pkg-config's first include path happens to be.
 #
@@ -19,5 +25,6 @@
 # path — run `make ffmpeg` (or scripts/fetch-ffmpeg.sh) to populate it.
 [env]
 FFMPEG_PKG_CONFIG_PATH = { value = "vendor/ffmpeg/prefix/lib/pkgconfig", relative = true }
+FFMPEG_LIBS_DIR = { value = "vendor/ffmpeg/prefix/lib", relative = true }
 FFMPEG_INCLUDE_DIR = { value = "vendor/ffmpeg/prefix/include", relative = true }
 FFMPEG_LINK_MODE = "static"

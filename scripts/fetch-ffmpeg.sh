@@ -35,9 +35,12 @@ VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/scripts/ffmpeg-version")"
 case "$(uname -s)" in
   Linux)  OS="linux" ;;
   Darwin) OS="macos" ;;
-  # Windows links FFmpeg through a different rusty_ffmpeg path (FFMPEG_LIBS_DIR,
-  # not pkg-config); that wiring doesn't exist yet, so don't pretend to stage it.
-  MINGW*|MSYS*|CYGWIN*) die "Windows is not wired for static FFmpeg yet (Linux/macOS only)" ;;
+  # Windows (run under Git-for-Windows bash). rusty_ffmpeg links Windows through
+  # FFMPEG_LIBS_DIR rather than pkg-config (it ignores FFMPEG_PKG_CONFIG_PATH on
+  # this target); .cargo/ffmpeg-env.toml sets both so the same staged prefix
+  # feeds every OS. See crates/tether-codec/build.rs for the transitive
+  # system-lib wiring the static archives need.
+  MINGW*|MSYS*|CYGWIN*) OS="windows" ;;
   *) die "unsupported OS: $(uname -s)" ;;
 esac
 case "$(uname -m)" in

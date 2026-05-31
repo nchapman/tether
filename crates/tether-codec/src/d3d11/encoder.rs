@@ -89,8 +89,9 @@ const VENDOR_NVIDIA: u32 = 0x10de;
 /// with a broken QSV-over-D3D11 path (notably gyan.dev's
 /// `full_build-shared`) fail child-frames-context creation AND hang in
 /// `MFXClose` during teardown, so a failed QSV attempt is unrecoverable.
-/// Link an FFmpeg build whose oneVPL works (e.g. BtbN's) — see
-/// `docs/CODEC_CAPABILITIES.md`.
+/// Tether statically links its own LGPL FFmpeg (the `nchapman/tether-ffmpeg`
+/// release, oneVPL dispatcher built static — see `scripts/fetch-ffmpeg.sh`),
+/// so this path is fixed at build time; see `docs/CODEC_CAPABILITIES.md`.
 fn backends_for_vendor(kind: CodecKind, vendor_id: u32) -> &'static [&'static str] {
     match (kind, vendor_id) {
         (CodecKind::Hevc, VENDOR_INTEL) => &["hevc_qsv", "hevc_mf"],

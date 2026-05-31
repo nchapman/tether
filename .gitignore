@@ -1,5 +1,9 @@
 /target
 
+# Prebuilt static FFmpeg staged by scripts/fetch-ffmpeg.sh (downloaded per host
+# from the nchapman/tether-ffmpeg releases; never committed — `make ffmpeg`).
+/vendor/ffmpeg/
+
 # Ad-hoc log captures from manual `cargo run` testing.
 *.log
 

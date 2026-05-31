@@ -233,6 +233,18 @@ impl VaapiDecoder {
             SendFrame(frame),
         )))
     }
+
+    /// Signal end-of-stream so the decoder emits any buffered frames.
+    /// ffmpeg's HEVC (and AV1) decoders hold the first frame in the
+    /// reorder DPB until a subsequent packet or EOF arrives; in a
+    /// continuous stream the next packet flushes it, but a lone IDR
+    /// (e.g. the capability probe) needs this explicit drain to emit.
+    /// Matches `D3D11Decoder::signal_eof` / VideoToolbox. After this,
+    /// `next_frame` drains until it returns `None`.
+    pub fn signal_eof(&mut self) -> Result<()> {
+        self.decoder.send_packet(None)?;
+        Ok(())
+    }
 }
 
 impl Decoder for VaapiDecoder {

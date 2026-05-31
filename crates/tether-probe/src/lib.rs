@@ -453,6 +453,23 @@ mod tests {
         }
     }
 
+    /// Diagnostic dump: run the full per-profile encode/decode probe on
+    /// real hardware and print the verdict matrix. Not an assertion —
+    /// `make probe` runs this with `--nocapture` so an operator can see
+    /// which codecs this host can actually build + round-trip, and the
+    /// `PipelineStage` reason for any it can't. Ignored by default
+    /// because it constructs real encoders/decoders.
+    #[test]
+    #[ignore = "requires a working host codec backend (VAAPI on Linux, VideoToolbox on macOS, D3D11 on Windows)"]
+    fn print_host_supported_profiles() {
+        println!("Host codec capability matrix:");
+        for support in host_supported_profiles() {
+            println!("  {:?}", support.profile);
+            println!("    encode: {:?}", support.encode);
+            println!("    decode: {:?}", support.decode);
+        }
+    }
+
     #[test]
     fn support_status_helpers_match() {
         let supp = ProfileSupport {

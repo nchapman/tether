@@ -95,13 +95,6 @@ async fn list_peers(supervisor: State<'_, Supervisor>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // WebKitGTK's DMABUF renderer leaves the webview blank (just the window
-    // background) on many Linux GPU/driver combinations. Disable it before the
-    // webview initializes. Harmless for us: the chrome is lightweight and the
-    // actual video is the engine's own native window, not this webview.
-    #[cfg(target_os = "linux")]
-    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

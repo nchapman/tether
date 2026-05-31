@@ -77,3 +77,81 @@ jobs:
           #   - tauri.updater.conf.json enables createUpdaterArtifacts, which
           #     requires the signing key — only layered on here, where it's set.
           args: --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.updater.conf.json
+
+  # The Tauri AppImage bundles host-coupled display libraries (libwayland-*)
+  # that shadow the user's system copies. On newer GPU/Wayland stacks (e.g.
+  # Intel Lunar Lake / xe) the bundled libs fail EGL init and the window is
+  # blank ("EGL_BAD_PARAMETER. Aborting"). Tauri exposes no way to exclude
+  # libraries at bundle time, so we strip them after the fact, re-pack,
+  # re-sign the AppImage, and patch its signature in the updater manifest.
+  # Runs after every platform finishes so latest.json is complete — no race
+  # with the macOS/Windows jobs that also write it.
+  fix-appimage:
+    name: Patch Linux AppImage (strip host-coupled libs)
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - name: Install the Tauri CLI (for the signer)
+        run: pnpm --dir apps/tether-shell install --frozen-lockfile
+
+      - name: Download the AppImage + updater manifest from the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir dist
+          gh release download "${{ github.ref_name }}" -D dist -p '*.AppImage' -p 'latest.json'
+
+      - name: Strip libwayland-* and re-pack
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          appimage=$(ls *.AppImage)
+          chmod +x "$appimage"
+          "./$appimage" --appimage-extract >/dev/null
+          echo "removing bundled host-coupled Wayland libs:"
+          find squashfs-root -name 'libwayland-*.so*' -printf '  %P\n' -delete
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool --no-appstream squashfs-root "$appimage"
+          chmod +x "$appimage"
+          rm -rf squashfs-root appimagetool
+          # Sanity: the re-pack is a valid AppImage and the libs are actually gone.
+          "./$appimage" --appimage-extract >/dev/null
+          if find squashfs-root -name 'libwayland-*.so*' | grep -q .; then
+            echo "::error::libwayland-* still present after re-pack"; exit 1
+          fi
+          rm -rf squashfs-root
+          echo "re-packed $appimage cleanly"
+
+      - name: Re-sign and patch the updater manifest
+        working-directory: dist
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          appimage=$(ls *.AppImage)
+          rm -f "$appimage.sig"
+          pnpm --dir "$GITHUB_WORKSPACE/apps/tether-shell" exec tauri signer sign "$PWD/$appimage"
+          sig=$(cat "$appimage.sig")
+          # The AppImage backs both the generic linux-x86_64 entry and the
+          # explicit -appimage entry; patch whichever exist, never create.
+          jq --arg s "$sig" '
+            (if .platforms["linux-x86_64"] then .platforms["linux-x86_64"].signature = $s else . end)
+            | (if .platforms["linux-x86_64-appimage"] then .platforms["linux-x86_64-appimage"].signature = $s else . end)
+          ' latest.json > latest.json.tmp
+          mv latest.json.tmp latest.json
+
+      - name: Re-upload the fixed AppImage, signature, and manifest
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          appimage=$(ls *.AppImage)
+          gh release upload "${{ github.ref_name }}" --clobber "$appimage" "$appimage.sig" latest.json

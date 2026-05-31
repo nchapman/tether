@@ -17,6 +17,13 @@ plugin against GitHub Releases.
 - **`.github/workflows/release.yml`** — on a `v*` tag: builds the engines,
   stages them as sidecars, and runs `tauri-action` to bundle, sign the updater
   manifest, and publish a **draft** GitHub Release with installers + `latest.json`.
+  A final `fix-appimage` job then strips the host-coupled `libwayland-*` libs
+  that Tauri's bundler embeds in the Linux AppImage (they shadow the user's
+  system copies and fail EGL init on newer GPU/Wayland stacks — e.g. Intel
+  Lunar Lake/`xe` — producing a blank window), then re-packs, re-signs, and
+  patches the AppImage signature in `latest.json`. Tauri exposes no bundle-time
+  knob to exclude libraries, so this is done post-build; it runs after every
+  platform so `latest.json` is already complete.
 - **`.github/actions/setup`** — shared setup (mise toolchains, Linux system
   deps, static FFmpeg fetch + cache, cargo cache).
 - **Local pre-commit hook** — `make hooks` installs `.githooks/pre-commit`,

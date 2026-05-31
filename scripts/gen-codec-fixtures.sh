@@ -18,7 +18,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${REPO_ROOT}/crates/tether-codec/testdata"
-RAW="$(mktemp --suffix=.h264)"
+# Plain mktemp (no --suffix): GNU-only flag, and the extension is cosmetic —
+# ffmpeg's container is forced below with `-f h264`. Portable on macOS/BSD.
+RAW="$(mktemp)"
 trap 'rm -f "${RAW}"' EXIT
 
 command -v ffmpeg >/dev/null || { echo "need a system ffmpeg with libx264" >&2; exit 1; }

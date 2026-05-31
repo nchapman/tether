@@ -382,10 +382,57 @@ function ClientPanel() {
   );
 }
 
+// Shown when the startup updater check emits `update-available` (payload is
+// the new version string). The button calls the `install_update` command,
+// which downloads + installs the signed bundle and restarts into it — so a
+// successful install never returns here.
+function UpdateBanner() {
+  const [version, setVersion] = useState<string | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const un = listen<string>("update-available", ({ payload }) =>
+      setVersion(payload),
+    );
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
+  if (!version) return null;
+
+  async function install() {
+    setError(null);
+    setInstalling(true);
+    try {
+      await invoke("install_update");
+    } catch (e) {
+      // On success we never get here (the app restarts); a thrown error means
+      // the download/install failed, so re-enable the button.
+      setError(String(e));
+      setInstalling(false);
+    }
+  }
+
+  return (
+    <div className="update-banner">
+      <span>
+        Update <strong>{version}</strong> available
+      </span>
+      <button onClick={install} disabled={installing}>
+        {installing ? "Installing…" : "Install & restart"}
+      </button>
+      {error && <span className="error">{error}</span>}
+    </div>
+  );
+}
+
 function App() {
   return (
     <main className="container">
       <h1>Tether</h1>
+      <UpdateBanner />
       <HostPanel />
       <ClientPanel />
     </main>

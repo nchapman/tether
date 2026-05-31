@@ -93,6 +93,24 @@ async fn list_peers(supervisor: State<'_, Supervisor>) -> Result<(), String> {
         .await
 }
 
+/// Download, verify, install the latest release, then restart into it.
+/// Invoked by the "update available" banner. Re-checks the endpoint (cheap)
+/// to get a fresh `Update` handle, applies the signature-verified bundle, then
+/// restarts — so on success this never returns.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Err("no update is available".to_string());
+    };
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    // Relaunch into the freshly installed version; does not return.
+    app.restart()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -137,7 +155,8 @@ pub fn run() {
             stop_engine,
             start_pairing,
             revoke_peer,
-            list_peers
+            list_peers,
+            install_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building tether-shell")
@@ -154,10 +173,10 @@ pub fn run() {
 
 /// Best-effort startup update check. Queries the configured GitHub Releases
 /// endpoint and, if a newer signed bundle exists, emits `update-available`
-/// (carrying the new version) so the webview can surface it. Applying the
-/// update is deferred to a follow-up UI — this only reports. Any failure
-/// (offline, no release yet, dev build) is returned to the caller, which logs
-/// and swallows it; a failed check must never block the shell from starting.
+/// (carrying the new version) so the webview can show the banner whose
+/// "Install & restart" button calls [`install_update`]. Any failure (offline,
+/// no release yet, dev build) is returned to the caller, which logs and
+/// swallows it; a failed check must never block the shell from starting.
 async fn check_for_updates(app: AppHandle) -> Result<(), String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
     match updater.check().await.map_err(|e| e.to_string())? {

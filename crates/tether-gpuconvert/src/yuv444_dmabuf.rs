@@ -306,6 +306,9 @@ impl Yuv444DmaBuf {
 
 #[cfg(test)]
 mod tests {
+    // Readback pixel-math casts (u64 offset → usize) are intentional.
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
     use super::*;
 
     /// Read one R8 plane back from the shared dma-buf by re-importing

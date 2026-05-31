@@ -591,9 +591,9 @@ fn roundtrip_hevc_main444_8bit_full_chain() {
 /// HEVC Main 10 client upscale. capture == encode (no scaler — the
 /// 10-bit scaler input path doesn't exist in production), surface
 /// > encode so the renderer's Mitchell upscale of the decoded 10-bit
-/// content gets exercised. Targets the Biplanar16 import + 10-bit
-/// shader dispatch + Mitchell upscale all at once. Will SKIP on
-/// Intel iHD + Meteor Lake (P010 dma-buf driver gap).
+/// > content gets exercised. Targets the Biplanar16 import + 10-bit
+/// > shader dispatch + Mitchell upscale all at once. Will SKIP on
+/// > Intel iHD + Meteor Lake (P010 dma-buf driver gap).
 #[test]
 #[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16; may SKIP on Intel iHD/Meteor Lake"]
 fn roundtrip_hevc_main10_client_upscale() {

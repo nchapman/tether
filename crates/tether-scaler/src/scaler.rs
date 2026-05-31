@@ -477,7 +477,7 @@ impl Scaler {
                 &self.pipelines.vertical_linear,
                 &self.pipelines.vertical_linear_bgl,
             ),
-            ColorSpace::LumaR8 { .. } => {
+            ColorSpace::LumaR8 => {
                 let plane = self
                     .pipelines
                     .plane
@@ -501,7 +501,7 @@ impl Scaler {
                     &plane.vertical_plane_rg_bgl,
                 )
             }
-            ColorSpace::LumaR16 { .. } => {
+            ColorSpace::LumaR16 => {
                 let plane = self
                     .pipelines
                     .plane

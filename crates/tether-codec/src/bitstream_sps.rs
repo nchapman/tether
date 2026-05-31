@@ -21,6 +21,11 @@
 //! signal as absent (the IOSurface fourcc check is still authoritative
 //! on its own).
 
+// Bitstream parsing: narrowing reads of small spec-bounded fields
+// (e.g. read_bits(3), read_ue() for chroma_format_idc / bit_depth)
+// into u8/usize is intentional and range-checked by the spec.
+#![allow(clippy::cast_possible_truncation)]
+
 use tether_protocol::control::{ChromaSubsampling, CodecKind};
 
 /// Result of parsing an SPS NAL. Both fields directly reflect the

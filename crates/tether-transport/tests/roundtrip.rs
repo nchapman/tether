@@ -1,3 +1,6 @@
+// Test payloads built from loop indices; the byte casts are deliberate.
+#![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+
 use std::net::Ipv4Addr;
 
 use tether_protocol::{

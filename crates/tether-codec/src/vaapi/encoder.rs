@@ -634,8 +634,9 @@ impl VaapiEncoder {
                 offset: 0,
                 pitch: 0,
             }; AV_DRM_MAX_PLANES];
-            for p in 0..(layer.num_planes as usize).min(AV_DRM_MAX_PLANES) {
-                planes[p] = AVDRMPlaneDescriptor {
+            let num_planes = (layer.num_planes as usize).min(AV_DRM_MAX_PLANES);
+            for (p, plane) in planes.iter_mut().enumerate().take(num_planes) {
+                *plane = AVDRMPlaneDescriptor {
                     object_index: i32::try_from(layer.object_index[p])
                         .expect("object_index fits in i32"),
                     offset: isize::try_from(layer.offset[p]).expect("offset fits in isize"),

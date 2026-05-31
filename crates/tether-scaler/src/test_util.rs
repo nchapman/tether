@@ -26,6 +26,10 @@
 //! explicit in the function name (`_bgra` vs `_rgba`); the SSIM/PSNR
 //! helpers are order-agnostic on RGB channels and ignore alpha.
 
+// Test-only photometric/geometric helpers: fp → u8/int quantization and
+// pixel-coordinate casts are intentional and range-bounded.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use crate::reference::mitchell_filter_default;
 
 /// 2D SSIM (Structural Similarity Index) per RGB channel, averaged.
@@ -65,7 +69,7 @@ pub fn ssim_rgb(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
                 let mut sum_aa = 0.0_f64;
                 let mut sum_bb = 0.0_f64;
                 let mut sum_ab = 0.0_f64;
-                let n_pix = (WIN * WIN) as f64;
+                let n_pix = f64::from(WIN * WIN);
                 for dy in 0..WIN {
                     for dx in 0..WIN {
                         let off = (((wy + dy) * w + (wx + dx)) * 4 + ch) as usize;
@@ -141,7 +145,7 @@ pub fn ssim_heatmap_l8(a: &[u8], b: &[u8], width: u32, height: u32) -> (u32, u32
                 let mut saa = 0.0_f64;
                 let mut sbb = 0.0_f64;
                 let mut sab = 0.0_f64;
-                let n_pix = (TILE * TILE) as f64;
+                let n_pix = f64::from(TILE * TILE);
                 for dy in 0..TILE {
                     for dx in 0..TILE {
                         let off = (((ty * TILE + dy) * w + (tx * TILE + dx)) * 4 + ch) as usize;
@@ -449,9 +453,9 @@ pub fn cpu_mitchell_resize_bgra(
     mitchell_filter_default(src_bgra, src_dims.0, src_dims.1, dst_dims.0, dst_dims.1)
 }
 
-/// Codec chroma siting. H.264 uses MPEG-2-style left-cosited horizontal
-/// + interstitial vertical 4:2:0 chroma by default. HEVC defaults to
-/// centered ("MPEG-1") 4:2:0 unless the bitstream's
+/// Codec chroma siting. H.264 uses MPEG-2-style left-cosited
+/// horizontal plus interstitial vertical 4:2:0 chroma by default. HEVC
+/// defaults to centered ("MPEG-1") 4:2:0 unless the bitstream's
 /// `chroma_sample_loc_type` says otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromaSiting {
@@ -606,8 +610,8 @@ fn clamp_u8(v: f32) -> u8 {
 /// the metric compare doesn't drift on aspect.
 #[must_use]
 pub fn letterbox_fit_dims(src: (u32, u32), dst: (u32, u32)) -> (u32, u32) {
-    let (sw, sh) = (src.0 as f64, src.1 as f64);
-    let (dw, dh) = (dst.0 as f64, dst.1 as f64);
+    let (sw, sh) = (f64::from(src.0), f64::from(src.1));
+    let (dw, dh) = (f64::from(dst.0), f64::from(dst.1));
     let scale = (dw / sw).min(dh / sh);
     let w = (sw * scale).round() as u32;
     let h = (sh * scale).round() as u32;
@@ -805,7 +809,7 @@ mod tests {
         // and confirm the boundary pixel's chroma differs.
         let mid_y = (dims.1 / 2) as usize;
         let boundary_x = (dims.0 / 2) as usize;
-        let off = ((mid_y * dims.0 as usize + boundary_x) * 4) as usize;
+        let off = (mid_y * dims.0 as usize + boundary_x) * 4;
         assert_ne!(
             (h264[off], h264[off + 1], h264[off + 2]),
             (hevc[off], hevc[off + 1], hevc[off + 2]),

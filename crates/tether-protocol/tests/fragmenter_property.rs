@@ -7,6 +7,9 @@
 //! specifically the `latest_seq`-driven stale-fragment classification
 //! that bumps `fragments_lost`.
 
+// Test-only sequence numbers derived from small loop indices; casts are in range.
+#![allow(clippy::cast_possible_truncation)]
+
 use bytes::Bytes;
 use proptest::prelude::*;
 use tether_protocol::video::{

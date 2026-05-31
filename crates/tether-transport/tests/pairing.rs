@@ -69,9 +69,7 @@ async fn first_contact_pairing_then_session() -> anyhow::Result<()> {
         let exporter: [u8; EXPORTER_LEN] = exporter.try_into().expect("exporter len");
         let t = transcript(&exporter, &host_fp, &client_fp);
 
-        let client_mac = match pending.recv_pairing::<PairingConfirm>().await? {
-            PairingConfirm { mac } => mac,
-        };
+        let PairingConfirm { mac: client_mac } = pending.recv_pairing::<PairingConfirm>().await?;
         assert!(
             host_keyed.verify_confirmation(Direction::ClientToHost, &t, &client_mac),
             "client confirmation must verify"

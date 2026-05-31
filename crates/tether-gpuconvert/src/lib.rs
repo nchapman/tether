@@ -463,13 +463,13 @@ fn allocate_textures(
 
     let y_readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("y readback"),
-        size: (y_padded_row as u64) * (height as u64),
+        size: u64::from(y_padded_row) * u64::from(height),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     let uv_readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("uv readback"),
-        size: (uv_padded_row as u64) * (chroma_h as u64),
+        size: u64::from(uv_padded_row) * u64::from(chroma_h),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -538,6 +538,9 @@ fn read_buffer(
 
 #[cfg(test)]
 mod tests {
+    // BT.709 reference pixel-math casts (clamped fp → u8) are intentional.
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
     use super::*;
 
     /// Fill `bgra` with a solid colour. BGRA layout: B, G, R, A.

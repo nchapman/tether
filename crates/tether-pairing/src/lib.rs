@@ -37,6 +37,7 @@
 //!        the confirmation MACs can't agree. This is the load-bearing defense
 //!        once an attacker can terminate TLS (a reflection attacker becomes
 //!        exactly that case).
+//!
 //!    The transcript also folds in both cert fingerprints (kills
 //!    unknown-key-share) and the protocol version (downgrade defense).
 //!

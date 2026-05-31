@@ -319,6 +319,9 @@ pub(crate) fn cursor_uniform_for(
             (snap.width as f32) * (fit_w as f32) / (vw.max(1) as f32),
             (snap.height as f32) * (fit_h as f32) / (vh.max(1) as f32),
         );
+        // Diagnostic-only: rounded sprite extents logged as integers.
+        #[allow(clippy::cast_possible_truncation)]
+        let rendered_sprite_px = (sprite_px.0.round() as i32, sprite_px.1.round() as i32);
         tracing::info!(
             sprite_wh = ?(snap.width, snap.height),
             video_wh = ?(vw, vh),
@@ -326,7 +329,7 @@ pub(crate) fn cursor_uniform_for(
             fit_wh = ?(fit_w, fit_h),
             position = ?(snap.position_x, snap.position_y),
             hotspot = ?(snap.hotspot_x, snap.hotspot_y),
-            rendered_sprite_px = ?(sprite_px.0.round() as i32, sprite_px.1.round() as i32),
+            rendered_sprite_px = ?rendered_sprite_px,
             "cursor overlay render params changed"
         );
         *last_logged = Some(key);

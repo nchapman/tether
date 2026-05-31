@@ -276,6 +276,9 @@ pub type EventSink = Box<dyn Fn(RenderEvent) + Send>;
 /// `on_event` is optional: pass `None` to skip input-event emission.
 /// Using a callback rather than a channel lets the caller bridge into
 /// whatever sync/async plumbing they already have.
+// Public render entrypoint: window config, negotiated video format, and the
+// frame/cursor/event seams are all distinct, intrinsic parameters.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     title: &str,
     initial_size: (u32, u32),
@@ -536,13 +539,12 @@ impl ApplicationHandler for App {
                             warn!(error = ?e, "applying frame failed");
                         }
                     }
-                    if !skipped && t_capture.is_some() {
+                    if let Some(t_cap) = t_capture.filter(|_| !skipped) {
                         // Sample present latency only for frames we
                         // actually applied. Dedup against
                         // `last_recorded_t_cap` so OS-initiated
                         // redraws don't double-count.
                         if self.last_recorded_t_cap != t_capture {
-                            let t_cap = t_capture.expect("checked Some above");
                             let latency = MonoNanos::now().saturating_sub(t_cap);
                             self.present_stats.record_and_maybe_log(latency);
                             self.last_recorded_t_cap = Some(t_cap);
@@ -694,10 +696,7 @@ impl LatestFrame {
     /// that for a drop count or just drop it.
     #[must_use = "displaced frame should be counted as a render drop or explicitly ignored"]
     pub fn set(&self, frame: Frame) -> Option<Frame> {
-        std::mem::replace(
-            &mut *self.0.lock().expect("LatestFrame mutex poisoned"),
-            Some(frame),
-        )
+        (*self.0.lock().expect("LatestFrame mutex poisoned")).replace(frame)
     }
 
     /// Take the currently-held frame, leaving the slot empty.

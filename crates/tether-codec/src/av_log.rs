@@ -248,7 +248,8 @@ unsafe extern "C" fn tether_log_callback(
             fmt,
             vl,
             buf.as_mut_ptr().cast::<c_char>(),
-            #[allow(clippy::cast_possible_wrap)]
+            // buf is a fixed 1024-byte stack array; fits c_int.
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
             {
                 buf.len() as c_int
             },

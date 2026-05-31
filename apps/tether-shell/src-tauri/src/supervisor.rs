@@ -121,32 +121,28 @@ impl Supervisor {
         let role_owned = role.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        tracing::debug!(role = role_owned, line, "engine stdout line");
-                        match serde_json::from_str::<EngineEvent>(line) {
-                            Ok(event) => {
-                                if let Err(e) = app_for_reader.emit(
-                                    "engine-status",
-                                    StatusPayload {
-                                        role: role_owned.clone(),
-                                        event,
-                                    },
-                                ) {
-                                    tracing::error!(error = %e, role = role_owned, "emit engine-status failed");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, line, role = role_owned, "unparseable engine line");
-                            }
+            // Drain stdout line-by-line; Ok(None) (EOF) or an Err ends the loop.
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                tracing::debug!(role = role_owned, line, "engine stdout line");
+                match serde_json::from_str::<EngineEvent>(line) {
+                    Ok(event) => {
+                        if let Err(e) = app_for_reader.emit(
+                            "engine-status",
+                            StatusPayload {
+                                role: role_owned.clone(),
+                                event,
+                            },
+                        ) {
+                            tracing::error!(error = %e, role = role_owned, "emit engine-status failed");
                         }
                     }
-                    Ok(None) | Err(_) => break,
+                    Err(e) => {
+                        tracing::warn!(error = %e, line, role = role_owned, "unparseable engine line");
+                    }
                 }
             }
             tracing::info!(

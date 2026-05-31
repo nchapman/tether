@@ -1,6 +1,9 @@
 //! Loopback test for `InputChannel`: 100 events sent through the
 //! in-memory duplex pair must arrive in order on the other side.
 
+// Test event ids derived from small loop indices; cast is in range.
+#![allow(clippy::cast_possible_truncation)]
+
 use tether_protocol::input::{HidUsage, InputEvent, InputEventKind, Modifiers};
 use tether_protocol::MonoNanos;
 use tether_transport::test_support::input_duplex_pair;

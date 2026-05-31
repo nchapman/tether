@@ -12,6 +12,12 @@
 //! Cost: one allocation per keyframe of `extradata.len()` bytes
 //! (~25 bytes H.264, ~50 bytes HEVC). P-frames pass through untouched.
 
+// hvcc/avcc box construction writes NALU and array lengths into the
+// container's fixed-width size fields (u16 length prefixes, u8 counts).
+// These narrowing casts are intentional and bounded by realistic
+// parameter-set sizes.
+#![allow(clippy::cast_possible_truncation)]
+
 use std::slice;
 
 use bytes::{Bytes, BytesMut};
@@ -521,14 +527,15 @@ mod tests {
         let sps = [0x67, 0x42, 0x00, 0x1e, 0xab]; // NAL type 7 (SPS)
         let pps = [0x68, 0xce, 0x38, 0x80]; // NAL type 8 (PPS)
 
-        let mut avcc = Vec::new();
-        avcc.push(1); // configurationVersion
-        avcc.push(66); // AVCProfileIndication (Baseline)
-        avcc.push(0); // profile_compatibility
-        avcc.push(30); // AVCLevelIndication
-        avcc.push(0xFF); // lengthSizeMinusOne=3 (lower 2 bits) + reserved
-        avcc.push(0xE1); // numSPS=1 (lower 5 bits) + reserved
-                         // SPS
+        let mut avcc = vec![
+            1,    // configurationVersion
+            66,   // AVCProfileIndication (Baseline)
+            0,    // profile_compatibility
+            30,   // AVCLevelIndication
+            0xFF, // lengthSizeMinusOne=3 (lower 2 bits) + reserved
+            0xE1, // numSPS=1 (lower 5 bits) + reserved
+        ];
+        // SPS
         avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
         avcc.extend_from_slice(&sps);
         // numPPS

@@ -18,8 +18,8 @@
 //! Bitrates and per-frame budgets are anchored at 60 fps:
 //! - 1080p60: 16.6 ms/frame budget, 8 Mbps target
 //! - 4K60:    16.6 ms/frame budget, 25 Mbps target (HEVC: × 0.7 in the
-//!            host's `derive_bitrate_kbps`; we use the upper number
-//!            here to keep the benches comparable across codecs)
+//!   host's `derive_bitrate_kbps`; we use the upper number here to keep
+//!   the benches comparable across codecs)
 //!
 //! Source for `encode_dmabuf`: run one frame through VAAPI encode →
 //! VAAPI decode → DMA-BUF export to get a real surface at the right
@@ -31,6 +31,10 @@
 //! at the same dims/codec we're decoding. The encoder is fresh each
 //! bench so the bitstream characteristics are deterministic, modulo
 //! the encoder's own non-determinism (rate-control state).
+
+// Bench harness: frame counts / timing values are small positive
+// literals; narrowing casts are intentional and unchecked here.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use std::time::Instant;
 

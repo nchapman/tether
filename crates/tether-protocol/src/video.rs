@@ -1147,6 +1147,8 @@ impl FrameReassembler {
 /// Requires (primary slots filled OR parity slots filled) ≥ data_shards
 /// AND parity availability > 0.
 fn enough_for_rs_decode(pending: &Pending) -> bool {
+    // Parity shard count is bounded by FEC_MAX_PRIMARY_SHARDS (212), well within u16.
+    #[allow(clippy::cast_possible_truncation)]
     let parity_received = pending.parity_shards.iter().filter(|s| s.is_some()).count() as u16;
     pending.received_count + parity_received >= pending.fragment_count
 }

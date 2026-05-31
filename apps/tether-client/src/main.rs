@@ -754,6 +754,8 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or(u32::MAX);
                 last_frames_dropped = frames_dropped_now;
                 last_fragments_lost = fragments_lost_now;
+                // window_secs is a small positive duration; round-to-i64 is intentional.
+                #[allow(clippy::cast_possible_truncation)]
                 let interval_ms =
                     u32::try_from((window_secs * 1000.0).round() as i64).unwrap_or(u32::MAX);
                 let rtt_ewma_us =

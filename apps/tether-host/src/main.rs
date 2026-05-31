@@ -1194,7 +1194,11 @@ struct AbrState {
     last_applied_kbps: u32,
 }
 
+// `Ready` is the steady-state variant and lives for the encoder's whole
+// lifetime; boxing it would only add an indirection on the hot path without
+// shrinking any frequently-moved value, so the size skew is accepted.
 #[cfg(target_os = "linux")]
+#[allow(clippy::large_enum_variant)]
 enum BridgeState {
     NotYetBuilt,
     Ready(GpuConvertBridge),
@@ -2024,6 +2028,9 @@ enum CursorEffect {
 /// Pure function — no I/O, no clock side effects beyond `t_capture`
 /// on the position packet. The `now` parameter is injected so tests
 /// can pin it.
+// Cursor positions are rescaled into encode-pixel space; the round-then-cast
+// to i32 is intentional and bounded by realistic screen dimensions.
+#[allow(clippy::cast_possible_truncation)]
 fn cursor_tick(
     state: &mut CursorPumpState,
     source: &mut dyn CursorSource,
@@ -2224,6 +2231,7 @@ async fn pump_cursor(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod cursor_pump_tests {
     use super::*;
     use tether_capture::{CursorPosition, CursorShapeEvent};
@@ -2408,6 +2416,9 @@ const ENCODER_ALIGN: u32 = 16;
 /// preserve aspect ratio (letterbox at the client; never stretch)
 /// and clamp to [`ENCODER_ALIGN`]. `None` returns the capture dims
 /// (with the same alignment guarantee).
+// Scaled dimensions are non-negative (scale clamped to <= 1.0, dims positive)
+// and far below u32::MAX; the round-then-cast is intentional.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_dims_for_viewport(
     capture_w: u32,
     capture_h: u32,
@@ -2448,6 +2459,9 @@ fn encode_dims_for_viewport(
 /// reach this function. A real GPU compute scaler is the planned
 /// follow-up; for now those paths encode at capture dims regardless
 /// of viewport.
+// Sample coordinates are floored/clamped to >= 0 and bounded by source dims;
+// output samples are clamped to [0, 255] before the u8 cast. All casts intentional.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn resize_bgra_bilinear(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     debug_assert_eq!((src_w * src_h * 4) as usize, src.len());
     let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
@@ -2494,6 +2508,8 @@ fn resize_bgra_bilinear(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u
 /// Fold one observation into the encoder's ABR controller and apply
 /// the resulting bitrate target if it changed. No-op when the encoder
 /// reports `supports_changing_bitrate() == false` (slot.abr is None).
+// rtt_ms is a logging-only value; RTT in milliseconds never approaches u64::MAX.
+#[allow(clippy::cast_possible_truncation)]
 fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObservation) {
     let Some(abr) = slot.abr.as_mut() else {
         return;
@@ -2578,6 +2594,10 @@ impl StageLatency {
     }
 }
 
+// The capture/send loop wires together independently-owned channels, signals,
+// and shared flags; bundling them into a struct would only obscure the seam.
+// The as_nanos()->u64 latency cast is logging-only and never overflows.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn run_capture_and_send(
     conn: Arc<Connection>,
     frames: FrameReceiver,
@@ -3431,7 +3451,6 @@ fn init_tracing(ipc: bool) -> tracing_appender::non_blocking::WorkerGuard {
 /// chroma in the same budget that was sized for subsampled video.
 /// Clamped to a sane band so a tiny test pattern doesn't get a
 /// starvation-tier bitrate and a huge display doesn't blow the LAN.
-
 fn derive_bitrate_kbps(profile: VideoProfile, width: u32, height: u32, fps: u32) -> u32 {
     const REFERENCE_PIXELS: u64 = 1920 * 1080;
     const REFERENCE_FPS: u64 = 60;

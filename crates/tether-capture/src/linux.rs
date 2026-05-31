@@ -1324,7 +1324,7 @@ mod tests {
         .expect("header size fits in i32");
         assert_eq!(
             *min,
-            header + 1 * 1 * 4,
+            header + 4,
             "min must reserve a 1×1 bitmap (matching OBS CURSOR_META_SIZE)"
         );
         assert_eq!(

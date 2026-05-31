@@ -1,3 +1,7 @@
+// Test harness: frame counts / dimensions are small positive literals;
+// narrowing casts in assertions are intentional.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use crate::h264::{fixture_access_units, H264_320X240_INTRA};
 use crate::{Decoder, Encoder, Frame, GpuFrame, GpuFrameSource};
 
@@ -201,7 +205,7 @@ fn vaapi_encoder_dmabuf_import() {
     let mut gpu_frame: Option<GpuFrame> = None;
     'decode: for au in fixture_access_units(H264_320X240_INTRA) {
         dec.submit(au).expect("vaapi submit");
-        while let Some(f) = dec.next_frame().expect("vaapi next_frame") {
+        if let Some(f) = dec.next_frame().expect("vaapi next_frame") {
             let Frame::Gpu(g) = f else {
                 panic!("VaapiDecoder must emit Gpu frames");
             };
@@ -697,8 +701,8 @@ fn h264_nal_types(annex_b: &[u8]) -> Vec<u8> {
     // Need at least 3 bytes for a start code; the four-byte case
     // checks its own bound inside the body.
     while i + 3 <= annex_b.len() {
-        let three = &annex_b[i..i + 3] == [0, 0, 1];
-        let four = i + 4 <= annex_b.len() && &annex_b[i..i + 4] == [0, 0, 0, 1];
+        let three = annex_b[i..i + 3] == [0, 0, 1];
+        let four = i + 4 <= annex_b.len() && annex_b[i..i + 4] == [0, 0, 0, 1];
         if four {
             i += 4;
         } else if three {
@@ -743,7 +747,7 @@ fn h264_nal_types(annex_b: &[u8]) -> Vec<u8> {
 ///
 /// Per `intra_refresh` AVOption semantics, the encoder emits gradual
 /// refresh (P-slices with progressively-positioned intra MB columns
-/// + recovery-point SEI) instead of periodic IDRs. We don't parse the
+/// plus recovery-point SEI) instead of periodic IDRs. We don't parse the
 /// SEIs here — confirming the option was *accepted* by the driver
 /// (property 1) and the bitstream stays decodable (property 3) is
 /// the load-bearing verification.

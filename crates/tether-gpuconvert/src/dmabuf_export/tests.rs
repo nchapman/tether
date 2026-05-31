@@ -207,7 +207,7 @@ fn export_then_reimport_roundtrip() {
     };
 
     // Copy the imported texture into a readback buffer and verify.
-    let padded_row = ((width + 255) / 256) * 256;
+    let padded_row = width.div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
         size: u64::from(padded_row) * u64::from(height),
@@ -386,7 +386,7 @@ fn export_rg8unorm_odd_width_roundtrip() {
     };
 
     // Read back. Rg8 is 2 bytes per texel.
-    let row_pad = ((width * 2 + 255) / 256) * 256;
+    let row_pad = (width * 2).div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("rg8 readback"),
         size: u64::from(row_pad) * u64::from(height),

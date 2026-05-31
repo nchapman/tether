@@ -10,7 +10,8 @@ plugin against GitHub Releases.
 
 - **`.github/workflows/ci.yml`** — on every push/PR: rustfmt, the test-support
   gating check, a warning-free workspace build, no-hardware unit tests, the
-  shell typecheck + backend tests, and advisory clippy. Runs on Linux, macOS,
+  shell typecheck + backend tests, and clippy (a blocking gate, `-D warnings`,
+  workspace + the excluded shell). Runs on Linux, macOS,
   and Windows. Hardware tests (VAAPI/Vulkan/Metal) are **not** run in CI — they
   need a real GPU; run `make test-hw` locally.
 - **`.github/workflows/release.yml`** — on a `v*` tag: builds the engines,

@@ -112,7 +112,10 @@ impl VaapiDecoder {
     /// (libavutil convention); `frame.hw_frames_ctx -> data ->
     /// device_ctx -> hwctx` is the `AVVAAPIDeviceContext` whose
     /// `display` field is the `VADisplay` we need to pass to libva.
-    #[allow(clippy::cast_sign_loss)] // i32 width/height from ffmpeg are non-negative
+    // cast_sign_loss: i32 width/height from ffmpeg are non-negative.
+    // cast_possible_truncation: VASurfaceID round-trips through usize
+    // from frame.data[3] (libavutil hwaccel convention).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn export_vaapi_frame(&self, frame: AVFrame) -> Result<Frame> {
         let width = frame.width;
         let height = frame.height;

@@ -144,10 +144,13 @@ behaviour we expect to work everywhere.
   a documented follow-up.
 - Releases: `.github/workflows/release.yml` on `v*` tags produces Tauri
   installers + a signed updater manifest (see `docs/RELEASING.md`).
-- `cargo clippy --workspace --all-targets` is advisory (pre-existing
-  cast warnings in `tether-codec` and `tether-scaler/src/reference.rs`).
-  New clippy warnings in files under active edit should be addressed
-  in the same change.
+- Clippy is a blocking gate: `cargo clippy --workspace --all-targets -- -D
+  warnings`, plus the excluded Tauri shell. Intentional numeric/pixel casts
+  (the workspace opts into `cast_possible_truncation` / `cast_sign_loss` /
+  `cast_lossless`) are suppressed with scoped `#[allow(...)]` + a justifying
+  comment — never by disabling the lints. New warnings must be resolved the
+  same way (fix, or scoped allow with reason) in the change that introduces
+  them.
 
 ## What's deliberately untested today
 

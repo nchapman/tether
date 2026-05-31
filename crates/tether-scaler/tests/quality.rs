@@ -10,6 +10,9 @@
 //! but they keep the CPU reference honest. If the reference is wrong,
 //! the hardware test is comparing two wrongs.
 
+// Pixel/coordinate quantization casts in test fixtures are intentional.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use image::{ImageBuffer, Rgba};
 use tether_scaler::reference::{mitchell_filter_default, mitchell_weight, srgb_to_linear};
 
@@ -87,9 +90,21 @@ fn upscale_then_downscale_preserves_solid_color() {
     let up = mitchell_filter_default(&src, 128, 128, 256, 256);
     let back = mitchell_filter_default(&up, 256, 256, 128, 128);
     for chunk in back.chunks_exact(4) {
-        assert!((chunk[0] as i32 - 200).abs() <= 2, "R drift: {}", chunk[0]);
-        assert!((chunk[1] as i32 - 150).abs() <= 2, "G drift: {}", chunk[1]);
-        assert!((chunk[2] as i32 - 80).abs() <= 2, "B drift: {}", chunk[2]);
+        assert!(
+            (i32::from(chunk[0]) - 200).abs() <= 2,
+            "R drift: {}",
+            chunk[0]
+        );
+        assert!(
+            (i32::from(chunk[1]) - 150).abs() <= 2,
+            "G drift: {}",
+            chunk[1]
+        );
+        assert!(
+            (i32::from(chunk[2]) - 80).abs() <= 2,
+            "B drift: {}",
+            chunk[2]
+        );
     }
 }
 
@@ -169,17 +184,17 @@ fn asymmetric_scale_handles_independent_axes() {
     assert_eq!(dst.len(), 64 * 96 * 4);
     for (i, chunk) in dst.chunks_exact(4).enumerate() {
         assert!(
-            (chunk[0] as i32 - 80).abs() <= 2,
+            (i32::from(chunk[0]) - 80).abs() <= 2,
             "px {i} R drift: {}",
             chunk[0]
         );
         assert!(
-            (chunk[1] as i32 - 160).abs() <= 2,
+            (i32::from(chunk[1]) - 160).abs() <= 2,
             "px {i} G drift: {}",
             chunk[1]
         );
         assert!(
-            (chunk[2] as i32 - 40).abs() <= 2,
+            (i32::from(chunk[2]) - 40).abs() <= 2,
             "px {i} B drift: {}",
             chunk[2]
         );

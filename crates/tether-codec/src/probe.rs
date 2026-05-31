@@ -179,6 +179,10 @@ pub fn build_encoder_d3d11(
 /// Errors if no GPU decoder is available for `profile.codec` on this
 /// client.
 #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+// Each per-OS cfg block returns so the next platform's block doesn't
+// run; on a single target the active block looks like a needless tail
+// return, but the explicit return is load-bearing cross-platform.
+#[allow(clippy::needless_return)]
 pub fn build_decoder(profile: VideoProfile, gpu_export: bool) -> Result<Box<dyn Decoder>> {
     let kind = profile.codec;
     #[cfg(target_os = "linux")]

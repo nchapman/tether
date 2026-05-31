@@ -166,6 +166,13 @@ pub fn refresh_period_ns(refresh_rate_mhz: u32) -> u64 {
     1_000_000_000_000u64 / u64::from(rate_mhz)
 }
 
+/// Duration form of [`refresh_period_ns`] for callers that prefer
+/// the `Duration` type.
+#[must_use]
+pub fn refresh_period(refresh_rate_mhz: u32) -> Duration {
+    Duration::from_nanos(refresh_period_ns(refresh_rate_mhz))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,11 +255,4 @@ mod tests {
         let p = PresentPolicy::Smooth.preference();
         assert_eq!(p[0], wgpu::PresentMode::Fifo);
     }
-}
-
-/// Duration form of [`refresh_period_ns`] for callers that prefer
-/// the `Duration` type.
-#[must_use]
-pub fn refresh_period(refresh_rate_mhz: u32) -> Duration {
-    Duration::from_nanos(refresh_period_ns(refresh_rate_mhz))
 }

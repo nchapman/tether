@@ -9,6 +9,9 @@
 //!    reports a non-zero `render_drops` count matching the
 //!    `produced - consumed` arithmetic.
 
+// Drop counts are small test values; the u64 -> u32 casts are in range.
+#![allow(clippy::cast_possible_truncation)]
+
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -155,7 +158,7 @@ async fn render_drops_accounting_is_exact() {
         };
         let c = worker.process_job(job, MonoNanos::now());
         produced += 1;
-        observed_drops.fetch_add(c.render_drops as u64, Ordering::Relaxed);
+        observed_drops.fetch_add(u64::from(c.render_drops), Ordering::Relaxed);
         if (i + 1) % drain_every == 0 {
             // Consumer pulls the latest frame, leaving the slot empty.
             if frames.take().is_some() {

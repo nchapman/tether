@@ -230,11 +230,10 @@ mod tests {
     #[tokio::test]
     async fn resume_authorized_promotes_and_returns_host_fp() {
         let (server, client, host_pending, client_pending) = loopback().await;
-        let (host_done, client_res) = tokio::join!(
+        let (_host_done, client_res) = tokio::join!(
             host_resume(host_pending, true),
             establish(client_pending, &HostAuth::Resume, client.fingerprint()),
         );
-        let _ = host_done;
         let (_conn, host_fp) = client_res.expect("resume should succeed");
         assert_eq!(host_fp, server.fingerprint());
     }

@@ -49,8 +49,9 @@ bench: ffmpeg ## VAAPI benchmark matrix (codec x resolution x layer; prints p50/
 probe: ffmpeg ## Print the host codec capability matrix (encode/decode per profile)
 	cargo test -p tether-probe --lib print_host_supported_profiles -- --ignored --nocapture
 
-clippy: ffmpeg ## Lint the workspace (advisory — some pre-existing warnings exist)
-	cargo clippy --workspace --all-targets
+clippy: ffmpeg ## Lint the workspace + shell, warnings-as-errors (CI gate)
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --manifest-path apps/tether-shell/src-tauri/Cargo.toml --all-targets -- -D warnings
 
 fmt: ## Format the workspace + the (excluded) Tauri shell
 	cargo fmt --all

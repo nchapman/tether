@@ -1138,9 +1138,7 @@ impl GpuState {
         // GpuFrameSource variant (NVDEC over CUDA-Vulkan interop, a
         // VideoToolbox CVPixelBuffer, etc.) is a compile error here
         // rather than a silent fallthrough.
-        let dmabuf = match frame.source {
-            GpuFrameSource::DmaBuf(d) => d,
-        };
+        let GpuFrameSource::DmaBuf(dmabuf) = frame.source;
         let fresh = import_dmabuf_textures(
             &self.device,
             &self.yuv_bgl,
@@ -1322,9 +1320,11 @@ impl GpuState {
         };
         let scaler_needs_rebuild = need_upscale
             && self.upscale.scaler_failed_for != Some(upscale_dims)
-            && self.upscale.scaler.as_ref().map_or(true, |s| {
-                s.dst_dims() != upscale_dims || s.src_dims() != video_dims
-            });
+            && self
+                .upscale
+                .scaler
+                .as_ref()
+                .is_none_or(|s| s.dst_dims() != upscale_dims || s.src_dims() != video_dims);
         if scaler_needs_rebuild {
             match build_upscale_scaler(
                 &self.device,
@@ -1589,9 +1589,9 @@ fn letterbox_fit_dims(video: (u32, u32), window: (u32, u32)) -> (u32, u32) {
 /// Returns:
 /// - `Ok(Some(scaler))` — normal upscale case.
 /// - `Ok(None)` — `src_dims == dst_dims`; no scaler needed, blit
-///    samples the intermediate directly.
+///   samples the intermediate directly.
 /// - `Err(_)` — construction genuinely failed. Caller logs once and
-///    sets a sticky failure flag to avoid per-frame retries.
+///   sets a sticky failure flag to avoid per-frame retries.
 fn build_upscale_scaler(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

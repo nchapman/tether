@@ -384,6 +384,9 @@ impl Nv12DmaBuf {
 
 #[cfg(test)]
 mod tests {
+    // Readback pixel-math casts (fp → u8, u64 offset → usize) are intentional.
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
     use super::*;
     use crate::dmabuf_export::export_texture_as_dmabuf;
 

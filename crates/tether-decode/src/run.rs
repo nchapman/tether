@@ -343,6 +343,8 @@ impl Worker {
     /// the watchdog so both update `DecodeCompletion::idr_request_fired`
     /// consistently.
     fn try_fire_idr(&mut self, now: MonoNanos) -> bool {
+        // IDR_RATE_LIMIT is a small constant Duration; its nanos fit in u64.
+        #[allow(clippy::cast_possible_truncation)]
         let rate_limit_ns = IDR_RATE_LIMIT.as_nanos() as u64;
         let fire = self
             .last_idr_request
@@ -372,6 +374,8 @@ impl Worker {
             return (None, false);
         };
         let elapsed_ns = now.saturating_sub(last);
+        // NO_OUTPUT_WATCHDOG is a small constant Duration; its nanos fit in u64.
+        #[allow(clippy::cast_possible_truncation)]
         let window_ns = NO_OUTPUT_WATCHDOG.as_nanos() as u64;
         if elapsed_ns < window_ns {
             return (None, false);

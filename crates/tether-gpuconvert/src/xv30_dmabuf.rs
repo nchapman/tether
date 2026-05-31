@@ -385,6 +385,9 @@ impl Bgra2Xv30DmaBuf {
 
 #[cfg(test)]
 mod tests {
+    // Readback pixel-math casts (u64 offset → usize) are intentional.
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
     use super::*;
 
     /// Re-import one packed XV30 plane as Rgb10a2Unorm, copy it to a

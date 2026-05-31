@@ -110,6 +110,8 @@ pub(super) fn align_up(value: u64, align: u64) -> u64 {
     (value + align - 1) & !(align - 1)
 }
 
+// Vulkan exposes at most 32 memory types, so the index fits in u32.
+#[allow(clippy::cast_possible_truncation)]
 pub(super) fn find_memory_type(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     type_bits_req: u32,

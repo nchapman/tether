@@ -126,6 +126,7 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecErro
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::control::*;
@@ -1156,7 +1157,7 @@ mod tests {
         let kept: Vec<_> = pkts
             .into_iter()
             .enumerate()
-            .filter(|(i, _)| *i >= parity_count + 1)
+            .filter(|(i, _)| *i > parity_count)
             .map(|(_, p)| p)
             .collect();
         let mut r = FrameReassembler::new();

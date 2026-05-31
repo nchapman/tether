@@ -320,6 +320,8 @@ async fn decoy_reject(mut pending: PendingConnection, client_spake2: Vec<u8>) ->
 /// First-contact path: run SPAKE2 + channel-bound confirmation against the open
 /// pairing window's PIN. The PIN is burned on attempt (taken before any crypto
 /// runs), so a wrong guess consumes the window.
+// False positive: the guard is explicitly `drop(guard)`-ed before every `.await`.
+#[allow(clippy::await_holding_lock)]
 async fn authorize_pair(
     mut pending: PendingConnection,
     state: &PairingState,

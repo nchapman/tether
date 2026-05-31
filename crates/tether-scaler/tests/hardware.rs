@@ -15,6 +15,9 @@
 //!     downscale, 4K→720p with mip, upscale, heavy down with multi-
 //!     level mip).
 
+// Pixel/coordinate quantization casts in test fixtures are intentional.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use std::sync::Arc;
 
 use std::time::Instant;
@@ -60,7 +63,7 @@ fn upload_rgba8(
     width: u32,
     height: u32,
 ) -> wgpu::Texture {
-    let tex = device.create_texture_with_data(
+    device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
             label: Some("scaler-test source"),
@@ -78,8 +81,7 @@ fn upload_rgba8(
         },
         wgpu::util::TextureDataOrder::LayerMajor,
         bytes,
-    );
-    tex
+    )
 }
 
 /// Map a texture's contents back to a Vec<u8>. Adds a row-padding
@@ -92,7 +94,7 @@ fn read_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture)
     // 256-byte alignment is the wgpu spec for buffer-image copy.
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_row = unpadded_row.div_ceil(align) * align;
-    let buf_size = (padded_row * height) as u64;
+    let buf_size = u64::from(padded_row * height);
 
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scaler-test readback"),
@@ -175,8 +177,8 @@ fn coord_encoded(width: u32, height: u32) -> Vec<u8> {
     let mut v = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
         for x in 0..width {
-            let r = ((x as f64 / width as f64) * 256.0).clamp(0.0, 255.0) as u8;
-            let g = ((y as f64 / height as f64) * 256.0).clamp(0.0, 255.0) as u8;
+            let r = ((f64::from(x) / f64::from(width)) * 256.0).clamp(0.0, 255.0) as u8;
+            let g = ((f64::from(y) / f64::from(height)) * 256.0).clamp(0.0, 255.0) as u8;
             v.extend_from_slice(&[r, g, 128, 255]);
         }
     }
@@ -191,15 +193,15 @@ fn column_mae_rgb(a: &[u8], b: &[u8], width: u32, height: u32) -> Vec<f64> {
     let w = width as usize;
     let h = height as usize;
     let mut out = vec![0.0; w];
-    for col in 0..w {
+    for (col, slot) in out.iter_mut().enumerate() {
         let mut acc = 0.0_f64;
         for row in 0..h {
             let off = (row * w + col) * 4;
             for ch in 0..3 {
-                acc += (a[off + ch] as f64 - b[off + ch] as f64).abs();
+                acc += (f64::from(a[off + ch]) - f64::from(b[off + ch])).abs();
             }
         }
-        out[col] = acc / (h as f64 * 3.0);
+        *slot = acc / (h as f64 * 3.0);
     }
     out
 }
@@ -274,7 +276,7 @@ fn ssim_rgb(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
                 let mut sum_aa = 0.0_f64;
                 let mut sum_bb = 0.0_f64;
                 let mut sum_ab = 0.0_f64;
-                let n_pix = (WIN * WIN) as f64;
+                let n_pix = f64::from(WIN * WIN);
                 for dy in 0..WIN {
                     for dx in 0..WIN {
                         let off = (((wy + dy) * w + (wx + dx)) * 4 + ch) as usize;
@@ -349,6 +351,8 @@ fn fiducial_channel_order_red_stays_red() {
 /// max per-channel diff ≤ 4. Bounds are tuned for fp16 vs fp32
 /// precision in the intermediate texture; tightening below this
 /// chases noise.
+// Test helper: dims + buffers + label are naturally distinct parameters.
+#[allow(clippy::too_many_arguments)]
 fn assert_matches_reference(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -664,7 +668,7 @@ fn read_texture_rgba16f(
     let padded_row = unpadded_row.div_ceil(align) * align;
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scaler-test linear readback"),
-        size: (padded_row * height) as u64,
+        size: u64::from(padded_row * height),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -944,13 +948,13 @@ fn bench_scale_realistic_dims() {
         "case", "mip levels", "min µs", "med µs", "max µs"
     );
 
-    let cases_srgb: &[((u32, u32), (u32, u32), &str)] = &[
+    let cases_srgb = [
         ((1920, 1080), (1280, 720), "1080p → 720p (host downscale)"),
         ((3840, 2160), (1920, 1080), "4K → 1080p (host downscale)"),
         ((3840, 2160), (1280, 720), "4K → 720p (mip + Mitchell)"),
         ((3840, 2160), (640, 360), "4K → 360p (heavy mip)"),
     ];
-    for &(src_dims, dst_dims, label) in cases_srgb {
+    for &(src_dims, dst_dims, label) in &cases_srgb {
         let bytes = quadrant_image(src_dims.0, src_dims.1);
         let src_tex = upload_rgba8(&device, &queue, &bytes, src_dims.0, src_dims.1);
         let scaler = Scaler::new_with_color_space(
@@ -973,12 +977,12 @@ fn bench_scale_realistic_dims() {
         );
     }
 
-    let cases_linear: &[((u32, u32), (u32, u32), &str)] = &[
+    let cases_linear = [
         ((1280, 720), (1920, 1080), "720p → 1080p (client upscale)"),
         ((1280, 720), (3840, 2160), "720p → 4K (client upscale)"),
         ((640, 360), (1920, 1080), "360p → 1080p (3× upscale)"),
     ];
-    for &(src_dims, dst_dims, label) in cases_linear {
+    for &(src_dims, dst_dims, label) in &cases_linear {
         // Build a linear-light fp32 source and upload.
         let n = (src_dims.0 * src_dims.1) as usize;
         let mut src = Vec::with_capacity(n * 4);
@@ -1108,7 +1112,7 @@ fn read_plane(
     let unpadded_row = width * bytes_per_pixel;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_row = unpadded_row.div_ceil(align) * align;
-    let buf_size = (padded_row * height) as u64;
+    let buf_size = u64::from(padded_row * height);
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("plane-test readback"),
         size: buf_size,
@@ -1331,7 +1335,7 @@ fn uv_chroma_siting_no_half_pixel_shift() {
         "no chroma signal landed in dst — scaler dropped everything"
     );
     let centroid = weighted / total;
-    let expected = (src_idx as f64) / 2.0; // cosited mapping: dst_x = src_x / scale_h
+    let expected = f64::from(src_idx) / 2.0; // cosited mapping: dst_x = src_x / scale_h
     let drift = (centroid - expected).abs();
     println!("uv chroma siting centroid {centroid:.3} (expected {expected:.3}); drift {drift:.3}");
     // Two-cell tolerance. The Mitchell kernel spreads a single bright

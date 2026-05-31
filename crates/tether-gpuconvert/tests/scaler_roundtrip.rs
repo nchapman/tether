@@ -12,6 +12,8 @@
 //! rejection.
 
 #![cfg(target_os = "linux")]
+// Pixel/coordinate quantization casts in test fixtures are intentional.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use std::sync::Arc;
 
@@ -308,8 +310,8 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
     let mut bgra = Vec::with_capacity((dims.0 * dims.1 * 4) as usize);
     for y in 0..dims.1 {
         for x in 0..dims.0 {
-            let r = ((x as f64 / dims.0 as f64) * 256.0).clamp(0.0, 255.0) as u8;
-            let g = ((y as f64 / dims.1 as f64) * 256.0).clamp(0.0, 255.0) as u8;
+            let r = ((f64::from(x) / f64::from(dims.0)) * 256.0).clamp(0.0, 255.0) as u8;
+            let g = ((f64::from(y) / f64::from(dims.1)) * 256.0).clamp(0.0, 255.0) as u8;
             // Stored as BGRA bytes: B, G, R, A.
             bgra.extend_from_slice(&[128, g, r, 255]);
         }
@@ -510,10 +512,10 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
         pass.draw(0..6, 0..1);
     }
     // Read back via buffer copy.
-    let bytes_per_row_aligned = ((dims.0 * 4 + 255) / 256) * 256;
+    let bytes_per_row_aligned = (dims.0 * 4).div_ceil(256) * 256;
     let buf = bridge.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback buf"),
-        size: (bytes_per_row_aligned * dims.1) as u64,
+        size: u64::from(bytes_per_row_aligned * dims.1),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -564,15 +566,15 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
     let w = dims.0 as usize;
     let h = dims.1 as usize;
     let mut col_mae = vec![0.0_f64; w];
-    for col in 0..w {
+    for (col, slot) in col_mae.iter_mut().enumerate() {
         let mut acc = 0.0_f64;
         for row in 0..h {
             let off = (row * w + col) * 4;
             for ch in 0..4 {
-                acc += (bgra[off + ch] as f64 - readback[off + ch] as f64).abs();
+                acc += (f64::from(bgra[off + ch]) - f64::from(readback[off + ch])).abs();
             }
         }
-        col_mae[col] = acc / (h as f64 * 4.0);
+        *slot = acc / (h as f64 * 4.0);
     }
     let interior_mean: f64 = col_mae[64..w - 64].iter().sum::<f64>() / (w - 128) as f64;
     let left_max = col_mae[..32].iter().cloned().fold(0.0_f64, f64::max);
@@ -625,8 +627,8 @@ fn imported_bgra_then_scaler_preserves_left_edge(capture: (u32, u32), encode: (u
     let mut bgra = Vec::with_capacity((capture.0 * capture.1 * 4) as usize);
     for y in 0..capture.1 {
         for x in 0..capture.0 {
-            let r = ((x as f64 / capture.0 as f64) * 256.0).clamp(0.0, 255.0) as u8;
-            let g = ((y as f64 / capture.1 as f64) * 256.0).clamp(0.0, 255.0) as u8;
+            let r = ((f64::from(x) / f64::from(capture.0)) * 256.0).clamp(0.0, 255.0) as u8;
+            let g = ((f64::from(y) / f64::from(capture.1)) * 256.0).clamp(0.0, 255.0) as u8;
             bgra.extend_from_slice(&[128, g, r, 255]);
         }
     }
@@ -678,10 +680,10 @@ fn imported_bgra_then_scaler_preserves_left_edge(capture: (u32, u32), encode: (u
 
     // Read back the scaler output (Rgba8Unorm) directly via
     // copy_texture_to_buffer — scaler's output has COPY_SRC.
-    let bytes_per_row_aligned = ((encode.0 * 4 + 255) / 256) * 256;
+    let bytes_per_row_aligned = (encode.0 * 4).div_ceil(256) * 256;
     let buf = bridge.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("scaler readback"),
-        size: (bytes_per_row_aligned * encode.1) as u64,
+        size: u64::from(bytes_per_row_aligned * encode.1),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -744,15 +746,15 @@ fn imported_bgra_then_scaler_preserves_left_edge(capture: (u32, u32), encode: (u
     );
 
     let mut col_mae = vec![0.0_f64; w];
-    for col in 0..w {
+    for (col, slot) in col_mae.iter_mut().enumerate() {
         let mut acc = 0.0_f64;
         for row in 0..h {
             let off = (row * w + col) * 4;
             for ch in 0..3 {
-                acc += (readback[off + ch] as f64 - ref_rgba[off + ch] as f64).abs();
+                acc += (f64::from(readback[off + ch]) - f64::from(ref_rgba[off + ch])).abs();
             }
         }
-        col_mae[col] = acc / (h as f64 * 3.0);
+        *slot = acc / (h as f64 * 3.0);
     }
     let interior: f64 = col_mae[64..w - 64].iter().sum::<f64>() / (w - 128) as f64;
     let left = col_mae[..32].iter().cloned().fold(0.0_f64, f64::max);

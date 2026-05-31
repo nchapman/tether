@@ -353,6 +353,7 @@ fn current_user_sid_string() -> io::Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
 

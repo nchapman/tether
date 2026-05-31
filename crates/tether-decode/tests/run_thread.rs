@@ -6,6 +6,9 @@
 //! is covered by integration tests in `tether-session/tests`.
 
 #![cfg(feature = "test-support")]
+// Test timing offsets derived from small loop indices; casts are in range.
+// The lifecycle-callbacks tuple is a test helper, not a public API.
+#![allow(clippy::cast_sign_loss, clippy::type_complexity)]
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;

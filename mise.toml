@@ -1,5 +1,8 @@
 [tools]
-rust = "1.95.0"
+# `components` pulls rustfmt + clippy into the toolchain — mise installs the
+# `minimal` rustup profile by default, which omits them, breaking `cargo fmt`
+# / `cargo clippy` in CI and on fresh clones.
+rust = { version = "1.95.0", components = "rustfmt,clippy" }
 # Frontend toolchain for the Tauri shell (apps/tether-shell). Node drives
 # Vite + the React/TS build; pnpm is the package manager (lockfile is
 # committed). Pinned to majors so a fresh checkout resolves the same

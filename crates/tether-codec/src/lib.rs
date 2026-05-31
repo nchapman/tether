@@ -1,8 +1,11 @@
 //! Codec trait + ffmpeg-backed encoders/decoders.
 //!
-//! Current backends: software H.264 (libx264 via rsmpeg) and hardware
-//! H.264 via VAAPI on Linux. VideoToolbox / NVENC and additional codecs
-//! (HEVC, AV1) land as additional [`Encoder`] / [`Decoder`] impls.
+//! Current backends are hardware-only: VAAPI on Linux, VideoToolbox on
+//! macOS, D3D11 (QSV/AMF/NVENC/MF) on Windows, across H.264, HEVC, and AV1.
+//! There is no software *encoder* — tether links its own LGPL FFmpeg, which
+//! has no libx264/libx265; a `#[cfg(test)]` software *decoder* lives in
+//! [`h264`] only to exercise decode-path tests against a committed fixture.
+//! New backends land as additional [`Encoder`] / [`Decoder`] impls.
 //! Trait shape is cribbed from RustDesk's `EncoderApi`
 //! (`libs/scrap/src/common/codec.rs:60`) so the introspection surface
 //! (latency hints, bitrate control, HW vs SW detection) is right from
@@ -159,7 +162,8 @@ impl DecodedFrame {
 }
 
 /// Pluggable video-encoder backend. One impl per (codec, backend) pair
-/// — `libx264` software, `h264_vaapi`, `h264_videotoolbox`, etc. The
+/// — `h264_vaapi`, `h264_videotoolbox`, `hevc_qsv`, etc. (all hardware;
+/// the LGPL FFmpeg ships no software video encoder). The
 /// host probes available backends at startup, picks the best one that
 /// constructs successfully, and stores the result as `Box<dyn Encoder>`
 /// so the encode loop is backend-agnostic.
@@ -171,8 +175,8 @@ impl DecodedFrame {
 /// to know the concrete type.
 pub trait Encoder: Send {
     /// Encode one BGRA frame at the negotiated width/height. May emit
-    /// zero or more packets — zero on the very first frame while
-    /// libx264 buffers SPS/PPS, multiple on an IDR that emits SPS/PPS
+    /// zero or more packets — zero on the very first frame while the
+    /// encoder buffers headers, multiple on an IDR that emits SPS/PPS
     /// + the IDR slice as separate packets.
     fn encode_bgra(
         &mut self,
@@ -201,8 +205,8 @@ pub trait Encoder: Send {
     fn codec_kind(&self) -> tether_protocol::control::CodecKind;
 
     /// Short human-readable identifier suitable for logs and the
-    /// `ServerHello` descriptor field — e.g. `"libx264 sw"`,
-    /// `"h264_vaapi (Intel)"`, `"h264_videotoolbox"`. Distinct from
+    /// `ServerHello` descriptor field — e.g. `"h264_vaapi (Intel)"`,
+    /// `"h264_videotoolbox"`, `"hevc_qsv"`. Distinct from
     /// `codec_kind` (which only carries the on-wire codec id) so the
     /// client can show which backend the host actually chose.
     fn name(&self) -> &'static str;

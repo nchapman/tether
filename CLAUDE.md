@@ -8,8 +8,18 @@ Tether is a low-latency open-source remote desktop in Rust. Two binaries (`tethe
 
 ## Common commands
 
+**First build / fresh clone:** run `make ffmpeg` once. `tether-codec` statically
+links our own LGPL FFmpeg 8.1 from the `nchapman/tether-ffmpeg` releases (pinned
+in `scripts/ffmpeg-version`); `scripts/fetch-ffmpeg.sh` downloads + checksum-verifies
+the host artifact into `vendor/ffmpeg/` (gitignored) and `.cargo/ffmpeg-env.toml`
+points rusty_ffmpeg at it. The `make` build/test targets fetch it automatically
+(idempotent); a raw `cargo build` on a fresh clone fails with a pkg-config path
+error until `make ffmpeg` has run. No system FFmpeg dev package is needed. There
+is no software encoder in the LGPL build — see `crates/tether-codec/src/h264.rs`.
+
 All wrapped by `make` (`make help`). Key targets:
 
+- `make ffmpeg` — download + stage the pinned static FFmpeg for this host (idempotent)
 - `make build` — `cargo build --workspace`
 - `make test` — `cargo test --workspace --lib` (no hardware)
 - `make test-hw` — `test-correctness` + `bench`; needs VAAPI + Vulkan

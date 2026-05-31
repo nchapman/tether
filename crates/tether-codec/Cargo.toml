@@ -23,6 +23,14 @@ bytes = { workspace = true }
 # pins would break silently if the PR author force-pushes.
 # Migration trigger: bump to `version = "0.19"` once PR #252 lands and a
 # new rsmpeg version ships to crates.io.
+#
+# Linking: we statically link our own LGPL FFmpeg 8.1 from the
+# nchapman/tether-ffmpeg releases. `scripts/fetch-ffmpeg.sh` stages it under
+# vendor/ffmpeg/prefix and `.cargo/ffmpeg-env.toml` points rusty_ffmpeg at it
+# (FFMPEG_PKG_CONFIG_PATH + FFMPEG_LINK_MODE=static); bindings are generated
+# from those headers, so they track the linked libs exactly — no system 8.0/8.1
+# drift. The `link_system_ffmpeg` feature is retained only as the env-less
+# fallback (probe system pkg-config); it's inert whenever the env is staged.
 rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a200256763b31e5528fb0f21876e", features = ["ffmpeg8", "link_system_ffmpeg"] }
 
 # libva FFI for vaExportSurfaceHandle on the decode-side zero-copy

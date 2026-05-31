@@ -1,4 +1,4 @@
-use crate::h264::H264Encoder;
+use crate::h264::{fixture_access_units, H264_320X240_INTRA};
 use crate::{Decoder, Encoder, Frame, GpuFrame, GpuFrameSource};
 
 use super::{VaapiDecoder, VaapiEncoder};
@@ -98,30 +98,24 @@ fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
 #[test]
 #[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi)"]
 fn vaapi_decoder_smoke() {
-    // Encode a few frames with the software encoder so we have a
-    // valid Annex-B bitstream to decode, then verify the VAAPI
+    // Feed the committed 320×240 Annex-B fixture (the LGPL FFmpeg has no
+    // software encoder to make one on the fly), then verify the VAAPI
     // decoder produces a frame at the expected dimensions.
     let w = 320;
     let h = 240;
-    let mut enc = H264Encoder::new_bgra(w, h, 30, 2_000).expect("sw encoder");
     let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
 
     let mut got: Option<GpuFrame> = None;
-    for t in 0..6i64 {
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let bgra = make_test_bgra(w, h, t as u32);
-        let packets = enc.encode_bgra(&bgra, t, t == 0).expect("encode");
-        for p in packets {
-            dec.submit(&p.data).expect("vaapi submit");
-            while let Some(f) = dec.next_frame().expect("vaapi next_frame") {
-                let Frame::Gpu(g) = f else {
-                    panic!("VaapiDecoder must emit DMA-BUF Gpu frames");
-                };
-                got = Some(g);
-            }
+    for au in fixture_access_units(H264_320X240_INTRA) {
+        dec.submit(au).expect("vaapi submit");
+        while let Some(f) = dec.next_frame().expect("vaapi next_frame") {
+            let Frame::Gpu(g) = f else {
+                panic!("VaapiDecoder must emit DMA-BUF Gpu frames");
+            };
+            got = Some(g);
         }
     }
-    let frame = got.expect("decoder produced a frame within six input frames");
+    let frame = got.expect("decoder produced a frame from the fixture");
     assert_eq!(frame.width, w);
     assert_eq!(frame.height, h);
     // `GpuFrameSource` only has the `DmaBuf` variant on Linux (the
@@ -161,51 +155,42 @@ fn vaapi_decoder_smoke() {
     );
 }
 
-/// Round-trip a frame through SW encode → VAAPI decode (which
-/// exports a DMA-BUF) → VAAPI encode via the DMA-BUF import path.
-/// Validates the riskiest unknown: that ffmpeg accepts a DRM_PRIME
-/// AVFrame mapped into the encoder's hwframes pool and emits a valid
-/// H.264 packet without a CPU upload.
+/// Round-trip a frame through VAAPI decode (which exports a DMA-BUF) →
+/// VAAPI encode via the DMA-BUF import path. Validates the riskiest
+/// unknown: that ffmpeg accepts a DRM_PRIME AVFrame mapped into the
+/// encoder's hwframes pool and emits a valid H.264 packet without a CPU
+/// upload.
 ///
 /// We piggyback on the decoder to produce the DMA-BUF (which is itself
 /// covered by `vaapi_decoder_smoke`) rather than synthesising one via
 /// vaCreateSurfaces — both sources hit the same import code path
-/// inside ffmpeg's hwcontext_vaapi.
+/// inside ffmpeg's hwcontext_vaapi. The decoder input is the committed
+/// 320×240 fixture (no software encoder in the LGPL build).
 #[test]
 #[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_encoder_dmabuf_import)"]
 fn vaapi_encoder_dmabuf_import() {
-    // Same dimensions on the SW encoder, the VAAPI decoder (implicit
-    // — picks them up from the SPS), and the VAAPI encoder built
-    // below. They must match because the encoder's hw_frames_ctx
-    // pins width/height, and av_hwframe_map needs the dst pool to
-    // accept the src dimensions.
+    // The fixture's dimensions, the VAAPI decoder (implicit — picks
+    // them up from the SPS), and the VAAPI encoder built below must all
+    // match: the encoder's hw_frames_ctx pins width/height, and
+    // av_hwframe_map needs the dst pool to accept the src dimensions.
     let w = 320;
     let h = 240;
 
-    let mut sw_enc = H264Encoder::new_bgra(w, h, 30, 2_000).expect("sw encoder");
     let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
     let mut hw_enc = VaapiEncoder::new(tether_protocol::control::VideoProfile::H264_8BIT_420, w, h, 30, 4_000).expect("VAAPI encoder");
 
-    // Pump frames through SW encode → VAAPI decode until we get a
-    // GpuFrame holding a DMA-BUF. Six frames is the same budget
-    // vaapi_decoder_smoke uses (decoder usually emits on frame 0
-    // for the I-frame, but allow latency for swscale warmup).
+    // Pump the fixture's access units through the VAAPI decoder until we
+    // get a GpuFrame holding a DMA-BUF (the I-frame decodes on the first
+    // unit).
     let mut gpu_frame: Option<GpuFrame> = None;
-    for t in 0..6i64 {
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let bgra = make_test_bgra(w, h, t as u32);
-        let packets = sw_enc.encode_bgra(&bgra, t, t == 0).expect("sw encode");
-        for p in packets {
-            dec.submit(&p.data).expect("vaapi submit");
-            while let Some(f) = dec.next_frame().expect("vaapi next_frame") {
-                let Frame::Gpu(g) = f else {
-                    panic!("VaapiDecoder must emit Gpu frames");
-                };
-                gpu_frame = Some(g);
-            }
-        }
-        if gpu_frame.is_some() {
-            break;
+    'decode: for au in fixture_access_units(H264_320X240_INTRA) {
+        dec.submit(au).expect("vaapi submit");
+        while let Some(f) = dec.next_frame().expect("vaapi next_frame") {
+            let Frame::Gpu(g) = f else {
+                panic!("VaapiDecoder must emit Gpu frames");
+            };
+            gpu_frame = Some(g);
+            break 'decode;
         }
     }
     let gpu = gpu_frame.expect("decoder produced a GpuFrame");

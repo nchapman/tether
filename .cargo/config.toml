@@ -1,3 +1,8 @@
+# Pull in the FFmpeg static-link environment (FFMPEG_PKG_CONFIG_PATH etc.)
+# staged by `scripts/fetch-ffmpeg.sh`. Kept in a separate file so the linking
+# env lives next to the fetch tooling; see .cargo/ffmpeg-env.toml.
+include = ["ffmpeg-env.toml"]
+
 # macOS: apple-cf / screencapturekit / apple-metal ship Swift shims that
 # link `libswift_Concurrency.dylib` via `@rpath`. Their build scripts emit
 # `cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift`, but cargo only

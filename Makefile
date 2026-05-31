@@ -81,6 +81,7 @@ ci: ffmpeg ## Run the no-hardware checks CI runs (fmt, gating, build, test)
 package: ffmpeg ## Build a local Tauri installer bundle with the engines embedded
 	cargo build --release -p tether-host -p tether-client
 	@scripts/stage-engine-binaries.sh
+	@scripts/stage-windows-runtime.sh
 	pnpm --dir apps/tether-shell install
 	pnpm --dir apps/tether-shell tauri build --config src-tauri/tauri.release.conf.json
 

@@ -49,6 +49,15 @@ jobs:
         shell: bash
         run: scripts/stage-engine-binaries.sh
 
+      # The engines link the dynamic MSVC CRT (our static FFmpeg is built with
+      # -MD); ship those DLLs app-local so a clean Windows machine without the
+      # VC++ redistributable can run them. tauri.windows.conf.json (auto-merged
+      # on Windows) references them from bundle.resources.
+      - name: Stage Windows runtime DLLs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: scripts/stage-windows-runtime.sh
+
       - name: Install frontend dependencies
         run: pnpm --dir apps/tether-shell install --frozen-lockfile
 

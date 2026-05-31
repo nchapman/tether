@@ -1,0 +1,58 @@
+name: "Set up Tether build environment"
+description: >
+  Installs the pinned toolchains (mise), the Linux system libraries the
+  workspace links against, the prebuilt static FFmpeg, and the cargo build
+  cache. Shared by the CI and release workflows so the setup stays in one place.
+
+inputs:
+  ffmpeg:
+    description: "Whether to fetch the static FFmpeg (skip for jobs that don't compile the engines, e.g. fmt)."
+    required: false
+    default: "true"
+  github-token:
+    description: "Token used by scripts/fetch-ffmpeg.sh for `gh release download`. Falls back to anonymous curl if empty."
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    # The workspace links libva (tether-vaapi), PipeWire/SPA (tether-capture),
+    # and winit's xkbcommon/wayland; rsmpeg's bindgen needs libclang. The
+    # static FFmpeg covers the codec libs, so no FFmpeg dev package is needed.
+    # macOS and Windows runners ship the frameworks / import libs they need.
+    - name: Install Linux system dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config \
+          clang libclang-dev \
+          libva-dev libdrm-dev \
+          libpipewire-0.3-dev \
+          libxkbcommon-dev libwayland-dev \
+          libssl-dev
+
+    - name: Set up toolchains (rust/node/pnpm via mise.toml)
+      uses: jdx/mise-action@v2
+
+    - name: Cache static FFmpeg
+      if: inputs.ffmpeg == 'true'
+      uses: actions/cache@v4
+      with:
+        path: vendor/ffmpeg
+        key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ffmpeg-version') }}
+
+    # Use the script directly (not `make`) so this works on Windows runners,
+    # which have bash (Git for Windows) but no make. Idempotent: a cache hit
+    # leaves the staged prefix untouched.
+    - name: Fetch static FFmpeg
+      if: inputs.ffmpeg == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: scripts/fetch-ffmpeg.sh
+
+    - name: Cache cargo build
+      uses: Swatinem/rust-cache@v2

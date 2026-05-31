@@ -5,7 +5,7 @@
 # the cargo invocation each one wraps.
 
 .PHONY: help build release test test-hw test-correctness bench probe clippy fmt check clean \
-        ffmpeg ffmpeg-clean engines shell shell-install shell-check
+        ffmpeg ffmpeg-clean engines shell shell-install shell-check ci package hooks
 
 help:
 	@awk 'BEGIN { FS = ":.*##"; printf "\nTether dev targets:\n\n" } \
@@ -52,11 +52,36 @@ probe: ffmpeg ## Print the host codec capability matrix (encode/decode per profi
 clippy: ffmpeg ## Lint the workspace (advisory — some pre-existing warnings exist)
 	cargo clippy --workspace --all-targets
 
-fmt: ## Format the workspace
+fmt: ## Format the workspace + the (excluded) Tauri shell
 	cargo fmt --all
+	cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml
+
+hooks: ## Install the git pre-commit hook (fmt + gating, no compile)
+	git config core.hooksPath .githooks
+	@echo "pre-commit hook installed (.githooks)"
 
 clean: ## Cargo clean
 	cargo clean
+
+ci: ffmpeg ## Run the no-hardware checks CI runs (fmt, gating, build, test)
+	cargo fmt --all --check
+	cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check
+	@scripts/check_test_support_gating.sh
+	RUSTFLAGS="-D warnings" cargo build --workspace --all-targets
+	cargo test --workspace
+
+# --- Packaging (Tauri installers) -----------------------------------------
+# Builds release engines, stages them as sidecars, and runs the Tauri bundler
+# with the externalBin override. Produces installers under
+# apps/tether-shell/src-tauri/target/release/bundle/. This is the keyless local
+# smoke build: it does NOT emit (signed) updater artifacts — that's gated behind
+# tauri.updater.conf.json, which release.yml layers on with the signing key.
+
+package: ffmpeg ## Build a local Tauri installer bundle with the engines embedded
+	cargo build --release -p tether-host -p tether-client
+	@scripts/stage-engine-binaries.sh
+	pnpm --dir apps/tether-shell install
+	pnpm --dir apps/tether-shell tauri build --config src-tauri/tauri.release.conf.json
 
 # --- Tauri shell (control-plane UI) ---------------------------------------
 # The shell is excluded from the cargo workspace and builds via pnpm + the

@@ -28,6 +28,9 @@ All wrapped by `make` (`make help`). Key targets:
 - `make probe` — VAAPI codec build availability
 - `make clippy` — advisory
 - `make release` — host + client release build
+- `make ci` — the no-hardware checks CI runs (fmt, gating, warning-free build, test)
+- `make package` — local Tauri installer bundle with the engines embedded as sidecars
+- `make hooks` — install the git pre-commit hook (fmt + gating; run once per clone)
 
 Single test: `cargo test -p <crate> <name>`. Hardware tests are `#[ignore = "requires …"]`; the message names the requirement.
 
@@ -61,4 +64,4 @@ Single test: `cargo test -p <crate> <name>`. Hardware tests are `#[ignore = "req
 
 ## Testing matrix
 
-See `docs/TESTING.md` for per-crate counts and infrastructure. Default CI is `cargo build --workspace --all-targets && cargo test --workspace`; the build must stay warning-free. Hardware runs add `-- --ignored`. Clippy is advisory.
+See `docs/TESTING.md` for per-crate counts and infrastructure. Default CI is `cargo build --workspace --all-targets && cargo test --workspace`; the build must stay warning-free. Hardware runs add `-- --ignored`. Clippy is advisory. CI/CD lives in `.github/workflows/` (`ci.yml` on push/PR across Linux/macOS/Windows; `release.yml` on `v*` tags → Tauri-bundled installers + signed updater manifest to GitHub Releases) with shared setup in `.github/actions/setup`; `make ci` reproduces the no-hardware checks locally. Release + packaging flow is documented in `docs/RELEASING.md`.

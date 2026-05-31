@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Tether pre-commit hook: the fast, no-compile checks CI enforces, run before
+# every commit so the tree never drifts out of format again. Install with
+# `make hooks` (sets core.hooksPath to .githooks).
+#
+# Deliberately excludes the slow gates (build, test, clippy) — those run in CI
+# and via `make ci`. This hook is just rustfmt + the test-support gating check,
+# so it stays sub-second and never needs the FFmpeg toolchain.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+
+fail() {
+  printf '\033[31m[pre-commit] %s\033[0m\n' "$1" >&2
+  printf '  fix: %s\n' "$2" >&2
+  exit 1
+}
+
+# Workspace + the excluded Tauri shell (cargo fmt --all skips the latter).
+cargo fmt --all --check 2>/dev/null \
+  || fail "rustfmt: workspace not formatted" "cargo fmt --all"
+cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check 2>/dev/null \
+  || fail "rustfmt: tether-shell not formatted" \
+          "cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml"
+
+scripts/check_test_support_gating.sh >/dev/null \
+  || fail "test-support gating violation" "see scripts/check_test_support_gating.sh output"
+
+printf '\033[36m[pre-commit] fmt + gating OK\033[0m\n' >&2

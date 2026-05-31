@@ -11,7 +11,8 @@ mod supervisor;
 use supervisor::{Supervisor, ROLE_CLIENT, ROLE_HOST};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, RunEvent, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
 
 /// Start hosting: spawn `tether-host --ipc`. `test_pattern` swaps real
@@ -78,10 +79,7 @@ async fn start_pairing(supervisor: State<'_, Supervisor>, label: String) -> Resu
 /// Revoke a paired device by its tagged fingerprint; the host drops any live
 /// session from it and pushes a refreshed `peer_list`.
 #[tauri::command]
-async fn revoke_peer(
-    supervisor: State<'_, Supervisor>,
-    fingerprint: String,
-) -> Result<(), String> {
+async fn revoke_peer(supervisor: State<'_, Supervisor>, fingerprint: String) -> Result<(), String> {
     supervisor
         .send_command(ROLE_HOST, &ShellCommand::RevokePeer { fingerprint })
         .await
@@ -105,8 +103,17 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Supervisor::default())
         .setup(|app| {
+            // Best-effort startup update check; never blocks the shell.
+            let update_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = check_for_updates(update_handle).await {
+                    tracing::warn!(error = %e, "update check failed");
+                }
+            });
+
             // System tray: the shell keeps running here even when the
             // window is closed, so the host engine can stay up headless.
             let show = MenuItemBuilder::with_id("show", "Show Tether").build(app)?;
@@ -143,6 +150,24 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// Best-effort startup update check. Queries the configured GitHub Releases
+/// endpoint and, if a newer signed bundle exists, emits `update-available`
+/// (carrying the new version) so the webview can surface it. Applying the
+/// update is deferred to a follow-up UI — this only reports. Any failure
+/// (offline, no release yet, dev build) is returned to the caller, which logs
+/// and swallows it; a failed check must never block the shell from starting.
+async fn check_for_updates(app: AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    match updater.check().await.map_err(|e| e.to_string())? {
+        Some(update) => {
+            tracing::info!(version = %update.version, "update available");
+            let _ = app.emit("update-available", update.version.clone());
+        }
+        None => tracing::info!("shell is up to date"),
+    }
+    Ok(())
 }
 
 /// Reveal and focus the main window (from the tray "Show" item).

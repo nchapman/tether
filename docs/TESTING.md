@@ -131,11 +131,19 @@ behaviour we expect to work everywhere.
 
 ## CI shape
 
+- Implemented in `.github/workflows/ci.yml` (push/PR) across Linux, macOS,
+  and Windows, with shared setup in `.github/actions/setup`. `make ci`
+  reproduces the no-hardware checks locally.
 - Default: `cargo build --workspace --all-targets && cargo test --workspace`.
-  `cargo build --workspace --all-targets` is warning-free — treat any
-  new warning as a gate.
-- Hardware runner (when one exists): same plus
-  `cargo test --workspace -- --ignored`.
+  The build runs with `RUSTFLAGS=-D warnings`, so any new warning is a hard
+  gate. The Tauri shell (excluded from the workspace) is typechecked +
+  backend-tested in a separate `shell-check` job.
+- Hardware tests (VAAPI/Vulkan/Metal) are **not** run in CI — GitHub-hosted
+  runners have no usable GPU. Run `make test-hw` locally on a hardware runner;
+  a self-hosted GPU runner that adds `cargo test --workspace -- --ignored` is
+  a documented follow-up.
+- Releases: `.github/workflows/release.yml` on `v*` tags produces Tauri
+  installers + a signed updater manifest (see `docs/RELEASING.md`).
 - `cargo clippy --workspace --all-targets` is advisory (pre-existing
   cast warnings in `tether-codec` and `tether-scaler/src/reference.rs`).
   New clippy warnings in files under active edit should be addressed

@@ -25,6 +25,10 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Release builds use the release profile and run on tag refs whose
+          # cache scope no PR/main run can restore — caching them only evicts
+          # useful PR caches from the repo's 10 GB budget.
+          rust-cache: "false"
 
       # The Tauri shell links the webview/GTK toolkit on Linux to bundle.
       - name: Install Tauri Linux dependencies

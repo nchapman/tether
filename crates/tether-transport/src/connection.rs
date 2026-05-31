@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use tether_protocol::MonoNanos;
 use tether_protocol::{
     control::{ClientHello, ClockSync, ControlMessage, ServerHello},
     cursor::{ClientCursorPacket, HostCursorPacket},
@@ -12,7 +13,6 @@ use tether_protocol::{
     video::VideoPacket,
     MAX_DATAGRAM_PAYLOAD,
 };
-use tether_protocol::MonoNanos;
 
 use crate::channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
 use crate::tls::CertFingerprint;

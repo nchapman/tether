@@ -65,10 +65,7 @@ impl LibeiInjector {
         .await
         .map_err(|e| InjectError::Init(format!("spawn_blocking join: {e}")))?
         .map_err(|e| InjectError::Init(format!("enigo new: {e:?}")))?;
-        tracing::info!(
-            session = "wayland (libei)",
-            "linux input backend selected"
-        );
+        tracing::info!(session = "wayland (libei)", "linux input backend selected");
         Ok(Self {
             inner: EnigoBackend::new(enigo),
         })
@@ -130,7 +127,9 @@ impl SilenceStdout {
                 return Self { saved_fd: None };
             }
             libc::close(devnull);
-            Self { saved_fd: Some(saved) }
+            Self {
+                saved_fd: Some(saved),
+            }
         }
     }
 }

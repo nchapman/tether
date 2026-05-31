@@ -46,8 +46,7 @@ fn videotoolbox_set_bitrate_live_continues_to_encode() {
         enc.supports_changing_bitrate(),
         "VideoToolbox encoder is expected to advertise bitrate-change support"
     );
-    let mut dec =
-        VideoToolboxDecoder::new(CodecKind::H264).expect("VideoToolbox decoder");
+    let mut dec = VideoToolboxDecoder::new(CodecKind::H264).expect("VideoToolbox decoder");
 
     for t in 0..4i64 {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -181,7 +180,9 @@ fn videotoolbox_keyframes_carry_extradata() {
         // VideoToolbox can hold the last submitted frame's packet until
         // the next frame arrives; without this drain a forced keyframe
         // late in the loop would be missed.
-        let trailing = enc.flush().unwrap_or_else(|e| panic!("{kind:?} flush: {e:?}"));
+        let trailing = enc
+            .flush()
+            .unwrap_or_else(|e| panic!("{kind:?} flush: {e:?}"));
         for p in trailing {
             if p.keyframe {
                 keyframes_seen += 1;
@@ -235,7 +236,6 @@ fn videotoolbox_decoder_constructs() {
 #[test]
 #[ignore = "requires macOS + VideoToolbox (run with: cargo test -p tether-codec --ignored videotoolbox_round_trip)"]
 fn videotoolbox_round_trip() {
-
     // NV12 fourccs the IOSurface may carry (matches what the renderer
     // accepts in `tether-render/src/gpu/metal.rs`).
     const NV12_VIDEO_RANGE: u32 = u32::from_be_bytes(*b"420v");
@@ -246,8 +246,8 @@ fn videotoolbox_round_trip() {
         let h = 240;
         let mut enc = VideoToolboxEncoder::new(yuv420_8bit(kind), w, h, 30, 2_000)
             .unwrap_or_else(|e| panic!("{kind:?} encoder: {e:?}"));
-        let mut dec = VideoToolboxDecoder::new(kind)
-            .unwrap_or_else(|e| panic!("{kind:?} decoder: {e:?}"));
+        let mut dec =
+            VideoToolboxDecoder::new(kind).unwrap_or_else(|e| panic!("{kind:?} decoder: {e:?}"));
 
         let mut decoded: Option<GpuFrame> = None;
         // 12 frames is plenty: the first keyframe carries extradata
@@ -386,14 +386,10 @@ fn videotoolbox_round_trip_chroma_matrix() {
                      0x{fourcc:08x} is not in the 4:4:4 family — VT likely \
                      silently downsampled to 4:2:0 in the bitstream"
                 );
-                eprintln!(
-                    "round-trip matrix: {profile:?} OK (IOSurface 0x{fourcc:08x})"
-                );
+                eprintln!("round-trip matrix: {profile:?} OK (IOSurface 0x{fourcc:08x})");
             }
             (Ok(fourcc), _) => {
-                eprintln!(
-                    "round-trip matrix: {profile:?} OK (IOSurface 0x{fourcc:08x})"
-                );
+                eprintln!("round-trip matrix: {profile:?} OK (IOSurface 0x{fourcc:08x})");
             }
             (Err(reason), _) => {
                 eprintln!("round-trip matrix: {profile:?} unsupported ({reason})");
@@ -523,7 +519,6 @@ fn expected_iosurface_fourccs_for(profile: VideoProfile) -> &'static [u32] {
 #[test]
 #[ignore = "requires macOS + VideoToolbox"]
 fn videotoolbox_decoder_recovers_from_mid_session_idr() {
-
     for kind in [CodecKind::H264, CodecKind::Hevc] {
         let w = 320;
         let h = 240;

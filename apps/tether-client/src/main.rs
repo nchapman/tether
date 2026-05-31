@@ -18,14 +18,14 @@ use std::time::Instant;
 
 use crossbeam_channel::bounded;
 use tether_decode::{DecodeCompletion, DecodeJob};
-use tether_ipc::{EngineEvent, Reporter};
-use tether_render::LatestFrame;
 use tether_input::{WinitTranslator, WireEvent};
+use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::control::{ControlMessage, GoodbyeCode, Viewport};
-use tether_session::{ClientSession, ClientSessionConfig, ConnectError};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
+use tether_render::LatestFrame;
 use tether_render::RenderEvent;
+use tether_session::{ClientSession, ClientSessionConfig, ConnectError};
 use tether_transport::{Client, Datagram, ServerAuth};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -118,7 +118,10 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::with_identity(&config_dir)?;
     let client_fp = client.fingerprint();
-    let pending = match client.connect_pending(addr, "tether-host", server_auth).await {
+    let pending = match client
+        .connect_pending(addr, "tether-host", server_auth)
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             reporter.emit(&EngineEvent::Error {
@@ -318,7 +321,12 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     Ok(ControlMessage::CursorShape {
-                        id, hotspot, width, height, format, pixels,
+                        id,
+                        hotspot,
+                        width,
+                        height,
+                        format,
+                        pixels,
                     }) => {
                         // The wire pixel format is always Rgba8 today
                         // (`CursorPixelFormat::Rgba8`). New variants
@@ -328,12 +336,17 @@ async fn main() -> anyhow::Result<()> {
                         use tether_protocol::cursor::CursorPixelFormat;
                         if !matches!(format, CursorPixelFormat::Rgba8) {
                             tracing::warn!(
-                                id, ?format, "unsupported cursor pixel format; dropping shape"
+                                id,
+                                ?format,
+                                "unsupported cursor pixel format; dropping shape"
                             );
                             continue;
                         }
                         info!(
-                            id, ?hotspot, width, height,
+                            id,
+                            ?hotspot,
+                            width,
+                            height,
                             pixel_bytes = pixels.len(),
                             "received cursor shape; enqueuing for renderer upload",
                         );
@@ -376,15 +389,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(ControlMessage::SetActiveDisplays { .. }) => {
                         // Client-originated; misrouted if seen on the client side.
-                        tracing::debug!("unexpected client→host SetActiveDisplays arrived on client; ignoring");
+                        tracing::debug!(
+                            "unexpected client→host SetActiveDisplays arrived on client; ignoring"
+                        );
                     }
-                    Ok(ControlMessage::StreamReady { .. }
-                       | ControlMessage::StreamPause { .. }
-                       | ControlMessage::StreamResume { .. }
-                       | ControlMessage::ClientStats { .. }
-                       | ControlMessage::SetClientViewport(_)) => {
+                    Ok(
+                        ControlMessage::StreamReady { .. }
+                        | ControlMessage::StreamPause { .. }
+                        | ControlMessage::StreamResume { .. }
+                        | ControlMessage::ClientStats { .. }
+                        | ControlMessage::SetClientViewport(_),
+                    ) => {
                         // Client-originated; misrouted if seen on the client side.
-                        tracing::debug!("unexpected client→host control message arrived on client; ignoring");
+                        tracing::debug!(
+                            "unexpected client→host control message arrived on client; ignoring"
+                        );
                     }
                     Err(e) => {
                         warn!(error = ?e, "control recv failed; ending control loop");
@@ -462,7 +481,9 @@ async fn main() -> anyhow::Result<()> {
             // timeout, and the user sees a frozen window with no
             // explanation. `say_goodbye_with_code` closes the
             // connection as part of its shutdown.
-            error!("decode thread failed to initialise; sending Goodbye(InternalError) and exiting");
+            error!(
+                "decode thread failed to initialise; sending Goodbye(InternalError) and exiting"
+            );
             say_goodbye_with_code(
                 &conn_ready,
                 "client decoder failed to initialise",
@@ -678,8 +699,7 @@ async fn main() -> anyhow::Result<()> {
             // pipeline) and send-to-recv (network + reassembly).
             let host_in_client_clock =
                 recv_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
-            let send_in_client_clock =
-                recv_clock_sync.remote_to_local(frame.meta.timing.t_send);
+            let send_in_client_clock = recv_clock_sync.remote_to_local(frame.meta.timing.t_send);
             let age_ns = now.saturating_sub(host_in_client_clock);
             let network_ns = now.saturating_sub(send_in_client_clock);
             frame_count += 1;
@@ -707,8 +727,7 @@ async fn main() -> anyhow::Result<()> {
             // the recv loop owns.
             while let Ok(c) = decode_completion_rx.try_recv() {
                 decode_completion_count = decode_completion_count.saturating_add(1);
-                decode_latency_sum_ns =
-                    decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
+                decode_latency_sum_ns = decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
                 if c.decode_err || c.soft_failure {
                     decode_errors = decode_errors.saturating_add(1);
                 }
@@ -726,26 +745,20 @@ async fn main() -> anyhow::Result<()> {
                 // against last window so the wire field is a
                 // per-interval rate; rtt_ewma_us is whole-
                 // session EWMA on the QUIC RTT.
-                let (frames_dropped_now, fragments_lost_now) =
-                    reassembler.loss_counters();
-                let frames_dropped_delta = u32::try_from(
-                    frames_dropped_now.saturating_sub(last_frames_dropped),
-                )
-                .unwrap_or(u32::MAX);
-                let fragments_lost_delta = u32::try_from(
-                    fragments_lost_now.saturating_sub(last_fragments_lost),
-                )
-                .unwrap_or(u32::MAX);
+                let (frames_dropped_now, fragments_lost_now) = reassembler.loss_counters();
+                let frames_dropped_delta =
+                    u32::try_from(frames_dropped_now.saturating_sub(last_frames_dropped))
+                        .unwrap_or(u32::MAX);
+                let fragments_lost_delta =
+                    u32::try_from(fragments_lost_now.saturating_sub(last_fragments_lost))
+                        .unwrap_or(u32::MAX);
                 last_frames_dropped = frames_dropped_now;
                 last_fragments_lost = fragments_lost_now;
-                let interval_ms = u32::try_from(
-                    (window_secs * 1000.0).round() as i64,
-                )
-                .unwrap_or(u32::MAX);
-                let rtt_ewma_us = u32::try_from(
-                    conn_recv.rtt().as_micros().min(u128::from(u32::MAX)),
-                )
-                .unwrap_or(u32::MAX);
+                let interval_ms =
+                    u32::try_from((window_secs * 1000.0).round() as i64).unwrap_or(u32::MAX);
+                let rtt_ewma_us =
+                    u32::try_from(conn_recv.rtt().as_micros().min(u128::from(u32::MAX)))
+                        .unwrap_or(u32::MAX);
                 let stats = ControlMessage::ClientStats {
                     interval_ms,
                     frames_received: u32::try_from(frame_count).unwrap_or(u32::MAX),
@@ -849,9 +862,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     WireEvent::Cursor(pkt) => {
-                        if let Err(e) =
-                            conn_input.send_datagram(&Datagram::ClientCursor(pkt))
-                        {
+                        if let Err(e) = conn_input.send_datagram(&Datagram::ClientCursor(pkt)) {
                             // Cursor packets are best-effort by design
                             // — log at debug and keep going. A burst
                             // of failures means quinn's send queue is
@@ -1316,7 +1327,11 @@ mod arg_tests {
     #[test]
     fn pin_and_label_consume_their_values() {
         let parsed = parse_cli_args(&args(&[
-            "--pin", "12345678", "127.0.0.1:7654", "--label", "my laptop",
+            "--pin",
+            "12345678",
+            "127.0.0.1:7654",
+            "--label",
+            "my laptop",
         ]))
         .expect("flags + positional");
         assert_eq!(parsed.pin.as_deref(), Some("12345678"));

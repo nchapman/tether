@@ -16,13 +16,13 @@ use windows::core::s;
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11RasterizerState, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE,
-    D3D11_BLEND_OP_ADD, D3D11_BLEND_SRC_ALPHA, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL,
-    D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_RASTERIZER_DESC,
-    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
+    ID3D11RasterizerState, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BLEND_DESC,
+    D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_SRC_ALPHA,
+    D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_CULL_NONE, D3D11_FILL_SOLID,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC,
+    D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
 
@@ -131,15 +131,18 @@ impl D3D11CursorOverlay {
         unsafe { device.CreateRasterizerState(&raster_desc, Some(&mut rasterizer)) }
             .map_err(|e| d3d_err("CreateRasterizerState (cursor)", e))?;
 
-        let cbuffer = cbuffer.ok_or_else(|| RenderError::GraphicsApi("null cursor cbuffer".into()))?;
-        let sampler = sampler.ok_or_else(|| RenderError::GraphicsApi("null cursor sampler".into()))?;
+        let cbuffer =
+            cbuffer.ok_or_else(|| RenderError::GraphicsApi("null cursor cbuffer".into()))?;
+        let sampler =
+            sampler.ok_or_else(|| RenderError::GraphicsApi("null cursor sampler".into()))?;
         Ok(Self {
             vs: vs.ok_or_else(|| RenderError::GraphicsApi("null cursor vertex shader".into()))?,
             ps: ps.ok_or_else(|| RenderError::GraphicsApi("null cursor pixel shader".into()))?,
             cbuffers: [Some(cbuffer.clone())],
             cbuffer,
             samplers: [Some(sampler)],
-            blend: blend.ok_or_else(|| RenderError::GraphicsApi("null cursor blend state".into()))?,
+            blend: blend
+                .ok_or_else(|| RenderError::GraphicsApi("null cursor blend state".into()))?,
             rasterizer: rasterizer
                 .ok_or_else(|| RenderError::GraphicsApi("null cursor rasterizer".into()))?,
             active: None,
@@ -160,7 +163,10 @@ impl D3D11CursorOverlay {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_IMMUTABLE,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             CPUAccessFlags: 0,
@@ -183,7 +189,11 @@ impl D3D11CursorOverlay {
             .map_err(|e| d3d_err("CreateShaderResourceView (cursor sprite)", e))?;
         let srv = srv.ok_or_else(|| RenderError::GraphicsApi("null cursor sprite SRV".into()))?;
 
-        self.active = Some(ActiveSprite { id: snap.id, _texture: texture, srvs: [Some(srv)] });
+        self.active = Some(ActiveSprite {
+            id: snap.id,
+            _texture: texture,
+            srvs: [Some(srv)],
+        });
         Ok(())
     }
 

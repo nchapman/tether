@@ -155,10 +155,7 @@ fn export_then_reimport_roundtrip() {
 
     // Re-import via wgpu's existing import path. `try_clone` dups
     // the fd because texture_from_dmabuf_fd takes ownership.
-    let import_fd = export
-        .fd
-        .try_clone()
-        .expect("dup fd for re-import");
+    let import_fd = export.fd.try_clone().expect("dup fd for re-import");
     let import_desc = wgpu::hal::TextureDescriptor {
         label: Some("roundtrip import"),
         size: wgpu::Extent3d {
@@ -217,8 +214,9 @@ fn export_then_reimport_roundtrip() {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut enc = device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback enc") });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("readback enc"),
+    });
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &import_tex,
@@ -395,8 +393,9 @@ fn export_rg8unorm_odd_width_roundtrip() {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut enc = device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rg8 enc") });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("rg8 enc"),
+    });
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &import_tex,
@@ -441,11 +440,7 @@ fn export_rg8unorm_odd_width_roundtrip() {
                 "R[{x},{y}] mismatched (stride={})",
                 export.stride
             );
-            assert_eq!(
-                mapped[i + 1],
-                (y & 0xff) as u8,
-                "G[{x},{y}] mismatched"
-            );
+            assert_eq!(mapped[i + 1], (y & 0xff) as u8, "G[{x},{y}] mismatched");
         }
     }
 }

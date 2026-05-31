@@ -303,7 +303,16 @@ pub(crate) fn cursor_uniform_for(
     #[allow(clippy::cast_precision_loss)]
     let rect_y = (surf_h as f32 - fit_h as f32) * 0.5;
 
-    let key = (snap.width, snap.height, vw, vh, surf_w, surf_h, fit_w, fit_h);
+    let key = (
+        snap.width,
+        snap.height,
+        vw,
+        vh,
+        surf_w,
+        surf_h,
+        fit_w,
+        fit_h,
+    );
     if *last_logged != Some(key) {
         #[allow(clippy::cast_precision_loss)]
         let sprite_px = (
@@ -325,7 +334,12 @@ pub(crate) fn cursor_uniform_for(
     #[allow(clippy::cast_precision_loss)]
     let rows = [
         [rect_x, rect_y, fit_w as f32, fit_h as f32],
-        [snap.position_x, snap.position_y, snap.hotspot_x as f32, snap.hotspot_y as f32],
+        [
+            snap.position_x,
+            snap.position_y,
+            snap.hotspot_x as f32,
+            snap.hotspot_y as f32,
+        ],
         [snap.width as f32, snap.height as f32, vw as f32, vh as f32],
         [surf_w as f32, surf_h as f32, 1.0, 0.0],
     ];
@@ -501,7 +515,12 @@ mod wgpu_overlay {
         /// Upload `snap`'s pixels into a fresh `Rgba8Unorm` texture and
         /// make it the active sprite. Called only when the active id
         /// changes, so a static cursor pays nothing here.
-        fn upload_sprite(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, snap: &CursorSnapshot<'_>) {
+        fn upload_sprite(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            snap: &CursorSnapshot<'_>,
+        ) {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("tether-render cursor sprite"),
                 size: wgpu::Extent3d {
@@ -536,7 +555,11 @@ mod wgpu_overlay {
                 },
             );
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.active = Some(ActiveSprite { id: snap.id, _texture: texture, view });
+            self.active = Some(ActiveSprite {
+                id: snap.id,
+                _texture: texture,
+                view,
+            });
         }
 
         /// Run the cursor pass for one frame. No-ops when the cursor isn't

@@ -71,7 +71,14 @@ fn vaapi_set_bitrate_live_continues_to_encode() {
 fn vaapi_encoder_smoke() {
     let w = 640;
     let h = 480;
-    let mut enc = VaapiEncoder::new(tether_protocol::control::VideoProfile::H264_8BIT_420, w, h, 30, 4_000).expect("VAAPI encoder");
+    let mut enc = VaapiEncoder::new(
+        tether_protocol::control::VideoProfile::H264_8BIT_420,
+        w,
+        h,
+        30,
+        4_000,
+    )
+    .expect("VAAPI encoder");
     let bgra = vec![0x80u8; (w * h * 4) as usize];
     let packets = enc.encode_bgra(&bgra, 0, true).expect("encode");
     // First frame may produce 0 packets (encoder warm-up) or 1+
@@ -103,7 +110,8 @@ fn vaapi_decoder_smoke() {
     // decoder produces a frame at the expected dimensions.
     let w = 320;
     let h = 240;
-    let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
+    let mut dec =
+        VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
 
     let mut got: Option<GpuFrame> = None;
     for au in fixture_access_units(H264_320X240_INTRA) {
@@ -176,8 +184,16 @@ fn vaapi_encoder_dmabuf_import() {
     let w = 320;
     let h = 240;
 
-    let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
-    let mut hw_enc = VaapiEncoder::new(tether_protocol::control::VideoProfile::H264_8BIT_420, w, h, 30, 4_000).expect("VAAPI encoder");
+    let mut dec =
+        VaapiDecoder::new(tether_protocol::control::CodecKind::H264).expect("VAAPI decoder");
+    let mut hw_enc = VaapiEncoder::new(
+        tether_protocol::control::VideoProfile::H264_8BIT_420,
+        w,
+        h,
+        30,
+        4_000,
+    )
+    .expect("VAAPI encoder");
 
     // Pump the fixture's access units through the VAAPI decoder until we
     // get a GpuFrame holding a DMA-BUF (the I-frame decodes on the first
@@ -306,22 +322,20 @@ fn hevc_main444_dmabuf_roundtrip() {
     // Vulkan instance as the compute pipeline) and fill it with mid-
     // grey. We don't need a fancy gradient — we're testing the
     // pipeline plumbing, not chroma fidelity.
-    let src = bridge
-        .device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("test bgra mid-grey"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("test bgra mid-grey"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
     let n = (w * h) as usize;
     let bgra = vec![0x80u8; n * 4];
     bridge.queue().write_texture(
@@ -346,8 +360,8 @@ fn hevc_main444_dmabuf_roundtrip() {
 
     let mut enc = VaapiEncoder::new(VideoProfile::HEVC_8BIT_444, w, h, 30, 8_000)
         .expect("VAAPI HEVC Main444 encoder");
-    let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::Hevc)
-        .expect("VAAPI HEVC decoder");
+    let mut dec =
+        VaapiDecoder::new(tether_protocol::control::CodecKind::Hevc).expect("VAAPI HEVC decoder");
 
     // Push 8 frames so the encoder can emit at least one IDR plus a
     // P-frame chain — the decoder usually needs a couple of frames
@@ -457,22 +471,20 @@ fn hevc_main444_10bit_xv30_dmabuf_roundtrip() {
         }
     };
 
-    let src = bridge
-        .device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("test bgra mid-grey"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("test bgra mid-grey"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
     let n = (w * h) as usize;
     let bgra = vec![0x80u8; n * 4];
     bridge.queue().write_texture(
@@ -502,8 +514,8 @@ fn hevc_main444_10bit_xv30_dmabuf_roundtrip() {
             return;
         }
     };
-    let mut dec = VaapiDecoder::new(tether_protocol::control::CodecKind::Hevc)
-        .expect("VAAPI HEVC decoder");
+    let mut dec =
+        VaapiDecoder::new(tether_protocol::control::CodecKind::Hevc).expect("VAAPI HEVC decoder");
 
     let mut got_decoded = false;
     for t in 0..8i64 {
@@ -542,7 +554,11 @@ fn hevc_main444_10bit_xv30_dmabuf_roundtrip() {
                     dmabuf.fourcc,
                     std::str::from_utf8(&dmabuf.fourcc.to_le_bytes()).unwrap_or("?"),
                     dmabuf.layers.len(),
-                    dmabuf.layers.iter().map(|l| l.num_planes).collect::<Vec<_>>(),
+                    dmabuf
+                        .layers
+                        .iter()
+                        .map(|l| l.num_planes)
+                        .collect::<Vec<_>>(),
                 );
                 got_decoded = true;
             }
@@ -593,15 +609,17 @@ fn vaapi_bitrate_retune_changes_bitstream_size() {
     const LOW_KBPS: u32 = 1_000;
     const HIGH_KBPS: u32 = 20_000;
 
-    let mut enc = VaapiEncoder::new(VideoProfile::H264_8BIT_420, W, H, 30, LOW_KBPS)
-        .expect("VAAPI encoder");
+    let mut enc =
+        VaapiEncoder::new(VideoProfile::H264_8BIT_420, W, H, 30, LOW_KBPS).expect("VAAPI encoder");
 
     // Phase A: encode at LOW_KBPS. Warm up first so rate-control
     // converges; only count bytes from the second half.
     for t in 0..(FRAMES / 2) {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let bgra = make_noisy_bgra(W, H, t as u32);
-        let _ = enc.encode_bgra(&bgra, t, t == 0).expect("encode warmup low");
+        let _ = enc
+            .encode_bgra(&bgra, t, t == 0)
+            .expect("encode warmup low");
     }
     let mut low_bytes: usize = 0;
     for t in (FRAMES / 2)..FRAMES {
@@ -622,7 +640,9 @@ fn vaapi_bitrate_retune_changes_bitstream_size() {
     for t in FRAMES..(FRAMES + FRAMES / 2) {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let bgra = make_noisy_bgra(W, H, t as u32);
-        let _ = enc.encode_bgra(&bgra, t, false).expect("encode warmup high");
+        let _ = enc
+            .encode_bgra(&bgra, t, false)
+            .expect("encode warmup high");
     }
     let mut high_bytes: usize = 0;
     for t in (FRAMES + FRAMES / 2)..(FRAMES * 2) {
@@ -875,7 +895,8 @@ fn encode_with_env_and_measure(
             std::env::remove_var(env_key);
         }
     }
-    let enc_result = VaapiEncoder::new(VideoProfile::H264_8BIT_420, width, height, 30, bitrate_kbps);
+    let enc_result =
+        VaapiEncoder::new(VideoProfile::H264_8BIT_420, width, height, 30, bitrate_kbps);
     unsafe {
         std::env::remove_var(env_key);
     }
@@ -926,14 +947,8 @@ fn vaapi_min_qp_floor_reduces_bitstream() {
     const BITRATE_KBPS: u32 = 10_000;
 
     // Baseline: lowest legal qmin — effectively no floor.
-    let (baseline_bytes, baseline_unused) = encode_with_env_and_measure(
-        "TETHER_MIN_QP",
-        Some("1"),
-        W,
-        H,
-        FRAMES,
-        BITRATE_KBPS,
-    );
+    let (baseline_bytes, baseline_unused) =
+        encode_with_env_and_measure("TETHER_MIN_QP", Some("1"), W, H, FRAMES, BITRATE_KBPS);
     if baseline_unused.iter().any(|k| k == "qmin") {
         eprintln!(
             "SKIP: VAAPI driver did not consume qmin AVOption (leftover: {baseline_unused:?})."
@@ -945,14 +960,8 @@ fn vaapi_min_qp_floor_reduces_bitstream() {
     // 45 is deep in the high-compression end of the H.264 scale (0=lossless,
     // 51=worst); high enough that the bytecount delta is unambiguous,
     // not so high that the encoder rejects it.
-    let (constrained_bytes, constrained_unused) = encode_with_env_and_measure(
-        "TETHER_MIN_QP",
-        Some("45"),
-        W,
-        H,
-        FRAMES,
-        BITRATE_KBPS,
-    );
+    let (constrained_bytes, constrained_unused) =
+        encode_with_env_and_measure("TETHER_MIN_QP", Some("45"), W, H, FRAMES, BITRATE_KBPS);
     assert!(
         !constrained_unused.iter().any(|k| k == "qmin"),
         "second run's qmin was unexpectedly ignored: {constrained_unused:?}"
@@ -1032,22 +1041,20 @@ fn av1_main_dmabuf_roundtrip() {
         }
     };
 
-    let src = bridge
-        .device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("test bgra mid-grey av1"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("test bgra mid-grey av1"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
     let n = (w * h) as usize;
     let bgra = vec![0x80u8; n * 4];
     bridge.queue().write_texture(
@@ -1156,7 +1163,11 @@ fn av1_main_dmabuf_roundtrip() {
                     "decoded AV1 surface exported: fourcc=0x{:08x} layers={} planes_per_layer={:?}",
                     dmabuf.fourcc,
                     dmabuf.layers.len(),
-                    dmabuf.layers.iter().map(|l| l.num_planes).collect::<Vec<_>>(),
+                    dmabuf
+                        .layers
+                        .iter()
+                        .map(|l| l.num_planes)
+                        .collect::<Vec<_>>(),
                 );
                 got_decoded = true;
             }

@@ -189,11 +189,10 @@ fn build_and_start_stream(
     pixel_format: PixelFormat,
 ) -> Result<(SCStream, CaptureGeometry)> {
     let content = SCShareableContent::get()?;
-    let primary = content
-        .displays()
-        .into_iter()
-        .next()
-        .ok_or_else(|| CaptureError::Sck("no displays reported by SCShareableContent".into()))?;
+    let primary =
+        content.displays().into_iter().next().ok_or_else(|| {
+            CaptureError::Sck("no displays reported by SCShareableContent".into())
+        })?;
     // SCDisplay::width/height report logical *point* dimensions, not
     // physical pixels. On a Retina 2× display that's half the actual
     // resolution, and configuring SCStreamConfiguration with the
@@ -343,8 +342,7 @@ impl SCStreamOutputTrait for FrameHandler {
             return;
         }
         let t_capture_userspace = MonoNanos::now();
-        let Some(frame) = build_frame(&sample, self.width, self.height, t_capture_userspace)
-        else {
+        let Some(frame) = build_frame(&sample, self.width, self.height, t_capture_userspace) else {
             return;
         };
         match self.tx.try_send(frame) {
@@ -736,11 +734,10 @@ enum ProbeOutcome {
 /// sees a prompt for "tether host" twice.
 pub async fn probe_capture_pixel_formats() -> Result<SckCaptureCapability> {
     let content = SCShareableContent::get()?;
-    let display = content
-        .displays()
-        .into_iter()
-        .next()
-        .ok_or_else(|| CaptureError::Sck("no displays reported by SCShareableContent".into()))?;
+    let display =
+        content.displays().into_iter().next().ok_or_else(|| {
+            CaptureError::Sck("no displays reported by SCShareableContent".into())
+        })?;
     let display_width = display.width();
     let display_height = display.height();
 
@@ -759,11 +756,7 @@ pub async fn probe_capture_pixel_formats() -> Result<SckCaptureCapability> {
             match probe_one_format(&filter, probe, display_width, display_height) {
                 Ok(outcome) => {
                     let accepted = matches!(outcome, ProbeOutcome::Accepted);
-                    tracing::debug!(
-                        format = probe.label(),
-                        accepted,
-                        "SCK probe result"
-                    );
+                    tracing::debug!(format = probe.label(), accepted, "SCK probe result");
                     probe.apply(&mut caps, accepted);
                 }
                 Err(e) => {
@@ -910,7 +903,11 @@ mod sck_tests {
             (ChromaSubsampling::Yuv444, 8, *b"444v"),
             (ChromaSubsampling::Yuv444, 10, *b"xf44"),
         ] {
-            let profile = VideoProfile { codec: CodecKind::Hevc, chroma, bit_depth };
+            let profile = VideoProfile {
+                codec: CodecKind::Hevc,
+                chroma,
+                bit_depth,
+            };
             let mapping = sck_pixel_format_for_profile(profile);
             match mapping {
                 SckCapabilityCheck::Supported(pf) => {
@@ -932,7 +929,11 @@ mod sck_tests {
     #[test]
     fn sck_pixel_format_for_profile_rejects_unmodeled_bit_depths() {
         use tether_protocol::control::{CodecKind, VideoProfile};
-        let bogus = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 12 };
+        let bogus = VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 12,
+        };
         assert!(matches!(
             sck_pixel_format_for_profile(bogus),
             SckCapabilityCheck::Unsupported
@@ -947,8 +948,16 @@ mod sck_tests {
             yuv420_video_range: true,
             ..Default::default()
         };
-        let p_420_8 = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 8 };
-        let p_420_10 = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth: 10 };
+        let p_420_8 = VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        };
+        let p_420_10 = VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        };
         assert!(sck_pixel_format_for_profile(p_420_8).is_deliverable(&caps));
         assert!(!sck_pixel_format_for_profile(p_420_10).is_deliverable(&caps));
 
@@ -961,7 +970,6 @@ mod sck_tests {
         assert!(sck_pixel_format_for_profile(p_420_10).is_deliverable(&caps10));
     }
 }
-
 
 // === Core Graphics FFI for physical-pixel display dimensions ===
 //

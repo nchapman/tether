@@ -31,7 +31,7 @@ use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 use crate::encoder_common::{drain_encoder, snapshot_extradata};
 use crate::h264::frame_plane_mut;
 use crate::{
-    init_ffmpeg, CodecError, D3D11TextureFrame, Encoder, EncodedPacket, GpuEncoderFrame, Result,
+    init_ffmpeg, CodecError, D3D11TextureFrame, EncodedPacket, Encoder, GpuEncoderFrame, Result,
     GOP_SECONDS,
 };
 
@@ -274,8 +274,8 @@ impl D3D11Encoder {
         encoder.set_time_base(ra(1, fps_i32));
         encoder.set_framerate(ra(fps_i32, 1));
         encoder.set_bit_rate(i64::from(bitrate_kbps) * 1000);
-        let gop_frames = fps_i32
-            .saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits i32"));
+        let gop_frames =
+            fps_i32.saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits i32"));
         encoder.set_gop_size(gop_frames);
         encoder.set_max_b_frames(0);
 
@@ -325,23 +325,27 @@ impl D3D11Encoder {
             // single-frame handoff. `usage=ultralowlatency` + `latency=1`
             // select AMF's low-latency RC path (B-frames are already off
             // via `max_b_frames=0` above).
-            Some(AVDictionary::new(c"usage", c"ultralowlatency", 0)
-                .set(c"quality", c"speed", 0)
-                .set(c"latency", c"1", 0)
-                .set(c"async_depth", c"1", 0)
-                .set(c"forced_idr", c"1", 0)
-                .set(c"gops_per_idr", c"1", 0))
+            Some(
+                AVDictionary::new(c"usage", c"ultralowlatency", 0)
+                    .set(c"quality", c"speed", 0)
+                    .set(c"latency", c"1", 0)
+                    .set(c"async_depth", c"1", 0)
+                    .set(c"forced_idr", c"1", 0)
+                    .set(c"gops_per_idr", c"1", 0),
+            )
         } else if backend_name.contains("nvenc") {
             // `delay=0` is critical: nvenc defaults it to INT_MAX (output
             // is held indefinitely waiting to reorder). `zerolatency=1`
             // removes the reordering delay, `tune=ull` is the ultra-low-
             // latency tuning, `surfaces=1` bounds the pool to one frame.
-            Some(AVDictionary::new(c"delay", c"0", 0)
-                .set(c"forced-idr", c"1", 0)
-                .set(c"zerolatency", c"1", 0)
-                .set(c"tune", c"ull", 0)
-                .set(c"rc", c"cbr", 0)
-                .set(c"surfaces", c"1", 0))
+            Some(
+                AVDictionary::new(c"delay", c"0", 0)
+                    .set(c"forced-idr", c"1", 0)
+                    .set(c"zerolatency", c"1", 0)
+                    .set(c"tune", c"ull", 0)
+                    .set(c"rc", c"cbr", 0)
+                    .set(c"surfaces", c"1", 0),
+            )
         } else if backend_name.contains("qsv") {
             // `async_depth=1` keeps latency low (one frame in flight) and
             // bounds the surface pool. `forced_idr` honours ForceIdr.
@@ -351,8 +355,7 @@ impl D3D11Encoder {
             // supply — every frame is rejected `Invalid FrameType:0`
             // (AVERROR_INVALIDDATA). Verified by
             // `d3d11_qsv_gpu_encode_decode_roundtrip`.
-            Some(AVDictionary::new(c"forced_idr", c"1", 0)
-                .set(c"async_depth", c"1", 0))
+            Some(AVDictionary::new(c"forced_idr", c"1", 0).set(c"async_depth", c"1", 0))
         } else if backend_name.contains("mf") {
             // Force the hardware MFT (`hw_encoding=1`). Without it
             // `hevc_mf` / `h264_mf` may select a software MFT, which
@@ -616,7 +619,12 @@ impl Encoder for D3D11Encoder {
         self.bgra_frame.set_pts(pts);
 
         // BGRA → NV12 via swscale.
-        self.bgra_to_nv12.scale_frame(&self.bgra_frame, 0, self.height as i32, &mut self.sw_frame)?;
+        self.bgra_to_nv12.scale_frame(
+            &self.bgra_frame,
+            0,
+            self.height as i32,
+            &mut self.sw_frame,
+        )?;
         self.sw_frame.set_pts(pts);
 
         // Upload NV12 sw_frame into a hw_frame from the pool.
@@ -715,8 +723,7 @@ fn create_d3d11va_hw_device(
     device_ctx_ptr: *mut std::ffi::c_void,
 ) -> Result<AVHWDeviceContext> {
     if device_ptr.is_null() {
-        let hw_device =
-            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_D3D11VA, None, None, 0)?;
+        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_D3D11VA, None, None, 0)?;
         return Ok(hw_device);
     }
 
@@ -831,8 +838,14 @@ mod backend_selection_tests {
     /// as the safe (vendor-agnostic) fallback.
     #[test]
     fn known_vendors_lead_with_hardware_then_mf() {
-        assert_eq!(backends_for_vendor(CodecKind::Hevc, VENDOR_INTEL), &["hevc_qsv", "hevc_mf"]);
-        assert_eq!(backends_for_vendor(CodecKind::Hevc, VENDOR_AMD), &["hevc_amf", "hevc_mf"]);
+        assert_eq!(
+            backends_for_vendor(CodecKind::Hevc, VENDOR_INTEL),
+            &["hevc_qsv", "hevc_mf"]
+        );
+        assert_eq!(
+            backends_for_vendor(CodecKind::Hevc, VENDOR_AMD),
+            &["hevc_amf", "hevc_mf"]
+        );
         assert_eq!(
             backends_for_vendor(CodecKind::Hevc, VENDOR_NVIDIA),
             &["hevc_nvenc", "hevc_mf"]

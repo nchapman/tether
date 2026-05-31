@@ -284,6 +284,10 @@ mod tests {
             CursorEvent::Idle => panic!("first call must emit Shape"),
         }
         assert_eq!(s.next_event(), CursorEvent::Idle);
-        assert_eq!(s.next_event(), CursorEvent::Idle, "Idle is sticky once emitted");
+        assert_eq!(
+            s.next_event(),
+            CursorEvent::Idle,
+            "Idle is sticky once emitted"
+        );
     }
 }

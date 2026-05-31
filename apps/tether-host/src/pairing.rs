@@ -24,12 +24,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tether_pairing::{
-    Direction, PairedStore, PairingStart, Transcript, CONFIRM_LEN, EXPORTER_CONTEXT, EXPORTER_LABEL,
-    EXPORTER_LEN,
+    Direction, PairedStore, PairingStart, Transcript, CONFIRM_LEN, EXPORTER_CONTEXT,
+    EXPORTER_LABEL, EXPORTER_LEN,
 };
-use tether_protocol::pairing::{
-    PairingClientMsg, PairingConfirm, PairingResult, PairingServerMsg,
-};
+use tether_protocol::pairing::{PairingClientMsg, PairingConfirm, PairingResult, PairingServerMsg};
 use tether_protocol::PROTOCOL_VERSION;
 use tether_transport::{CertFingerprint, Connection, PendingConnection};
 use tracing::{info, warn};
@@ -222,7 +220,11 @@ pub enum RefusedReason {
 /// returns [`Authorized::Session`]; on any refusal closes the connection and
 /// returns [`Authorized::Refused`]. `now` is injected so the expiry decision is
 /// testable.
-pub async fn authorize(mut pending: PendingConnection, state: &PairingState, now: Instant) -> Authorized {
+pub async fn authorize(
+    mut pending: PendingConnection,
+    state: &PairingState,
+    now: Instant,
+) -> Authorized {
     let fp = match pending.peer_cert_fingerprint() {
         Some(fp) => fp,
         None => {
@@ -259,7 +261,11 @@ async fn authorize_resume(
     state: &PairingState,
     fp: CertFingerprint,
 ) -> Authorized {
-    let known = state.paired.lock().expect("paired store lock").contains(&fp);
+    let known = state
+        .paired
+        .lock()
+        .expect("paired store lock")
+        .contains(&fp);
     if !known {
         // Uniform on-wire reason; the local refusal reason is specific. (An
         // attacker can only `Resume` with a cert it holds the key for, so this
@@ -298,7 +304,9 @@ async fn decoy_reject(mut pending: PendingConnection, client_spake2: Vec<u8>) ->
     // sooner and the timing itself would be the oracle we built this to hide.
     // The cryptographic outcome is ignored (a fresh random PIN can't succeed).
     let _ = start.into_keyed(&client_spake2);
-    let challenge = PairingServerMsg::PairChallenge { spake2: host_spake2 };
+    let challenge = PairingServerMsg::PairChallenge {
+        spake2: host_spake2,
+    };
     if pending.send_pairing(&challenge).await.is_ok() {
         // Consume the client's confirmation if it sends one, so the timing and
         // message count match a genuine failed attempt.
@@ -441,10 +449,12 @@ fn exporter_bytes(pending: &PendingConnection) -> Result<[u8; EXPORTER_LEN], Str
     let bytes = pending
         .export_keying_material(EXPORTER_LABEL, EXPORTER_CONTEXT, EXPORTER_LEN)
         .map_err(|e| format!("TLS exporter unavailable: {e}"))?;
-    bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("TLS exporter returned {} bytes, expected {EXPORTER_LEN}", bytes.len()))
+    bytes.as_slice().try_into().map_err(|_| {
+        format!(
+            "TLS exporter returned {} bytes, expected {EXPORTER_LEN}",
+            bytes.len()
+        )
+    })
 }
 
 /// Seconds since the Unix epoch, for stamping a pairing time. Clamps a
@@ -498,8 +508,10 @@ mod tests {
         // closes it (the bug this guards against: revoke removed the allowlist
         // entry but left the live stream running).
         let (server, client, host_pending, client_pending) = loopback().await;
-        let (host_conn, client_conn) =
-            tokio::join!(host_pending.into_connection(), client_pending.into_connection());
+        let (host_conn, client_conn) = tokio::join!(
+            host_pending.into_connection(),
+            client_pending.into_connection()
+        );
         let host_conn = Arc::new(host_conn.expect("host promote"));
         let client_conn = client_conn.expect("client promote");
 
@@ -517,7 +529,10 @@ mod tests {
 
         assert!(removed);
         assert!(!state.paired.lock().unwrap().contains(&fp));
-        assert!(revoked.load(Ordering::Relaxed), "revoke must flag the session for attribution");
+        assert!(
+            revoked.load(Ordering::Relaxed),
+            "revoke must flag the session for attribution"
+        );
         // The peer must observe the connection close — the live session is
         // actually torn down, not just delisted.
         let recv = tokio::time::timeout(Duration::from_secs(2), client_conn.recv_control()).await;
@@ -531,8 +546,10 @@ mod tests {
     async fn revoke_does_not_close_a_non_matching_session() {
         // A revoke for a different fingerprint must leave the live session up.
         let (server, client, host_pending, client_pending) = loopback().await;
-        let (host_conn, client_conn) =
-            tokio::join!(host_pending.into_connection(), client_pending.into_connection());
+        let (host_conn, client_conn) = tokio::join!(
+            host_pending.into_connection(),
+            client_pending.into_connection()
+        );
         let host_conn = Arc::new(host_conn.expect("host promote"));
         let client_conn = client_conn.expect("client promote");
 
@@ -547,7 +564,10 @@ mod tests {
         // Revoke some other (unpaired) fingerprint.
         let _ = state.revoke(&tether_pairing::tag_fingerprint(&[0xEEu8; 32]));
 
-        assert!(!revoked.load(Ordering::Relaxed), "non-matching revoke must not flag this session");
+        assert!(
+            !revoked.load(Ordering::Relaxed),
+            "non-matching revoke must not flag this session"
+        );
         // Positively prove the session is still alive: a control message sent
         // host->client still arrives. (A flaky "recv times out" check would only
         // prove nothing happened *fast enough*.)
@@ -617,7 +637,8 @@ mod tests {
     async fn first_contact_pairs_with_correct_pin() {
         let (server, client, host_pending, client_pending) = loopback().await;
         let state = test_state(server.fingerprint());
-        *state.window.lock().unwrap() = Some(PairingWindow::open("12345678".into(), "laptop".into()));
+        *state.window.lock().unwrap() =
+            Some(PairingWindow::open("12345678".into(), "laptop".into()));
         let client_fp = client.fingerprint();
 
         let (auth, client_result) = tokio::join!(
@@ -628,7 +649,9 @@ mod tests {
         // The client authenticated the host's H2C confirmation.
         assert!(matches!(
             client_result,
-            ClientPairResult::Confirmed { host_verified: true }
+            ClientPairResult::Confirmed {
+                host_verified: true
+            }
         ));
         match auth {
             Authorized::Session {
@@ -648,7 +671,8 @@ mod tests {
     async fn wrong_pin_refuses_and_burns_window() {
         let (server, client, host_pending, client_pending) = loopback().await;
         let state = test_state(server.fingerprint());
-        *state.window.lock().unwrap() = Some(PairingWindow::open("12345678".into(), "laptop".into()));
+        *state.window.lock().unwrap() =
+            Some(PairingWindow::open("12345678".into(), "laptop".into()));
         let client_fp = client.fingerprint();
 
         let (auth, client_result) = tokio::join!(
@@ -662,7 +686,10 @@ mod tests {
             Authorized::Refused(RefusedReason::PairingRequired)
         ));
         // Wrong guesses are not free: the single-flight window is consumed.
-        assert!(state.window.lock().unwrap().is_none(), "window burned on attempt");
+        assert!(
+            state.window.lock().unwrap().is_none(),
+            "window burned on attempt"
+        );
         assert!(!state.paired.lock().unwrap().contains(&client_fp));
     }
 
@@ -688,7 +715,8 @@ mod tests {
     async fn expired_window_is_refused() {
         let (server, client, host_pending, client_pending) = loopback().await;
         let state = test_state(server.fingerprint());
-        *state.window.lock().unwrap() = Some(PairingWindow::open("12345678".into(), "laptop".into()));
+        *state.window.lock().unwrap() =
+            Some(PairingWindow::open("12345678".into(), "laptop".into()));
         let client_fp = client.fingerprint();
         // Authorize as if the window had already elapsed.
         let after_expiry = Instant::now() + PAIRING_WINDOW + Duration::from_secs(1);
@@ -709,20 +737,24 @@ mod tests {
     async fn malformed_spake2_refuses_and_burns_window() {
         let (server, client, host_pending, client_pending) = loopback().await;
         let state = test_state(server.fingerprint());
-        *state.window.lock().unwrap() = Some(PairingWindow::open("12345678".into(), "laptop".into()));
+        *state.window.lock().unwrap() =
+            Some(PairingWindow::open("12345678".into(), "laptop".into()));
         let client_fp = client.fingerprint();
 
-        let (auth, _) = tokio::join!(authorize(host_pending, &state, Instant::now()), async move {
-            let mut p = client_pending;
-            // Garbage that isn't a valid SPAKE2 message — attacker-controlled
-            // input to the PAKE layer.
-            p.send_pairing(&PairingClientMsg::Pair {
-                spake2: vec![0xFF; 8],
-            })
-            .await
-            .unwrap();
-            let _ = p.recv_pairing::<PairingServerMsg>().await; // message or close
-        });
+        let (auth, _) = tokio::join!(
+            authorize(host_pending, &state, Instant::now()),
+            async move {
+                let mut p = client_pending;
+                // Garbage that isn't a valid SPAKE2 message — attacker-controlled
+                // input to the PAKE layer.
+                p.send_pairing(&PairingClientMsg::Pair {
+                    spake2: vec![0xFF; 8],
+                })
+                .await
+                .unwrap();
+                let _ = p.recv_pairing::<PairingServerMsg>().await; // message or close
+            }
+        );
 
         // Refused (via the decoy, so it's wire-indistinguishable from a
         // wrong-PIN attempt), window burned, nothing persisted.

@@ -82,11 +82,7 @@ pub const XF20_FOURCC: u32 = u32::from_be_bytes(*b"xf20");
 /// anyway. Matches the encoder's range policy in
 /// `videotoolbox::encoder::iosurface_fourcc_matches`.
 #[must_use]
-pub fn accepts_iosurface_fourcc(
-    chroma: ChromaSubsampling,
-    bit_depth: u8,
-    fourcc: u32,
-) -> bool {
+pub fn accepts_iosurface_fourcc(chroma: ChromaSubsampling, bit_depth: u8, fourcc: u32) -> bool {
     matches!(
         (chroma, bit_depth, fourcc),
         (ChromaSubsampling::Yuv420, 8, NV12_VIDEO_RANGE_FOURCC)
@@ -101,16 +97,15 @@ pub fn accepts_iosurface_fourcc(
 /// arrives; living alongside [`accepts_iosurface_fourcc`] keeps a new
 /// family's accept entry and error label in lockstep.
 #[must_use]
-pub fn iosurface_fourcc_expected_label(
-    chroma: ChromaSubsampling,
-    bit_depth: u8,
-) -> &'static str {
+pub fn iosurface_fourcc_expected_label(chroma: ChromaSubsampling, bit_depth: u8) -> &'static str {
     match (chroma, bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => "'420v' or '420f' (NV12 biplanar 8-bit)",
         (ChromaSubsampling::Yuv444, 8) => "'444v' or '444f' (NV24 biplanar 8-bit)",
         (ChromaSubsampling::Yuv420, 10) => "'x420', 'xf20', or 'P010' (biplanar 4:2:0 10-bit)",
         (ChromaSubsampling::Yuv444, 10) => "'xf44' or 'P410' (biplanar 4:4:4 10-bit)",
-        _ => "an IOSurface fourcc supported by this build (8-bit 4:2:0/4:4:4 or 10-bit 4:2:0/4:4:4)",
+        _ => {
+            "an IOSurface fourcc supported by this build (8-bit 4:2:0/4:4:4 or 10-bit 4:2:0/4:4:4)"
+        }
     }
 }
 
@@ -163,7 +158,9 @@ pub const READ_ONLY_MTL_USAGE: MTLTextureUsage = MTLTextureUsage::ShaderRead;
 /// because wgpu may create internal views with a different format
 /// (e.g. an sRGB-typed view of a linear-typed texture).
 pub const READ_WRITE_MTL_USAGE: MTLTextureUsage = MTLTextureUsage(
-    MTLTextureUsage::ShaderRead.0 | MTLTextureUsage::ShaderWrite.0 | MTLTextureUsage::PixelFormatView.0,
+    MTLTextureUsage::ShaderRead.0
+        | MTLTextureUsage::ShaderWrite.0
+        | MTLTextureUsage::PixelFormatView.0,
 );
 
 /// Reinterpret the [`IOSurfaceFrame`]'s opaque pointer as the typed
@@ -180,9 +177,7 @@ pub const READ_WRITE_MTL_USAGE: MTLTextureUsage = MTLTextureUsage(
 /// surface alive (via [`crate::GpuFrameGuard`] on decode, the capture
 /// `release_guard` on encode, or a pool's owning slot on the host
 /// scaler output path).
-pub fn iosurface_as_ref(
-    iosurface: &IOSurfaceFrame,
-) -> Result<&IOSurfaceRef, IOSurfaceImportError> {
+pub fn iosurface_as_ref(iosurface: &IOSurfaceFrame) -> Result<&IOSurfaceRef, IOSurfaceImportError> {
     if iosurface.surface.is_null() {
         return Err(IOSurfaceImportError::NullSurface);
     }
@@ -293,8 +288,7 @@ pub fn import_iosurface_plane(
     // SAFETY: `hal_texture` was built from this device's MTLDevice
     // above; `wgpu_desc` faithfully describes the same image (width,
     // height, format match the MTLTextureDescriptor and the CopyExtent).
-    let texture = unsafe {
-        device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &wgpu_desc)
-    };
+    let texture =
+        unsafe { device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &wgpu_desc) };
     Ok(texture)
 }

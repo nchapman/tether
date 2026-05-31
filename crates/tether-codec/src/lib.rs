@@ -32,9 +32,9 @@ pub mod macos_interop;
 #[cfg(target_os = "windows")]
 pub mod d3d11;
 
-pub use probe::{build_decoder, build_encoder, validate_chosen_profile};
 #[cfg(target_os = "windows")]
 pub use probe::build_encoder_d3d11;
+pub use probe::{build_decoder, build_encoder, validate_chosen_profile};
 
 // Re-exported so downstream crates can name the payload type on
 // [`EncodedPacket::data`] without independently depending on `bytes`
@@ -47,7 +47,6 @@ pub use bytes;
 /// returns the VAAPI surface to the pool); the renderer can't
 /// downcast or inspect.
 pub use tether_protocol::GpuResourceGuard as GpuFrameGuard;
-
 
 /// GOP length used by every H.264 encoder we ship. Long enough that
 /// GOP length in seconds. Safety-net cadence for decoder recovery —

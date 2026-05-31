@@ -44,8 +44,7 @@ impl EncodeStatsWindow {
     /// dependency cone tight).
     pub fn record_frame(&mut self, encode_delta_ns: u64, encoded_bytes: u64, keyframe: bool) {
         self.frame_count = self.frame_count.saturating_add(1);
-        self.encode_latency_sum_ns =
-            self.encode_latency_sum_ns.saturating_add(encode_delta_ns);
+        self.encode_latency_sum_ns = self.encode_latency_sum_ns.saturating_add(encode_delta_ns);
         self.encoded_bytes_sum = self.encoded_bytes_sum.saturating_add(encoded_bytes);
         if keyframe {
             self.keyframe_count = self.keyframe_count.saturating_add(1);
@@ -74,9 +73,8 @@ impl EncodeStatsWindow {
         // Frame counts well under 2^53; the precision-loss lint here
         // would fire on a workload that's already misbehaving.
         #[allow(clippy::cast_precision_loss)]
-        let avg_encode_ms = (self.encode_latency_sum_ns as f64
-            / self.frame_count as f64)
-            / 1_000_000.0;
+        let avg_encode_ms =
+            (self.encode_latency_sum_ns as f64 / self.frame_count as f64) / 1_000_000.0;
         #[allow(clippy::cast_precision_loss)]
         let kbps_out = if window_secs > 0.0 {
             (self.encoded_bytes_sum as f64 * 8.0 / 1000.0) / window_secs

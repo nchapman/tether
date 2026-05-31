@@ -39,10 +39,7 @@ use tether_protocol::control::ChromaSubsampling;
 /// onto a code path it never opted into. Either way the right
 /// response is a session-fatal bail at handshake, not silent best-
 /// effort rendering with the wrong pipeline.
-pub fn validate_chosen_profile(
-    chosen: VideoProfile,
-    advertised: &[VideoProfile],
-) -> Result<()> {
+pub fn validate_chosen_profile(chosen: VideoProfile, advertised: &[VideoProfile]) -> Result<()> {
     if advertised.contains(&chosen) {
         return Ok(());
     }
@@ -108,7 +105,16 @@ pub fn build_encoder(
 
     #[cfg(target_os = "windows")]
     {
-        build_encoder_d3d11(profile, width, height, fps, bitrate_kbps, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+        build_encoder_d3d11(
+            profile,
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -336,12 +342,8 @@ mod validation_tests {
             VideoProfile::HEVC_8BIT_420,
             VideoProfile::H264_8BIT_420,
         ];
-        assert!(
-            validate_chosen_profile(VideoProfile::HEVC_8BIT_444, &advertised).is_ok()
-        );
-        assert!(
-            validate_chosen_profile(VideoProfile::H264_8BIT_420, &advertised).is_ok()
-        );
+        assert!(validate_chosen_profile(VideoProfile::HEVC_8BIT_444, &advertised).is_ok());
+        assert!(validate_chosen_profile(VideoProfile::H264_8BIT_420, &advertised).is_ok());
     }
 
     #[test]
@@ -358,8 +360,6 @@ mod validation_tests {
 
     #[test]
     fn validate_chosen_profile_rejects_empty_advertised() {
-        assert!(
-            validate_chosen_profile(VideoProfile::H264_8BIT_420, &[]).is_err()
-        );
+        assert!(validate_chosen_profile(VideoProfile::H264_8BIT_420, &[]).is_err());
     }
 }

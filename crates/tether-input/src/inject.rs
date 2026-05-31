@@ -144,8 +144,6 @@ pub async fn default_injector() -> Box<dyn Injector> {
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    tracing::warn!(
-        "no input injection backend compiled for this target; using noop"
-    );
+    tracing::warn!("no input injection backend compiled for this target; using noop");
     Box::new(NoopInjector)
 }

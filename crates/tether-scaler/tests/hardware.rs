@@ -85,11 +85,7 @@ fn upload_rgba8(
 /// Map a texture's contents back to a Vec<u8>. Adds a row-padding
 /// awareness because wgpu requires 256-byte row alignment for buffer
 /// copies.
-fn read_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    tex: &wgpu::Texture,
-) -> Vec<u8> {
+fn read_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture) -> Vec<u8> {
     let (width, height) = (tex.width(), tex.height());
     let bytes_per_pixel = 4u32;
     let unpadded_row = width * bytes_per_pixel;
@@ -333,8 +329,8 @@ fn fiducial_channel_order_red_stays_red() {
     let src_bytes: Vec<u8> = (0..4 * 4).flat_map(|_| [255u8, 0, 0, 255]).collect();
     let src_tex = upload_rgba8(&device, &queue, &src_bytes, 4, 4);
     let pipelines = Arc::new(Pipelines::build(&device));
-    let scaler = Scaler::new(pipelines, device.clone(), queue.clone(), (4, 4), (2, 2))
-        .expect("scaler");
+    let scaler =
+        Scaler::new(pipelines, device.clone(), queue.clone(), (4, 4), (2, 2)).expect("scaler");
     let out_tex = scaler.scale(&src_tex).expect("scale");
     let out = read_texture(&device, &queue, out_tex);
     for (i, chunk) in out.chunks_exact(4).enumerate() {
@@ -431,9 +427,29 @@ fn matches_reference_typical_downscale() {
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
     let src = quadrant_image(256, 256);
-    assert_matches_reference(&device, &queue, &pipelines, 256, 256, 128, 128, &src, "256→128 quadrants");
+    assert_matches_reference(
+        &device,
+        &queue,
+        &pipelines,
+        256,
+        256,
+        128,
+        128,
+        &src,
+        "256→128 quadrants",
+    );
     let cb = checkerboard(256, 256, 8);
-    assert_matches_reference(&device, &queue, &pipelines, 256, 256, 200, 150, &cb, "256→200×150 checker");
+    assert_matches_reference(
+        &device,
+        &queue,
+        &pipelines,
+        256,
+        256,
+        200,
+        150,
+        &cb,
+        "256→200×150 checker",
+    );
 }
 
 #[test]
@@ -442,7 +458,17 @@ fn matches_reference_upscale() {
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
     let src = quadrant_image(64, 64);
-    assert_matches_reference(&device, &queue, &pipelines, 64, 64, 256, 256, &src, "64→256 upscale");
+    assert_matches_reference(
+        &device,
+        &queue,
+        &pipelines,
+        64,
+        64,
+        256,
+        256,
+        &src,
+        "64→256 upscale",
+    );
 }
 
 #[test]
@@ -452,7 +478,17 @@ fn matches_reference_heavy_downscale_with_mip() {
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
     let cb = checkerboard(256, 256, 4);
-    assert_matches_reference(&device, &queue, &pipelines, 256, 256, 32, 32, &cb, "256→32 heavy down");
+    assert_matches_reference(
+        &device,
+        &queue,
+        &pipelines,
+        256,
+        256,
+        32,
+        32,
+        &cb,
+        "256→32 heavy down",
+    );
 }
 
 #[test]
@@ -464,7 +500,17 @@ fn matches_reference_realistic_screen_dim() {
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
     let src = quadrant_image(1920, 1080);
-    assert_matches_reference(&device, &queue, &pipelines, 1920, 1080, 1280, 720, &src, "1080p→720p");
+    assert_matches_reference(
+        &device,
+        &queue,
+        &pipelines,
+        1920,
+        1080,
+        1280,
+        720,
+        &src,
+        "1080p→720p",
+    );
 }
 
 /// Repro-shape regression: 2880×1920 → 2160×1440 (1.333× downscale,
@@ -497,8 +543,8 @@ fn matches_reference_coord_encoded_left_edge() {
     let gpu_out = read_texture(&device, &queue, out_tex);
     let ref_out = reference::mitchell_filter_default(&src, src_w, src_h, dst_w, dst_h);
     let col_mae = column_mae_rgb(&gpu_out, &ref_out, dst_w, dst_h);
-    let interior_mean: f64 = col_mae[64..(dst_w as usize - 64)].iter().sum::<f64>()
-        / (dst_w as usize - 128) as f64;
+    let interior_mean: f64 =
+        col_mae[64..(dst_w as usize - 64)].iter().sum::<f64>() / (dst_w as usize - 128) as f64;
     let left_edge_max = col_mae[..32].iter().cloned().fold(0.0_f64, f64::max);
     let right_edge_max = col_mae[(dst_w as usize - 32)..]
         .iter()
@@ -548,10 +594,22 @@ fn no_scale_needed_errors_at_exact_match() {
     // trip this — the client upscale path depends on it succeeding.
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
-    let res = Scaler::new(pipelines.clone(), device.clone(), queue.clone(), (64, 64), (64, 64));
+    let res = Scaler::new(
+        pipelines.clone(),
+        device.clone(),
+        queue.clone(),
+        (64, 64),
+        (64, 64),
+    );
     assert!(matches!(res, Err(ScalerError::NoScaleNeeded)));
     // Upscale must succeed.
-    let ok = Scaler::new(pipelines.clone(), device.clone(), queue.clone(), (64, 64), (128, 128));
+    let ok = Scaler::new(
+        pipelines.clone(),
+        device.clone(),
+        queue.clone(),
+        (64, 64),
+        (128, 128),
+    );
     assert!(ok.is_ok());
     // Zero dim must error with ZeroDim, not NoScaleNeeded.
     let z = Scaler::new(pipelines, device, queue, (0, 64), (32, 32));
@@ -660,13 +718,7 @@ fn read_texture_rgba16f(
 /// Linear-light Mitchell reference: same separable bicubic math as
 /// the sRGB reference but skips the transfer functions, mirroring
 /// the `horizontal_linear` / `vertical_linear` shader entry points.
-fn mitchell_filter_linear(
-    src: &[f32],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Vec<f32> {
+fn mitchell_filter_linear(src: &[f32], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<f32> {
     use tether_scaler::reference::{mitchell_weight, tap_count};
     assert_eq!(src.len(), (src_w as usize) * (src_h as usize) * 4);
     let scale_x = src_w as f32 / dst_w as f32;
@@ -794,9 +846,7 @@ fn linear_light_scaler_matches_linear_reference() {
         }
     }
     let rms = (sum_sq / n as f64).sqrt();
-    println!(
-        "linear-light upscale 128→256: max diff {max_diff:.4}, RMS {rms:.5}"
-    );
+    println!("linear-light upscale 128→256: max diff {max_diff:.4}, RMS {rms:.5}");
     // 1/256 ≈ 0.004 — tighter than fp16 quantization at the high
     // end of the range and still substantially below human-visible
     // (a 1/256 sRGB byte step).
@@ -817,7 +867,9 @@ fn linear_light_solid_color_preserves_color() {
     // shader is broken.
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
-    let src_f32: Vec<f32> = (0..64 * 64).flat_map(|_| [0.4_f32, 0.2, 0.7, 1.0]).collect();
+    let src_f32: Vec<f32> = (0..64 * 64)
+        .flat_map(|_| [0.4_f32, 0.2, 0.7, 1.0])
+        .collect();
     let src_tex = upload_rgba16f(&device, &queue, &src_f32, 64, 64);
     let scaler = Scaler::new_with_color_space(
         pipelines,
@@ -887,13 +939,16 @@ fn bench_scale_realistic_dims() {
     let pipelines = std::sync::Arc::new(Pipelines::build(&device));
     let info_string = "scaler microbench (Srgb8 / LinearF16, --release recommended)";
     println!("\n{info_string}\n{}", "-".repeat(info_string.len()));
-    println!("{:<32} {:<14} {:>8} {:>8} {:>8}", "case", "mip levels", "min µs", "med µs", "max µs");
+    println!(
+        "{:<32} {:<14} {:>8} {:>8} {:>8}",
+        "case", "mip levels", "min µs", "med µs", "max µs"
+    );
 
     let cases_srgb: &[((u32, u32), (u32, u32), &str)] = &[
-        ((1920, 1080), (1280, 720),  "1080p → 720p (host downscale)"),
+        ((1920, 1080), (1280, 720), "1080p → 720p (host downscale)"),
         ((3840, 2160), (1920, 1080), "4K → 1080p (host downscale)"),
-        ((3840, 2160), (1280, 720),  "4K → 720p (mip + Mitchell)"),
-        ((3840, 2160), (640, 360),   "4K → 360p (heavy mip)"),
+        ((3840, 2160), (1280, 720), "4K → 720p (mip + Mitchell)"),
+        ((3840, 2160), (640, 360), "4K → 360p (heavy mip)"),
     ];
     for &(src_dims, dst_dims, label) in cases_srgb {
         let bytes = quadrant_image(src_dims.0, src_dims.1);
@@ -919,9 +974,9 @@ fn bench_scale_realistic_dims() {
     }
 
     let cases_linear: &[((u32, u32), (u32, u32), &str)] = &[
-        ((1280, 720), (1920, 1080),  "720p → 1080p (client upscale)"),
-        ((1280, 720), (3840, 2160),  "720p → 4K (client upscale)"),
-        ((640, 360),  (1920, 1080),  "360p → 1080p (3× upscale)"),
+        ((1280, 720), (1920, 1080), "720p → 1080p (client upscale)"),
+        ((1280, 720), (3840, 2160), "720p → 4K (client upscale)"),
+        ((640, 360), (1920, 1080), "360p → 1080p (3× upscale)"),
     ];
     for &(src_dims, dst_dims, label) in cases_linear {
         // Build a linear-light fp32 source and upload.
@@ -943,11 +998,7 @@ fn bench_scale_realistic_dims() {
         let (min, med, max) = time_scale(&device, &scaler, &src_tex, 30);
         println!(
             "{:<32} {:<14} {:>8.1} {:>8.1} {:>8.1}",
-            label,
-            "(linear)",
-            min,
-            med,
-            max
+            label, "(linear)", min, med, max
         );
     }
     println!();
@@ -1113,7 +1164,11 @@ fn read_plane(
 /// Per-channel max-abs-diff for packed u8 plane buffers of equal size.
 fn max_abs_diff_plane(a: &[u8], b: &[u8]) -> u8 {
     assert_eq!(a.len(), b.len(), "plane size mismatch");
-    a.iter().zip(b.iter()).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| x.abs_diff(*y))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Mean-abs-diff (mean absolute error) for packed u8 plane buffers
@@ -1157,7 +1212,8 @@ fn r8_plane_scaler_matches_reference() {
     .expect("scaler new");
     let out = scaler.scale(&src).expect("scale");
     let gpu = read_plane(&device, &queue, out, 1);
-    let cpu = reference::mitchell_filter_plane(&src_bytes, src_w, src_h, dst_w, dst_h, 1, (0.0, 0.0));
+    let cpu =
+        reference::mitchell_filter_plane(&src_bytes, src_w, src_h, dst_w, dst_h, 1, (0.0, 0.0));
     let max = max_abs_diff_plane(&gpu, &cpu);
     let mean = mean_abs_diff_plane(&gpu, &cpu);
     println!("r8 plane {src_w}x{src_h}->{dst_w}x{dst_h} max {max} mean {mean:.3}");
@@ -1194,12 +1250,15 @@ fn rg8_plane_scaler_matches_reference() {
         queue.clone(),
         (src_w, src_h),
         (dst_w, dst_h),
-        ColorSpace::ChromaRg8 { chroma_offset: (0.0, 0.0) },
+        ColorSpace::ChromaRg8 {
+            chroma_offset: (0.0, 0.0),
+        },
     )
     .expect("scaler new");
     let out = scaler.scale(&src).expect("scale");
     let gpu = read_plane(&device, &queue, out, 2);
-    let cpu = reference::mitchell_filter_plane(&src_bytes, src_w, src_h, dst_w, dst_h, 2, (0.0, 0.0));
+    let cpu =
+        reference::mitchell_filter_plane(&src_bytes, src_w, src_h, dst_w, dst_h, 2, (0.0, 0.0));
     let max = max_abs_diff_plane(&gpu, &cpu);
     let mean = mean_abs_diff_plane(&gpu, &cpu);
     println!("rg8 plane {src_w}x{src_h}->{dst_w}x{dst_h} max {max} mean {mean:.3}");
@@ -1248,7 +1307,9 @@ fn uv_chroma_siting_no_half_pixel_shift() {
         queue.clone(),
         (src_w, src_h),
         (dst_w, dst_h),
-        ColorSpace::ChromaRg8 { chroma_offset: (cosited_offset, 0.0) },
+        ColorSpace::ChromaRg8 {
+            chroma_offset: (cosited_offset, 0.0),
+        },
     )
     .expect("scaler new");
     let src = upload_plane(&device, &queue, &src_bytes, src_w, src_h, 2);
@@ -1265,13 +1326,14 @@ fn uv_chroma_siting_no_half_pixel_shift() {
         weighted += m * f64::from(x);
         total += m;
     }
-    assert!(total > 0.0, "no chroma signal landed in dst — scaler dropped everything");
+    assert!(
+        total > 0.0,
+        "no chroma signal landed in dst — scaler dropped everything"
+    );
     let centroid = weighted / total;
     let expected = (src_idx as f64) / 2.0; // cosited mapping: dst_x = src_x / scale_h
     let drift = (centroid - expected).abs();
-    println!(
-        "uv chroma siting centroid {centroid:.3} (expected {expected:.3}); drift {drift:.3}"
-    );
+    println!("uv chroma siting centroid {centroid:.3} (expected {expected:.3}); drift {drift:.3}");
     // Two-cell tolerance. The Mitchell kernel spreads a single bright
     // src column across ~4 dst cells (negative side-lobes included);
     // the centroid sits within ~0.25 dst pixels of the correct

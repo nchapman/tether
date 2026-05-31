@@ -21,11 +21,11 @@ use rsmpeg::ffi;
 use crate::{CodecError, Result};
 
 #[cfg(test)]
+use crate::{init_ffmpeg, DecodedFrame, Decoder, Frame};
+#[cfg(test)]
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 #[cfg(test)]
 use tether_protocol::control::CodecKind;
-#[cfg(test)]
-use crate::{init_ffmpeg, DecodedFrame, Decoder, Frame};
 
 /// Pack a planar AVFrame plane into a tight `Vec<u8>`, stripping any
 /// stride padding so downstream consumers can upload row-major without
@@ -106,9 +106,8 @@ pub(crate) fn frame_plane(frame: &AVFrame, idx: usize, height: usize) -> &[u8] {
 /// buffer and frees it on Drop) and memcpy our bytes in.
 pub(crate) fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
     let mut packet = AVPacket::new();
-    let size = i32::try_from(bytes.len()).map_err(|_| {
-        CodecError::Ffmpeg(RsmpegError::AVError(ffi::AVERROR_INVALIDDATA))
-    })?;
+    let size = i32::try_from(bytes.len())
+        .map_err(|_| CodecError::Ffmpeg(RsmpegError::AVError(ffi::AVERROR_INVALIDDATA)))?;
     // SAFETY: `packet` was just allocated by AVPacket::new(). av_new_packet
     // allocates `size + AV_INPUT_BUFFER_PADDING_SIZE` bytes, fills the
     // padding with zeroes, and sets packet.data + packet.size. Ownership
@@ -135,8 +134,7 @@ pub(crate) fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
 /// (AUD + SPS + PPS + IDR) per entry. Regenerate with
 /// `scripts/gen-codec-fixtures.sh`.
 #[cfg(test)]
-pub(crate) const H264_320X240_INTRA: &[u8] =
-    include_bytes!("../testdata/h264_320x240_intra.bin");
+pub(crate) const H264_320X240_INTRA: &[u8] = include_bytes!("../testdata/h264_320x240_intra.bin");
 
 /// Split the length-delimited fixture into its access units. Each unit is
 /// independently decodable, so a parser-less decoder can be fed one at a time
@@ -155,7 +153,11 @@ pub(crate) fn fixture_access_units(fixture: &[u8]) -> Vec<&[u8]> {
     // A correctly-formed fixture consumes exactly to the end; trailing bytes
     // mean truncation at a length boundary, which would otherwise silently
     // yield fewer access units than intended.
-    assert_eq!(i, fixture.len(), "fixture has trailing bytes after last access unit");
+    assert_eq!(
+        i,
+        fixture.len(),
+        "fixture has trailing bytes after last access unit"
+    );
     units
 }
 
@@ -302,8 +304,8 @@ mod tests {
         // Row 0: U(0,0) V(0,0) U(0,1) V(0,1) U(0,2) V(0,2) U(0,3) V(0,3)
         // Row 1: U(1,0) V(1,0) U(1,1) V(1,1) ...
         let expected: Vec<u8> = vec![
-            0x00, 0xF0, 0x01, 0xF1, 0x02, 0xF2, 0x03, 0xF3,
-            0x10, 0xF0, 0x11, 0xF1, 0x12, 0xF2, 0x13, 0xF3,
+            0x00, 0xF0, 0x01, 0xF1, 0x02, 0xF2, 0x03, 0xF3, 0x10, 0xF0, 0x11, 0xF1, 0x12, 0xF2,
+            0x13, 0xF3,
         ];
         assert_eq!(uv, expected);
         // No stride-padding sentinels leaked into the output.

@@ -64,9 +64,7 @@ pub enum Yuv444DmaBufError {
     /// the chroma shader's `.rgb` swizzle is format-agnostic.
     #[error("input texture format must be Bgra8Unorm or Rgba8Unorm, got {0:?}")]
     InputFormat(wgpu::TextureFormat),
-    #[error(
-        "input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}"
-    )]
+    #[error("input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}")]
     DimMismatch {
         input_w: u32,
         input_h: u32,
@@ -209,9 +207,7 @@ impl Yuv444DmaBuf {
                     )
                 })?
                 .texture_from_dmabuf_fd(fd, &hal_desc, modifier, stride, offset)
-                .map_err(|e| {
-                    Yuv444DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}"))
-                })?
+                .map_err(|e| Yuv444DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}")))?
         };
         let wgpu_desc = wgpu::TextureDescriptor {
             label: Some("imported bgra"),
@@ -450,22 +446,20 @@ mod tests {
             Err(e) => panic!("Yuv444DmaBuf::new: {e}"),
         };
 
-        let src = bridge
-            .device()
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("test bgra white"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+        let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("test bgra white"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         let n = (width * height) as usize;
         let bgra = vec![255u8; n * 4];
         bridge.queue().write_texture(

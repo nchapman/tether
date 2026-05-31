@@ -130,7 +130,11 @@ impl RenderTarget {
                 config.height = height;
                 surface.configure(device, config);
             }
-            RenderTarget::Offscreen { target, dims, format } => {
+            RenderTarget::Offscreen {
+                target,
+                dims,
+                format,
+            } => {
                 *dims = (width, height);
                 *target = make_offscreen_target(device, *format, (width, height));
             }
@@ -316,9 +320,7 @@ pub(crate) fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> Ren
         // capture) / `'P010'` (HEVC Main10 decode); Linux receives
         // `DRM_FORMAT_P010`/`P410` dma-bufs. The 10-in-16 MSB-align
         // applies uniformly.
-        (ChromaSubsampling::Yuv420 | ChromaSubsampling::Yuv444, 10) => {
-            RenderLayout::Biplanar16
-        }
+        (ChromaSubsampling::Yuv420 | ChromaSubsampling::Yuv444, 10) => RenderLayout::Biplanar16,
         // Anything we haven't enumerated (12-bit, future chroma like
         // Yuv422) reaches the renderer by construction — the
         // negotiator filters on PROFILE_PREFERENCE, and the encoder
@@ -499,8 +501,9 @@ impl GpuState {
             })
             .await?;
         #[cfg(target_os = "linux")]
-        let dmabuf_import_supported =
-            device.features().contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
+        let dmabuf_import_supported = device
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
         // Probe the Metal HAL once at startup. If the wgpu device wasn't
         // built on the Metal backend (could happen if a future config
         // forces Vulkan via MoltenVK on macOS) we want a clean failure
@@ -578,7 +581,10 @@ impl GpuState {
         Self::build_state(
             device,
             queue,
-            RenderTarget::Swapchain { surface, config: surface_config },
+            RenderTarget::Swapchain {
+                surface,
+                config: surface_config,
+            },
             format,
             color_space,
             chroma,
@@ -662,7 +668,11 @@ impl GpuState {
         Self::build_state(
             device,
             queue,
-            RenderTarget::Offscreen { target: target_tex, dims: target_dims, format },
+            RenderTarget::Offscreen {
+                target: target_tex,
+                dims: target_dims,
+                format,
+            },
             format,
             color_space,
             chroma,
@@ -715,9 +725,7 @@ impl GpuState {
                         wgpu::BindGroupLayoutEntry {
                             binding: 2,
                             visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(
-                                wgpu::SamplerBindingType::Filtering,
-                            ),
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
                     ],
@@ -731,9 +739,7 @@ impl GpuState {
                         wgpu::BindGroupLayoutEntry {
                             binding: 1,
                             visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(
-                                wgpu::SamplerBindingType::Filtering,
-                            ),
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
                     ],
@@ -890,8 +896,7 @@ impl GpuState {
             cache: None,
         });
 
-        let textures =
-            make_yuv_textures(&device, &yuv_bgl, &sampler, chroma, bit_depth, 1, 1);
+        let textures = make_yuv_textures(&device, &yuv_bgl, &sampler, chroma, bit_depth, 1, 1);
 
         // === UpscaleStage construction ===
         //
@@ -1317,11 +1322,9 @@ impl GpuState {
         };
         let scaler_needs_rebuild = need_upscale
             && self.upscale.scaler_failed_for != Some(upscale_dims)
-            && self
-                .upscale
-                .scaler
-                .as_ref()
-                .map_or(true, |s| s.dst_dims() != upscale_dims || s.src_dims() != video_dims);
+            && self.upscale.scaler.as_ref().map_or(true, |s| {
+                s.dst_dims() != upscale_dims || s.src_dims() != video_dims
+            });
         if scaler_needs_rebuild {
             match build_upscale_scaler(
                 &self.device,
@@ -1471,7 +1474,11 @@ impl GpuState {
         // letterbox-fit rect inside the window is computed from the
         // same `(sx, sy)` the blit pass used so the sprite lands in
         // the exact pixel rect covered by the video.
-        #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation
+        )]
         let fit_dims = (
             ((surface_dims.0 as f32) * sx).round() as u32,
             ((surface_dims.1 as f32) * sy).round() as u32,
@@ -1513,7 +1520,11 @@ fn make_offscreen_target(
     let (w, h) = (dims.0.max(1), dims.1.max(1));
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tether-render offscreen target"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -1549,7 +1560,11 @@ fn make_rgb_intermediate(device: &wgpu::Device, dims: (u32, u32)) -> wgpu::Textu
 /// at this size and the blit pass stretches a centered quad at the
 /// same aspect ratio — the letterbox bars become the swapchain's
 /// cleared-black margin.
-#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn letterbox_fit_dims(video: (u32, u32), window: (u32, u32)) -> (u32, u32) {
     if video.0 == 0 || video.1 == 0 || window.0 == 0 || window.1 == 0 {
         return video;
@@ -1666,18 +1681,13 @@ fn make_yuv_textures(
                 RenderLayout::Biplanar8 => {
                     (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
                 }
-                RenderLayout::Biplanar16 => {
-                    (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
-                }
+                RenderLayout::Biplanar16 => (
+                    wgpu::TextureFormat::R16Unorm,
+                    wgpu::TextureFormat::Rg16Unorm,
+                ),
                 RenderLayout::PackedXYUV => unreachable!("guarded by outer match"),
             };
-            let y = make_plane_texture(
-                device,
-                "tether-render y plane",
-                width,
-                height,
-                y_format,
-            );
+            let y = make_plane_texture(device, "tether-render y plane", width, height, y_format);
             let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
             // UV plane dims: half-res for 4:2:0 (NV12/P010), full-res
             // for 4:4:4 (NV24/P410/xf44). The Rg{8,16}Unorm plane works
@@ -1813,11 +1823,23 @@ fn make_plane_texture(
     })
 }
 
-fn write_plane_r8(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
+fn write_plane_r8(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+) {
     write_plane(queue, texture, bytes, width, height, 1);
 }
 
-fn write_plane_rg8(queue: &wgpu::Queue, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
+fn write_plane_rg8(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+) {
     write_plane(queue, texture, bytes, width, height, 2);
 }
 
@@ -1849,7 +1871,6 @@ fn write_plane(
         },
     );
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1902,9 +1923,18 @@ mod tests {
             RANGE_KIND_LIMITED_10,
             "10-bit biplanar input must use the 10-bit range breakpoints"
         );
-        assert_eq!(range_kind_for(8, RenderLayout::Biplanar8), RANGE_KIND_LIMITED_8);
-        assert_eq!(range_kind_for(8, RenderLayout::Biplanar16), RANGE_KIND_LIMITED_8);
-        assert_eq!(range_kind_for(8, RenderLayout::PackedXYUV), RANGE_KIND_LIMITED_8);
+        assert_eq!(
+            range_kind_for(8, RenderLayout::Biplanar8),
+            RANGE_KIND_LIMITED_8
+        );
+        assert_eq!(
+            range_kind_for(8, RenderLayout::Biplanar16),
+            RANGE_KIND_LIMITED_8
+        );
+        assert_eq!(
+            range_kind_for(8, RenderLayout::PackedXYUV),
+            RANGE_KIND_LIMITED_8
+        );
     }
 
     /// Algebraic check on the 10-bit range constants the shader uses.
@@ -1922,7 +1952,10 @@ mod tests {
         let range = 65535.0_f32 / 56064.0;
         let white = (headroom - 4096.0 / 65535.0) * range;
         let black = (footroom - 4096.0 / 65535.0) * range;
-        assert!((white - 1.0).abs() < 1e-6, "10-bit white expected 1.0; got {white}");
+        assert!(
+            (white - 1.0).abs() < 1e-6,
+            "10-bit white expected 1.0; got {white}"
+        );
         assert!(black.abs() < 1e-6, "10-bit black expected 0.0; got {black}");
     }
 
@@ -1979,15 +2012,24 @@ mod tests {
     /// renumbering fails here.
     #[test]
     fn transfer_kind_for_pins_the_mapping() {
-        assert_eq!(transfer_kind_for(VideoColorSpec::sdr_desktop()), TRANSFER_KIND_SRGB);
-        assert_eq!(transfer_kind_for(VideoColorSpec::sdr_bt709()), TRANSFER_KIND_BT709);
+        assert_eq!(
+            transfer_kind_for(VideoColorSpec::sdr_desktop()),
+            TRANSFER_KIND_SRGB
+        );
+        assert_eq!(
+            transfer_kind_for(VideoColorSpec::sdr_bt709()),
+            TRANSFER_KIND_BT709
+        );
 
         // Each currently-unimplemented variant should hit the
         // BT.709 fallback. Keep this array in sync with the
         // `Pq | Hlg | Linear` arm in `transfer_kind_for`; a future
         // variant added there should also be appended here.
         for transfer in [ColorTransfer::Pq, ColorTransfer::Hlg, ColorTransfer::Linear] {
-            let spec = VideoColorSpec { transfer, ..VideoColorSpec::sdr_desktop() };
+            let spec = VideoColorSpec {
+                transfer,
+                ..VideoColorSpec::sdr_desktop()
+            };
             assert_eq!(transfer_kind_for(spec), TRANSFER_KIND_BT709);
         }
     }

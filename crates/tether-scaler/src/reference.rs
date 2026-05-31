@@ -426,15 +426,10 @@ mod tests {
     fn identity_scale_round_trips_solid_color() {
         // 1:1 scale of a solid-colour image must produce the same bytes
         // back (modulo sRGB round-trip drift of at most 1).
-        let src: Vec<u8> = (0..16 * 16)
-            .flat_map(|_| [128, 64, 200, 255])
-            .collect();
+        let src: Vec<u8> = (0..16 * 16).flat_map(|_| [128, 64, 200, 255]).collect();
         let dst = mitchell_filter_default(&src, 16, 16, 16, 16);
         for (i, (s, d)) in src.iter().zip(dst.iter()).enumerate() {
-            assert!(
-                s.abs_diff(*d) <= 1,
-                "channel {i} drifted {s} -> {d}",
-            );
+            assert!(s.abs_diff(*d) <= 1, "channel {i} drifted {s} -> {d}",);
         }
     }
 

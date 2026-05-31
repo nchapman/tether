@@ -186,7 +186,12 @@ fn split_annexb_nalus(data: &[u8]) -> Vec<&[u8]> {
     let mut i = 0;
     while i < data.len() {
         // Find start code (3 or 4 bytes).
-        let sc_len = if i + 3 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+        let sc_len = if i + 3 < data.len()
+            && data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+        {
             4
         } else if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
             3
@@ -198,8 +203,11 @@ fn split_annexb_nalus(data: &[u8]) -> Vec<&[u8]> {
         // Find next start code or end of data.
         let mut end = nalu_start;
         while end < data.len() {
-            if end + 3 <= data.len() && data[end] == 0 && data[end + 1] == 0
-                && (data[end + 2] == 1 || (end + 3 < data.len() && data[end + 2] == 0 && data[end + 3] == 1))
+            if end + 3 <= data.len()
+                && data[end] == 0
+                && data[end + 1] == 0
+                && (data[end + 2] == 1
+                    || (end + 3 < data.len() && data[end + 2] == 0 && data[end + 3] == 1))
             {
                 break;
             }
@@ -426,7 +434,7 @@ mod tests {
         // Array 0: type VPS (32), 2 NALUs
         hvcc.push(0x20); // completeness=0, nal_unit_type=32
         hvcc.extend_from_slice(&(2u16).to_be_bytes()); // numNalus = 2
-        // NALU 1 (VPS)
+                                                       // NALU 1 (VPS)
         hvcc.extend_from_slice(&(vps_nalu.len() as u16).to_be_bytes());
         hvcc.extend_from_slice(&vps_nalu);
         // NALU 2 (SPS)
@@ -485,7 +493,7 @@ mod tests {
     #[test]
     fn hvcc_to_annexb_rejects_truncated_record() {
         assert_eq!(hvcc_to_annexb(&[1; 10]), None); // too short for header
-        // Header says 1 array but no array data follows
+                                                    // Header says 1 array but no array data follows
         let mut hvcc = vec![0u8; 23];
         hvcc[0] = 1;
         hvcc[22] = 1;
@@ -520,7 +528,7 @@ mod tests {
         avcc.push(30); // AVCLevelIndication
         avcc.push(0xFF); // lengthSizeMinusOne=3 (lower 2 bits) + reserved
         avcc.push(0xE1); // numSPS=1 (lower 5 bits) + reserved
-        // SPS
+                         // SPS
         avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
         avcc.extend_from_slice(&sps);
         // numPPS
@@ -611,12 +619,17 @@ mod tests {
             i += 1;
         }
         for (idx, &start) in starts.iter().enumerate() {
-            let end = starts.get(idx + 1).map(|&s| {
-                // back up past trailing zeros before next start code
-                let mut e = s;
-                while e > start && fixture[e - 1] == 0 { e -= 1; }
-                e
-            }).unwrap_or(fixture.len());
+            let end = starts
+                .get(idx + 1)
+                .map(|&s| {
+                    // back up past trailing zeros before next start code
+                    let mut e = s;
+                    while e > start && fixture[e - 1] == 0 {
+                        e -= 1;
+                    }
+                    e
+                })
+                .unwrap_or(fixture.len());
             nalus.push(&fixture[start..end]);
         }
 
@@ -625,7 +638,11 @@ mod tests {
         hvcc[0] = 1; // configurationVersion
         hvcc[22] = nalus.len() as u8; // numOfArrays
         for nalu in &nalus {
-            let nal_type = if !nalu.is_empty() { (nalu[0] >> 1) & 0x3F } else { 0 };
+            let nal_type = if !nalu.is_empty() {
+                (nalu[0] >> 1) & 0x3F
+            } else {
+                0
+            };
             hvcc.push(nal_type);
             hvcc.extend_from_slice(&1u16.to_be_bytes());
             hvcc.extend_from_slice(&(nalu.len() as u16).to_be_bytes());
@@ -636,9 +653,7 @@ mod tests {
         assert!(is_annexb(&converted));
 
         // The SPS parser should find the SPS and extract chroma+bit_depth
-        let parsed = crate::bitstream_sps::parse_sps_chroma_bit_depth(
-            &converted, CodecKind::Hevc
-        );
+        let parsed = crate::bitstream_sps::parse_sps_chroma_bit_depth(&converted, CodecKind::Hevc);
         assert!(
             parsed.is_some(),
             "converted hvcC should be parseable as Annex-B HEVC"

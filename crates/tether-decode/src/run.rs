@@ -550,17 +550,14 @@ pub fn run_thread_with_init(
 /// `keyframe` flag, which some encoders (AMF) fail to set on forced IDRs.
 fn body_starts_with_parameter_sets(body: &[u8]) -> bool {
     // Find the first NALU type after the Annex-B start code.
-    let nalu_byte = if body.len() >= 5
-        && body[0] == 0 && body[1] == 0 && body[2] == 0 && body[3] == 1
-    {
-        Some(body[4])
-    } else if body.len() >= 4
-        && body[0] == 0 && body[1] == 0 && body[2] == 1
-    {
-        Some(body[3])
-    } else {
-        None
-    };
+    let nalu_byte =
+        if body.len() >= 5 && body[0] == 0 && body[1] == 0 && body[2] == 0 && body[3] == 1 {
+            Some(body[4])
+        } else if body.len() >= 4 && body[0] == 0 && body[1] == 0 && body[2] == 1 {
+            Some(body[3])
+        } else {
+            None
+        };
     let Some(b) = nalu_byte else { return false };
     // HEVC: VPS = type 32, first byte = (32 << 1) | 0 = 0x40.
     // NALU type is bits [6:1] of the first byte.

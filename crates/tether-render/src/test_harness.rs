@@ -50,9 +50,8 @@ use tether_codec::vaapi::{VaapiDecoder, VaapiEncoder};
 use tether_codec::{Decoder, Encoder, Frame as CodecFrame};
 use tether_protocol::control::{ChromaSubsampling, VideoColorSpec, VideoProfile};
 use tether_scaler::test_util::{
-    LetterboxMap, coord_fixture_fill, coord_fixture_residual_px_rms,
-    cpu_letterbox_to_surface_bgra, cpu_mitchell_resize_bgra, psnr_db_y_bgra,
-    ssim_heatmap_l8, ssim_rgb,
+    coord_fixture_fill, coord_fixture_residual_px_rms, cpu_letterbox_to_surface_bgra,
+    cpu_mitchell_resize_bgra, psnr_db_y_bgra, ssim_heatmap_l8, ssim_rgb, LetterboxMap,
 };
 
 use crate::gpu::GpuState;
@@ -176,7 +175,10 @@ pub(crate) enum RoundtripResult {
     Ok(RoundtripOutcome),
     /// Loud skip — runner CI can grep these to distinguish missing
     /// hardware from green tests.
-    Skip { capability: Capability, detail: String },
+    Skip {
+        capability: Capability,
+        detail: String,
+    },
 }
 
 /// Drive one case end-to-end.
@@ -207,23 +209,23 @@ pub(crate) fn run_roundtrip(case: &RoundtripCase) -> RoundtripResult {
 
     // 1. Capability checks. Missing capability is a loud Skip, never
     // a silent pass.
-    let (device, queue) =
-        match pollster::block_on(try_init_wgpu_for_dmabuf(case.profile.bit_depth)) {
-            Some((d, q, _adapter)) => (d, q),
-            None => {
-                return RoundtripResult::Skip {
-                    capability: Capability::VulkanDmaBufImport,
-                    detail: format!(
-                        "wgpu adapter lacks VULKAN_EXTERNAL_MEMORY_DMA_BUF{}",
-                        if case.profile.bit_depth == 10 {
-                            " (or TEXTURE_FORMAT_16BIT_NORM for 10-bit)"
-                        } else {
-                            ""
-                        }
-                    ),
-                };
-            }
-        };
+    let (device, queue) = match pollster::block_on(try_init_wgpu_for_dmabuf(case.profile.bit_depth))
+    {
+        Some((d, q, _adapter)) => (d, q),
+        None => {
+            return RoundtripResult::Skip {
+                capability: Capability::VulkanDmaBufImport,
+                detail: format!(
+                    "wgpu adapter lacks VULKAN_EXTERNAL_MEMORY_DMA_BUF{}",
+                    if case.profile.bit_depth == 10 {
+                        " (or TEXTURE_FORMAT_16BIT_NORM for 10-bit)"
+                    } else {
+                        ""
+                    }
+                ),
+            };
+        }
+    };
 
     // 2. Fixture → BGRA at capture_dims.
     let capture_bgra = load_fixture(case.fixture, case.capture_dims);
@@ -405,7 +407,7 @@ fn load_png_fixture_at(name: &str, dims: (u32, u32)) -> Vec<u8> {
     let src_rgba = img.into_raw();
     let mut src_bgra = vec![0u8; src_rgba.len()];
     for i in 0..(src_rgba.len() / 4) {
-        src_bgra[i * 4]     = src_rgba[i * 4 + 2];
+        src_bgra[i * 4] = src_rgba[i * 4 + 2];
         src_bgra[i * 4 + 1] = src_rgba[i * 4 + 1];
         src_bgra[i * 4 + 2] = src_rgba[i * 4];
         src_bgra[i * 4 + 3] = src_rgba[i * 4 + 3];
@@ -420,16 +422,23 @@ fn load_png_fixture_at(name: &str, dims: (u32, u32)) -> Vec<u8> {
 // Encode side
 // =====================================================================
 
-fn encode_chain(
-    case: &RoundtripCase,
-    capture_bgra: &[u8],
-) -> Vec<tether_codec::EncodedPacket> {
+fn encode_chain(case: &RoundtripCase, capture_bgra: &[u8]) -> Vec<tether_codec::EncodedPacket> {
     if case.encode_dims == case.capture_dims {
         // No scaler; encode directly. 10-bit needs the P010 bridge.
         if case.profile.bit_depth == 10 {
-            encode_via_p010_bridge(case.profile, case.capture_dims, capture_bgra, case.frames_encoded)
+            encode_via_p010_bridge(
+                case.profile,
+                case.capture_dims,
+                capture_bgra,
+                case.frames_encoded,
+            )
         } else {
-            encode_via_cpu_upload(case.profile, case.capture_dims, capture_bgra, case.frames_encoded)
+            encode_via_cpu_upload(
+                case.profile,
+                case.capture_dims,
+                capture_bgra,
+                case.frames_encoded,
+            )
         }
     } else {
         // Scaler-active path. Production runs the host Mitchell on
@@ -585,7 +594,11 @@ fn encode_via_p010_bridge(
     };
     let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("roundtrip P010 bgra src"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -606,7 +619,11 @@ fn encode_via_p010_bridge(
             bytes_per_row: Some(w * 4),
             rows_per_image: Some(h),
         },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
     );
     let mut packets = Vec::new();
     for t in 0..frames as i64 {
@@ -636,7 +653,7 @@ fn encode_via_scaler_chain(
     capture_bgra: &[u8],
     frames: usize,
 ) -> Vec<tether_codec::EncodedPacket> {
-    use tether_gpuconvert::{Nv12DmaBuf, export_texture_as_dmabuf};
+    use tether_gpuconvert::{export_texture_as_dmabuf, Nv12DmaBuf};
     use tether_scaler::{ColorSpace, Pipelines, Scaler};
 
     let mut enc = match VaapiEncoder::new(profile, encode.0, encode.1, 30, 4_000) {
@@ -680,7 +697,11 @@ fn encode_via_scaler_chain(
             bytes_per_row: Some(capture.0 * 4),
             rows_per_image: Some(capture.1),
         },
-        wgpu::Extent3d { width: capture.0, height: capture.1, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: capture.0,
+            height: capture.1,
+            depth_or_array_layers: 1,
+        },
     );
     bridge.queue().submit(std::iter::empty());
     bridge
@@ -876,9 +897,7 @@ fn capability_for_profile(profile: VideoProfile) -> Capability {
     // driver gap at 10-bit shows up as a misleading "Main444 missing".
     match (profile.codec, profile.chroma, profile.bit_depth) {
         (CodecKind::H264, _, _) => Capability::VaapiH264,
-        (CodecKind::Hevc, ChromaSubsampling::Yuv444, 10) => {
-            Capability::VaapiHevcMain444_10DmaBuf
-        }
+        (CodecKind::Hevc, ChromaSubsampling::Yuv444, 10) => Capability::VaapiHevcMain444_10DmaBuf,
         (CodecKind::Hevc, ChromaSubsampling::Yuv444, _) => Capability::VaapiHevcMain444,
         (CodecKind::Hevc, _, 10) => Capability::VaapiHevcMain10DmaBuf,
         (CodecKind::Hevc, _, _) => Capability::VaapiHevcMain,
@@ -918,7 +937,11 @@ fn readback_offscreen(renderer: &GpuState, device: &wgpu::Device) -> Vec<u8> {
                 rows_per_image: Some(h),
             },
         },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
     );
     let queue = renderer.queue_for_readback();
     queue.submit(std::iter::once(encoder.finish()));
@@ -1005,7 +1028,11 @@ fn mae_bgra(a: &[u8], b: &[u8]) -> f64 {
             n += 1;
         }
     }
-    if n == 0 { 0.0 } else { sum / (n as f64) }
+    if n == 0 {
+        0.0
+    } else {
+        sum / (n as f64)
+    }
 }
 
 // =====================================================================
@@ -1097,8 +1124,18 @@ pub(crate) fn dump_failure_diagnostics(case: &RoundtripCase, outcome: &Roundtrip
     }
 
     let (sw, sh) = case.surface_dims;
-    save_bgra_as_png(&target_root.join("readback.png"), &outcome.readback_bgra, sw, sh);
-    save_bgra_as_png(&target_root.join("reference.png"), &outcome.reference_bgra, sw, sh);
+    save_bgra_as_png(
+        &target_root.join("readback.png"),
+        &outcome.readback_bgra,
+        sw,
+        sh,
+    );
+    save_bgra_as_png(
+        &target_root.join("reference.png"),
+        &outcome.reference_bgra,
+        sw,
+        sh,
+    );
     save_diff_png(
         &target_root.join("diff.png"),
         &outcome.readback_bgra,
@@ -1153,13 +1190,7 @@ fn save_l8_as_png(path: &std::path::Path, l8: &[u8], w: u32, h: u32) {
     }
 }
 
-fn save_diff_png(
-    path: &std::path::Path,
-    a_bgra: &[u8],
-    b_bgra: &[u8],
-    w: u32,
-    h: u32,
-) {
+fn save_diff_png(path: &std::path::Path, a_bgra: &[u8], b_bgra: &[u8], w: u32, h: u32) {
     assert_eq!(a_bgra.len(), b_bgra.len());
     let mut rgba = Vec::with_capacity(a_bgra.len());
     for (ca, cb) in a_bgra.chunks_exact(4).zip(b_bgra.chunks_exact(4)) {

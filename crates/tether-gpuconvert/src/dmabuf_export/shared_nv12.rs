@@ -114,8 +114,7 @@ pub fn export_nv12_shared_dmabuf(
         let raw_physical = hal_dev.raw_physical_device();
 
         let ext_mem_fd = khr::external_memory_fd::Device::new(raw_instance, raw_device);
-        let modifier_ext =
-            ext::image_drm_format_modifier::Device::new(raw_instance, raw_device);
+        let modifier_ext = ext::image_drm_format_modifier::Device::new(raw_instance, raw_device);
 
         // Same image-create template as the single-plane path; called
         // twice with different format + extent. The modifier list lives
@@ -130,7 +129,11 @@ pub fn export_nv12_shared_dmabuf(
             let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
-                .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+                .extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                })
                 .mip_levels(1)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -178,7 +181,11 @@ pub fn export_nv12_shared_dmabuf(
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
             .or_else(|| {
-                find_memory_type(&mem_props, combined_type_bits, vk::MemoryPropertyFlags::empty())
+                find_memory_type(
+                    &mem_props,
+                    combined_type_bits,
+                    vk::MemoryPropertyFlags::empty(),
+                )
             })
             .ok_or(ExportError::NoMemoryType)?;
 
@@ -373,7 +380,11 @@ unsafe fn import_shared_image_into_wgpu(
 ) -> wgpu::Texture {
     let hal_desc = wgpu::hal::TextureDescriptor {
         label: Some(label),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -413,7 +424,11 @@ unsafe fn import_shared_image_into_wgpu(
 
         let wgpu_desc = wgpu::TextureDescriptor {
             label: Some(label),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,

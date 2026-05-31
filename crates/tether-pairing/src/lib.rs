@@ -118,14 +118,20 @@ pub fn generate_pin() -> String {
     // (~2.2%) and the loop almost always takes one iteration.
     const RANGE: u32 = 100_000_000; // 10^8
     const REJECT_AT: u32 = RANGE * (u32::MAX / RANGE); // 4_200_000_000
-    // Make the rejection-sampling invariants unmistakable: the threshold must
-    // be an exact multiple of RANGE (so `draw % RANGE` is unbiased over the
-    // accepted band) and must not exceed u32::MAX.
-    const _: () = assert!(REJECT_AT % RANGE == 0, "REJECT_AT must be a multiple of RANGE");
+                                                       // Make the rejection-sampling invariants unmistakable: the threshold must
+                                                       // be an exact multiple of RANGE (so `draw % RANGE` is unbiased over the
+                                                       // accepted band) and must not exceed u32::MAX.
+    const _: () = assert!(
+        REJECT_AT % RANGE == 0,
+        "REJECT_AT must be a multiple of RANGE"
+    );
     // The largest multiple of RANGE that is ≤ u32::MAX, so the rejected band
     // (REJECT_AT..=u32::MAX) is narrower than one RANGE — the loop rejects at
     // most ~RANGE/2^32 of draws.
-    const _: () = assert!(REJECT_AT > u32::MAX - RANGE, "REJECT_AT must be the largest RANGE multiple ≤ u32::MAX");
+    const _: () = assert!(
+        REJECT_AT > u32::MAX - RANGE,
+        "REJECT_AT must be the largest RANGE multiple ≤ u32::MAX"
+    );
     loop {
         let mut bytes = [0u8; 4];
         getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable");
@@ -190,8 +196,10 @@ impl PairingStart {
     /// to the peer, then feed the peer's message to
     /// [`into_keyed`](Self::into_keyed).
     pub fn new(pin: &[u8]) -> Self {
-        let (state, outbound) =
-            Spake2::<Ed25519Group>::start_symmetric(&Password::new(pin), &Identity::new(APP_IDENTITY));
+        let (state, outbound) = Spake2::<Ed25519Group>::start_symmetric(
+            &Password::new(pin),
+            &Identity::new(APP_IDENTITY),
+        );
         Self { state, outbound }
     }
 
@@ -378,7 +386,10 @@ mod tests {
         for _ in 0..1000 {
             let pin = generate_pin();
             assert_eq!(pin.len(), PIN_DIGITS);
-            assert!(pin.chars().all(|c| c.is_ascii_digit()), "pin {pin} not all digits");
+            assert!(
+                pin.chars().all(|c| c.is_ascii_digit()),
+                "pin {pin} not all digits"
+            );
             let value: u32 = pin.parse().expect("pin parses as a number");
             assert!(value < 100_000_000);
         }

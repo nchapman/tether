@@ -9,8 +9,8 @@ use crate::{
     connection::{Connection, STREAM_PREAMBLE_LEN},
     pending::PendingConnection,
     tls::{
-        ensure_crypto_provider, generate_self_signed, load_or_generate_persistent,
-        CertFingerprint, PermissiveClientCertVerifier, SelfSignedCert,
+        ensure_crypto_provider, generate_self_signed, load_or_generate_persistent, CertFingerprint,
+        PermissiveClientCertVerifier, SelfSignedCert,
     },
     Result, TransportError,
 };
@@ -143,7 +143,11 @@ async fn handle_incoming_pending(incoming: quinn::Incoming) -> Result<PendingCon
         .read_exact(&mut preamble)
         .await
         .map_err(crate::TransportError::from_read_exact)?;
-    Ok(PendingConnection::new_host(conn, pairing_send, pairing_recv))
+    Ok(PendingConnection::new_host(
+        conn,
+        pairing_send,
+        pairing_recv,
+    ))
 }
 
 fn default_subject_alt_names() -> Vec<String> {

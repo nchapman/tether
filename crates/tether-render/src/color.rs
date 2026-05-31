@@ -163,7 +163,11 @@ pub fn bt709_limited_to_srgb_display(yuv: Yuv8, spec: VideoColorSpec) -> Bgra8 {
     let b_gamma = y + 1.855_6 * u;
     // 3. TRANSFER: EOTF dispatch — match `apply_eotf` in shader.wgsl.
     let (r_linear, g_linear, b_linear) = match spec.transfer {
-        ColorTransfer::Bt709 => (bt709_eotf(r_gamma), bt709_eotf(g_gamma), bt709_eotf(b_gamma)),
+        ColorTransfer::Bt709 => (
+            bt709_eotf(r_gamma),
+            bt709_eotf(g_gamma),
+            bt709_eotf(b_gamma),
+        ),
         ColorTransfer::Srgb => (srgb_eotf(r_gamma), srgb_eotf(g_gamma), srgb_eotf(b_gamma)),
         // Pq / Hlg / Linear are unimplemented in the shader and
         // fall through to BT.709. Match the GPU path's `tracing::warn!`
@@ -176,7 +180,11 @@ pub fn bt709_limited_to_srgb_display(yuv: Yuv8, spec: VideoColorSpec) -> Bgra8 {
                 ?spec.transfer,
                 "EOTF not yet implemented; falling back to BT.709"
             );
-            (bt709_eotf(r_gamma), bt709_eotf(g_gamma), bt709_eotf(b_gamma))
+            (
+                bt709_eotf(r_gamma),
+                bt709_eotf(g_gamma),
+                bt709_eotf(b_gamma),
+            )
         }
     };
     // 4. SURFACE: sRGB OETF (what wgpu's surface write does for us).

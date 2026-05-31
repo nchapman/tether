@@ -64,14 +64,7 @@ fn make_test_bgra(w: u32, h: u32) -> Vec<u8> {
     data
 }
 
-fn region_average_rgb(
-    rgba: &[u8],
-    w: u32,
-    x0: u32,
-    y0: u32,
-    rw: u32,
-    rh: u32,
-) -> (u8, u8, u8) {
+fn region_average_rgb(rgba: &[u8], w: u32, x0: u32, y0: u32, rw: u32, rh: u32) -> (u8, u8, u8) {
     let mut sum = [0u64; 3];
     let mut count = 0u64;
     for y in y0..y0 + rh {
@@ -490,11 +483,9 @@ fn run_roundtrip(profile: VideoProfile) -> Option<((u8, u8, u8), (u8, u8, u8))> 
     queue.submit(std::iter::once(encoder.finish()));
 
     let (tx, rx) = mpsc::channel();
-    readback
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |r| {
-            tx.send(r).expect("send map result");
-        });
+    readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        tx.send(r).expect("send map result");
+    });
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("device poll");
@@ -721,11 +712,9 @@ fn run_fixture_render(
     queue.submit(std::iter::once(encoder.finish()));
 
     let (tx, rx) = mpsc::channel();
-    readback
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |r| {
-            tx.send(r).expect("send map result");
-        });
+    readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        tx.send(r).expect("send map result");
+    });
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("device poll");
@@ -788,8 +777,7 @@ fn assert_grey(label: &str, rgb: (u8, u8, u8)) {
 #[test]
 #[ignore = "requires macOS + VideoToolbox + Metal Main444; run with: cargo test -p tether-render --release -- --ignored iosurface"]
 fn iosurface_zero_copy_roundtrip_hevc_main_444_8bit() {
-    const FIXTURE: &[u8] =
-        include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_8bit.idr");
+    const FIXTURE: &[u8] = include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_8bit.idr");
     let Some((left, right)) = run_fixture_render(
         VideoProfile {
             codec: tether_protocol::control::CodecKind::Hevc,
@@ -849,9 +837,7 @@ enum HostScalerFixture {
 fn host_scaler_input_bgra(w: u32, h: u32, fixture: HostScalerFixture) -> Vec<u8> {
     match fixture {
         HostScalerFixture::SolidSplit => make_test_bgra(w, h),
-        HostScalerFixture::CoordEncoded => {
-            tether_scaler::test_util::coord_fixture_fill((w, h))
-        }
+        HostScalerFixture::CoordEncoded => tether_scaler::test_util::coord_fixture_fill((w, h)),
     }
 }
 
@@ -957,8 +943,8 @@ fn run_host_scaler_roundtrip_with_input(
     // === 1) encode + decode at src_dims to produce a representative
     // NV12 IOSurface (what SCK would deliver on the host) ===
     let (sw, sh) = src_dims;
-    let mut enc = VideoToolboxEncoder::new(profile, sw, sh, 30, 4_000)
-        .expect("VT encoder construction");
+    let mut enc =
+        VideoToolboxEncoder::new(profile, sw, sh, 30, 4_000).expect("VT encoder construction");
     let mut packets = Vec::new();
     for t in 0..6i64 {
         packets.extend(enc.encode_bgra(input_bgra, t, t == 0).expect("encode_bgra"));
@@ -993,7 +979,11 @@ fn run_host_scaler_roundtrip_with_input(
     // ever pads or crops, the bridge constructor below would build
     // with wrong src_dims and panic with an opaque error — better to
     // fail here with a clear message.
-    assert_eq!((gw, gh), src_dims, "decoded src dims must match encoded src dims");
+    assert_eq!(
+        (gw, gh),
+        src_dims,
+        "decoded src dims must match encoded src dims"
+    );
     let src_iosurface = match source {
         GpuFrameSource::IOSurface(io) => io,
     };
@@ -1415,15 +1405,14 @@ fn iosurface_host_scaler_sustained_rate() {
     let src_dims = (640u32, 480u32);
     let dst_dims = (320u32, 240u32);
 
-    let (device, queue, _caps) = match pollster::block_on(
-        tether_gpuconvert::nv12_iosurface::build_bridge_device(),
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("SKIPPED: build_bridge_device failed: {e}");
-            return;
-        }
-    };
+    let (device, queue, _caps) =
+        match pollster::block_on(tether_gpuconvert::nv12_iosurface::build_bridge_device()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: build_bridge_device failed: {e}");
+                return;
+            }
+        };
 
     // Build one IOSurface to use as the source for every iteration —
     // a real session would refresh src per frame, but the test only
@@ -1432,11 +1421,14 @@ fn iosurface_host_scaler_sustained_rate() {
     // SCK-side variance.
     let (sw, sh) = src_dims;
     let input_bgra = make_test_bgra(sw, sh);
-    let mut enc = VideoToolboxEncoder::new(profile, sw, sh, 30, 4_000)
-        .expect("VT encoder construction");
+    let mut enc =
+        VideoToolboxEncoder::new(profile, sw, sh, 30, 4_000).expect("VT encoder construction");
     let mut packets = Vec::new();
     for t in 0..6i64 {
-        packets.extend(enc.encode_bgra(&input_bgra, t, t == 0).expect("encode_bgra"));
+        packets.extend(
+            enc.encode_bgra(&input_bgra, t, t == 0)
+                .expect("encode_bgra"),
+        );
     }
     packets.extend(enc.flush().expect("flush"));
     let mut dec = VideoToolboxDecoder::new(profile.codec).expect("VT decoder");
@@ -1508,7 +1500,9 @@ fn iosurface_host_scaler_sustained_rate() {
 #[cfg(target_os = "macos")]
 fn iosurface_host_scaler_10bit_construction() {
     use tether_codec::macos_interop::{X420_FOURCC, XF20_FOURCC};
-    use tether_gpuconvert::nv12_iosurface::{build_bridge_device, BridgeError, Nv12IOSurfaceBridge};
+    use tether_gpuconvert::nv12_iosurface::{
+        build_bridge_device, BridgeError, Nv12IOSurfaceBridge,
+    };
 
     let (device, queue, caps) = match pollster::block_on(build_bridge_device()) {
         Ok(t) => t,
@@ -1536,7 +1530,10 @@ fn iosurface_host_scaler_10bit_construction() {
                 drop(bridge);
             }
             (false, Err(BridgeError::TenBitNotImplemented { fourcc })) => {
-                assert_eq!(fourcc, fcc, "TenBitNotImplemented error must carry the rejected fourcc");
+                assert_eq!(
+                    fourcc, fcc,
+                    "TenBitNotImplemented error must carry the rejected fourcc"
+                );
                 eprintln!(
                     "10-bit fourcc 0x{fcc:08x}: bridge correctly refused — adapter lacks 16BIT_NORM"
                 );

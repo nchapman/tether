@@ -9,10 +9,10 @@ mod cursor_overlay;
 // Linux/macOS, native D3D11 on Windows (decode + present stay in one
 // API — see `d3d11`). The shared `App` event loop drives whichever
 // through the `Backend` alias below.
-#[cfg(not(target_os = "windows"))]
-mod gpu;
 #[cfg(target_os = "windows")]
 mod d3d11;
+#[cfg(not(target_os = "windows"))]
+mod gpu;
 pub mod present_policy;
 pub mod relative_mouse;
 
@@ -42,10 +42,10 @@ use winit::window::{Window, WindowAttributes, WindowId};
 // The active render backend. Both expose the same method surface
 // (`new`, `resize`, `apply_frame`, `render`, `dimensions`) so the `App`
 // loop is identical across platforms.
-#[cfg(not(target_os = "windows"))]
-use gpu::GpuState as Backend;
 #[cfg(target_os = "windows")]
 use d3d11::D3D11RenderState as Backend;
+#[cfg(not(target_os = "windows"))]
+use gpu::GpuState as Backend;
 
 // Re-exported so tether-input / tether-client can match on render events
 // without having to add their own winit dep at a possibly-different
@@ -63,10 +63,10 @@ pub use winit::keyboard::{KeyCode, ModifiersState};
 #[cfg(target_os = "macos")]
 pub use gpu::accepts_iosurface_fourcc;
 
-#[cfg(not(target_os = "windows"))]
-pub use gpu::supports_10bit_render;
 #[cfg(target_os = "windows")]
 pub use d3d11::supports_10bit_render;
+#[cfg(not(target_os = "windows"))]
+pub use gpu::supports_10bit_render;
 // Windows decode-format accept table, exported for the cross-crate
 // consistency test in tether-client (see `decode_plane_srv_formats`).
 #[cfg(target_os = "windows")]
@@ -300,8 +300,7 @@ pub fn run(
         on_event,
         present_stats: PresentStats::default(),
         last_recorded_t_cap: None,
-        refresh_rate_mhz: present_policy::REFRESH_RATE_FALLBACK_HZ
-            .saturating_mul(1000),
+        refresh_rate_mhz: present_policy::REFRESH_RATE_FALLBACK_HZ.saturating_mul(1000),
         age_tracker: present_policy::FrameAgeTracker::default(),
         cursor_mode: CursorMode::Absolute,
         relative_accum: relative_mouse::SubPixelAccum::default(),
@@ -312,7 +311,6 @@ pub fn run(
     event_loop.run_app(&mut app)?;
     Ok(())
 }
-
 
 struct App {
     title: String,
@@ -481,19 +479,17 @@ impl ApplicationHandler for App {
             if let Some(mhz) = monitor.refresh_rate_millihertz() {
                 self.refresh_rate_mhz = mhz;
             }
-        } else if let Some(mhz) = win.current_monitor().and_then(|m| m.refresh_rate_millihertz()) {
+        } else if let Some(mhz) = win
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+        {
             self.refresh_rate_mhz = mhz;
         }
         self.window = Some(win);
         self.gpu = Some(gpu);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
@@ -646,12 +642,7 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn device_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        _id: DeviceId,
-        event: DeviceEvent,
-    ) {
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         // Device-level pointer motion fires even when the cursor
         // is grabbed (locked or confined), which is exactly the
         // raw-input shape recenter-loop games need. Only emit
@@ -703,7 +694,10 @@ impl LatestFrame {
     /// that for a drop count or just drop it.
     #[must_use = "displaced frame should be counted as a render drop or explicitly ignored"]
     pub fn set(&self, frame: Frame) -> Option<Frame> {
-        std::mem::replace(&mut *self.0.lock().expect("LatestFrame mutex poisoned"), Some(frame))
+        std::mem::replace(
+            &mut *self.0.lock().expect("LatestFrame mutex poisoned"),
+            Some(frame),
+        )
     }
 
     /// Take the currently-held frame, leaving the slot empty.
@@ -839,17 +833,24 @@ mod tests {
     fn latest_frame_displaces_previous_on_set() {
         let frames = LatestFrame::new();
         let frame_a = Frame::Cpu(CpuFrame {
-            width: 1, height: 1,
-            y: vec![0xa], uv: vec![0, 0],
+            width: 1,
+            height: 1,
+            y: vec![0xa],
+            uv: vec![0, 0],
             t_capture_client_clock: None,
         });
         let frame_b = Frame::Cpu(CpuFrame {
-            width: 2, height: 2,
-            y: vec![0xb], uv: vec![0, 0],
+            width: 2,
+            height: 2,
+            y: vec![0xb],
+            uv: vec![0, 0],
             t_capture_client_clock: None,
         });
         // First set: empty slot, no displacement.
-        assert!(frames.set(frame_a).is_none(), "empty slot should return None");
+        assert!(
+            frames.set(frame_a).is_none(),
+            "empty slot should return None"
+        );
         // Second set: A is displaced; caller can count this as a render drop.
         let displaced = frames.set(frame_b).expect("second set should displace");
         match displaced {

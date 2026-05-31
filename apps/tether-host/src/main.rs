@@ -21,34 +21,34 @@ use tether_capture::{
     CapturedFrame, CursorEvent, CursorSource, DamageHint, DamageSignal, FrameReceiver, HashDamage,
     PixelFormat, PlaceholderCursorSource,
 };
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-use tether_codec::GpuEncoderFrame;
 #[cfg(not(target_os = "windows"))]
 use tether_codec::build_encoder;
-use tether_codec::Encoder;
 #[cfg(target_os = "windows")]
 use tether_codec::build_encoder_d3d11;
+use tether_codec::Encoder;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use tether_codec::GpuEncoderFrame;
 #[cfg(target_os = "linux")]
 use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
-#[cfg(target_os = "linux")]
-use tether_gpuconvert::{
-    Bgra2P010DmaBuf, Bgra2Xv30DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame, Xv30DmaBufFrame,
-    Yuv444DmaBuf, Yuv444DmaBufFrame,
-};
-#[cfg(target_os = "linux")]
-use tether_scaler::{Pipelines as ScalerPipelines, Scaler, ScalerError};
 #[cfg(target_os = "macos")]
 use tether_gpuconvert::nv12_iosurface::{
     BridgeError as IOSurfaceBridgeError, Nv12IOSurfaceBridge, PooledIOSurface,
 };
+#[cfg(target_os = "linux")]
+use tether_gpuconvert::{
+    Bgra2P010DmaBuf, Bgra2Xv30DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame,
+    Xv30DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
+};
+use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ControlMessage, VideoProfile, Viewport,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
 };
-use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::MonoNanos;
+#[cfg(target_os = "linux")]
+use tether_scaler::{Pipelines as ScalerPipelines, Scaler, ScalerError};
 use tether_session::{
     AbrConfig, AbrController, AbrSample, AcceptError, HostSession, HostSessionConfig,
 };
@@ -549,9 +549,7 @@ async fn handle_client(
         idr_signal: force_idr,
         stream_ready,
     } = session;
-    let initial_viewport = client_hello
-        .viewport
-        .filter(|v| v.is_valid());
+    let initial_viewport = client_hello.viewport.filter(|v| v.is_valid());
 
     // `use_test_pattern` from here on only switches the capture source;
     // the handshake-time profile floor it implied is already baked into
@@ -864,7 +862,11 @@ async fn handle_client(
                             });
                     }
                     Ok(ControlMessage::SetClientViewport(v)) => {
-                        info!(width = v.width, height = v.height, "client viewport changed");
+                        info!(
+                            width = v.width,
+                            height = v.height,
+                            "client viewport changed"
+                        );
                         // Latch the new viewport. The send thread
                         // notices the seq bump on its next iteration
                         // and rebuilds the encoder ONLY if encode
@@ -1809,14 +1811,20 @@ impl MacosGpuState {
         dst_dims: (u32, u32),
         fourcc: u32,
     ) -> anyhow::Result<Nv12IOSurfaceBridge> {
-        Nv12IOSurfaceBridge::new(self.device.clone(), self.queue.clone(), src_dims, dst_dims, fourcc)
-            .map_err(|e| match e {
-                IOSurfaceBridgeError::NoScaleNeeded { dims } => anyhow::anyhow!(
-                    "bridge construction got NoScaleNeeded for dims {dims:?} — caller \
+        Nv12IOSurfaceBridge::new(
+            self.device.clone(),
+            self.queue.clone(),
+            src_dims,
+            dst_dims,
+            fourcc,
+        )
+        .map_err(|e| match e {
+            IOSurfaceBridgeError::NoScaleNeeded { dims } => anyhow::anyhow!(
+                "bridge construction got NoScaleNeeded for dims {dims:?} — caller \
                      should have skipped the bridge path"
-                ),
-                other => anyhow::anyhow!("Nv12IOSurfaceBridge::new: {other}"),
-            })
+            ),
+            other => anyhow::anyhow!("Nv12IOSurfaceBridge::new: {other}"),
+        })
     }
 }
 
@@ -1942,13 +1950,7 @@ fn yuv444_dmabuf_to_codec_frame(out: Yuv444DmaBufFrame) -> DmaBufFrame {
 /// pin the fourcc family.
 #[cfg(target_os = "linux")]
 fn xv30_dmabuf_to_codec_frame(out: Xv30DmaBufFrame) -> DmaBufFrame {
-    tether_codec::build_xv30_dmabuf_frame(
-        out.fd,
-        out.size,
-        out.modifier,
-        out.offset,
-        out.stride,
-    )
+    tether_codec::build_xv30_dmabuf_frame(out.fd, out.size, out.modifier, out.offset, out.stride)
 }
 
 /// Long-running cursor pump. Owns the per-backend
@@ -2116,7 +2118,9 @@ async fn pump_cursor(
     mut source: Box<dyn CursorSource>,
     mut cursor_frame_rx: tokio::sync::watch::Receiver<Option<CursorFrameDims>>,
 ) {
-    info!("cursor pump started; waiting for first encoder slot rebuild to learn capture/encode dims");
+    info!(
+        "cursor pump started; waiting for first encoder slot rebuild to learn capture/encode dims"
+    );
     // Block until the encode loop publishes its first dims. Sending
     // anything before that races against the encoder setup: the
     // cursor source produces in capture-pixel space, the client
@@ -2138,8 +2142,7 @@ async fn pump_cursor(
     // motion at; sleeping for one tick collapses any sub-tick
     // updates into a single latest-wins datagram, which is exactly
     // what the unreliable channel wants.
-    let mut tick =
-        tokio::time::interval(std::time::Duration::from_millis(8));
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(8));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
@@ -2311,12 +2314,7 @@ mod cursor_pump_tests {
         let effects = cursor_tick(&mut state, &mut src, None, now());
         assert_eq!(effects.len(), 1);
         match &effects[0] {
-            CursorEffect::Position(HostCursorPacket::Position {
-                x,
-                y,
-                visible,
-                ..
-            }) => {
+            CursorEffect::Position(HostCursorPacket::Position { x, y, visible, .. }) => {
                 assert_eq!(*x, 100);
                 assert_eq!(*y, 200);
                 assert!(*visible);
@@ -2450,13 +2448,7 @@ fn encode_dims_for_viewport(
 /// reach this function. A real GPU compute scaler is the planned
 /// follow-up; for now those paths encode at capture dims regardless
 /// of viewport.
-fn resize_bgra_bilinear(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Vec<u8> {
+fn resize_bgra_bilinear(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     debug_assert_eq!((src_w * src_h * 4) as usize, src.len());
     let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
     if dst_w == 0 || dst_h == 0 {
@@ -2799,9 +2791,13 @@ fn run_capture_and_send(
                     None => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
                 };
                 build_encoder_d3d11(
-                    chosen_profile, encode_width, encode_height,
-                    ENCODER_FPS, baseline_kbps,
-                    dev_ptr, ctx_ptr,
+                    chosen_profile,
+                    encode_width,
+                    encode_height,
+                    ENCODER_FPS,
+                    baseline_kbps,
+                    dev_ptr,
+                    ctx_ptr,
                     vendor_id,
                 )
             };
@@ -2843,9 +2839,7 @@ fn run_capture_and_send(
                     // range. Surface it once at encoder init so a
                     // future "ABR isn't doing anything" investigation
                     // finds the cause in the logs.
-                    if abr.is_some()
-                        && AbrConfig::new(baseline_kbps).floor_kbps == baseline_kbps
-                    {
+                    if abr.is_some() && AbrConfig::new(baseline_kbps).floor_kbps == baseline_kbps {
                         info!(
                             baseline_kbps,
                             "ABR enabled but floor == baseline; bitrate control range is zero \
@@ -3026,12 +3020,11 @@ fn run_capture_and_send(
                         );
                         let goodbye_conn = conn.clone();
                         let reason = format!("host macOS GPU encode bridge collapsed: {e}");
-                        let _ = runtime.block_on(goodbye_conn.send_control(
-                            &ControlMessage::Goodbye {
+                        let _ =
+                            runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
                                 reason,
                                 code: tether_protocol::control::GoodbyeCode::InternalError,
-                            },
-                        ));
+                            }));
                         return;
                     }
                 }
@@ -3049,7 +3042,9 @@ fn run_capture_and_send(
                     format: tex.format.0 as u32,
                 };
                 match slot_mut.encoder.encode_gpu(
-                    GpuEncoderFrame::D3D11Texture(&frame), pts, force_kf,
+                    GpuEncoderFrame::D3D11Texture(&frame),
+                    pts,
+                    force_kf,
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -3305,7 +3300,9 @@ async fn pick_capture_source(
 }
 
 #[cfg(target_os = "linux")]
-async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
+async fn real_capture(
+    _chosen_profile: VideoProfile,
+) -> anyhow::Result<tether_capture::CaptureHandle> {
     info!("capture source: linux (PipeWire + xdg-desktop-portal)");
     // Query which DRM modifiers our wgpu/Vulkan importer can consume for
     // the BGRA-family capture formats PipeWire emits. PipeWire then
@@ -3342,7 +3339,9 @@ async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_ca
 }
 
 #[cfg(target_os = "macos")]
-async fn real_capture(chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
+async fn real_capture(
+    chosen_profile: VideoProfile,
+) -> anyhow::Result<tether_capture::CaptureHandle> {
     // Pick the SCK pixel format that matches the negotiated encoder
     // profile. The encoder's `submit_iosurface` cross-checks the
     // delivered IOSurface fourcc against this; a mismatch would refuse
@@ -3374,22 +3373,26 @@ static PRECREATED_CAPTURE: std::sync::Mutex<Option<tether_capture::windows::PreC
     std::sync::Mutex::new(None);
 
 #[cfg(target_os = "windows")]
-async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
+async fn real_capture(
+    _chosen_profile: VideoProfile,
+) -> anyhow::Result<tether_capture::CaptureHandle> {
     info!("capture source: windows (DXGI Desktop Duplication)");
     let pre = PRECREATED_CAPTURE.lock().unwrap().take();
     let (handle, d3d11_device) = match pre {
-        Some(p) => tether_capture::windows::start_with(p)
-            .map_err(anyhow::Error::from)?,
+        Some(p) => tether_capture::windows::start_with(p).map_err(anyhow::Error::from)?,
         None => tether_capture::windows::start_with(
-            tether_capture::windows::pre_create().map_err(anyhow::Error::from)?
-        ).map_err(anyhow::Error::from)?,
+            tether_capture::windows::pre_create().map_err(anyhow::Error::from)?,
+        )
+        .map_err(anyhow::Error::from)?,
     };
     let _ = SHARED_D3D11_DEVICE.set(d3d11_device);
     Ok(handle)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn real_capture(_chosen_profile: VideoProfile) -> anyhow::Result<tether_capture::CaptureHandle> {
+async fn real_capture(
+    _chosen_profile: VideoProfile,
+) -> anyhow::Result<tether_capture::CaptureHandle> {
     warn!("no real capture backend on this platform yet; falling back to test-pattern");
     Ok(tether_capture::test_pattern::start(
         TEST_PATTERN_WIDTH,

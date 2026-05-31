@@ -80,14 +80,13 @@ pub fn export_xv30_shared_dmabuf(
         let raw_physical = hal_dev.raw_physical_device();
 
         let ext_mem_fd = khr::external_memory_fd::Device::new(raw_instance, raw_device);
-        let modifier_ext =
-            ext::image_drm_format_modifier::Device::new(raw_instance, raw_device);
+        let modifier_ext = ext::image_drm_format_modifier::Device::new(raw_instance, raw_device);
 
         let modifiers = [DRM_FORMAT_MOD_LINEAR];
         let mut ext_mem_create = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let mut modifier_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-            .drm_format_modifiers(&modifiers);
+        let mut modifier_info =
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::A2B10G10R10_UNORM_PACK32)
@@ -223,8 +222,8 @@ pub fn export_xv30_shared_dmabuf(
                     usage,
                     view_formats: &[],
                 };
-                let packed_texture = device
-                    .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_tex, &wgpu_desc);
+                let packed_texture =
+                    device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_tex, &wgpu_desc);
 
                 Ok(SharedXv30Export {
                     packed_texture,

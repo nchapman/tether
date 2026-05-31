@@ -27,7 +27,9 @@
 use std::os::fd::OwnedFd;
 
 use crate::{
-    dmabuf_export::{export_p010_shared_dmabuf, ExportError, SharedP010Export, DRM_FORMAT_MOD_LINEAR},
+    dmabuf_export::{
+        export_p010_shared_dmabuf, ExportError, SharedP010Export, DRM_FORMAT_MOD_LINEAR,
+    },
     modifier_query::ModifierQueryError,
     pipeline::build_p010_pipeline,
 };
@@ -83,9 +85,7 @@ pub enum P010DmaBufError {
     /// the chroma shader's `.rgb` swizzle is format-agnostic.
     #[error("input texture format must be Bgra8Unorm or Rgba8Unorm, got {0:?}")]
     InputFormat(wgpu::TextureFormat),
-    #[error(
-        "input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}"
-    )]
+    #[error("input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}")]
     DimMismatch {
         input_w: u32,
         input_h: u32,
@@ -280,9 +280,7 @@ impl Bgra2P010DmaBuf {
                     )
                 })?
                 .texture_from_dmabuf_fd(fd, &hal_desc, modifier, stride, offset)
-                .map_err(|e| {
-                    P010DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}"))
-                })?
+                .map_err(|e| P010DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}")))?
         };
         let wgpu_desc = wgpu::TextureDescriptor {
             label: Some("imported bgra"),
@@ -473,22 +471,20 @@ mod tests {
             Err(e) => panic!("Bgra2P010DmaBuf::new: {e}"),
         };
 
-        let src = bridge
-            .device()
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("test bgra red"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+        let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("test bgra red"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         let n = (width * height) as usize;
         let mut bgra = Vec::with_capacity(n * 4);
         for _ in 0..n {
@@ -540,7 +536,9 @@ mod tests {
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .expect("vulkan backend")
                 .texture_from_dmabuf_fd(
-                    out.fd.try_clone().expect("dup shared P010 fd for Y reimport"),
+                    out.fd
+                        .try_clone()
+                        .expect("dup shared P010 fd for Y reimport"),
                     &import_desc,
                     out.modifier,
                     out.y_stride,
@@ -549,23 +547,25 @@ mod tests {
                 .expect("y texture_from_dmabuf_fd")
         };
         let import_tex = unsafe {
-            bridge.device().create_texture_from_hal::<wgpu::hal::api::Vulkan>(
-                hal_tex,
-                &wgpu::TextureDescriptor {
-                    label: Some("y reimport"),
-                    size: wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
+            bridge
+                .device()
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    hal_tex,
+                    &wgpu::TextureDescriptor {
+                        label: Some("y reimport"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::R16Unorm,
+                        usage: wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
                     },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R16Unorm,
-                    usage: wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                },
-            )
+                )
         };
 
         // R16Unorm is 2 bytes/texel. wgpu still requires 256-byte row
@@ -700,7 +700,9 @@ mod tests {
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .expect("vulkan backend")
                 .texture_from_dmabuf_fd(
-                    out.fd.try_clone().expect("dup shared P010 fd for UV reimport"),
+                    out.fd
+                        .try_clone()
+                        .expect("dup shared P010 fd for UV reimport"),
                     &uv_import_desc,
                     out.modifier,
                     out.uv_stride,
@@ -709,23 +711,25 @@ mod tests {
                 .expect("uv texture_from_dmabuf_fd")
         };
         let uv_import_tex = unsafe {
-            bridge.device().create_texture_from_hal::<wgpu::hal::api::Vulkan>(
-                uv_hal_tex,
-                &wgpu::TextureDescriptor {
-                    label: Some("uv reimport"),
-                    size: wgpu::Extent3d {
-                        width: chroma_w,
-                        height: chroma_h,
-                        depth_or_array_layers: 1,
+            bridge
+                .device()
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    uv_hal_tex,
+                    &wgpu::TextureDescriptor {
+                        label: Some("uv reimport"),
+                        size: wgpu::Extent3d {
+                            width: chroma_w,
+                            height: chroma_h,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rg16Unorm,
+                        usage: wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
                     },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rg16Unorm,
-                    usage: wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                },
-            )
+                )
         };
 
         // Rg16Unorm is 4 bytes/texel (two 16-bit channels). 256-byte

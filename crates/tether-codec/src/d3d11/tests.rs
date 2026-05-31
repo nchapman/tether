@@ -99,7 +99,11 @@ mod tests {
             std::ptr::null_mut(),
             0,
         );
-        assert!(enc.is_ok(), "H.264 encoder construction failed: {:?}", enc.err());
+        assert!(
+            enc.is_ok(),
+            "H.264 encoder construction failed: {:?}",
+            enc.err()
+        );
         assert!(enc.unwrap().is_hardware());
     }
 
@@ -116,18 +120,22 @@ mod tests {
             std::ptr::null_mut(),
             0,
         );
-        assert!(enc.is_ok(), "HEVC encoder construction failed: {:?}", enc.err());
+        assert!(
+            enc.is_ok(),
+            "HEVC encoder construction failed: {:?}",
+            enc.err()
+        );
     }
 
     #[test]
     #[ignore = "requires D3D11VA-capable GPU (Windows)"]
     fn d3d11_encoder_shared_device_h264() {
         use windows::core::Interface;
+        use windows::Win32::Foundation::HMODULE;
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
         use windows::Win32::Graphics::Direct3D11::{
             D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
         };
-        use windows::Win32::Foundation::HMODULE;
 
         let mut device = None;
         let mut context = None;
@@ -166,7 +174,11 @@ mod tests {
     #[ignore = "requires D3D11VA-capable GPU (Windows)"]
     fn d3d11_decoder_constructs_h264() {
         let dec = D3D11Decoder::new(CodecKind::H264, false);
-        assert!(dec.is_ok(), "H.264 decoder construction failed: {:?}", dec.err());
+        assert!(
+            dec.is_ok(),
+            "H.264 decoder construction failed: {:?}",
+            dec.err()
+        );
         assert!(dec.unwrap().is_hardware());
     }
 
@@ -174,7 +186,11 @@ mod tests {
     #[ignore = "requires D3D11VA-capable GPU (Windows)"]
     fn d3d11_decoder_constructs_hevc() {
         let dec = D3D11Decoder::new(CodecKind::Hevc, false);
-        assert!(dec.is_ok(), "HEVC decoder construction failed: {:?}", dec.err());
+        assert!(
+            dec.is_ok(),
+            "HEVC decoder construction failed: {:?}",
+            dec.err()
+        );
     }
 
     #[test]
@@ -210,7 +226,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!all_packets.is_empty(), "encoder produced no packets after 30 frames");
+        assert!(
+            !all_packets.is_empty(),
+            "encoder produced no packets after 30 frames"
+        );
 
         // Submit all encoded packets to decoder.
         for pkt in &all_packets {
@@ -262,6 +281,7 @@ mod tests {
     fn d3d11_viewport_scale_encode_decode_roundtrip() {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
+        use windows::Win32::Foundation::HMODULE;
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
         use windows::Win32::Graphics::Direct3D11::{
             D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
@@ -270,7 +290,6 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
         };
-        use windows::Win32::Foundation::HMODULE;
 
         let capture_w = 1920u32;
         let capture_h = 1080u32;
@@ -305,7 +324,10 @@ mod tests {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: 0,
             CPUAccessFlags: 0,
@@ -355,7 +377,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!all_packets.is_empty(), "VP-scaled encoder produced no packets after 30 frames");
+        assert!(
+            !all_packets.is_empty(),
+            "VP-scaled encoder produced no packets after 30 frames"
+        );
 
         for pkt in &all_packets {
             dec.submit(&pkt.data).expect("submit");
@@ -367,7 +392,9 @@ mod tests {
                 decoded_frame = Some(f);
                 break;
             }
-            let pkts = enc.submit_d3d11_texture(&frame, pts, false).expect("encode");
+            let pkts = enc
+                .submit_d3d11_texture(&frame, pts, false)
+                .expect("encode");
             for pkt in &pkts {
                 dec.submit(&pkt.data).expect("submit");
             }
@@ -376,7 +403,10 @@ mod tests {
         let f = decoded_frame.expect("decoder never produced a frame");
         match f {
             Frame::Cpu(f) => {
-                assert_eq!(f.width, encode_w, "decoded width should match encode (viewport) dims");
+                assert_eq!(
+                    f.width, encode_w,
+                    "decoded width should match encode (viewport) dims"
+                );
                 assert_eq!(f.height, encode_h);
                 assert!(!f.y.is_empty());
             }
@@ -417,7 +447,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!all_packets.is_empty(), "encoder produced no packets after 30 frames");
+        assert!(
+            !all_packets.is_empty(),
+            "encoder produced no packets after 30 frames"
+        );
 
         for pkt in &all_packets {
             dec.submit(&pkt.data).expect("submit failed");
@@ -477,7 +510,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!all_packets.is_empty(), "Main10 encoder produced no packets after 30 frames");
+        assert!(
+            !all_packets.is_empty(),
+            "Main10 encoder produced no packets after 30 frames"
+        );
         // Verify the first packet contains valid HEVC NALUs (starts with
         // 00 00 00 01 or is Annex-B formatted after extradata prepend).
         assert!(
@@ -508,9 +544,7 @@ mod tests {
 
         let mut keyframe = None;
         for pts in 0..30 {
-            let pkts = enc
-                .encode_bgra(&bgra, pts, pts == 0)
-                .expect("encode_bgra");
+            let pkts = enc.encode_bgra(&bgra, pts, pts == 0).expect("encode_bgra");
             for pkt in pkts {
                 if pkt.keyframe {
                     keyframe = Some(pkt);
@@ -566,9 +600,7 @@ mod tests {
 
         let mut keyframe = None;
         for pts in 0..30 {
-            let pkts = enc
-                .encode_bgra(&bgra, pts, pts == 0)
-                .expect("encode_bgra");
+            let pkts = enc.encode_bgra(&bgra, pts, pts == 0).expect("encode_bgra");
             for pkt in pkts {
                 if pkt.keyframe {
                     keyframe = Some(pkt);
@@ -635,7 +667,11 @@ mod tests {
         let kf = keyframe_data.expect("no keyframe produced");
 
         // Dump first bytes for debugging
-        eprintln!("keyframe {} bytes, first 64: {:02x?}", kf.len(), &kf[..kf.len().min(64)]);
+        eprintln!(
+            "keyframe {} bytes, first 64: {:02x?}",
+            kf.len(),
+            &kf[..kf.len().min(64)]
+        );
 
         // Parse NALU types from the bitstream
         let mut i = 0;
@@ -675,7 +711,10 @@ mod tests {
                 break;
             }
         }
-        assert!(got_frame, "decoder produced no frames from single IDR with VPS/SPS/PPS");
+        assert!(
+            got_frame,
+            "decoder produced no frames from single IDR with VPS/SPS/PPS"
+        );
     }
 
     /// Verify the extradata stored in the encoder starts with VPS (type 32)
@@ -753,9 +792,7 @@ mod tests {
     /// AMF/NVENC encoder on a machine without that GPU faults inside the
     /// vendor's runtime (STATUS_ACCESS_VIOLATION), so we must skip rather
     /// than try-and-fall-back.
-    fn device_vendor_id(
-        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
-    ) -> u32 {
+    fn device_vendor_id(device: &windows::Win32::Graphics::Direct3D11::ID3D11Device) -> u32 {
         use windows::core::Interface;
         use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
         unsafe {
@@ -818,7 +855,10 @@ mod tests {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: 0,
             CPUAccessFlags: 0,
@@ -954,8 +994,8 @@ mod tests {
         use std::sync::Arc;
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D11::{
-            ID3D11DeviceContext, ID3D11Texture2D, D3D11_SUBRESOURCE_DATA,
-            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+            ID3D11DeviceContext, ID3D11Texture2D, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+            D3D11_USAGE_DEFAULT,
         };
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -976,7 +1016,10 @@ mod tests {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: 0,
                 CPUAccessFlags: 0,
@@ -1065,7 +1108,9 @@ mod tests {
         let mx = warm.iter().max().unwrap();
         eprintln!(
             "QSV submit UNDER capture contention (warm): avg={}us max={}us  [first5={:?}us]",
-            avg, mx, &submit_us[..5]
+            avg,
+            mx,
+            &submit_us[..5]
         );
     }
 
@@ -1091,7 +1136,12 @@ mod tests {
             VENDOR_INTEL,
         )
         .expect("QSV encoder construction");
-        assert_eq!(enc.name(), "hevc_qsv", "QSV unavailable; got {}", enc.name());
+        assert_eq!(
+            enc.name(),
+            "hevc_qsv",
+            "QSV unavailable; got {}",
+            enc.name()
+        );
 
         let mut dec = D3D11Decoder::new(CodecKind::Hevc, false).expect("decoder construction");
         let bgra = vec![128u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
@@ -1104,7 +1154,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!packets.is_empty(), "QSV encode_bgra produced no packets after 30 frames");
+        assert!(
+            !packets.is_empty(),
+            "QSV encode_bgra produced no packets after 30 frames"
+        );
 
         for pkt in &packets {
             dec.submit(&pkt.data).expect("submit");
@@ -1120,7 +1173,10 @@ mod tests {
                 dec.submit(&pkt.data).expect("submit");
             }
         }
-        assert!(decoded.is_some(), "decoder produced no frame from QSV encode_bgra");
+        assert!(
+            decoded.is_some(),
+            "decoder produced no frame from QSV encode_bgra"
+        );
     }
 
     /// Diagnostic: can a second D3D11 device read content a first device
@@ -1185,7 +1241,10 @@ mod tests {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_R8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_STAGING,
                 BindFlags: 0,
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -1221,7 +1280,10 @@ mod tests {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_R8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             CPUAccessFlags: 0,
@@ -1253,12 +1315,19 @@ mod tests {
 
         // A must see its own write (proves the copy itself worked).
         let a_value = read_center(&dev_a, &ctx_a, &shared);
-        assert_eq!(a_value, FILL, "device A can't read its own write — copy failed, not a coherency issue");
+        assert_eq!(
+            a_value, FILL,
+            "device A can't read its own write — copy failed, not a coherency issue"
+        );
 
         // Export the NT handle and open it on device B (renderer role).
         let dxgi_res: IDXGIResource1 = shared.cast().expect("IDXGIResource1");
         let handle: HANDLE = unsafe {
-            dxgi_res.CreateSharedHandle(None, DXGI_SHARED_RESOURCE_READ.0, windows::core::PCWSTR::null())
+            dxgi_res.CreateSharedHandle(
+                None,
+                DXGI_SHARED_RESOURCE_READ.0,
+                windows::core::PCWSTR::null(),
+            )
         }
         .expect("CreateSharedHandle");
 
@@ -1302,7 +1371,12 @@ mod tests {
             VENDOR_INTEL,
         )
         .expect("first QSV encoder construction");
-        assert_eq!(enc_a.name(), "hevc_qsv", "QSV unavailable; got {}", enc_a.name());
+        assert_eq!(
+            enc_a.name(),
+            "hevc_qsv",
+            "QSV unavailable; got {}",
+            enc_a.name()
+        );
         drop(enc_a);
 
         let enc_b = D3D11Encoder::new(

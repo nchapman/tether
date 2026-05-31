@@ -615,7 +615,9 @@ pub enum ControlMessage {
         last_known_good_frame_id: u32,
     },
     /// Periodic clock-sync re-probe (either side may initiate).
-    ClockProbeRequest { t0_sender: MonoNanos },
+    ClockProbeRequest {
+        t0_sender: MonoNanos,
+    },
     ClockProbeResponse(ClockProbe),
     Goodbye {
         reason: String,
@@ -646,33 +648,46 @@ pub enum ControlMessage {
     /// Host → client. Activate a previously-sent [`Self::CursorShape`]
     /// by id. Separate from `CursorShape` so the host can switch
     /// between cached cursors without re-sending the pixels.
-    CursorUseShape { id: u64 },
+    CursorUseShape {
+        id: u64,
+    },
     /// Host → client. Full display topology. Sent post-handshake and
     /// again on hotplug (display added/removed) — the client treats
     /// each message as the authoritative replacement. Single-monitor
     /// hosts send a one-element list; the field shape supports
     /// multi-monitor without a V2.
-    DisplayList { displays: Vec<DisplayDescriptor> },
+    DisplayList {
+        displays: Vec<DisplayDescriptor>,
+    },
     /// Client → host. Subscribe to a subset of host displays. Empty
     /// vec means "the primary" (today, the only one). Sent on the
     /// client's user-driven display switch; host stops emitting video
     /// for displays not in the set.
-    SetActiveDisplays { displays: Vec<u8> },
+    SetActiveDisplays {
+        displays: Vec<u8>,
+    },
     /// Client → host. Sent once after the client has finished building
     /// its decoders, so the host doesn't start blasting video before
     /// the receive side is ready. Booleans indicate which streams the
     /// client is prepared to consume; `audio` is reserved for the
     /// future Opus pipeline (always `false` from clients today).
-    StreamReady { video: bool, audio: bool },
+    StreamReady {
+        video: bool,
+        audio: bool,
+    },
     /// Client → host. Pause emission for the given display (e.g.
     /// window minimised). Host is free to stop encoding entirely for
     /// that display to save power.
-    StreamPause { display: u8 },
+    StreamPause {
+        display: u8,
+    },
     /// Client → host. Resume emission for the given display. Pairs
     /// with [`Self::StreamPause`]; host emits a fresh IDR before any
     /// subsequent P-frames so the client doesn't render a half-decoded
     /// stream.
-    StreamResume { display: u8 },
+    StreamResume {
+        display: u8,
+    },
     /// Client → host. Periodic receive-side telemetry (1 Hz typical).
     /// Feeds future adaptive-bitrate / FEC / codec-downshift policy on
     /// the host. Counters are per the elapsed `interval_ms` window;
@@ -691,7 +706,9 @@ pub enum ControlMessage {
     /// instead emits `InputEventKind::RelativeMouseMove` on the
     /// reliable input stream — the only path that survives
     /// recenter-loop games and raw-input HID readers.
-    SetCursorMode { mode: CursorMode },
+    SetCursorMode {
+        mode: CursorMode,
+    },
     /// Client → host. The client's viewport changed (window resize,
     /// monitor switch, fullscreen toggle). The host treats this as a
     /// request to re-target the encoder at the new dimensions; the
@@ -773,11 +790,8 @@ impl ClockSync {
         let remote_processing = t2 - t1;
         let rtt = (total - remote_processing).max(0);
         Self {
-            offset_nanos: i64::try_from(offset.clamp(
-                i128::from(i64::MIN),
-                i128::from(i64::MAX),
-            ))
-            .expect("clamped to i64 range"),
+            offset_nanos: i64::try_from(offset.clamp(i128::from(i64::MIN), i128::from(i64::MAX)))
+                .expect("clamped to i64 range"),
             rtt_nanos: u64::try_from(rtt.clamp(0, i128::from(u64::MAX)))
                 .expect("clamped to u64 range"),
             sampled_at_local: t3_local_recv,
@@ -791,10 +805,7 @@ impl ClockSync {
     #[must_use]
     pub fn remote_to_local(&self, remote: MonoNanos) -> MonoNanos {
         let v = i128::from(remote.0) - i128::from(self.offset_nanos);
-        MonoNanos(
-            u64::try_from(v.clamp(0, i128::from(u64::MAX)))
-                .expect("clamped to u64 range"),
-        )
+        MonoNanos(u64::try_from(v.clamp(0, i128::from(u64::MAX))).expect("clamped to u64 range"))
     }
 }
 

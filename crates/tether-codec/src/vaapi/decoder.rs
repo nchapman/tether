@@ -62,7 +62,9 @@ impl VaapiDecoder {
         // less actionable error.
         let mut vaapi_supported = false;
         for i in 0.. {
-            let Some(config) = codec.hw_config(i) else { break };
+            let Some(config) = codec.hw_config(i) else {
+                break;
+            };
             #[allow(clippy::cast_possible_wrap)] // single-bit constant
             let supports_device_ctx =
                 config.methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0;
@@ -75,8 +77,7 @@ impl VaapiDecoder {
             return Err(CodecError::CodecNotFound(vaapi_decoder_name(kind)));
         }
 
-        let hw_device =
-            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_VAAPI, None, None, 0)?;
+        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_VAAPI, None, None, 0)?;
 
         let mut decoder = AVCodecContext::new(&codec);
         // Cloning an AVHWDeviceContext is an av_buffer_ref under the
@@ -136,7 +137,10 @@ impl VaapiDecoder {
             // pointer (sibling `device_ref` is the AVBufferRef*),
             // so we deref it directly without another `.data` step.
             let dev = (*hwf).device_ctx;
-            assert!(!dev.is_null(), "VAAPI frame's hwframes ctx missing device_ctx");
+            assert!(
+                !dev.is_null(),
+                "VAAPI frame's hwframes ctx missing device_ctx"
+            );
             let vactx = (*dev).hwctx as *const AVVAAPIDeviceContext;
             let display = (*vactx).display;
             // VASurfaceID is unsigned int; libavutil stores it in
@@ -350,8 +354,7 @@ unsafe extern "C" fn get_vaapi_format(
     _ctx: *mut ffi::AVCodecContext,
     pix_fmts: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
-    let fmts =
-        unsafe { rsmpeg::build_array(pix_fmts, ffi::AV_PIX_FMT_NONE) }.unwrap_or_default();
+    let fmts = unsafe { rsmpeg::build_array(pix_fmts, ffi::AV_PIX_FMT_NONE) }.unwrap_or_default();
     for &fmt in fmts {
         if fmt == ffi::AV_PIX_FMT_VAAPI {
             return fmt;

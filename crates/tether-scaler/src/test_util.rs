@@ -45,7 +45,11 @@ use crate::reference::mitchell_filter_default;
 #[must_use]
 pub fn ssim_rgb(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
     assert_eq!(a.len(), b.len(), "ssim inputs must be the same length");
-    assert_eq!(a.len(), (width * height * 4) as usize, "ssim length must match width*height*4");
+    assert_eq!(
+        a.len(),
+        (width * height * 4) as usize,
+        "ssim length must match width*height*4"
+    );
     const WIN: i32 = 8;
     let c1: f64 = (0.01_f64 * 255.0).powi(2);
     let c2: f64 = (0.03_f64 * 255.0).powi(2);
@@ -183,7 +187,11 @@ pub fn mse_rgb(a: &[u8], b: &[u8]) -> f64 {
             n += 1;
         }
     }
-    if n == 0 { 0.0 } else { sum / (n as f64) }
+    if n == 0 {
+        0.0
+    } else {
+        sum / (n as f64)
+    }
 }
 
 /// PSNR over RGB channels in dB. Returns `f64::INFINITY` if identical.
@@ -386,7 +394,10 @@ pub fn coord_fixture_residual_px_rms(
     map: &LetterboxMap,
 ) -> f64 {
     assert_eq!(map.surface_dims, surface_dims);
-    assert_eq!(readback_bgra.len(), (surface_dims.0 * surface_dims.1 * 4) as usize);
+    assert_eq!(
+        readback_bgra.len(),
+        (surface_dims.0 * surface_dims.1 * 4) as usize
+    );
     assert!(
         map.video_x1 > map.video_x0 && map.video_y1 > map.video_y0,
         "degenerate letterbox map has no video rect — would silently return 0.0",
@@ -497,9 +508,9 @@ pub fn cpu_chroma_roundtrip_bgra(
         let b = f32::from(src_bgra[i * 4]);
         let g = f32::from(src_bgra[i * 4 + 1]);
         let r = f32::from(src_bgra[i * 4 + 2]);
-        y[i]       =  0.2126   * r + 0.7152   * g + 0.0722   * b;
-        cb_full[i] = -0.114572 * r - 0.385428 * g + 0.5      * b + 128.0;
-        cr_full[i] =  0.5      * r - 0.454153 * g - 0.045847 * b + 128.0;
+        y[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        cb_full[i] = -0.114572 * r - 0.385428 * g + 0.5 * b + 128.0;
+        cr_full[i] = 0.5 * r - 0.454153 * g - 0.045847 * b + 128.0;
     }
 
     // Step 2: subsample chroma to half resolution with siting offsets.
@@ -537,12 +548,8 @@ pub fn cpu_chroma_roundtrip_bgra(
             // Inverse of the subsample step — find the chroma-grid
             // coordinate this luma sample interpolates from.
             let (cx, cy) = match siting {
-                ChromaSiting::H264LeftInterstitial => {
-                    (lx as f32 / 2.0, (ly as f32 - 0.5) / 2.0)
-                }
-                ChromaSiting::HevcCentered => {
-                    ((lx as f32 - 0.5) / 2.0, (ly as f32 - 0.5) / 2.0)
-                }
+                ChromaSiting::H264LeftInterstitial => (lx as f32 / 2.0, (ly as f32 - 0.5) / 2.0),
+                ChromaSiting::HevcCentered => ((lx as f32 - 0.5) / 2.0, (ly as f32 - 0.5) / 2.0),
                 ChromaSiting::None => unreachable!(),
             };
             cb_up[ly * w + lx] = bilinear_sample(&cb_sub, cw, ch_h, cx, cy);
@@ -556,10 +563,10 @@ pub fn cpu_chroma_roundtrip_bgra(
         let yp = y[i];
         let cb = cb_up[i] - 128.0;
         let cr = cr_up[i] - 128.0;
-        let r = yp                 + 1.5748   * cr;
-        let g = yp - 0.18733 * cb - 0.46813  * cr;
-        let b = yp + 1.8556  * cb;
-        out[i * 4]     = clamp_u8(b);
+        let r = yp + 1.5748 * cr;
+        let g = yp - 0.18733 * cb - 0.46813 * cr;
+        let b = yp + 1.8556 * cb;
+        out[i * 4] = clamp_u8(b);
         out[i * 4 + 1] = clamp_u8(g);
         out[i * 4 + 2] = clamp_u8(r);
         out[i * 4 + 3] = src_bgra[i * 4 + 3];
@@ -704,12 +711,20 @@ mod tests {
         }
         let map = LetterboxMap::new(dims, dims);
         let r = coord_fixture_residual_px_rms(&shifted, dims, &map);
-        assert!(r > 30.0, "shifted-fixture residual {} too low — metric is blind", r);
+        assert!(
+            r > 30.0,
+            "shifted-fixture residual {} too low — metric is blind",
+            r
+        );
         // Upper-bound sanity: a sane RMS for a 50-px shift on a 256-
         // wide fixture is bounded by the width. A degenerate impl
         // that returned f64::MAX would otherwise pass the lower
         // assert vacuously.
-        assert!(r < f64::from(dims.0), "shift residual {} exceeds image width", r);
+        assert!(
+            r < f64::from(dims.0),
+            "shift residual {} exceeds image width",
+            r
+        );
     }
 
     #[test]
@@ -745,7 +760,11 @@ mod tests {
         let out = cpu_chroma_roundtrip_bgra(&src, dims, ChromaSiting::H264LeftInterstitial);
         assert_eq!(out.len(), src.len());
         let psnr_y = psnr_db_y_bgra(&src, &out);
-        assert!(psnr_y > 40.0, "luma should survive chroma roundtrip; got psnr_y = {} dB", psnr_y);
+        assert!(
+            psnr_y > 40.0,
+            "luma should survive chroma roundtrip; got psnr_y = {} dB",
+            psnr_y
+        );
     }
 
     #[test]
@@ -777,7 +796,10 @@ mod tests {
         }
         let h264 = cpu_chroma_roundtrip_bgra(&src, dims, ChromaSiting::H264LeftInterstitial);
         let hevc = cpu_chroma_roundtrip_bgra(&src, dims, ChromaSiting::HevcCentered);
-        assert_ne!(h264, hevc, "H.264 and HEVC siting must produce different chroma reconstructions");
+        assert_ne!(
+            h264, hevc,
+            "H.264 and HEVC siting must produce different chroma reconstructions"
+        );
         // The horizontal boundary at x=dims.0/2 should sit at slightly
         // different sub-pixel positions between the two — pick a row
         // and confirm the boundary pixel's chroma differs.

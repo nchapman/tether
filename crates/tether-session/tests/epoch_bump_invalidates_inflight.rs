@@ -11,9 +11,7 @@
 //! resets to 0 in the new epoch.
 
 use bytes::Bytes;
-use tether_protocol::video::{
-    FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta,
-};
+use tether_protocol::video::{FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta};
 use tether_transport::test_support::video_duplex_pair;
 use tether_transport::{Datagram, VideoChannel};
 
@@ -51,11 +49,10 @@ async fn frames_across_epoch_bump_reassemble_independently() {
 
     let mut completed = Vec::new();
     while completed.len() < 2 {
-        let dgram =
-            tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_datagram())
-                .await
-                .expect("timeout")
-                .unwrap();
+        let dgram = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_datagram())
+            .await
+            .expect("timeout")
+            .unwrap();
         let Datagram::Video(pkt) = dgram else {
             panic!()
         };

@@ -101,7 +101,13 @@ pub async fn build_bridge_device(
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         })
         .await?;
-    Ok((device, queue, BridgeDeviceCapabilities { supports_10bit: has_16bit }))
+    Ok((
+        device,
+        queue,
+        BridgeDeviceCapabilities {
+            supports_10bit: has_16bit,
+        },
+    ))
 }
 
 /// Capability summary returned alongside the wgpu device by
@@ -172,7 +178,11 @@ pub enum BridgeError {
     /// rejected: typically a zero dimension or an unsupported
     /// `kIOSurfacePixelFormat`.
     #[error("IOSurfaceCreate returned null for {width}x{height} fourcc 0x{fourcc:08x}")]
-    IOSurfaceCreateFailed { width: u32, height: u32, fourcc: u32 },
+    IOSurfaceCreateFailed {
+        width: u32,
+        height: u32,
+        fourcc: u32,
+    },
 
     #[error("scaler construction: {0}")]
     Scaler(#[from] ScalerError),
@@ -254,7 +264,11 @@ impl IOSurfaceOwned {
                 &kCFTypeArrayCallBacks,
             );
             if arr_ref.is_null() {
-                return Err(BridgeError::IOSurfaceCreateFailed { width, height, fourcc });
+                return Err(BridgeError::IOSurfaceCreateFailed {
+                    width,
+                    height,
+                    fourcc,
+                });
             }
             CFType::wrap_under_create_rule(arr_ref)
         };
@@ -272,10 +286,7 @@ impl IOSurfaceOwned {
                 cf_str_borrowed(unsafe { kIOSurfacePixelFormat }),
                 fourcc_num.as_CFType(),
             ),
-            (
-                cf_str_borrowed(unsafe { kIOSurfacePlaneInfo }),
-                planes_arr,
-            ),
+            (cf_str_borrowed(unsafe { kIOSurfacePlaneInfo }), planes_arr),
         ];
         let props = CFDictionary::from_CFType_pairs(&props_pairs);
 
@@ -283,8 +294,11 @@ impl IOSurfaceOwned {
         // allocating a fresh IOSurface; the returned pointer has
         // +1 refcount which we transfer into `IOSurfaceOwned`.
         let raw = unsafe { IOSurfaceCreate(props.as_concrete_TypeRef()) };
-        let ptr = NonNull::new(raw)
-            .ok_or(BridgeError::IOSurfaceCreateFailed { width, height, fourcc })?;
+        let ptr = NonNull::new(raw).ok_or(BridgeError::IOSurfaceCreateFailed {
+            width,
+            height,
+            fourcc,
+        })?;
         Ok(Self { ptr })
     }
 
@@ -443,7 +457,14 @@ impl Nv12IOSurfaceBridge {
         dst_dims: (u32, u32),
         dst_fourcc: u32,
     ) -> Result<Self, BridgeError> {
-        Self::with_pool_depth(device, queue, src_dims, dst_dims, dst_fourcc, DEFAULT_POOL_DEPTH)
+        Self::with_pool_depth(
+            device,
+            queue,
+            src_dims,
+            dst_dims,
+            dst_fourcc,
+            DEFAULT_POOL_DEPTH,
+        )
     }
 
     /// Like [`Self::new`] but with an explicit `pool_depth`. Caller
@@ -501,7 +522,10 @@ impl Nv12IOSurfaceBridge {
         // probe the device features here and surface a clearer
         // error if so.
         let pipelines = if bit_depth == 10 {
-            if !device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            if !device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+            {
                 return Err(BridgeError::TenBitNotImplemented { fourcc: dst_fourcc });
             }
             Arc::new(Pipelines::build_with_plane_storage_16bit(&device))
@@ -655,14 +679,12 @@ impl Nv12IOSurfaceBridge {
     /// `encoder.submit_iosurface`; dropping the handle returns the
     /// slot to the pool, so the caller MUST keep the handle alive
     /// until VideoToolbox's compression-output callback fires.
-    pub fn scale_to_iosurface(
-        &self,
-        src: &IOSurfaceFrame,
-    ) -> Result<PooledIOSurface, BridgeError> {
+    pub fn scale_to_iosurface(&self, src: &IOSurfaceFrame) -> Result<PooledIOSurface, BridgeError> {
         let pool_depth = self.pool.inner.lock().unwrap().slots.len();
-        let slot_idx = self.pool.acquire().ok_or(BridgeError::PoolExhausted {
-            depth: pool_depth,
-        })?;
+        let slot_idx = self
+            .pool
+            .acquire()
+            .ok_or(BridgeError::PoolExhausted { depth: pool_depth })?;
 
         // From here on, we MUST release the slot on any error path
         // (the early `?` returns below would otherwise leak the slot
@@ -733,7 +755,8 @@ impl Nv12IOSurfaceBridge {
             let g = self.pool.inner.lock().unwrap();
             let slot = &g.slots[slot_idx];
             (
-                slot.iosurface.as_frame(self.dst_fourcc, self.dst_dims.0, self.dst_dims.1),
+                slot.iosurface
+                    .as_frame(self.dst_fourcc, self.dst_dims.0, self.dst_dims.1),
                 slot.attachments_seeded,
                 slot.y_tex.clone(),
                 slot.uv_tex.clone(),
@@ -948,13 +971,23 @@ fn cf_str_borrowed(ptr: CFStringRef) -> CFString {
     unsafe { CFString::wrap_under_get_rule(ptr) }
 }
 
-fn make_plane_dict(width: i64, height: i64, bytes_per_element: i64) -> CFDictionary<CFString, CFType> {
+fn make_plane_dict(
+    width: i64,
+    height: i64,
+    bytes_per_element: i64,
+) -> CFDictionary<CFString, CFType> {
     let w = CFNumber::from(width);
     let h = CFNumber::from(height);
     let bpe = CFNumber::from(bytes_per_element);
     let pairs: Vec<(CFString, CFType)> = vec![
-        (cf_str_borrowed(unsafe { kIOSurfacePlaneWidth }), w.as_CFType()),
-        (cf_str_borrowed(unsafe { kIOSurfacePlaneHeight }), h.as_CFType()),
+        (
+            cf_str_borrowed(unsafe { kIOSurfacePlaneWidth }),
+            w.as_CFType(),
+        ),
+        (
+            cf_str_borrowed(unsafe { kIOSurfacePlaneHeight }),
+            h.as_CFType(),
+        ),
         (
             cf_str_borrowed(unsafe { kIOSurfacePlaneBytesPerElement }),
             bpe.as_CFType(),
@@ -1092,8 +1125,8 @@ mod tests {
     fn ten_bit_fourccs_route_through_dedicated_guard() {
         use tether_codec::macos_interop::{X420_FOURCC, XF20_FOURCC};
         for &fcc in &[X420_FOURCC, XF20_FOURCC] {
-            let (_chroma, bd) = chroma_bit_depth_for_fourcc(fcc)
-                .expect("10-bit fourcc must be in the table");
+            let (_chroma, bd) =
+                chroma_bit_depth_for_fourcc(fcc).expect("10-bit fourcc must be in the table");
             assert_eq!(
                 bd, 10,
                 "fourcc 0x{fcc:08x} must report bit_depth=10 so the constructor's \

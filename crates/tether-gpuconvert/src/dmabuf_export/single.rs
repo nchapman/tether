@@ -65,8 +65,7 @@ pub fn export_texture_as_dmabuf(
         // our own; both reference the same underlying VkDevice so the
         // function pointers resolve identically.
         let ext_mem_fd = khr::external_memory_fd::Device::new(raw_instance, raw_device);
-        let modifier_ext =
-            ext::image_drm_format_modifier::Device::new(raw_instance, raw_device);
+        let modifier_ext = ext::image_drm_format_modifier::Device::new(raw_instance, raw_device);
 
         let mut ext_mem_create = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -80,13 +79,17 @@ pub fn export_texture_as_dmabuf(
         // wrong shape for "let the driver allocate, then tell me what
         // it picked".
         let modifiers = [DRM_FORMAT_MOD_LINEAR];
-        let mut modifier_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-            .drm_format_modifiers(&modifiers);
+        let mut modifier_info =
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
 
         let image_create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk_format)
-            .extent(vk::Extent3D { width, height, depth: 1 })
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -139,8 +142,7 @@ pub fn export_texture_as_dmabuf(
             // drivers required) for external memory.
             let mut export_alloc_info = vk::ExportMemoryAllocateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-            let mut dedicated_info =
-                vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
 
             let alloc_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(mem_req.size)
@@ -168,13 +170,10 @@ pub fn export_texture_as_dmabuf(
                 // and must close exactly once. OwnedFd handles that.
                 let fd = OwnedFd::from_raw_fd(raw_fd);
 
-                let mut mod_props =
-                    vk::ImageDrmFormatModifierPropertiesEXT::default();
+                let mut mod_props = vk::ImageDrmFormatModifierPropertiesEXT::default();
                 modifier_ext
                     .get_image_drm_format_modifier_properties(image, &mut mod_props)
-                    .map_err(|e| {
-                        ExportError::Vk(e, "vkGetImageDrmFormatModifierPropertiesEXT")
-                    })?;
+                    .map_err(|e| ExportError::Vk(e, "vkGetImageDrmFormatModifierPropertiesEXT"))?;
 
                 // Plane-0 layout. For DRM-modifier-tiled images you
                 // MUST use `MEMORY_PLANE_*_EXT` aspect masks, not the
@@ -250,8 +249,8 @@ pub fn export_texture_as_dmabuf(
             // Vulkan backend; wgpu_desc matches hal_desc except for
             // the usage representation difference (TextureUsages vs
             // TextureUses), which is the correct pairing.
-            let texture = device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_tex, &wgpu_desc);
+            let texture =
+                device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_tex, &wgpu_desc);
 
             Ok(DmaBufExport {
                 texture,
@@ -274,4 +273,3 @@ pub fn export_texture_as_dmabuf(
         }
     }
 }
-

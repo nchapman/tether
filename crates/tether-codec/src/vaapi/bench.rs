@@ -271,9 +271,9 @@ fn build_dmabuf_source(width: u32, height: u32) -> Result<GpuFrame, String> {
         60,
         8_000,
     )
-        .map_err(|e| format!("source encoder failed: {e}"))?;
-    let mut src_dec = VaapiDecoder::new(CodecKind::H264)
-        .map_err(|e| format!("source decoder failed: {e}"))?;
+    .map_err(|e| format!("source encoder failed: {e}"))?;
+    let mut src_dec =
+        VaapiDecoder::new(CodecKind::H264).map_err(|e| format!("source decoder failed: {e}"))?;
 
     for t in 0..8i64 {
         let bgra = make_test_bgra(width, height, t as u32);

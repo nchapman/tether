@@ -27,17 +27,14 @@ use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
-    ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-};
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
@@ -125,7 +122,14 @@ unsafe impl Send for CapturedD3D11Texture {}
 pub fn pre_create() -> Result<PreCreatedCapture> {
     let (device, context, duplication, width, height, vendor_id) =
         create_d3d11_device_and_duplication()?;
-    Ok(PreCreatedCapture { device, context, duplication, width, height, vendor_id })
+    Ok(PreCreatedCapture {
+        device,
+        context,
+        duplication,
+        width,
+        height,
+        vendor_id,
+    })
 }
 
 /// Opaque handle holding pre-created DXGI resources.
@@ -143,7 +147,14 @@ unsafe impl Send for PreCreatedCapture {}
 
 /// Start DXGI Desktop Duplication using pre-created resources from [`pre_create`].
 pub fn start_with(pre: PreCreatedCapture) -> Result<(CaptureHandle, D3D11Device)> {
-    let PreCreatedCapture { device, context, duplication, width, height, vendor_id } = pre;
+    let PreCreatedCapture {
+        device,
+        context,
+        duplication,
+        width,
+        height,
+        vendor_id,
+    } = pre;
     let shared_device = D3D11Device {
         device: device.clone(),
         context: context.clone(),
@@ -191,8 +202,14 @@ pub fn start_with(pre: PreCreatedCapture) -> Result<(CaptureHandle, D3D11Device)
 }
 
 /// Returns (device, context, duplication, width, height, vendor_id).
-fn create_d3d11_device_and_duplication(
-) -> Result<(ID3D11Device, ID3D11DeviceContext, IDXGIOutputDuplication, u32, u32, u32)> {
+fn create_d3d11_device_and_duplication() -> Result<(
+    ID3D11Device,
+    ID3D11DeviceContext,
+    IDXGIOutputDuplication,
+    u32,
+    u32,
+    u32,
+)> {
     // First try: create device via D3D_DRIVER_TYPE_HARDWARE (lets D3D11
     // pick the GPU itself, bypassing DXGI factory enumeration which can
     // become stale after AMF/D3D11VA probe activity in-process).
@@ -219,8 +236,8 @@ fn create_d3d11_device_and_duplication(
 
         let dxgi_device: windows::Win32::Graphics::Dxgi::IDXGIDevice =
             device.cast().map_err(|e| CaptureError::Io(hresult_io(e)))?;
-        let adapter: IDXGIAdapter1 = unsafe { dxgi_device.GetParent() }
-            .map_err(|e| CaptureError::Io(hresult_io(e)))?;
+        let adapter: IDXGIAdapter1 =
+            unsafe { dxgi_device.GetParent() }.map_err(|e| CaptureError::Io(hresult_io(e)))?;
         let vendor_id = unsafe { adapter.GetDesc1() }
             .map(|d| d.VendorId)
             .unwrap_or(0);
@@ -229,7 +246,10 @@ fn create_d3d11_device_and_duplication(
         while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
             let output1: IDXGIOutput1 = match output.cast() {
                 Ok(o) => o,
-                Err(_) => { output_idx += 1; continue; }
+                Err(_) => {
+                    output_idx += 1;
+                    continue;
+                }
             };
             match unsafe { output1.DuplicateOutput(&device) } {
                 Ok(duplication) => {
@@ -252,7 +272,9 @@ fn create_d3d11_device_and_duplication(
             }
             output_idx += 1;
         }
-        tracing::warn!("hardware device has no duplicable outputs; falling back to factory enumeration");
+        tracing::warn!(
+            "hardware device has no duplicable outputs; falling back to factory enumeration"
+        );
     }
 
     // Fallback: enumerate all adapters via factory.
@@ -261,17 +283,24 @@ fn create_d3d11_device_and_duplication(
 
     let mut adapter_idx = 0u32;
     while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_idx) } {
-        let adapter_desc = unsafe { adapter.GetDesc1() }
-            .map_err(|e| CaptureError::Io(hresult_io(e)))?;
+        let adapter_desc =
+            unsafe { adapter.GetDesc1() }.map_err(|e| CaptureError::Io(hresult_io(e)))?;
         let adapter_name = String::from_utf16_lossy(
-            &adapter_desc.Description[..adapter_desc.Description.iter().position(|&c| c == 0).unwrap_or(adapter_desc.Description.len())]
+            &adapter_desc.Description[..adapter_desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(adapter_desc.Description.len())],
         );
 
         let mut output_idx = 0u32;
         while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
             let output1: IDXGIOutput1 = match output.cast() {
                 Ok(o) => o,
-                Err(_) => { output_idx += 1; continue; }
+                Err(_) => {
+                    output_idx += 1;
+                    continue;
+                }
             };
 
             let mut dev = None;
@@ -288,7 +317,9 @@ fn create_d3d11_device_and_duplication(
                     None,
                     Some(&mut ctx),
                 )
-            }.is_err() {
+            }
+            .is_err()
+            {
                 output_idx += 1;
                 continue;
             }
@@ -338,20 +369,21 @@ fn create_d3d11_device_and_duplication(
     )))
 }
 
-fn create_duplication(
-    device: &ID3D11Device,
-) -> Result<(IDXGIOutputDuplication, u32, u32)> {
+fn create_duplication(device: &ID3D11Device) -> Result<(IDXGIOutputDuplication, u32, u32)> {
     let dxgi_device: windows::Win32::Graphics::Dxgi::IDXGIDevice =
         device.cast().map_err(|e| CaptureError::Io(hresult_io(e)))?;
 
-    let adapter: IDXGIAdapter1 = unsafe { dxgi_device.GetParent() }
-        .map_err(|e| CaptureError::Io(hresult_io(e)))?;
+    let adapter: IDXGIAdapter1 =
+        unsafe { dxgi_device.GetParent() }.map_err(|e| CaptureError::Io(hresult_io(e)))?;
 
     let mut output_idx = 0u32;
     while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
         let output1: IDXGIOutput1 = match output.cast() {
             Ok(o) => o,
-            Err(_) => { output_idx += 1; continue; }
+            Err(_) => {
+                output_idx += 1;
+                continue;
+            }
         };
         match unsafe { output1.DuplicateOutput(device) } {
             Ok(duplication) => {
@@ -361,7 +393,9 @@ fn create_duplication(
                 tracing::info!(width, height, "DXGI reconnected on output {output_idx}");
                 return Ok((duplication, width, height));
             }
-            Err(_) => { output_idx += 1; }
+            Err(_) => {
+                output_idx += 1;
+            }
         }
     }
     Err(CaptureError::Io(std::io::Error::new(
@@ -550,8 +584,8 @@ fn run_capture_thread(
 
         let t_userspace = MonoNanos::now();
 
-        let t_kernel = qpc_to_mono_nanos(frame_info.LastPresentTime, qpc_freq)
-            .unwrap_or(t_userspace);
+        let t_kernel =
+            qpc_to_mono_nanos(frame_info.LastPresentTime, qpc_freq).unwrap_or(t_userspace);
 
         cursor_state.update(&frame_info, &duplication);
 
@@ -622,7 +656,11 @@ fn run_capture_thread(
     }
 }
 
-fn create_texture_pool(device: &ID3D11Device, width: u32, height: u32) -> Option<Vec<ID3D11Texture2D>> {
+fn create_texture_pool(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Option<Vec<ID3D11Texture2D>> {
     let mut pool = Vec::with_capacity(TEXTURE_POOL_SIZE);
     for _ in 0..TEXTURE_POOL_SIZE {
         match create_pool_texture(device, width, height) {
@@ -711,9 +749,16 @@ mod tests {
                 free_tx: free_tx.clone(),
                 slot: 7,
             };
-            assert!(free_rx.try_recv().is_err(), "slot must not return while held");
+            assert!(
+                free_rx.try_recv().is_err(),
+                "slot must not return while held"
+            );
         }
-        assert_eq!(free_rx.try_recv().ok(), Some(7), "slot returns once guard drops");
+        assert_eq!(
+            free_rx.try_recv().ok(),
+            Some(7),
+            "slot returns once guard drops"
+        );
     }
 
     #[test]
@@ -730,15 +775,42 @@ mod tests {
 
         // Frame A grabs slot 0 and goes into the mailbox.
         let s0 = free_rx.try_recv().unwrap();
-        send_latest(&mtx, &evict, (100, SlotReturn { free_tx: free_tx.clone(), slot: s0 }));
+        send_latest(
+            &mtx,
+            &evict,
+            (
+                100,
+                SlotReturn {
+                    free_tx: free_tx.clone(),
+                    slot: s0,
+                },
+            ),
+        );
 
         // Frame B grabs slot 1; sending it evicts (drops) A → slot 0 frees.
         let s1 = free_rx.try_recv().unwrap();
-        send_latest(&mtx, &evict, (200, SlotReturn { free_tx: free_tx.clone(), slot: s1 }));
+        send_latest(
+            &mtx,
+            &evict,
+            (
+                200,
+                SlotReturn {
+                    free_tx: free_tx.clone(),
+                    slot: s1,
+                },
+            ),
+        );
 
-        assert_eq!(free_rx.try_recv().ok(), Some(s0), "evicted frame's slot returns");
+        assert_eq!(
+            free_rx.try_recv().ok(),
+            Some(s0),
+            "evicted frame's slot returns"
+        );
         let (val, _held) = mrx.try_recv().expect("mailbox holds the newest frame");
-        assert_eq!(val, 200, "consumer dequeues the freshest frame, not the stale one");
+        assert_eq!(
+            val, 200,
+            "consumer dequeues the freshest frame, not the stale one"
+        );
     }
 
     #[test]
@@ -750,11 +822,24 @@ mod tests {
         let evict = mrx.clone();
 
         // Slot 5 is held by the mailbox frame; the free-list is empty.
-        mtx.try_send((1, SlotReturn { free_tx: free_tx.clone(), slot: 5 }))
-            .unwrap();
+        mtx.try_send((
+            1,
+            SlotReturn {
+                free_tx: free_tx.clone(),
+                slot: 5,
+            },
+        ))
+        .unwrap();
 
-        assert_eq!(acquire_slot(&free_rx, &evict), Some(5), "eviction reclaims the slot");
-        assert!(mrx.try_recv().is_err(), "the evicted frame is gone from the mailbox");
+        assert_eq!(
+            acquire_slot(&free_rx, &evict),
+            Some(5),
+            "eviction reclaims the slot"
+        );
+        assert!(
+            mrx.try_recv().is_err(),
+            "the evicted frame is gone from the mailbox"
+        );
     }
 
     #[test]
@@ -785,7 +870,17 @@ mod tests {
         for id in 0..10u32 {
             let slot = acquire_slot(&free_rx, &evict)
                 .expect("eviction keeps a slot available while only the mailbox holds one");
-            send_latest(&mtx, &evict, (id, SlotReturn { free_tx: free_tx.clone(), slot }));
+            send_latest(
+                &mtx,
+                &evict,
+                (
+                    id,
+                    SlotReturn {
+                        free_tx: free_tx.clone(),
+                        slot,
+                    },
+                ),
+            );
         }
 
         let (newest, guard) = mrx.try_recv().expect("mailbox holds a frame");

@@ -525,7 +525,11 @@ impl<V: VideoChannel + ?Sized> LossyChannel<V> {
     /// Snapshot of every drop the wrapper has performed so far. Cheap
     /// because `DropEvent: Clone` and the vec is small in practice.
     pub fn drop_log(&self) -> Vec<DropEvent> {
-        self.sync_state.lock().expect("LossyChannel mutex poisoned").drop_log.clone()
+        self.sync_state
+            .lock()
+            .expect("LossyChannel mutex poisoned")
+            .drop_log
+            .clone()
     }
 }
 
@@ -618,9 +622,7 @@ pub fn empty_client_hello() -> ClientHello {
 /// Minimal-valid `ServerHello` for tests. See [`empty_client_hello`].
 #[must_use]
 pub fn empty_server_hello() -> ServerHello {
-    use tether_protocol::control::{
-        ChromaSubsampling, CodecKind, ServerHelloV1, VideoColorSpec,
-    };
+    use tether_protocol::control::{ChromaSubsampling, CodecKind, ServerHelloV1, VideoColorSpec};
     ServerHello::V1(ServerHelloV1 {
         server_name: "test".into(),
         chosen_codec: CodecKind::H264,
@@ -655,7 +657,11 @@ mod tests {
         };
         let client_fut = async move {
             let (_server, sync) = client.client_handshake(empty_client_hello()).await.unwrap();
-            assert!(sync.rtt_nanos < 100_000_000, "rtt was {} ns", sync.rtt_nanos);
+            assert!(
+                sync.rtt_nanos < 100_000_000,
+                "rtt was {} ns",
+                sync.rtt_nanos
+            );
         };
         tokio::join!(host_fut, client_fut);
     }
@@ -706,7 +712,10 @@ mod tests {
         let client_for_send = client.clone();
         tokio::spawn(async move {
             for i in 0..5u64 {
-                client_for_send.send_input(&make_input_event(i)).await.unwrap();
+                client_for_send
+                    .send_input(&make_input_event(i))
+                    .await
+                    .unwrap();
             }
         });
         for expected in 0..5u64 {
@@ -771,7 +780,7 @@ mod tests {
                 dimensions: (16, 16),
                 keyframe: true,
                 timing: tether_protocol::video::HostFrameTiming::default(),
-            input_echo: Default::default(),
+                input_echo: Default::default(),
             },
             b"idr-body".to_vec().into(),
         );

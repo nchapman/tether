@@ -216,9 +216,18 @@ impl Bgra2Nv12 {
             label: Some("bgra_to_nv12 bg"),
             layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&y_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&uv_view) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&y_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&uv_view),
+                },
             ],
         });
 
@@ -278,7 +287,9 @@ impl Bgra2Nv12 {
         let (chroma_w, chroma_h) = (self.width.div_ceil(2), self.height.div_ceil(2));
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bgra_to_nv12 enc") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bgra_to_nv12 enc"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("bgra_to_nv12 pass"),
@@ -311,7 +322,11 @@ impl Bgra2Nv12 {
                     rows_per_image: Some(self.height),
                 },
             },
-            wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
         );
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -328,7 +343,11 @@ impl Bgra2Nv12 {
                     rows_per_image: Some(chroma_h),
                 },
             },
-            wgpu::Extent3d { width: chroma_w, height: chroma_h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: chroma_w,
+                height: chroma_h,
+                depth_or_array_layers: 1,
+            },
         );
 
         self.queue.submit(Some(encoder.finish()));
@@ -385,7 +404,11 @@ fn allocate_textures(
 
     let src_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("bgra src"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -405,7 +428,11 @@ fn allocate_textures(
 
     let y_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("nv12 y"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -447,7 +474,15 @@ fn allocate_textures(
         mapped_at_creation: false,
     });
 
-    (src_tex, y_tex, uv_tex, y_readback, uv_readback, y_padded_row, uv_padded_row)
+    (
+        src_tex,
+        y_tex,
+        uv_tex,
+        y_readback,
+        uv_readback,
+        y_padded_row,
+        uv_padded_row,
+    )
 }
 
 /// Round `tight_row` up to wgpu's 256-byte alignment requirement.
@@ -550,8 +585,7 @@ mod tests {
     /// enough to catch sign/coefficient/range bugs.
     fn check_solid(width: u32, height: u32, b: u8, g: u8, r: u8) {
         let bgra = solid(width, height, b, g, r);
-        let nv12 = Bgra2Nv12::convert_oneshot(&bgra, width, height)
-            .expect("convert");
+        let nv12 = Bgra2Nv12::convert_oneshot(&bgra, width, height).expect("convert");
         let (ey, eu, ev) = expected(b, g, r);
 
         assert_eq!(nv12.width, width);

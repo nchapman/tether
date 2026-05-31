@@ -14,14 +14,14 @@ use std::mem::ManuallyDrop;
 use windows::core::Interface;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
-    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2DARRAY,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
+    ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+    ID3D11VideoProcessorOutputView, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2DARRAY,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL;
 
@@ -55,10 +55,9 @@ impl VideoProcessorState {
             return Err("null device or context pointer".into());
         }
 
-        let device: ID3D11Device =
-            unsafe { ID3D11Device::from_raw_borrowed(&device_ptr) }
-                .ok_or("failed to borrow ID3D11Device")?
-                .clone();
+        let device: ID3D11Device = unsafe { ID3D11Device::from_raw_borrowed(&device_ptr) }
+            .ok_or("failed to borrow ID3D11Device")?
+            .clone();
         let context: ID3D11DeviceContext =
             unsafe { ID3D11DeviceContext::from_raw_borrowed(&context_ptr) }
                 .ok_or("failed to borrow ID3D11DeviceContext")?
@@ -88,22 +87,16 @@ impl VideoProcessorState {
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };
 
-        let enumerator: ID3D11VideoProcessorEnumerator = unsafe {
-            video_device.CreateVideoProcessorEnumerator(&content_desc)
-        }
-        .map_err(|e| format!("CreateVideoProcessorEnumerator: {e}"))?;
+        let enumerator: ID3D11VideoProcessorEnumerator =
+            unsafe { video_device.CreateVideoProcessorEnumerator(&content_desc) }
+                .map_err(|e| format!("CreateVideoProcessorEnumerator: {e}"))?;
 
-        let processor: ID3D11VideoProcessor = unsafe {
-            video_device.CreateVideoProcessor(&enumerator, 0)
-        }
-        .map_err(|e| format!("CreateVideoProcessor: {e}"))?;
+        let processor: ID3D11VideoProcessor =
+            unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
+                .map_err(|e| format!("CreateVideoProcessor: {e}"))?;
 
         unsafe {
-            video_context.VideoProcessorSetStreamAutoProcessingMode(
-                &processor,
-                0,
-                false,
-            );
+            video_context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
             video_context.VideoProcessorSetStreamFrameFormat(
                 &processor,
                 0,
@@ -237,12 +230,7 @@ impl VideoProcessorState {
                 Some(&target_rect),
             );
             self.video_context
-                .VideoProcessorBlt(
-                    &self.processor,
-                    &output_view,
-                    0,
-                    &[stream],
-                )
+                .VideoProcessorBlt(&self.processor, &output_view, 0, &[stream])
                 .map_err(|e| format!("VideoProcessorBlt: {e}"))?;
             // Flush so the blit is submitted to the GPU before the
             // encoder (esp. QSV/MFX, which reads the surface out-of-band)

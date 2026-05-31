@@ -21,9 +21,7 @@ use tether_render::LatestFrame;
 /// Construct a `Worker` with bare callbacks and a fake decoder.
 /// Returns `(worker, idr_calls, warnings)` so the test can poke
 /// `warnings.store(...)` and assert `idr_calls.load(...)`.
-fn make_worker(
-    decoder: FakeDecoder,
-) -> (Worker, Arc<AtomicU32>, Arc<AtomicU64>, LatestFrame) {
+fn make_worker(decoder: FakeDecoder) -> (Worker, Arc<AtomicU32>, Arc<AtomicU64>, LatestFrame) {
     let idr_calls = Arc::new(AtomicU32::new(0));
     let warnings = Arc::new(AtomicU64::new(0));
     let frames = LatestFrame::new();
@@ -83,7 +81,10 @@ fn decode_success_pushes_frame_to_latest_and_no_idr() {
     assert!(!completion.soft_failure);
     assert!(!completion.idr_request_fired);
     assert_eq!(idr_calls.load(Ordering::Relaxed), 0);
-    assert!(frames.take().is_some(), "LatestFrame should hold the decoded frame");
+    assert!(
+        frames.take().is_some(),
+        "LatestFrame should hold the decoded frame"
+    );
 }
 
 #[test]
@@ -133,7 +134,11 @@ fn soft_failure_via_warning_bump_fires_idr() {
     assert!(completion.soft_failure);
     assert!(completion.idr_request_fired);
     assert_eq!(idr_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(read_calls.load(Ordering::Relaxed), 2, "exactly two reads bracket the job");
+    assert_eq!(
+        read_calls.load(Ordering::Relaxed),
+        2,
+        "exactly two reads bracket the job"
+    );
 }
 
 #[test]
@@ -291,7 +296,10 @@ async fn init_failure_drops_ready_tx_without_send() {
     // ready_rx must surface RecvError because the worker dropped the
     // sender without sending.
     let err = ready_rx.await.err();
-    assert!(err.is_some(), "ready_tx dropped without send should error ready_rx");
+    assert!(
+        err.is_some(),
+        "ready_tx dropped without send should error ready_rx"
+    );
 
     // Thread should exit promptly; dropping the job tx isn't even
     // needed because the worker returned before the loop. Join with
@@ -498,15 +506,14 @@ fn watchdog_fires_after_no_output_window() {
     // soft failure. Use AtomicU64 to track call count.
     let call_idx = Arc::new(AtomicU64::new(0));
     let call_idx_cb = Arc::clone(&call_idx);
-    let phased_warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static> =
-        Arc::new(move || {
-            let n = call_idx_cb.fetch_add(1, Ordering::Relaxed);
-            if n < 2 {
-                0
-            } else {
-                n - 1
-            }
-        });
+    let phased_warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static> = Arc::new(move || {
+        let n = call_idx_cb.fetch_add(1, Ordering::Relaxed);
+        if n < 2 {
+            0
+        } else {
+            n - 1
+        }
+    });
 
     let decoder = FakeDecoder::new(vec![
         // Job 0: solid frame → success.
@@ -642,7 +649,11 @@ fn watchdog_alone_escalates_after_two_silent_windows() {
 fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
     // Build a decoder that always succeeds (returns one frame per submit).
     let outcomes: Vec<FakeOutcome> = (0..10)
-        .map(|_| FakeOutcome::Solid { width: 8, height: 8, luma: 0x80 })
+        .map(|_| FakeOutcome::Solid {
+            width: 8,
+            height: 8,
+            luma: 0x80,
+        })
         .collect();
     let (mut worker, _idr_calls, _warnings, frames) = make_worker(FakeDecoder::new(outcomes));
 
@@ -653,7 +664,11 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
 
     // Simulate a rebuild by calling replace_decoder.
     let rebuild_outcomes: Vec<FakeOutcome> = (0..10)
-        .map(|_| FakeOutcome::Solid { width: 8, height: 8, luma: 0x40 })
+        .map(|_| FakeOutcome::Solid {
+            width: 8,
+            height: 8,
+            luma: 0x40,
+        })
         .collect();
     worker.replace_decoder(Box::new(FakeDecoder::new(rebuild_outcomes)));
 
@@ -665,7 +680,10 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
     };
     let c = worker.process_job(p_frame, MonoNanos::now());
     assert!(!c.decode_err, "skipped frames should not count as errors");
-    assert!(frames.take().is_none(), "P-frame after rebuild should not render");
+    assert!(
+        frames.take().is_none(),
+        "P-frame after rebuild should not render"
+    );
 
     let p_frame2 = DecodeJob {
         body: Bytes::from_static(b"p-frame-2"),
@@ -673,7 +691,10 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
         keyframe: false,
     };
     let _c = worker.process_job(p_frame2, MonoNanos::now());
-    assert!(frames.take().is_none(), "second P-frame after rebuild should not render");
+    assert!(
+        frames.take().is_none(),
+        "second P-frame after rebuild should not render"
+    );
 
     // IDR (keyframe=true) clears the gate and decodes normally.
     let idr = DecodeJob {
@@ -683,7 +704,10 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
     };
     let c = worker.process_job(idr, MonoNanos::now());
     assert!(!c.decode_err);
-    assert!(frames.take().is_some(), "IDR after rebuild should decode and render");
+    assert!(
+        frames.take().is_some(),
+        "IDR after rebuild should decode and render"
+    );
 
     // Subsequent P-frames now work (gate cleared).
     let p_after = DecodeJob {
@@ -693,5 +717,8 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
     };
     let c = worker.process_job(p_after, MonoNanos::now());
     assert!(!c.decode_err);
-    assert!(frames.take().is_some(), "P-frame after IDR should decode normally");
+    assert!(
+        frames.take().is_some(),
+        "P-frame after IDR should decode normally"
+    );
 }

@@ -170,9 +170,8 @@ impl KnownHosts {
 /// silently discarding a damaged trust root.
 fn load_json<T: Default + DeserializeOwned>(path: &Path) -> io::Result<T> {
     match std::fs::read(path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        }
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e),
     }
@@ -189,8 +188,8 @@ fn save_json_private<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json =
-        serde_json::to_vec_pretty(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_vec_pretty(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
     write_private(&tmp, &json)?;
     std::fs::rename(&tmp, path)
@@ -303,7 +302,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn current_user_sid_string() -> io::Result<String> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree,
+        CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL,
     };
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
@@ -423,11 +422,16 @@ mod tests {
         // as an empty store would be a fail-open: an attacker who zeroes the
         // file should not turn "trust these peers" into "trust nobody and
         // re-pair anyone." (Fail closed: the host refuses to start instead.)
-        let path =
-            std::env::temp_dir().join(format!("tether-pairing-corrupt-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "tether-pairing-corrupt-{}.json",
+            std::process::id()
+        ));
         std::fs::write(&path, b"this is not json").expect("write corrupt file");
         let result = PairedStore::load(&path);
-        assert!(result.is_err(), "corrupt file must be Err, not an empty store");
+        assert!(
+            result.is_err(),
+            "corrupt file must be Err, not an empty store"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -454,7 +458,12 @@ mod tests {
         let mut hosts = KnownHosts::default();
         let fp = [6u8; 32];
         assert!(!hosts.contains("192.168.1.5:7654"));
-        hosts.insert("192.168.1.5:7654".to_string(), &fp, "desktop".to_string(), 1_700_000_000);
+        hosts.insert(
+            "192.168.1.5:7654".to_string(),
+            &fp,
+            "desktop".to_string(),
+            1_700_000_000,
+        );
         assert!(hosts.contains("192.168.1.5:7654"));
         // Lookup returns the decoded fingerprint to pin on reconnect.
         assert_eq!(hosts.fingerprint("192.168.1.5:7654"), Some(fp));
@@ -473,7 +482,12 @@ mod tests {
 
         let mut hosts = KnownHosts::default();
         let fp = [7u8; 32];
-        hosts.insert("host.local:7654".to_string(), &fp, "work".to_string(), 1_700_000_010);
+        hosts.insert(
+            "host.local:7654".to_string(),
+            &fp,
+            "work".to_string(),
+            1_700_000_010,
+        );
         hosts.save(&path).expect("save");
 
         let loaded = KnownHosts::load(&path).expect("load");
@@ -537,8 +551,10 @@ mod tests {
 
     #[test]
     fn known_hosts_corrupt_file_is_an_error() {
-        let path = std::env::temp_dir()
-            .join(format!("tether-known-hosts-corrupt-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "tether-known-hosts-corrupt-{}.json",
+            std::process::id()
+        ));
         std::fs::write(&path, b"not json at all").expect("write corrupt");
         assert!(KnownHosts::load(&path).is_err());
         let _ = std::fs::remove_file(&path);

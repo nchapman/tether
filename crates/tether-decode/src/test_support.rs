@@ -28,11 +28,7 @@ pub enum FakeOutcome {
     NextFrameError,
     /// Trivial single solid-color CPU frame at `(w, h)`. Convenience
     /// constructor — tests rarely care about pixel data.
-    Solid {
-        width: u32,
-        height: u32,
-        luma: u8,
-    },
+    Solid { width: u32, height: u32, luma: u8 },
 }
 
 /// Decoder impl driven by a scripted queue of [`FakeOutcome`]s.
@@ -93,7 +89,8 @@ impl Decoder for FakeDecoder {
                 height,
                 luma,
             }) => {
-                self.pending_frames.push_back(solid_cpu_frame(width, height, luma));
+                self.pending_frames
+                    .push_back(solid_cpu_frame(width, height, luma));
                 Ok(())
             }
             Some(FakeOutcome::SubmitError) => Err(CodecError::UnsupportedInputFormat),

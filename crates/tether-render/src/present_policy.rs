@@ -123,9 +123,7 @@ pub fn decide_present(
     // expressible as an integer fraction (3/2 = 1.5×). Integer math
     // throughout avoids any float-rounding surprises at the
     // threshold boundary.
-    let threshold_ns = refresh_period_ns
-        .saturating_mul(u64::from(FRAME_AGE_THRESHOLD_FACTOR))
-        / 2;
+    let threshold_ns = refresh_period_ns.saturating_mul(u64::from(FRAME_AGE_THRESHOLD_FACTOR)) / 2;
     let is_late = frame_age_ns > threshold_ns;
 
     // Always tick down the cooldown so a long stretch of on-time

@@ -238,8 +238,10 @@ fn parse_client_decode_profiles(body: &ClientHelloV1) -> Vec<VideoProfile> {
             // list — the rest of the advertised profiles may still
             // contain something we can match.
             let total = v.len();
-            let filtered: Vec<VideoProfile> =
-                v.into_iter().filter(|p| is_known_bit_depth(p.bit_depth)).collect();
+            let filtered: Vec<VideoProfile> = v
+                .into_iter()
+                .filter(|p| is_known_bit_depth(p.bit_depth))
+                .collect();
             if filtered.len() != total {
                 warn!(
                     dropped = total - filtered.len(),

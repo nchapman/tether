@@ -54,10 +54,7 @@ impl SpsChromaAndBitDepth {
 /// of the given codec and parse out `(chroma_format_idc, bit_depth)`.
 /// Returns `None` if no SPS is found, the SPS is truncated, or any
 /// field is outside the values this parser models.
-pub fn parse_sps_chroma_bit_depth(
-    annexb: &[u8],
-    codec: CodecKind,
-) -> Option<SpsChromaAndBitDepth> {
+pub fn parse_sps_chroma_bit_depth(annexb: &[u8], codec: CodecKind) -> Option<SpsChromaAndBitDepth> {
     // AV1 isn't an Annex-B / NAL-framed codec — OBU framing is wholly
     // different. The probe layer would have to call a different
     // parser; today we return `None` so AV1 (when wired) falls back to
@@ -260,7 +257,7 @@ fn skip_hevc_ptl(r: &mut BitReader<'_>, max_sub_layers_minus1: usize) -> Option<
     r.read_bits(43)?; // constraint flags + reserved (total 43, all branches)
     r.read_bits(1)?; // inbld_flag / reserved_zero_bit
     r.read_bits(8)?; // general_level_idc
-    // Sub-layer presence flags: 2 bits per sublayer.
+                     // Sub-layer presence flags: 2 bits per sublayer.
     let mut profile_present = Vec::with_capacity(max_sub_layers_minus1);
     let mut level_present = Vec::with_capacity(max_sub_layers_minus1);
     for _ in 0..max_sub_layers_minus1 {
@@ -406,7 +403,10 @@ mod tests {
     fn emulation_prevention_bytes_are_stripped() {
         // A 3-byte input `00 00 03` is the emulation prevention
         // pattern; stripping must produce a 2-byte `00 00` output.
-        assert_eq!(strip_emulation_prevention(&[0x00, 0x00, 0x03]), vec![0x00, 0x00]);
+        assert_eq!(
+            strip_emulation_prevention(&[0x00, 0x00, 0x03]),
+            vec![0x00, 0x00]
+        );
         // The 0x03 after a non-`00 00` prefix must be preserved
         // verbatim — it's a real payload byte there.
         assert_eq!(

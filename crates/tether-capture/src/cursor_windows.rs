@@ -119,14 +119,12 @@ impl DxgiCursorState {
             t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 as u32 => {
                 bgra_to_rgba(&self.shape_buffer[..required_size as usize])
             }
-            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 => {
-                monochrome_to_rgba(
-                    &self.shape_buffer[..required_size as usize],
-                    shape_info.Width,
-                    shape_info.Height,
-                    shape_info.Pitch,
-                )
-            }
+            t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 => monochrome_to_rgba(
+                &self.shape_buffer[..required_size as usize],
+                shape_info.Width,
+                shape_info.Height,
+                shape_info.Pitch,
+            ),
             t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 => {
                 masked_color_to_rgba(
                     &self.shape_buffer[..required_size as usize],
@@ -216,9 +214,9 @@ fn monochrome_to_rgba(buf: &[u8], width: u32, height: u32, pitch: u32) -> Vec<u8
 
             let (r, g, b, a) = match (and_bit, xor_bit) {
                 (0, 0) => (0, 0, 0, 255),       // Black, opaque
-                (0, 1) => (255, 255, 255, 255),  // White, opaque
-                (1, 0) => (0, 0, 0, 0),          // Transparent
-                (1, 1) => (255, 255, 255, 128),  // Inverted — approximate as semi-white
+                (0, 1) => (255, 255, 255, 255), // White, opaque
+                (1, 0) => (0, 0, 0, 0),         // Transparent
+                (1, 1) => (255, 255, 255, 128), // Inverted — approximate as semi-white
                 _ => unreachable!(),
             };
 
@@ -256,10 +254,10 @@ fn masked_color_to_rgba(buf: &[u8], width: u32, height: u32, pitch: u32) -> Vec<
             let mask = src_row[si + 3];
             if mask == 0 {
                 // Opaque color pixel.
-                rgba[di] = src_row[si + 2];     // R
+                rgba[di] = src_row[si + 2]; // R
                 rgba[di + 1] = src_row[si + 1]; // G
-                rgba[di + 2] = src_row[si];     // B
-                rgba[di + 3] = 255;             // A
+                rgba[di + 2] = src_row[si]; // B
+                rgba[di + 3] = 255; // A
             } else {
                 // XOR pixel — approximate as semi-transparent inverted.
                 rgba[di] = src_row[si + 2];
@@ -298,7 +296,7 @@ mod tests {
         let bgra = vec![64, 0, 128, 128];
         let rgba = bgra_to_rgba(&bgra);
         assert_eq!(rgba[0], 255); // R
-        assert_eq!(rgba[1], 0);   // G
+        assert_eq!(rgba[1], 0); // G
         assert_eq!(rgba[2], 127); // B (64 * 255 / 128 = 127.5 → 127)
         assert_eq!(rgba[3], 128); // A
     }
@@ -344,8 +342,8 @@ mod tests {
         let width = 2u32;
         let height = 1u32;
         let pitch = 8u32; // 2 pixels * 4 bytes
-        // Pixel 0: BGRA = (10, 20, 30, 0) → alpha=0 → opaque → RGBA = (30, 20, 10, 255)
-        // Pixel 1: BGRA = (40, 50, 60, 0xFF) → alpha!=0 → XOR → RGBA = (60, 50, 40, 128)
+                          // Pixel 0: BGRA = (10, 20, 30, 0) → alpha=0 → opaque → RGBA = (30, 20, 10, 255)
+                          // Pixel 1: BGRA = (40, 50, 60, 0xFF) → alpha!=0 → XOR → RGBA = (60, 50, 40, 128)
         let buf = vec![10, 20, 30, 0, 40, 50, 60, 0xFF];
         let rgba = masked_color_to_rgba(&buf, width, height, pitch);
         assert_eq!(&rgba[0..4], &[30, 20, 10, 255]);

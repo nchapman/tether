@@ -76,10 +76,13 @@ async fn idr_uni_stream_delivers_keyframe_intact() {
     let pkt = fragmenter.single_packet(meta(true), body.clone());
     host.send_video_keyframe(&pkt).await.unwrap();
 
-    let received = tokio::time::timeout(std::time::Duration::from_secs(2), client.accept_video_keyframe())
-        .await
-        .expect("timeout")
-        .unwrap();
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.accept_video_keyframe(),
+    )
+    .await
+    .expect("timeout")
+    .unwrap();
     match received {
         VideoPacket::First {
             payload,

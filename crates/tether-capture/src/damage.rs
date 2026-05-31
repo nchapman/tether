@@ -302,5 +302,4 @@ mod tests {
         // Unknown (e.g. GPU frame) always encodes.
         assert!(should_encode(DamageHint::Unknown, false));
     }
-
 }

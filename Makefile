@@ -97,6 +97,7 @@ shell-install: ## Install the shell's frontend dependencies (run once, or after 
 	pnpm --dir apps/tether-shell install
 
 shell: engines ## Run the Tauri shell in dev mode (builds the engines first)
+	@scripts/stage-windows-runtime.sh
 	pnpm --dir apps/tether-shell tauri dev
 
 shell-check: ## Typecheck the shell without running it (TypeScript + src-tauri Rust)

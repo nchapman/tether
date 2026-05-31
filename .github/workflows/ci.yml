@@ -98,6 +98,15 @@ jobs:
       - name: Typecheck frontend (tsc)
         run: pnpm --dir apps/tether-shell exec tsc --noEmit
 
+      # tauri.windows.conf.json (auto-merged on Windows) declares the VC++
+      # runtime DLLs as bundle resources, and Tauri's build script validates
+      # they exist — even for `cargo test`. Stage them as release.yml does so
+      # the shell backend compiles.
+      - name: Stage Windows runtime DLLs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: scripts/stage-windows-runtime.sh
+
       - name: Test shell backend (cargo)
         run: cargo test --manifest-path apps/tether-shell/src-tauri/Cargo.toml
 

@@ -476,26 +476,23 @@ fn make_chroma_detail_bgra(width: u32, height: u32) -> Vec<u8> {
 }
 
 /// Per-profile set of IOSurface fourccs a *correctly-encoded*
-/// bitstream's decode should land in. Range variants (`'420v'` /
-/// `'420f'`, etc.) both count — range is signalled in the VUI, not
-/// in the chroma fourcc, and we deliberately don't constrain it
-/// here. Mirrors the probe's `expected_iosurface_fourccs` (kept
-/// duplicated rather than re-exported to keep the test self-contained
-/// and the cross-module coupling minimal).
+/// bitstream's decode should land in. Video-range only — the host
+/// encoder emits video-range and the renderer imports video-range
+/// only, so a full-range decode can't arise (and wouldn't display).
+/// Mirrors the probe's `expected_iosurface_fourccs` (kept duplicated
+/// rather than re-exported to keep the test self-contained and the
+/// cross-module coupling minimal).
 fn expected_iosurface_fourccs_for(profile: VideoProfile) -> &'static [u32] {
     const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
-    const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
     const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
-    const NV24_FULL: u32 = u32::from_be_bytes(*b"444f");
     const P010: u32 = u32::from_be_bytes(*b"P010");
-    const XF20: u32 = u32::from_be_bytes(*b"xf20");
     const X420: u32 = u32::from_be_bytes(*b"x420");
     const XF44: u32 = u32::from_be_bytes(*b"xf44");
     const P410: u32 = u32::from_be_bytes(*b"P410");
     match (profile.chroma, profile.bit_depth) {
-        (ChromaSubsampling::Yuv420, 8) => &[NV12_VIDEO, NV12_FULL],
-        (ChromaSubsampling::Yuv420, 10) => &[P010, XF20, X420],
-        (ChromaSubsampling::Yuv444, 8) => &[NV24_VIDEO, NV24_FULL],
+        (ChromaSubsampling::Yuv420, 8) => &[NV12_VIDEO],
+        (ChromaSubsampling::Yuv420, 10) => &[P010, X420],
+        (ChromaSubsampling::Yuv444, 8) => &[NV24_VIDEO],
         (ChromaSubsampling::Yuv444, 10) => &[XF44, P410],
         _ => &[],
     }

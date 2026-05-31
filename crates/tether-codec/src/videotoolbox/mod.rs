@@ -41,33 +41,37 @@ use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
 /// The set of IOSurface fourccs a VT decoder may emit for `profile`'s
 /// bitstream, when the encoder *actually* produced that profile's
-/// chroma + bit-depth (vs. silently downsampled). Per-profile range
-/// variants (`'420v'` vs `'420f'`, etc.) both count — range is a VUI
-/// signal, not a chroma-resolution one, and we deliberately don't
-/// gate on it.
+/// chroma + bit-depth (vs. silently downsampled).
+///
+/// Restricted to the **video-range** fourcc of each family. The
+/// renderer shader is hardcoded BT.709 *limited* range, so it only
+/// imports video-range surfaces (`macos_interop::accepts_iosurface_fourcc`),
+/// and the host encoder only ever emits video-range
+/// (`videotoolbox::encoder::iosurface_fourcc_matches`). A full-range
+/// surface (`'420f'` / `'xf20'` / `'444f'`) therefore can't arise in a
+/// tether↔tether session and wouldn't be displayable if it did, so
+/// listing it here would only mask a real renderer-accept gap rather
+/// than describe a reachable decode. The 4:4:4 10-bit family has no
+/// video-range fourcc on macOS, so both `'xf44'` and `'P410'` are
+/// listed (the renderer accepts both).
 ///
 /// Exposed at `pub` so cross-crate consistency tests can confirm the
 /// renderer's IOSurface accept set (`tether-render::gpu::metal`) is a
-/// superset of this — i.e. that the renderer can import everything
-/// the encode probe (in `tether-probe`) expects the decoder to
-/// produce. A subset mismatch is what bit us in commit `621badc`
-/// (renderer rejected `'x420'` even though the probe correctly
-/// listed it).
+/// superset of this — a subset mismatch is what bit us in commit
+/// `621badc` (renderer rejected `'x420'` even though the probe listed
+/// it).
 #[must_use]
 pub fn expected_iosurface_fourccs(profile: VideoProfile) -> &'static [u32] {
     const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
-    const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
     const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
-    const NV24_FULL: u32 = u32::from_be_bytes(*b"444f");
     const P010: u32 = u32::from_be_bytes(*b"P010");
-    const XF20: u32 = u32::from_be_bytes(*b"xf20");
     const X420: u32 = u32::from_be_bytes(*b"x420");
     const XF44: u32 = u32::from_be_bytes(*b"xf44");
     const P410: u32 = u32::from_be_bytes(*b"P410");
     match (profile.chroma, profile.bit_depth) {
-        (ChromaSubsampling::Yuv420, 8) => &[NV12_VIDEO, NV12_FULL],
-        (ChromaSubsampling::Yuv420, 10) => &[P010, XF20, X420],
-        (ChromaSubsampling::Yuv444, 8) => &[NV24_VIDEO, NV24_FULL],
+        (ChromaSubsampling::Yuv420, 8) => &[NV12_VIDEO],
+        (ChromaSubsampling::Yuv420, 10) => &[P010, X420],
+        (ChromaSubsampling::Yuv444, 8) => &[NV24_VIDEO],
         (ChromaSubsampling::Yuv444, 10) => &[XF44, P410],
         _ => &[],
     }

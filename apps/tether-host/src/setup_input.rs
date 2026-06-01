@@ -52,8 +52,10 @@ fn install_udev_rule() -> Result<(), String> {
     // ordering where the `add` event could be processed under the old
     // ruleset. `settle` blocks until the triggered events finish, so the
     // caller's immediate re-open sees the applied ACL. `$1` is the rule
-    // body.
-    const SCRIPT: &str = "printf '%s' \"$1\" > /etc/udev/rules.d/60-tether-uinput.rules \
+    // body and `$2` the destination path — both passed as argv (not
+    // interpolated into the script) so there's no shell-escaping concern
+    // and `RULE_PATH` stays the single source of truth for the location.
+    const SCRIPT: &str = "printf '%s' \"$1\" > \"$2\" \
          && udevadm control --reload-rules \
          && { modprobe uinput 2>/dev/null || true; } \
          && { udevadm trigger --subsystem-match=misc --sysname-match=uinput 2>/dev/null \
@@ -66,6 +68,7 @@ fn install_udev_rule() -> Result<(), String> {
         .arg(SCRIPT)
         .arg("sh") // $0 for the inner shell
         .arg(RULE) // $1 — the rule body
+        .arg(RULE_PATH) // $2 — the destination path
         .status();
 
     match status {

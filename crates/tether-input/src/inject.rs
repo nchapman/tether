@@ -10,12 +10,12 @@ use tether_protocol::input::InputEvent;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InjectError {
-    /// The backend's input device exists but couldn't be opened for use —
-    /// on Linux this is `/dev/uinput` missing (module not loaded) or not
-    /// writable (no udev rule yet). Distinct from [`InjectError::Init`]
-    /// because it's *fixable by a one-time privileged setup*: the host
-    /// reacts by requesting that grant through the GUI rather than treating
-    /// it as a hard failure.
+    /// The backend's input device can't be opened for use — on Linux
+    /// `/dev/uinput` is either missing (the `uinput` module isn't loaded)
+    /// or present but not writable (no udev rule yet). Distinct from
+    /// [`InjectError::Init`] because it's *fixable by a one-time privileged
+    /// setup*: the host reacts by requesting that grant through the GUI
+    /// rather than treating it as a hard failure.
     #[error("input device unavailable: {0}")]
     DeviceUnavailable(String),
     #[error("backend init: {0}")]

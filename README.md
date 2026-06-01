@@ -59,6 +59,26 @@ make package     # build local installer bundles
 make help        # full target list
 ```
 
+## Linux host setup
+
+A Linux host needs one-time access to `/dev/uinput` so it can inject
+keyboard/mouse input without an xdg-desktop-portal prompt on every
+connection. Run once:
+
+```
+tether-host --setup-input    # installs a udev rule via pkexec (one auth prompt)
+```
+
+or, equivalently, `make install-udev`. After this, input works with no
+per-session permission dialog. The screen-capture grant persists the same
+way automatically — Tether stores the portal restore token under
+`~/.tether/` and replays it, so the "share your screen" dialog appears
+only on the first connection (until you revoke it in your desktop's
+privacy settings).
+
+Headless hosts with no active local seat must additionally add the user
+to the `input` group (`sudo usermod -aG input $USER`) and log back in.
+
 ## Docs
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — channels, handshake,

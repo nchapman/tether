@@ -13,21 +13,17 @@ tether-render = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# Linux host-side injection via libei (portal-mediated, same model as our
-# PipeWire screen capture). enigo's libei_tokio feature integrates with
-# the tokio runtime we already use. We intentionally omit the x11rb
-# feature: PipeWire capture is Wayland-anchored, so a Tether host can
-# only meaningfully run under a portal-mediated Wayland session anyway,
-# and dropping the X11 backend keeps enigo from logging an ERROR at
-# startup as its X11 probe fails. Bring x11rb back behind a feature
-# flag if an X11-only host turns out to be a real use case.
+# Linux host-side injection via /dev/uinput (the `evdev` crate's pure-Rust
+# uinput builder — no libevdev C dependency). We deliberately do NOT route
+# input through the RemoteDesktop portal/libei: that portal re-prompts on
+# every session and its restore-token support is unreliable across
+# compositors, which is a non-starter for unattended remote access. uinput
+# has no portal and therefore no prompt once /dev/uinput is accessible
+# (see `tether-host --setup-input`). This mirrors what the mature Wayland
+# hosts (Sunshine, rustdesk server mode) ship.
 [target.'cfg(target_os = "linux")'.dependencies]
-enigo = { version = "0.6", default-features = false, features = ["libei_tokio"] }
+evdev = "0.13"
 tokio = { workspace = true }
-# dup2 + open(/dev/null) to muzzle enigo 0.6.1's raw `println!("Start
-# emulating")` on libei session init. Drop this dep once enigo demotes
-# those lines to log!().
-libc = "0.2"
 
 # macOS uses enigo's CGEvent backend (always present, no feature flag
 # needed). default-features = false drops the x11rb default feature;

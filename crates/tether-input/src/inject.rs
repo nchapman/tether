@@ -1,9 +1,9 @@
 //! Host-side input injection. Cross-platform `Injector` trait + a
 //! per-platform backend selected at compile time. On Linux we drive
-//! `libei` via the `enigo` crate (`libei_tokio` feature), which performs
-//! a Remote Desktop portal handshake — same model as our screen capture.
-//! Targets without a real backend fall through to `NoopInjector`, which
-//! just logs each event and returns success.
+//! `/dev/uinput` directly (no portal — see [`uinput`]); on macOS / Windows
+//! we drive `enigo` (CGEvent / SendInput). Targets without a real backend
+//! fall through to `NoopInjector`, which just logs each event and returns
+//! success.
 
 use tether_protocol::cursor::ClientCursorPacket;
 use tether_protocol::input::InputEvent;
@@ -71,13 +71,13 @@ impl Injector for NoopInjector {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod enigo_backend;
 
 #[cfg(target_os = "linux")]
-mod linux;
+mod uinput;
 #[cfg(target_os = "linux")]
-pub use linux::LibeiInjector;
+pub use uinput::UinputInjector;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -90,15 +90,16 @@ mod windows;
 pub use windows::WindowsInjector;
 
 /// Pick the best available backend for the current target. On Linux
-/// [`LibeiInjector`] drives libei via the Remote Desktop portal; on
-/// macOS [`MacOsInjector`] drives CGEvent (no portal — the
-/// Accessibility TCC grant is the equivalent gate). On unsupported
+/// [`UinputInjector`] drives `/dev/uinput` directly (no portal — the
+/// `/dev/uinput` permission is the equivalent gate, granted once via
+/// `tether-host --setup-input`); on macOS [`MacOsInjector`] drives
+/// CGEvent (the Accessibility TCC grant is the gate). On unsupported
 /// targets we fall back to [`NoopInjector`] with a single warn-level
 /// log so the operator notices.
 pub async fn default_injector() -> Box<dyn Injector> {
     #[cfg(target_os = "linux")]
     {
-        match LibeiInjector::connect().await {
+        match UinputInjector::connect().await {
             Ok(inj) => {
                 return Box::new(inj);
             }
@@ -106,7 +107,9 @@ pub async fn default_injector() -> Box<dyn Injector> {
                 tracing::warn!(
                     error = %e,
                     "linux injector unavailable; falling back to noop. \
-                     Input events will be logged but not applied."
+                     Input events will be logged but not applied. \
+                     Most likely /dev/uinput is not writable — \
+                     run `tether-host --setup-input` once to grant access."
                 );
             }
         }

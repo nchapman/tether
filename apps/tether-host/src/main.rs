@@ -60,6 +60,9 @@ use tracing::{debug, info, warn};
 mod pairing;
 use pairing::{ActiveSession, Authorized, PairingState, RefusedReason};
 
+#[cfg(target_os = "linux")]
+mod setup_input;
+
 /// Registers the live session in the shared `active` slot on creation and
 /// clears it on drop. Using a guard keeps the invariant "the slot is `Some`
 /// iff a session is live" on *every* exit path — clean end, revocation, a
@@ -164,7 +167,29 @@ async fn main() -> anyhow::Result<()> {
     // Parse args first so `--ipc` can route tracing off stdout *before*
     // the subscriber is installed: in IPC mode stdout is reserved for the
     // JSON-lines protocol the shell parses, so logs go to stderr instead.
-    let (bind, use_test_pattern, ipc) = parse_args()?;
+    let args = parse_args()?;
+
+    // `--setup-input` is a standalone maintenance action: install the
+    // udev rule (via pkexec) and exit before any server setup. Linux-only;
+    // elsewhere it's a no-op with a note.
+    if args.setup_input {
+        #[cfg(target_os = "linux")]
+        {
+            std::process::exit(setup_input::run());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("--setup-input is only needed on Linux (uinput); nothing to do.");
+            std::process::exit(0);
+        }
+    }
+
+    let Args {
+        bind,
+        use_test_pattern,
+        ipc,
+        ..
+    } = args;
     let reporter = Reporter::from_ipc_flag(ipc);
 
     // Both host (encoder) and client (decoder) call av_log::install(),
@@ -3213,23 +3238,45 @@ fn persistent_cert_dir() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".tether"))
 }
 
-fn parse_args() -> anyhow::Result<(SocketAddr, bool, bool)> {
+struct Args {
+    bind: SocketAddr,
+    use_test_pattern: bool,
+    ipc: bool,
+    /// Linux only: install the `/dev/uinput` udev rule and exit. Parsed
+    /// on every platform so the flag gives a clear message rather than
+    /// being mistaken for a bind address elsewhere.
+    setup_input: bool,
+}
+
+fn parse_args() -> anyhow::Result<Args> {
     let mut bind: SocketAddr = "127.0.0.1:7654".parse().expect("static literal");
     let mut use_test_pattern = false;
     let mut ipc = false;
+    let mut setup_input = false;
     for arg in std::env::args().skip(1) {
         if arg == "--test-pattern" {
             use_test_pattern = true;
         } else if arg == "--ipc" {
             ipc = true;
+        } else if arg == "--setup-input" {
+            setup_input = true;
         } else if arg == "--help" || arg == "-h" {
-            eprintln!("usage: tether-host [--test-pattern] [--ipc] [bind_addr]");
+            eprintln!(
+                "usage: tether-host [--test-pattern] [--ipc] [--setup-input] [bind_addr]\n\
+                 \n\
+                 --setup-input  (Linux) grant /dev/uinput access for input injection, then exit"
+            );
             std::process::exit(0);
         } else {
             bind = arg.parse()?;
         }
     }
-    Ok((bind, use_test_pattern, ipc))
+    Ok(Args {
+        bind,
+        use_test_pattern,
+        ipc,
+        setup_input,
+    })
 }
 
 /// In `--ipc` mode, watch stdin for shell commands. `Stop` (or stdin EOF / a

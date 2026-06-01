@@ -370,8 +370,10 @@ NV12 video range natively), so the macOS host has no analogue of
 `tether-gpuconvert`, no `BridgeState`, and no chroma-aware dispatch
 (VideoToolbox is 4:2:0 only — see the per-platform capability gate
 in the negotiation section above). Input injection is via `enigo`'s
-CGEvent backend, sharing the modifier-reconciliation and HID→Key
-code with the Linux libei path through `inject::enigo_backend`.
+CGEvent backend (`inject::enigo_backend`, shared with the Windows
+SendInput backend). The Linux host injects through `/dev/uinput`
+(`inject::uinput`) instead — portal-free, so input needs no
+per-session prompt; see the input section below.
 
 `encode_iosurface_frame` in `apps/tether-host/src/main.rs` is the
 macOS sibling of `encode_gpu_frame`: same `EncoderSlot` shape, same
@@ -548,7 +550,7 @@ only.
 
 `tether-host`'s `main` runs a reconnect loop: per-session errors log
 and continue; only a server close ends the process. The whole
-per-connection graph (encoder thread, libei injector, recv tasks)
+per-connection graph (encoder thread, uinput injector, recv tasks)
 lives inside `handle_client` and drops when it returns, so nothing
 leaks across reconnects.
 
@@ -682,10 +684,18 @@ Four non-negotiable invariants tracked end-to-end:
 ## Input and cursor
 
 Host side, Linux:
-- `tether-input::inject::linux` uses `enigo` with the `libei_tokio`
-  feature. Portal-mediated, same permission model as screen capture.
-  No X11 backend — the host has to be a Wayland session anyway since
-  capture is PipeWire-anchored.
+- `tether-input::inject::uinput` creates three virtual devices via
+  `/dev/uinput` (keyboard, relative pointer, absolute pointer — split
+  so libinput doesn't see a device mixing REL and ABS). Portal-free, so
+  unlike screen capture it needs **no per-session prompt**; the only
+  gate is `/dev/uinput` access, granted once by `tether-host
+  --setup-input` (installs a udev rule via pkexec). We deliberately do
+  not use the RemoteDesktop portal/libei: it re-prompts every session
+  and its restore-token support is unreliable across compositors. This
+  matches Sunshine and rustdesk's server mode. Caveat: uinput emits
+  physical keycodes, so the client's `Text` events are reverse-mapped
+  to a US-QWERTY layout — non-US host layouts and non-ASCII codepoints
+  don't round-trip and are dropped.
 - Cursor updates are a separate channel from input events so the client
   can render a remote cursor sprite over the decoded video without
   waiting for the next encoded frame.
@@ -704,9 +714,10 @@ sub-pixel motion accumulates across events instead of being
 rounded away). `InputEventKind::RelativeMouseMove { dx, dy,
 modifiers }` rides the input stream. Ctrl+Alt+G toggles the mode
 on the client; cursor grab uses winit `CursorGrabMode::Locked` and
-falls back to `Confined`. Host-side, the enigo backend clamps each
-delta to ±1000 px before dispatching `Coordinate::Rel` so a
-malformed or hostile event can't teleport the cursor.
+falls back to `Confined`. Host-side, the injector clamps each
+delta to ±1000 px before emitting it (REL_X/REL_Y on Linux uinput,
+`Coordinate::Rel` on macOS/Windows enigo) so a malformed or hostile
+event can't teleport the cursor.
 
 **`CaptureHandle` seam** (`tether-capture/src/lib.rs`). Every
 backend's `start()` returns `CaptureHandle { rx:

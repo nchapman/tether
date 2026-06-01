@@ -6,19 +6,23 @@
 //! when the compositor falls back to SHM.
 //!
 //! Calling [`start`] performs the portal handshake (which triggers a
-//! permission dialog on the user's desktop) and then spawns a dedicated
-//! thread running PipeWire's main loop. Frames are pushed into a bounded
-//! crossbeam channel. The thread has no graceful shutdown signal when
-//! the receiver is dropped — it waits until the process exits. Wiring
-//! `mainloop.quit()` through a clone of `MainLoopRc` in `UserData` would
-//! fix that; deferred because we don't yet have a host shutdown path
-//! that needs it (capture stays up for the process lifetime today).
+//! permission dialog on the user's desktop, unless a restore token
+//! suppresses it) and then spawns a dedicated thread running PipeWire's
+//! main loop. Frames are pushed into a bounded crossbeam channel. When
+//! the frame receiver is dropped (the client disconnected and the host's
+//! `handle_client` returned), the `process` callback quits the mainloop
+//! via a `MainLoopRc` clone in `UserData`; the thread then exits and
+//! drops the PipeWire stream + core + portal fd, ending the capture so
+//! the compositor's "screen is being shared" indicator clears and no
+//! session leaks across reconnects. The quit fires on the next buffer
+//! after disconnect, so a fully idle stream lingers until its next
+//! frame — fine in practice (capture is rarely perfectly static).
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
-    PersistMode,
+    PersistMode, Session,
 };
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -65,12 +69,32 @@ const CAPTURE_CHANNEL_DEPTH: usize = 1;
 /// the user's desktop session. The call blocks (asynchronously) until the
 /// user grants or denies access.
 pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
-    let (node_id, fd) = open_portal().await?;
+    let (node_id, fd, session) = open_portal().await?;
     tracing::info!(
         node_id,
         dmabuf_modifiers = dmabuf_modifiers.len(),
         "portal handshake complete; spawning pipewire thread"
     );
+
+    // Hold the portal ScreenCast session alive and close it explicitly
+    // when capture ends. Quitting the PipeWire mainloop stops the stream
+    // but does NOT clear the compositor's "screen is being shared"
+    // indicator — that's tied to the portal *session*, which lingers
+    // until `Session::close` (or process exit, since the zbus connection
+    // is shared process-wide). The PipeWire thread fires `close_tx` once
+    // its mainloop exits; this task then closes the session on the tokio
+    // runtime where the session's connection lives (closing from the
+    // sync capture thread would have no reactor).
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        // `Err` means the sender dropped without signalling (capture
+        // thread panicked before sending) — close anyway for cleanup.
+        let _ = close_rx.await;
+        match session.close().await {
+            Ok(()) => tracing::info!("portal screencast session closed"),
+            Err(e) => tracing::warn!(error = %e, "failed to close portal screencast session"),
+        }
+    });
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
     // Cursor channels: shape changes are rare → unbounded crossbeam (a
@@ -98,6 +122,11 @@ pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
             ) {
                 tracing::error!(error = %e, "pipewire capture thread failed");
             }
+            // The mainloop has exited (receiver dropped → `quit()`, or an
+            // early error above). Signal the closer task to tear down the
+            // portal session. Send error = receiver already gone; nothing
+            // to do.
+            let _ = close_tx.send(());
         })?;
     let cursor_source: Box<dyn CursorSource> = Box::new(PipeWireCursorSource {
         shape_rx,
@@ -157,7 +186,75 @@ impl CursorSource for PipeWireCursorSource {
     }
 }
 
-async fn open_portal() -> Result<(u32, OwnedFd)> {
+/// Directory where we persist the ScreenCast restore token. Mirrors
+/// the client's `$HOME/.tether` convention (see `tether-client`'s
+/// `client_config_dir`); `TETHER_STATE_DIR` overrides it for tests and
+/// sandboxed deployments.
+fn state_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("TETHER_STATE_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".tether"))
+}
+
+fn restore_token_path() -> Option<std::path::PathBuf> {
+    state_dir().map(|dir| dir.join("screencast-restore-token"))
+}
+
+/// Read the saved ScreenCast restore token, if any. Any error (no
+/// state dir, missing file, unreadable) is treated as "no token" — the
+/// portal then prompts and issues a fresh one.
+fn load_restore_token() -> Option<String> {
+    load_restore_token_from(&restore_token_path()?)
+}
+
+/// Persist the ScreenCast restore token for the next session. Best
+/// effort: a failure just means we re-prompt next launch, so we log and
+/// move on rather than failing the capture handshake.
+fn save_restore_token(token: &str) {
+    let Some(path) = restore_token_path() else {
+        tracing::warn!("no state dir (HOME unset); cannot persist screencast restore token");
+        return;
+    };
+    match save_restore_token_to(&path, token) {
+        Ok(()) => tracing::info!(?path, "persisted screencast restore token"),
+        Err(e) => tracing::warn!(error = %e, ?path, "failed to persist screencast restore token"),
+    }
+}
+
+fn load_restore_token_from(path: &std::path::Path) -> Option<String> {
+    let token = std::fs::read_to_string(path).ok()?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_owned())
+    }
+}
+
+fn save_restore_token_to(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // SECURITY: the restore token is a portal capability credential — a
+    // co-user who reads it could potentially replay our share grant.
+    // Owner-only, matching tether-pairing/tether-transport key files.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode(0o600)` above only applies when *creating* the file; if it
+    // already existed with broader permissions, tighten it now so a
+    // rotated token can't inherit a world-readable mode.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(token.as_bytes())
+}
+
+async fn open_portal() -> Result<(u32, OwnedFd, Session<Screencast>)> {
     let proxy = Screencast::new().await?;
     // Query supported cursor modes up front. GNOME 45+ and KDE
     // Plasma 6 both advertise Metadata, but legacy portals fall
@@ -181,6 +278,12 @@ async fn open_portal() -> Result<(u32, OwnedFd)> {
         "portal cursor mode negotiation"
     );
     let session = proxy.create_session(Default::default()).await?;
+    // Replay a previously-granted restore token so the compositor can
+    // skip (or quietly confirm) the share dialog. `ExplicitlyRevoked`
+    // asks the portal to remember the grant until the user revokes it
+    // in their desktop's privacy settings — the behaviour unattended
+    // remote access needs. Mirrors Sunshine / rustdesk server mode.
+    let saved_token = load_restore_token();
     proxy
         .select_sources(
             &session,
@@ -188,14 +291,25 @@ async fn open_portal() -> Result<(u32, OwnedFd)> {
                 .set_cursor_mode(chosen_cursor_mode)
                 .set_sources(BitFlags::from(SourceType::Monitor))
                 .set_multiple(false)
-                .set_restore_token(None)
-                .set_persist_mode(PersistMode::DoNot),
+                .set_restore_token(saved_token.as_deref())
+                .set_persist_mode(PersistMode::ExplicitlyRevoked),
         )
         .await?;
     let response = proxy
         .start(&session, None, Default::default())
         .await?
         .response()?;
+    // The portal may hand back a fresh token on every Start (token
+    // rotation), so persist whatever it returned, replacing the old
+    // one. A missing token means the portal declined to persist (older
+    // backend / user chose not to remember) — leave any prior token in
+    // place rather than clobbering it. Save failures are non-fatal: the
+    // session still works, we just re-prompt next launch.
+    if let Some(token) = response.restore_token() {
+        if Some(token) != saved_token.as_deref() {
+            save_restore_token(token);
+        }
+    }
     let stream = response
         .streams()
         .first()
@@ -205,10 +319,20 @@ async fn open_portal() -> Result<(u32, OwnedFd)> {
     let fd = proxy
         .open_pipe_wire_remote(&session, Default::default())
         .await?;
-    Ok((node_id, fd))
+    // Return the session (it owns its own zbus proxy/connection) so the
+    // caller can close it on teardown; dropping it here would leak it on
+    // the portal until process exit. The `proxy` can drop — `close` goes
+    // through the session's own proxy.
+    Ok((node_id, fd, session))
 }
 
 struct UserData {
+    /// Clone of the capture thread's mainloop, so the `process`
+    /// callback can `quit()` it when the frame receiver is gone (client
+    /// disconnected). Without this the thread spins forever, leaking a
+    /// PipeWire stream + portal screencast session per connection and
+    /// keeping the compositor's "screen is being shared" indicator up.
+    mainloop: pw::main_loop::MainLoopRc,
     format: spa::param::video::VideoInfoRaw,
     sender: Sender<CapturedFrame>,
     /// `Some(modifier)` once `param_changed` has seen a fixated
@@ -252,6 +376,7 @@ fn run_pipewire(
     let core = context.connect_fd(fd, None)?;
 
     let user_data = UserData {
+        mainloop: mainloop.clone(),
         format: spa::param::video::VideoInfoRaw::new(),
         sender,
         negotiated_modifier: None,
@@ -472,12 +597,14 @@ fn run_pipewire(
                     tracing::trace!("capture consumer slow, dropping frame");
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    // Receiver is gone but the PipeWire mainloop has no
-                    // graceful-quit signal from here. Hooking
-                    // `mainloop.quit()` in needs a `MainLoopRc` clone
-                    // captured in `UserData`; not done yet because
-                    // capture lives for the process lifetime today.
-                    tracing::debug!("capture receiver dropped; thread will exit on process exit");
+                    // Frame receiver dropped — the client disconnected and
+                    // `handle_client` returned. Quit the mainloop so this
+                    // thread exits and drops the PipeWire stream + core +
+                    // portal fd, ending the capture (and clearing the
+                    // compositor's share indicator) instead of leaking a
+                    // session per connection.
+                    tracing::info!("capture receiver dropped; quitting pipewire mainloop");
+                    user_data.mainloop.quit();
                 }
             }
         })
@@ -1205,6 +1332,102 @@ mod tests {
     #[test]
     fn region_count_zero_is_idle() {
         assert!(native_damage_from_region_count(0).idle);
+    }
+
+    #[test]
+    fn restore_token_round_trips_through_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "tether-restore-token-roundtrip-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        save_restore_token_to(&path, "tok-abc-123").expect("save succeeds");
+        assert_eq!(
+            load_restore_token_from(&path).as_deref(),
+            Some("tok-abc-123")
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restore_token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("tether-restore-token-perms-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        save_restore_token_to(&path, "secret-token").expect("save succeeds");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "restore token must not be group/world readable"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restore_token_tightens_preexisting_broad_perms() {
+        // A token file left world-readable (older build, manual edit) must
+        // be tightened on the next save — `OpenOptions::mode` only applies
+        // on create, so the explicit chmod is what closes the exposure.
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("tether-restore-token-broad-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "old").expect("seed file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("seed broad perms");
+        save_restore_token_to(&path, "new").expect("save succeeds");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "save must tighten a pre-existing broad mode");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restore_token_resave_with_same_value_round_trips() {
+        // The open_portal dedup only writes when the token changed; this
+        // guards that an idempotent re-save of the same value is a no-op
+        // for the reader (content + perms stay correct).
+        let path = std::env::temp_dir().join(format!(
+            "tether-restore-token-resave-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        save_restore_token_to(&path, "tok").expect("first save");
+        save_restore_token_to(&path, "tok").expect("second save");
+        assert_eq!(load_restore_token_from(&path).as_deref(), Some("tok"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restore_token_missing_file_is_none() {
+        let path = std::env::temp_dir().join("tether-restore-token-absent-xyz");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(load_restore_token_from(&path), None);
+    }
+
+    #[test]
+    fn restore_token_blank_file_is_none() {
+        let path =
+            std::env::temp_dir().join(format!("tether-restore-token-blank-{}", std::process::id()));
+        save_restore_token_to(&path, "   \n").expect("save succeeds");
+        // A whitespace-only file must read back as "no token" so we
+        // don't replay an empty token into the portal.
+        assert_eq!(load_restore_token_from(&path), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_creates_missing_parent_dirs() {
+        let dir =
+            std::env::temp_dir().join(format!("tether-restore-token-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("screencast-restore-token");
+        save_restore_token_to(&path, "deep-token").expect("save creates parents");
+        assert_eq!(
+            load_restore_token_from(&path).as_deref(),
+            Some("deep-token")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

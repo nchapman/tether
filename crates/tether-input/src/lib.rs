@@ -2,10 +2,9 @@
 //! [`InputEvent`]s on the client (`WinitTranslator`), and inject those
 //! events into the host's native input system (`inject::Injector`).
 //!
-//! Backends are picked per-target by [`inject::default_injector`]; today
-//! that's libei on Linux (portal-mediated, Wayland-native) and a noop
-//! everywhere else. Adding macOS / Windows means another backend behind
-//! the same trait.
+//! Backends are picked per-target by [`inject::default_injector`]: a
+//! portal-free `/dev/uinput` backend on Linux, `enigo` (CGEvent /
+//! SendInput) on macOS / Windows, and a noop on unsupported targets.
 
 pub mod inject;
 

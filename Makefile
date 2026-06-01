@@ -5,7 +5,7 @@
 # the cargo invocation each one wraps.
 
 .PHONY: help build release test test-hw test-correctness bench probe clippy fmt check clean \
-        ffmpeg ffmpeg-clean engines shell shell-install shell-check ci package hooks
+        ffmpeg ffmpeg-clean engines shell shell-install shell-check ci package hooks install-udev
 
 help:
 	@awk 'BEGIN { FS = ":.*##"; printf "\nTether dev targets:\n\n" } \
@@ -60,6 +60,13 @@ fmt: ## Format the workspace + the (excluded) Tauri shell
 hooks: ## Install the git pre-commit hook (fmt + gating, no compile)
 	git config core.hooksPath .githooks
 	@echo "pre-commit hook installed (.githooks)"
+
+install-udev: ## (Linux) Install the /dev/uinput udev rule for portal-free input injection (needs sudo)
+	sudo install -m 0644 packaging/linux/udev/60-tether-uinput.rules /etc/udev/rules.d/60-tether-uinput.rules
+	sudo udevadm control --reload-rules
+	sudo udevadm trigger /dev/uinput || sudo udevadm trigger
+	sudo modprobe uinput || true
+	@echo "udev rule installed. tether-host can now inject input without a per-session prompt."
 
 clean: ## Cargo clean
 	cargo clean

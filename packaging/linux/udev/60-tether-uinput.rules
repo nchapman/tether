@@ -1,0 +1,12 @@
+# Let the Tether host create virtual input devices via /dev/uinput
+# without an xdg-desktop-portal prompt on every session.
+#
+# TAG+="uaccess" grants the user of the active local seat an ACL on the
+# node (no group membership and no re-login required; applies on the next
+# `udevadm trigger`). GROUP="input" + MODE="0660" is the fallback for
+# headless / no-seat hosts — those users must be in the `input` group
+# (which takes effect at next login).
+#
+# Installed to /etc/udev/rules.d/60-tether-uinput.rules by
+# `tether-host --setup-input` (or `make install-udev`).
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="input", MODE="0660", TAG+="uaccess"

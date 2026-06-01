@@ -24,7 +24,11 @@ cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check 2>/dev/
   || fail "rustfmt: tether-shell not formatted" \
           "cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml"
 
-scripts/check_test_support_gating.sh >/dev/null \
-  || fail "test-support gating violation" "see scripts/check_test_support_gating.sh output"
+# Capture so a passing run stays quiet, but surface the diagnostics on failure
+# instead of pointing at output we threw away.
+if ! gating_out=$(scripts/check_test_support_gating.sh 2>&1); then
+  printf '%s\n' "${gating_out}" >&2
+  fail "test-support gating violation" "fix the violation reported above"
+fi
 
 printf '\033[36m[pre-commit] fmt + gating OK\033[0m\n' >&2

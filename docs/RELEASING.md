@@ -97,6 +97,8 @@ are dynamic system libraries the installer does **not** ship:
 
 ## Local packaging
 
-`make package` runs the same bundle steps locally (unsigned updater artifacts
-unless `TAURI_SIGNING_PRIVATE_KEY` is exported). Output lands under
-`apps/tether-shell/src-tauri/target/release/bundle/`.
+`make package` builds the installers locally. It passes only
+`tauri.release.conf.json`, so it does **not** emit updater artifacts
+(`latest.json` + per-bundle `.sig`) — those need `tauri.updater.conf.json`
+plus the signing key, which only the tagged `release.yml` flow layers on.
+Output lands under `apps/tether-shell/src-tauri/target/release/bundle/`.

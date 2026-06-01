@@ -382,22 +382,20 @@ function ClientPanel() {
   );
 }
 
-// Shown when the startup updater check emits `update-available` (payload is
-// the new version string). The button calls the `install_update` command,
-// which downloads + installs the signed bundle and restarts into it — so a
-// successful install never returns here.
+// Asks the backend for an available update on mount; if there is one, shows a
+// banner whose button calls `install_update` — which downloads + installs the
+// signed bundle and restarts into it, so a successful install never returns
+// here. Pulling on mount (rather than listening for a startup-emitted event)
+// avoids the race where the check resolves before this listener exists.
 function UpdateBanner() {
   const [version, setVersion] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const un = listen<string>("update-available", ({ payload }) =>
-      setVersion(payload),
-    );
-    return () => {
-      un.then((f) => f());
-    };
+    invoke<string | null>("check_for_updates")
+      .then(setVersion)
+      .catch((e) => console.warn("update check failed", e));
   }, []);
 
   if (!version) return null;

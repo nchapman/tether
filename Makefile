@@ -64,12 +64,14 @@ hooks: ## Install the git pre-commit hook (fmt + gating, no compile)
 clean: ## Cargo clean
 	cargo clean
 
-ci: ffmpeg ## Run the no-hardware checks CI runs (fmt, gating, build, test)
+ci: ffmpeg ## Run the no-hardware checks CI runs (fmt, gating, build, test, clippy, shell)
 	cargo fmt --all --check
 	cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check
 	@scripts/check_test_support_gating.sh
 	RUSTFLAGS="-D warnings" cargo build --workspace --all-targets
 	cargo test --workspace
+	$(MAKE) clippy
+	$(MAKE) shell-check
 
 # --- Packaging (Tauri installers) -----------------------------------------
 # Builds release engines, stages them as sidecars, and runs the Tauri bundler

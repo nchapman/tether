@@ -99,9 +99,9 @@ pub fn accepts_iosurface_fourcc(chroma: ChromaSubsampling, bit_depth: u8, fourcc
 #[must_use]
 pub fn iosurface_fourcc_expected_label(chroma: ChromaSubsampling, bit_depth: u8) -> &'static str {
     match (chroma, bit_depth) {
-        (ChromaSubsampling::Yuv420, 8) => "'420v' or '420f' (NV12 biplanar 8-bit)",
-        (ChromaSubsampling::Yuv444, 8) => "'444v' or '444f' (NV24 biplanar 8-bit)",
-        (ChromaSubsampling::Yuv420, 10) => "'x420', 'xf20', or 'P010' (biplanar 4:2:0 10-bit)",
+        (ChromaSubsampling::Yuv420, 8) => "'420v' (NV12 biplanar 8-bit)",
+        (ChromaSubsampling::Yuv444, 8) => "'444v' (NV24 biplanar 8-bit)",
+        (ChromaSubsampling::Yuv420, 10) => "'x420' or 'P010' (biplanar 4:2:0 10-bit)",
         (ChromaSubsampling::Yuv444, 10) => "'xf44' or 'P410' (biplanar 4:4:4 10-bit)",
         _ => {
             "an IOSurface fourcc supported by this build (8-bit 4:2:0/4:4:4 or 10-bit 4:2:0/4:4:4)"

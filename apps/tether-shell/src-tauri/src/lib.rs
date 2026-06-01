@@ -11,7 +11,7 @@ mod supervisor;
 use supervisor::{Supervisor, ROLE_CLIENT, ROLE_HOST};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri::{AppHandle, Manager, RunEvent, State};
 use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
 
@@ -124,14 +124,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Supervisor::default())
         .setup(|app| {
-            // Best-effort startup update check; never blocks the shell.
-            let update_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = check_for_updates(update_handle).await {
-                    tracing::warn!(error = %e, "update check failed");
-                }
-            });
-
             // System tray: the shell keeps running here even when the
             // window is closed, so the host engine can stay up headless.
             let show = MenuItemBuilder::with_id("show", "Show Tether").build(app)?;
@@ -156,6 +148,7 @@ pub fn run() {
             start_pairing,
             revoke_peer,
             list_peers,
+            check_for_updates,
             install_update
         ])
         .build(tauri::generate_context!())
@@ -171,22 +164,28 @@ pub fn run() {
         });
 }
 
-/// Best-effort startup update check. Queries the configured GitHub Releases
-/// endpoint and, if a newer signed bundle exists, emits `update-available`
-/// (carrying the new version) so the webview can show the banner whose
-/// "Install & restart" button calls [`install_update`]. Any failure (offline,
-/// no release yet, dev build) is returned to the caller, which logs and
-/// swallows it; a failed check must never block the shell from starting.
-async fn check_for_updates(app: AppHandle) -> Result<(), String> {
+/// Check the configured GitHub Releases endpoint for a newer signed bundle.
+/// Returns the available version (so the webview can show the "Install &
+/// restart" banner that calls [`install_update`]), or `None` if up to date.
+///
+/// Invoked by the webview on mount rather than pushed from `setup`: a startup
+/// emit can fire before the React listener mounts, and Tauri doesn't buffer
+/// events for late subscribers — the request/response shape has no such race.
+/// Any failure (offline, no release yet, dev build) is returned to the caller,
+/// which logs and swallows it; a failed check must never block the shell.
+#[tauri::command]
+async fn check_for_updates(app: AppHandle) -> Result<Option<String>, String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
     match updater.check().await.map_err(|e| e.to_string())? {
         Some(update) => {
             tracing::info!(version = %update.version, "update available");
-            let _ = app.emit("update-available", update.version.clone());
+            Ok(Some(update.version))
         }
-        None => tracing::info!("shell is up to date"),
+        None => {
+            tracing::info!("shell is up to date");
+            Ok(None)
+        }
     }
-    Ok(())
 }
 
 /// Reveal and focus the main window (from the tray "Show" item).

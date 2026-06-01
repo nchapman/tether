@@ -2,8 +2,9 @@
 //! plane(s) the renderer can sample. Dispatches on the negotiated
 //! `(chroma, bit_depth)` — 8-bit 4:2:0 gets biplanar NV12 (R8 Y +
 //! Rg8 UV), 8-bit 4:4:4 gets packed XYUV in a single Rgba8 texture,
-//! 10-bit gets biplanar P010/P410 (R16 Y + Rg16 UV). Pure Linux
-//! module — macOS lands its IOSurface equivalent in `metal.rs`.
+//! 10-bit 4:2:0 gets biplanar P010 (R16 Y + Rg16 UV), 10-bit 4:4:4 gets
+//! packed Y410 in a single Rgb10a2 texture. Pure Linux module — macOS
+//! lands its IOSurface equivalent in `metal.rs`.
 
 use tether_codec::{DmaBufFrame, GpuFrameGuard};
 use tether_protocol::control::ChromaSubsampling;
@@ -50,30 +51,23 @@ pub(crate) fn import_dmabuf_textures(
         (ChromaSubsampling::Yuv444, 8) => {
             import_yuv444_packed(device, layout, sampler, dmabuf, width, height, guard)
         }
-        (ChromaSubsampling::Yuv420 | ChromaSubsampling::Yuv444, 10) => {
-            // 10-bit 4:2:0 (P010) and 4:4:4 (P410) both land here:
-            // biplanar 16-bit cells, MSB-aligned 10-bit data. UV plane
-            // dims come from `chroma` (half-res for 4:2:0, full-res
-            // for 4:4:4) — passing it through means we never have to
-            // sniff the DRM fourcc for layout decisions, which would
-            // be wrong for any driver that emits a non-P010/P410
-            // fourcc for the same (chroma, bit_depth) shape.
-            //
-            // **Unverified for 4:4:4 10-bit on Linux**: the encoder
-            // takes packed XV30 input, but VAAPI's *decode* output
-            // format for HEVC Main 4:4:4 10-bit is driver-dependent —
-            // RADV has emitted both packed XV30 (1 layer) and
-            // biplanar P410-style 16-bit (2 layers) across Mesa
-            // versions. If `import_biplanar` errors below with
-            // "expected 2 layers, got 1" on a 4:4:4 10-bit frame,
-            // the driver emitted packed XV30 and the renderer needs
-            // a new `RenderLayout::Packed1010102` import variant
-            // analogous to `PackedXYUV`. The hardware test
-            // `dmabuf_test::roundtrip_hevc_main444_10bit_identity`
-            // is the gate that surfaces this on RADV/NVK.
+        (ChromaSubsampling::Yuv420, 10) => {
+            // P010: biplanar 16-bit cells, MSB-aligned 10-bit data,
+            // half-res UV. We never sniff the DRM fourcc for layout —
+            // the negotiated `chroma` is the source of truth.
             import_biplanar(
                 device, layout, sampler, chroma, dmabuf, width, height, guard, true,
             )
+        }
+        (ChromaSubsampling::Yuv444, 10) => {
+            // HEVC Main 4:4:4 10-bit. Intel's VAAPI decoder exports this
+            // as a single packed Y410 layer (DRM_FORMAT_Y410, 10:10:10:2).
+            // `render_layout_for` returns `PackedY410` for this cell on
+            // Linux, so the bind-group layout here is the single-texture
+            // packed one. (A driver that instead emits biplanar P410 or
+            // XV30 would need a separate cell; not observed on Intel
+            // media-driver, which is our reference for 4:4:4.)
+            import_yuv444_packed_y410(device, layout, sampler, dmabuf, width, height, guard)
         }
         _ => Err(RenderError::DmaBufImport(format!(
             "no Linux dma-buf import path wired for {chroma:?} {bit_depth}-bit"
@@ -231,6 +225,80 @@ fn import_yuv444_packed(
     let packed_view = packed.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tether-render yuv bind group (dmabuf 444 packed)"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&packed_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    Ok(YuvTextures {
+        planes: YuvPlanes::Yuv444Packed { packed },
+        bind_group,
+        size: (width, height),
+        _guard: Some(guard),
+    })
+}
+
+/// VAAPI decodes a Main444 10-bit surface to a single packed Y410 layer:
+/// one DRM object, one layer, fourcc `Y410` (DRM_FORMAT_Y410, "[31:0]
+/// A:Cr:Y:Cb"), one plane (32 bpp, 10:10:10:2 little-endian). Imported as
+/// a single `Rgb10a2Unorm` texture — native 10-bit, so no MSB-align — and
+/// sampled by `shader_yuv444_10bit.wgsl` (channel map R=Y, G=U, B=V,
+/// empirically verified — Intel's Y410 output uses the same Rgb10a2
+/// layout it consumes as XV30 input, not the DRM-spec Y410 order).
+///
+/// NOTE the decode-output fourcc (Y410) differs from the encoder-input
+/// fourcc (XV30 that gpuconvert's BGRA→XV30 pass writes), but the bit
+/// layout is identical on Intel media-driver — our 4:4:4 reference. A
+/// driver that emits a genuinely different layout (e.g. biplanar P410)
+/// would need its own cell.
+fn import_yuv444_packed_y410(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    dmabuf: &DmaBufFrame,
+    width: u32,
+    height: u32,
+    guard: GpuFrameGuard,
+) -> Result<YuvTextures> {
+    if dmabuf.layers.len() != 1 {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444 10-bit dma-buf has {} layers; expected 1 (packed Y410)",
+            dmabuf.layers.len()
+        )));
+    }
+    let layer = &dmabuf.layers[0];
+    if layer.num_planes != 1 {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444 10-bit packed layer should have 1 plane, got {}",
+            layer.num_planes
+        )));
+    }
+    let expected_fourcc = u32::from_le_bytes(*b"Y410");
+    if layer.drm_format != expected_fourcc {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444 10-bit layer fourcc 0x{:08x} != expected Y410 (0x{:08x})",
+            layer.drm_format, expected_fourcc
+        )));
+    }
+    let packed = import_one_layer(
+        device,
+        "tether-render y410 packed (dmabuf 444 10-bit)",
+        dmabuf,
+        0,
+        width,
+        height,
+        wgpu::TextureFormat::Rgb10a2Unorm,
+    )?;
+    let packed_view = packed.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tether-render yuv bind group (dmabuf 444 packed 10-bit)"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {

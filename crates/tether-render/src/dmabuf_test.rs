@@ -327,21 +327,18 @@ fn roundtrip_hevc_main10_identity() {
 
 /// HEVC Main 4:4:4 10-bit identity. XV30 dma-buf bridge
 /// (Bgra2Xv30DmaBuf, packed 10:10:10:2) → encoder.submit_dmabuf →
-/// decoder → render-side import. The decoder's exported surface format
-/// for 4:4:4 10-bit is driver-dependent (RADV has emitted both packed
-/// XV30 and biplanar P410-style 16-bit across Mesa versions); the
-/// existing `b"XV30" → RenderLayout::Biplanar16` mapping in the
-/// `cross_table_consistency` module below assumes biplanar. If this
-/// test fails because the decoder emits packed instead, the renderer
-/// needs a new `RenderLayout::Packed1010102` import variant.
+/// decoder → render-side import. The encoder *consumes* XV30, but Intel's
+/// VAAPI decoder *outputs* packed Y410 (single 10:10:10:2 layer — same
+/// size, different component order), which `render_layout_for` maps to
+/// `RenderLayout::PackedY410` and `import_yuv444_packed_y410` imports as
+/// one `Rgb10a2Unorm` texture (`shader_yuv444_10bit.wgsl`). This cell is
+/// the gate that exercises that packed path end-to-end.
 ///
 /// Empirically SKIPs on Intel iHD + Meteor Lake — same driver-side
 /// vaapi_drm_format_map gap as the 4:2:0 10-bit Main10 cell.
 #[test]
 #[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Rgb10a2Unorm storage; \
-            may SKIP on Intel iHD/Meteor Lake; \
-            may fail with 'expected 2 layers, got 1' if RADV emits packed XV30 \
-            from decode (needs RenderLayout::Packed1010102 — see import.rs:53)"]
+            may SKIP on Intel iHD/Meteor Lake"]
 fn roundtrip_hevc_main444_10bit_identity() {
     let case = RoundtripCase {
         name: "hevc_main444_10bit_identity",
@@ -694,25 +691,20 @@ mod cross_table_consistency {
     ];
 
     /// Maps each encoder-input fourcc to the renderer layout we expect
-    /// to use for the matching `(chroma, bit_depth)`. The mapping
-    /// holds for the 8-bit and 4:2:0 10-bit paths because the
-    /// decoder emits the same fourcc family it consumes.
-    ///
-    /// **The XV30 entry is a hypothesis, not a verified fact.** The
-    /// encoder takes packed XV30 (single-plane); VAAPI's decode-side
-    /// output format for HEVC 4:4:4 10-bit is driver-dependent, and
-    /// RADV has emitted both packed XV30 and biplanar P410-style
-    /// 16-bit across Mesa versions. If a future hardware run shows
-    /// the decoder emits packed XV30, this mapping is wrong and the
-    /// renderer needs a `RenderLayout::Packed1010102` variant —
-    /// `import.rs:53` carries the matching comment. See the
-    /// `roundtrip_hevc_main444_10bit_identity` cell for the gate.
+    /// to use for the matching `(chroma, bit_depth)`. The keys are the
+    /// *encoder-input* fourccs (`expected_dmabuf_fourcc`); the values are
+    /// the renderer's *decode-output* layout. For 4:2:0 and 8-bit 4:4:4
+    /// the decoder emits the same fourcc family it consumes. For 4:4:4
+    /// 10-bit they differ: the encoder consumes XV30 but Intel's decoder
+    /// outputs Y410 (→ `PackedY410`) — same 10:10:10:2 packing, different
+    /// component order. Verified end-to-end by the
+    /// `roundtrip_hevc_main444_10bit_identity` cell on Intel media-driver.
     fn expected_layout_for_fourcc(fourcc: u32) -> RenderLayout {
         match &fourcc.to_le_bytes() {
             b"NV12" => RenderLayout::Biplanar8,
             b"P010" => RenderLayout::Biplanar16,
             b"XYUV" => RenderLayout::PackedXYUV,
-            b"XV30" => RenderLayout::Biplanar16,
+            b"XV30" => RenderLayout::PackedY410,
             other => panic!("expected_layout_for_fourcc: unknown fourcc {other:?}"),
         }
     }

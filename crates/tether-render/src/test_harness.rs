@@ -424,14 +424,25 @@ fn load_png_fixture_at(name: &str, dims: (u32, u32)) -> Vec<u8> {
 
 fn encode_chain(case: &RoundtripCase, capture_bgra: &[u8]) -> Vec<tether_codec::EncodedPacket> {
     if case.encode_dims == case.capture_dims {
-        // No scaler; encode directly. 10-bit needs the P010 bridge.
+        // No scaler; encode directly. 10-bit needs a packed/biplanar
+        // bridge matching the encoder's input format: 4:4:4 takes XV30
+        // (the production path via Bgra2Xv30DmaBuf), 4:2:0 takes P010.
         if case.profile.bit_depth == 10 {
-            encode_via_p010_bridge(
-                case.profile,
-                case.capture_dims,
-                capture_bgra,
-                case.frames_encoded,
-            )
+            if case.profile.chroma == ChromaSubsampling::Yuv444 {
+                encode_via_xv30_bridge(
+                    case.profile,
+                    case.capture_dims,
+                    capture_bgra,
+                    case.frames_encoded,
+                )
+            } else {
+                encode_via_p010_bridge(
+                    case.profile,
+                    case.capture_dims,
+                    capture_bgra,
+                    case.frames_encoded,
+                )
+            }
         } else {
             encode_via_cpu_upload(
                 case.profile,
@@ -639,6 +650,60 @@ fn encode_via_p010_bridge(
             Ok(p) => packets.extend(p),
             Err(e) => {
                 eprintln!("SKIP: submit_dmabuf rejected P010 (driver gap): {e}");
+                return Vec::new();
+            }
+        }
+    }
+    packets
+}
+
+/// Encode 4:4:4 10-bit via the production XV30 packed bridge
+/// (`Bgra2Xv30DmaBuf`), the encoder-input format for HEVC Main 4:4:4
+/// 10-bit. Mirrors `encode_via_p010_bridge` but single-plane packed.
+/// SKIPs (empty packets) if the encoder or bridge can't be built on this
+/// driver, same convention as the other encode helpers.
+fn encode_via_xv30_bridge(
+    profile: VideoProfile,
+    dims: (u32, u32),
+    bgra: &[u8],
+    frames: usize,
+) -> Vec<tether_codec::EncodedPacket> {
+    let (w, h) = dims;
+    let mut enc = match VaapiEncoder::new(profile, w, h, 30, 4_000) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("SKIP: VAAPI 4:4:4 10-bit encoder construction failed: {e}");
+            return Vec::new();
+        }
+    };
+    let bridge = match pollster::block_on(tether_gpuconvert::Bgra2Xv30DmaBuf::new(w, h)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP: Bgra2Xv30DmaBuf::new failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut packets = Vec::new();
+    for t in 0..frames as i64 {
+        let xv30 = match bridge.convert_bgra_bytes(bgra) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("SKIP: XV30 bridge convert failed: {e}");
+                return Vec::new();
+            }
+        };
+        let dup_fd = xv30.fd.try_clone().expect("dup XV30 fd");
+        let codec_frame = tether_codec::build_xv30_dmabuf_frame(
+            dup_fd,
+            xv30.size,
+            xv30.modifier,
+            xv30.offset,
+            xv30.stride,
+        );
+        match enc.submit_dmabuf(&codec_frame, t, t == 0) {
+            Ok(p) => packets.extend(p),
+            Err(e) => {
+                eprintln!("SKIP: submit_dmabuf rejected XV30 (driver gap): {e}");
                 return Vec::new();
             }
         }

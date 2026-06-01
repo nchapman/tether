@@ -71,8 +71,11 @@ pub(crate) enum YuvPlanes {
     /// `1.0` so the limited-range expansion lands on the right
     /// breakpoints.
     Biplanar16 { y: wgpu::Texture, uv: wgpu::Texture },
-    /// XYUV8888 packed 4:4:4: one Rgba8 texture, byte order V/U/Y/X.
-    /// See `shader_yuv444.wgsl` for why packed instead of planar.
+    /// Packed 4:4:4 in a single texture: 8-bit XYUV8888 (Rgba8, byte
+    /// order V/U/Y/X — see `shader_yuv444.wgsl`) or 10-bit Y410 (Rgb10a2,
+    /// 10:10:10:2, channels R=Y/G=U/B=V — see `shader_yuv444_10bit.wgsl`).
+    /// The variant holds one texture either way; the `RenderLayout`
+    /// (`PackedXYUV` vs `PackedY410`) picks the matching shader.
     Yuv444Packed { packed: wgpu::Texture },
 }
 
@@ -300,6 +303,10 @@ pub(crate) enum RenderLayout {
     Biplanar8,
     Biplanar16,
     PackedXYUV,
+    /// Packed 4:4:4 10-bit (Y410 / `Rgb10a2Unorm`): one 10:10:10:2
+    /// texture, native 10-bit (no MSB-align). Linux VAAPI decode-output
+    /// shape for HEVC Main 4:4:4 10-bit; see `shader_yuv444_10bit.wgsl`.
+    PackedY410,
 }
 
 pub(crate) fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> RenderLayout {
@@ -315,12 +322,23 @@ pub(crate) fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> Ren
                 RenderLayout::PackedXYUV
             }
         }
-        // 10-bit: both platforms land on biplanar 16-bit. macOS receives
-        // `'P410'` (HEVC 4:4:4 10-bit decode) / `'xf44'` (SCK 4:4:4 10-bit
-        // capture) / `'P010'` (HEVC Main10 decode); Linux receives
-        // `DRM_FORMAT_P010`/`P410` dma-bufs. The 10-in-16 MSB-align
-        // applies uniformly.
-        (ChromaSubsampling::Yuv420 | ChromaSubsampling::Yuv444, 10) => RenderLayout::Biplanar16,
+        // 10-bit 4:2:0 (Main10): biplanar 16-bit on both platforms.
+        // macOS gets `'P010'`, Linux gets `DRM_FORMAT_P010`; the
+        // 10-in-16 MSB-align applies uniformly.
+        (ChromaSubsampling::Yuv420, 10) => RenderLayout::Biplanar16,
+        // 10-bit 4:4:4: same platform split as the 8-bit 4:4:4 case.
+        // macOS decodes to biplanar `'P410'`/`'xf44'` (16-bit cells →
+        // Biplanar16). Linux's VAAPI decoder exports packed Y410 (single
+        // 10:10:10:2 plane → PackedY410). Mirrors the `Yuv444, 8` XYUV
+        // split above. (Note: the decode-output Y410 differs in component
+        // order from the encoder-input XV30 the gpuconvert bridge writes.)
+        (ChromaSubsampling::Yuv444, 10) => {
+            if cfg!(target_os = "macos") {
+                RenderLayout::Biplanar16
+            } else {
+                RenderLayout::PackedY410
+            }
+        }
         // Anything we haven't enumerated (12-bit, future chroma like
         // Yuv422) reaches the renderer by construction — the
         // negotiator filters on PROFILE_PREFERENCE, and the encoder
@@ -715,37 +733,36 @@ impl GpuState {
         // filterable-float-sampleable, so the bgl can stay format-blind);
         // PackedXYUV has one Rgba8 texture + sampler at binding 1.
         let layout = render_layout_for(chroma, bit_depth);
-        let yuv_bgl = match layout {
-            RenderLayout::Biplanar8 | RenderLayout::Biplanar16 => {
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("tether-render yuv bgl (biplanar)"),
-                    entries: &[
-                        bgl_texture_entry(0),
-                        bgl_texture_entry(1),
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                    ],
-                })
-            }
-            RenderLayout::PackedXYUV => {
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("tether-render yuv bgl (444 packed)"),
-                    entries: &[
-                        bgl_texture_entry(0),
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                    ],
-                })
-            }
-        };
+        let yuv_bgl =
+            match layout {
+                RenderLayout::Biplanar8 | RenderLayout::Biplanar16 => device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("tether-render yuv bgl (biplanar)"),
+                        entries: &[
+                            bgl_texture_entry(0),
+                            bgl_texture_entry(1),
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 2,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                        ],
+                    }),
+                RenderLayout::PackedXYUV | RenderLayout::PackedY410 => device
+                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("tether-render yuv bgl (444 packed)"),
+                        entries: &[
+                            bgl_texture_entry(0),
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                        ],
+                    }),
+            };
 
         let scale_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tether-render scale bgl"),
@@ -841,12 +858,14 @@ impl GpuState {
                 include_str!("../shader.wgsl")
             }
             RenderLayout::PackedXYUV => include_str!("../shader_yuv444.wgsl"),
+            RenderLayout::PackedY410 => include_str!("../shader_yuv444_10bit.wgsl"),
         };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(match layout {
                 RenderLayout::Biplanar8 => "tether-render shader (biplanar 8)",
                 RenderLayout::Biplanar16 => "tether-render shader (biplanar 16)",
                 RenderLayout::PackedXYUV => "tether-render shader (444 packed)",
+                RenderLayout::PackedY410 => "tether-render shader (444 packed 10-bit)",
             }),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
@@ -1685,7 +1704,9 @@ fn make_yuv_textures(
                     wgpu::TextureFormat::R16Unorm,
                     wgpu::TextureFormat::Rg16Unorm,
                 ),
-                RenderLayout::PackedXYUV => unreachable!("guarded by outer match"),
+                RenderLayout::PackedXYUV | RenderLayout::PackedY410 => {
+                    unreachable!("guarded by outer match")
+                }
             };
             let y = make_plane_texture(device, "tether-render y plane", width, height, y_format);
             let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1726,7 +1747,7 @@ fn make_yuv_textures(
             let planes = match render_layout {
                 RenderLayout::Biplanar8 => YuvPlanes::Biplanar8 { y, uv },
                 RenderLayout::Biplanar16 => YuvPlanes::Biplanar16 { y, uv },
-                RenderLayout::PackedXYUV => unreachable!(),
+                RenderLayout::PackedXYUV | RenderLayout::PackedY410 => unreachable!(),
             };
             YuvTextures {
                 planes,
@@ -1735,14 +1756,20 @@ fn make_yuv_textures(
                 _guard: None,
             }
         }
-        RenderLayout::PackedXYUV => {
-            let packed = make_plane_texture(
-                device,
-                "tether-render xyuv packed (444)",
-                width,
-                height,
-                wgpu::TextureFormat::Rgba8Unorm,
-            );
+        RenderLayout::PackedXYUV | RenderLayout::PackedY410 => {
+            // 8-bit XYUV → Rgba8Unorm; 10-bit Y410 → Rgb10a2Unorm. Both
+            // bind as a single packed texture + sampler.
+            let (label, format) = match render_layout {
+                RenderLayout::PackedY410 => (
+                    "tether-render y410 packed (444 10-bit)",
+                    wgpu::TextureFormat::Rgb10a2Unorm,
+                ),
+                _ => (
+                    "tether-render xyuv packed (444)",
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ),
+            };
+            let packed = make_plane_texture(device, label, width, height, format);
             let packed_view = packed.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("tether-render yuv bind group (444 packed)"),
@@ -1977,19 +2004,21 @@ mod tests {
         } else {
             assert_eq!(yuv444_8bit, RenderLayout::PackedXYUV);
         }
-        // 10-bit: both chroma subsamplings land on biplanar 16. Pin
-        // both explicitly so a future refactor that splits these into
-        // separate variants (e.g. PackedXVYU2101010) fails here.
+        // 10-bit 4:2:0 (Main10) is biplanar P010 on both platforms.
         assert_eq!(
             render_layout_for(ChromaSubsampling::Yuv420, 10),
             RenderLayout::Biplanar16,
             "Yuv420 10-bit must dispatch to Biplanar16; the renderer's import \
              path relies on this for UV-plane dimensioning"
         );
-        assert_eq!(
-            render_layout_for(ChromaSubsampling::Yuv444, 10),
-            RenderLayout::Biplanar16
-        );
+        // 10-bit 4:4:4: same platform split as 8-bit 4:4:4 — macOS
+        // decodes to biplanar P410 (Biplanar16), Linux to packed Y410.
+        let yuv444_10bit = render_layout_for(ChromaSubsampling::Yuv444, 10);
+        if cfg!(target_os = "macos") {
+            assert_eq!(yuv444_10bit, RenderLayout::Biplanar16);
+        } else {
+            assert_eq!(yuv444_10bit, RenderLayout::PackedY410);
+        }
     }
 
     /// Pins the Rust→shader integer mapping so a refactor that

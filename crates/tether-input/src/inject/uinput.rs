@@ -313,6 +313,20 @@ fn letter_keycode(c: char) -> KeyCode {
     hid_to_evdev(HidUsage((0x07 << 16) | hid)).unwrap_or(KeyCode::KEY_RESERVED)
 }
 
+/// Every mouse button we translate, in one place so the device's
+/// capability set (`pointer_buttons`) is derived from the same source as
+/// the codes we emit — the buttons can't drift apart. A new `ProtoButton`
+/// variant breaks `proto_button_to_btn`'s match (forcing a mapping) and
+/// must be added here too, or `proto_buttons_register_on_the_pointer`
+/// fails.
+const ALL_PROTO_BUTTONS: [ProtoButton; 5] = [
+    ProtoButton::Left,
+    ProtoButton::Right,
+    ProtoButton::Middle,
+    ProtoButton::X1,
+    ProtoButton::X2,
+];
+
 fn proto_button_to_btn(b: ProtoButton) -> KeyCode {
     match b {
         ProtoButton::Left => KeyCode::BTN_LEFT,
@@ -336,16 +350,13 @@ fn keyboard_keycodes() -> AttributeSet<KeyCode> {
     set
 }
 
+/// Derived from `proto_button_to_btn` over every button we translate, so
+/// a button we emit can never go unregistered on the device (which would
+/// make the kernel silently drop its press — a stuck-button bug).
 fn pointer_buttons() -> AttributeSet<KeyCode> {
     let mut set = AttributeSet::<KeyCode>::new();
-    for b in [
-        KeyCode::BTN_LEFT,
-        KeyCode::BTN_RIGHT,
-        KeyCode::BTN_MIDDLE,
-        KeyCode::BTN_SIDE,
-        KeyCode::BTN_EXTRA,
-    ] {
-        set.insert(b);
+    for b in ALL_PROTO_BUTTONS {
+        set.insert(proto_button_to_btn(b));
     }
     set
 }
@@ -921,5 +932,20 @@ mod tests {
         // Out-of-range clamps.
         assert_eq!(normalised_to_abs(-1.0), 0);
         assert_eq!(normalised_to_abs(2.0), ABS_MAX);
+    }
+
+    #[test]
+    fn proto_buttons_register_on_the_pointer() {
+        // Every button we translate must be advertised by the pointer
+        // device. If `proto_button_to_btn` and `pointer_buttons` ever
+        // drift, the kernel silently drops the unregistered button's
+        // press (stuck-button bug) — this pins them to one source.
+        let registered = pointer_buttons();
+        for b in ALL_PROTO_BUTTONS {
+            assert!(
+                registered.contains(proto_button_to_btn(b)),
+                "{b:?} maps to a BTN_* the pointer device never registered",
+            );
+        }
     }
 }

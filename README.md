@@ -76,12 +76,9 @@ terminal commands required:
     one-time setup, exactly like the screen-share prompt. Approve it once
     and input works from then on, no per-session dialog.
 
-To grant the input permission ahead of time (e.g. scripting an unattended
-host), run `tether-host --setup-input` (or `make install-udev`) once.
-
-Headless hosts with no active local seat must additionally add the user
-to the `input` group (`sudo usermod -aG input $USER`) and log back in —
-`uaccess` only applies to the user of an active seat.
+Headless hosts with no active local seat must add the user to the `input`
+group (`sudo usermod -aG input $USER`) and log back in — `uaccess` only
+applies to the user of an active seat.
 
 ## Docs
 

@@ -234,20 +234,24 @@ fn load_restore_token_from(path: &std::path::Path) -> Option<String> {
 
 fn save_restore_token_to(path: &std::path::Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // SECURITY: the restore token is a portal capability credential — a
     // co-user who reads it could potentially replay our share grant.
     // Owner-only, matching tether-pairing/tether-transport key files.
-    std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)?
-        .write_all(token.as_bytes())
+        .open(path)?;
+    // `mode(0o600)` above only applies when *creating* the file; if it
+    // already existed with broader permissions, tighten it now so a
+    // rotated token can't inherit a world-readable mode.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(token.as_bytes())
 }
 
 async fn open_portal() -> Result<(u32, OwnedFd, Session<Screencast>)> {
@@ -1357,6 +1361,24 @@ mod tests {
             mode, 0o600,
             "restore token must not be group/world readable"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restore_token_tightens_preexisting_broad_perms() {
+        // A token file left world-readable (older build, manual edit) must
+        // be tightened on the next save — `OpenOptions::mode` only applies
+        // on create, so the explicit chmod is what closes the exposure.
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("tether-restore-token-broad-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "old").expect("seed file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("seed broad perms");
+        save_restore_token_to(&path, "new").expect("save succeeds");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "save must tighten a pre-existing broad mode");
         std::fs::remove_file(&path).ok();
     }
 

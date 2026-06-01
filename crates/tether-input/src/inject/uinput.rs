@@ -99,6 +99,55 @@ fn modifier_right_variant(hid: HidUsage) -> Option<HidUsage> {
     }
 }
 
+/// The modifier snapshot implied by a set of held HID usages: a bit is set
+/// if either the left or right variant is down.
+fn modifiers_from_held(held: &HashSet<HidUsage>) -> Modifiers {
+    Modifiers {
+        shift: held.contains(&HID_LSHIFT) || held.contains(&HID_RSHIFT),
+        ctrl: held.contains(&HID_LCTRL) || held.contains(&HID_RCTRL),
+        alt: held.contains(&HID_LALT) || held.contains(&HID_RALT),
+        meta: held.contains(&HID_LMETA) || held.contains(&HID_RMETA),
+    }
+}
+
+/// Decide the modifier press/release actions needed to reconcile `held`
+/// with the wire's `Modifiers` snapshot, as `(bit, hid, press)` tuples.
+/// `skip` excludes a modifier the caller handles itself. Pure so the
+/// release-variant logic is unit-testable without `/dev/uinput`.
+///
+/// To set a bit the host lacks we press the left variant (either side
+/// satisfies it). To clear a bit we release *every* variant actually held
+/// — releasing only the left would leave a held right-side key stuck.
+fn reconcile_plan(
+    held: &HashSet<HidUsage>,
+    wire: Modifiers,
+    skip: Option<ModBit>,
+) -> Vec<(ModBit, HidUsage, bool)> {
+    let host = modifiers_from_held(held);
+    let mut plan = Vec::new();
+    for (bit, wire_bit, host_bit, left) in [
+        (ModBit::Shift, wire.shift, host.shift, HID_LSHIFT),
+        (ModBit::Ctrl, wire.ctrl, host.ctrl, HID_LCTRL),
+        (ModBit::Alt, wire.alt, host.alt, HID_LALT),
+        (ModBit::Meta, wire.meta, host.meta, HID_LMETA),
+    ] {
+        if Some(bit) == skip || wire_bit == host_bit {
+            continue;
+        }
+        if wire_bit {
+            plan.push((bit, left, true));
+        } else {
+            let right = modifier_right_variant(left).unwrap_or(left);
+            for variant in [left, right] {
+                if held.contains(&variant) {
+                    plan.push((bit, variant, false));
+                }
+            }
+        }
+    }
+    plan
+}
+
 /// HID Keyboard usage (Page 0x07) → evdev physical key. HID usages are
 /// themselves physical-key based, so this is the correct identity
 /// mapping; the compositor then applies the host's keymap to produce a
@@ -487,42 +536,26 @@ impl UinputInjector {
     }
 
     fn host_modifiers(&self) -> Modifiers {
-        Modifiers {
-            shift: self.held_keys.contains(&HID_LSHIFT) || self.held_keys.contains(&HID_RSHIFT),
-            ctrl: self.held_keys.contains(&HID_LCTRL) || self.held_keys.contains(&HID_RCTRL),
-            alt: self.held_keys.contains(&HID_LALT) || self.held_keys.contains(&HID_RALT),
-            meta: self.held_keys.contains(&HID_LMETA) || self.held_keys.contains(&HID_RMETA),
-        }
+        modifiers_from_held(&self.held_keys)
     }
 
     /// Bring host modifier state in line with the wire's `Modifiers`
     /// snapshot by synthesising press/release for any disagreeing bit.
     /// `skip` covers both sides of the modifier the caller is about to
     /// press/release itself, avoiding a double-press. Mirrors the enigo
-    /// backend's `reconcile_modifiers`.
+    /// backend's `reconcile_modifiers`. The release-variant decision lives
+    /// in `reconcile_plan` so it's testable without `/dev/uinput`.
     fn reconcile_modifiers(&mut self, wire: Modifiers, skip: Option<ModBit>) -> Result<()> {
-        let host = self.host_modifiers();
-        for (bit, wire_bit, host_bit, hid) in [
-            (ModBit::Shift, wire.shift, host.shift, HID_LSHIFT),
-            (ModBit::Ctrl, wire.ctrl, host.ctrl, HID_LCTRL),
-            (ModBit::Alt, wire.alt, host.alt, HID_LALT),
-            (ModBit::Meta, wire.meta, host.meta, HID_LMETA),
-        ] {
-            if Some(bit) == skip || wire_bit == host_bit {
-                continue;
-            }
+        for (bit, hid, press) in reconcile_plan(&self.held_keys, wire, skip) {
             if let Some(code) = hid_to_evdev(hid) {
-                let value = i32::from(wire_bit);
-                self.emit_keyboard(&[key_ev(code, value), syn()])?;
-                if wire_bit {
-                    self.held_keys.insert(hid);
-                } else {
-                    self.held_keys.remove(&hid);
-                    self.held_keys
-                        .remove(&modifier_right_variant(hid).unwrap_or(hid));
-                }
-                tracing::trace!(?bit, press = wire_bit, "synthesised modifier to match wire");
+                self.emit_keyboard(&[key_ev(code, i32::from(press)), syn()])?;
             }
+            if press {
+                self.held_keys.insert(hid);
+            } else {
+                self.held_keys.remove(&hid);
+            }
+            tracing::trace!(?bit, press, "synthesised modifier to match wire");
         }
         Ok(())
     }
@@ -932,6 +965,50 @@ mod tests {
         // Out-of-range clamps.
         assert_eq!(normalised_to_abs(-1.0), 0);
         assert_eq!(normalised_to_abs(2.0), ABS_MAX);
+    }
+
+    #[test]
+    fn reconcile_releases_the_held_right_side_modifier() {
+        // Host holds RIGHT shift; wire snapshot says shift is now up.
+        // The release must target the right variant we actually hold —
+        // releasing only LEFT (a no-op) would leave RIGHT shift stuck.
+        let held = HashSet::from([HID_RSHIFT]);
+        let wire = Modifiers {
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        };
+        let plan = reconcile_plan(&held, wire, None);
+        assert_eq!(plan, vec![(ModBit::Shift, HID_RSHIFT, false)]);
+    }
+
+    #[test]
+    fn reconcile_presses_left_variant_to_set_a_bit() {
+        let held = HashSet::new();
+        let wire = Modifiers {
+            shift: false,
+            ctrl: true,
+            alt: false,
+            meta: false,
+        };
+        let plan = reconcile_plan(&held, wire, None);
+        assert_eq!(plan, vec![(ModBit::Ctrl, HID_LCTRL, true)]);
+    }
+
+    #[test]
+    fn reconcile_skips_the_caller_owned_modifier() {
+        // The caller is about to press RIGHT shift itself, so reconcile
+        // must not also touch Shift even though host/wire disagree.
+        let held = HashSet::new();
+        let wire = Modifiers {
+            shift: true,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        };
+        let plan = reconcile_plan(&held, wire, Some(ModBit::Shift));
+        assert!(plan.is_empty());
     }
 
     #[test]

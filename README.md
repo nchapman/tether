@@ -4,7 +4,7 @@ Low-latency, open-source remote desktop in Rust. Inspired by
 [Parsec](https://parsec.app/), [Moonlight](https://moonlight-stream.org/),
 and [Sunshine](https://github.com/LizardByte/Sunshine).
 
-**Status:** early (v0.2.0). Three platforms are wired end-to-end over QUIC:
+**Status:** early (v0.2.1). Three platforms are wired end-to-end over QUIC:
 
 - **Linux** host → client — VAAPI hardware encode, PipeWire DMA-BUF
   capture, wgpu present (the most-exercised path; negotiates up to

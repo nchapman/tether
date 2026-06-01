@@ -59,25 +59,26 @@ make package     # build local installer bundles
 make help        # full target list
 ```
 
-## Linux host setup
+## Linux host permissions
 
-A Linux host needs one-time access to `/dev/uinput` so it can inject
-keyboard/mouse input without an xdg-desktop-portal prompt on every
-connection. Run once:
+A Linux host asks for two permissions, both **once, on first use** — no
+terminal commands required:
 
-```
-tether-host --setup-input    # installs a udev rule via pkexec (one auth prompt)
-```
+- **Screen capture** is granted through the xdg-desktop-portal "share your
+  screen" dialog on the first connection. Tether stores the portal restore
+  token under `~/.tether/` and replays it, so the dialog won't appear again
+  (until you revoke it in your desktop's privacy settings).
+- **Input injection** needs access to `/dev/uinput`, gated by a udev rule:
+  - The **deb/rpm packages install the rule at install time**, so input
+    just works — no prompt at all.
+  - The **AppImage** (and running from source) request it the first time a
+    client connects: a system **PolicyKit dialog** appears to authorize the
+    one-time setup, exactly like the screen-share prompt. Approve it once
+    and input works from then on, no per-session dialog.
 
-or, equivalently, `make install-udev`. After this, input works with no
-per-session permission dialog. The screen-capture grant persists the same
-way automatically — Tether stores the portal restore token under
-`~/.tether/` and replays it, so the "share your screen" dialog appears
-only on the first connection (until you revoke it in your desktop's
-privacy settings).
-
-Headless hosts with no active local seat must additionally add the user
-to the `input` group (`sudo usermod -aG input $USER`) and log back in.
+Headless hosts with no active local seat must add the user to the `input`
+group (`sudo usermod -aG input $USER`) and log back in — `uaccess` only
+applies to the user of an active seat.
 
 ## Docs
 

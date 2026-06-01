@@ -7,6 +7,8 @@
 # headless / no-seat hosts — those users must be in the `input` group
 # (which takes effect at next login).
 #
-# Installed to /etc/udev/rules.d/60-tether-uinput.rules by
-# `tether-host --setup-input` (or `make install-udev`).
+# Installed three ways (identical bytes): shipped to
+# /usr/lib/udev/rules.d by the deb/rpm packages; written to
+# /etc/udev/rules.d on first connection by the host (GUI auth prompt);
+# or up front via `tether-host --setup-input` (or `make install-udev`).
 KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="input", MODE="0660", TAG+="uaccess"

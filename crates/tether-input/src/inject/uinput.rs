@@ -5,8 +5,10 @@
 //! session and its restore-token support is unreliable across
 //! compositors — unacceptable for unattended remote access. uinput
 //! creates virtual input devices the kernel exposes to the compositor's
-//! libinput seat directly: once `/dev/uinput` is writable (see
-//! `tether-host --setup-input`) there is no prompt, ever. This mirrors
+//! libinput seat directly: once `/dev/uinput` is writable there is no
+//! prompt, ever. Access is granted by a udev rule — shipped by the
+//! deb/rpm packages, or installed on first connection through a GUI
+//! authorization prompt (see `tether-host`'s `setup_input`). This mirrors
 //! what the mature Wayland hosts (Sunshine, rustdesk server mode) ship.
 //!
 //! Three virtual devices are created, following Sunshine's split (a
@@ -447,15 +449,17 @@ pub struct UinputInjector {
 }
 
 impl UinputInjector {
-    /// Create the three virtual devices. Fails with [`InjectError::Init`]
-    /// if `/dev/uinput` isn't writable — the host then logs an actionable
-    /// hint (`tether-host --setup-input`) and falls back to no-op.
+    /// Create the three virtual devices. Returns
+    /// [`InjectError::DeviceUnavailable`] when `/dev/uinput` is missing
+    /// (module not loaded) or not writable (no udev rule yet) — the
+    /// fixable-by-a-grant cases the host reacts to by requesting access;
+    /// other failures are [`InjectError::Init`].
     pub async fn connect() -> Result<Self> {
         let keys = keyboard_keycodes();
         let buttons = pointer_buttons();
 
         let keyboard = VirtualDevice::builder()
-            .map_err(|e| InjectError::Init(open_uinput_error(&e)))?
+            .map_err(|e| open_uinput_init_error(&e))?
             .name("Tether Virtual Keyboard")
             .input_id(InputId::new(BusType::BUS_USB, 0x1209, 0x7e70, 1))
             .with_keys(&keys)
@@ -475,7 +479,7 @@ impl UinputInjector {
             rel_axes.insert(axis);
         }
         let rel_pointer = VirtualDevice::builder()
-            .map_err(|e| InjectError::Init(open_uinput_error(&e)))?
+            .map_err(|e| open_uinput_init_error(&e))?
             .name("Tether Virtual Pointer")
             .input_id(InputId::new(BusType::BUS_USB, 0x1209, 0x7e71, 1))
             .with_keys(&buttons)
@@ -507,7 +511,7 @@ impl UinputInjector {
             AbsInfo::new(0, 0, ABS_MAX, 0, 0, 0),
         );
         let abs_pointer = VirtualDevice::builder()
-            .map_err(|e| InjectError::Init(open_uinput_error(&e)))?
+            .map_err(|e| open_uinput_init_error(&e))?
             .name("Tether Virtual Pointer (absolute)")
             .input_id(InputId::new(BusType::BUS_USB, 0x1209, 0x7e72, 1))
             .with_properties(&props)
@@ -808,20 +812,58 @@ fn scroll_detents(dx: f32, dy: f32, kind: ScrollKind) -> (i32, i32) {
     (to_detents(dy), to_detents(dx))
 }
 
-/// Friendly message for the common `/dev/uinput` permission failure.
-fn open_uinput_error(e: &std::io::Error) -> String {
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
-        format!(
-            "cannot open /dev/uinput ({e}); run `tether-host --setup-input` once to grant access"
-        )
-    } else {
-        format!("open /dev/uinput: {e}")
+/// Classify the error from opening `/dev/uinput` (via the `VirtualDevice`
+/// builder). Permission-denied (no udev rule yet) and not-found (the
+/// `uinput` kernel module isn't loaded, so the node doesn't exist) are
+/// both *fixable by a one-time privileged setup*, so they map to
+/// [`InjectError::DeviceUnavailable`] — the host turns that into a GUI
+/// authorization prompt + retry. Anything else is a genuine init failure.
+fn open_uinput_init_error(e: &std::io::Error) -> InjectError {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => InjectError::DeviceUnavailable(format!(
+            "/dev/uinput is not writable ({e}); a one-time permission grant is needed"
+        )),
+        std::io::ErrorKind::NotFound => InjectError::DeviceUnavailable(format!(
+            "/dev/uinput is missing ({e}); the uinput kernel module needs to be loaded"
+        )),
+        _ => InjectError::Init(format!("open /dev/uinput: {e}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The host distinguishes "needs a one-time permission grant" (which it
+    // resolves with a GUI prompt + retry) from a genuine init failure
+    // (which it can't fix) purely by the error variant `connect()` returns.
+    // If this classification regresses, the host would either stop
+    // prompting (input silently dead) or prompt on unrelated failures.
+    #[test]
+    fn permission_denied_open_is_device_unavailable() {
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            open_uinput_init_error(&e),
+            InjectError::DeviceUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn missing_node_open_is_device_unavailable() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(matches!(
+            open_uinput_init_error(&e),
+            InjectError::DeviceUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn other_open_errors_are_plain_init_failures() {
+        // e.g. ENOSPC / EIO while building the device — not fixable by the
+        // permission grant, so the host must treat it as a hard init error.
+        let e = std::io::Error::from(std::io::ErrorKind::Other);
+        assert!(matches!(open_uinput_init_error(&e), InjectError::Init(_)));
+    }
 
     #[test]
     fn hid_letters_map_to_correct_evdev_keys() {

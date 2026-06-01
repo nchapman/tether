@@ -10,6 +10,14 @@ use tether_protocol::input::InputEvent;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InjectError {
+    /// The backend's input device exists but couldn't be opened for use —
+    /// on Linux this is `/dev/uinput` missing (module not loaded) or not
+    /// writable (no udev rule yet). Distinct from [`InjectError::Init`]
+    /// because it's *fixable by a one-time privileged setup*: the host
+    /// reacts by requesting that grant through the GUI rather than treating
+    /// it as a hard failure.
+    #[error("input device unavailable: {0}")]
+    DeviceUnavailable(String),
     #[error("backend init: {0}")]
     Init(String),
     #[error("backend inject: {0}")]
@@ -91,11 +99,15 @@ pub use windows::WindowsInjector;
 
 /// Pick the best available backend for the current target. On Linux
 /// [`UinputInjector`] drives `/dev/uinput` directly (no portal — the
-/// `/dev/uinput` permission is the equivalent gate, granted once via
-/// `tether-host --setup-input`); on macOS [`MacOsInjector`] drives
-/// CGEvent (the Accessibility TCC grant is the gate). On unsupported
-/// targets we fall back to [`NoopInjector`] with a single warn-level
-/// log so the operator notices.
+/// `/dev/uinput` permission is the equivalent gate); on macOS
+/// [`MacOsInjector`] drives CGEvent (the Accessibility TCC grant is the
+/// gate). On unsupported targets we fall back to [`NoopInjector`] with a
+/// single warn-level log so the operator notices.
+///
+/// The Linux host does *not* call this — it builds the injector through a
+/// path that turns [`InjectError::DeviceUnavailable`] into a GUI
+/// authorization prompt and retry (see `tether-host`'s `setup_input`).
+/// This default stays the simple connect-or-noop for non-host callers.
 pub async fn default_injector() -> Box<dyn Injector> {
     #[cfg(target_os = "linux")]
     {

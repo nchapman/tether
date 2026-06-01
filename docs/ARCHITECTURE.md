@@ -688,8 +688,16 @@ Host side, Linux:
   `/dev/uinput` (keyboard, relative pointer, absolute pointer — split
   so libinput doesn't see a device mixing REL and ABS). Portal-free, so
   unlike screen capture it needs **no per-session prompt**; the only
-  gate is `/dev/uinput` access, granted once by `tether-host
-  --setup-input` (installs a udev rule via pkexec). We deliberately do
+  gate is `/dev/uinput` access, granted once by a udev rule. The rule
+  ships in the deb/rpm packages (zero prompts); otherwise the host
+  installs it lazily on first connection through a GUI PolicyKit dialog
+  and retries (`apps/tether-host/src/setup_input.rs::linux_injector`) —
+  the same "permission prompt on first use" model as the screen-capture
+  portal. `connect()` returns `InjectError::DeviceUnavailable` for the
+  missing-node / not-writable cases so the host knows to prompt rather
+  than fail; a declined grant degrades to no-op input, never a fatal
+  error. `tether-host --setup-input` remains as an explicit
+  pre-provision step (headless / scripted setup). We deliberately do
   not use the RemoteDesktop portal/libei: it re-prompts every session
   and its restore-token support is unreliable across compositors. This
   matches Sunshine and rustdesk's server mode. Caveat: uinput emits

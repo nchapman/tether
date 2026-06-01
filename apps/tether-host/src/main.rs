@@ -541,11 +541,27 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the per-connection input injector for the current platform. On
+/// Linux this lazily requests the `/dev/uinput` permission via a GUI
+/// PolicyKit prompt on first connection (mirroring the screen-capture
+/// portal) and retries before falling back to no-op; other platforms use
+/// the library's plain connect-or-noop default.
+async fn build_injector() -> Box<dyn tether_input::inject::Injector> {
+    #[cfg(target_os = "linux")]
+    {
+        setup_input::linux_injector().await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tether_input::inject::default_injector().await
+    }
+}
+
 /// Owns every piece of per-connection state — encoder thread, injector,
 /// recv tasks. When this function returns the whole graph drops together:
-/// the libei session releases, the QUIC connection closes, the encoder
-/// frees its hardware context. Anything that needs to survive across
-/// reconnects must live in `main`, not here.
+/// the injector releases its virtual input devices, the QUIC connection
+/// closes, the encoder frees its hardware context. Anything that needs to
+/// survive across reconnects must live in `main`, not here.
 async fn handle_client(
     session: HostSession,
     conn: Arc<Connection>,
@@ -739,22 +755,21 @@ async fn handle_client(
             )
         })?;
 
-    // Per-connection injector. The libei session lives inside the
-    // injector; when the last Arc drops, libei releases. We deliberately
-    // hand the three clones to the three recv tasks and don't keep a
-    // fourth reference in this scope — otherwise the original outlives
-    // the tasks, refcount never hits zero, and the host's mouse stays
-    // grabbed until the process exits (which is the bug that prompted
-    // this whole rewrite). The recv tasks themselves are owned by the
-    // JoinSet below, so tasks.shutdown() is what triggers the final drop.
+    // Per-connection injector. The backend's virtual devices live inside
+    // the injector; when the last Arc drops, they're released. We
+    // deliberately hand the three clones to the three recv tasks and don't
+    // keep a fourth reference in this scope — otherwise the original
+    // outlives the tasks, refcount never hits zero, and the host's input
+    // devices stay open until the process exits (which is the bug that
+    // prompted this whole rewrite). The recv tasks themselves are owned by
+    // the JoinSet below, so tasks.shutdown() is what triggers the final
+    // drop.
     //
     // tokio::sync::Mutex is the right primitive: the lock is held only
-    // for the duration of one enigo call (microseconds), but both
+    // for the duration of one inject call (microseconds), but both
     // holders are async, and a std::sync::Mutex held across an await
     // would risk blocking a tokio worker.
-    let injector = Arc::new(TokioMutex::new(
-        tether_input::inject::default_injector().await,
-    ));
+    let injector = Arc::new(TokioMutex::new(build_injector().await));
 
     let mut tasks: JoinSet<()> = JoinSet::new();
 

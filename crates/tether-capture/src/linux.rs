@@ -157,6 +157,70 @@ impl CursorSource for PipeWireCursorSource {
     }
 }
 
+/// Directory where we persist the ScreenCast restore token. Mirrors
+/// the client's `$HOME/.tether` convention (see `tether-client`'s
+/// `client_config_dir`); `TETHER_STATE_DIR` overrides it for tests and
+/// sandboxed deployments.
+fn state_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("TETHER_STATE_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".tether"))
+}
+
+fn restore_token_path() -> Option<std::path::PathBuf> {
+    state_dir().map(|dir| dir.join("screencast-restore-token"))
+}
+
+/// Read the saved ScreenCast restore token, if any. Any error (no
+/// state dir, missing file, unreadable) is treated as "no token" — the
+/// portal then prompts and issues a fresh one.
+fn load_restore_token() -> Option<String> {
+    load_restore_token_from(&restore_token_path()?)
+}
+
+/// Persist the ScreenCast restore token for the next session. Best
+/// effort: a failure just means we re-prompt next launch, so we log and
+/// move on rather than failing the capture handshake.
+fn save_restore_token(token: &str) {
+    let Some(path) = restore_token_path() else {
+        tracing::warn!("no state dir (HOME unset); cannot persist screencast restore token");
+        return;
+    };
+    match save_restore_token_to(&path, token) {
+        Ok(()) => tracing::info!(?path, "persisted screencast restore token"),
+        Err(e) => tracing::warn!(error = %e, ?path, "failed to persist screencast restore token"),
+    }
+}
+
+fn load_restore_token_from(path: &std::path::Path) -> Option<String> {
+    let token = std::fs::read_to_string(path).ok()?;
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_owned())
+    }
+}
+
+fn save_restore_token_to(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // SECURITY: the restore token is a portal capability credential — a
+    // co-user who reads it could potentially replay our share grant.
+    // Owner-only, matching tether-pairing/tether-transport key files.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(token.as_bytes())
+}
+
 async fn open_portal() -> Result<(u32, OwnedFd)> {
     let proxy = Screencast::new().await?;
     // Query supported cursor modes up front. GNOME 45+ and KDE
@@ -181,6 +245,12 @@ async fn open_portal() -> Result<(u32, OwnedFd)> {
         "portal cursor mode negotiation"
     );
     let session = proxy.create_session(Default::default()).await?;
+    // Replay a previously-granted restore token so the compositor can
+    // skip (or quietly confirm) the share dialog. `ExplicitlyRevoked`
+    // asks the portal to remember the grant until the user revokes it
+    // in their desktop's privacy settings — the behaviour unattended
+    // remote access needs. Mirrors Sunshine / rustdesk server mode.
+    let saved_token = load_restore_token();
     proxy
         .select_sources(
             &session,
@@ -188,14 +258,25 @@ async fn open_portal() -> Result<(u32, OwnedFd)> {
                 .set_cursor_mode(chosen_cursor_mode)
                 .set_sources(BitFlags::from(SourceType::Monitor))
                 .set_multiple(false)
-                .set_restore_token(None)
-                .set_persist_mode(PersistMode::DoNot),
+                .set_restore_token(saved_token.as_deref())
+                .set_persist_mode(PersistMode::ExplicitlyRevoked),
         )
         .await?;
     let response = proxy
         .start(&session, None, Default::default())
         .await?
         .response()?;
+    // The portal may hand back a fresh token on every Start (token
+    // rotation), so persist whatever it returned, replacing the old
+    // one. A missing token means the portal declined to persist (older
+    // backend / user chose not to remember) — leave any prior token in
+    // place rather than clobbering it. Save failures are non-fatal: the
+    // session still works, we just re-prompt next launch.
+    if let Some(token) = response.restore_token() {
+        if Some(token) != saved_token.as_deref() {
+            save_restore_token(token);
+        }
+    }
     let stream = response
         .streams()
         .first()
@@ -1205,6 +1286,84 @@ mod tests {
     #[test]
     fn region_count_zero_is_idle() {
         assert!(native_damage_from_region_count(0).idle);
+    }
+
+    #[test]
+    fn restore_token_round_trips_through_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "tether-restore-token-roundtrip-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        save_restore_token_to(&path, "tok-abc-123").expect("save succeeds");
+        assert_eq!(
+            load_restore_token_from(&path).as_deref(),
+            Some("tok-abc-123")
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restore_token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("tether-restore-token-perms-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        save_restore_token_to(&path, "secret-token").expect("save succeeds");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "restore token must not be group/world readable"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restore_token_resave_with_same_value_round_trips() {
+        // The open_portal dedup only writes when the token changed; this
+        // guards that an idempotent re-save of the same value is a no-op
+        // for the reader (content + perms stay correct).
+        let path = std::env::temp_dir().join(format!(
+            "tether-restore-token-resave-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        save_restore_token_to(&path, "tok").expect("first save");
+        save_restore_token_to(&path, "tok").expect("second save");
+        assert_eq!(load_restore_token_from(&path).as_deref(), Some("tok"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn restore_token_missing_file_is_none() {
+        let path = std::env::temp_dir().join("tether-restore-token-absent-xyz");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(load_restore_token_from(&path), None);
+    }
+
+    #[test]
+    fn restore_token_blank_file_is_none() {
+        let path =
+            std::env::temp_dir().join(format!("tether-restore-token-blank-{}", std::process::id()));
+        save_restore_token_to(&path, "   \n").expect("save succeeds");
+        // A whitespace-only file must read back as "no token" so we
+        // don't replay an empty token into the portal.
+        assert_eq!(load_restore_token_from(&path), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_creates_missing_parent_dirs() {
+        let dir =
+            std::env::temp_dir().join(format!("tether-restore-token-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("screencast-restore-token");
+        save_restore_token_to(&path, "deep-token").expect("save creates parents");
+        assert_eq!(
+            load_restore_token_from(&path).as_deref(),
+            Some("deep-token")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

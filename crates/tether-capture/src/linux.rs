@@ -6,19 +6,23 @@
 //! when the compositor falls back to SHM.
 //!
 //! Calling [`start`] performs the portal handshake (which triggers a
-//! permission dialog on the user's desktop) and then spawns a dedicated
-//! thread running PipeWire's main loop. Frames are pushed into a bounded
-//! crossbeam channel. The thread has no graceful shutdown signal when
-//! the receiver is dropped — it waits until the process exits. Wiring
-//! `mainloop.quit()` through a clone of `MainLoopRc` in `UserData` would
-//! fix that; deferred because we don't yet have a host shutdown path
-//! that needs it (capture stays up for the process lifetime today).
+//! permission dialog on the user's desktop, unless a restore token
+//! suppresses it) and then spawns a dedicated thread running PipeWire's
+//! main loop. Frames are pushed into a bounded crossbeam channel. When
+//! the frame receiver is dropped (the client disconnected and the host's
+//! `handle_client` returned), the `process` callback quits the mainloop
+//! via a `MainLoopRc` clone in `UserData`; the thread then exits and
+//! drops the PipeWire stream + core + portal fd, ending the capture so
+//! the compositor's "screen is being shared" indicator clears and no
+//! session leaks across reconnects. The quit fires on the next buffer
+//! after disconnect, so a fully idle stream lingers until its next
+//! frame — fine in practice (capture is rarely perfectly static).
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
-    PersistMode,
+    PersistMode, Session,
 };
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -65,12 +69,32 @@ const CAPTURE_CHANNEL_DEPTH: usize = 1;
 /// the user's desktop session. The call blocks (asynchronously) until the
 /// user grants or denies access.
 pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
-    let (node_id, fd) = open_portal().await?;
+    let (node_id, fd, session) = open_portal().await?;
     tracing::info!(
         node_id,
         dmabuf_modifiers = dmabuf_modifiers.len(),
         "portal handshake complete; spawning pipewire thread"
     );
+
+    // Hold the portal ScreenCast session alive and close it explicitly
+    // when capture ends. Quitting the PipeWire mainloop stops the stream
+    // but does NOT clear the compositor's "screen is being shared"
+    // indicator — that's tied to the portal *session*, which lingers
+    // until `Session::close` (or process exit, since the zbus connection
+    // is shared process-wide). The PipeWire thread fires `close_tx` once
+    // its mainloop exits; this task then closes the session on the tokio
+    // runtime where the session's connection lives (closing from the
+    // sync capture thread would have no reactor).
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        // `Err` means the sender dropped without signalling (capture
+        // thread panicked before sending) — close anyway for cleanup.
+        let _ = close_rx.await;
+        match session.close().await {
+            Ok(()) => tracing::info!("portal screencast session closed"),
+            Err(e) => tracing::warn!(error = %e, "failed to close portal screencast session"),
+        }
+    });
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
     // Cursor channels: shape changes are rare → unbounded crossbeam (a
@@ -98,6 +122,11 @@ pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
             ) {
                 tracing::error!(error = %e, "pipewire capture thread failed");
             }
+            // The mainloop has exited (receiver dropped → `quit()`, or an
+            // early error above). Signal the closer task to tear down the
+            // portal session. Send error = receiver already gone; nothing
+            // to do.
+            let _ = close_tx.send(());
         })?;
     let cursor_source: Box<dyn CursorSource> = Box::new(PipeWireCursorSource {
         shape_rx,
@@ -221,7 +250,7 @@ fn save_restore_token_to(path: &std::path::Path, token: &str) -> std::io::Result
         .write_all(token.as_bytes())
 }
 
-async fn open_portal() -> Result<(u32, OwnedFd)> {
+async fn open_portal() -> Result<(u32, OwnedFd, Session<Screencast>)> {
     let proxy = Screencast::new().await?;
     // Query supported cursor modes up front. GNOME 45+ and KDE
     // Plasma 6 both advertise Metadata, but legacy portals fall
@@ -286,10 +315,20 @@ async fn open_portal() -> Result<(u32, OwnedFd)> {
     let fd = proxy
         .open_pipe_wire_remote(&session, Default::default())
         .await?;
-    Ok((node_id, fd))
+    // Return the session (it owns its own zbus proxy/connection) so the
+    // caller can close it on teardown; dropping it here would leak it on
+    // the portal until process exit. The `proxy` can drop — `close` goes
+    // through the session's own proxy.
+    Ok((node_id, fd, session))
 }
 
 struct UserData {
+    /// Clone of the capture thread's mainloop, so the `process`
+    /// callback can `quit()` it when the frame receiver is gone (client
+    /// disconnected). Without this the thread spins forever, leaking a
+    /// PipeWire stream + portal screencast session per connection and
+    /// keeping the compositor's "screen is being shared" indicator up.
+    mainloop: pw::main_loop::MainLoopRc,
     format: spa::param::video::VideoInfoRaw,
     sender: Sender<CapturedFrame>,
     /// `Some(modifier)` once `param_changed` has seen a fixated
@@ -333,6 +372,7 @@ fn run_pipewire(
     let core = context.connect_fd(fd, None)?;
 
     let user_data = UserData {
+        mainloop: mainloop.clone(),
         format: spa::param::video::VideoInfoRaw::new(),
         sender,
         negotiated_modifier: None,
@@ -553,12 +593,14 @@ fn run_pipewire(
                     tracing::trace!("capture consumer slow, dropping frame");
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    // Receiver is gone but the PipeWire mainloop has no
-                    // graceful-quit signal from here. Hooking
-                    // `mainloop.quit()` in needs a `MainLoopRc` clone
-                    // captured in `UserData`; not done yet because
-                    // capture lives for the process lifetime today.
-                    tracing::debug!("capture receiver dropped; thread will exit on process exit");
+                    // Frame receiver dropped — the client disconnected and
+                    // `handle_client` returned. Quit the mainloop so this
+                    // thread exits and drops the PipeWire stream + core +
+                    // portal fd, ending the capture (and clearing the
+                    // compositor's share indicator) instead of leaking a
+                    // session per connection.
+                    tracing::info!("capture receiver dropped; quitting pipewire mainloop");
+                    user_data.mainloop.quit();
                 }
             }
         })

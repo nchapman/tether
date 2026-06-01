@@ -343,6 +343,8 @@ impl Worker {
     /// the watchdog so both update `DecodeCompletion::idr_request_fired`
     /// consistently.
     fn try_fire_idr(&mut self, now: MonoNanos) -> bool {
+        // IDR_RATE_LIMIT is a small constant Duration; its nanos fit in u64.
+        #[allow(clippy::cast_possible_truncation)]
         let rate_limit_ns = IDR_RATE_LIMIT.as_nanos() as u64;
         let fire = self
             .last_idr_request
@@ -372,6 +374,8 @@ impl Worker {
             return (None, false);
         };
         let elapsed_ns = now.saturating_sub(last);
+        // NO_OUTPUT_WATCHDOG is a small constant Duration; its nanos fit in u64.
+        #[allow(clippy::cast_possible_truncation)]
         let window_ns = NO_OUTPUT_WATCHDOG.as_nanos() as u64;
         if elapsed_ns < window_ns {
             return (None, false);
@@ -550,17 +554,14 @@ pub fn run_thread_with_init(
 /// `keyframe` flag, which some encoders (AMF) fail to set on forced IDRs.
 fn body_starts_with_parameter_sets(body: &[u8]) -> bool {
     // Find the first NALU type after the Annex-B start code.
-    let nalu_byte = if body.len() >= 5
-        && body[0] == 0 && body[1] == 0 && body[2] == 0 && body[3] == 1
-    {
-        Some(body[4])
-    } else if body.len() >= 4
-        && body[0] == 0 && body[1] == 0 && body[2] == 1
-    {
-        Some(body[3])
-    } else {
-        None
-    };
+    let nalu_byte =
+        if body.len() >= 5 && body[0] == 0 && body[1] == 0 && body[2] == 0 && body[3] == 1 {
+            Some(body[4])
+        } else if body.len() >= 4 && body[0] == 0 && body[1] == 0 && body[2] == 1 {
+            Some(body[3])
+        } else {
+            None
+        };
     let Some(b) = nalu_byte else { return false };
     // HEVC: VPS = type 32, first byte = (32 << 1) | 0 = 0x40.
     // NALU type is bits [6:1] of the first byte.

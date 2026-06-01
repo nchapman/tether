@@ -4,6 +4,10 @@
 # from the nchapman/tether-ffmpeg releases; never committed — `make ffmpeg`).
 /vendor/ffmpeg/
 
+# Engine sidecars staged for Tauri bundling by scripts/stage-engine-binaries.sh
+# (copied from target/release per build; never committed).
+/apps/tether-shell/src-tauri/binaries/
+
 # Ad-hoc log captures from manual `cargo run` testing.
 *.log
 

@@ -21,6 +21,10 @@
 //! feature) and the host's downstream chroma shaders are taught to
 //! accept either. Stick to one convention here.
 
+// Pixel/geometry math: clamped fp32 → u8 quantization and tap/coord casts
+// are intentional and range-bounded.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 /// Mitchell-Netravali bicubic kernel.
 ///
 /// `b = c = 1/3` is the canonical "balanced" form from
@@ -87,7 +91,7 @@ pub const MAX_TAPS: u32 = 32;
 #[must_use]
 pub fn tap_count(scale: f32) -> u32 {
     let raw = (4.0_f32 * scale.max(1.0)).ceil() as u32;
-    raw.max(4).min(MAX_TAPS)
+    raw.clamp(4, MAX_TAPS)
 }
 
 /// Box-filter downsample by 2× in linear-light. Each output pixel
@@ -426,15 +430,10 @@ mod tests {
     fn identity_scale_round_trips_solid_color() {
         // 1:1 scale of a solid-colour image must produce the same bytes
         // back (modulo sRGB round-trip drift of at most 1).
-        let src: Vec<u8> = (0..16 * 16)
-            .flat_map(|_| [128, 64, 200, 255])
-            .collect();
+        let src: Vec<u8> = (0..16 * 16).flat_map(|_| [128, 64, 200, 255]).collect();
         let dst = mitchell_filter_default(&src, 16, 16, 16, 16);
         for (i, (s, d)) in src.iter().zip(dst.iter()).enumerate() {
-            assert!(
-                s.abs_diff(*d) <= 1,
-                "channel {i} drifted {s} -> {d}",
-            );
+            assert!(s.abs_diff(*d) <= 1, "channel {i} drifted {s} -> {d}",);
         }
     }
 
@@ -445,9 +444,9 @@ mod tests {
         let src: Vec<u8> = (0..64 * 64).flat_map(|_| [50, 100, 200, 255]).collect();
         let dst = mitchell_filter_default(&src, 64, 64, 16, 16);
         for chunk in dst.chunks_exact(4) {
-            assert!((chunk[0] as i32 - 50).abs() <= 2);
-            assert!((chunk[1] as i32 - 100).abs() <= 2);
-            assert!((chunk[2] as i32 - 200).abs() <= 2);
+            assert!((i32::from(chunk[0]) - 50).abs() <= 2);
+            assert!((i32::from(chunk[1]) - 100).abs() <= 2);
+            assert!((i32::from(chunk[2]) - 200).abs() <= 2);
         }
     }
 

@@ -211,14 +211,12 @@ fn resolve_negotiated_profile(
     chosen_chroma: ChromaSubsampling,
 ) -> Result<VideoProfile, ConnectError> {
     match extension_bytes {
-        Some(bytes) => {
-            tether_protocol::decode::<VideoProfile>(bytes).map_err(|e| {
-                ConnectError::InvalidEncodeProfile {
-                    source: e,
-                    payload_len: bytes.len(),
-                }
-            })
-        }
+        Some(bytes) => tether_protocol::decode::<VideoProfile>(bytes).map_err(|e| {
+            ConnectError::InvalidEncodeProfile {
+                source: e,
+                payload_len: bytes.len(),
+            }
+        }),
         None => Ok(VideoProfile {
             codec: chosen_codec,
             chroma: chosen_chroma,
@@ -252,7 +250,10 @@ fn cross_check_pixel_format(server_body: &ServerHelloV1, negotiated: VideoProfil
     };
     match expected {
         Some(exp) if pf == exp => {
-            tracing::debug!(?pf, "host pixel-format extension matches negotiated chroma + bit_depth");
+            tracing::debug!(
+                ?pf,
+                "host pixel-format extension matches negotiated chroma + bit_depth"
+            );
         }
         Some(exp) => {
             warn!(
@@ -284,12 +285,9 @@ mod tests {
         let profile = VideoProfile::HEVC_10BIT_444;
         let bytes = tether_protocol::encode(&profile).unwrap();
         // Inline fields deliberately disagree — the extension wins.
-        let resolved = resolve_negotiated_profile(
-            Some(&bytes),
-            CodecKind::H264,
-            ChromaSubsampling::Yuv420,
-        )
-        .unwrap();
+        let resolved =
+            resolve_negotiated_profile(Some(&bytes), CodecKind::H264, ChromaSubsampling::Yuv420)
+                .unwrap();
         assert_eq!(resolved, profile);
     }
 
@@ -321,12 +319,9 @@ mod tests {
     #[test]
     fn extension_undecodable_returns_error_not_fallback() {
         let garbage = [0xFFu8; 3];
-        let err = resolve_negotiated_profile(
-            Some(&garbage),
-            CodecKind::Hevc,
-            ChromaSubsampling::Yuv420,
-        )
-        .expect_err("garbage payload should error, not 8-bit fallback");
+        let err =
+            resolve_negotiated_profile(Some(&garbage), CodecKind::Hevc, ChromaSubsampling::Yuv420)
+                .expect_err("garbage payload should error, not 8-bit fallback");
         assert!(matches!(err, ConnectError::InvalidEncodeProfile { .. }));
     }
 }

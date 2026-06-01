@@ -45,8 +45,14 @@ pub enum ScrollKind {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InputEventKind {
-    KeyDown { key: HidUsage, modifiers: Modifiers },
-    KeyUp { key: HidUsage, modifiers: Modifiers },
+    KeyDown {
+        key: HidUsage,
+        modifiers: Modifiers,
+    },
+    KeyUp {
+        key: HidUsage,
+        modifiers: Modifiers,
+    },
     /// Layout-/IME-resolved character(s) to type as a unit, complementing
     /// the HID path. The client emits this when it has the actual text
     /// the user produced — IME composition results, dead-key sequences,
@@ -54,7 +60,9 @@ pub enum InputEventKind {
     /// `type-text` operation is more correct than reconstructing the
     /// string from physical keycodes. Hosts apply the current keymap;
     /// shortcuts (Ctrl+C etc.) keep going through `KeyDown`/`KeyUp`.
-    Text { utf8: String },
+    Text {
+        utf8: String,
+    },
     // Mouse-position events live on the cursor datagram channel
     // (`tether_protocol::cursor::ClientCursorPacket`), not here, so a
     // queue of keystrokes can't head-of-line-block the pointer. The

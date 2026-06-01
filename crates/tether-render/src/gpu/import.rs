@@ -108,7 +108,10 @@ fn import_biplanar(
         ChromaSubsampling::Yuv444 => (width, height),
     };
     let (y_fmt, uv_fmt) = if high_bit_depth {
-        (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
+        (
+            wgpu::TextureFormat::R16Unorm,
+            wgpu::TextureFormat::Rg16Unorm,
+        )
     } else {
         (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
     };
@@ -342,9 +345,7 @@ fn import_one_plane(
                 u64::from(layer.pitch[plane_idx]),
                 u64::from(layer.offset[plane_idx]),
             )
-            .map_err(|e| {
-                RenderError::DmaBufImport(format!("texture_from_dmabuf_fd: {e:?}"))
-            })?
+            .map_err(|e| RenderError::DmaBufImport(format!("texture_from_dmabuf_fd: {e:?}")))?
     };
 
     let wgpu_desc = wgpu::TextureDescriptor {
@@ -368,6 +369,8 @@ fn import_one_plane(
     // the hal side, `TextureUsages::TEXTURE_BINDING` on the wgpu side
     // — they're the equivalent representations in each API's vocabulary
     // and that's the correct pairing).
-    let texture = unsafe { device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc) };
+    let texture = unsafe {
+        device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc)
+    };
     Ok(texture)
 }

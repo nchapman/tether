@@ -267,7 +267,12 @@ impl Pipelines {
                     compilation_options: Default::default(),
                     cache: None,
                 });
-                (Some(pipeline_r), Some(bgl_r), Some(pipeline_rg), Some(bgl_rg))
+                (
+                    Some(pipeline_r),
+                    Some(bgl_r),
+                    Some(pipeline_rg),
+                    Some(bgl_rg),
+                )
             } else {
                 (None, None, None, None)
             };

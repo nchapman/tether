@@ -61,19 +61,17 @@ const PROBE_BITRATE_KBPS: u32 = 1_000;
 /// of the SCK probe result.
 fn sck_capability() -> &'static SckCaptureCapability {
     static CACHED: OnceLock<SckCaptureCapability> = OnceLock::new();
-    CACHED.get_or_init(|| {
-        match pollster::block_on(probe_capture_pixel_formats()) {
-            Ok(c) => {
-                tracing::info!(?c, "SCK capture capability probed");
-                c
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "SCK capability probe failed; \
+    CACHED.get_or_init(|| match pollster::block_on(probe_capture_pixel_formats()) {
+        Ok(c) => {
+            tracing::info!(?c, "SCK capture capability probed");
+            c
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "SCK capability probe failed; \
                     falling back to yuv420 video-range only");
-                SckCaptureCapability {
-                    yuv420_video_range: true,
-                    ..Default::default()
-                }
+            SckCaptureCapability {
+                yuv420_video_range: true,
+                ..Default::default()
             }
         }
     })

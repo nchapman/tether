@@ -16,9 +16,7 @@ use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
 use crate::encoder_common::{drain_encoder, snapshot_extradata};
 use crate::h264::frame_plane_mut;
-use crate::{
-    init_ffmpeg, CodecError, Encoder, EncodedPacket, IOSurfaceFrame, Result, GOP_SECONDS,
-};
+use crate::{init_ffmpeg, CodecError, EncodedPacket, Encoder, IOSurfaceFrame, Result, GOP_SECONDS};
 
 use super::ffi::{
     kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
@@ -127,8 +125,8 @@ impl VideoToolboxEncoder {
         encoder.set_time_base(ra(1, fps_i32));
         encoder.set_framerate(ra(fps_i32, 1));
         encoder.set_bit_rate(i64::from(bitrate_kbps) * 1000);
-        let gop_frames = fps_i32
-            .saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
+        let gop_frames =
+            fps_i32.saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
         encoder.set_gop_size(gop_frames);
         encoder.set_max_b_frames(0);
 
@@ -195,8 +193,8 @@ impl VideoToolboxEncoder {
         // `gop_size` above and drive on-demand IDRs through the
         // `AVPicture::AV_PICTURE_TYPE_I` pict_type on individual
         // input frames (same channel as the VAAPI path).
-        let dict = rsmpeg::avutil::AVDictionary::new(c"realtime", c"1", 0)
-            .set(c"allow_sw", c"0", 0);
+        let dict =
+            rsmpeg::avutil::AVDictionary::new(c"realtime", c"1", 0).set(c"allow_sw", c"0", 0);
         let leftover = encoder.open(Some(dict))?;
         // The "GPU or nothing" invariant rides on `allow_sw=0` actually
         // being consumed by the encoder. If a build of FFmpeg silently
@@ -380,12 +378,7 @@ impl VideoToolboxEncoder {
         // valid out-pointer, the allocator/attributes are documented
         // as nullable for "use the default".
         let rc = unsafe {
-            CVPixelBufferCreateWithIOSurface(
-                ptr::null(),
-                frame.surface,
-                ptr::null(),
-                &mut pixbuf,
-            )
+            CVPixelBufferCreateWithIOSurface(ptr::null(), frame.surface, ptr::null(), &mut pixbuf)
         };
         if rc != K_CV_RETURN_SUCCESS || pixbuf.is_null() {
             return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR_EXTERNAL)));
@@ -458,7 +451,9 @@ impl VideoToolboxEncoder {
             // CVPixelBufferRef on failure, so we still own the +1
             // retain and must release it.
             unsafe { CFRelease(pixbuf.cast_const()) };
-            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(ffi::ENOMEM))));
+            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(
+                ffi::ENOMEM,
+            ))));
         }
 
         // 3. Build the AVFrame. Format = VIDEOTOOLBOX, data[3] points
@@ -493,7 +488,9 @@ impl VideoToolboxEncoder {
         // CVPixelBuffer +1 retain is already owned by `pixbuf_buf` /
         // `src.buf[0]`, so the AVFrame's Drop releases it.
         if frames_ref.is_null() {
-            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(ffi::ENOMEM))));
+            return Err(CodecError::Ffmpeg(RsmpegError::from(ffi::AVERROR(
+                ffi::ENOMEM,
+            ))));
         }
 
         src.set_pts(pts);
@@ -728,21 +725,76 @@ mod fourcc_match_tests {
         // 4:4:4 10-bit has no video-range fourcc on macOS, so
         // `'xf44'` is accepted (and the path is probe-gated anyway).
         for (chroma, bd, fourcc, accept) in [
-            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"420v"), true),
-            (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"x420"), true),
-            (ChromaSubsampling::Yuv444, 8, u32::from_be_bytes(*b"444v"), true),
-            (ChromaSubsampling::Yuv444, 10, u32::from_be_bytes(*b"xf44"), true),
+            (
+                ChromaSubsampling::Yuv420,
+                8,
+                u32::from_be_bytes(*b"420v"),
+                true,
+            ),
+            (
+                ChromaSubsampling::Yuv420,
+                10,
+                u32::from_be_bytes(*b"x420"),
+                true,
+            ),
+            (
+                ChromaSubsampling::Yuv444,
+                8,
+                u32::from_be_bytes(*b"444v"),
+                true,
+            ),
+            (
+                ChromaSubsampling::Yuv444,
+                10,
+                u32::from_be_bytes(*b"xf44"),
+                true,
+            ),
             // Full-range siblings are rejected: encoder VUI is
             // limited, full-range bytes would mis-tag.
-            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"420f"), false),
-            (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"xf20"), false),
-            (ChromaSubsampling::Yuv444, 8, u32::from_be_bytes(*b"444f"), false),
+            (
+                ChromaSubsampling::Yuv420,
+                8,
+                u32::from_be_bytes(*b"420f"),
+                false,
+            ),
+            (
+                ChromaSubsampling::Yuv420,
+                10,
+                u32::from_be_bytes(*b"xf20"),
+                false,
+            ),
+            (
+                ChromaSubsampling::Yuv444,
+                8,
+                u32::from_be_bytes(*b"444f"),
+                false,
+            ),
             // Cross-bucket mismatches: 10-bit cells for an 8-bit
             // encoder, 4:4:4 fourcc for a 4:2:0 encoder, etc.
-            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"x420"), false),
-            (ChromaSubsampling::Yuv420, 10, u32::from_be_bytes(*b"420v"), false),
-            (ChromaSubsampling::Yuv420, 8, u32::from_be_bytes(*b"444v"), false),
-            (ChromaSubsampling::Yuv444, 10, u32::from_be_bytes(*b"x420"), false),
+            (
+                ChromaSubsampling::Yuv420,
+                8,
+                u32::from_be_bytes(*b"x420"),
+                false,
+            ),
+            (
+                ChromaSubsampling::Yuv420,
+                10,
+                u32::from_be_bytes(*b"420v"),
+                false,
+            ),
+            (
+                ChromaSubsampling::Yuv420,
+                8,
+                u32::from_be_bytes(*b"444v"),
+                false,
+            ),
+            (
+                ChromaSubsampling::Yuv444,
+                10,
+                u32::from_be_bytes(*b"x420"),
+                false,
+            ),
         ] {
             assert_eq!(
                 iosurface_fourcc_matches(chroma, bd, fourcc),
@@ -751,7 +803,4 @@ mod fourcc_match_tests {
             );
         }
     }
-
 }
-
-

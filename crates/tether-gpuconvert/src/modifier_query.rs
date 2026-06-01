@@ -126,11 +126,7 @@ async fn query_dmabuf_modifiers(
         // counting call (spec) so we don't preallocate.
         let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
         let mut props2 = vk::FormatProperties2::default().push_next(&mut list);
-        raw_instance.get_physical_device_format_properties2(
-            raw_physical,
-            vk_format,
-            &mut props2,
-        );
+        raw_instance.get_physical_device_format_properties2(raw_physical, vk_format, &mut props2);
 
         let count = list.drm_format_modifier_count as usize;
         if count == 0 {
@@ -141,11 +137,7 @@ async fn query_dmabuf_modifiers(
         let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
             .drm_format_modifier_properties(&mut storage);
         let mut props2 = vk::FormatProperties2::default().push_next(&mut list);
-        raw_instance.get_physical_device_format_properties2(
-            raw_physical,
-            vk_format,
-            &mut props2,
-        );
+        raw_instance.get_physical_device_format_properties2(raw_physical, vk_format, &mut props2);
 
         storage
             .into_iter()
@@ -197,7 +189,7 @@ fn drm_fourcc_to_vk_format(drm_fourcc: u32) -> Result<vk::Format> {
     // Fourcc constants from <drm/drm_fourcc.h> — little-endian 4-char.
     const AR24: u32 = u32::from_le_bytes(*b"AR24"); // DRM_FORMAT_ARGB8888
     const XR24: u32 = u32::from_le_bytes(*b"XR24"); // DRM_FORMAT_XRGB8888
-    // Y plane of NV12 / NV24 — single-channel 8-bit, DRM_FORMAT_R8.
+                                                    // Y plane of NV12 / NV24 — single-channel 8-bit, DRM_FORMAT_R8.
     const R8: u32 = u32::from_le_bytes(*b"R8  ");
     // UV plane of NV12 / NV24 — two-channel 8-bit, DRM_FORMAT_GR88.
     const GR88: u32 = u32::from_le_bytes(*b"GR88");
@@ -265,7 +257,10 @@ mod tests {
             vk::Format::R8G8B8A8_UNORM
         );
         assert_eq!(drm_fourcc_to_vk_format(r8).unwrap(), vk::Format::R8_UNORM);
-        assert_eq!(drm_fourcc_to_vk_format(gr88).unwrap(), vk::Format::R8G8_UNORM);
+        assert_eq!(
+            drm_fourcc_to_vk_format(gr88).unwrap(),
+            vk::Format::R8G8_UNORM
+        );
     }
 
     /// Pin DRM_FORMAT_XV30 → A2B10G10R10_UNORM_PACK32 — the
@@ -321,10 +316,10 @@ mod tests {
     fn storable_probe_returns_linear_for_r16_and_gr32() {
         let r16 = u32::from_le_bytes(*b"R16 ");
         let gr32 = u32::from_le_bytes(*b"GR32");
-        let r16_mods = pollster::block_on(storable_dmabuf_modifiers(r16))
-            .expect("storage probe for R16");
-        let gr32_mods = pollster::block_on(storable_dmabuf_modifiers(gr32))
-            .expect("storage probe for GR32");
+        let r16_mods =
+            pollster::block_on(storable_dmabuf_modifiers(r16)).expect("storage probe for R16");
+        let gr32_mods =
+            pollster::block_on(storable_dmabuf_modifiers(gr32)).expect("storage probe for GR32");
         // LINEAR is the only modifier the encoder DMA-BUF export uses;
         // anything else returned is bonus. If LINEAR is missing the
         // driver can't host storage writes to 16-bit unorm at all.
@@ -351,8 +346,8 @@ mod tests {
     #[ignore = "requires a working Vulkan adapter advertising VK_EXT_image_drm_format_modifier; may SKIP on Intel iHD"]
     fn storable_probe_returns_linear_for_xv30() {
         let xv30 = u32::from_le_bytes(*b"XV30");
-        let xv30_mods = pollster::block_on(storable_dmabuf_modifiers(xv30))
-            .expect("storage probe for XV30");
+        let xv30_mods =
+            pollster::block_on(storable_dmabuf_modifiers(xv30)).expect("storage probe for XV30");
         let linear = crate::dmabuf_export::DRM_FORMAT_MOD_LINEAR;
         assert!(
             xv30_mods.contains(&linear),

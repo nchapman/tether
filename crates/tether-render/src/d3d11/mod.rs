@@ -24,27 +24,26 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::core::{s, Interface, PCSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2D;
 use windows::Win32::Graphics::Direct3D::{
-    ID3DBlob, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0,
-    D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    ID3DBlob, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_DRIVER_TYPE_HARDWARE,
+    D3D_FEATURE_LEVEL_11_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11Device1,
-    ID3D11DeviceContext,
-    ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
-    ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    ID3D11DeviceContext, ID3D11PixelShader, ID3D11RasterizerState, ID3D11RenderTargetView,
+    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
+    D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FORMAT_SUPPORT_TEXTURE2D,
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_RASTERIZER_DESC,
     D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
-    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_TEX2D_RTV,
-    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT, ID3D11RasterizerState,
-    D3D11_FORMAT_SUPPORT_TEXTURE2D,
+    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEX2D_RTV, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CULL_NONE, D3D11_FILL_SOLID, D3D11_SHADER_RESOURCE_VIEW_DESC,
     D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV,
 };
-use windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2D;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP,
 };
@@ -185,7 +184,12 @@ enum SourceKey {
     /// dims makes a false cache hit require both an identical recycled
     /// handle value AND identical dims (the decoder closes the old handle
     /// on `Drop`, so the recycling window is a single resolution flip).
-    Gpu { handle: *mut c_void, width: u32, height: u32, format: u32 },
+    Gpu {
+        handle: *mut c_void,
+        width: u32,
+        height: u32,
+        format: u32,
+    },
     /// CPU fallback: dims of the dynamic upload textures. Pixels are
     /// re-mapped every frame; the textures are recreated only on resize.
     Cpu { width: u32, height: u32 },
@@ -216,9 +220,7 @@ enum PresentTarget {
         swapchain: IDXGISwapChain1,
     },
     #[cfg(test)]
-    Offscreen {
-        color: ID3D11Texture2D,
-    },
+    Offscreen { color: ID3D11Texture2D },
 }
 
 pub(crate) struct D3D11RenderState {
@@ -306,8 +308,9 @@ impl D3D11RenderState {
         let device = device.ok_or_else(|| RenderError::GraphicsApi("null D3D11 device".into()))?;
         let context =
             context.ok_or_else(|| RenderError::GraphicsApi("null D3D11 context".into()))?;
-        let device1: ID3D11Device1 =
-            device.cast().map_err(|e| d3d_err("ID3D11Device1 cast", e))?;
+        let device1: ID3D11Device1 = device
+            .cast()
+            .map_err(|e| d3d_err("ID3D11Device1 cast", e))?;
 
         // Walk device → DXGI factory to create a swapchain for the HWND.
         let dxgi_device: IDXGIDevice = device.cast().map_err(|e| d3d_err("IDXGIDevice cast", e))?;
@@ -330,7 +333,10 @@ impl D3D11RenderState {
             Height: surface_size.1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: false.into(),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
             Scaling: DXGI_SCALING_STRETCH,
@@ -358,7 +364,10 @@ impl D3D11RenderState {
             device,
             device1,
             context,
-            target: PresentTarget::Window { _window: window, swapchain },
+            target: PresentTarget::Window {
+                _window: window,
+                swapchain,
+            },
             rtv: Some(rtv),
             pipeline,
             surface_size,
@@ -445,7 +454,12 @@ impl D3D11RenderState {
         if handle.is_null() {
             return Err(RenderError::GraphicsApi("null D3D11 shared handle".into()));
         }
-        let key = SourceKey::Gpu { handle, width, height, format };
+        let key = SourceKey::Gpu {
+            handle,
+            width,
+            height,
+            format,
+        };
         if self.imported.as_ref().is_some_and(|i| i.key == key) {
             return Ok(());
         }
@@ -459,7 +473,12 @@ impl D3D11RenderState {
         let y_srv = create_plane_srv(&self.device, &tex, y_fmt)?;
         let uv_srv = create_plane_srv(&self.device, &tex, uv_fmt)?;
 
-        tracing::debug!(width, height, format, "opened decoder biplanar shared handle");
+        tracing::debug!(
+            width,
+            height,
+            format,
+            "opened decoder biplanar shared handle"
+        );
         self.imported = Some(Imported {
             key,
             y_tex: tex.clone(),
@@ -475,10 +494,17 @@ impl D3D11RenderState {
     /// textures only on a dimension change; re-maps the pixels each frame.
     fn upload_cpu_frame(&mut self, frame: &crate::CpuFrame) -> Result<()> {
         let (chroma_w, chroma_h) = frame.chroma_dims();
-        let key = SourceKey::Cpu { width: frame.width, height: frame.height };
+        let key = SourceKey::Cpu {
+            width: frame.width,
+            height: frame.height,
+        };
         if !self.imported.as_ref().is_some_and(|i| i.key == key) {
-            let y_tex =
-                create_dynamic_texture(&self.device, frame.width, frame.height, DXGI_FORMAT_R8_UNORM)?;
+            let y_tex = create_dynamic_texture(
+                &self.device,
+                frame.width,
+                frame.height,
+                DXGI_FORMAT_R8_UNORM,
+            )?;
             let uv_tex =
                 create_dynamic_texture(&self.device, chroma_w, chroma_h, DXGI_FORMAT_R8G8_UNORM)?;
             let y_srv = create_srv(&self.device, &y_tex)?;
@@ -492,7 +518,13 @@ impl D3D11RenderState {
         }
         let imported = self.imported.as_ref().expect("just set");
         // 1 byte/texel for Y, 2 bytes/texel for interleaved UV.
-        upload_rows(&self.context, &imported.y_tex, &frame.y, frame.width as usize * 1, frame.height)?;
+        upload_rows(
+            &self.context,
+            &imported.y_tex,
+            &frame.y,
+            frame.width as usize * 1,
+            frame.height,
+        )?;
         upload_rows(
             &self.context,
             &imported.uv_tex,
@@ -511,7 +543,8 @@ impl D3D11RenderState {
         };
 
         unsafe {
-            self.context.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
+            self.context
+                .ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
             // Reset to opaque blending each frame: the cursor pass below
             // sets a straight-alpha blend state that must not leak into
             // the next frame's (opaque) video draw.
@@ -553,8 +586,10 @@ impl D3D11RenderState {
                 self.context.VSSetShader(&self.pipeline.vs, None);
                 self.context.PSSetShader(&self.pipeline.ps, None);
                 // Bind the pre-built arrays by borrow — no per-frame clones.
-                self.context.VSSetConstantBuffers(0, Some(&self.pipeline.cbuffers));
-                self.context.PSSetConstantBuffers(0, Some(&self.pipeline.cbuffers));
+                self.context
+                    .VSSetConstantBuffers(0, Some(&self.pipeline.cbuffers));
+                self.context
+                    .PSSetConstantBuffers(0, Some(&self.pipeline.cbuffers));
                 self.context.PSSetShaderResources(0, Some(&imported.srvs));
                 self.context.PSSetSamplers(0, Some(&self.pipeline.samplers));
 
@@ -650,7 +685,10 @@ impl D3D11RenderState {
             MipLevels: 1,
             ArraySize: 1,
             Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_TYPELESS,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_RENDER_TARGET.0 as u32,
             CPUAccessFlags: 0,
@@ -676,7 +714,11 @@ impl D3D11RenderState {
             imported: None,
             video_size: (width, height),
             transfer_kind: transfer_kind_for(color_space),
-            range_kind: if bit_depth == 10 { RANGE_KIND_LIMITED_10 } else { RANGE_KIND_LIMITED_8 },
+            range_kind: if bit_depth == 10 {
+                RANGE_KIND_LIMITED_10
+            } else {
+                RANGE_KIND_LIMITED_8
+            },
             cursor,
             // Detached channel: headless tests with no wire-side producer
             // get an overlay that exists but never draws. The cursor
@@ -696,16 +738,11 @@ impl D3D11RenderState {
     /// their SRVs, and install them as the imported frame — lets a test
     /// drive the render path with synthetic planes, no decoder/`Frame`
     /// plumbing. `y` is `width*height`; `uv` is `chroma_w*chroma_h*2`.
-    pub(crate) fn upload_test_planes(
-        &mut self,
-        y: &[u8],
-        uv: &[u8],
-        width: u32,
-        height: u32,
-    ) {
+    pub(crate) fn upload_test_planes(&mut self, y: &[u8], uv: &[u8], width: u32, height: u32) {
         let chroma_w = width.div_ceil(2);
         let chroma_h = height.div_ceil(2);
-        let y_tex = make_immutable_texture(&self.device, width, height, DXGI_FORMAT_R8_UNORM, y, width);
+        let y_tex =
+            make_immutable_texture(&self.device, width, height, DXGI_FORMAT_R8_UNORM, y, width);
         let uv_tex = make_immutable_texture(
             &self.device,
             chroma_w,
@@ -741,7 +778,10 @@ impl D3D11RenderState {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
             CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -762,7 +802,11 @@ impl D3D11RenderState {
             let row_bytes = (w * 4) as usize;
             for row in 0..h as usize {
                 let src = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
-                std::ptr::copy_nonoverlapping(src, out.as_mut_ptr().add(row * row_bytes), row_bytes);
+                std::ptr::copy_nonoverlapping(
+                    src,
+                    out.as_mut_ptr().add(row * row_bytes),
+                    row_bytes,
+                );
             }
             self.context.Unmap(&staging, 0);
         }
@@ -825,7 +869,13 @@ fn resize_and_rebuild_rtv(
 ) -> Result<ID3D11RenderTargetView> {
     unsafe {
         // 0 buffer count = preserve existing; keep format + flags.
-        swapchain.ResizeBuffers(0, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
+        swapchain.ResizeBuffers(
+            0,
+            width,
+            height,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_SWAP_CHAIN_FLAG(0),
+        )
     }
     .map_err(|e| d3d_err("ResizeBuffers", e))?;
     create_rtv(device, swapchain)
@@ -894,7 +944,10 @@ fn create_plane_srv(
         Format: format,
         ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
         Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-            Texture2D: D3D11_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1 },
+            Texture2D: D3D11_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+            },
         },
     };
     let mut srv = None;
@@ -916,7 +969,10 @@ fn create_dynamic_texture(
         MipLevels: 1,
         ArraySize: 1,
         Format: format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DYNAMIC,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
@@ -961,7 +1017,11 @@ fn upload_rows(
     unsafe {
         for row in 0..rows as usize {
             let dst = (mapped.pData as *mut u8).add(row * dst_pitch);
-            std::ptr::copy_nonoverlapping(src.as_ptr().add(row * src_row_bytes), dst, src_row_bytes);
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().add(row * src_row_bytes),
+                dst,
+                src_row_bytes,
+            );
         }
         context.Unmap(texture, 0);
     }
@@ -1050,19 +1110,25 @@ fn compile_shader(src: &[u8], entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
         let detail = errors
             .as_ref()
             .map(|b| unsafe {
-                let bytes =
-                    std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize());
+                let bytes = std::slice::from_raw_parts(
+                    b.GetBufferPointer().cast::<u8>(),
+                    b.GetBufferSize(),
+                );
                 String::from_utf8_lossy(bytes).into_owned()
             })
             .unwrap_or_default();
-        return Err(RenderError::GraphicsApi(format!("D3DCompile: {e}: {detail}")));
+        return Err(RenderError::GraphicsApi(format!(
+            "D3DCompile: {e}: {detail}"
+        )));
     }
     code.ok_or_else(|| RenderError::GraphicsApi("D3DCompile produced no bytecode".into()))
 }
 
 /// Bytecode view over a compiled shader blob.
 fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) }
+    unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    }
 }
 
 /// IMMUTABLE, shader-readable texture initialised from `data` — the
@@ -1076,16 +1142,17 @@ fn make_immutable_texture(
     data: &[u8],
     row_pitch: u32,
 ) -> ID3D11Texture2D {
-    use windows::Win32::Graphics::Direct3D11::{
-        D3D11_SUBRESOURCE_DATA, D3D11_USAGE_IMMUTABLE,
-    };
+    use windows::Win32::Graphics::Direct3D11::{D3D11_SUBRESOURCE_DATA, D3D11_USAGE_IMMUTABLE};
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
         MipLevels: 1,
         ArraySize: 1,
         Format: format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_IMMUTABLE,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         CPUAccessFlags: 0,
@@ -1146,7 +1213,10 @@ mod tests {
     fn decode_plane_srv_formats_mirrors_internal_table() {
         for fmt in [DXGI_FORMAT_NV12.0 as u32, DXGI_FORMAT_P010.0 as u32] {
             let (y, uv) = plane_srv_formats(fmt).unwrap();
-            assert_eq!(decode_plane_srv_formats(fmt), Some((y.0 as u32, uv.0 as u32)));
+            assert_eq!(
+                decode_plane_srv_formats(fmt),
+                Some((y.0 as u32, uv.0 as u32))
+            );
         }
         assert_eq!(decode_plane_srv_formats(0), None);
     }
@@ -1181,7 +1251,10 @@ mod tests {
             "render produced ~black for mid-luma input: ({b}, {g}, {r})"
         );
         let (max, min) = (r.max(g).max(b) as i32, r.min(g).min(b) as i32);
-        assert!(max - min < 40, "neutral chroma should be near-gray: ({b}, {g}, {r})");
+        assert!(
+            max - min < 40,
+            "neutral chroma should be near-gray: ({b}, {g}, {r})"
+        );
     }
 
     /// Drives the cursor overlay through the real `render` path: a gray
@@ -1268,9 +1341,11 @@ mod tests {
 
     fn coord_fixture_roundtrip(bit_depth: u8) {
         use tether_codec::d3d11::{D3D11Decoder, D3D11Encoder};
-        use tether_codec::{Decoder, Encoder, D3D11TextureFrame, Frame as CodecFrame};
+        use tether_codec::{D3D11TextureFrame, Decoder, Encoder, Frame as CodecFrame};
         use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
-        use tether_scaler::test_util::{coord_fixture_fill, coord_fixture_residual_px_rms, LetterboxMap};
+        use tether_scaler::test_util::{
+            coord_fixture_fill, coord_fixture_residual_px_rms, LetterboxMap,
+        };
         use windows::core::Interface;
         use windows::Win32::Foundation::HMODULE;
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -1279,7 +1354,9 @@ mod tests {
             D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
             D3D11_USAGE_DEFAULT,
         };
-        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
         use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 
         const VENDOR_INTEL: u32 = 0x8086;
@@ -1328,7 +1405,10 @@ mod tests {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             // No bind flags: the encoder's VP-blit input validation
             // rejects a SHADER_RESOURCE-bound source (UnsupportedInputFormat).
@@ -1346,7 +1426,11 @@ mod tests {
             .expect("fixture CreateTexture2D");
         let src = src.unwrap();
 
-        let profile = VideoProfile { codec: CodecKind::Hevc, chroma: ChromaSubsampling::Yuv420, bit_depth };
+        let profile = VideoProfile {
+            codec: CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth,
+        };
         let mut enc = D3D11Encoder::new(
             profile,
             w,
@@ -1358,7 +1442,12 @@ mod tests {
             VENDOR_INTEL,
         )
         .expect("QSV encoder");
-        assert_eq!(enc.name(), "hevc_qsv", "QSV unavailable; got {}", enc.name());
+        assert_eq!(
+            enc.name(),
+            "hevc_qsv",
+            "QSV unavailable; got {}",
+            enc.name()
+        );
 
         let mut dec = D3D11Decoder::new(CodecKind::Hevc, true).expect("decoder");
         let frame_desc = D3D11TextureFrame {
@@ -1374,7 +1463,9 @@ mod tests {
         // keep the latest (post-IDR, fully-formed).
         let mut decoded: Option<CodecFrame> = None;
         for pts in 0..90 {
-            let pkts = enc.submit_d3d11_texture(&frame_desc, pts, pts == 0).expect("encode");
+            let pkts = enc
+                .submit_d3d11_texture(&frame_desc, pts, pts == 0)
+                .expect("encode");
             for pkt in &pkts {
                 dec.submit(&pkt.data).expect("submit");
             }
@@ -1396,8 +1487,9 @@ mod tests {
 
         // Render through the production import/SRV/shader path on a fresh
         // device (cross-device, like the real client), read back, measure.
-        let mut state = D3D11RenderState::new_headless(w, h, VideoColorSpec::sdr_desktop(), bit_depth)
-            .expect("headless");
+        let mut state =
+            D3D11RenderState::new_headless(w, h, VideoColorSpec::sdr_desktop(), bit_depth)
+                .expect("headless");
         state.apply_frame(render_frame).expect("apply_frame");
         state.render().expect("render");
         let bgra = state.read_back_bgra();
@@ -1407,7 +1499,9 @@ mod tests {
         let mid = (((h / 2) * w + (w / 2)) * 4) as usize;
         eprintln!(
             "coord-fixture residual = {residual:.1}px  center BGRA = ({}, {}, {})",
-            bgra[mid], bgra[mid + 1], bgra[mid + 2]
+            bgra[mid],
+            bgra[mid + 1],
+            bgra[mid + 2]
         );
         assert!(
             residual < 80.0,

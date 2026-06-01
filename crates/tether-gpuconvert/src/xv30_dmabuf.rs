@@ -77,9 +77,7 @@ pub enum Xv30DmaBufError {
     /// the chroma shader's `.rgb` swizzle is format-agnostic.
     #[error("input texture format must be Bgra8Unorm or Rgba8Unorm, got {0:?}")]
     InputFormat(wgpu::TextureFormat),
-    #[error(
-        "input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}"
-    )]
+    #[error("input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}")]
     DimMismatch {
         input_w: u32,
         input_h: u32,
@@ -154,8 +152,7 @@ impl Bgra2Xv30DmaBuf {
         // STORAGE_IMAGE_BIT gate. Multi-GPU caveat is the same as the
         // P010 sibling — see `bgra_to_p010_dmabuf.rs`'s comment on the
         // hybrid-adapter case.
-        let mods =
-            crate::modifier_query::storable_dmabuf_modifiers(DRM_FOURCC_XV30).await?;
+        let mods = crate::modifier_query::storable_dmabuf_modifiers(DRM_FOURCC_XV30).await?;
         if !mods.contains(&DRM_FORMAT_MOD_LINEAR) {
             return Err(Xv30DmaBufError::StorageUnsupported);
         }
@@ -242,9 +239,7 @@ impl Bgra2Xv30DmaBuf {
                     )
                 })?
                 .texture_from_dmabuf_fd(fd, &hal_desc, modifier, stride, offset)
-                .map_err(|e| {
-                    Xv30DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}"))
-                })?
+                .map_err(|e| Xv30DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}")))?
         };
         let wgpu_desc = wgpu::TextureDescriptor {
             label: Some("imported bgra"),
@@ -390,6 +385,9 @@ impl Bgra2Xv30DmaBuf {
 
 #[cfg(test)]
 mod tests {
+    // Readback pixel-math casts (u64 offset → usize) are intentional.
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
     use super::*;
 
     /// Re-import one packed XV30 plane as Rgb10a2Unorm, copy it to a
@@ -536,9 +534,7 @@ mod tests {
                 | Xv30DmaBufError::FeatureUnsupported
                 | Xv30DmaBufError::StorageUnsupported,
             ) => {
-                eprintln!(
-                    "SKIP: no wgpu adapter with DMA-BUF export + Rgb10a2Unorm storage"
-                );
+                eprintln!("SKIP: no wgpu adapter with DMA-BUF export + Rgb10a2Unorm storage");
                 return;
             }
             Err(e) => panic!("Bgra2Xv30DmaBuf::new: {e}"),
@@ -601,9 +597,7 @@ mod tests {
                 | Xv30DmaBufError::FeatureUnsupported
                 | Xv30DmaBufError::StorageUnsupported,
             ) => {
-                eprintln!(
-                    "SKIP: no wgpu adapter with DMA-BUF export + Rgb10a2Unorm storage"
-                );
+                eprintln!("SKIP: no wgpu adapter with DMA-BUF export + Rgb10a2Unorm storage");
                 return;
             }
             Err(e) => panic!("Bgra2Xv30DmaBuf::new: {e}"),

@@ -115,12 +115,8 @@ impl Client {
         let std_socket: std::net::UdpSocket = socket.into();
         let runtime = quinn::default_runtime()
             .ok_or_else(|| std::io::Error::other("no async runtime found"))?;
-        let endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            std_socket,
-            runtime,
-        )?;
+        let endpoint =
+            quinn::Endpoint::new(quinn::EndpointConfig::default(), None, std_socket, runtime)?;
         Ok(Self { endpoint, identity })
     }
 
@@ -145,7 +141,9 @@ impl Client {
         let client_chain = self.identity.chain.clone();
         let client_key = PrivatePkcs8KeyDer::from(self.identity.key.secret_pkcs8_der().to_vec());
         let client_config = make_client_config(server_auth, client_chain, client_key.into())?;
-        let connecting = self.endpoint.connect_with(client_config, addr, server_name)?;
+        let connecting = self
+            .endpoint
+            .connect_with(client_config, addr, server_name)?;
         let conn = connecting.await?;
         trace!(remote = %conn.remote_address(), "client connection established");
         // Open the pairing stream (stream #1) and write its preamble. In QUIC,
@@ -155,7 +153,11 @@ impl Client {
         // in `into_connection`, only once authorized.
         let (mut pairing_send, pairing_recv) = conn.open_bi().await?;
         pairing_send.write_all(STREAM_PREAMBLE).await?;
-        Ok(PendingConnection::new_client(conn, pairing_send, pairing_recv))
+        Ok(PendingConnection::new_client(
+            conn,
+            pairing_send,
+            pairing_recv,
+        ))
     }
 
     /// Convenience: connect and immediately promote to a session with **no
@@ -202,8 +204,9 @@ fn make_client_config(
     // at the protocol layer, but being explicit keeps the exporter's RFC 8446
     // channel-binding guarantee from silently weakening if this config is ever
     // reused over a non-QUIC transport.
-    let dangerous = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .dangerous();
+    let dangerous =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .dangerous();
     let crypto = match server_auth {
         ServerAuth::Pinned(fingerprint) => {
             dangerous.with_custom_certificate_verifier(PinnedCertVerifier::new(fingerprint))

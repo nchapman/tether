@@ -228,7 +228,10 @@ fn probe_host() -> Vec<ProfileSupport> {
     let probe_order = {
         let mut order: Vec<_> = PROFILE_PREFERENCE.to_vec();
         // Move H.264 to front.
-        if let Some(pos) = order.iter().position(|p| p.codec == tether_protocol::control::CodecKind::H264) {
+        if let Some(pos) = order
+            .iter()
+            .position(|p| p.codec == tether_protocol::control::CodecKind::H264)
+        {
             let h264 = order.remove(pos);
             order.insert(0, h264);
         }
@@ -541,8 +544,7 @@ mod tests {
     fn probe_host_includes_h264_encode() {
         let profiles = host_supported_profiles();
         let h264 = profiles.iter().find(|s| {
-            s.profile.codec == tether_protocol::control::CodecKind::H264
-                && s.profile.bit_depth == 8
+            s.profile.codec == tether_protocol::control::CodecKind::H264 && s.profile.bit_depth == 8
         });
         assert!(
             h264.is_some(),
@@ -635,8 +637,7 @@ mod tests {
     fn probe_client_includes_h264_decode() {
         let profiles = client_supported_profiles();
         let h264 = profiles.iter().find(|s| {
-            s.profile.codec == tether_protocol::control::CodecKind::H264
-                && s.profile.bit_depth == 8
+            s.profile.codec == tether_protocol::control::CodecKind::H264 && s.profile.bit_depth == 8
         });
         assert!(
             h264.is_some(),

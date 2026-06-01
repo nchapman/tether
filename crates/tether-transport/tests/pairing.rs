@@ -64,13 +64,12 @@ async fn first_contact_pairing_then_session() -> anyhow::Result<()> {
             .await?;
 
         // Verify the client's confirmation, then send ours and authorize.
-        let exporter = pending.export_keying_material(EXPORTER_LABEL, EXPORTER_CONTEXT, EXPORTER_LEN)?;
+        let exporter =
+            pending.export_keying_material(EXPORTER_LABEL, EXPORTER_CONTEXT, EXPORTER_LEN)?;
         let exporter: [u8; EXPORTER_LEN] = exporter.try_into().expect("exporter len");
         let t = transcript(&exporter, &host_fp, &client_fp);
 
-        let client_mac = match pending.recv_pairing::<PairingConfirm>().await? {
-            PairingConfirm { mac } => mac,
-        };
+        let PairingConfirm { mac: client_mac } = pending.recv_pairing::<PairingConfirm>().await?;
         assert!(
             host_keyed.verify_confirmation(Direction::ClientToHost, &t, &client_mac),
             "client confirmation must verify"
@@ -114,7 +113,8 @@ async fn first_contact_pairing_then_session() -> anyhow::Result<()> {
     };
     let client_keyed = client_start.into_keyed(&host_spake2).expect("client keyed");
 
-    let exporter = pending.export_keying_material(EXPORTER_LABEL, EXPORTER_CONTEXT, EXPORTER_LEN)?;
+    let exporter =
+        pending.export_keying_material(EXPORTER_LABEL, EXPORTER_CONTEXT, EXPORTER_LEN)?;
     let exporter: [u8; EXPORTER_LEN] = exporter.try_into().expect("exporter len");
     let t = transcript(&exporter, &observed_host_fp, &client_fp);
 
@@ -143,7 +143,10 @@ async fn first_contact_pairing_then_session() -> anyhow::Result<()> {
         observed_client_fp, client_fp,
         "host saw the client's real fingerprint"
     );
-    assert_eq!(observed_host_fp, host_fp, "client saw the host's real fingerprint");
+    assert_eq!(
+        observed_host_fp, host_fp,
+        "client saw the host's real fingerprint"
+    );
     Ok(())
 }
 

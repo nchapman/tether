@@ -254,3 +254,27 @@ button.link.danger {
 button.link.danger:hover {
   text-decoration: underline;
 }
+
+/* --- update banner --- */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+  padding: 0.6rem 0.85rem;
+  border-radius: 8px;
+  background: #1f2740;
+  border: 1px solid #5b8cff;
+  font-size: 0.9rem;
+}
+
+.update-banner button {
+  margin-left: auto;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.update-banner .error {
+  flex-basis: 100%;
+}

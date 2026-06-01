@@ -326,7 +326,11 @@ fn read_pointer_position(geom: CaptureGeometry) -> Option<CursorPosition> {
         && (px as u32) < geom.capture_pixel_w
         && (py as u32) < geom.capture_pixel_h;
 
-    Some(CursorPosition { x: px, y: py, visible })
+    Some(CursorPosition {
+        x: px,
+        y: py,
+        visible,
+    })
 }
 
 // ===========================================================================
@@ -598,7 +602,6 @@ pub(crate) fn downscale_if_oversize(
     (new_w, new_h, new_pixels, new_hot)
 }
 
-
 // ===========================================================================
 // CGSCurrentCursorSeed (private symbol, weak-linked via dlsym)
 // ===========================================================================
@@ -614,7 +617,9 @@ unsafe fn lookup_cursor_seed() -> Option<unsafe extern "C" fn() -> i32> {
         return None;
     }
     // SAFETY: caller's responsibility — see fn-level safety note.
-    Some(unsafe { std::mem::transmute::<*mut std::ffi::c_void, unsafe extern "C" fn() -> i32>(sym) })
+    Some(unsafe {
+        std::mem::transmute::<*mut std::ffi::c_void, unsafe extern "C" fn() -> i32>(sym)
+    })
 }
 
 #[cfg(test)]
@@ -651,8 +656,7 @@ mod tests {
     #[test]
     fn downscale_preserves_aspect_and_fits_under_cap() {
         let pixels = vec![0xFFu8; 170 * 230 * 4];
-        let (w, h, out, hot) =
-            downscale_if_oversize(170, 230, pixels, (40, 40), 128);
+        let (w, h, out, hot) = downscale_if_oversize(170, 230, pixels, (40, 40), 128);
         assert!(w <= 128 && h <= 128, "got {w}x{h}");
         assert_eq!(h, 128, "longest dim should hit the cap");
         let aspect_in = 170.0_f64 / 230.0_f64;
@@ -662,7 +666,10 @@ mod tests {
             "aspect drifted: in={aspect_in}, out={aspect_out}"
         );
         assert_eq!(out.len(), (w as usize) * (h as usize) * 4);
-        assert!(out.len() < 64 * 1024, "downscaled sprite must fit framed cap");
+        assert!(
+            out.len() < 64 * 1024,
+            "downscaled sprite must fit framed cap"
+        );
         // Hotspot scales by the same factor as the longest side.
         let expected_scale = f64::from(h) / 230.0;
         let expected_hot_x = (40.0 * expected_scale).round() as u32;
@@ -699,7 +706,10 @@ mod tests {
         // CGPoint; we re-derive the visibility predicate here to lock
         // it in.
         let visible = |x: i32, y: i32| {
-            x >= 0 && y >= 0 && (x as u32) < geom.capture_pixel_w && (y as u32) < geom.capture_pixel_h
+            x >= 0
+                && y >= 0
+                && (x as u32) < geom.capture_pixel_w
+                && (y as u32) < geom.capture_pixel_h
         };
         assert!(visible(0, 0));
         assert!(visible(999, 499));

@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Formatting doesn't compile, so skip the FFmpeg/system-dep setup.
+      # cache: false — see .github/actions/setup for why (rustfmt component).
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - run: cargo fmt --all --check
+      # The Tauri shell is excluded from the workspace, so `--all` skips it.
+      - run: cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check
+
+  test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # rustflags is per-OS: a RUSTFLAGS env *replaces* (doesn't merge with)
+        # the rustflags in .cargo/config.toml, so on macOS we must re-add the
+        # Swift rpath there or the Swift-bridged crates' test binaries abort
+        # with "Library not loaded: @rpath/libswift_Concurrency.dylib".
+        include:
+          - os: ubuntu-latest
+            rustflags: "-D warnings"
+          - os: windows-latest
+            rustflags: "-D warnings"
+          - os: macos-latest
+            rustflags: "-D warnings -C link-arg=-Wl,-rpath,/usr/lib/swift"
+    env:
+      # CLAUDE.md: the build must stay warning-free. cargo caps lints to
+      # `allow` for registry/git dependencies, so this only gates our crates.
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test-support gating check
+        if: runner.os == 'Linux'
+        shell: bash
+        run: scripts/check_test_support_gating.sh
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+
+      - name: Run unit tests (no hardware)
+        run: cargo test --workspace
+
+  shell-check:
+    name: shell typecheck (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      # The Tauri shell is excluded from the cargo workspace and needs the
+      # webview/GTK toolkit on Linux; install it only for this job so the
+      # core build stays lean.
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libsoup-3.0-dev libayatana-appindicator3-dev
+
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/tether-shell/src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm --dir apps/tether-shell install --frozen-lockfile
+
+      - name: Typecheck frontend (tsc)
+        run: pnpm --dir apps/tether-shell exec tsc --noEmit
+
+      # tauri.windows.conf.json (auto-merged on Windows) declares the VC++
+      # runtime DLLs as bundle resources, and Tauri's build script validates
+      # they exist — even for `cargo test`. Stage them as release.yml does so
+      # the shell backend compiles.
+      - name: Stage Windows runtime DLLs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: scripts/stage-windows-runtime.sh
+
+      - name: Test shell backend (cargo)
+        run: cargo test --manifest-path apps/tether-shell/src-tauri/Cargo.toml
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The Tauri shell is excluded from the workspace and needs the webview
+      # toolkit to build; lint it separately so it stays clean too.
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libsoup-3.0-dev libayatana-appindicator3-dev
+      - run: cargo clippy --manifest-path apps/tether-shell/src-tauri/Cargo.toml --all-targets -- -D warnings

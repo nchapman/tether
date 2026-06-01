@@ -153,10 +153,7 @@ impl CursorSource for PipeWireCursorSource {
         // panics with the guard held in normal operation, and the
         // host has no useful "no cursor" fallback if the snapshot is
         // unreadable. Log and treat as transient None.
-        self.position_state
-            .lock()
-            .ok()
-            .and_then(|guard| *guard)
+        self.position_state.lock().ok().and_then(|guard| *guard)
     }
 }
 
@@ -322,15 +319,11 @@ fn run_pipewire(
                 // pod → object for this case in 0.10; we use the raw
                 // helper.
                 let ptr = param.as_raw_ptr() as *const libspa_sys::spa_pod;
-                let prop = libspa_sys::spa_pod_find_prop(
-                    ptr.cast(),
-                    std::ptr::null(),
-                    modifier_key.0,
-                );
+                let prop =
+                    libspa_sys::spa_pod_find_prop(ptr.cast(), std::ptr::null(), modifier_key.0);
                 !prop.is_null()
             };
-            user_data.negotiated_modifier =
-                has_modifier.then_some(user_data.format.modifier());
+            user_data.negotiated_modifier = has_modifier.then_some(user_data.format.modifier());
             let f = &user_data.format;
             tracing::info!(
                 spa_format = ?f.format(),
@@ -352,9 +345,8 @@ fn run_pipewire(
             // DmaBuf only when modifier negotiation succeeded — sending
             // the DmaBuf bit without a fixated modifier would let the
             // compositor hand us an opaque-tiled buffer we can't import.
-            let mut data_type_mask = (1u32
-                << libspa_sys::SPA_DATA_MemPtr)
-                | (1u32 << libspa_sys::SPA_DATA_MemFd);
+            let mut data_type_mask =
+                (1u32 << libspa_sys::SPA_DATA_MemPtr) | (1u32 << libspa_sys::SPA_DATA_MemFd);
             if has_modifier {
                 data_type_mask |= 1u32 << libspa_sys::SPA_DATA_DmaBuf;
             }
@@ -459,8 +451,7 @@ fn run_pipewire(
                         }
                     }
                 }
-                pw::spa::buffer::DataType::MemPtr
-                | pw::spa::buffer::DataType::MemFd => {
+                pw::spa::buffer::DataType::MemPtr | pw::spa::buffer::DataType::MemFd => {
                     match build_cpu_frame(data, user_data, width, height, t) {
                         Ok(f) => f,
                         Err(e) => {
@@ -523,9 +514,11 @@ fn run_pipewire(
         .ok_or_else(|| CaptureError::PipeWire("cursor meta pod from_bytes returned None".into()))?;
     let mut params_storage: Vec<&spa::pod::Pod> = Vec::with_capacity(4);
     if let Some(ref bytes) = dmabuf_pod_bytes {
-        params_storage.push(spa::pod::Pod::from_bytes(bytes).ok_or_else(|| {
-            CaptureError::PipeWire("dmabuf pod from_bytes returned None".into())
-        })?);
+        params_storage.push(
+            spa::pod::Pod::from_bytes(bytes).ok_or_else(|| {
+                CaptureError::PipeWire("dmabuf pod from_bytes returned None".into())
+            })?,
+        );
     }
     params_storage.push(shm_pod);
     params_storage.push(meta_pod);
@@ -603,9 +596,18 @@ fn build_format_pod(modifiers: &[u64]) -> Result<Vec<u8>> {
         Choice,
         Range,
         Rectangle,
-        pw::spa::utils::Rectangle { width: 1920, height: 1080 },
-        pw::spa::utils::Rectangle { width: 1, height: 1 },
-        pw::spa::utils::Rectangle { width: 7680, height: 4320 }
+        pw::spa::utils::Rectangle {
+            width: 1920,
+            height: 1080
+        },
+        pw::spa::utils::Rectangle {
+            width: 1,
+            height: 1
+        },
+        pw::spa::utils::Rectangle {
+            width: 7680,
+            height: 4320
+        }
     ));
     properties.push(pw::spa::pod::property!(
         pw::spa::param::format::FormatProperties::VideoFramerate,
@@ -1032,7 +1034,9 @@ fn process_cursor_meta(buffer: &pw::buffer::Buffer<'_>, user_data: &mut UserData
     // try_send because the receiver might be lagging (host pump
     // hasn't drained yet); dropping a stale shape forward is the
     // right call — the next change will resend.
-    let _ = user_data.cursor_shape_tx.try_send(CursorEvent::Shape(shape));
+    let _ = user_data
+        .cursor_shape_tx
+        .try_send(CursorEvent::Shape(shape));
 }
 
 /// Convert a `MetaBitmap` payload into a wire-ready
@@ -1157,7 +1161,9 @@ fn build_video_damage_meta_pod() -> Result<Vec<u8>> {
             pw::spa::pod::Property {
                 key: libspa_sys::SPA_PARAM_META_type,
                 flags: pw::spa::pod::PropertyFlags::empty(),
-                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(libspa_sys::SPA_META_VideoDamage)),
+                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
+                    libspa_sys::SPA_META_VideoDamage,
+                )),
             },
             pw::spa::pod::Property {
                 key: libspa_sys::SPA_PARAM_META_size,
@@ -1224,7 +1230,10 @@ mod tests {
         let Value::Object(obj) = value else {
             panic!("expected Object, got {value:?}");
         };
-        assert_eq!(obj.type_, pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw());
+        assert_eq!(
+            obj.type_,
+            pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw()
+        );
         assert_eq!(obj.id, pw::spa::param::ParamType::Meta.as_raw());
 
         let type_prop = obj
@@ -1315,7 +1324,7 @@ mod tests {
         .expect("header size fits in i32");
         assert_eq!(
             *min,
-            header + 1 * 1 * 4,
+            header + 4,
             "min must reserve a 1×1 bitmap (matching OBS CURSOR_META_SIZE)"
         );
         assert_eq!(
@@ -1363,7 +1372,7 @@ mod tests {
         let mut raw = vec![0u8; 16];
         raw[0..4].copy_from_slice(&[0x30, 0x20, 0x10, 0xFF]); // BGRA → R=10
         raw[4..8].copy_from_slice(&[0x60, 0x50, 0x40, 0xFF]); // BGRA → R=40
-        // Padding (bytes 8..16) is junk that must not appear in output.
+                                                              // Padding (bytes 8..16) is junk that must not appear in output.
         for b in raw.iter_mut().take(16).skip(8) {
             *b = 0xAB;
         }

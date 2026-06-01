@@ -56,7 +56,10 @@ impl VaError {
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
-        Self { status, message: msg }
+        Self {
+            status,
+            message: msg,
+        }
     }
 }
 
@@ -109,7 +112,13 @@ impl DrmPrimeSurface {
     /// Decompose into fields so callers can hand fds to a wgpu/Vulkan
     /// import that takes ownership.
     pub fn into_parts(self) -> (u32, u32, u32, Vec<PrimeObject>, Vec<PrimeLayer>) {
-        (self.fourcc, self.width, self.height, self.objects, self.layers)
+        (
+            self.fourcc,
+            self.width,
+            self.height,
+            self.objects,
+            self.layers,
+        )
     }
 }
 
@@ -163,9 +172,8 @@ pub unsafe fn export_surface_handle(
     let mut desc = ffi::DRMPRIMESurfaceDescriptor::zeroed();
     // SAFETY: forwarding caller's invariants on display+surface; `desc`
     // is a valid writable struct of the right type.
-    let status = unsafe {
-        ffi::vaExportSurfaceHandle(display, surface, mem_type, flags, &mut desc)
-    };
+    let status =
+        unsafe { ffi::vaExportSurfaceHandle(display, surface, mem_type, flags, &mut desc) };
     if status != VA_STATUS_SUCCESS {
         return Err(VaError::from_status(status));
     }

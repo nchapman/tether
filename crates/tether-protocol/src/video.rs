@@ -473,8 +473,7 @@ impl FrameFragmenter {
 
         if !use_fec {
             if fec_on {
-                self.no_fec_fallback_count =
-                    self.no_fec_fallback_count.saturating_add(1);
+                self.no_fec_fallback_count = self.no_fec_fallback_count.saturating_add(1);
                 tracing::debug!(
                     primary_shards_needed,
                     ceiling,
@@ -495,8 +494,7 @@ impl FrameFragmenter {
             .expect("primary count fits in u16; capped by max_primary_shards_for_pct");
         let parity_count = compute_parity_count(primary_shards_needed, self.fec_percentage);
 
-        let mut packets =
-            Vec::with_capacity(primary_shards_needed + parity_count);
+        let mut packets = Vec::with_capacity(primary_shards_needed + parity_count);
 
         // First shard. Wrap meta in the envelope; clone so we can
         // also replicate it across every parity packet for the
@@ -573,8 +571,8 @@ impl FrameFragmenter {
         let first_len = body.len().min(FIRST_PAYLOAD_BUDGET);
         let tail_len = body.len() - first_len;
         let cont_count = tail_len.div_ceil(CONTINUATION_PAYLOAD_BUDGET);
-        let fragment_count = u16::try_from(1 + cont_count)
-            .expect("frame exceeds u16::MAX fragments");
+        let fragment_count =
+            u16::try_from(1 + cont_count).expect("frame exceeds u16::MAX fragments");
 
         let mut packets = Vec::with_capacity(1 + cont_count);
         packets.push(VideoPacket::First {
@@ -612,7 +610,9 @@ fn compute_parity_count(primary: usize, fec_percentage: u8) -> usize {
     if fec_percentage == 0 {
         return 0;
     }
-    let raw = primary.saturating_mul(fec_percentage as usize).div_ceil(100);
+    let raw = primary
+        .saturating_mul(fec_percentage as usize)
+        .div_ceil(100);
     raw.max(1)
 }
 
@@ -1147,11 +1147,9 @@ impl FrameReassembler {
 /// Requires (primary slots filled OR parity slots filled) ≥ data_shards
 /// AND parity availability > 0.
 fn enough_for_rs_decode(pending: &Pending) -> bool {
-    let parity_received = pending
-        .parity_shards
-        .iter()
-        .filter(|s| s.is_some())
-        .count() as u16;
+    // Parity shard count is bounded by FEC_MAX_PRIMARY_SHARDS (212), well within u16.
+    #[allow(clippy::cast_possible_truncation)]
+    let parity_received = pending.parity_shards.iter().filter(|s| s.is_some()).count() as u16;
     pending.received_count + parity_received >= pending.fragment_count
 }
 
@@ -1175,9 +1173,7 @@ fn validate_packet_sizing(packet: &VideoPacket) -> Option<&'static str> {
                 return Some("First.fragment_count exceeds MAX_FRAGMENTS_PER_FRAME");
             }
         }
-        VideoPacket::Continuation {
-            fragment_index, ..
-        } => {
+        VideoPacket::Continuation { fragment_index, .. } => {
             if *fragment_index as usize >= MAX_FRAGMENTS_PER_FRAME {
                 return Some("Continuation.fragment_index exceeds MAX_FRAGMENTS_PER_FRAME");
             }
@@ -1365,15 +1361,24 @@ mod validation_tests {
         let primary_count = packets
             .iter()
             .filter(|p| {
-                matches!(p, VideoPacket::First { .. } | VideoPacket::Continuation { .. })
+                matches!(
+                    p,
+                    VideoPacket::First { .. } | VideoPacket::Continuation { .. }
+                )
             })
             .count();
         let parity_count = packets
             .iter()
             .filter(|p| matches!(p, VideoPacket::Parity { .. }))
             .count();
-        assert!(primary_count >= 3, "expected ≥3 primary packets, got {primary_count}");
-        assert!(parity_count >= 1, "expected ≥1 parity packet, got {parity_count}");
+        assert!(
+            primary_count >= 3,
+            "expected ≥3 primary packets, got {primary_count}"
+        );
+        assert!(
+            parity_count >= 1,
+            "expected ≥1 parity packet, got {parity_count}"
+        );
 
         let mut reassembler = FrameReassembler::new();
         let (drops_before, lost_before) = reassembler.loss_counters();
@@ -1381,7 +1386,10 @@ mod validation_tests {
         // Feed primaries first, parity second — the wire order the
         // sender emits in `fragment()`.
         let (primaries, parities): (Vec<_>, Vec<_>) = packets.into_iter().partition(|p| {
-            matches!(p, VideoPacket::First { .. } | VideoPacket::Continuation { .. })
+            matches!(
+                p,
+                VideoPacket::First { .. } | VideoPacket::Continuation { .. }
+            )
         });
         let mut finalised = None;
         for packet in primaries {
@@ -1389,7 +1397,10 @@ mod validation_tests {
                 finalised = Some(frame);
             }
         }
-        assert!(finalised.is_some(), "frame must finalise from primaries alone");
+        assert!(
+            finalised.is_some(),
+            "frame must finalise from primaries alone"
+        );
 
         // Late parity packets must drop silently — no new pending
         // entry, no counter bump.

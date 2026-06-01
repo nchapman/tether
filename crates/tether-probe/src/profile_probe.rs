@@ -73,7 +73,10 @@ pub(crate) type Result<T> = std::result::Result<T, ProbeError>;
 /// driver, not in the probe object. A trait (rather than two
 /// platform-specific free functions) keeps the contract explicit when
 /// adding a new backend.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 pub(crate) trait ProfileProbe {
     /// Construct an encoder at `profile` (128×128 floor — satisfies
     /// HEVC's minimum-block constraint on Intel hardware) and verify
@@ -103,7 +106,10 @@ pub(crate) trait ProfileProbe {
 ///
 /// Fixtures are tiny single-IDR bitstreams generated offline at
 /// 128×128 grey. Regeneration commands live in `fixtures/probe/README.md`.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 pub(crate) fn fixture_for(profile: VideoProfile) -> Option<&'static [u8]> {
     match (profile.codec, profile.chroma, profile.bit_depth) {
         (CodecKind::H264, ChromaSubsampling::Yuv420, 8) => {

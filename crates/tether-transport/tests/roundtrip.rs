@@ -1,3 +1,6 @@
+// Test payloads built from loop indices; the byte casts are deliberate.
+#![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+
 use std::net::Ipv4Addr;
 
 use tether_protocol::{
@@ -292,7 +295,10 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
     };
     let err = conn.send_datagram(&Datagram::Video(oversized));
     assert!(
-        matches!(err, Err(tether_transport::TransportError::FrameTooLarge { .. })),
+        matches!(
+            err,
+            Err(tether_transport::TransportError::FrameTooLarge { .. })
+        ),
         "expected FrameTooLarge, got {err:?}"
     );
     Ok(())
@@ -407,7 +413,10 @@ async fn oversize_video_keyframe_is_rejected_on_send() -> anyhow::Result<()> {
     };
     let err = conn.send_video_keyframe(&oversized).await;
     assert!(
-        matches!(err, Err(tether_transport::TransportError::FrameTooLarge { .. })),
+        matches!(
+            err,
+            Err(tether_transport::TransportError::FrameTooLarge { .. })
+        ),
         "expected FrameTooLarge, got {err:?}"
     );
     conn.send_control(&ControlMessage::ForceIdr).await?;

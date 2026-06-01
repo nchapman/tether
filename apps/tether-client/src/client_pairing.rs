@@ -218,7 +218,9 @@ mod tests {
         } else {
             vec![0u8; EXPORTER_LEN] // wrong MAC → client must reject
         };
-        p.send_pairing(&PairingResult::Confirmed { mac }).await.unwrap();
+        p.send_pairing(&PairingResult::Confirmed { mac })
+            .await
+            .unwrap();
         if good_confirmation {
             // Client will promote; match it so its into_connection() completes.
             p.into_connection().await.unwrap();
@@ -228,11 +230,10 @@ mod tests {
     #[tokio::test]
     async fn resume_authorized_promotes_and_returns_host_fp() {
         let (server, client, host_pending, client_pending) = loopback().await;
-        let (host_done, client_res) = tokio::join!(
+        let (_host_done, client_res) = tokio::join!(
             host_resume(host_pending, true),
             establish(client_pending, &HostAuth::Resume, client.fingerprint()),
         );
-        let _ = host_done;
         let (_conn, host_fp) = client_res.expect("resume should succeed");
         assert_eq!(host_fp, server.fingerprint());
     }
@@ -260,7 +261,10 @@ mod tests {
             establish(client_pending, &mode, client_fp),
         );
         let (_conn, learned_fp) = client_res.expect("matching PIN should pair");
-        assert_eq!(learned_fp, host_fp, "client learns the host fingerprint to pin");
+        assert_eq!(
+            learned_fp, host_fp,
+            "client learns the host fingerprint to pin"
+        );
     }
 
     #[tokio::test]

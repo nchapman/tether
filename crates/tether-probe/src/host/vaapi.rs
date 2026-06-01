@@ -188,13 +188,8 @@ fn probe_xv30_submit(enc: &mut VaapiEncoder) -> Result<()> {
     let xv30 = bridge.convert_bgra_bytes(&probe_bytes).map_err(|e| {
         ProbeError::new(PipelineStage::Capture, format!("XV30 bridge convert: {e}"))
     })?;
-    let codec_frame = build_xv30_dmabuf_frame(
-        xv30.fd,
-        xv30.size,
-        xv30.modifier,
-        xv30.offset,
-        xv30.stride,
-    );
+    let codec_frame =
+        build_xv30_dmabuf_frame(xv30.fd, xv30.size, xv30.modifier, xv30.offset, xv30.stride);
     enc.submit_dmabuf(&codec_frame, 0, true)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
     Ok(())

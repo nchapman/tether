@@ -12,6 +12,7 @@ use supervisor::{Supervisor, ROLE_CLIENT, ROLE_HOST};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, State};
+use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
 
 /// Start hosting: spawn `tether-host --ipc`. `test_pattern` swaps real
@@ -78,10 +79,7 @@ async fn start_pairing(supervisor: State<'_, Supervisor>, label: String) -> Resu
 /// Revoke a paired device by its tagged fingerprint; the host drops any live
 /// session from it and pushes a refreshed `peer_list`.
 #[tauri::command]
-async fn revoke_peer(
-    supervisor: State<'_, Supervisor>,
-    fingerprint: String,
-) -> Result<(), String> {
+async fn revoke_peer(supervisor: State<'_, Supervisor>, fingerprint: String) -> Result<(), String> {
     supervisor
         .send_command(ROLE_HOST, &ShellCommand::RevokePeer { fingerprint })
         .await
@@ -95,6 +93,24 @@ async fn list_peers(supervisor: State<'_, Supervisor>) -> Result<(), String> {
         .await
 }
 
+/// Download, verify, install the latest release, then restart into it.
+/// Invoked by the "update available" banner. Re-checks the endpoint (cheap)
+/// to get a fresh `Update` handle, applies the signature-verified bundle, then
+/// restarts — so on success this never returns.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Err("no update is available".to_string());
+    };
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    // Relaunch into the freshly installed version; does not return.
+    app.restart()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -105,6 +121,7 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Supervisor::default())
         .setup(|app| {
             // System tray: the shell keeps running here even when the
@@ -130,7 +147,9 @@ pub fn run() {
             stop_engine,
             start_pairing,
             revoke_peer,
-            list_peers
+            list_peers,
+            check_for_updates,
+            install_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building tether-shell")
@@ -143,6 +162,30 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// Check the configured GitHub Releases endpoint for a newer signed bundle.
+/// Returns the available version (so the webview can show the "Install &
+/// restart" banner that calls [`install_update`]), or `None` if up to date.
+///
+/// Invoked by the webview on mount rather than pushed from `setup`: a startup
+/// emit can fire before the React listener mounts, and Tauri doesn't buffer
+/// events for late subscribers — the request/response shape has no such race.
+/// Any failure (offline, no release yet, dev build) is returned to the caller,
+/// which logs and swallows it; a failed check must never block the shell.
+#[tauri::command]
+async fn check_for_updates(app: AppHandle) -> Result<Option<String>, String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    match updater.check().await.map_err(|e| e.to_string())? {
+        Some(update) => {
+            tracing::info!(version = %update.version, "update available");
+            Ok(Some(update.version))
+        }
+        None => {
+            tracing::info!("shell is up to date");
+            Ok(None)
+        }
+    }
 }
 
 /// Reveal and focus the main window (from the tray "Show" item).

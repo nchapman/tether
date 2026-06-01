@@ -54,9 +54,8 @@ async fn happy_path_handshake_completes_with_negotiated_profile() {
         })
         .await
     });
-    let client_task = tokio::spawn(async move {
-        ClientSession::connect(client_chan, client_cfg).await
-    });
+    let client_task =
+        tokio::spawn(async move { ClientSession::connect(client_chan, client_cfg).await });
 
     let host = host_task.await.unwrap().unwrap();
     let client = client_task.await.unwrap().unwrap();
@@ -337,9 +336,8 @@ async fn host_filters_unknown_bit_depths_keeps_known_ones() {
         })
         .await
     });
-    let client_task = tokio::spawn(async move {
-        ClientSession::connect(client_chan_dyn, client_cfg).await
-    });
+    let client_task =
+        tokio::spawn(async move { ClientSession::connect(client_chan_dyn, client_cfg).await });
 
     let host = host_task.await.unwrap().unwrap();
     let client = client_task.await.unwrap().unwrap();
@@ -419,7 +417,9 @@ async fn dropped_client_during_handshake_surfaces_as_transport_error() {
         |_| Some(VideoProfile::H264_8BIT_420),
     )
     .await;
-    let err = res.map(|_| ()).expect_err("dropped client should produce transport error");
+    let err = res
+        .map(|_| ())
+        .expect_err("dropped client should produce transport error");
     assert!(
         matches!(err, AcceptError::Transport(_)),
         "expected Transport(_), got: {err:?}"
@@ -447,7 +447,9 @@ async fn initial_viewport_round_trips_via_client_hello() {
         .unwrap()
     });
     let client_task = tokio::spawn(async move {
-        ClientSession::connect(client_chan, client_cfg).await.unwrap()
+        ClientSession::connect(client_chan, client_cfg)
+            .await
+            .unwrap()
     });
 
     let host = host_task.await.unwrap();
@@ -513,4 +515,3 @@ async fn mid_session_set_viewport_round_trips_on_control_stream() {
         other => panic!("expected SetClientViewport, got {other:?}"),
     }
 }
-

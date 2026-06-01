@@ -90,10 +90,7 @@ impl ClientHelloReceived {
     /// `t1_server_recv` / `t2_server_send` and writes it. Returns the
     /// channel so the caller can resume post-handshake control-message
     /// exchange.
-    pub async fn send_server_hello(
-        self,
-        server: ServerHello,
-    ) -> Result<Arc<dyn ControlChannel>> {
+    pub async fn send_server_hello(self, server: ServerHello) -> Result<Arc<dyn ControlChannel>> {
         self.channel
             .send_server_hello(server, self.client_t0, self.t1_server_recv)
             .await?;
@@ -105,10 +102,10 @@ impl ClientHelloReceived {
 mod tests {
     use super::*;
     use crate::test_support::duplex_pair;
+    use std::collections::BTreeMap;
     use tether_protocol::control::{
         ChromaSubsampling, ClientHelloV1, CodecKind, ServerHelloV1, VideoColorSpec,
     };
-    use std::collections::BTreeMap;
 
     fn hello() -> ClientHello {
         ClientHello::V1(ClientHelloV1 {
@@ -141,10 +138,7 @@ mod tests {
     async fn typestate_routes_recv_then_send_and_returns_channel() {
         let (host, client) = duplex_pair();
         let host_fut = async move {
-            let (_hello, pending) = HostHandshake::new(host)
-                .recv_client_hello()
-                .await
-                .unwrap();
+            let (_hello, pending) = HostHandshake::new(host).recv_client_hello().await.unwrap();
             let channel = pending.send_server_hello(server()).await.unwrap();
             // Channel comes back usable for post-handshake exchange —
             // we don't send anything, but we should be able to await

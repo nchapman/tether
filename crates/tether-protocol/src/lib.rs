@@ -126,15 +126,16 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecErro
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::control::*;
     use crate::cursor::*;
     use crate::input::*;
     use crate::video::{
-        FrameFragmenter, FrameReassembler, HostFrameTiming, HostFrameTimingBuilder,
-        InputEchoBatch, VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket,
-        CONTINUATION_PAYLOAD_BUDGET, FEC_MAX_PRIMARY_SHARDS, FEC_SHARD_SIZE, FIRST_PAYLOAD_BUDGET,
+        FrameFragmenter, FrameReassembler, HostFrameTiming, HostFrameTimingBuilder, InputEchoBatch,
+        VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket, CONTINUATION_PAYLOAD_BUDGET,
+        FEC_MAX_PRIMARY_SHARDS, FEC_SHARD_SIZE, FIRST_PAYLOAD_BUDGET,
     };
 
     #[test]
@@ -174,7 +175,9 @@ mod tests {
         assert_eq!(confirm, decode(&encode(&confirm).unwrap()).unwrap());
 
         let cases_result = [
-            PairingResult::Confirmed { mac: vec![0xCD; 32] },
+            PairingResult::Confirmed {
+                mac: vec![0xCD; 32],
+            },
             PairingResult::Rejected {
                 reason: "confirmation failed".into(),
             },
@@ -413,7 +416,12 @@ mod tests {
         let msg2: ControlMessage = decode(&bytes).unwrap();
         match msg2 {
             ControlMessage::CursorShape {
-                id, hotspot, width, height, format, pixels,
+                id,
+                hotspot,
+                width,
+                height,
+                format,
+                pixels,
             } => {
                 assert_eq!(id, 42);
                 assert_eq!(hotspot, (4, 7));
@@ -504,9 +512,7 @@ mod tests {
         // shape: server encodes into BTreeMap value, client decodes back.
         let mut ext = std::collections::BTreeMap::<String, Vec<u8>>::new();
         ext.insert(PIXEL_FORMAT_EXTENSION_KEY.to_string(), bytes);
-        let read = ext
-            .get(PIXEL_FORMAT_EXTENSION_KEY)
-            .expect("present");
+        let read = ext.get(PIXEL_FORMAT_EXTENSION_KEY).expect("present");
         let decoded: PixelFormat = decode(read).unwrap();
         assert_eq!(decoded, PixelFormat::Nv12);
         assert_eq!(PIXEL_FORMAT_EXTENSION_KEY, "tether.pixel-format");
@@ -515,8 +521,7 @@ mod tests {
     #[test]
     fn video_profile_round_trips_via_extension() {
         use crate::control::{
-            VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY,
-            SERVER_ENCODE_PROFILE_EXTENSION_KEY,
+            VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY, SERVER_ENCODE_PROFILE_EXTENSION_KEY,
         };
         // Client packs its full decode set into one extension value.
         let client_caps = vec![
@@ -556,10 +561,7 @@ mod tests {
     #[test]
     fn ten_bit_video_profile_round_trips() {
         use crate::control::VideoProfile;
-        for profile in [
-            VideoProfile::HEVC_10BIT_420,
-            VideoProfile::HEVC_10BIT_444,
-        ] {
+        for profile in [VideoProfile::HEVC_10BIT_420, VideoProfile::HEVC_10BIT_444] {
             let bytes = encode(&profile).unwrap();
             let decoded: VideoProfile = decode(&bytes).unwrap();
             assert_eq!(decoded, profile);
@@ -577,10 +579,7 @@ mod tests {
     #[test]
     fn av1_video_profile_round_trips() {
         use crate::control::{CodecKind, VideoProfile};
-        for profile in [
-            VideoProfile::AV1_8BIT_420,
-            VideoProfile::AV1_10BIT_420,
-        ] {
+        for profile in [VideoProfile::AV1_8BIT_420, VideoProfile::AV1_10BIT_420] {
             let bytes = encode(&profile).unwrap();
             let decoded: VideoProfile = decode(&bytes).unwrap();
             assert_eq!(decoded, profile);
@@ -1092,7 +1091,12 @@ mod tests {
         let pkts = frag.fragment(default_meta(), body);
         let primary = pkts
             .iter()
-            .filter(|p| matches!(p, VideoPacket::First { .. } | VideoPacket::Continuation { .. }))
+            .filter(|p| {
+                matches!(
+                    p,
+                    VideoPacket::First { .. } | VideoPacket::Continuation { .. }
+                )
+            })
             .count();
         let parity = pkts
             .iter()
@@ -1107,7 +1111,10 @@ mod tests {
     fn fec_recovers_from_losing_up_to_parity_count_primaries() {
         // Drop up to K of the N primaries; reassembler must
         // reconstruct from the K parity shards.
-        let body: bytes::Bytes = (0..5000u32).map(|i| (i & 0xff) as u8).collect::<Vec<u8>>().into();
+        let body: bytes::Bytes = (0..5000u32)
+            .map(|i| (i & 0xff) as u8)
+            .collect::<Vec<u8>>()
+            .into();
         let mut frag = FrameFragmenter::new_with_fec(0, 25); // 25% parity
         let pkts = frag.fragment(default_meta(), body.clone());
         let parity_count = pkts
@@ -1150,7 +1157,7 @@ mod tests {
         let kept: Vec<_> = pkts
             .into_iter()
             .enumerate()
-            .filter(|(i, _)| *i >= parity_count + 1)
+            .filter(|(i, _)| *i > parity_count)
             .map(|(_, p)| p)
             .collect();
         let mut r = FrameReassembler::new();
@@ -1177,7 +1184,8 @@ mod tests {
         assert_eq!(frag.no_fec_fallback_count(), 0);
         let pkts = frag.fragment(default_meta(), body);
         assert!(
-            pkts.iter().all(|p| !matches!(p, VideoPacket::Parity { .. })),
+            pkts.iter()
+                .all(|p| !matches!(p, VideoPacket::Parity { .. })),
             "oversize frames must fall back to no-FEC fragmentation"
         );
         assert_eq!(
@@ -1209,7 +1217,8 @@ mod tests {
         let mut frag = FrameFragmenter::new_with_fec(0, 25);
         let pkts = frag.fragment(default_meta(), body);
         assert!(
-            pkts.iter().all(|p| !matches!(p, VideoPacket::Parity { .. })),
+            pkts.iter()
+                .all(|p| !matches!(p, VideoPacket::Parity { .. })),
             "frame above per-pct ceiling must fall back to no-FEC"
         );
         assert_eq!(frag.no_fec_fallback_count(), 1);
@@ -1307,7 +1316,9 @@ mod tests {
         let mut frag_fec = FrameFragmenter::new_with_fec(0, 20);
         let packets_fec = frag_fec.fragment(meta, body);
         assert!(
-            packets_fec.iter().any(|p| matches!(p, VideoPacket::Parity { .. })),
+            packets_fec
+                .iter()
+                .any(|p| matches!(p, VideoPacket::Parity { .. })),
             "FEC fragmenter must emit Parity for this body size"
         );
         for p in &packets_fec {
@@ -1334,11 +1345,10 @@ mod tests {
 
         // First fragment carries FIRST_PAYLOAD_BUDGET, remainder split into
         // CONTINUATION_PAYLOAD_BUDGET chunks.
-        let expected_count = 1
-            + body
-                .len()
-                .saturating_sub(FIRST_PAYLOAD_BUDGET)
-                .div_ceil(CONTINUATION_PAYLOAD_BUDGET);
+        let expected_count = 1 + body
+            .len()
+            .saturating_sub(FIRST_PAYLOAD_BUDGET)
+            .div_ceil(CONTINUATION_PAYLOAD_BUDGET);
         assert_eq!(packets.len(), expected_count);
 
         // Encode every packet to wire and back to simulate the network
@@ -1425,8 +1435,8 @@ mod tests {
         // frames arrive to advance `latest_seq` past `max_age`. The
         // wall-clock timeout is the only thing standing between us
         // and a stuck pending entry that holds memory indefinitely.
-        let mut reassembler = FrameReassembler::new()
-            .with_max_pending_age(std::time::Duration::from_millis(20));
+        let mut reassembler =
+            FrameReassembler::new().with_max_pending_age(std::time::Duration::from_millis(20));
 
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
@@ -1463,7 +1473,10 @@ mod tests {
         };
         let _ = reassembler.handle(unrelated);
         let (dropped_after, _) = reassembler.loss_counters();
-        assert_eq!(dropped_after, 1, "wall-clock timeout did not evict stuck pending frame");
+        assert_eq!(
+            dropped_after, 1,
+            "wall-clock timeout did not evict stuck pending frame"
+        );
     }
 
     #[test]
@@ -1569,14 +1582,18 @@ mod tests {
 
         // Deliver a complete frame under epoch 0.
         let mut fragmenter_epoch0 = FrameFragmenter::new(0);
-        let packets_e0 = fragmenter_epoch0.fragment(meta.clone(), bytes::Bytes::from_static(&[1u8; 200]));
+        let packets_e0 =
+            fragmenter_epoch0.fragment(meta.clone(), bytes::Bytes::from_static(&[1u8; 200]));
         let mut out0 = None;
         for p in packets_e0 {
             if let Some(f) = reassembler.handle(p) {
                 out0 = Some(f);
             }
         }
-        assert_eq!(out0.expect("epoch 0 frame should reassemble").stream_epoch, 0);
+        assert_eq!(
+            out0.expect("epoch 0 frame should reassemble").stream_epoch,
+            0
+        );
 
         // Switch epochs (simulating encoder restart) and deliver an
         // independent frame. The two streams share `(display=0)` but
@@ -1595,7 +1612,10 @@ mod tests {
         }
         let frame1 = out1.expect("epoch 1 frame should reassemble");
         assert_eq!(frame1.stream_epoch, 1);
-        assert_eq!(frame1.body[0], 2, "epoch 1 body must not be fused with epoch 0");
+        assert_eq!(
+            frame1.body[0], 2,
+            "epoch 1 body must not be fused with epoch 0"
+        );
     }
 
     #[test]
@@ -1615,8 +1635,15 @@ mod tests {
         let body: Vec<u8> = (0..50_000).map(|i| (i & 0xff) as u8).collect();
         let packet = fragmenter.single_packet(meta.clone(), bytes::Bytes::from(body.clone()));
         match &packet {
-            VideoPacket::First { fragment_count, payload, .. } => {
-                assert_eq!(*fragment_count, 1, "single_packet must produce fragment_count=1");
+            VideoPacket::First {
+                fragment_count,
+                payload,
+                ..
+            } => {
+                assert_eq!(
+                    *fragment_count, 1,
+                    "single_packet must produce fragment_count=1"
+                );
                 assert_eq!(payload.len(), body.len());
             }
             other => panic!("expected First, got {other:?}"),
@@ -1626,7 +1653,10 @@ mod tests {
         let next = fragmenter.fragment(meta, bytes::Bytes::from_static(&[0u8; 100]));
         match &next[0] {
             VideoPacket::First { frame_seq, .. } => {
-                assert_eq!(*frame_seq, 1, "next frame_seq must be 1 after single_packet");
+                assert_eq!(
+                    *frame_seq, 1,
+                    "next frame_seq must be 1 after single_packet"
+                );
             }
             other => panic!("expected First, got {other:?}"),
         }
@@ -1660,7 +1690,10 @@ mod tests {
         // Deliver the first fragment twice.
         reassembler.handle(packets[0].clone());
         let after_dup = reassembler.handle(packets[0].clone());
-        assert!(after_dup.is_none(), "duplicate First must not complete the frame on its own");
+        assert!(
+            after_dup.is_none(),
+            "duplicate First must not complete the frame on its own"
+        );
 
         // Now deliver the rest; the frame should still complete with
         // the correct body, not a corrupted concatenation.
@@ -1693,8 +1726,10 @@ mod tests {
         let mut reassembler = FrameReassembler::new();
         // Deliver continuations first.
         for p in packets.iter().skip(1) {
-            assert!(reassembler.handle(p.clone()).is_none(),
-                "frame cannot complete without First (no meta)");
+            assert!(
+                reassembler.handle(p.clone()).is_none(),
+                "frame cannot complete without First (no meta)"
+            );
         }
         // Now First.
         let frame = reassembler

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": [
+      "binaries/tether-host",
+      "binaries/tether-client"
+    ]
+  }
+}

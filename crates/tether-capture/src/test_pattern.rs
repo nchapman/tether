@@ -140,18 +140,30 @@ mod tests {
         let handle = start(8, 8, 10);
         // Drain the initial frame and one more so the producer is
         // settled into its loop with the old period.
-        let _ = handle.rx().recv_timeout(Duration::from_secs(2)).expect("frame 1");
-        let _ = handle.rx().recv_timeout(Duration::from_secs(2)).expect("frame 2");
+        let _ = handle
+            .rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("frame 1");
+        let _ = handle
+            .rx()
+            .recv_timeout(Duration::from_secs(2))
+            .expect("frame 2");
         handle.set_target_fps(200);
         // Skip one transitional frame whose preceding sleep was at
         // the old 100 ms period.
-        let _ = handle.rx().recv_timeout(Duration::from_millis(250)).expect("frame 3");
+        let _ = handle
+            .rx()
+            .recv_timeout(Duration::from_millis(250))
+            .expect("frame 3");
         // Now time the gap between two frames whose sleeps were both
         // post-retune. At 200 fps the gap is ~5 ms; with generous
         // jitter budget assert < 50 ms (well below the 100 ms old
         // period — the discriminator).
         let t = std::time::Instant::now();
-        let _ = handle.rx().recv_timeout(Duration::from_millis(250)).expect("frame 4");
+        let _ = handle
+            .rx()
+            .recv_timeout(Duration::from_millis(250))
+            .expect("frame 4");
         let gap = t.elapsed();
         // Threshold 80 ms = comfortably below the 100 ms old period
         // (the discriminator) with enough margin for scheduler jitter

@@ -382,10 +382,55 @@ function ClientPanel() {
   );
 }
 
+// Asks the backend for an available update on mount; if there is one, shows a
+// banner whose button calls `install_update` — which downloads + installs the
+// signed bundle and restarts into it, so a successful install never returns
+// here. Pulling on mount (rather than listening for a startup-emitted event)
+// avoids the race where the check resolves before this listener exists.
+function UpdateBanner() {
+  const [version, setVersion] = useState<string | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<string | null>("check_for_updates")
+      .then(setVersion)
+      .catch((e) => console.warn("update check failed", e));
+  }, []);
+
+  if (!version) return null;
+
+  async function install() {
+    setError(null);
+    setInstalling(true);
+    try {
+      await invoke("install_update");
+    } catch (e) {
+      // On success we never get here (the app restarts); a thrown error means
+      // the download/install failed, so re-enable the button.
+      setError(String(e));
+      setInstalling(false);
+    }
+  }
+
+  return (
+    <div className="update-banner">
+      <span>
+        Update <strong>{version}</strong> available
+      </span>
+      <button onClick={install} disabled={installing}>
+        {installing ? "Installing…" : "Install & restart"}
+      </button>
+      {error && <span className="error">{error}</span>}
+    </div>
+  );
+}
+
 function App() {
   return (
     <main className="container">
       <h1>Tether</h1>
+      <UpdateBanner />
       <HostPanel />
       <ClientPanel />
     </main>

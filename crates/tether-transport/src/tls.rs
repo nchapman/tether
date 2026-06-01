@@ -15,9 +15,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -231,7 +229,7 @@ fn write_key_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn current_user_sid_string() -> std::io::Result<String> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, LocalFree,
+        CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL,
     };
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
@@ -290,8 +288,8 @@ pub struct PinnedCertVerifier {
 
 impl PinnedCertVerifier {
     pub fn new(expected: CertFingerprint) -> Arc<Self> {
-        let supported_schemes = rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms;
+        let supported_schemes =
+            rustls::crypto::ring::default_provider().signature_verification_algorithms;
         Arc::new(Self {
             expected,
             supported_schemes,

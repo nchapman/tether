@@ -18,13 +18,12 @@ use rsmpeg::UnsafeDerefMut;
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGIResource1, DXGI_SHARED_RESOURCE_READ};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Graphics::Dxgi::{IDXGIResource1, DXGI_SHARED_RESOURCE_READ};
 
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
@@ -128,7 +127,9 @@ impl Drop for PlaneStaging {
         // The renderer's `OpenSharedResource1` copy is independent and is
         // released when its `ID3D11Texture2D` drops.
         if !self.handle.is_invalid() {
-            unsafe { let _ = CloseHandle(self.handle); }
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
         }
     }
 }
@@ -181,7 +182,9 @@ impl D3D11Decoder {
 
         let mut d3d11va_supported = false;
         for i in 0.. {
-            let Some(config) = codec.hw_config(i) else { break };
+            let Some(config) = codec.hw_config(i) else {
+                break;
+            };
             #[allow(clippy::cast_possible_wrap)]
             let supports_device_ctx =
                 config.methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0;
@@ -194,8 +197,7 @@ impl D3D11Decoder {
             return Err(CodecError::CodecNotFound(d3d11_decoder_name(kind)));
         }
 
-        let hw_device =
-            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_D3D11VA, None, None, 0)?;
+        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_D3D11VA, None, None, 0)?;
 
         // Extract the D3D11 device FFmpeg created for us.
         let (device, context) = unsafe {
@@ -204,14 +206,12 @@ impl D3D11Decoder {
             let hwctx = data.hwctx as *const super::encoder::AvD3D11VADeviceContext;
             let dev_ptr = (*hwctx).device;
             let ctx_ptr = (*hwctx).device_context;
-            let device: ID3D11Device =
-                ID3D11Device::from_raw_borrowed(&dev_ptr)
-                    .ok_or(CodecError::CodecNotFound("d3d11va device null"))?
-                    .clone();
-            let context: ID3D11DeviceContext =
-                ID3D11DeviceContext::from_raw_borrowed(&ctx_ptr)
-                    .ok_or(CodecError::CodecNotFound("d3d11va context null"))?
-                    .clone();
+            let device: ID3D11Device = ID3D11Device::from_raw_borrowed(&dev_ptr)
+                .ok_or(CodecError::CodecNotFound("d3d11va device null"))?
+                .clone();
+            let context: ID3D11DeviceContext = ID3D11DeviceContext::from_raw_borrowed(&ctx_ptr)
+                .ok_or(CodecError::CodecNotFound("d3d11va context null"))?
+                .clone();
             (device, context)
         };
 
@@ -290,8 +290,12 @@ impl D3D11Decoder {
         if self.staging.as_ref().map_or(true, |s| {
             s.width != width || s.height != height || s.format != src_format
         }) {
-            self.staging =
-                Some(Arc::new(Self::create_staging(&self.device, width, height, src_format)?));
+            self.staging = Some(Arc::new(Self::create_staging(
+                &self.device,
+                width,
+                height,
+                src_format,
+            )?));
         }
         let staging = self.staging.as_ref().unwrap();
 
@@ -310,12 +314,24 @@ impl D3D11Decoder {
 
         unsafe {
             self.context.CopySubresourceRegion(
-                &staging.tex, 0, 0, 0, 0,
-                &src_texture, y_subresource, None,
+                &staging.tex,
+                0,
+                0,
+                0,
+                0,
+                &src_texture,
+                y_subresource,
+                None,
             );
             self.context.CopySubresourceRegion(
-                &staging.tex, 1, 0, 0, 0,
-                &src_texture, uv_subresource, None,
+                &staging.tex,
+                1,
+                0,
+                0,
+                0,
+                &src_texture,
+                uv_subresource,
+                None,
             );
             // Submit the copies so the consumer device sees them.
             gpu_sync(&self.device, &self.context);
@@ -351,7 +367,13 @@ impl D3D11Decoder {
         let h = (height + 1) & !1;
         let tex = Self::create_shared_texture(device, w, h, format)?;
         let handle = Self::get_shared_handle(&tex)?;
-        Ok(PlaneStaging { tex, handle, width, height, format })
+        Ok(PlaneStaging {
+            tex,
+            handle,
+            width,
+            height,
+            format,
+        })
     }
 
     fn create_shared_texture(
@@ -366,15 +388,19 @@ impl D3D11Decoder {
             MipLevels: 1,
             ArraySize: 1,
             Format: format,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE,
             CPUAccessFlags: 0,
             MiscFlags: D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
         };
         let mut texture = None;
-        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-            .map_err(|_| CodecError::CodecNotFound("D3D11 staging CreateTexture2D failed (NV12/P010 shared)"))?;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }.map_err(|_| {
+            CodecError::CodecNotFound("D3D11 staging CreateTexture2D failed (NV12/P010 shared)")
+        })?;
         Ok(texture.unwrap())
     }
 
@@ -409,9 +435,8 @@ impl D3D11Decoder {
         // Leave the format unset so `av_hwframe_transfer_data` picks the
         // surface's native sw format (NV12 for 8-bit, P010 for 10-bit) —
         // forcing NV12 on a P010 surface is rejected by the transfer.
-        let rc = unsafe {
-            ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), hw_frame.as_ptr(), 0)
-        };
+        let rc =
+            unsafe { ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), hw_frame.as_ptr(), 0) };
         if rc < 0 {
             return Err(CodecError::Ffmpeg(RsmpegError::AVError(rc)));
         }
@@ -582,11 +607,17 @@ mod tests {
         };
 
         // 8-bit 4:2:0: NV12 on both sides.
-        assert_eq!(expected_decode_dxgi_format(profile(8)), Some(DXGI_FORMAT_NV12.0 as u32));
+        assert_eq!(
+            expected_decode_dxgi_format(profile(8)),
+            Some(DXGI_FORMAT_NV12.0 as u32)
+        );
         assert_eq!(d3d11_sw_format(profile(8)), ffi::AV_PIX_FMT_NV12);
 
         // 10-bit 4:2:0: P010 on both sides.
-        assert_eq!(expected_decode_dxgi_format(profile(10)), Some(DXGI_FORMAT_P010.0 as u32));
+        assert_eq!(
+            expected_decode_dxgi_format(profile(10)),
+            Some(DXGI_FORMAT_P010.0 as u32)
+        );
         assert_eq!(d3d11_sw_format(profile(10)), ffi::AV_PIX_FMT_P010LE);
     }
 

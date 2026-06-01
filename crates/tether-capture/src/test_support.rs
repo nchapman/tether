@@ -113,12 +113,16 @@ mod tests {
             (Duration::ZERO, make_frame(0xa)),
             (Duration::from_millis(5), make_frame(0xb)),
         ]);
-        let f1 = rx.recv_timeout(Duration::from_secs(1)).expect("first frame");
+        let f1 = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first frame");
         let CapturedFrame::Cpu(c) = f1 else {
             panic!("expected Cpu frame");
         };
         assert_eq!(c.data[0], 0xa);
-        let f2 = rx.recv_timeout(Duration::from_secs(1)).expect("second frame");
+        let f2 = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second frame");
         let CapturedFrame::Cpu(c) = f2 else {
             panic!("expected Cpu frame");
         };
@@ -157,6 +161,10 @@ mod tests {
             panic!("expected Cpu frame");
         };
         assert_eq!(c.data[0], 0x42);
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "delay callback fires once per recv");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "delay callback fires once per recv"
+        );
     }
 }

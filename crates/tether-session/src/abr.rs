@@ -441,9 +441,7 @@ mod tests {
         // Burn one fast-step.
         c.observe(Duration::from_secs(4), healthy());
         c.observe(Duration::from_millis(500), healthy());
-        let after_first_fast = c
-            .observe(Duration::from_millis(500), healthy())
-            .target_kbps;
+        let after_first_fast = c.observe(Duration::from_millis(500), healthy()).target_kbps;
         assert!(after_first_fast > 1_500);
         // Second collapse mid-climb.
         c.observe(Duration::from_secs(4), loss_burst());
@@ -452,9 +450,7 @@ mod tests {
         // fires at 25%.
         c.observe(Duration::from_secs(4), healthy());
         c.observe(Duration::from_millis(500), healthy());
-        let s1 = c
-            .observe(Duration::from_millis(500), healthy())
-            .target_kbps;
+        let s1 = c.observe(Duration::from_millis(500), healthy()).target_kbps;
         assert_eq!(s1, 1_875, "post-second-collapse step should be fast (25%)");
     }
 

@@ -20,9 +20,7 @@ use tether_protocol::video::{
 };
 use tether_protocol::MonoNanos;
 use tether_render::LatestFrame;
-use tether_transport::test_support::{
-    video_duplex_pair, LossyChannel, LossyConfig,
-};
+use tether_transport::test_support::{video_duplex_pair, LossyChannel, LossyConfig};
 use tether_transport::{Datagram, VideoChannel};
 
 fn meta(keyframe: bool) -> VideoFrameMeta {
@@ -49,9 +47,7 @@ async fn lossy_pframe_path_increments_reassembler_loss_counter() {
     let mut fragmenter = FrameFragmenter::new(0);
     let mut reassembler = FrameReassembler::new();
 
-    let bodies: Vec<Bytes> = (0..64u8)
-        .map(|i| Bytes::from(vec![i; 4096]))
-        .collect();
+    let bodies: Vec<Bytes> = (0..64u8).map(|i| Bytes::from(vec![i; 4096])).collect();
     let mut expected_packets = 0u64;
     for body in &bodies {
         let pkts = fragmenter.fragment(meta(false), body.clone());
@@ -64,7 +60,10 @@ async fn lossy_pframe_path_increments_reassembler_loss_counter() {
     let drop_log = host.drop_log();
     let dropped_packets = drop_log.len() as u64;
     let delivered_expected = expected_packets - dropped_packets;
-    assert!(dropped_packets > 0, "10% drop on 64 frames should drop at least one");
+    assert!(
+        dropped_packets > 0,
+        "10% drop on 64 frames should drop at least one"
+    );
     assert!(
         dropped_packets < expected_packets,
         "10% drop should not drop everything (seed=0xC0FFEE)"
@@ -75,9 +74,11 @@ async fn lossy_pframe_path_increments_reassembler_loss_counter() {
     let mut delivered = 0u64;
     let mut frames_completed = 0u64;
     while delivered < delivered_expected {
-        let next =
-            tokio::time::timeout(std::time::Duration::from_millis(500), client.recv_datagram())
-                .await;
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.recv_datagram(),
+        )
+        .await;
         let Ok(Ok(dgram)) = next else { break };
         delivered += 1;
         let Datagram::Video(pkt) = dgram else {
@@ -136,10 +137,13 @@ async fn idr_uni_stream_unaffected_by_lossy_wrapper() {
     // tamper with the reliable stream — keyframes always arrive intact.
     host.send_video_keyframe(&pkt).await.unwrap();
 
-    let received = tokio::time::timeout(std::time::Duration::from_secs(2), client.accept_video_keyframe())
-        .await
-        .expect("timeout")
-        .unwrap();
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.accept_video_keyframe(),
+    )
+    .await
+    .expect("timeout")
+    .unwrap();
     match received {
         VideoPacket::First { payload, .. } => assert_eq!(payload, body),
         other => panic!("expected First, got {other:?}"),
@@ -181,8 +185,11 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
     }
 
     let mut reassembled: Vec<Bytes> = Vec::new();
-    while let Ok(Ok(d)) =
-        tokio::time::timeout(std::time::Duration::from_millis(100), client.recv_datagram()).await
+    while let Ok(Ok(d)) = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        client.recv_datagram(),
+    )
+    .await
     {
         if let Datagram::Video(pkt) = d {
             if let Some(frame) = reassembler.handle(pkt) {
@@ -234,7 +241,10 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
             keyframe: false,
         };
         let c = worker.process_job(job, MonoNanos::now());
-        assert!(c.soft_failure, "warnings bump must classify as soft failure");
+        assert!(
+            c.soft_failure,
+            "warnings bump must classify as soft failure"
+        );
     }
 
     // Rate-limit collapses N consecutive soft failures into 1
@@ -250,10 +260,12 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
     // everything.
     let kf = fragmenter.single_packet(meta(true), Bytes::from(vec![0xff; 4096]));
     lossy.send_video_keyframe(&kf).await.unwrap();
-    let received =
-        tokio::time::timeout(std::time::Duration::from_secs(2), client.accept_video_keyframe())
-            .await
-            .expect("timeout")
-            .unwrap();
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.accept_video_keyframe(),
+    )
+    .await
+    .expect("timeout")
+    .unwrap();
     assert!(matches!(received, VideoPacket::First { .. }));
 }

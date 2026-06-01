@@ -39,10 +39,7 @@ use tether_protocol::control::ChromaSubsampling;
 /// onto a code path it never opted into. Either way the right
 /// response is a session-fatal bail at handshake, not silent best-
 /// effort rendering with the wrong pipeline.
-pub fn validate_chosen_profile(
-    chosen: VideoProfile,
-    advertised: &[VideoProfile],
-) -> Result<()> {
+pub fn validate_chosen_profile(chosen: VideoProfile, advertised: &[VideoProfile]) -> Result<()> {
     if advertised.contains(&chosen) {
         return Ok(());
     }
@@ -108,7 +105,16 @@ pub fn build_encoder(
 
     #[cfg(target_os = "windows")]
     {
-        build_encoder_d3d11(profile, width, height, fps, bitrate_kbps, std::ptr::null_mut(), std::ptr::null_mut(), 0)
+        build_encoder_d3d11(
+            profile,
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -173,6 +179,10 @@ pub fn build_encoder_d3d11(
 /// Errors if no GPU decoder is available for `profile.codec` on this
 /// client.
 #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+// Each per-OS cfg block returns so the next platform's block doesn't
+// run; on a single target the active block looks like a needless tail
+// return, but the explicit return is load-bearing cross-platform.
+#[allow(clippy::needless_return)]
 pub fn build_decoder(profile: VideoProfile, gpu_export: bool) -> Result<Box<dyn Decoder>> {
     let kind = profile.codec;
     #[cfg(target_os = "linux")]
@@ -336,12 +346,8 @@ mod validation_tests {
             VideoProfile::HEVC_8BIT_420,
             VideoProfile::H264_8BIT_420,
         ];
-        assert!(
-            validate_chosen_profile(VideoProfile::HEVC_8BIT_444, &advertised).is_ok()
-        );
-        assert!(
-            validate_chosen_profile(VideoProfile::H264_8BIT_420, &advertised).is_ok()
-        );
+        assert!(validate_chosen_profile(VideoProfile::HEVC_8BIT_444, &advertised).is_ok());
+        assert!(validate_chosen_profile(VideoProfile::H264_8BIT_420, &advertised).is_ok());
     }
 
     #[test]
@@ -358,8 +364,6 @@ mod validation_tests {
 
     #[test]
     fn validate_chosen_profile_rejects_empty_advertised() {
-        assert!(
-            validate_chosen_profile(VideoProfile::H264_8BIT_420, &[]).is_err()
-        );
+        assert!(validate_chosen_profile(VideoProfile::H264_8BIT_420, &[]).is_err());
     }
 }

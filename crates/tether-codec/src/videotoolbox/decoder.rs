@@ -78,7 +78,9 @@ impl VideoToolboxDecoder {
         // actionable error. Same shape as the VAAPI sibling.
         let mut vt_supported = false;
         for i in 0.. {
-            let Some(config) = codec.hw_config(i) else { break };
+            let Some(config) = codec.hw_config(i) else {
+                break;
+            };
             #[allow(clippy::cast_possible_wrap)] // single-bit constant
             let supports_device_ctx =
                 config.methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0;
@@ -309,8 +311,7 @@ unsafe extern "C" fn get_videotoolbox_format(
     _ctx: *mut ffi::AVCodecContext,
     pix_fmts: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
-    let fmts =
-        unsafe { rsmpeg::build_array(pix_fmts, ffi::AV_PIX_FMT_NONE) }.unwrap_or_default();
+    let fmts = unsafe { rsmpeg::build_array(pix_fmts, ffi::AV_PIX_FMT_NONE) }.unwrap_or_default();
     for &fmt in fmts {
         if fmt == ffi::AV_PIX_FMT_VIDEOTOOLBOX {
             return fmt;

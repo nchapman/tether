@@ -123,9 +123,7 @@ pub fn decide_present(
     // expressible as an integer fraction (3/2 = 1.5×). Integer math
     // throughout avoids any float-rounding surprises at the
     // threshold boundary.
-    let threshold_ns = refresh_period_ns
-        .saturating_mul(u64::from(FRAME_AGE_THRESHOLD_FACTOR))
-        / 2;
+    let threshold_ns = refresh_period_ns.saturating_mul(u64::from(FRAME_AGE_THRESHOLD_FACTOR)) / 2;
     let is_late = frame_age_ns > threshold_ns;
 
     // Always tick down the cooldown so a long stretch of on-time
@@ -166,6 +164,13 @@ pub fn refresh_period_ns(refresh_rate_mhz: u32) -> u64 {
     };
     // mHz → period: 1e12 ns / mHz.
     1_000_000_000_000u64 / u64::from(rate_mhz)
+}
+
+/// Duration form of [`refresh_period_ns`] for callers that prefer
+/// the `Duration` type.
+#[must_use]
+pub fn refresh_period(refresh_rate_mhz: u32) -> Duration {
+    Duration::from_nanos(refresh_period_ns(refresh_rate_mhz))
 }
 
 #[cfg(test)]
@@ -250,11 +255,4 @@ mod tests {
         let p = PresentPolicy::Smooth.preference();
         assert_eq!(p[0], wgpu::PresentMode::Fifo);
     }
-}
-
-/// Duration form of [`refresh_period_ns`] for callers that prefer
-/// the `Duration` type.
-#[must_use]
-pub fn refresh_period(refresh_rate_mhz: u32) -> Duration {
-    Duration::from_nanos(refresh_period_ns(refresh_rate_mhz))
 }

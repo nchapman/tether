@@ -12,6 +12,8 @@
 //! rejection.
 
 #![cfg(target_os = "linux")]
+// Pixel/coordinate quantization casts in test fixtures are intentional.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use std::sync::Arc;
 
@@ -143,7 +145,12 @@ fn run_scaler_to_yuv444_chain(capture: (u32, u32), encode: (u32, u32)) {
         "scaler-test bgra source (yuv444)",
     )
     .expect("export bgra source");
-    fill_solid_red(bridge.device(), bridge.queue(), &src_export.texture, capture);
+    fill_solid_red(
+        bridge.device(),
+        bridge.queue(),
+        &src_export.texture,
+        capture,
+    );
     let dup_fd = src_export.fd.try_clone().expect("dup");
     let imported = bridge
         .import_bgra_dmabuf(
@@ -186,7 +193,12 @@ fn run_scaler_to_p010_chain(capture: (u32, u32), encode: (u32, u32)) {
         "scaler-test bgra source (p010)",
     )
     .expect("export bgra source");
-    fill_solid_red(bridge.device(), bridge.queue(), &src_export.texture, capture);
+    fill_solid_red(
+        bridge.device(),
+        bridge.queue(),
+        &src_export.texture,
+        capture,
+    );
     let dup_fd = src_export.fd.try_clone().expect("dup");
     let imported = bridge
         .import_bgra_dmabuf(
@@ -298,8 +310,8 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
     let mut bgra = Vec::with_capacity((dims.0 * dims.1 * 4) as usize);
     for y in 0..dims.1 {
         for x in 0..dims.0 {
-            let r = ((x as f64 / dims.0 as f64) * 256.0).clamp(0.0, 255.0) as u8;
-            let g = ((y as f64 / dims.1 as f64) * 256.0).clamp(0.0, 255.0) as u8;
+            let r = ((f64::from(x) / f64::from(dims.0)) * 256.0).clamp(0.0, 255.0) as u8;
+            let g = ((f64::from(y) / f64::from(dims.1)) * 256.0).clamp(0.0, 255.0) as u8;
             // Stored as BGRA bytes: B, G, R, A.
             bgra.extend_from_slice(&[128, g, r, 255]);
         }
@@ -360,16 +372,17 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Bgra8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
 
     // Trivial sample-and-write shader so we can read back via COPY_SRC.
-    let shader = bridge.device().create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("readback blit"),
-        source: wgpu::ShaderSource::Wgsl(
-            r#"
+    let shader = bridge
+        .device()
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("readback blit"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
             @group(0) @binding(0) var src: texture_2d<f32>;
             @group(0) @binding(1) var s: sampler;
             struct VsOut { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
@@ -391,30 +404,32 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
                 return textureLoad(src, coord, 0);
             }
             "#
-            .into(),
-        ),
-    });
-    let bgl = bridge.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("blit bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+                .into(),
+            ),
+        });
+    let bgl = bridge
+        .device()
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
     let pl = bridge
         .device()
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -449,26 +464,32 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
             multiview_mask: None,
             cache: None,
         });
-    let sampler = bridge.device().create_sampler(&wgpu::SamplerDescriptor::default());
+    let sampler = bridge
+        .device()
+        .create_sampler(&wgpu::SamplerDescriptor::default());
     let imported_view = imported.create_view(&wgpu::TextureViewDescriptor::default());
-    let bg = bridge.device().create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blit bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&imported_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
+    let bg = bridge
+        .device()
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&imported_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
     let staging_view = staging.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut enc = bridge.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("blit enc"),
-    });
+    let mut enc = bridge
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("blit enc"),
+        });
     {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("blit pass"),
@@ -491,10 +512,10 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
         pass.draw(0..6, 0..1);
     }
     // Read back via buffer copy.
-    let bytes_per_row_aligned = ((dims.0 * 4 + 255) / 256) * 256;
+    let bytes_per_row_aligned = (dims.0 * 4).div_ceil(256) * 256;
     let buf = bridge.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback buf"),
-        size: (bytes_per_row_aligned * dims.1) as u64,
+        size: u64::from(bytes_per_row_aligned * dims.1),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -545,15 +566,15 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
     let w = dims.0 as usize;
     let h = dims.1 as usize;
     let mut col_mae = vec![0.0_f64; w];
-    for col in 0..w {
+    for (col, slot) in col_mae.iter_mut().enumerate() {
         let mut acc = 0.0_f64;
         for row in 0..h {
             let off = (row * w + col) * 4;
             for ch in 0..4 {
-                acc += (bgra[off + ch] as f64 - readback[off + ch] as f64).abs();
+                acc += (f64::from(bgra[off + ch]) - f64::from(readback[off + ch])).abs();
             }
         }
-        col_mae[col] = acc / (h as f64 * 4.0);
+        *slot = acc / (h as f64 * 4.0);
     }
     let interior_mean: f64 = col_mae[64..w - 64].iter().sum::<f64>() / (w - 128) as f64;
     let left_max = col_mae[..32].iter().cloned().fold(0.0_f64, f64::max);
@@ -606,8 +627,8 @@ fn imported_bgra_then_scaler_preserves_left_edge(capture: (u32, u32), encode: (u
     let mut bgra = Vec::with_capacity((capture.0 * capture.1 * 4) as usize);
     for y in 0..capture.1 {
         for x in 0..capture.0 {
-            let r = ((x as f64 / capture.0 as f64) * 256.0).clamp(0.0, 255.0) as u8;
-            let g = ((y as f64 / capture.1 as f64) * 256.0).clamp(0.0, 255.0) as u8;
+            let r = ((f64::from(x) / f64::from(capture.0)) * 256.0).clamp(0.0, 255.0) as u8;
+            let g = ((f64::from(y) / f64::from(capture.1)) * 256.0).clamp(0.0, 255.0) as u8;
             bgra.extend_from_slice(&[128, g, r, 255]);
         }
     }
@@ -659,10 +680,10 @@ fn imported_bgra_then_scaler_preserves_left_edge(capture: (u32, u32), encode: (u
 
     // Read back the scaler output (Rgba8Unorm) directly via
     // copy_texture_to_buffer — scaler's output has COPY_SRC.
-    let bytes_per_row_aligned = ((encode.0 * 4 + 255) / 256) * 256;
+    let bytes_per_row_aligned = (encode.0 * 4).div_ceil(256) * 256;
     let buf = bridge.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("scaler readback"),
-        size: (bytes_per_row_aligned * encode.1) as u64,
+        size: u64::from(bytes_per_row_aligned * encode.1),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -708,8 +729,7 @@ fn imported_bgra_then_scaler_preserves_left_edge(capture: (u32, u32), encode: (u
     for y in 0..h {
         let src_off = y * bytes_per_row_aligned as usize;
         let dst_off = y * w * 4;
-        readback[dst_off..dst_off + w * 4]
-            .copy_from_slice(&mapped[src_off..src_off + w * 4]);
+        readback[dst_off..dst_off + w * 4].copy_from_slice(&mapped[src_off..src_off + w * 4]);
     }
     drop(mapped);
     buf.unmap();
@@ -721,19 +741,20 @@ fn imported_bgra_then_scaler_preserves_left_edge(capture: (u32, u32), encode: (u
     for px in bgra.chunks_exact(4) {
         rgba_src.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
     }
-    let ref_rgba =
-        tether_scaler::reference::mitchell_filter_default(&rgba_src, capture.0, capture.1, encode.0, encode.1);
+    let ref_rgba = tether_scaler::reference::mitchell_filter_default(
+        &rgba_src, capture.0, capture.1, encode.0, encode.1,
+    );
 
     let mut col_mae = vec![0.0_f64; w];
-    for col in 0..w {
+    for (col, slot) in col_mae.iter_mut().enumerate() {
         let mut acc = 0.0_f64;
         for row in 0..h {
             let off = (row * w + col) * 4;
             for ch in 0..3 {
-                acc += (readback[off + ch] as f64 - ref_rgba[off + ch] as f64).abs();
+                acc += (f64::from(readback[off + ch]) - f64::from(ref_rgba[off + ch])).abs();
             }
         }
-        col_mae[col] = acc / (h as f64 * 3.0);
+        *slot = acc / (h as f64 * 3.0);
     }
     let interior: f64 = col_mae[64..w - 64].iter().sum::<f64>() / (w - 128) as f64;
     let left = col_mae[..32].iter().cloned().fold(0.0_f64, f64::max);

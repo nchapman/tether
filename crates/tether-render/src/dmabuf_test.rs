@@ -70,8 +70,8 @@ use tether_codec::Encoder;
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoColorSpec, VideoProfile};
 
 use crate::test_harness::{
-    Capability, Fixture, Floors, RoundtripCase, RoundtripOutcome, RoundtripResult,
-    dump_failure_diagnostics, run_roundtrip,
+    dump_failure_diagnostics, run_roundtrip, Capability, Fixture, Floors, RoundtripCase,
+    RoundtripOutcome, RoundtripResult,
 };
 
 // =====================================================================
@@ -136,8 +136,12 @@ fn assert_outcome(case: &RoundtripCase, result: RoundtripResult) {
 
     if !failures.is_empty() {
         dump_failure_diagnostics(case, &outcome);
-        panic!("[{}] {} metric(s) failed:\n  - {}",
-               case.name, failures.len(), failures.join("\n  - "));
+        panic!(
+            "[{}] {} metric(s) failed:\n  - {}",
+            case.name,
+            failures.len(),
+            failures.join("\n  - ")
+        );
     }
 }
 
@@ -164,18 +168,38 @@ fn assert_outcome(case: &RoundtripCase, result: RoundtripResult) {
 // drift). The 130 px ceiling gives ~50% headroom for hardware-
 // variant noise without masking a real stride bug, which moves
 // geometry by at least one row-stride pitch (≥ 1200 px at our dims).
-const FLOOR_IDENTITY:       Floors = Floors { ssim: 0.95, psnr_y_db: 25.5, geom_px: 130.0 };
-const FLOOR_CLIENT_UPSCALE: Floors = Floors { ssim: 0.95, psnr_y_db: 26.0, geom_px: 130.0 };
-const FLOOR_SURFACE_BELOW:  Floors = Floors { ssim: 0.95, psnr_y_db: 25.5, geom_px: 130.0 };
+const FLOOR_IDENTITY: Floors = Floors {
+    ssim: 0.95,
+    psnr_y_db: 25.5,
+    geom_px: 130.0,
+};
+const FLOOR_CLIENT_UPSCALE: Floors = Floors {
+    ssim: 0.95,
+    psnr_y_db: 26.0,
+    geom_px: 130.0,
+};
+const FLOOR_SURFACE_BELOW: Floors = Floors {
+    ssim: 0.95,
+    psnr_y_db: 25.5,
+    geom_px: 130.0,
+};
 // Host-scaler cell (PNG fixture, downscale, surface == encode). The
 // geometric metric is skipped for PNG fixtures (assert_outcome gates
 // on Fixture::CoordEncoded). NaN here documents that the value is
 // unused; a future CoordEncoded cell that reuses this constant would
 // fail loudly instead of inheriting an uncalibrated floor.
-const FLOOR_HOST_SCALER:    Floors = Floors { ssim: 0.985, psnr_y_db: 50.0, geom_px: f64::NAN };
+const FLOOR_HOST_SCALER: Floors = Floors {
+    ssim: 0.985,
+    psnr_y_db: 50.0,
+    geom_px: f64::NAN,
+};
 // Full-chain cell — host Mitchell smooths the fixture before encode,
 // so encoder noise drops by ~5×; client upscale adds back a little.
-const FLOOR_FULL_CHAIN:     Floors = Floors { ssim: 0.97, psnr_y_db: 50.0, geom_px: 30.0 };
+const FLOOR_FULL_CHAIN: Floors = Floors {
+    ssim: 0.97,
+    psnr_y_db: 50.0,
+    geom_px: 30.0,
+};
 
 const H264_8BIT_420: VideoProfile = VideoProfile {
     codec: CodecKind::H264,
@@ -268,10 +292,7 @@ fn roundtrip_hevc_main444_8bit_identity() {
         frames_encoded: 6,
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
-        requires: &[
-            Capability::VaapiHevcMain444,
-            Capability::VulkanDmaBufImport,
-        ],
+        requires: &[Capability::VaapiHevcMain444, Capability::VulkanDmaBufImport],
         floors: FLOOR_IDENTITY,
     };
     assert_outcome(&case, run_roundtrip(&case));
@@ -486,7 +507,7 @@ fn roundtrip_h264_8bit_repro_shape() {
         profile: H264_8BIT_420,
         fixture: Fixture::CoordEncoded,
         capture_dims: (2880, 1920),
-        encode_dims:  (2160, 1440),
+        encode_dims: (2160, 1440),
         surface_dims: (2560, 1440),
         frames_encoded: 6,
         assert_steady_state_eps: Some(2.0),
@@ -561,10 +582,7 @@ fn roundtrip_hevc_main444_8bit_full_chain() {
         frames_encoded: 6,
         assert_steady_state_eps: Some(2.0),
         color_space: VideoColorSpec::sdr_desktop(),
-        requires: &[
-            Capability::VaapiHevcMain444,
-            Capability::VulkanDmaBufImport,
-        ],
+        requires: &[Capability::VaapiHevcMain444, Capability::VulkanDmaBufImport],
         floors: FLOOR_FULL_CHAIN,
     };
     assert_outcome(&case, run_roundtrip(&case));
@@ -573,9 +591,9 @@ fn roundtrip_hevc_main444_8bit_full_chain() {
 /// HEVC Main 10 client upscale. capture == encode (no scaler — the
 /// 10-bit scaler input path doesn't exist in production), surface
 /// > encode so the renderer's Mitchell upscale of the decoded 10-bit
-/// content gets exercised. Targets the Biplanar16 import + 10-bit
-/// shader dispatch + Mitchell upscale all at once. Will SKIP on
-/// Intel iHD + Meteor Lake (P010 dma-buf driver gap).
+/// > content gets exercised. Targets the Biplanar16 import + 10-bit
+/// > shader dispatch + Mitchell upscale all at once. Will SKIP on
+/// > Intel iHD + Meteor Lake (P010 dma-buf driver gap).
 #[test]
 #[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16; may SKIP on Intel iHD/Meteor Lake"]
 fn roundtrip_hevc_main10_client_upscale() {
@@ -666,7 +684,7 @@ mod cross_table_consistency {
     use tether_codec::vaapi::expected_dmabuf_fourcc;
     use tether_protocol::control::ChromaSubsampling;
 
-    use crate::gpu::{RenderLayout, render_layout_for};
+    use crate::gpu::{render_layout_for, RenderLayout};
 
     const MODELED: &[(ChromaSubsampling, u8)] = &[
         (ChromaSubsampling::Yuv420, 8),
@@ -702,9 +720,8 @@ mod cross_table_consistency {
     #[test]
     fn encoder_fourccs_are_well_formed() {
         for &(chroma, bit_depth) in MODELED {
-            let f = expected_dmabuf_fourcc(chroma, bit_depth).unwrap_or_else(|| {
-                panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})")
-            });
+            let f = expected_dmabuf_fourcc(chroma, bit_depth)
+                .unwrap_or_else(|| panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})"));
             let bytes = f.to_le_bytes();
             assert!(
                 bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)),
@@ -716,13 +733,13 @@ mod cross_table_consistency {
     #[test]
     fn renderer_layout_matches_encoder_fourcc() {
         for &(chroma, bit_depth) in MODELED {
-            let fourcc = expected_dmabuf_fourcc(chroma, bit_depth).unwrap_or_else(|| {
-                panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})")
-            });
+            let fourcc = expected_dmabuf_fourcc(chroma, bit_depth)
+                .unwrap_or_else(|| panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})"));
             let renderer = render_layout_for(chroma, bit_depth);
             let expected = expected_layout_for_fourcc(fourcc);
             assert_eq!(
-                renderer, expected,
+                renderer,
+                expected,
                 "render_layout_for({chroma:?}, {bit_depth}) = {renderer:?} but \
                  fourcc {:?} expects {expected:?}",
                 std::str::from_utf8(&fourcc.to_le_bytes()).unwrap_or("?"),

@@ -89,18 +89,21 @@ pub fn export_yuv444_shared_dmabuf(
         let raw_physical = hal_dev.raw_physical_device();
 
         let ext_mem_fd = khr::external_memory_fd::Device::new(raw_instance, raw_device);
-        let modifier_ext =
-            ext::image_drm_format_modifier::Device::new(raw_instance, raw_device);
+        let modifier_ext = ext::image_drm_format_modifier::Device::new(raw_instance, raw_device);
 
         let modifiers = [DRM_FORMAT_MOD_LINEAR];
         let mut ext_mem_create = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let mut modifier_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-            .drm_format_modifiers(&modifiers);
+        let mut modifier_info =
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
-            .extent(vk::Extent3D { width: aligned_w, height: aligned_h, depth: 1 })
+            .extent(vk::Extent3D {
+                width: aligned_w,
+                height: aligned_h,
+                depth: 1,
+            })
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -190,7 +193,11 @@ pub fn export_yuv444_shared_dmabuf(
 
                 let hal_desc = wgpu::hal::TextureDescriptor {
                     label: Some("yuv444-xyuv shared"),
-                    size: wgpu::Extent3d { width: aligned_w, height: aligned_h, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: aligned_w,
+                        height: aligned_h,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -213,7 +220,11 @@ pub fn export_yuv444_shared_dmabuf(
 
                 let wgpu_desc = wgpu::TextureDescriptor {
                     label: Some("yuv444-xyuv shared"),
-                    size: wgpu::Extent3d { width: aligned_w, height: aligned_h, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: aligned_w,
+                        height: aligned_h,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -221,8 +232,8 @@ pub fn export_yuv444_shared_dmabuf(
                     usage,
                     view_formats: &[],
                 };
-                let packed_texture = device
-                    .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_tex, &wgpu_desc);
+                let packed_texture =
+                    device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_tex, &wgpu_desc);
 
                 Ok(SharedYuv444Export {
                     packed_texture,

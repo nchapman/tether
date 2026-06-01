@@ -155,10 +155,7 @@ fn export_then_reimport_roundtrip() {
 
     // Re-import via wgpu's existing import path. `try_clone` dups
     // the fd because texture_from_dmabuf_fd takes ownership.
-    let import_fd = export
-        .fd
-        .try_clone()
-        .expect("dup fd for re-import");
+    let import_fd = export.fd.try_clone().expect("dup fd for re-import");
     let import_desc = wgpu::hal::TextureDescriptor {
         label: Some("roundtrip import"),
         size: wgpu::Extent3d {
@@ -210,15 +207,16 @@ fn export_then_reimport_roundtrip() {
     };
 
     // Copy the imported texture into a readback buffer and verify.
-    let padded_row = ((width + 255) / 256) * 256;
+    let padded_row = width.div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
         size: u64::from(padded_row) * u64::from(height),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut enc = device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback enc") });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("readback enc"),
+    });
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &import_tex,
@@ -388,15 +386,16 @@ fn export_rg8unorm_odd_width_roundtrip() {
     };
 
     // Read back. Rg8 is 2 bytes per texel.
-    let row_pad = ((width * 2 + 255) / 256) * 256;
+    let row_pad = (width * 2).div_ceil(256) * 256;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("rg8 readback"),
         size: u64::from(row_pad) * u64::from(height),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut enc = device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rg8 enc") });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("rg8 enc"),
+    });
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &import_tex,
@@ -441,11 +440,7 @@ fn export_rg8unorm_odd_width_roundtrip() {
                 "R[{x},{y}] mismatched (stride={})",
                 export.stride
             );
-            assert_eq!(
-                mapped[i + 1],
-                (y & 0xff) as u8,
-                "G[{x},{y}] mismatched"
-            );
+            assert_eq!(mapped[i + 1], (y & 0xff) as u8, "G[{x},{y}] mismatched");
         }
     }
 }

@@ -110,9 +110,7 @@ impl ColorSpace {
     fn chroma_offset(self) -> (f32, f32) {
         match self {
             Self::Srgb8 | Self::LinearF16 | Self::LumaR8 | Self::LumaR16 => (0.0, 0.0),
-            Self::ChromaRg8 { chroma_offset } | Self::ChromaRg16 { chroma_offset } => {
-                chroma_offset
-            }
+            Self::ChromaRg8 { chroma_offset } | Self::ChromaRg16 { chroma_offset } => chroma_offset,
         }
     }
     fn needs_plane_pipelines(self) -> bool {
@@ -402,11 +400,7 @@ impl Scaler {
     /// storage from a pooled IOSurface) as the scaler output, so the
     /// scaler writes directly into the surface VideoToolbox encodes
     /// from, no intermediate copy.
-    pub fn scale_into(
-        &self,
-        src: &Texture,
-        dst: &Texture,
-    ) -> Result<(), ScalerError> {
+    pub fn scale_into(&self, src: &Texture, dst: &Texture) -> Result<(), ScalerError> {
         if src.width() != self.src_dims.0 || src.height() != self.src_dims.1 {
             // Returning rather than running the shader with stale
             // params: a resize race or wiring bug would otherwise
@@ -483,10 +477,12 @@ impl Scaler {
                 &self.pipelines.vertical_linear,
                 &self.pipelines.vertical_linear_bgl,
             ),
-            ColorSpace::LumaR8 { .. } => {
-                let plane = self.pipelines.plane.as_ref().ok_or(
-                    ScalerError::MissingPlanePipelines,
-                )?;
+            ColorSpace::LumaR8 => {
+                let plane = self
+                    .pipelines
+                    .plane
+                    .as_ref()
+                    .ok_or(ScalerError::MissingPlanePipelines)?;
                 (
                     &self.pipelines.horizontal_linear,
                     &plane.vertical_plane_r,
@@ -494,37 +490,47 @@ impl Scaler {
                 )
             }
             ColorSpace::ChromaRg8 { .. } => {
-                let plane = self.pipelines.plane.as_ref().ok_or(
-                    ScalerError::MissingPlanePipelines,
-                )?;
+                let plane = self
+                    .pipelines
+                    .plane
+                    .as_ref()
+                    .ok_or(ScalerError::MissingPlanePipelines)?;
                 (
                     &self.pipelines.horizontal_linear,
                     &plane.vertical_plane_rg,
                     &plane.vertical_plane_rg_bgl,
                 )
             }
-            ColorSpace::LumaR16 { .. } => {
-                let plane = self.pipelines.plane.as_ref().ok_or(
-                    ScalerError::MissingPlanePipelines,
-                )?;
-                let pipeline = plane.vertical_plane_r16.as_ref().ok_or(
-                    ScalerError::MissingPlanePipelines,
-                )?;
-                let bgl = plane.vertical_plane_r16_bgl.as_ref().ok_or(
-                    ScalerError::MissingPlanePipelines,
-                )?;
+            ColorSpace::LumaR16 => {
+                let plane = self
+                    .pipelines
+                    .plane
+                    .as_ref()
+                    .ok_or(ScalerError::MissingPlanePipelines)?;
+                let pipeline = plane
+                    .vertical_plane_r16
+                    .as_ref()
+                    .ok_or(ScalerError::MissingPlanePipelines)?;
+                let bgl = plane
+                    .vertical_plane_r16_bgl
+                    .as_ref()
+                    .ok_or(ScalerError::MissingPlanePipelines)?;
                 (&self.pipelines.horizontal_linear, pipeline, bgl)
             }
             ColorSpace::ChromaRg16 { .. } => {
-                let plane = self.pipelines.plane.as_ref().ok_or(
-                    ScalerError::MissingPlanePipelines,
-                )?;
-                let pipeline = plane.vertical_plane_rg16.as_ref().ok_or(
-                    ScalerError::MissingPlanePipelines,
-                )?;
-                let bgl = plane.vertical_plane_rg16_bgl.as_ref().ok_or(
-                    ScalerError::MissingPlanePipelines,
-                )?;
+                let plane = self
+                    .pipelines
+                    .plane
+                    .as_ref()
+                    .ok_or(ScalerError::MissingPlanePipelines)?;
+                let pipeline = plane
+                    .vertical_plane_rg16
+                    .as_ref()
+                    .ok_or(ScalerError::MissingPlanePipelines)?;
+                let bgl = plane
+                    .vertical_plane_rg16_bgl
+                    .as_ref()
+                    .ok_or(ScalerError::MissingPlanePipelines)?;
                 (&self.pipelines.horizontal_linear, pipeline, bgl)
             }
         };
@@ -537,7 +543,9 @@ impl Scaler {
         // dispatch should grow a match arm. The comment is the
         // load-bearing reminder; a debug_assert on layout identity
         // isn't expressible through wgpu's public API today.
-        let h_dst_view = self.intermediate.create_view(&TextureViewDescriptor::default());
+        let h_dst_view = self
+            .intermediate
+            .create_view(&TextureViewDescriptor::default());
         let h_bg = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("tether-scaler horizontal bg"),
             layout: &self.pipelines.horizontal_bgl,
@@ -576,7 +584,9 @@ impl Scaler {
         // when entered via `scale()`); its format must match the
         // vertical_bgl picked above. wgpu's bind-group validation
         // catches the mismatch.
-        let v_src_view = self.intermediate.create_view(&TextureViewDescriptor::default());
+        let v_src_view = self
+            .intermediate
+            .create_view(&TextureViewDescriptor::default());
         let v_dst_view = dst.create_view(&TextureViewDescriptor::default());
         let v_bg = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("tether-scaler vertical bg"),
@@ -603,11 +613,7 @@ impl Scaler {
             });
             pass.set_pipeline(vertical_pipeline);
             pass.set_bind_group(0, &v_bg, &[]);
-            pass.dispatch_workgroups(
-                dst.width().div_ceil(8),
-                dst.height().div_ceil(8),
-                1,
-            );
+            pass.dispatch_workgroups(dst.width().div_ceil(8), dst.height().div_ceil(8), 1);
         }
 
         self.queue.submit([encoder.finish()]);

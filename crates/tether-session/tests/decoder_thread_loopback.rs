@@ -9,6 +9,9 @@
 //!    reports a non-zero `render_drops` count matching the
 //!    `produced - consumed` arithmetic.
 
+// Drop counts are small test values; the u64 -> u32 casts are in range.
+#![allow(clippy::cast_possible_truncation)]
+
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -16,9 +19,7 @@ use bytes::Bytes;
 use tether_codec::Frame as CodecFrame;
 use tether_decode::test_support::{FakeDecoder, FakeOutcome};
 use tether_decode::Worker;
-use tether_protocol::video::{
-    FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta,
-};
+use tether_protocol::video::{FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta};
 use tether_protocol::MonoNanos;
 use tether_render::{Frame as RenderFrame, LatestFrame};
 use tether_transport::test_support::video_duplex_pair;
@@ -48,9 +49,7 @@ fn solid_frame(width: u32, height: u32, luma: u8) -> CodecFrame {
     })
 }
 
-fn make_worker_with(
-    outcomes: Vec<FakeOutcome>,
-) -> (Worker, LatestFrame, Arc<AtomicU32>) {
+fn make_worker_with(outcomes: Vec<FakeOutcome>) -> (Worker, LatestFrame, Arc<AtomicU32>) {
     let frames = LatestFrame::new();
     let idr_calls = Arc::new(AtomicU32::new(0));
     let idr_cb = Arc::clone(&idr_calls);
@@ -159,7 +158,7 @@ async fn render_drops_accounting_is_exact() {
         };
         let c = worker.process_job(job, MonoNanos::now());
         produced += 1;
-        observed_drops.fetch_add(c.render_drops as u64, Ordering::Relaxed);
+        observed_drops.fetch_add(u64::from(c.render_drops), Ordering::Relaxed);
         if (i + 1) % drain_every == 0 {
             // Consumer pulls the latest frame, leaving the slot empty.
             if frames.take().is_some() {
@@ -236,7 +235,10 @@ async fn concurrent_producer_consumer_under_load_preserves_invariant() {
     let drops = drops_seen.load(Ordering::Relaxed) as u32;
     let consumed_n = consumed.load(Ordering::Relaxed);
     // After consumer drained to idle, slot must be empty.
-    assert!(frames.take().is_none(), "consumer should have drained the slot");
+    assert!(
+        frames.take().is_none(),
+        "consumer should have drained the slot"
+    );
     assert_eq!(
         produced,
         consumed_n + drops,

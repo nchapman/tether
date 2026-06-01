@@ -15,6 +15,10 @@
 //! compile-time `#[cfg]` selection — no runtime "discover the
 //! cursor API" step.
 
+// Cursor sprite geometry: hotspot/dimension casts (f64 screen coords → u32,
+// u32 dims → u16/u8 wire fields) are intentional and range-bounded.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use tether_protocol::cursor::CursorPixelFormat;
 
 /// One change to the host's cursor sprite. `id` is a stable hash of
@@ -284,6 +288,10 @@ mod tests {
             CursorEvent::Idle => panic!("first call must emit Shape"),
         }
         assert_eq!(s.next_event(), CursorEvent::Idle);
-        assert_eq!(s.next_event(), CursorEvent::Idle, "Idle is sticky once emitted");
+        assert_eq!(
+            s.next_event(),
+            CursorEvent::Idle,
+            "Idle is sticky once emitted"
+        );
     }
 }

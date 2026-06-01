@@ -81,9 +81,7 @@ pub enum Nv12DmaBufError {
     /// before the bind-group binding fails opaquely.
     #[error("input texture format must be Bgra8Unorm or Rgba8Unorm, got {0:?}")]
     InputFormat(wgpu::TextureFormat),
-    #[error(
-        "input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}"
-    )]
+    #[error("input texture dimensions {input_w}x{input_h} don't match converter {w}x{h}")]
     DimMismatch {
         input_w: u32,
         input_h: u32,
@@ -269,9 +267,7 @@ impl Nv12DmaBuf {
                     )
                 })?
                 .texture_from_dmabuf_fd(fd, &hal_desc, modifier, stride, offset)
-                .map_err(|e| {
-                    Nv12DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}"))
-                })?
+                .map_err(|e| Nv12DmaBufError::Poll(format!("texture_from_dmabuf_fd: {e:?}")))?
         };
         let wgpu_desc = wgpu::TextureDescriptor {
             label: Some("imported bgra"),
@@ -388,6 +384,9 @@ impl Nv12DmaBuf {
 
 #[cfg(test)]
 mod tests {
+    // Readback pixel-math casts (fp → u8, u64 offset → usize) are intentional.
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
     use super::*;
     use crate::dmabuf_export::export_texture_as_dmabuf;
 
@@ -452,22 +451,20 @@ mod tests {
         // (BGRA: B=0, G=0, R=255, A=255). Uses the bridge's own device
         // so the texture is on the same Vulkan instance the compute
         // pipeline will read from.
-        let src = bridge
-            .device()
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("test bgra red"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+        let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("test bgra red"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         let n = (width * height) as usize;
         let mut bgra = Vec::with_capacity(n * 4);
         for _ in 0..n {
@@ -520,7 +517,9 @@ mod tests {
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .expect("vulkan backend")
                 .texture_from_dmabuf_fd(
-                    out.fd.try_clone().expect("dup shared NV12 fd for Y reimport"),
+                    out.fd
+                        .try_clone()
+                        .expect("dup shared NV12 fd for Y reimport"),
                     &import_desc,
                     out.modifier,
                     out.y_stride,
@@ -529,23 +528,25 @@ mod tests {
                 .expect("y texture_from_dmabuf_fd")
         };
         let import_tex = unsafe {
-            bridge.device().create_texture_from_hal::<wgpu::hal::api::Vulkan>(
-                hal_tex,
-                &wgpu::TextureDescriptor {
-                    label: Some("y reimport"),
-                    size: wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
+            bridge
+                .device()
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    hal_tex,
+                    &wgpu::TextureDescriptor {
+                        label: Some("y reimport"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::R8Unorm,
+                        usage: wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
                     },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R8Unorm,
-                    usage: wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                },
-            )
+                )
         };
 
         let padded_row = u64::from(width).div_ceil(256) * 256;
@@ -722,7 +723,9 @@ mod tests {
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .expect("vulkan backend")
                 .texture_from_dmabuf_fd(
-                    out.fd.try_clone().expect("dup shared NV12 fd for Y reimport"),
+                    out.fd
+                        .try_clone()
+                        .expect("dup shared NV12 fd for Y reimport"),
                     &import_desc,
                     out.modifier,
                     out.y_stride,
@@ -731,23 +734,25 @@ mod tests {
                 .expect("texture_from_dmabuf_fd y")
         };
         let y_tex = unsafe {
-            bridge.device().create_texture_from_hal::<wgpu::hal::api::Vulkan>(
-                hal_tex,
-                &wgpu::TextureDescriptor {
-                    label: Some("y reimport"),
-                    size: wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
+            bridge
+                .device()
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    hal_tex,
+                    &wgpu::TextureDescriptor {
+                        label: Some("y reimport"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::R8Unorm,
+                        usage: wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
                     },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R8Unorm,
-                    usage: wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                },
-            )
+                )
         };
         let padded_row = u64::from(width).div_ceil(256) * 256;
         let readback = bridge.device().create_buffer(&wgpu::BufferDescriptor {

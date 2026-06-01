@@ -161,11 +161,7 @@ impl EnigoBackend {
                     self.held_keys
                         .remove(&modifier_right_variant(hid).unwrap_or(hid));
                 }
-                tracing::trace!(
-                    ?bit,
-                    ?direction,
-                    "synthesised modifier to match wire state"
-                );
+                tracing::trace!(?bit, ?direction, "synthesised modifier to match wire state");
             }
         }
         Ok(())

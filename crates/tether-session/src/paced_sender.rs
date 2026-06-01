@@ -113,8 +113,9 @@ impl PacedSender {
             return None;
         }
         let start = self.frame_start?;
-        let bytes_through_this_packet =
-            self.bytes_sent_this_frame.saturating_add(packet_bytes as u64);
+        let bytes_through_this_packet = self
+            .bytes_sent_this_frame
+            .saturating_add(packet_bytes as u64);
         // Spread evenly: this packet's last byte should be on the
         // wire at `bytes_through_this_packet * 8 / bps` seconds after
         // frame_start. u128 intermediate avoids overflow at the
@@ -280,8 +281,8 @@ mod tests {
         let due_b = p.due_time(1200).unwrap();
         let span_a = due_a - t0; // first 1200 B at 25 Mbps
         let span_b = due_b - t0; // 2400 B at the *new* rate combined w/ accounting
-        // due_b reflects 2400 B at 100 Mbps = 192 µs total.
-        // due_a reflects 1200 B at 25 Mbps = 384 µs total.
+                                 // due_b reflects 2400 B at 100 Mbps = 192 µs total.
+                                 // due_a reflects 1200 B at 25 Mbps = 384 µs total.
         assert!(
             span_b < span_a,
             "post-bump cumulative due should drop below pre-bump first packet"

@@ -14,7 +14,7 @@
 //! stop, see the engine-side stdin watchers).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -74,12 +74,7 @@ impl Supervisor {
     /// reader, and register it. Replaces any existing engine in that role
     /// (the old one is stopped first). Returns an error string the UI can
     /// surface if the binary is missing or won't launch.
-    pub async fn spawn(
-        &self,
-        app: &AppHandle,
-        role: &str,
-        args: &[String],
-    ) -> Result<(), String> {
+    pub async fn spawn(&self, app: &AppHandle, role: &str, args: &[String]) -> Result<(), String> {
         // Tear down a prior engine in this role so we never leak one.
         self.stop(role).await;
 
@@ -87,12 +82,23 @@ impl Supervisor {
         let bin = engine_binary(role)?;
         tracing::info!(?bin, role, generation, ?args, "spawning engine");
 
-        let mut child = Command::new(&bin)
+        let mut command = Command::new(&bin);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so engine logs land in the dev terminal.
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // The engines are console-subsystem binaries; spawning one from this
+        // GUI shell would otherwise pop a console window on Windows. We still
+        // pipe stdin/stdout for the IPC channel — CREATE_NO_WINDOW only
+        // suppresses the console allocation, it doesn't touch the std handles.
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| format!("failed to launch {}: {e}", bin.display()))?;
 
@@ -126,35 +132,35 @@ impl Supervisor {
         let role_owned = role.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        tracing::debug!(role = role_owned, line, "engine stdout line");
-                        match serde_json::from_str::<EngineEvent>(line) {
-                            Ok(event) => {
-                                if let Err(e) = app_for_reader.emit(
-                                    "engine-status",
-                                    StatusPayload {
-                                        role: role_owned.clone(),
-                                        event,
-                                    },
-                                ) {
-                                    tracing::error!(error = %e, role = role_owned, "emit engine-status failed");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, line, role = role_owned, "unparseable engine line");
-                            }
+            // Drain stdout line-by-line; Ok(None) (EOF) or an Err ends the loop.
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                tracing::debug!(role = role_owned, line, "engine stdout line");
+                match serde_json::from_str::<EngineEvent>(line) {
+                    Ok(event) => {
+                        if let Err(e) = app_for_reader.emit(
+                            "engine-status",
+                            StatusPayload {
+                                role: role_owned.clone(),
+                                event,
+                            },
+                        ) {
+                            tracing::error!(error = %e, role = role_owned, "emit engine-status failed");
                         }
                     }
-                    Ok(None) | Err(_) => break,
+                    Err(e) => {
+                        tracing::warn!(error = %e, line, role = role_owned, "unparseable engine line");
+                    }
                 }
             }
-            tracing::info!(role = role_owned, generation, "engine stdout closed; engine exited");
+            tracing::info!(
+                role = role_owned,
+                generation,
+                "engine stdout closed; engine exited"
+            );
             // Only retire the role if *we* are still the current engine.
             // A replacement may have been spawned while our process was
             // still draining its stdout; clobbering its handle (or emitting
@@ -261,31 +267,136 @@ impl Supervisor {
     }
 }
 
-/// Directory holding the engine binaries. `TETHER_ENGINE_DIR` overrides;
-/// the default is the workspace `target/debug` relative to the
-/// `tauri dev` working directory (`apps/tether-shell/src-tauri`).
-/// Bundling will replace this with Tauri sidecar resolution.
-fn engine_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("TETHER_ENGINE_DIR") {
-        return PathBuf::from(dir);
-    }
-    PathBuf::from("../../../target/debug")
-}
-
-/// Resolve the platform binary path for an engine role.
-fn engine_binary(role: &str) -> Result<PathBuf, String> {
+/// The binary file name for an engine role, including the platform's
+/// executable suffix (`.exe` on Windows, empty elsewhere).
+fn engine_file_name(role: &str) -> Result<String, String> {
     let stem = match role {
         ROLE_HOST => "tether-host",
         ROLE_CLIENT => "tether-client",
         other => return Err(format!("unknown engine role: {other}")),
     };
-    let path = engine_dir().join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
-    if !path.exists() {
-        return Err(format!(
-            "engine binary not found at {} — build it with `cargo build -p {stem}` \
-             or set TETHER_ENGINE_DIR",
-            path.display()
-        ));
+    Ok(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// Directories to search for an engine binary, in priority order:
+/// 1. `TETHER_ENGINE_DIR` — explicit override (dev / `make shell`).
+/// 2. The directory of the running shell binary — Tauri installs the
+///    `externalBin` sidecars next to the app binary in a packaged build.
+/// 3. `../../../target/debug` relative to `tauri dev`'s working directory —
+///    the dev fallback, where sidecars aren't copied next to the dev binary.
+fn engine_search_dirs(override_dir: Option<PathBuf>, exe_dir: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = override_dir {
+        dirs.push(dir);
     }
-    Ok(path)
+    if let Some(dir) = exe_dir {
+        dirs.push(dir);
+    }
+    dirs.push(PathBuf::from("../../../target/debug"));
+    dirs
+}
+
+/// Pure resolver: the first directory whose `file_name` exists wins. On a
+/// miss, returns the full candidate list so the error can show where we
+/// looked. Factored out of [`engine_binary`] so the precedence is unit-tested
+/// without touching the environment or filesystem.
+fn resolve_engine_path(
+    dirs: &[PathBuf],
+    file_name: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, Vec<PathBuf>> {
+    let candidates: Vec<PathBuf> = dirs.iter().map(|dir| dir.join(file_name)).collect();
+    match candidates.iter().find(|path| exists(path)) {
+        Some(path) => Ok(path.clone()),
+        None => Err(candidates),
+    }
+}
+
+/// Resolve the platform binary path for an engine role against the live
+/// environment, current-exe location, and filesystem.
+fn engine_binary(role: &str) -> Result<PathBuf, String> {
+    let file_name = engine_file_name(role)?;
+    let override_dir = std::env::var_os("TETHER_ENGINE_DIR").map(PathBuf::from);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let dirs = engine_search_dirs(override_dir, exe_dir);
+
+    resolve_engine_path(&dirs, &file_name, |path| path.exists()).map_err(|candidates| {
+        let looked: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+        format!(
+            "{file_name} not found — looked in [{}]. Build it with `cargo build -p {}` \
+             or set TETHER_ENGINE_DIR",
+            looked.join(", "),
+            file_name.trim_end_matches(std::env::consts::EXE_SUFFIX),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_role_is_rejected() {
+        assert!(engine_file_name("bogus").is_err());
+        // Includes the platform suffix (`.exe` on Windows, empty elsewhere) so
+        // this passes on the Windows CI runner too.
+        assert_eq!(
+            engine_file_name(ROLE_HOST).unwrap(),
+            format!("tether-host{}", std::env::consts::EXE_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn search_dirs_are_ordered_override_then_exe_then_fallback() {
+        let override_dir = PathBuf::from("/override");
+        let exe_dir = PathBuf::from("/app");
+        let dirs = engine_search_dirs(Some(override_dir.clone()), Some(exe_dir.clone()));
+        assert_eq!(
+            dirs,
+            vec![
+                override_dir,
+                exe_dir,
+                PathBuf::from("../../../target/debug")
+            ]
+        );
+    }
+
+    #[test]
+    fn search_dirs_skip_absent_sources() {
+        // With no override and no resolvable exe dir, only the dev fallback
+        // remains — never a stray empty path.
+        assert_eq!(
+            engine_search_dirs(None, None),
+            vec![PathBuf::from("../../../target/debug")]
+        );
+    }
+
+    #[test]
+    fn resolution_prefers_first_existing_candidate() {
+        let dirs = engine_search_dirs(
+            Some(PathBuf::from("/override")),
+            Some(PathBuf::from("/app")),
+        );
+
+        // Override present → override wins even though the others "exist" too.
+        let got = resolve_engine_path(&dirs, "tether-host", |_| true).unwrap();
+        assert_eq!(got, PathBuf::from("/override/tether-host"));
+
+        // Override missing → fall through to the exe (sidecar) directory.
+        let got = resolve_engine_path(&dirs, "tether-host", |p| p.starts_with("/app")).unwrap();
+        assert_eq!(got, PathBuf::from("/app/tether-host"));
+    }
+
+    #[test]
+    fn resolution_miss_reports_every_candidate() {
+        let dirs = engine_search_dirs(
+            Some(PathBuf::from("/override")),
+            Some(PathBuf::from("/app")),
+        );
+        let candidates = resolve_engine_path(&dirs, "tether-host", |_| false).unwrap_err();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0], PathBuf::from("/override/tether-host"));
+    }
 }

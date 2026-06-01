@@ -185,7 +185,9 @@ impl EngineEvent {
             EngineEvent::PairingPin {
                 pin,
                 expires_in_secs,
-            } => vec![format!("pairing PIN: {pin} (expires in {expires_in_secs}s)")],
+            } => vec![format!(
+                "pairing PIN: {pin} (expires in {expires_in_secs}s)"
+            )],
             EngineEvent::Paired { peer, label } => {
                 vec![format!("paired with {label} ({peer})")]
             }
@@ -295,7 +297,10 @@ mod tests {
             fingerprint: "sha256:abcd".into(),
         })
         .unwrap();
-        assert_eq!(revoke, r#"{"cmd":"revoke_peer","fingerprint":"sha256:abcd"}"#);
+        assert_eq!(
+            revoke,
+            r#"{"cmd":"revoke_peer","fingerprint":"sha256:abcd"}"#
+        );
         let list = serde_json::to_string(&ShellCommand::ListPeers).unwrap();
         assert_eq!(list, r#"{"cmd":"list_peers"}"#);
     }
@@ -340,7 +345,10 @@ mod tests {
             fingerprint: "f".into(),
         })
         .unwrap();
-        assert_eq!(line, r#"{"event":"listening","addr":"a","fingerprint":"f"}"#);
+        assert_eq!(
+            line,
+            r#"{"event":"listening","addr":"a","fingerprint":"f"}"#
+        );
     }
 
     /// An unknown command line is a clean parse error, not a panic — the

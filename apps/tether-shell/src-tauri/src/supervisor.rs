@@ -82,12 +82,23 @@ impl Supervisor {
         let bin = engine_binary(role)?;
         tracing::info!(?bin, role, generation, ?args, "spawning engine");
 
-        let mut child = Command::new(&bin)
+        let mut command = Command::new(&bin);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so engine logs land in the dev terminal.
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        // The engines are console-subsystem binaries; spawning one from this
+        // GUI shell would otherwise pop a console window on Windows. We still
+        // pipe stdin/stdout for the IPC channel — CREATE_NO_WINDOW only
+        // suppresses the console allocation, it doesn't touch the std handles.
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| format!("failed to launch {}: {e}", bin.display()))?;
 

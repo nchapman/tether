@@ -3598,7 +3598,7 @@ dependencies = [
 
 [[package]]
 name = "tether-ipc"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3606,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "tether-shell"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",

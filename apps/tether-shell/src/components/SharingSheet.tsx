@@ -6,9 +6,8 @@ import { OverflowMenu } from "./OverflowMenu";
 import { CopyIcon } from "../icons";
 
 // Sharing (the host role) as a settings sheet. Reads like a system preference:
-// one switch, the address to hand out, and who's paired. The cert fingerprint
-// ("safety code") and the test-pattern dev toggle live under Advanced — off
-// the default path, since the PIN flow handles the trust ceremony.
+// one switch, the address to hand out, and who's paired. The PIN flow handles
+// the trust ceremony, so there's nothing else to configure here.
 export function SharingSheet({
   host,
   onStart,
@@ -19,16 +18,14 @@ export function SharingSheet({
   onClose,
 }: {
   host: HostState;
-  onStart: (testPattern: boolean) => void;
+  onStart: () => void;
   onStop: () => void;
   onAddDevice: (label: string) => void;
   onRevoke: (peer: PairedPeer) => void;
   onCopy: (text: string) => void;
   onClose: () => void;
 }) {
-  const [testPattern, setTestPattern] = useState(false);
   const [newLabel, setNewLabel] = useState("");
-  const [advanced, setAdvanced] = useState(false);
 
   return (
     <Sheet title="Sharing" onClose={onClose}>
@@ -39,7 +36,7 @@ export function SharingSheet({
             role="switch"
             aria-checked={host.running}
             className={"switch" + (host.running ? " on" : "")}
-            onClick={() => (host.running ? onStop() : onStart(testPattern))}
+            onClick={() => (host.running ? onStop() : onStart())}
           >
             <span className="switch-knob" />
           </button>
@@ -121,41 +118,6 @@ export function SharingSheet({
               </div>
             )}
           </>
-        )}
-
-        <button className="disclosure" onClick={() => setAdvanced((v) => !v)}>
-          {advanced ? "▾" : "▸"} Advanced
-        </button>
-        {advanced && (
-          <div className="advanced">
-            {host.running && host.fingerprint && (
-              <div className="kv">
-                <span className="field-label">Safety code</span>
-                <div className="copy-row">
-                  <span className="mono break">{host.fingerprint}</span>
-                  <button
-                    className="icon-btn"
-                    aria-label="Copy safety code"
-                    onClick={() => onCopy(host.fingerprint)}
-                  >
-                    <CopyIcon />
-                  </button>
-                </div>
-              </div>
-            )}
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={testPattern}
-                disabled={host.running}
-                onChange={(e) => setTestPattern(e.currentTarget.checked)}
-              />
-              Test pattern (no screen capture)
-            </label>
-            <span className="field-hint">
-              Turn sharing off and on again to apply the test-pattern change.
-            </span>
-          </div>
         )}
       </div>
     </Sheet>

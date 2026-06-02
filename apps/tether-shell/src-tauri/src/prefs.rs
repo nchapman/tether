@@ -30,8 +30,7 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellPrefs {
     /// Whether hosting should be active. When true, the shell auto-starts the
-    /// host engine on launch (with real capture; the test-pattern dev toggle is
-    /// deliberately not persisted).
+    /// host engine on launch with real screen capture.
     #[serde(default)]
     pub sharing_enabled: bool,
 }

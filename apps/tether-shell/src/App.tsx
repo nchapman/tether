@@ -124,7 +124,7 @@ function App() {
           // Surface a failure into host state so the Sharing sheet shows why
           // hosting didn't come back (e.g. engine binary missing), rather than
           // a silently-off toggle.
-          startHost(false).catch((e) => {
+          startHost().catch((e) => {
             console.warn("auto-start host failed", e);
             setHost((h) => ({ ...h, error: String(e) }));
           });
@@ -202,7 +202,6 @@ function App() {
           ...h,
           running: true,
           addr: p.addr ?? "",
-          fingerprint: p.fingerprint ?? "",
           error: null,
         }));
         listPeers().catch((e) => console.warn("list_peers failed", e));
@@ -421,7 +420,7 @@ function App() {
       {sheet === "sharing" && (
         <SharingSheet
           host={host}
-          onStart={(testPattern) => startHost(testPattern).catch((e) => console.warn(e))}
+          onStart={() => startHost().catch((e) => console.warn(e))}
           onStop={onStopSharing}
           onAddDevice={(label) => startPairing(label).catch((e) => console.warn(e))}
           onRevoke={onRevoke}

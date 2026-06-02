@@ -650,9 +650,6 @@ input::placeholder {
 .copy-row .mono {
   flex: 1;
 }
-.break {
-  word-break: break-all;
-}
 .status {
   display: flex;
   align-items: center;
@@ -694,33 +691,6 @@ input::placeholder {
 .device-row:last-child {
   border-bottom: none;
 }
-.disclosure {
-  font: inherit;
-  font-size: 13px;
-  color: var(--text-2);
-  background: transparent;
-  border: none;
-  text-align: left;
-  padding: 4px 0;
-}
-.disclosure:hover {
-  color: var(--text);
-}
-.advanced {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 12px;
-  background: var(--bg);
-  border-radius: var(--radius-ctl);
-}
-.check {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-}
-
 .mono {
   font-family: var(--mono);
   font-size: 12px;

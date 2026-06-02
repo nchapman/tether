@@ -79,8 +79,7 @@ export const disconnectClient = () => invoke<void>("stop_engine", { role: "clien
 
 // --- Host / sharing ----------------------------------------------------------
 
-export const startHost = (testPattern: boolean) =>
-  invoke<void>("start_host", { testPattern });
+export const startHost = () => invoke<void>("start_host");
 
 export const stopHost = () => invoke<void>("stop_engine", { role: "host" });
 

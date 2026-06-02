@@ -139,24 +139,19 @@ The window is the client. Nothing about hosting competes for attention.
 ## Surface 2a — The sharing-settings sheet (Host)
 
 Reached from `⚙`. Reads like a system preference: one switch and minimal
-reference info. The fingerprint ("safety code") is **not** on the default
-path — the PIN flow handles the trust ceremony, and surfacing the fingerprint
-re-introduces the vocabulary/clutter the redesign retires. It lives under
-Advanced for debugging.
+reference info — nothing else to configure. The PIN flow handles the whole
+trust ceremony, so neither the fingerprint nor any debug knob is surfaced here.
 
 ```
    ┌─ Sharing ─────────────────────────────────┐
    │  Allow remote connections      [ ●═══ ON ] │
    │                                            │
-   │  This computer:  Nick's MacBook            │
    │  Address:        192.168.1.42:7654  [Copy] │
    │  ● Waiting for someone to connect…         │  ← live status
    │                                            │
    │  Paired devices                  [+ Add]   │
    │   Jane's MacBook   today                ⋯  │  ← Revoke lives in ⋯
    │   Work laptop      Mar 28               ⋯  │
-   │                                            │
-   │  ▸ Advanced  (safety code, test pattern)   │
    └────────────────────────────────────────────┘
 ```
 
@@ -169,7 +164,9 @@ Advanced for debugging.
   via Add a device). Both have one-click Copy.
 - Paired devices, **Add a device** (`StartPairing` → `PairingPin`), and
   **Revoke** (in `⋯`, with confirm) map to existing IPC.
-- **Test pattern** and the safety code move under **Advanced**.
+- No "Advanced" disclosure. The fingerprint isn't shown (the PIN flow already
+  authenticates the cert, so an out-of-band code is redundant clutter), and the
+  engine's `--test-pattern` dev fallback is reachable only from the CLI.
 
 ## Surface 2b — Add a computer (first contact)
 
@@ -413,8 +410,11 @@ Each phase is independently shippable and testable.
 
 ### Phase 2 — Hosting moves to the tray + settings sheet — DONE
 
-- Host UI lives in the `⚙` sharing-settings sheet (landed with Phase 1). Safety
-  code under Advanced; Copy on address; Revoke into `⋯`; test pattern demoted.
+- Host UI lives in the `⚙` sharing-settings sheet (landed with Phase 1): the
+  toggle, Copy on address, live status, paired devices, Add a device, Revoke in
+  `⋯`. No Advanced section — the fingerprint and the test-pattern dev toggle
+  were dropped from the UI (the fingerprint is redundant given PIN pairing; the
+  engine's `--test-pattern` stays CLI-only).
 - Persist a `sharing_enabled` shell preference (`prefs.rs`, stored next to the
   trust store). On launch the webview reads it via `get_prefs` — after the
   engine-event listeners are live — and re-spawns the host when true. First run
@@ -431,7 +431,8 @@ Each phase is independently shippable and testable.
   before stdout EOF, so the reader emits none. Both the webview and the tray are
   event-driven, so without this an explicit host/client stop (from either
   surface) would leave the *other* surface showing stale "sharing"/"connected".
-- Reframe "fingerprint" → "safety code".
+- The fingerprint is no longer surfaced in the UI at all (PIN pairing makes an
+  out-of-band code redundant), so there's no "safety code" vocabulary to reframe.
 
 ### Phase 3 — Tray richness — DONE
 

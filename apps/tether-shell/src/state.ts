@@ -24,7 +24,6 @@ export type ClientState =
 export type HostState = {
   running: boolean;
   addr: string;
-  fingerprint: string;
   /// The connected client's address, or null while waiting.
   peer: string | null;
   /// Active pairing PIN and its live countdown, or null when not pairing.
@@ -38,7 +37,6 @@ export type HostState = {
 export const initialHostState: HostState = {
   running: false,
   addr: "",
-  fingerprint: "",
   peer: null,
   pin: null,
   secondsLeft: 0,

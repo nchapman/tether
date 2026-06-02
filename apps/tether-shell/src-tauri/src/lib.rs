@@ -16,24 +16,19 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
 
-/// Start hosting: spawn `tether-host --ipc`. `test_pattern` swaps real
-/// capture for the synthetic gradient (useful for one-machine loopback).
+/// Start hosting: spawn `tether-host --ipc` with real screen capture. (The
+/// engine's `--test-pattern` dev fallback is reachable only from the CLI, not
+/// the UI.)
 ///
 /// The sharing posture is persisted as on only once the host actually reaches
 /// `listening` (in the supervisor reader), not here at spawn time — so a host
 /// that spawns but fails to bind never leaves a broken "sharing on" posture
 /// that would auto-restart and fail every launch.
 #[tauri::command]
-async fn start_host(
-    app: AppHandle,
-    supervisor: State<'_, Supervisor>,
-    test_pattern: bool,
-) -> Result<(), String> {
-    let mut args = vec!["--ipc".to_string()];
-    if test_pattern {
-        args.push("--test-pattern".to_string());
-    }
-    supervisor.spawn(&app, ROLE_HOST, &args).await
+async fn start_host(app: AppHandle, supervisor: State<'_, Supervisor>) -> Result<(), String> {
+    supervisor
+        .spawn(&app, ROLE_HOST, &["--ipc".to_string()])
+        .await
 }
 
 /// Connect as a client: spawn `tether-client --ipc [--pin P] [--label L] <addr>

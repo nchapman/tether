@@ -1065,7 +1065,9 @@ async fn handle_client(
                             warn!(error = %e, "cursor inject failed; dropping");
                         }
                     }
-                    Ok(Datagram::Video(_)) | Ok(Datagram::HostCursor(_)) => {
+                    Ok(Datagram::Video(_))
+                    | Ok(Datagram::HostCursor(_))
+                    | Ok(Datagram::Audio(_)) => {
                         tracing::trace!("unexpected host-direction datagram on host; ignoring");
                     }
                     Err(e) => {

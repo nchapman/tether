@@ -623,6 +623,12 @@ async fn main() -> anyhow::Result<()> {
                             // come back to the client; ignore defensively.
                             continue;
                         }
+                        Ok(Datagram::Audio(_)) => {
+                            // Audio shares this datagram demux point; the
+                            // decode→jitter-buffer→playback path is wired in
+                            // when the audio pipeline lands. Drop until then.
+                            continue;
+                        }
                         Err(e) => {
                             // Promoted from warn → error: this is terminal for the
                             // video stream and the user otherwise sees a frozen

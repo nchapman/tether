@@ -58,6 +58,8 @@ function App() {
   clientRef.current = client;
   const hostsRef = useRef(hosts);
   hostsRef.current = hosts;
+  const hostRef = useRef(host);
+  hostRef.current = host;
   // Tracks whether we hid the window for a live session, so we restore it on
   // *any* terminal transition (clean disconnect, error, or crash-exit) without
   // re-showing — and stealing focus — when it was never hidden.
@@ -99,6 +101,16 @@ function App() {
         setHost(initialHostState);
       }
     });
+    // The tray's "Add a device…" shows the window and asks us to open Sharing.
+    const unsharing = listen("open-sharing", () => {
+      setSheet("sharing");
+      if (hostRef.current.running) listPeers().catch((e) => console.warn(e));
+    });
+    // The tray asks us to connect through the window (only when a session is
+    // already live, so the switch-computer confirm runs).
+    const unconnect = listen<string>("request-connect", ({ payload }) => {
+      onConnect(payload);
+    });
 
     // Re-apply the persisted sharing posture: if hosting was last left on,
     // start it again. Wait until both listeners are live so we don't miss the
@@ -122,6 +134,8 @@ function App() {
     return () => {
       unstatus.then((f) => f());
       unexit.then((f) => f());
+      unsharing.then((f) => f());
+      unconnect.then((f) => f());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -161,7 +175,10 @@ function App() {
         setClient({ kind: "idle" });
         break;
       case "error": {
-        restoreWindow();
+        // Force-show the window so the failure is visible even for a
+        // tray-initiated connect (which never hid it through us).
+        showWindow();
+        windowHidden.current = false;
         const addr = prev.kind !== "idle" ? prev.addr : p.host ?? "";
         const via: ConnectVia =
           prev.kind === "connecting" || prev.kind === "error" ? prev.via : "saved";

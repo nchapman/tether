@@ -9,10 +9,9 @@
 mod known_hosts;
 mod prefs;
 mod supervisor;
+mod tray;
 
 use supervisor::{Supervisor, ROLE_CLIENT, ROLE_HOST};
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
-use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, State};
 use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
@@ -76,14 +75,22 @@ async fn connect_client(
 /// and auto-restore retries on the next launch.
 #[tauri::command]
 async fn stop_engine(supervisor: State<'_, Supervisor>, role: String) -> Result<(), String> {
-    supervisor.stop(&role).await;
     if role == ROLE_HOST {
-        // Clear the posture even if no host was running: this command means
-        // "sharing should be off", and being idempotent keeps it safe for the
-        // tray toggle to call without first checking engine state.
-        prefs::set_sharing_enabled(false);
+        stop_sharing(supervisor.inner()).await;
+    } else {
+        supervisor.stop(&role).await;
     }
     Ok(())
+}
+
+/// Stop the host engine and clear the persisted sharing posture. Shared by the
+/// `stop_engine` command and the tray's Share toggle so "turn sharing off"
+/// always goes through one place. Clearing the posture even when no host was
+/// running is intentional — the meaning is "sharing should be off", and the
+/// idempotency keeps it safe for the tray to call without checking state first.
+pub(crate) async fn stop_sharing(supervisor: &Supervisor) {
+    supervisor.stop(ROLE_HOST).await;
+    prefs::set_sharing_enabled(false);
 }
 
 /// Open a host pairing window for a new device with display name `label`. The
@@ -150,21 +157,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Supervisor::default())
         .setup(|app| {
-            // System tray: the shell keeps running here even when the
-            // window is closed, so the host engine can stay up headless.
-            let show = MenuItemBuilder::with_id("show", "Show Tether").build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-            let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
-            TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Tether")
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main_window(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .build(app)?;
+            // System tray: the shell keeps running here even when the window is
+            // closed, so the host engine can stay up headless. The tray owns its
+            // own dynamic menu + status (see `tray`).
+            tray::init(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -240,7 +236,7 @@ fn show_window(app: AppHandle) {
 }
 
 /// Reveal and focus the main window (from the tray "Show" item).
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();

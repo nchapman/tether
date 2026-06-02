@@ -141,15 +141,25 @@ impl Supervisor {
                 tracing::debug!(role = role_owned, line, "engine stdout line");
                 match serde_json::from_str::<EngineEvent>(line) {
                     Ok(event) => {
-                        // A host that reaches `listening` has successfully
-                        // started sharing — persist the posture now (not at
-                        // spawn) so a spawn that fails to bind never leaves a
-                        // broken "sharing on" state that auto-restarts every
-                        // launch. See `crate::prefs`.
-                        if role_owned == ROLE_HOST
-                            && matches!(event, EngineEvent::Listening { .. })
-                        {
-                            crate::prefs::set_sharing_enabled(true);
+                        // Persist the sharing posture from the *host's* own
+                        // lifecycle, not at spawn time (see `crate::prefs`):
+                        //   - `listening` = sharing actually came up → on.
+                        //   - `error` = a startup failure (the host emits Error
+                        //     only on bind/allowlist failure, then exits) → off,
+                        //     so a host that can't start doesn't auto-retry and
+                        //     fail every launch.
+                        // A *mid-session* crash exits with no Error event, so it
+                        // leaves the posture sticky-on and auto-restore retries.
+                        if role_owned == ROLE_HOST {
+                            match &event {
+                                EngineEvent::Listening { .. } => {
+                                    crate::prefs::set_sharing_enabled(true)
+                                }
+                                EngineEvent::Error { .. } => {
+                                    crate::prefs::set_sharing_enabled(false)
+                                }
+                                _ => {}
+                            }
                         }
                         if let Err(e) = app_for_reader.emit(
                             "engine-status",

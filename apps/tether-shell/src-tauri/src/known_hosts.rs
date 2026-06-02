@@ -13,7 +13,14 @@
 //! path). This module is only the list-management half.
 
 use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 use tether_pairing::KnownHosts;
+
+/// Event the shell emits when the saved-host store changes (rename/forget), so
+/// other consumers of it — notably the tray's quick-connect submenu — can
+/// refresh without polling. The webview already re-lists after its own edits;
+/// this keeps the tray in sync within the same session too.
+pub const HOSTS_CHANGED: &str = "hosts-changed";
 
 /// One saved computer, as the Connect window renders it. The cert fingerprint
 /// is deliberately omitted: it's a trust-internal detail the redesigned UI no
@@ -75,16 +82,26 @@ pub fn list_known_hosts() -> Result<Vec<SavedHost>, String> {
     Ok(sorted_rows(&load_store()?))
 }
 
+/// The most-recently-used saved computers, capped at `limit`, for the tray's
+/// quick-connect submenu. A missing or unreadable store yields an empty list:
+/// the tray menu must never fail to build over a bad address book.
+pub fn recent_hosts(limit: usize) -> Vec<SavedHost> {
+    let Ok(store) = load_store() else {
+        return Vec::new();
+    };
+    let mut rows = sorted_rows(&store);
+    rows.truncate(limit);
+    rows
+}
+
 /// Longest accepted display label. Labels are non-authoritative chrome; this
 /// cap just stops a malformed/oversized IPC call from bloating the trust store
 /// (which is re-read in full on every load).
 const MAX_LABEL_BYTES: usize = 255;
 
-/// Rename a saved computer (display label only — never the pinned identity).
-/// A blank label is rejected so a row can't lose its name; an unknown address
-/// (e.g. forgotten in another window) is an error the UI can show.
-#[tauri::command]
-pub fn rename_known_host(addr: String, label: String) -> Result<(), String> {
+/// Validate and normalize a display label: trimmed, non-empty, within the byte
+/// cap. Pure so the rules are unit-tested without a filesystem or an AppHandle.
+fn validate_label(label: &str) -> Result<String, String> {
     let label = label.trim();
     if label.is_empty() {
         return Err("a name can't be empty".to_string());
@@ -94,21 +111,34 @@ pub fn rename_known_host(addr: String, label: String) -> Result<(), String> {
             "a name must be {MAX_LABEL_BYTES} characters or fewer"
         ));
     }
+    Ok(label.to_string())
+}
+
+/// Rename a saved computer (display label only — never the pinned identity).
+/// A blank label is rejected so a row can't lose its name; an unknown address
+/// (e.g. forgotten in another window) is an error the UI can show.
+#[tauri::command]
+pub fn rename_known_host(app: AppHandle, addr: String, label: String) -> Result<(), String> {
+    let label = validate_label(&label)?;
     let mut store = load_store()?;
-    if !store.rename(&addr, label.to_string()) {
+    if !store.rename(&addr, label) {
         return Err(format!("no saved computer at {addr}"));
     }
-    save_store(&store)
+    save_store(&store)?;
+    let _ = app.emit(HOSTS_CHANGED, ());
+    Ok(())
 }
 
 /// Forget a saved computer: drop its pinned cert so it disappears from the
 /// address book. Reconnecting afterward needs a fresh PIN. Forgetting an
 /// already-absent host is a no-op success (idempotent for double-clicks).
 #[tauri::command]
-pub fn forget_known_host(addr: String) -> Result<(), String> {
+pub fn forget_known_host(app: AppHandle, addr: String) -> Result<(), String> {
     let mut store = load_store()?;
     store.remove(&addr);
-    save_store(&store)
+    save_store(&store)?;
+    let _ = app.emit(HOSTS_CHANGED, ());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -152,11 +182,11 @@ mod tests {
     }
 
     #[test]
-    fn rename_rejects_blank_and_oversized_labels() {
-        // Both checks short-circuit before any filesystem access.
-        assert!(rename_known_host("a:7654".to_string(), "   ".to_string()).is_err());
-        let huge = "x".repeat(MAX_LABEL_BYTES + 1);
-        assert!(rename_known_host("a:7654".to_string(), huge).is_err());
+    fn validate_label_rejects_blank_and_oversized() {
+        assert!(validate_label("   ").is_err());
+        assert!(validate_label(&"x".repeat(MAX_LABEL_BYTES + 1)).is_err());
+        // A normal label is trimmed and accepted.
+        assert_eq!(validate_label("  Work Mac  ").unwrap(), "Work Mac");
     }
 
     #[test]

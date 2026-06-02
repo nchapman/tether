@@ -418,21 +418,35 @@ Each phase is independently shippable and testable.
 - Persist a `sharing_enabled` shell preference (`prefs.rs`, stored next to the
   trust store). On launch the webview reads it via `get_prefs` — after the
   engine-event listeners are live — and re-spawns the host when true. First run
-  = false. The posture is written through one path: `stop_engine(host)` clears
-  it (explicit "sharing off", idempotent), and the **host's confirmed
-  `listening` event** sets it on (persisting at spawn would leave a bind-failure
-  auto-restarting every launch). A crash exits via the supervisor's EOF path,
-  not `stop_engine`, so the posture stays sticky-on and auto-restore retries.
-  The Phase 3 tray toggle reuses `start_host` / `stop_engine`, so it inherits
-  the same single source of truth for free.
+  = false. The posture is written from the host's own lifecycle in the
+  supervisor reader, not at spawn: a confirmed `listening` event sets it on; a
+  startup `error` (bind/allowlist failure, which exits) clears it so a host that
+  can't start doesn't auto-retry-and-fail every launch. `stop_engine(host)` (via
+  `stop_sharing`) clears it on an explicit toggle-off. A *mid-session* crash
+  exits with no error event, so the posture stays sticky-on and auto-restore
+  retries. The tray toggle reuses this path, so it inherits one source of truth.
 - Reframe "fingerprint" → "safety code".
 
-### Phase 3 — Tray richness
+### Phase 3 — Tray richness — DONE
 
-- Tray-state updater driven by `engine-status`: status header, icon/badge
-  states (host state only), tooltip.
-- **Connect to ▸** recents submenu and **Share this computer** toggle;
-  **Add a device…** force-shows the window.
+- `tray.rs`: the tray is a *second consumer* of `engine-status` / `engine-exited`
+  (Rust-side `app.listen`), rebuilding its own menu + tooltip — decoupled from
+  the supervisor internals and React state. Status is menu text + tooltip only
+  (no per-state icon art this release).
+- Menu: disabled status header (`Not sharing` / `Sharing · waiting` /
+  `Sharing · <peer> connected` / `Connected to <host>`), a **Connect to ▸**
+  recents submenu (MRU, capped at 8), a **Disconnect** item only while a client
+  session is live, a **Share this computer** check toggle, **Add a device…**,
+  and Show/Quit.
+- Tray recents connect **headless** when idle (the engine's video window is what
+  the user wants); if a session is already live, the tray force-shows the window
+  and routes through the webview's "Switch computer?" confirm (`request-connect`
+  event) rather than silently killing it. Spawn failures force-show the window.
+- **Add a device…** force-shows the window and opens the Sharing sheet
+  (`open-sharing` event). Rename/forget emit `hosts-changed` so the submenu
+  refreshes in-session.
+- A client `error` now force-shows the window (so a tray-initiated failure is
+  visible even though it never hid the window through the webview).
 
 ### Phase 4 — Native-feel + visual polish pass
 

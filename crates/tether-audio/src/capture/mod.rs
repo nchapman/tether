@@ -68,6 +68,15 @@ pub enum CaptureError {
     Backend(String),
 }
 
+/// Whether a system-audio capture backend exists for this platform. The host
+/// uses this to decide whether to advertise audio at all, so a client never
+/// opts into audio a backend-less host can't deliver. Linux/Windows flip to
+/// `true` when their backends land.
+#[must_use]
+pub fn is_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// Start capturing system-output audio for the current platform.
 ///
 /// Returns [`CaptureError::Unsupported`] on platforms whose backend isn't wired

@@ -26,6 +26,7 @@ use tether_transport::ControlChannel;
 fn cfgs() -> (HostSessionConfig, ClientSessionConfig) {
     let host = HostSessionConfig {
         server_name: "test-host".to_string(),
+        audio_config: None,
     };
     let client = ClientSessionConfig {
         client_name: "test-client".to_string(),
@@ -254,6 +255,7 @@ async fn client_filters_unknown_bit_depth_from_host_advert() {
     let (host_chan, client_chan) = duplex_pair();
     let host_cfg = HostSessionConfig {
         server_name: "buggy-host".to_string(),
+        audio_config: None,
     };
     let client_cfg = ClientSessionConfig {
         client_name: "test-client".to_string(),
@@ -299,6 +301,7 @@ async fn host_filters_unknown_bit_depths_keeps_known_ones() {
     let (host_chan, client_chan) = duplex_pair();
     let host_cfg = HostSessionConfig {
         server_name: "test-host".to_string(),
+        audio_config: None,
     };
     // Client advertises a 12-bit profile (unknown) and a real
     // 8-bit HEVC profile. The host should filter the unknown depth
@@ -413,6 +416,7 @@ async fn dropped_client_during_handshake_surfaces_as_transport_error() {
         host_chan_dyn,
         HostSessionConfig {
             server_name: "test".into(),
+            audio_config: None,
         },
         |_| Some(VideoProfile::H264_8BIT_420),
     )

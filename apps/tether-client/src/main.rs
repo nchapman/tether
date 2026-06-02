@@ -20,6 +20,7 @@ use crossbeam_channel::bounded;
 use tether_decode::{DecodeCompletion, DecodeJob};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
+use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{ControlMessage, GoodbyeCode, Viewport};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
@@ -62,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         fingerprint_hex,
         pin,
         label,
+        audio: audio_enabled,
     } = parse_cli_args(&raw_args)?;
 
     // Decide how to authenticate the host. Precedence: an explicit `--pin`
@@ -476,6 +478,12 @@ async fn main() -> anyhow::Result<()> {
         gpu_export,
     );
 
+    // Audio: if enabled and the host advertised an `AudioConfig`, stand up the
+    // decode → jitter buffer → cpal playback path on its own thread.
+    // `audio_tx` feeds it from the datagram recv loop below; `audio_active`
+    // gates `StreamReady.audio`. Both are moved into the recv task.
+    let (audio_tx, audio_active) = setup_audio_playback(audio_enabled, &server_hello);
+
     let conn_for_recovery_send = conn.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
@@ -499,13 +507,13 @@ async fn main() -> anyhow::Result<()> {
             .await;
             return;
         }
-        // Decoder is up; tell the host to start streaming. `audio: false`
-        // because the Opus pipeline isn't wired yet (the wire-shape lands
-        // in tether-protocol/audio.rs).
+        // Decoder is up; tell the host to start streaming. `audio` is true only
+        // when we built a playback path for the host's advertised AudioConfig —
+        // the host's audio gate keys off this.
         if let Err(e) = conn_ready
             .send_control(&ControlMessage::StreamReady {
                 video: true,
-                audio: false,
+                audio: audio_active,
             })
             .await
         {
@@ -623,10 +631,14 @@ async fn main() -> anyhow::Result<()> {
                             // come back to the client; ignore defensively.
                             continue;
                         }
-                        Ok(Datagram::Audio(_)) => {
-                            // Audio shares this datagram demux point; the
-                            // decode→jitter-buffer→playback path is wired in
-                            // when the audio pipeline lands. Drop until then.
+                        Ok(Datagram::Audio(AudioPacket::Opus {
+                            frame_seq, payload, ..
+                        })) => {
+                            // Forward to the audio decode thread; drop on a full
+                            // channel (decoder behind) — audio is loss-tolerant.
+                            if let Some(tx) = &audio_tx {
+                                let _ = tx.try_send((frame_seq, payload));
+                            }
                             continue;
                         }
                         Err(e) => {
@@ -1165,6 +1177,9 @@ struct CliArgs {
     pin: Option<String>,
     /// `--label <name>`: display name to record for the host on first pair.
     label: Option<String>,
+    /// Play host audio when the host advertises it. On by default; `--no-audio`
+    /// disables the client's playback path entirely.
+    audio: bool,
 }
 
 /// Parse the client CLI. Positional[0] is the host address (required);
@@ -1175,10 +1190,12 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
     let mut positional: Vec<&str> = Vec::new();
     let mut pin = None;
     let mut label = None;
+    let mut audio = true;
     let mut it = raw_args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ipc" => {}
+            "--no-audio" => audio = false,
             "--pin" => pin = Some(take_flag_value(&mut it, "--pin")?),
             "--label" => label = Some(take_flag_value(&mut it, "--label")?),
             other if other.starts_with("--") => {
@@ -1200,6 +1217,7 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
         fingerprint_hex,
         pin,
         label,
+        audio,
     })
 }
 
@@ -1217,6 +1235,102 @@ fn take_flag_value<'a>(
         Some(v) => Ok(v.clone()),
         None => anyhow::bail!("{flag} requires a value"),
     }
+}
+
+/// If audio is enabled and the host advertised an `AudioConfig`, spawn the
+/// playback thread and return a sender the recv loop feeds Opus frames to,
+/// plus `true` (audio active). Otherwise return `(None, false)` and run
+/// video-only. Never fatal — a missing output device just means no sound.
+fn setup_audio_playback(
+    enabled: bool,
+    server_hello: &tether_protocol::control::ServerHelloV1,
+) -> (Option<crossbeam_channel::Sender<(u32, Vec<u8>)>>, bool) {
+    if !enabled {
+        info!("audio disabled via --no-audio");
+        return (None, false);
+    }
+    let Some(audio_cfg) = server_hello
+        .extensions
+        .get(tether_protocol::audio::AUDIO_CONFIG_EXTENSION_KEY)
+        .and_then(|b| tether_protocol::decode::<tether_protocol::audio::AudioConfig>(b).ok())
+    else {
+        info!("host advertised no audio; running video-only");
+        return (None, false);
+    };
+
+    let opus_cfg = tether_audio::OpusConfig {
+        sample_rate: audio_cfg.sample_rate_hz,
+        channels: audio_cfg.channels,
+        ..tether_audio::OpusConfig::default()
+    };
+    // ~640 ms of 10 ms frames — generous headroom so the recv loop never
+    // blocks; the jitter buffer downstream bounds actual playback latency.
+    let (tx, rx) = crossbeam_channel::bounded::<(u32, Vec<u8>)>(64);
+    match std::thread::Builder::new()
+        .name("tether-client-audio".into())
+        .spawn(move || run_audio_playback(opus_cfg, rx))
+    {
+        Ok(_) => {
+            info!(
+                sample_rate = audio_cfg.sample_rate_hz,
+                channels = audio_cfg.channels,
+                "audio playback enabled"
+            );
+            (Some(tx), true)
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to spawn audio thread; running video-only");
+            (None, false)
+        }
+    }
+}
+
+/// Audio playback thread: decode incoming Opus frames, conceal sequence gaps,
+/// and push PCM into the jitter buffer feeding the cpal output stream. Owns the
+/// `AudioPlayer` (and thus the cpal stream) for its lifetime; returns when the
+/// channel closes (session ending), dropping the player to stop playback.
+fn run_audio_playback(
+    cfg: tether_audio::OpusConfig,
+    rx: crossbeam_channel::Receiver<(u32, Vec<u8>)>,
+) {
+    let player = match tether_audio::AudioPlayer::with_defaults(cfg) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "audio output device unavailable; no playback");
+            return;
+        }
+    };
+    let sink = player.sink();
+    let mut decoder = match tether_audio::OpusDecoder::new(cfg) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "opus decoder init failed; no playback");
+            return;
+        }
+    };
+
+    let mut last_seq: Option<u32> = None;
+    while let Ok((seq, payload)) = rx.recv() {
+        if let Some(prev) = last_seq {
+            // Conceal interior gaps (lost packets) before this frame, bounded so
+            // a large jump (epoch wrap, long stall) can't spin.
+            let mut g = prev.wrapping_add(1);
+            let mut guard = 0;
+            while g != seq && guard < 8 {
+                sink.submit(&decoder.conceal());
+                g = g.wrapping_add(1);
+                guard += 1;
+            }
+        }
+        match decoder.decode(&payload) {
+            Ok(pcm) => sink.submit(&pcm),
+            Err(e) => warn!(error = %e, "opus decode failed; dropping audio frame"),
+        }
+        last_seq = Some(seq);
+    }
+
+    // Channel closed: drop the player to stop the output stream.
+    drop(player);
 }
 
 /// Directory the client caches its identity (`client_cert.der`/`client_key.der`)

@@ -3686,6 +3686,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "tether-audio",
  "tether-codec",
  "tether-decode",
  "tether-input",
@@ -3761,6 +3762,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "pollster",
+ "tether-audio",
  "tether-capture",
  "tether-codec",
  "tether-gpuconvert",

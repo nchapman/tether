@@ -53,6 +53,20 @@ impl OpusConfig {
     pub fn frame_size(&self) -> usize {
         (self.sample_rate as usize * self.frame_duration_ms as usize) / 1000
     }
+
+    /// The wire [`AudioConfig`](tether_protocol::audio::AudioConfig) the host
+    /// advertises for this codec config. Stereo maps to one coupled Opus
+    /// stream (RFC 7845 family 0); mono to a single uncoupled stream.
+    #[must_use]
+    pub fn wire_config(&self) -> tether_protocol::audio::AudioConfig {
+        tether_protocol::audio::AudioConfig {
+            sample_rate_hz: self.sample_rate,
+            channels: self.channels,
+            streams: 1,
+            coupled_streams: u8::from(self.channels == 2),
+            channel_mapping: (0..self.channels).collect(),
+        }
+    }
 }
 
 /// Wrap encoded bytes in an `AVPacket` ffmpeg owns, so it can be fed to a

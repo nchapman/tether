@@ -13,10 +13,14 @@
 //! hardware audio codecs aren't warranted at ~128 kbps — so the codec
 //! round-trip runs in the default (no-hardware) test set.
 
+pub mod capture;
 pub mod codec;
+pub mod playback;
 pub mod test_pattern;
 
+pub use capture::{AudioCaptureHandle, CaptureError};
 pub use codec::{OpusConfig, OpusDecoder, OpusEncoder};
+pub use playback::{AudioPlayer, AudioSink, PlaybackError};
 
 /// Session audio constants. 48 kHz stereo is the only configuration we ship
 /// in v1; the protocol's `AudioConfig` keeps the door open for surround.

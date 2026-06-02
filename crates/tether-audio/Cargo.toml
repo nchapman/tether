@@ -34,5 +34,12 @@ rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a2002567
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "6", features = ["macos_13_0"] }
 
+[dev-dependencies]
+# Loopback the Opus codec through the real `Datagram::Audio` wire channel,
+# including the lossy variant that exercises gap-driven concealment.
+tether-transport = { workspace = true, features = ["test-support"] }
+tether-protocol = { workspace = true }
+tokio = { workspace = true }
+
 [lints]
 workspace = true

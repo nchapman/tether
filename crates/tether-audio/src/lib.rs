@@ -91,6 +91,11 @@ pub enum AudioError {
     #[error("opus encoder does not accept a supported sample format")]
     NoSupportedSampleFormat,
 
+    /// Channel count outside the mono/stereo range v1 supports. Guards the
+    /// decoder's per-channel plane indexing against an out-of-range config.
+    #[error("unsupported channel count: {0} (v1 supports 1 or 2)")]
+    UnsupportedChannelCount(u8),
+
     /// A decoded frame came back in a sample format we don't convert.
     #[error("unsupported decoded sample format: {0}")]
     UnsupportedSampleFormat(i32),

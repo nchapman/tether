@@ -170,15 +170,15 @@ fn frame_from_buffer_list(
         }
         Some(AudioFrame::new(sample_rate, channels, samples))
     } else {
-        // Already interleaved in one buffer.
+        // Already interleaved in one buffer. Trust the configured channel count
+        // (SCK is set up with `with_channel_count(channels)`) rather than the
+        // buffer metadata, so the frame's declared layout always matches what
+        // the encoder was built for; guard against a length that doesn't divide.
         let interleaved = bytes_to_f32(first.data());
-        if interleaved.is_empty() {
+        if interleaved.is_empty() || interleaved.len() % channels.max(1) as usize != 0 {
             return None;
         }
-        let detected = u8::try_from(first.number_channels)
-            .unwrap_or(channels)
-            .max(1);
-        Some(AudioFrame::new(sample_rate, detected, interleaved))
+        Some(AudioFrame::new(sample_rate, channels, interleaved))
     }
 }
 

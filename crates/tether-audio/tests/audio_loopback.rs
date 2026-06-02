@@ -122,13 +122,18 @@ async fn audio_survives_one_percent_loss_with_concealment() {
         else {
             panic!("expected an audio datagram");
         };
+        // Conceal interior gaps the way the production client does: only a
+        // small forward gap counts as loss, capped so a reorder or crafted
+        // sequence can't spin or insert a long silence.
+        const MAX_CONCEAL: u32 = 8;
         if let Some(prev) = last_seq {
-            let mut gap = prev + 1;
-            while gap < frame_seq {
-                let c = dec.conceal();
-                assert_eq!(c.frames(), cfg.frame_size());
-                concealed += 1;
-                gap += 1;
+            let gap = frame_seq.wrapping_sub(prev);
+            if (2..=MAX_CONCEAL + 1).contains(&gap) {
+                for _ in 0..gap - 1 {
+                    let c = dec.conceal();
+                    assert_eq!(c.frames(), cfg.frame_size());
+                    concealed += 1;
+                }
             }
         }
         let pcm = dec.decode(&payload).unwrap();

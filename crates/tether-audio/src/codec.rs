@@ -115,6 +115,9 @@ unsafe impl Send for OpusEncoder {}
 impl OpusEncoder {
     /// Build and open a libopus encoder for `cfg`.
     pub fn new(cfg: OpusConfig) -> Result<Self> {
+        if !(1..=2).contains(&cfg.channels) {
+            return Err(AudioError::UnsupportedChannelCount(cfg.channels));
+        }
         let codec = AVCodec::find_encoder_by_name(c"libopus")
             .ok_or(AudioError::CodecNotFound("libopus"))?;
         let mut ctx = AVCodecContext::new(&codec);
@@ -258,6 +261,11 @@ impl OpusDecoder {
     /// on OpusHead extradata: our packets are raw Opus frames off the wire with
     /// no container, and both ends share `cfg`, so the config is authoritative.
     pub fn new(cfg: OpusConfig) -> Result<Self> {
+        // Bounds the per-channel plane indexing in `append_interleaved` against
+        // an out-of-range (untrusted) channel count.
+        if !(1..=2).contains(&cfg.channels) {
+            return Err(AudioError::UnsupportedChannelCount(cfg.channels));
+        }
         let codec = AVCodec::find_decoder_by_name(c"libopus")
             .ok_or(AudioError::CodecNotFound("libopus"))?;
         let mut ctx = AVCodecContext::new(&codec);
@@ -417,6 +425,44 @@ mod tests {
             }
             let out = dec.decode(pkt).unwrap();
             assert_eq!(out.frames(), fs);
+        }
+    }
+
+    /// The `frame_duration` AVOption can silently fall back to libopus's 20 ms
+    /// default; pin that the opened encoder actually adopted our 10 ms frame
+    /// (480 samples at 48 kHz), so a silent no-op becomes a test failure (per
+    /// the repo convention for knobs that may silently no-op). The decoder's
+    /// conceal-frame size must agree, or concealment frames would be the wrong
+    /// length.
+    #[test]
+    fn encoder_and_decoder_agree_on_configured_frame_size() {
+        let cfg = OpusConfig::default();
+        let enc = OpusEncoder::new(cfg).unwrap();
+        let dec = OpusDecoder::new(cfg).unwrap();
+        assert_eq!(cfg.frame_size(), 480, "48 kHz / 10 ms");
+        assert_eq!(enc.frame_size(), cfg.frame_size(), "encoder adopted 10 ms");
+        assert_eq!(
+            dec.conceal().frames(),
+            cfg.frame_size(),
+            "conceal size matches"
+        );
+    }
+
+    /// An out-of-range channel count is rejected before the unsafe per-channel
+    /// plane indexing in `append_interleaved` can be reached.
+    #[test]
+    fn constructors_reject_unsupported_channel_count() {
+        for ch in [0u8, 3, 8] {
+            let cfg = OpusConfig {
+                channels: ch,
+                ..OpusConfig::default()
+            };
+            assert!(
+                matches!(OpusEncoder::new(cfg), Err(AudioError::UnsupportedChannelCount(c)) if c == ch)
+            );
+            assert!(
+                matches!(OpusDecoder::new(cfg), Err(AudioError::UnsupportedChannelCount(c)) if c == ch)
+            );
         }
     }
 }

@@ -1258,6 +1258,21 @@ fn setup_audio_playback(
         return (None, false);
     };
 
+    // Validate the host-advertised config before it sizes any buffer. The
+    // `AudioConfig` is attacker-controllable; an out-of-range `sample_rate_hz`
+    // would make `JitterBuffer::new`'s `Vec::with_capacity` allocate gigabytes
+    // (OOM), and an out-of-range `channels` would drive decoder plane indexing.
+    // v1 ships mono/stereo at an Opus-native rate; reject anything else.
+    const OPUS_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+    if !OPUS_RATES.contains(&audio_cfg.sample_rate_hz) || !(1..=2).contains(&audio_cfg.channels) {
+        warn!(
+            sample_rate = audio_cfg.sample_rate_hz,
+            channels = audio_cfg.channels,
+            "host advertised an unsupported audio config; running video-only"
+        );
+        return (None, false);
+    }
+
     let opus_cfg = tether_audio::OpusConfig {
         sample_rate: audio_cfg.sample_rate_hz,
         channels: audio_cfg.channels,
@@ -1309,17 +1324,22 @@ fn run_audio_playback(
         }
     };
 
+    // Cap concealment per packet so a crafted/huge sequence jump can't insert a
+    // long silence or spin. ~80 ms at 10 ms frames.
+    const MAX_CONCEAL: u32 = 8;
     let mut last_seq: Option<u32> = None;
     while let Ok((seq, payload)) = rx.recv() {
         if let Some(prev) = last_seq {
-            // Conceal interior gaps (lost packets) before this frame, bounded so
-            // a large jump (epoch wrap, long stall) can't spin.
-            let mut g = prev.wrapping_add(1);
-            let mut guard = 0;
-            while g != seq && guard < 8 {
-                sink.submit(&decoder.conceal());
-                g = g.wrapping_add(1);
-                guard += 1;
+            // Forward distance from the last delivered frame. A small positive
+            // gap is real loss → conceal the missing frames. A gap of 1 is the
+            // in-order case (nothing missing); 0 (duplicate) or a large value
+            // (reordered late packet, or a future epoch reset) is *not* treated
+            // as loss, so a backward/late packet can't trigger spurious silence.
+            let gap = seq.wrapping_sub(prev);
+            if (2..=MAX_CONCEAL + 1).contains(&gap) {
+                for _ in 0..gap - 1 {
+                    sink.submit(&decoder.conceal());
+                }
             }
         }
         match decoder.decode(&payload) {

@@ -52,6 +52,17 @@ pub struct Supervisor {
     engines: Mutex<HashMap<String, EngineHandle>>,
     /// Monotonic id stamped on each spawn; see [`EngineHandle::generation`].
     next_generation: AtomicU64,
+    /// Serializes the whole stop→spawn→register sequence so two concurrent
+    /// triggers can't interleave. The `engines` mutex is released between the
+    /// `stop`'s `remove` and `spawn`'s `insert`, so without this two racing
+    /// `spawn`s would both see an empty map, both launch a child, and the
+    /// second `insert` would overwrite (and orphan) the first — leaving its
+    /// child with a closed stdin that the engine reads as "stop", so *both*
+    /// engines tear down and nothing ends up listening. The dev trigger is
+    /// React StrictMode double-invoking the launch-time auto-restore, but a
+    /// double-click or tray+webview race would hit the same window. Coarse
+    /// (one lock for all roles) — engine churn is rare and never hot-path.
+    lifecycle: AsyncMutex<()>,
 }
 
 /// `engine-status` payload: the engine's [`EngineEvent`] flattened
@@ -78,8 +89,12 @@ impl Supervisor {
     /// (the old one is stopped first). Returns an error string the UI can
     /// surface if the binary is missing or won't launch.
     pub async fn spawn(&self, app: &AppHandle, role: &str, args: &[String]) -> Result<(), String> {
+        // Hold the lifecycle lock across the entire stop→spawn→register so a
+        // concurrent spawn/stop can't interleave and orphan an engine (see the
+        // field doc). Released when this guard drops at function end.
+        let _lifecycle = self.lifecycle.lock().await;
         // Tear down a prior engine in this role so we never leak one.
-        self.stop(role).await;
+        self.stop_inner(role).await;
 
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let bin = engine_binary(role)?;
@@ -241,7 +256,18 @@ impl Supervisor {
     /// Stop the engine in `role` if present: send `Stop` on its stdin,
     /// close stdin (a second EOF stop signal), then reap with a short
     /// force-kill backstop. No-op if nothing is running in that role.
+    ///
+    /// Takes the lifecycle lock so an explicit stop can't interleave with a
+    /// concurrent spawn (see the field doc). `spawn` already holds the lock, so
+    /// it calls [`Self::stop_inner`] directly to avoid a re-entrant deadlock.
     pub async fn stop(&self, role: &str) {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.stop_inner(role).await;
+    }
+
+    /// The body of [`Self::stop`], without the lifecycle lock. Call only while
+    /// already holding it (from `spawn` or `stop`).
+    async fn stop_inner(&self, role: &str) {
         let handle = self.engines.lock().unwrap().remove(role);
         let Some(EngineHandle {
             stdin, mut child, ..

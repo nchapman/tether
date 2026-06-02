@@ -1,0 +1,25 @@
+[package]
+name = "tether-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Audio pipeline — system-output capture, Opus encode/decode, and playback."
+
+[dependencies]
+tether-protocol = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+# Opus rides the same statically-linked LGPL FFmpeg 8.1 as the video codec
+# (`tether-codec`) — libopus was added to the build in the 8.1.0-tether.4
+# release. Keeping the rsmpeg dependency line identical to tether-codec's lets
+# Cargo unify it to a single rusty_ffmpeg compilation, so FFmpeg is linked once
+# into binaries that pull both crates. See crates/tether-codec/Cargo.toml for
+# the linking rationale and build.rs for the Windows static-link wiring.
+rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a200256763b31e5528fb0f21876e", features = ["ffmpeg8", "link_system_ffmpeg"] }
+
+[lints]
+workspace = true

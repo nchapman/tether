@@ -3501,6 +3501,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tether-audio"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "rsmpeg",
+ "tether-protocol",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "tether-capture"
 version = "0.2.1"
 dependencies = [

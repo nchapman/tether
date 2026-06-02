@@ -44,3 +44,17 @@ export const initialHostState: HostState = {
   peers: [],
   error: null,
 };
+
+/// Which modal sheet is open over the Connect window. Named (not `Sheet`) to
+/// avoid clashing with the `Sheet` component.
+export type SheetName = "none" | "add" | "sharing";
+
+/// A pending confirm dialog: the copy to show plus the action to run on
+/// confirm. Owned by App; raised by the session/sharing hooks via `setConfirm`.
+export type Confirm = {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  danger?: boolean;
+  onConfirm: () => void;
+};

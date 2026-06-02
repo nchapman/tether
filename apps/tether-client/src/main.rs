@@ -1260,8 +1260,8 @@ fn setup_audio_playback(
 
     // Validate the host-advertised config before it sizes any buffer. The
     // `AudioConfig` is attacker-controllable; an out-of-range `sample_rate_hz`
-    // would make `JitterBuffer::new`'s `Vec::with_capacity` allocate gigabytes
-    // (OOM), and an out-of-range `channels` would drive decoder plane indexing.
+    // would size the playback ring's allocation into gigabytes (OOM), and an
+    // out-of-range `channels` would drive decoder plane indexing.
     // v1 ships mono/stereo at an Opus-native rate; reject anything else.
     const OPUS_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
     if !OPUS_RATES.contains(&audio_cfg.sample_rate_hz) || !(1..=2).contains(&audio_cfg.channels) {
@@ -1301,21 +1301,20 @@ fn setup_audio_playback(
 }
 
 /// Audio playback thread: decode incoming Opus frames, conceal sequence gaps,
-/// and push PCM into the jitter buffer feeding the cpal output stream. Owns the
+/// and push PCM into the playback ring feeding the cpal output stream. Owns the
 /// `AudioPlayer` (and thus the cpal stream) for its lifetime; returns when the
 /// channel closes (session ending), dropping the player to stop playback.
 fn run_audio_playback(
     cfg: tether_audio::OpusConfig,
     rx: crossbeam_channel::Receiver<(u32, Vec<u8>)>,
 ) {
-    let player = match tether_audio::AudioPlayer::with_defaults(cfg) {
-        Ok(p) => p,
+    let (player, sink) = match tether_audio::AudioPlayer::with_defaults(cfg) {
+        Ok(pair) => pair,
         Err(e) => {
             warn!(error = %e, "audio output device unavailable; no playback");
             return;
         }
     };
-    let sink = player.sink();
     let mut decoder = match tether_audio::OpusDecoder::new(cfg) {
         Ok(d) => d,
         Err(e) => {

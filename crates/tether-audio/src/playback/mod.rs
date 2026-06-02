@@ -1,19 +1,25 @@
-//! Client-side audio output: a cpal stream draining the [`JitterBuffer`].
+//! Client-side audio output: a cpal stream draining a lock-free ring.
 //!
 //! The cpal output callback is the consumer (pulls on the device clock); the
-//! Opus decode thread is the producer (pushes via an [`AudioSink`]). cpal's
-//! `Stream` is thread-bound (`!Send`), so [`AudioPlayer`] — which owns it —
-//! stays on its creating thread, while the cheap, `Send` [`AudioSink`] travels
-//! to the decode thread.
+//! Opus decode thread is the producer (pushes via an [`AudioSink`]). They are
+//! joined by a lock-free SPSC [`ring`] so the callback — a hard-real-time thread
+//! — never takes a lock, and a pure [`PlaybackPolicy`] on the consumer side
+//! handles priming, the latency cap, and underruns.
+//!
+//! cpal's `Stream` is thread-bound (`!Send`), so [`AudioPlayer`] — which owns it
+//! — stays on its creating thread, while the `Send` [`AudioSink`] (the ring
+//! producer) travels to the decode thread.
 
-pub mod jitter;
+mod policy;
+mod ring;
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::{AudioFrame, OpusConfig};
-use jitter::JitterBuffer;
+use policy::{PlaybackPolicy, PlaybackStats};
 
 /// Default jitter cushion before playback starts. ~40 ms keeps a LAN stream
 /// smooth without much added latency (Moonlight's level-2 buffer is in this
@@ -37,28 +43,30 @@ pub enum PlaybackError {
     PlayStream(#[from] cpal::PlayStreamError),
 }
 
-/// Producer handle to the playback buffer. Clone it to the decode thread to
-/// push PCM; the [`AudioPlayer`] keeps the stream alive elsewhere.
-#[derive(Clone)]
+/// Producer handle to the playback ring. Held by the decode thread to push PCM;
+/// the [`AudioPlayer`] keeps the cpal stream alive elsewhere. Not `Clone` —
+/// there is exactly one producer.
 pub struct AudioSink {
-    jitter: Arc<Mutex<JitterBuffer>>,
+    producer: ring::Producer,
+    stats: Arc<PlaybackStats>,
 }
 
 impl AudioSink {
-    /// Push a decoded frame for playback.
+    /// Push a decoded frame for playback. If the ring is momentarily full the
+    /// newest samples are dropped (the consumer trims to the latency target
+    /// first, so this is rare).
     pub fn submit(&self, frame: &AudioFrame) {
-        if let Ok(mut j) = self.jitter.lock() {
-            j.push(&frame.samples);
-        }
+        self.producer.push(&frame.samples);
     }
 
-    /// `(underruns, overruns, buffered_samples)` — for periodic logging.
+    /// `(underruns, dropped_samples, buffered_samples)` — for periodic logging.
     #[must_use]
     pub fn stats(&self) -> (u64, u64, usize) {
-        self.jitter
-            .lock()
-            .map(|j| (j.underruns(), j.overruns(), j.buffered_samples()))
-            .unwrap_or_default()
+        (
+            self.stats.underruns.load(Ordering::Relaxed),
+            self.stats.dropped_samples.load(Ordering::Relaxed),
+            self.producer.buffered(),
+        )
     }
 }
 
@@ -66,57 +74,57 @@ impl AudioSink {
 /// playback). `!Send` — create it on the thread that will keep it.
 pub struct AudioPlayer {
     _stream: cpal::Stream,
-    sink: AudioSink,
 }
 
 impl AudioPlayer {
-    /// Open the default output device at `cfg`'s rate/channels and start
-    /// playing from a fresh jitter buffer.
-    pub fn new(cfg: OpusConfig, target_ms: u32, max_ms: u32) -> Result<Self, PlaybackError> {
+    /// Open the default output device at `cfg`'s rate/channels and start playing
+    /// from a fresh ring. Returns the player (keep it alive) and the producer
+    /// [`AudioSink`] for the decode thread.
+    pub fn new(
+        cfg: OpusConfig,
+        target_ms: u32,
+        max_ms: u32,
+    ) -> Result<(Self, AudioSink), PlaybackError> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .ok_or(PlaybackError::NoDevice)?;
         let stream_config = pick_output_config(&device, cfg.sample_rate, cfg.channels)?;
 
-        let jitter = Arc::new(Mutex::new(JitterBuffer::new(
+        // Ring capacity comfortably exceeds the latency ceiling so the policy's
+        // drop-oldest is the active bound (the producer-side full-ring drop is
+        // just a safety valve).
+        let per_ms = (cfg.sample_rate as usize * usize::from(cfg.channels.max(1))) / 1000;
+        let ring_capacity = (per_ms * max_ms as usize * 2).max(per_ms * 4);
+        let (producer, consumer) = ring::channel(ring_capacity);
+
+        let stats = Arc::new(PlaybackStats::default());
+        let mut policy = PlaybackPolicy::new(
             cfg.channels,
             cfg.sample_rate,
             target_ms,
             max_ms,
-        )));
-        let sink = AudioSink {
-            jitter: Arc::clone(&jitter),
-        };
+            Arc::clone(&stats),
+        );
 
-        let cb_jitter = Arc::clone(&jitter);
         let stream = device.build_output_stream(
             &stream_config,
-            move |out: &mut [f32], _: &cpal::OutputCallbackInfo| match cb_jitter.lock() {
-                Ok(mut j) => {
-                    j.pull(out);
-                }
-                Err(_) => out.fill(0.0),
+            move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let plan = policy.plan(consumer.buffered(), out.len());
+                consumer.skip(plan.skip);
+                consumer.pop(&mut out[..plan.copy]);
+                out[plan.copy..].fill(0.0);
             },
             move |err| tracing::warn!(error = %err, "audio output stream error"),
             None,
         )?;
         stream.play()?;
-        Ok(Self {
-            _stream: stream,
-            sink,
-        })
+        Ok((Self { _stream: stream }, AudioSink { producer, stats }))
     }
 
     /// [`AudioPlayer::new`] with the default cushion/ceiling.
-    pub fn with_defaults(cfg: OpusConfig) -> Result<Self, PlaybackError> {
+    pub fn with_defaults(cfg: OpusConfig) -> Result<(Self, AudioSink), PlaybackError> {
         Self::new(cfg, DEFAULT_TARGET_MS, DEFAULT_MAX_MS)
-    }
-
-    /// A producer handle for the decode thread.
-    #[must_use]
-    pub fn sink(&self) -> AudioSink {
-        self.sink.clone()
     }
 }
 

@@ -23,8 +23,7 @@ fn macos_capture_encode_decode_playback_roundtrip() {
     let cfg = OpusConfig::default();
 
     let handle = capture::start(cfg).expect("start macOS system-audio capture");
-    let player = AudioPlayer::with_defaults(cfg).expect("open default audio output");
-    let sink = player.sink();
+    let (_player, sink) = AudioPlayer::with_defaults(cfg).expect("open default audio output");
     let mut enc = OpusEncoder::new(cfg).expect("build opus encoder");
     let mut dec = OpusDecoder::new(cfg).expect("build opus decoder");
 

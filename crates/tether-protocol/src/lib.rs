@@ -95,20 +95,43 @@ fn bincode_config() -> impl bincode::config::Config {
     bincode::config::standard()
 }
 
+/// Like [`bincode_config`] but caps the total bytes a single decode may claim
+/// at [`MAX_DATAGRAM_PAYLOAD`]. Datagrams arrive from an untrusted peer, and a
+/// forged length prefix on a `Vec<u8>` field (e.g. `AudioPacket::Opus.payload`)
+/// would otherwise drive bincode to pre-allocate gigabytes. bincode claims a
+/// container's bytes against this limit *before* allocating, so an over-long
+/// field is rejected up front. A legitimate datagram is at most
+/// `MAX_DATAGRAM_PAYLOAD` bytes, so it never trips the limit.
+fn datagram_config() -> impl bincode::config::Config {
+    bincode::config::standard().with_limit::<MAX_DATAGRAM_PAYLOAD>()
+}
+
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     Ok(bincode::serde::encode_to_vec(value, bincode_config())?)
 }
 
-// TODO(security): decode of untrusted input can allocate large Vec<u8> from
-// a forged length prefix. Video datagrams are guarded by
-// `VideoPacket::validate_packet_sizing` against MAX_FRAGMENTS_PER_FRAME /
-// MAX_FRAME_BODY_BYTES before any allocation, so the video path is safe.
-// What remains: `ControlMessage::CursorShape::pixels` and
-// `ControlMessage::Extension::payload` decoded over the reliable control
-// stream — both `Vec<u8>` with no length cap today. Wire bincode's Limit
-// config or per-field caps once we measure realistic sizes.
 pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> {
-    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode_config())?;
+    decode_with_config(bytes, bincode_config())
+}
+
+/// Decode a value read off the untrusted QUIC datagram path, bounding any
+/// allocation to [`MAX_DATAGRAM_PAYLOAD`] (see [`datagram_config`]). Use this —
+/// not [`decode`] — for anything deserialized straight from a received
+/// datagram, so a forged length prefix can't trigger an out-of-memory abort.
+pub fn decode_datagram<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> {
+    decode_with_config(bytes, datagram_config())
+}
+
+// Remaining untrusted-allocation surface after datagrams are bounded:
+// `ControlMessage::CursorShape::pixels` and `ControlMessage::Extension::payload`
+// decoded over the reliable control stream — both `Vec<u8>` with no length cap.
+// The control stream is framed by `MAX_FRAMED_MESSAGE` (64 KB), so worst-case is
+// bounded but larger than ideal; add per-field caps once sizes are measured.
+fn decode_with_config<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    config: impl bincode::config::Config,
+) -> Result<T, CodecError> {
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, config)?;
     // Strict-decode: every framed message must be fully consumed by its
     // declared type. The forward-compat policy (see control.rs) says
     // appending fields to a body is forbidden — only new enum variants
@@ -137,6 +160,34 @@ mod tests {
         VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket, CONTINUATION_PAYLOAD_BUDGET,
         FEC_MAX_PRIMARY_SHARDS, FEC_SHARD_SIZE, FIRST_PAYLOAD_BUDGET,
     };
+
+    /// The datagram decoder bounds allocation: a payload larger than
+    /// `MAX_DATAGRAM_PAYLOAD` is rejected before allocation (where the unbounded
+    /// `decode` would accept it). This is the guard against a forged length
+    /// prefix on an untrusted datagram (e.g. an Opus payload) driving an OOM.
+    #[test]
+    fn decode_datagram_rejects_oversize_payload() {
+        let big = vec![0u8; MAX_DATAGRAM_PAYLOAD + 64];
+        let bytes = encode(&big).unwrap();
+        assert!(
+            decode::<Vec<u8>>(&bytes).is_ok(),
+            "unbounded decode accepts the oversize payload"
+        );
+        assert!(
+            decode_datagram::<Vec<u8>>(&bytes).is_err(),
+            "bounded datagram decode rejects it before allocating"
+        );
+    }
+
+    /// A normal (within-limit) payload still round-trips through the bounded
+    /// datagram decoder.
+    #[test]
+    fn decode_datagram_round_trips_a_normal_payload() {
+        let payload = vec![7u8; 900];
+        let bytes = encode(&payload).unwrap();
+        let back: Vec<u8> = decode_datagram(&bytes).unwrap();
+        assert_eq!(back, payload);
+    }
 
     #[test]
     fn pairing_messages_round_trip() {

@@ -165,7 +165,9 @@ impl Connection {
 
     pub async fn recv_datagram(&self) -> Result<Datagram> {
         let bytes = self.conn.read_datagram().await?;
-        Ok(tether_protocol::decode(&bytes)?)
+        // Untrusted peer input: bound the decode's allocation so a forged
+        // length prefix (e.g. on an Opus payload) can't trigger an OOM abort.
+        Ok(tether_protocol::decode_datagram(&bytes)?)
     }
 
     /// Send a keyframe video packet on a fresh QUIC unidirectional

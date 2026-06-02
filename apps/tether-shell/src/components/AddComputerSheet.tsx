@@ -5,6 +5,20 @@ import { ArrowRightIcon } from "../icons";
 
 const DEFAULT_PORT = "7654";
 
+// Append the default port unless the address already has one. Handles IPv6:
+// a bare literal (`fe80::1`) is bracketed (`[fe80::1]:7654`) so it parses as a
+// SocketAddr, and an already-bracketed address keeps its port if present.
+function withDefaultPort(addr: string): string {
+  if (addr.startsWith("[")) {
+    // Bracketed IPv6, with or without a trailing `:port`.
+    return addr.includes("]:") ? addr : `${addr}:${DEFAULT_PORT}`;
+  }
+  const colons = (addr.match(/:/g) ?? []).length;
+  if (colons === 1) return addr; // host:port or IPv4:port
+  if (colons > 1) return `[${addr}]:${DEFAULT_PORT}`; // bare IPv6 literal
+  return `${addr}:${DEFAULT_PORT}`; // bare host / IPv4
+}
+
 // First-contact pairing. The highest-stakes, rarest action, so it gets its own
 // focused surface. The copy is deliberately directional — the #1 confusion is
 // *which* machine generates the PIN (it's the other one).
@@ -32,10 +46,7 @@ export function AddComputerSheet({
 
   function submit() {
     if (!canSubmit) return;
-    // Append the default port if the user typed a bare address.
-    const trimmed = addr.trim();
-    const withPort = trimmed.includes(":") ? trimmed : `${trimmed}:${DEFAULT_PORT}`;
-    onSubmit(withPort, pin, label.trim());
+    onSubmit(withDefaultPort(addr.trim()), pin, label.trim());
   }
 
   return (

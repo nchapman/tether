@@ -213,7 +213,7 @@ into a connection.
 ```
   ● Sharing on · Jane connected      ← status header (host + client state)
   ─────────
-  Connect to            ▸  Office desktop / Living room PC / New connection…
+  Connect to            ▸  Office desktop / Living room PC
   ─────────
   ☑ Share this computer              ← toggles start_host / stop_engine (shared state)
   Pair a device…                     ← when sharing; force-shows the window
@@ -222,19 +222,20 @@ into a connection.
   Quit
 ```
 
-- **Icon encodes host state only** — three variants: idle, sharing-idle (dot),
-  sharing-active (accent-filled dot). Client-session state is conveyed by the
-  header text, not the icon (a client session has its own visible video
-  window; don't overload the tray glyph with two orthogonal booleans).
-- **Connect to ▸** lists up to ~5 recents by `last_connected_unix` for
-  one-click reconnect without opening the window; **New connection…** opens the
-  Add sheet.
+- **Status is menu text + tooltip only** — the header line and the tooltip
+  carry the state (`Not sharing` / `Sharing · waiting` / `Sharing · <peer>
+  connected` / `Connected to <host>`). Per-state icon art is deferred to a
+  later polish pass; the tray icon doesn't change.
+- **Connect to ▸** lists up to 8 recents (`MAX_RECENTS`) by
+  `last_connected_unix` for one-click reconnect without opening the window.
+  Adding a new computer is done from the window's **Add**, not the tray.
 - **Pair a device…** must **force-show the main window** so the `PairingPin`
   event has a surface to display (pairing initiated from a closed window
   otherwise has nowhere to show the PIN).
-- Tray menu, tooltip, and icon are rebuilt from live engine state: the
-  supervisor already receives every `engine-status` event; it fans them out to
-  both the webview and a tray-state updater.
+- Tray menu and tooltip are rebuilt from live engine state: the tray subscribes
+  to the same `engine-status` / `engine-exited` events the webview reads (a
+  Rust-side `app.listen`) and rebuilds itself, staying decoupled from the
+  webview and the supervisor internals.
 
 ---
 

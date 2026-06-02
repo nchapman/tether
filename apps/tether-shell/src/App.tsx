@@ -19,6 +19,7 @@ import {
   listPeers,
   hideWindow,
   showWindow,
+  getPrefs,
   checkForUpdates,
   installUpdate,
   friendlyError,
@@ -98,6 +99,25 @@ function App() {
         setHost(initialHostState);
       }
     });
+
+    // Re-apply the persisted sharing posture: if hosting was last left on,
+    // start it again. Wait until both listeners are live so we don't miss the
+    // host's `listening` event (the toggle would otherwise show off while the
+    // engine is actually up). startHost re-persists the posture, harmlessly.
+    Promise.all([unstatus, unexit])
+      .then(() => getPrefs())
+      .then((prefs) => {
+        if (prefs.sharing_enabled) {
+          // Surface a failure into host state so the Sharing sheet shows why
+          // hosting didn't come back (e.g. engine binary missing), rather than
+          // a silently-off toggle.
+          startHost(false).catch((e) => {
+            console.warn("auto-start host failed", e);
+            setHost((h) => ({ ...h, error: String(e) }));
+          });
+        }
+      })
+      .catch((e) => console.warn("get_prefs failed", e));
 
     return () => {
       unstatus.then((f) => f());

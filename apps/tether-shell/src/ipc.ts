@@ -51,6 +51,12 @@ export type EngineEvent = {
 
 export type EngineExited = { role: "host" | "client" };
 
+/// Persisted shell preferences, mirroring `prefs::ShellPrefs` on the Rust side.
+export type ShellPrefs = {
+  /// Whether hosting was last left on; the shell re-applies this on launch.
+  sharing_enabled: boolean;
+};
+
 // --- Client / address book ---------------------------------------------------
 
 export const listKnownHosts = () => invoke<SavedHost[]>("list_known_hosts");
@@ -85,6 +91,12 @@ export const revokePeer = (fingerprint: string) =>
   invoke<void>("revoke_peer", { fingerprint });
 
 export const listPeers = () => invoke<void>("list_peers");
+
+// --- Preferences -------------------------------------------------------------
+
+/// Read the persisted shell prefs (sharing posture). Used on mount to decide
+/// whether to auto-start hosting.
+export const getPrefs = () => invoke<ShellPrefs>("get_prefs");
 
 // --- Window chrome -----------------------------------------------------------
 

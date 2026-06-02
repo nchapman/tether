@@ -7,6 +7,7 @@
 //! process; nothing renders video through the webview.
 
 mod known_hosts;
+mod prefs;
 mod supervisor;
 
 use supervisor::{Supervisor, ROLE_CLIENT, ROLE_HOST};
@@ -18,6 +19,11 @@ use tether_ipc::ShellCommand;
 
 /// Start hosting: spawn `tether-host --ipc`. `test_pattern` swaps real
 /// capture for the synthetic gradient (useful for one-machine loopback).
+///
+/// The sharing posture is persisted as on only once the host actually reaches
+/// `listening` (in the supervisor reader), not here at spawn time — so a host
+/// that spawns but fails to bind never leaves a broken "sharing on" posture
+/// that would auto-restart and fail every launch.
 #[tauri::command]
 async fn start_host(
     app: AppHandle,
@@ -62,9 +68,21 @@ async fn connect_client(
 }
 
 /// Stop the engine in `role` ("host" or "client").
+///
+/// Stopping the *host* is an explicit "turn sharing off", so it clears the
+/// persisted posture — the shell won't re-enable hosting next launch. A host
+/// that *crashes* exits through the supervisor's EOF path instead (it emits
+/// `engine-exited`, not this command), so a crash leaves the posture sticky-on
+/// and auto-restore retries on the next launch.
 #[tauri::command]
 async fn stop_engine(supervisor: State<'_, Supervisor>, role: String) -> Result<(), String> {
     supervisor.stop(&role).await;
+    if role == ROLE_HOST {
+        // Clear the posture even if no host was running: this command means
+        // "sharing should be off", and being idempotent keeps it safe for the
+        // tray toggle to call without first checking engine state.
+        prefs::set_sharing_enabled(false);
+    }
     Ok(())
 }
 
@@ -112,6 +130,13 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart()
 }
 
+/// Return the persisted shell preferences. The webview reads this on mount to
+/// re-apply the sharing posture (auto-start hosting when it was last left on).
+#[tauri::command]
+fn get_prefs() -> prefs::ShellPrefs {
+    prefs::load()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -154,6 +179,7 @@ pub fn run() {
             known_hosts::forget_known_host,
             hide_window,
             show_window,
+            get_prefs,
             check_for_updates,
             install_update
         ])

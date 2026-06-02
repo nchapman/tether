@@ -141,6 +141,16 @@ impl Supervisor {
                 tracing::debug!(role = role_owned, line, "engine stdout line");
                 match serde_json::from_str::<EngineEvent>(line) {
                     Ok(event) => {
+                        // A host that reaches `listening` has successfully
+                        // started sharing — persist the posture now (not at
+                        // spawn) so a spawn that fails to bind never leaves a
+                        // broken "sharing on" state that auto-restarts every
+                        // launch. See `crate::prefs`.
+                        if role_owned == ROLE_HOST
+                            && matches!(event, EngineEvent::Listening { .. })
+                        {
+                            crate::prefs::set_sharing_enabled(true);
+                        }
                         if let Err(e) = app_for_reader.emit(
                             "engine-status",
                             StatusPayload {

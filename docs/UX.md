@@ -411,13 +411,20 @@ Each phase is independently shippable and testable.
 - Tests: round-trip extended `HostEntry`; unit-test the shared config-dir
   resolver; test list/rename/forget against a temp known-hosts file.
 
-### Phase 2 — Hosting moves to the tray + settings sheet
+### Phase 2 — Hosting moves to the tray + settings sheet — DONE
 
-- Move host UI into the `⚙` sharing-settings sheet. Drop safety code to
-  Advanced; Copy on address; Revoke into `⋯`; demote test pattern.
-- Persist a `sharing_enabled` shell preference; on startup, if true,
-  auto-spawn the host engine. First run = false. Bind the sheet toggle and the
-  (Phase 3) tray toggle to this one source of truth.
+- Host UI lives in the `⚙` sharing-settings sheet (landed with Phase 1). Safety
+  code under Advanced; Copy on address; Revoke into `⋯`; test pattern demoted.
+- Persist a `sharing_enabled` shell preference (`prefs.rs`, stored next to the
+  trust store). On launch the webview reads it via `get_prefs` — after the
+  engine-event listeners are live — and re-spawns the host when true. First run
+  = false. The posture is written through one path: `stop_engine(host)` clears
+  it (explicit "sharing off", idempotent), and the **host's confirmed
+  `listening` event** sets it on (persisting at spawn would leave a bind-failure
+  auto-restarting every launch). A crash exits via the supervisor's EOF path,
+  not `stop_engine`, so the posture stays sticky-on and auto-restore retries.
+  The Phase 3 tray toggle reuses `start_host` / `stop_engine`, so it inherits
+  the same single source of truth for free.
 - Reframe "fingerprint" → "safety code".
 
 ### Phase 3 — Tray richness

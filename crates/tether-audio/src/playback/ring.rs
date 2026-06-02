@@ -11,6 +11,9 @@
 //! Capacity is a power of two so indexing is a mask. The ring carries raw
 //! samples only — priming, latency-cap drop, and underrun handling live in the
 //! pure [`PlaybackPolicy`](super::policy::PlaybackPolicy) on the consumer side.
+//! The ring is channel-agnostic; left/right (frame) alignment is preserved by
+//! the producer pushing whole frames and the consumer advancing `head` by
+//! frame-aligned amounts (enforced in the policy).
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -77,6 +80,17 @@ pub fn channel(min_capacity: usize) -> (Producer, Consumer) {
         },
         Consumer { inner },
     )
+}
+
+/// Test-only: build a ring with `head`/`tail` pre-seeded to `start`, so a test
+/// can drive the monotonic counters across the `usize::MAX` wrap boundary
+/// (unreachable in a normal run — it'd take millions of years at 48 kHz).
+#[cfg(test)]
+fn channel_at(min_capacity: usize, start: usize) -> (Producer, Consumer) {
+    let (p, c) = channel(min_capacity);
+    p.inner.head.store(start, Ordering::Relaxed);
+    p.inner.tail.store(start, Ordering::Relaxed);
+    (p, c)
 }
 
 impl Producer {
@@ -188,6 +202,21 @@ mod tests {
         assert_eq!(c.skip(10), 2, "skip can't exceed what's buffered");
         let mut out = [0.0f32; 4];
         assert_eq!(c.pop(&mut out), 0, "everything was skipped");
+    }
+
+    #[test]
+    fn monotonic_counters_wrap_across_usize_max() {
+        // Seed head=tail just below usize::MAX so a few push/pop rounds carry
+        // the wrapping_add/wrapping_sub arithmetic across the 2^usize boundary.
+        let (p, c) = channel_at(8, usize::MAX - 3);
+        let mut out = [0.0f32; 8];
+        for round in 0..4u32 {
+            let data: Vec<f32> = (0..6u32).map(|i| (round * 10 + i) as f32).collect();
+            assert_eq!(p.push(&data), 6);
+            assert_eq!(c.pop(&mut out), 6);
+            assert_eq!(&out[..6], data.as_slice());
+            assert_eq!(c.buffered(), 0, "buffered stays correct across the wrap");
+        }
     }
 
     #[test]

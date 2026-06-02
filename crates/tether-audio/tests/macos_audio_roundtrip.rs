@@ -45,8 +45,10 @@ fn macos_capture_encode_decode_playback_roundtrip() {
     }
     handle.stop();
 
-    let (underruns, overruns, _buffered) = sink.stats();
-    eprintln!("captured={captured} played={played} underruns={underruns} overruns={overruns}");
+    let (underruns, dropped_samples, _buffered) = sink.stats();
+    eprintln!(
+        "captured={captured} played={played} underruns={underruns} dropped_samples={dropped_samples}"
+    );
     assert!(captured > 0, "captured no audio frames from SCK in 2s");
     assert!(played > 0, "no frames survived encode->decode to playback");
 }

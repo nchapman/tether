@@ -195,14 +195,6 @@ impl OpusEncoder {
         }
         Ok(out)
     }
-
-    /// Flush on shutdown. libopus buffers nothing internally (each whole frame is
-    /// emitted by [`encode`](Self::encode)), so any sub-frame remainder is
-    /// dropped and there are no trailing packets. Kept for API symmetry.
-    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    pub fn flush(&mut self) -> Result<Vec<Bytes>> {
-        Ok(Vec::new())
-    }
 }
 
 impl Drop for OpusEncoder {
@@ -260,9 +252,17 @@ impl OpusDecoder {
     /// (unexpected) error path, falls back to silence so the playback clock
     /// still advances.
     pub fn conceal(&mut self) -> AudioFrame {
-        self.decode_into(ptr::null(), 0).unwrap_or_else(|_| {
+        let frame = self.decode_into(ptr::null(), 0).unwrap_or_else(|_| {
             AudioFrame::silence(self.sample_rate, self.channels, self.frame_size)
-        })
+        });
+        // Gap accounting downstream assumes one conceal() == exactly one frame
+        // on the playback clock; libopus PLC must return the full frame.
+        debug_assert_eq!(
+            frame.frames(),
+            self.frame_size,
+            "PLC must produce exactly one frame"
+        );
+        frame
     }
 
     /// Shared decode body. `data` is either a valid `len`-byte packet or null

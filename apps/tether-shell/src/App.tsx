@@ -67,6 +67,10 @@ function App() {
 
   // Open the Sharing sheet and refresh the paired-device list if hosting is
   // live. Shared by the gear button and the tray's "Pair a device…" trigger.
+  // NB: the tray path captures this once (first render) in the "open-sharing"
+  // listener below, so it must only ever read through stable refs/setters —
+  // `sharing.hostRef.current` is live; a direct `sharing.host` read would go
+  // stale.
   function openSharing() {
     setSheet("sharing");
     if (sharing.hostRef.current.running) listPeers().catch((e) => console.warn(e));

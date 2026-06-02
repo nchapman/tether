@@ -270,7 +270,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         ID_DISCONNECT => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                app.state::<Supervisor>().stop(ROLE_CLIENT).await;
+                crate::stop_role(&app, app.state::<Supervisor>().inner(), ROLE_CLIENT).await;
             });
         }
         other if other.starts_with(CONNECT_PREFIX) => {
@@ -289,7 +289,7 @@ fn toggle_sharing(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let supervisor = app.state::<Supervisor>();
         if sharing {
-            crate::stop_sharing(supervisor.inner()).await;
+            crate::stop_role(&app, supervisor.inner(), ROLE_HOST).await;
         } else if let Err(e) = supervisor
             .spawn(&app, ROLE_HOST, &["--ipc".to_string()])
             .await

@@ -11,8 +11,8 @@ mod prefs;
 mod supervisor;
 mod tray;
 
-use supervisor::{Supervisor, ROLE_CLIENT, ROLE_HOST};
-use tauri::{AppHandle, Manager, RunEvent, State};
+use supervisor::{ExitedPayload, Supervisor, ROLE_CLIENT, ROLE_HOST};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
 
@@ -74,23 +74,37 @@ async fn connect_client(
 /// `engine-exited`, not this command), so a crash leaves the posture sticky-on
 /// and auto-restore retries on the next launch.
 #[tauri::command]
-async fn stop_engine(supervisor: State<'_, Supervisor>, role: String) -> Result<(), String> {
-    if role == ROLE_HOST {
-        stop_sharing(supervisor.inner()).await;
-    } else {
-        supervisor.stop(&role).await;
-    }
+async fn stop_engine(
+    app: AppHandle,
+    supervisor: State<'_, Supervisor>,
+    role: String,
+) -> Result<(), String> {
+    stop_role(&app, supervisor.inner(), &role).await;
     Ok(())
 }
 
-/// Stop the host engine and clear the persisted sharing posture. Shared by the
-/// `stop_engine` command and the tray's Share toggle so "turn sharing off"
-/// always goes through one place. Clearing the posture even when no host was
-/// running is intentional — the meaning is "sharing should be off", and the
-/// idempotency keeps it safe for the tray to call without checking state first.
-pub(crate) async fn stop_sharing(supervisor: &Supervisor) {
-    supervisor.stop(ROLE_HOST).await;
-    prefs::set_sharing_enabled(false);
+/// Explicitly stop the engine in `role` and tell every consumer it's gone.
+///
+/// The supervisor's explicit stop removes the engine handle before its stdout
+/// hits EOF, so the reader emits no `engine-exited` for this path — we emit one
+/// here so the webview *and* the tray (both purely event-driven) don't keep
+/// showing stale "sharing"/"connected" state. Stopping the host also clears the
+/// persisted sharing posture (an explicit "sharing off"); doing so even when no
+/// host was running is intentional and keeps the call safe to make blind.
+///
+/// Shared by the `stop_engine` command and the tray's Share/Disconnect items so
+/// every explicit stop goes through one place.
+pub(crate) async fn stop_role(app: &AppHandle, supervisor: &Supervisor, role: &str) {
+    supervisor.stop(role).await;
+    if role == ROLE_HOST {
+        prefs::set_sharing_enabled(false);
+    }
+    let _ = app.emit(
+        "engine-exited",
+        ExitedPayload {
+            role: role.to_string(),
+        },
+    );
 }
 
 /// Open a host pairing window for a new device with display name `label`. The

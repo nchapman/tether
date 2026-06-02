@@ -421,10 +421,16 @@ Each phase is independently shippable and testable.
   = false. The posture is written from the host's own lifecycle in the
   supervisor reader, not at spawn: a confirmed `listening` event sets it on; a
   startup `error` (bind/allowlist failure, which exits) clears it so a host that
-  can't start doesn't auto-retry-and-fail every launch. `stop_engine(host)` (via
-  `stop_sharing`) clears it on an explicit toggle-off. A *mid-session* crash
-  exits with no error event, so the posture stays sticky-on and auto-restore
-  retries. The tray toggle reuses this path, so it inherits one source of truth.
+  can't start doesn't auto-retry-and-fail every launch. An explicit toggle-off
+  (via `stop_role`) clears it. A *mid-session* crash exits with no error event,
+  so the posture stays sticky-on and auto-restore retries. The tray toggle
+  reuses this path, so it inherits one source of truth.
+
+  Explicit stops route through `stop_role`, which emits a synthetic
+  `engine-exited` — the supervisor's explicit stop removes the engine handle
+  before stdout EOF, so the reader emits none. Both the webview and the tray are
+  event-driven, so without this an explicit host/client stop (from either
+  surface) would leave the *other* surface showing stale "sharing"/"connected".
 - Reframe "fingerprint" → "safety code".
 
 ### Phase 3 — Tray richness — DONE

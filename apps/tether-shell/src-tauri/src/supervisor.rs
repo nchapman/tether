@@ -63,10 +63,13 @@ struct StatusPayload {
     event: EngineEvent,
 }
 
-/// `engine-exited` payload: the child's stdout reached EOF (it exited).
+/// `engine-exited` payload: the engine in `role` is gone. Emitted by the reader
+/// on stdout EOF (a crash / self-exit) and by the explicit-stop helper in
+/// `crate::stop_role` (which the reader can't signal, since stop removes the
+/// handle before EOF). Both the webview and the tray key off this one event.
 #[derive(Clone, Serialize)]
-struct ExitedPayload {
-    role: String,
+pub(crate) struct ExitedPayload {
+    pub(crate) role: String,
 }
 
 impl Supervisor {

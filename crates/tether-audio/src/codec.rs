@@ -28,6 +28,10 @@ use crate::{AudioError, AudioFrame, Result};
 /// Recommended safe upper bound for a single encoded Opus packet (libopus docs).
 const MAX_PACKET_BYTES: usize = 4000;
 
+/// Expected packet-loss percentage hinted to the encoder. See the
+/// `OPUS_SET_PACKET_LOSS_PERC` call in [`OpusEncoder::new`].
+const EXPECTED_PACKET_LOSS_PERC: c_int = 5;
+
 /// Opus session parameters. The defaults are the v1 shipping config: 48 kHz
 /// stereo, 128 kbps CBR, 10 ms frames, restricted-lowdelay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +140,15 @@ impl OpusEncoder {
             .map_err(|_| AudioError::Opus("bitrate out of range".to_owned()))?;
         this.set_ctl(opus_sys::OPUS_SET_BITRATE_REQUEST, bitrate)?;
         this.set_ctl(opus_sys::OPUS_SET_COMPLEXITY_REQUEST, 10)?;
+        // Tell the encoder to expect a small amount of loss so it leaves each
+        // frame more self-contained — this is the one loss-resilience lever that
+        // works in CELT-only mode, and our whole loss strategy is PLC. A modest
+        // 5% is the conventional RTC value: enough to help concealment without
+        // measurably hurting the (near-lossless on a LAN) clean path.
+        this.set_ctl(
+            opus_sys::OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+            EXPECTED_PACKET_LOSS_PERC,
+        )?;
         Ok(this)
     }
 
@@ -282,6 +295,12 @@ impl OpusDecoder {
         }
         let n = usize::try_from(n).expect("non-negative after the check above");
         pcm.truncate(n * ch);
+        // libopus float output (and especially PLC extrapolation) can ring
+        // slightly past ±1.0; clamp so the OS mixer gets in-range samples and
+        // doesn't hard-clip them into a click on a loud transient.
+        for s in &mut pcm {
+            *s = s.clamp(-1.0, 1.0);
+        }
         Ok(AudioFrame::new(self.sample_rate, self.channels, pcm))
     }
 }

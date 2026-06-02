@@ -2733,6 +2733,11 @@ fn run_audio_capture_and_send(
         };
         for payload in packets {
             let packet = AudioPacket::Opus {
+                // Audio runs a single encoder for the whole session (no
+                // mid-stream sample-rate/device switch today), so the epoch is
+                // constant. If a device/rate switch is ever added, bump this on
+                // the restart AND reset the client decoder for the new epoch in
+                // the same change — don't pre-wire one half.
                 stream_epoch: 0,
                 frame_seq,
                 t_capture: MonoNanos::now(),

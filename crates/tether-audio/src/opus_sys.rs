@@ -45,6 +45,11 @@ pub const OPUS_SET_BITRATE_REQUEST: c_int = 4002;
 pub const OPUS_SET_VBR_REQUEST: c_int = 4006;
 /// Configures the encoder's computational complexity (0..=10).
 pub const OPUS_SET_COMPLEXITY_REQUEST: c_int = 4010;
+/// Hints the expected packet-loss percentage (0..=100). Active even in
+/// CELT-only mode (it reduces inter-frame prediction so each frame is more
+/// self-contained, improving PLC after a loss) — unlike LBRR FEC, which is
+/// SILK-only and a no-op here.
+pub const OPUS_SET_PACKET_LOSS_PERC_REQUEST: c_int = 4014;
 
 // --- opus_defines.h: coding modes (opus_encoder_create `application`) ---
 /// Lowest-latency mode (disables the speech/music detector); best for a remote

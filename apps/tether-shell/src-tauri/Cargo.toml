@@ -22,11 +22,19 @@ tauri = { version = "2", features = ["tray-icon"] }
 # Auto-update: pulls the signed `latest.json` from GitHub Releases and applies
 # bundled updates.
 tauri-plugin-updater = "2"
+# Remember the window's position/size across launches (native-app feel). Saves
+# on move/resize/close and restores on window-ready — Rust-only, no JS glue.
+tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Supervisor: spawn the engine binaries and read their stdout JSON-lines.
 # Tauri's async runtime is tokio, so these tasks run on its executor.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 tether-ipc = { path = "../../../crates/tether-ipc" }
+# Read/write the client's `known_hosts.json` directly: the address book the
+# Connect window shows is the same trust store the transient client engine
+# uses, so the shell shares its load/save (atomic, owner-only) rather than
+# re-implementing the format.
+tether-pairing = { path = "../../../crates/tether-pairing" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -6,28 +6,29 @@
 //! actual video session is the engine's own native window in its own
 //! process; nothing renders video through the webview.
 
+mod known_hosts;
+mod prefs;
 mod supervisor;
+mod tray;
 
-use supervisor::{Supervisor, ROLE_CLIENT, ROLE_HOST};
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
-use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, RunEvent, State};
+use supervisor::{ExitedPayload, Supervisor, ROLE_CLIENT, ROLE_HOST};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
 
-/// Start hosting: spawn `tether-host --ipc`. `test_pattern` swaps real
-/// capture for the synthetic gradient (useful for one-machine loopback).
+/// Start hosting: spawn `tether-host --ipc` with real screen capture. (The
+/// engine's `--test-pattern` dev fallback is reachable only from the CLI, not
+/// the UI.)
+///
+/// The sharing posture is persisted as on only once the host actually reaches
+/// `listening` (in the supervisor reader), not here at spawn time — so a host
+/// that spawns but fails to bind never leaves a broken "sharing on" posture
+/// that would auto-restart and fail every launch.
 #[tauri::command]
-async fn start_host(
-    app: AppHandle,
-    supervisor: State<'_, Supervisor>,
-    test_pattern: bool,
-) -> Result<(), String> {
-    let mut args = vec!["--ipc".to_string()];
-    if test_pattern {
-        args.push("--test-pattern".to_string());
-    }
-    supervisor.spawn(&app, ROLE_HOST, &args).await
+async fn start_host(app: AppHandle, supervisor: State<'_, Supervisor>) -> Result<(), String> {
+    supervisor
+        .spawn(&app, ROLE_HOST, &["--ipc".to_string()])
+        .await
 }
 
 /// Connect as a client: spawn `tether-client --ipc [--pin P] [--label L] <addr>
@@ -61,10 +62,44 @@ async fn connect_client(
 }
 
 /// Stop the engine in `role` ("host" or "client").
+///
+/// Stopping the *host* is an explicit "turn sharing off", so it clears the
+/// persisted posture — the shell won't re-enable hosting next launch. A host
+/// that *crashes* exits through the supervisor's EOF path instead (it emits
+/// `engine-exited`, not this command), so a crash leaves the posture sticky-on
+/// and auto-restore retries on the next launch.
 #[tauri::command]
-async fn stop_engine(supervisor: State<'_, Supervisor>, role: String) -> Result<(), String> {
-    supervisor.stop(&role).await;
+async fn stop_engine(
+    app: AppHandle,
+    supervisor: State<'_, Supervisor>,
+    role: String,
+) -> Result<(), String> {
+    stop_role(&app, supervisor.inner(), &role).await;
     Ok(())
+}
+
+/// Explicitly stop the engine in `role` and tell every consumer it's gone.
+///
+/// The supervisor's explicit stop removes the engine handle before its stdout
+/// hits EOF, so the reader emits no `engine-exited` for this path — we emit one
+/// here so the webview *and* the tray (both purely event-driven) don't keep
+/// showing stale "sharing"/"connected" state. Stopping the host also clears the
+/// persisted sharing posture (an explicit "sharing off"); doing so even when no
+/// host was running is intentional and keeps the call safe to make blind.
+///
+/// Shared by the `stop_engine` command and the tray's Share/Disconnect items so
+/// every explicit stop goes through one place.
+pub(crate) async fn stop_role(app: &AppHandle, supervisor: &Supervisor, role: &str) {
+    supervisor.stop(role).await;
+    if role == ROLE_HOST {
+        prefs::set_sharing_enabled(false);
+    }
+    let _ = app.emit(
+        "engine-exited",
+        ExitedPayload {
+            role: role.to_string(),
+        },
+    );
 }
 
 /// Open a host pairing window for a new device with display name `label`. The
@@ -111,6 +146,13 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
     app.restart()
 }
 
+/// Return the persisted shell preferences. The webview reads this on mount to
+/// re-apply the sharing posture (auto-start hosting when it was last left on).
+#[tauri::command]
+fn get_prefs() -> prefs::ShellPrefs {
+    prefs::load()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -122,24 +164,28 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Remember the window's position/size between launches.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Supervisor::default())
         .setup(|app| {
-            // System tray: the shell keeps running here even when the
-            // window is closed, so the host engine can stay up headless.
-            let show = MenuItemBuilder::with_id("show", "Show Tether").build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-            let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
-            TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Tether")
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main_window(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .build(app)?;
+            // System tray: the shell keeps running here even when the window is
+            // closed, so the host engine can stay up headless. The tray owns its
+            // own dynamic menu + status (see `tray`).
+            tray::init(app.handle())?;
             Ok(())
+        })
+        // Closing the window hides it to the tray instead of quitting — the
+        // shell must keep running so a host can stay reachable headless. The
+        // window comes back via the tray's "Show Tether"; the only real quit is
+        // the tray's "Quit" (app.exit). Without this, closing the last window
+        // would exit the whole app.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             start_host,
@@ -148,6 +194,12 @@ pub fn run() {
             start_pairing,
             revoke_peer,
             list_peers,
+            known_hosts::list_known_hosts,
+            known_hosts::rename_known_host,
+            known_hosts::forget_known_host,
+            hide_window,
+            show_window,
+            get_prefs,
             check_for_updates,
             install_update
         ])
@@ -188,8 +240,27 @@ async fn check_for_updates(app: AppHandle) -> Result<Option<String>, String> {
     }
 }
 
+/// Hide the main window. The webview calls this when a client session goes
+/// live: the engine's native video window is what the user wants in front, so
+/// the control-plane chrome gets out of the way (see the hide-on-Connected
+/// handoff in `docs/UX.md`). The window is re-shown via [`show_window`] when
+/// the session ends, or from the tray's "Show Tether".
+#[tauri::command]
+fn hide_window(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
+/// Reveal and focus the main window from the webview (e.g. a session ended and
+/// we want the address book back in front). Shares the tray "Show" path.
+#[tauri::command]
+fn show_window(app: AppHandle) {
+    show_main_window(&app);
+}
+
 /// Reveal and focus the main window (from the tray "Show" item).
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();

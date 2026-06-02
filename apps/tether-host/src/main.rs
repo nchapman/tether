@@ -3237,20 +3237,10 @@ fn run_capture_and_send(
 /// XDG paths — the file pair is small and operationally important,
 /// and a single well-known location ("look under ~/.tether") is
 /// easier to talk about in docs than "wherever XDG_DATA_HOME points".
+/// Delegates to the shared [`tether_pairing::config_dir`] so the host, the
+/// client, and the Tauri shell all resolve the same location.
 fn persistent_cert_dir() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    // $HOME on Unix, $USERPROFILE on Windows.
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "neither $TETHER_CERT_DIR nor $HOME/$USERPROFILE is set; \
-                 can't choose a cert directory"
-            )
-        })?;
-    Ok(PathBuf::from(home).join(".tether"))
+    Ok(tether_pairing::config_dir()?)
 }
 
 struct Args {

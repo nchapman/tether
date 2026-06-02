@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -91,11 +92,17 @@ impl PairedStore {
 /// algorithm-tagged (`"sha256:<hex>"`) host cert fingerprint the client pins on
 /// reconnect; `label` is a display name; `paired_at_unix` is when it was first
 /// paired (caller-stamped, so the store is deterministic for tests).
+/// `last_connected_unix` is the most recent successful connect, stamped by the
+/// client after every session so the UI can show recency ("connected 2h ago");
+/// `None` on entries written before this field existed (serde default), so the
+/// UI falls back to `paired_at_unix`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostEntry {
     pub fingerprint: String,
     pub label: String,
     pub paired_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected_unix: Option<u64>,
 }
 
 /// The client's pinned-host list, serialized as JSON, keyed by the host's
@@ -134,7 +141,11 @@ impl KnownHosts {
         self.hosts.contains_key(addr)
     }
 
-    /// Record (or replace) the host pinned at `addr`.
+    /// Record (or replace) the host pinned at `addr`. `last_connected_unix`
+    /// starts unset; the caller stamps it via [`set_last_connected`] after the
+    /// session is up.
+    ///
+    /// [`set_last_connected`]: KnownHosts::set_last_connected
     pub fn insert(&mut self, addr: String, fp: &Fingerprint, label: String, paired_at_unix: u64) {
         self.hosts.insert(
             addr,
@@ -142,8 +153,34 @@ impl KnownHosts {
                 fingerprint: tag_fingerprint(fp),
                 label,
                 paired_at_unix,
+                last_connected_unix: None,
             },
         );
+    }
+
+    /// Stamp the most-recent-connect time for `addr` if it's known; returns
+    /// whether the host existed. The client calls this after every successful
+    /// connect (first-contact or resume) so the UI can show recency.
+    pub fn set_last_connected(&mut self, addr: &str, when_unix: u64) -> bool {
+        match self.hosts.get_mut(addr) {
+            Some(entry) => {
+                entry.last_connected_unix = Some(when_unix);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Rename the host at `addr` (display label only — not a trust input);
+    /// returns whether it was present.
+    pub fn rename(&mut self, addr: &str, label: String) -> bool {
+        match self.hosts.get_mut(addr) {
+            Some(entry) => {
+                entry.label = label;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Forget the host at `addr`; returns whether it was present.
@@ -177,20 +214,31 @@ fn load_json<T: Default + DeserializeOwned>(path: &Path) -> io::Result<T> {
     }
 }
 
+/// Process-local counter making each in-flight temp file name distinct even
+/// when two threads in the same process save concurrently.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Persist `value` as pretty JSON to `path` atomically and owner-only: write a
 /// sibling temp file (created `0o600` on Unix), then rename over the target
-/// (rename replaces on both Unix and Windows). Single-writer assumption: each
-/// file path is written by at most one writer process (host → its allowlist,
-/// client → its known-hosts, in separate files), so the fixed sibling temp name
-/// (`<file>.tmp`) is safe; switch to a unique temp name if two writers ever
-/// share a path.
+/// (rename replaces on both Unix and Windows).
+///
+/// The temp name is made unique per writer — `<file>.json.<pid>.<seq>.tmp` —
+/// because `known_hosts.json` now has **two** writer processes: the
+/// `tether-client` engine (stamping `last_connected_unix` on connect) and the
+/// Tauri shell (rename/forget from the address book). A shared fixed temp name
+/// risks one writer truncating/renaming the other's half-written temp into
+/// place, corrupting the store. Each writer's own temp + atomic rename means
+/// the last rename always installs a complete, valid file. (A logical
+/// lost-update — e.g. a forget racing a connect-time stamp — can still drop one
+/// change, but never corrupts the file or weakens a pin.)
 fn save_json_private<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_vec_pretty(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("json.tmp");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
     write_private(&tmp, &json)?;
     std::fs::rename(&tmp, path)
 }
@@ -496,6 +544,57 @@ mod tests {
         assert_eq!(loaded.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_last_connected_only_touches_existing_hosts() {
+        let mut hosts = KnownHosts::default();
+        let fp = [8u8; 32];
+        hosts.insert("a:7654".to_string(), &fp, "a".to_string(), 100);
+        // New entries start with no last-connected stamp.
+        let entry = hosts.iter().next().unwrap().1;
+        assert_eq!(entry.last_connected_unix, None);
+
+        assert!(hosts.set_last_connected("a:7654", 200));
+        assert_eq!(
+            hosts.iter().next().unwrap().1.last_connected_unix,
+            Some(200)
+        );
+        // Unknown address is a no-op, reported as not-present.
+        assert!(!hosts.set_last_connected("b:7654", 300));
+    }
+
+    #[test]
+    fn rename_changes_label_not_fingerprint() {
+        let mut hosts = KnownHosts::default();
+        let fp = [9u8; 32];
+        hosts.insert("a:7654".to_string(), &fp, "old".to_string(), 100);
+        assert!(hosts.rename("a:7654", "new".to_string()));
+        let entry = hosts.iter().next().unwrap().1;
+        assert_eq!(entry.label, "new");
+        // Rename must not disturb the pinned identity.
+        assert_eq!(hosts.fingerprint("a:7654"), Some(fp));
+        assert!(!hosts.rename("missing:7654", "x".to_string()));
+    }
+
+    /// A `known_hosts.json` written before `last_connected_unix` existed must
+    /// still load — the field defaults to `None` rather than failing the parse
+    /// (which would fail-closed and drop the user's whole address book).
+    #[test]
+    fn host_entry_without_last_connected_field_deserializes() {
+        let legacy = r#"{
+            "hosts": {
+                "host.local:7654": {
+                    "fingerprint": "sha256:0000",
+                    "label": "work",
+                    "paired_at_unix": 1700000000
+                }
+            }
+        }"#;
+        let hosts: KnownHosts = serde_json::from_str(legacy).expect("legacy parses");
+        let entry = hosts.iter().next().unwrap().1;
+        assert_eq!(entry.last_connected_unix, None);
+        assert_eq!(entry.label, "work");
     }
 
     // The hardening this test guards is the *DACL*, not the write: a plain

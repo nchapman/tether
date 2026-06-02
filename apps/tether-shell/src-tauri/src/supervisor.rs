@@ -63,10 +63,13 @@ struct StatusPayload {
     event: EngineEvent,
 }
 
-/// `engine-exited` payload: the child's stdout reached EOF (it exited).
+/// `engine-exited` payload: the engine in `role` is gone. Emitted by the reader
+/// on stdout EOF (a crash / self-exit) and by the explicit-stop helper in
+/// `crate::stop_role` (which the reader can't signal, since stop removes the
+/// handle before EOF). Both the webview and the tray key off this one event.
 #[derive(Clone, Serialize)]
-struct ExitedPayload {
-    role: String,
+pub(crate) struct ExitedPayload {
+    pub(crate) role: String,
 }
 
 impl Supervisor {
@@ -141,6 +144,26 @@ impl Supervisor {
                 tracing::debug!(role = role_owned, line, "engine stdout line");
                 match serde_json::from_str::<EngineEvent>(line) {
                     Ok(event) => {
+                        // Persist the sharing posture from the *host's* own
+                        // lifecycle, not at spawn time (see `crate::prefs`):
+                        //   - `listening` = sharing actually came up → on.
+                        //   - `error` = a startup failure (the host emits Error
+                        //     only on bind/allowlist failure, then exits) → off,
+                        //     so a host that can't start doesn't auto-retry and
+                        //     fail every launch.
+                        // A *mid-session* crash exits with no Error event, so it
+                        // leaves the posture sticky-on and auto-restore retries.
+                        if role_owned == ROLE_HOST {
+                            match &event {
+                                EngineEvent::Listening { .. } => {
+                                    crate::prefs::set_sharing_enabled(true)
+                                }
+                                EngineEvent::Error { .. } => {
+                                    crate::prefs::set_sharing_enabled(false)
+                                }
+                                _ => {}
+                            }
+                        }
                         if let Err(e) = app_for_reader.emit(
                             "engine-status",
                             StatusPayload {

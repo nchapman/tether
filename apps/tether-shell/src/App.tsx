@@ -1,438 +1,194 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
-// One paired device, mirroring tether_ipc::PairedPeer.
-type PairedPeer = {
-  fingerprint: string;
-  label: string;
-  paired_at_unix: number;
-};
+import {
+  type EngineEvent,
+  type EngineExited,
+  type SavedHost,
+  listKnownHosts,
+  listPeers,
+  showWindow,
+  getPrefs,
+} from "./ipc";
+import { type Confirm, type SheetName } from "./state";
+import { useClientSession } from "./hooks/useClientSession";
+import { useHostSharing } from "./hooks/useHostSharing";
+import { ConnectView } from "./components/ConnectView";
+import { AddComputerSheet } from "./components/AddComputerSheet";
+import { SharingSheet } from "./components/SharingSheet";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import { UpdateBanner } from "./components/UpdateBanner";
 
-// Mirrors tether_ipc::EngineEvent (flattened) plus the `role` the
-// supervisor tags each line with. Only the fields the UI reads are typed.
-type StatusEvent = {
-  role: "host" | "client";
-  event:
-    | "listening"
-    | "peer_connected"
-    | "peer_disconnected"
-    | "connecting"
-    | "connected"
-    | "disconnected"
-    | "error"
-    | "pairing_pin"
-    | "paired"
-    | "pairing_required"
-    | "peer_list";
-  addr?: string;
-  fingerprint?: string;
-  peer?: string;
-  host?: string;
-  profile?: string;
-  reason?: string;
-  message?: string;
-  pin?: string;
-  expires_in_secs?: number;
-  label?: string;
-  peers?: PairedPeer[];
-};
-
-type ExitedEvent = { role: "host" | "client" };
-
-function HostPanel() {
-  const [running, setRunning] = useState(false);
-  // Default off: real screen capture negotiates HEVC, which works on the
-  // verified Windows/QSV path. Test pattern forces the H.264 floor, whose
-  // only Windows encoder (h264_mf) fails the self-decodable-IDR check — a
-  // black window. Keep the toggle for cross-platform dev.
-  const [testPattern, setTestPattern] = useState(false);
-  const [addr, setAddr] = useState("");
-  const [fingerprint, setFingerprint] = useState("");
-  const [peer, setPeer] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  // Pairing window: the PIN to read out and a live countdown.
-  const [newLabel, setNewLabel] = useState("");
-  const [pin, setPin] = useState<string | null>(null);
-  const [secondsLeft, setSecondsLeft] = useState(0);
-  // A device tried to connect while no window was open.
-  const [pendingPeer, setPendingPeer] = useState<string | null>(null);
-  const [peers, setPeers] = useState<PairedPeer[]>([]);
-
-  useEffect(() => {
-    const unstatus = listen<StatusEvent>("engine-status", ({ payload }) => {
-      if (payload.role !== "host") return;
-      switch (payload.event) {
-        case "listening":
-          setAddr(payload.addr ?? "");
-          setFingerprint(payload.fingerprint ?? "");
-          setError(null);
-          // Populate the paired-devices list once we're hosting. Best-effort:
-          // the host also pushes peer_list after every pair/revoke.
-          invoke("list_peers").catch((e) => console.warn("list_peers failed", e));
-          break;
-        case "peer_connected":
-          setPeer(payload.peer ?? "a client");
-          break;
-        case "peer_disconnected":
-          setPeer(null);
-          break;
-        case "pairing_pin":
-          setPin(payload.pin ?? null);
-          setSecondsLeft(payload.expires_in_secs ?? 0);
-          break;
-        case "paired":
-          // Window consumed; clear the PIN. A peer_list refresh follows.
-          setPin(null);
-          setPendingPeer(null);
-          break;
-        case "pairing_required":
-          setPendingPeer(payload.peer ?? "a device");
-          break;
-        case "peer_list":
-          setPeers(payload.peers ?? []);
-          break;
-        case "error":
-          // A host error (e.g. bind failure) means it isn't hosting; the
-          // engine exits right after, but reset now so the UI doesn't
-          // strand the "Stop hosting" button alongside the error.
-          setRunning(false);
-          setError(payload.message ?? "unknown error");
-          break;
-      }
-    });
-    const unexit = listen<ExitedEvent>("engine-exited", ({ payload }) => {
-      if (payload.role !== "host") return;
-      setRunning(false);
-      setAddr("");
-      setFingerprint("");
-      setPeer(null);
-      setPin(null);
-      setPendingPeer(null);
-      setPeers([]);
-    });
-    return () => {
-      unstatus.then((f) => f());
-      unexit.then((f) => f());
-    };
-  }, []);
-
-  // Tick the PIN countdown once a second; clear the PIN when it elapses
-  // (the host closed the window on its side too).
-  useEffect(() => {
-    if (pin === null) return;
-    if (secondsLeft <= 0) {
-      setPin(null);
-      return;
-    }
-    const t = setTimeout(() => setSecondsLeft((s) => s - 1), 1000);
-    return () => clearTimeout(t);
-  }, [pin, secondsLeft]);
-
-  async function start() {
-    setError(null);
-    try {
-      await invoke("start_host", { testPattern });
-      setRunning(true);
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function stop() {
-    await invoke("stop_engine", { role: "host" });
-    setRunning(false);
-  }
-
-  async function addDevice() {
-    setError(null);
-    try {
-      await invoke("start_pairing", { label: newLabel || "New device" });
-      setNewLabel("");
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function revoke(fp: string) {
-    try {
-      await invoke("revoke_peer", { fingerprint: fp });
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  return (
-    <section className="panel">
-      <h2>Host this machine</h2>
-      {!running ? (
-        <>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={testPattern}
-              onChange={(e) => setTestPattern(e.currentTarget.checked)}
-            />
-            Test pattern (no screen capture)
-          </label>
-          <button onClick={start}>Start hosting</button>
-        </>
-      ) : (
-        <>
-          <div className="status">
-            <span className={peer ? "dot on" : "dot wait"} />
-            {peer ? `Client connected: ${peer}` : "Waiting for a client…"}
-          </div>
-          {addr && (
-            <dl className="kv">
-              <dt>Address</dt>
-              <dd className="mono">{addr}</dd>
-              <dt>Fingerprint</dt>
-              <dd className="mono break">{fingerprint}</dd>
-            </dl>
-          )}
-
-          <div className="pairing">
-            <h3>Add a device</h3>
-            {pin ? (
-              <div className="pin-box">
-                <span className="pin">{pin}</span>
-                <span className="pin-hint">
-                  Enter this PIN on the new device — expires in {secondsLeft}s
-                </span>
-              </div>
-            ) : (
-              <div className="add-device">
-                <input
-                  placeholder="Device name (e.g. my laptop)"
-                  value={newLabel}
-                  onChange={(e) => setNewLabel(e.currentTarget.value)}
-                />
-                <button onClick={addDevice}>Add a device</button>
-              </div>
-            )}
-            {pendingPeer && !pin && (
-              <p className="hint">
-                {pendingPeer} tried to connect but isn’t paired. Click “Add a
-                device”, then enter the PIN on it.
-              </p>
-            )}
-          </div>
-
-          {peers.length > 0 && (
-            <div className="devices">
-              <h3>Paired devices</h3>
-              <ul>
-                {peers.map((p) => (
-                  <li key={p.fingerprint}>
-                    <span className="device-label">{p.label}</span>
-                    <span className="mono break device-fp">{p.fingerprint}</span>
-                    <button className="link danger" onClick={() => revoke(p.fingerprint)}>
-                      Revoke
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          <button className="secondary" onClick={stop}>
-            Stop hosting
-          </button>
-        </>
-      )}
-      {error && <p className="error">{error}</p>}
-    </section>
-  );
-}
-
-function ClientPanel() {
-  const [addr, setAddr] = useState("");
-  const [pin, setPin] = useState("");
-  const [label, setLabel] = useState("");
-  const [state, setState] = useState<
-    "idle" | "connecting" | "connected" | "error"
-  >("idle");
-  const [detail, setDetail] = useState<string | null>(null);
-
-  useEffect(() => {
-    const unstatus = listen<StatusEvent>("engine-status", ({ payload }) => {
-      if (payload.role !== "client") return;
-      switch (payload.event) {
-        case "connecting":
-          setState("connecting");
-          setDetail(`Connecting to ${payload.host}…`);
-          break;
-        case "connected":
-          setState("connected");
-          setDetail(`Streaming ${payload.profile ?? ""}`.trim());
-          // First contact is done: the host is now pinned in known-hosts, so
-          // clear the PIN/label fields. Otherwise a later disconnect+reconnect
-          // would re-take the `--pin` path with a now-expired PIN instead of
-          // the one-click known-hosts reconnect.
-          setPin("");
-          setLabel("");
-          break;
-        case "disconnected":
-          setState("idle");
-          setDetail(payload.reason ? `Disconnected: ${payload.reason}` : null);
-          break;
-        case "error":
-          setState("error");
-          setDetail(payload.message ?? "unknown error");
-          break;
-      }
-    });
-    const unexit = listen<ExitedEvent>("engine-exited", ({ payload }) => {
-      if (payload.role !== "client") return;
-      setState((s) => (s === "error" ? s : "idle"));
-    });
-    return () => {
-      unstatus.then((f) => f());
-      unexit.then((f) => f());
-    };
-    // Register once on mount: re-running on every `addr` keystroke would
-    // churn the listeners and (under StrictMode) double-fire events.
-  }, []);
-
-  async function connect() {
-    setDetail(null);
-    try {
-      // A PIN means first-contact pairing; without one the client reconnects
-      // using the host fingerprint it pinned last time (known-hosts).
-      await invoke("connect_client", {
-        addr,
-        pin: pin.trim() || null,
-        label: label.trim() || null,
-      });
-    } catch (e) {
-      setState("error");
-      setDetail(String(e));
-    }
-  }
-
-  async function disconnect() {
-    await invoke("stop_engine", { role: "client" });
-    setState("idle");
-  }
-
-  const busy = state === "connecting" || state === "connected";
-
-  return (
-    <section className="panel">
-      <h2>Connect to a host</h2>
-      <label>
-        Address
-        <input
-          className="mono"
-          placeholder="127.0.0.1:7654"
-          value={addr}
-          disabled={busy}
-          onChange={(e) => setAddr(e.currentTarget.value)}
-        />
-      </label>
-      <label>
-        PIN <span className="optional">(only for a new host)</span>
-        <input
-          className="mono"
-          placeholder="leave blank to reconnect"
-          value={pin}
-          disabled={busy}
-          onChange={(e) => setPin(e.currentTarget.value)}
-        />
-      </label>
-      {pin.trim() && (
-        <label>
-          Name for this host <span className="optional">(optional)</span>
-          <input
-            placeholder="e.g. office desktop"
-            value={label}
-            disabled={busy}
-            onChange={(e) => setLabel(e.currentTarget.value)}
-          />
-        </label>
-      )}
-      {!busy ? (
-        <button onClick={connect} disabled={!addr}>
-          {pin.trim() ? "Pair & connect" : "Connect"}
-        </button>
-      ) : (
-        <button className="secondary" onClick={disconnect}>
-          Disconnect
-        </button>
-      )}
-      {detail && (
-        <div className="status">
-          <span
-            className={
-              "dot " +
-              (state === "connected"
-                ? "on"
-                : state === "error"
-                  ? "err"
-                  : "wait")
-            }
-          />
-          {detail}
-        </div>
-      )}
-    </section>
-  );
-}
-
-// Asks the backend for an available update on mount; if there is one, shows a
-// banner whose button calls `install_update` — which downloads + installs the
-// signed bundle and restarts into it, so a successful install never returns
-// here. Pulling on mount (rather than listening for a startup-emitted event)
-// avoids the race where the check resolves before this listener exists.
-function UpdateBanner() {
-  const [version, setVersion] = useState<string | null>(null);
-  const [installing, setInstalling] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    invoke<string | null>("check_for_updates")
-      .then(setVersion)
-      .catch((e) => console.warn("update check failed", e));
-  }, []);
-
-  if (!version) return null;
-
-  async function install() {
-    setError(null);
-    setInstalling(true);
-    try {
-      await invoke("install_update");
-    } catch (e) {
-      // On success we never get here (the app restarts); a thrown error means
-      // the download/install failed, so re-enable the button.
-      setError(String(e));
-      setInstalling(false);
-    }
-  }
-
-  return (
-    <div className="update-banner">
-      <span>
-        Update <strong>{version}</strong> available
-      </span>
-      <button onClick={install} disabled={installing}>
-        {installing ? "Installing…" : "Install & restart"}
-      </button>
-      {error && <span className="error">{error}</span>}
-    </div>
-  );
-}
-
+// The control-plane shell: an address book of saved computers (the client
+// role) plus a sharing-settings sheet (the host role). App owns the shared
+// pieces — the address-book data, window-visibility lifecycle, and the modal
+// shell (sheets + confirms) — and wires the engine events to two state-machine
+// hooks (`useClientSession`, `useHostSharing`). No video renders here.
 function App() {
+  const [hosts, setHosts] = useState<SavedHost[]>([]);
+  const [sheet, setSheet] = useState<SheetName>("none");
+  const [addPrefill, setAddPrefill] = useState<string | undefined>(undefined);
+  const [confirm, setConfirm] = useState<Confirm | null>(null);
+
+  // The address book mirrored into a ref so the once-registered engine
+  // listeners (and label lookups inside the hooks) read the current list.
+  const hostsRef = useRef(hosts);
+  hostsRef.current = hosts;
+  // Tracks whether we hid the window for a live session, so we restore it on
+  // *any* terminal transition (clean disconnect, error, or crash-exit) without
+  // re-showing — and stealing focus — when it was never hidden.
+  const windowHidden = useRef(false);
+
+  function restoreWindow() {
+    if (windowHidden.current) {
+      showWindow();
+      windowHidden.current = false;
+    }
+  }
+
+  const refreshHosts = () =>
+    listKnownHosts()
+      .then(setHosts)
+      .catch((e) => console.warn("list_known_hosts failed", e));
+
+  const labelFor = (addr: string) =>
+    hostsRef.current.find((h) => h.addr === addr)?.label ?? addr;
+
+  const session = useClientSession({
+    windowHidden,
+    restoreWindow,
+    refreshHosts,
+    labelFor,
+    setSheet,
+    setConfirm,
+  });
+  const sharing = useHostSharing({ setConfirm });
+
+  // Open the Sharing sheet and refresh the paired-device list if hosting is
+  // live. Shared by the gear button and the tray's "Pair a device…" trigger.
+  // NB: the tray path captures this once (first render) in the "open-sharing"
+  // listener below, so it must only ever read through stable refs/setters —
+  // `sharing.hostRef.current` is live; a direct `sharing.host` read would go
+  // stale.
+  function openSharing() {
+    setSheet("sharing");
+    if (sharing.hostRef.current.running) listPeers().catch((e) => console.warn(e));
+  }
+
+  function openAdd(prefill?: string) {
+    setAddPrefill(prefill);
+    session.clearAddError();
+    setSheet("add");
+  }
+
+  function copy(text: string) {
+    navigator.clipboard?.writeText(text).catch((e) => console.warn("copy failed", e));
+  }
+
+  // --- Engine event wiring ---------------------------------------------------
+
+  useEffect(() => {
+    refreshHosts();
+
+    const unstatus = listen<EngineEvent>("engine-status", ({ payload }) => {
+      if (payload.role === "client") session.handleEvent(payload);
+      else sharing.handleEvent(payload);
+    });
+    const unexit = listen<EngineExited>("engine-exited", ({ payload }) => {
+      if (payload.role === "client") session.handleExit();
+      else sharing.handleExit();
+    });
+    // The tray's "Pair a device…" shows the window and asks us to open Sharing.
+    const unsharing = listen("open-sharing", () => openSharing());
+    // The tray asks us to connect through the window (only when a session is
+    // already live, so the switch-computer confirm runs).
+    const unconnect = listen<string>("request-connect", ({ payload }) =>
+      session.onConnect(payload),
+    );
+
+    // Re-apply the persisted sharing posture: if hosting was last left on,
+    // start it again. Wait until both listeners are live so we don't miss the
+    // host's `listening` event (the toggle would otherwise show off while the
+    // engine is actually up). startSharing re-persists the posture, harmlessly.
+    Promise.all([unstatus, unexit])
+      .then(() => getPrefs())
+      .then((prefs) => {
+        if (prefs.sharing_enabled) sharing.startSharing();
+      })
+      .catch((e) => console.warn("get_prefs failed", e));
+
+    return () => {
+      unstatus.then((f) => f());
+      unexit.then((f) => f());
+      unsharing.then((f) => f());
+      unconnect.then((f) => f());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Native feel: suppress the webview's right-click menu, except on inputs
+  // where copy/paste is expected.
+  useEffect(() => {
+    const onContextMenu = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      const editable =
+        t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
+      if (!editable) e.preventDefault();
+    };
+    document.addEventListener("contextmenu", onContextMenu);
+    return () => document.removeEventListener("contextmenu", onContextMenu);
+  }, []);
+
   return (
     <main className="container">
-      <h1>Tether</h1>
       <UpdateBanner />
-      <HostPanel />
-      <ClientPanel />
+      <ConnectView
+        hosts={hosts}
+        client={session.client}
+        rowErrors={session.rowErrors}
+        onConnect={session.onConnect}
+        onDisconnect={session.onDisconnect}
+        onRename={session.onRename}
+        onForget={session.onForget}
+        onCopyAddress={copy}
+        onPairAgain={(addr) => openAdd(addr)}
+        onAdd={() => openAdd()}
+        onOpenSharing={openSharing}
+      />
+
+      {sheet === "add" && (
+        <AddComputerSheet
+          prefillAddr={addPrefill}
+          status={session.addStatus}
+          errorMessage={session.addError}
+          onSubmit={(addr, pin, label) => session.beginConnect(addr, "add", pin, label || null)}
+          onClose={() => setSheet("none")}
+        />
+      )}
+
+      {sheet === "sharing" && (
+        <SharingSheet
+          host={sharing.host}
+          onStart={sharing.startSharing}
+          onStop={sharing.onStopSharing}
+          onAddDevice={sharing.onAddDevice}
+          onRevoke={sharing.onRevoke}
+          onCopy={copy}
+          onClose={() => setSheet("none")}
+        />
+      )}
+
+      {confirm && (
+        <ConfirmDialog
+          title={confirm.title}
+          message={confirm.message}
+          confirmLabel={confirm.confirmLabel}
+          danger={confirm.danger}
+          onConfirm={confirm.onConfirm}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
     </main>
   );
 }

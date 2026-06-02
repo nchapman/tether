@@ -179,6 +179,19 @@ pub fn run() {
             tray::init(app.handle())?;
             Ok(())
         })
+        // Closing the window hides it to the tray instead of quitting — the
+        // shell must keep running so a host can stay reachable headless. The
+        // window comes back via the tray's "Show Tether"; the only real quit is
+        // the tray's "Quit" (app.exit). Without this, closing the last window
+        // would exit the whole app.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             start_host,
             connect_client,

@@ -451,6 +451,9 @@ Each phase is independently shippable and testable.
 - **Add a device…** force-shows the window and opens the Sharing sheet
   (`open-sharing` event). Rename/forget emit `hosts-changed` so the submenu
   refreshes in-session.
+- Closing the window **hides it to the tray** (`CloseRequested` → `prevent_close`
+  + `hide`) rather than quitting, so a host stays reachable headless; the only
+  real quit is the tray's **Quit**. Reopen via **Show Tether**.
 - A client `error` now force-shows the window (so a tray-initiated failure is
   visible even though it never hid the window through the webview).
 

@@ -14,8 +14,10 @@
       {
         "label": "main",
         "title": "Tether",
-        "width": 520,
-        "height": 640
+        "width": 420,
+        "height": 560,
+        "minWidth": 360,
+        "minHeight": 480
       }
     ],
     "security": {

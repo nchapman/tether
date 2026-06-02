@@ -6,6 +6,7 @@
 //! actual video session is the engine's own native window in its own
 //! process; nothing renders video through the webview.
 
+mod known_hosts;
 mod supervisor;
 
 use supervisor::{Supervisor, ROLE_CLIENT, ROLE_HOST};
@@ -148,6 +149,11 @@ pub fn run() {
             start_pairing,
             revoke_peer,
             list_peers,
+            known_hosts::list_known_hosts,
+            known_hosts::rename_known_host,
+            known_hosts::forget_known_host,
+            hide_window,
+            show_window,
             check_for_updates,
             install_update
         ])
@@ -186,6 +192,25 @@ async fn check_for_updates(app: AppHandle) -> Result<Option<String>, String> {
             Ok(None)
         }
     }
+}
+
+/// Hide the main window. The webview calls this when a client session goes
+/// live: the engine's native video window is what the user wants in front, so
+/// the control-plane chrome gets out of the way (see the hide-on-Connected
+/// handoff in `docs/UX.md`). The window is re-shown via [`show_window`] when
+/// the session ends, or from the tray's "Show Tether".
+#[tauri::command]
+fn hide_window(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
+/// Reveal and focus the main window from the webview (e.g. a session ended and
+/// we want the address book back in front). Shares the tray "Show" path.
+#[tauri::command]
+fn show_window(app: AppHandle) {
+    show_main_window(&app);
 }
 
 /// Reveal and focus the main window (from the tray "Show" item).

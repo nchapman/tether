@@ -65,6 +65,38 @@ pub use store::{
     parse_tagged_fingerprint, tag_fingerprint, HostEntry, KnownHosts, PairedStore, PeerEntry,
 };
 
+use std::path::PathBuf;
+
+/// The directory Tether keeps its persistent identity and trust files in:
+/// the cert/key pair, the client's `known_hosts.json`, and the host's
+/// `paired_clients.json`. `$TETHER_CERT_DIR` overrides it (for tests or for
+/// sharing one identity between instances); otherwise it's `$HOME/.tether`
+/// (`%USERPROFILE%\.tether` on Windows).
+///
+/// Shared by `tether-host`, `tether-client`, and the Tauri shell so all three
+/// agree on where these files live — the shell reads/writes the same
+/// `known_hosts.json` the client engine uses.
+pub fn config_dir() -> std::io::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "neither $TETHER_CERT_DIR nor $HOME/$USERPROFILE is set; \
+                 can't choose a config directory",
+            )
+        })?;
+    Ok(PathBuf::from(home).join(".tether"))
+}
+
+/// The client's known-hosts file path under [`config_dir`].
+pub fn known_hosts_path() -> std::io::Result<PathBuf> {
+    Ok(config_dir()?.join("known_hosts.json"))
+}
+
 use hkdf::Hkdf;
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};

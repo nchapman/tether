@@ -141,13 +141,20 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // On first contact, pin the host so the next connect is one-click.
-    if is_first_contact {
+    // Persist known-hosts: on first contact, pin the host so the next connect
+    // is one-click; on every successful connect (first-contact or resume),
+    // stamp the time so the shell's address book can show recency.
+    {
         let mut known_hosts = known_hosts;
-        let label = label.unwrap_or_else(|| addr.to_string());
-        known_hosts.insert(addr.to_string(), &host_fp, label, unix_now());
+        let addr_key = addr.to_string();
+        let now = unix_now();
+        if is_first_contact {
+            let label = label.unwrap_or_else(|| addr_key.clone());
+            known_hosts.insert(addr_key.clone(), &host_fp, label, now);
+        }
+        known_hosts.set_last_connected(&addr_key, now);
         if let Err(e) = known_hosts.save(&known_hosts_path) {
-            warn!(error = %e, "paired but failed to persist known-hosts; next connect needs --pin again");
+            warn!(error = %e, "connected but failed to persist known-hosts; first-contact reconnect may need --pin again");
         }
     }
 
@@ -1207,22 +1214,11 @@ fn take_flag_value<'a>(
 }
 
 /// Directory the client caches its identity (`client_cert.der`/`client_key.der`)
-/// and `known_hosts.json` in. Mirrors the host's `persistent_cert_dir`: default
-/// `$HOME/.tether` (or `$USERPROFILE` on Windows), overridable with
-/// `$TETHER_CERT_DIR` for testing or sharing between instances.
+/// and `known_hosts.json` in. Delegates to the shared
+/// [`tether_pairing::config_dir`] so the host, the client, and the Tauri shell
+/// all resolve the same location.
 fn client_config_dir() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "neither $TETHER_CERT_DIR nor $HOME/$USERPROFILE is set; \
-                 can't choose a config directory"
-            )
-        })?;
-    Ok(PathBuf::from(home).join(".tether"))
+    Ok(tether_pairing::config_dir()?)
 }
 
 /// Seconds since the Unix epoch, for stamping when a host was paired. A

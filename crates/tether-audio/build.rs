@@ -1,41 +1,36 @@
-//! Windows-only link wiring for the statically linked FFmpeg.
+//! Link wiring for the audio codec's direct libopus binding.
 //!
-//! Identical to `crates/tether-codec/build.rs` — both crates statically link
-//! the staged LGPL FFmpeg via rsmpeg, and each produces its own test binary, so
-//! each needs to name the Win32 import libs the static archives reference. On
-//! Linux/macOS rusty_ffmpeg's pkg-config `.statik(true)` path supplies these
-//! from the `.pc` `Libs:` lines; this build script is inert there. Keep the
-//! `SYSTEM_LIBS` set in sync with tether-codec's if the upstream FFmpeg
-//! configure changes.
+//! `tether-audio` calls libopus directly (see `src/opus_sys.rs`) rather than
+//! going through FFmpeg/rsmpeg as the video codec does, so it links the
+//! standalone `libopus` archive the static FFmpeg package already stages — the
+//! same one FFmpeg's `libavcodec.a` resolves its `opus_*` references from, so no
+//! second copy of the library enters the binary.
+//!
+//! The staged prefix's lib dir is named by `FFMPEG_LIBS_DIR` (set for every
+//! target in `.cargo/ffmpeg-env.toml`). We gate on the opus archive actually
+//! being present so a non-staged / system FFmpeg build doesn't mis-link here.
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_LIBS_DIR");
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
     let Ok(libs_dir) = std::env::var("FFMPEG_LIBS_DIR") else {
         return;
     };
+    let dir = std::path::Path::new(&libs_dir);
 
-    // `vpl.lib` (bundled oneVPL dispatcher) distinguishes our staged static
-    // prefix from a dynamic/system FFmpeg, where the DLLs already carry these
-    // deps and emitting them would fail the link.
-    if !std::path::Path::new(&libs_dir).join("vpl.lib").exists() {
+    // Static opus archive name: MSVC `opus.lib`, otherwise `libopus.a`.
+    let is_msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+    let archive = if is_msvc { "opus.lib" } else { "libopus.a" };
+    if !dir.join(archive).exists() {
         return;
     }
 
     println!("cargo:rustc-link-search=native={libs_dir}");
-    println!("cargo:rustc-link-lib=static=vpl");
+    println!("cargo:rustc-link-lib=static=opus");
 
-    const SYSTEM_LIBS: &[&str] = &[
-        // libavutil / libavcodec / libavfilter
-        "mfuuid", "ole32", "strmiids", "user32", "advapi32", "bcrypt",
-        // libavdevice (vfw/dshow capture, GDI)
-        "psapi", "uuid", "oleaut32", "shlwapi", "gdi32", "vfw32",
-        // libavformat (TLS / sockets)
-        "secur32", "ncrypt", "crypt32", "ws2_32",
-    ];
-    for lib in SYSTEM_LIBS {
-        println!("cargo:rustc-link-lib={lib}");
+    // libopus references libm; FFmpeg (which would otherwise pull it in) is no
+    // longer linked by this crate, so the standalone test binary needs it
+    // explicitly. No-op where libm is part of the C runtime (macOS, MSVC).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-lib=m");
     }
 }

@@ -8,13 +8,18 @@
 //! `AudioConfig`) lives in `tether-protocol`; this crate produces and consumes
 //! the Opus payloads that ride it.
 //!
-//! Opus is statically linked through the same LGPL FFmpeg 8.1 as the video
-//! codec (libopus, every target). Audio is software-coded end to end —
-//! hardware audio codecs aren't warranted at ~128 kbps — so the codec
-//! round-trip runs in the default (no-hardware) test set.
+//! The codec binds libopus directly (`opus_sys`), linking the standalone
+//! `libopus` archive the static FFmpeg package already stages — the same one
+//! FFmpeg's `libavcodec` resolves against, so no second copy enters the binary.
+//! Going direct (rather than through FFmpeg's avcodec wrapper as the video codec
+//! does) is what gives us real `opus_decode(NULL)` packet-loss concealment and
+//! live encoder ctl. Audio is software-coded end to end — hardware audio codecs
+//! aren't warranted at ~128 kbps — so the codec round-trip runs in the default
+//! (no-hardware) test set.
 
 pub mod capture;
 pub mod codec;
+mod opus_sys;
 pub mod playback;
 pub mod test_pattern;
 
@@ -82,27 +87,15 @@ impl AudioFrame {
 /// Errors from the audio codec.
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
-    /// FFmpeg didn't build the named codec — should never happen with our
-    /// pinned static FFmpeg, but surfaced rather than panicked.
-    #[error("codec not found in this FFmpeg build: {0}")]
-    CodecNotFound(&'static str),
-
-    /// The encoder advertised no sample format we can feed.
-    #[error("opus encoder does not accept a supported sample format")]
-    NoSupportedSampleFormat,
-
     /// Channel count outside the mono/stereo range v1 supports. Guards the
-    /// decoder's per-channel plane indexing against an out-of-range config.
+    /// codec's per-channel handling against an out-of-range config.
     #[error("unsupported channel count: {0} (v1 supports 1 or 2)")]
     UnsupportedChannelCount(u8),
 
-    /// A decoded frame came back in a sample format we don't convert.
-    #[error("unsupported decoded sample format: {0}")]
-    UnsupportedSampleFormat(i32),
-
-    /// Wraps an underlying ffmpeg/rsmpeg error.
-    #[error("ffmpeg: {0}")]
-    Ffmpeg(#[from] rsmpeg::error::RsmpegError),
+    /// A libopus call failed; carries the entry point and the library's own
+    /// `opus_strerror` message.
+    #[error("libopus: {0}")]
+    Opus(String),
 }
 
 /// Crate result alias.

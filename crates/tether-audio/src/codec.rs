@@ -1,30 +1,32 @@
-//! Opus encode/decode over the statically-linked FFmpeg libopus.
+//! Opus encode/decode bound directly to libopus (see [`crate::opus_sys`]).
 //!
-//! The encoder buffers interleaved f32 PCM and emits one Opus packet per
-//! whole `frame_size` (e.g. 480 samples/channel = 10 ms at 48 kHz), so callers
-//! can push arbitrary capture chunk sizes. The decoder turns each packet back
-//! into interleaved f32 and exposes [`OpusDecoder::conceal`] for the
-//! jitter-buffer's loss path.
+//! The encoder buffers interleaved f32 PCM and emits one Opus packet per whole
+//! `frame_size` (e.g. 480 samples/channel = 10 ms at 48 kHz), so callers can
+//! push arbitrary capture chunk sizes. The decoder turns each packet back into
+//! interleaved f32 and exposes [`OpusDecoder::conceal`] for the jitter buffer's
+//! loss path.
 //!
-//! ## Loss concealment (v1)
+//! ## Loss concealment
 //!
-//! Real Opus PLC is driven by calling `opus_decode(NULL)` on the raw libopus
-//! API; FFmpeg's avcodec wrapper doesn't surface that, so v1 conceals a lost
-//! frame with silence ([`OpusDecoder::conceal`]). At the 1% isolated-loss
-//! target this is barely perceptible; if bursty-loss testing shows otherwise,
-//! the decode side can move to direct libopus (already in our static build)
-//! without touching the wire or the encoder.
+//! [`OpusDecoder::conceal`] is **real Opus PLC**: `opus_decode_float(NULL, …)`
+//! reconstructs the missing frame from decoder state (extrapolating the last
+//! good frame), rather than splicing in digital silence. This is what makes a
+//! dropped packet a soft, brief artifact instead of a broadband click. PLC
+//! advances decoder state, so it takes `&mut self` and the missing frame must be
+//! exactly one `frame_size` long (a libopus requirement for staying in the right
+//! state for the next packet).
 
-use std::ffi::CString;
-use std::slice;
+use std::ffi::CStr;
+use std::os::raw::c_int;
+use std::ptr;
 
 use bytes::Bytes;
-use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVPacket};
-use rsmpeg::avutil::{ra, AVChannelLayout, AVDictionary, AVFrame};
-use rsmpeg::error::RsmpegError;
-use rsmpeg::ffi;
 
+use crate::opus_sys;
 use crate::{AudioError, AudioFrame, Result};
+
+/// Recommended safe upper bound for a single encoded Opus packet (libopus docs).
+const MAX_PACKET_BYTES: usize = 4000;
 
 /// Opus session parameters. The defaults are the v1 shipping config: 48 kHz
 /// stereo, 128 kbps CBR, 10 ms frames, restricted-lowdelay.
@@ -69,101 +71,83 @@ impl OpusConfig {
     }
 }
 
-/// Wrap encoded bytes in an `AVPacket` ffmpeg owns, so it can be fed to a
-/// decoder. Mirrors `tether_codec`'s private helper (rsmpeg has no safe
-/// equivalent): allocate via `av_new_packet` so the packet owns and frees its
-/// buffer, then memcpy our bytes in.
-fn packet_from_bytes(bytes: &[u8]) -> Result<AVPacket> {
-    let mut packet = AVPacket::new();
-    let size = i32::try_from(bytes.len())
-        .map_err(|_| AudioError::Ffmpeg(RsmpegError::AVError(ffi::AVERROR_INVALIDDATA)))?;
-    // SAFETY: `packet` was just allocated by AVPacket::new(). av_new_packet
-    // allocates `size + AV_INPUT_BUFFER_PADDING_SIZE` bytes, zeroes the
-    // padding, and sets packet.data + packet.size; ownership transfers to the
-    // packet, freed by its Drop via av_packet_free.
-    let ret = unsafe { ffi::av_new_packet(packet.as_mut_ptr(), size) };
-    if ret < 0 {
-        return Err(AudioError::Ffmpeg(RsmpegError::AVError(ret)));
-    }
-    // SAFETY: packet.data now points to an owned buffer of exactly `size`
-    // writable bytes (plus padding we don't touch).
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), packet.data, bytes.len());
-    }
-    Ok(packet)
+/// Build an [`AudioError::Opus`] from a libopus return code, attaching the
+/// library's own human-readable message.
+fn opus_err(ctx: &'static str, code: c_int) -> AudioError {
+    // SAFETY: opus_strerror returns a static NUL-terminated string (or null).
+    let msg = unsafe {
+        let p = opus_sys::opus_strerror(code);
+        if p.is_null() {
+            "unknown error".to_owned()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    AudioError::Opus(format!("{ctx}: {msg}"))
 }
 
 /// Opus encoder: interleaved f32 PCM in, Opus packets out.
 pub struct OpusEncoder {
-    ctx: AVCodecContext,
+    enc: *mut opus_sys::OpusEncoder,
     channels: u8,
-    sample_rate: u32,
-    sample_fmt: i32,
-    /// Samples per channel per Opus frame (from the opened context).
     frame_size: usize,
     /// Interleaved PCM not yet aligned to a whole frame.
     accum: Vec<f32>,
-    /// Running pts in samples (time_base 1/sample_rate).
-    next_pts: i64,
 }
 
-// SAFETY: an ffmpeg codec context is safe to MOVE between threads but not to
-// SHARE. We expose only `&mut self` methods, so the borrow checker serialises
-// access within a thread and the inner pointer is never aliased.
+// SAFETY: a libopus encoder is safe to MOVE between threads but not to SHARE.
+// We expose only `&mut self` methods, so the borrow checker serialises access
+// within a thread and the inner pointer is never aliased.
 unsafe impl Send for OpusEncoder {}
 
 impl OpusEncoder {
-    /// Build and open a libopus encoder for `cfg`.
+    /// Build a libopus encoder for `cfg` in restricted-lowdelay, hard-CBR mode.
     pub fn new(cfg: OpusConfig) -> Result<Self> {
         if !(1..=2).contains(&cfg.channels) {
             return Err(AudioError::UnsupportedChannelCount(cfg.channels));
         }
-        let codec = AVCodec::find_encoder_by_name(c"libopus")
-            .ok_or(AudioError::CodecNotFound("libopus"))?;
-        let mut ctx = AVCodecContext::new(&codec);
-
-        // libopus accepts interleaved float (FLT) or s16; we speak FLT so the
-        // hot path is a single memcpy from the cpal-native f32 buffer.
-        let sample_fmt = ffi::AV_SAMPLE_FMT_FLT;
-        let supported = codec
-            .sample_fmts()
-            .ok_or(AudioError::NoSupportedSampleFormat)?;
-        if !supported.iter().copied().any(|f| f == sample_fmt) {
-            return Err(AudioError::NoSupportedSampleFormat);
+        let fs = c_int::try_from(cfg.sample_rate)
+            .map_err(|_| AudioError::Opus("sample_rate out of range".to_owned()))?;
+        let mut err: c_int = opus_sys::OPUS_OK;
+        // SAFETY: opus_encoder_create returns a heap encoder or null with `err`
+        // set; we check both before use. Freed in Drop.
+        let enc = unsafe {
+            opus_sys::opus_encoder_create(
+                fs,
+                c_int::from(cfg.channels),
+                opus_sys::OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+                &mut err,
+            )
+        };
+        if enc.is_null() || err != opus_sys::OPUS_OK {
+            return Err(opus_err("opus_encoder_create", err));
         }
 
-        ctx.set_sample_rate(cfg.sample_rate as i32);
-        ctx.set_ch_layout(AVChannelLayout::from_nb_channels(i32::from(cfg.channels)).into_inner());
-        ctx.set_sample_fmt(sample_fmt);
-        ctx.set_bit_rate(i64::from(cfg.bitrate_bps));
-        ctx.set_time_base(ra(1, cfg.sample_rate as i32));
-
-        // Private libopus options: restricted-lowdelay for interactivity,
-        // hard CBR for predictable bandwidth, and the frame duration that sets
-        // the encoder's Opus frame size.
-        let frame_dur = CString::new(cfg.frame_duration_ms.to_string())
-            .expect("integer string has no interior NUL");
-        let opts = AVDictionary::new(c"application", c"lowdelay", 0)
-            .set(c"vbr", c"off", 0)
-            .set(c"frame_duration", &frame_dur, 0);
-        ctx.open(Some(opts))?;
-
-        // After open the context reports the Opus frame size in samples; fall
-        // back to the configured size if it's unset or nonsensical.
-        let frame_size = usize::try_from(ctx.frame_size)
-            .ok()
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| cfg.frame_size());
-
-        Ok(Self {
-            ctx,
+        let mut this = Self {
+            enc,
             channels: cfg.channels,
-            sample_rate: cfg.sample_rate,
-            sample_fmt,
-            frame_size,
+            frame_size: cfg.frame_size(),
             accum: Vec::new(),
-            next_pts: 0,
-        })
+        };
+        // Hard CBR for predictable bandwidth, the configured target bitrate, and
+        // max complexity (cheap at audio rates, best quality).
+        this.set_ctl(opus_sys::OPUS_SET_VBR_REQUEST, 0)?;
+        let bitrate = c_int::try_from(cfg.bitrate_bps)
+            .map_err(|_| AudioError::Opus("bitrate out of range".to_owned()))?;
+        this.set_ctl(opus_sys::OPUS_SET_BITRATE_REQUEST, bitrate)?;
+        this.set_ctl(opus_sys::OPUS_SET_COMPLEXITY_REQUEST, 10)?;
+        Ok(this)
+    }
+
+    /// Issue an encoder CTL that takes a single `opus_int32` value.
+    fn set_ctl(&mut self, request: c_int, value: c_int) -> Result<()> {
+        // SAFETY: every `request` we pass is a SET taking one opus_int32 arg,
+        // matching the variadic C signature.
+        let ret = unsafe { opus_sys::opus_encoder_ctl(self.enc, request, value) };
+        if ret != opus_sys::OPUS_OK {
+            return Err(opus_err("opus_encoder_ctl", ret));
+        }
+        Ok(())
     }
 
     /// Samples per channel per emitted Opus packet.
@@ -177,15 +161,34 @@ impl OpusEncoder {
     /// buffered for the next call.
     pub fn encode(&mut self, interleaved: &[f32]) -> Result<Vec<Bytes>> {
         self.accum.extend_from_slice(interleaved);
-        let chunk = self.frame_size * self.channels as usize;
+        let chunk = self.frame_size * usize::from(self.channels);
+        let frame_size = c_int::try_from(self.frame_size)
+            .map_err(|_| AudioError::Opus("frame_size out of range".to_owned()))?;
+
         let mut out = Vec::new();
         let mut consumed = 0;
         while self.accum.len() - consumed >= chunk {
-            let frame = self.build_frame(&self.accum[consumed..consumed + chunk], self.next_pts)?;
-            self.next_pts += self.frame_size as i64;
+            let pcm = &self.accum[consumed..consumed + chunk];
+            let mut buf = [0u8; MAX_PACKET_BYTES];
+            let cap = c_int::try_from(buf.len()).expect("MAX_PACKET_BYTES fits in c_int");
+            // SAFETY: `pcm` holds exactly frame_size*channels f32 (one Opus
+            // frame); `buf` has `cap` writable bytes. opus_encode_float reads the
+            // former and writes at most `cap` bytes.
+            let n = unsafe {
+                opus_sys::opus_encode_float(
+                    self.enc,
+                    pcm.as_ptr(),
+                    frame_size,
+                    buf.as_mut_ptr(),
+                    cap,
+                )
+            };
+            if n < 0 {
+                return Err(opus_err("opus_encode_float", n));
+            }
+            let n = usize::try_from(n).expect("non-negative after the check above");
+            out.push(Bytes::copy_from_slice(&buf[..n]));
             consumed += chunk;
-            self.ctx.send_frame(Some(&frame))?;
-            self.drain_packets(&mut out)?;
         }
         if consumed > 0 {
             self.accum.drain(..consumed);
@@ -193,59 +196,26 @@ impl OpusEncoder {
         Ok(out)
     }
 
-    /// Flush the encoder (e.g. on shutdown), returning any trailing packets.
-    /// Does not pad a partial trailing frame — Opus needs whole frames, so a
-    /// sub-frame remainder is dropped.
+    /// Flush on shutdown. libopus buffers nothing internally (each whole frame is
+    /// emitted by [`encode`](Self::encode)), so any sub-frame remainder is
+    /// dropped and there are no trailing packets. Kept for API symmetry.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
     pub fn flush(&mut self) -> Result<Vec<Bytes>> {
-        let mut out = Vec::new();
-        self.ctx.send_frame(None)?;
-        self.drain_packets(&mut out)?;
-        Ok(out)
+        Ok(Vec::new())
     }
+}
 
-    fn build_frame(&self, chunk: &[f32], pts: i64) -> Result<AVFrame> {
-        let mut frame = AVFrame::new();
-        frame.set_nb_samples(i32::try_from(self.frame_size).expect("opus frame_size fits in i32"));
-        frame.set_ch_layout(
-            AVChannelLayout::from_nb_channels(i32::from(self.channels)).into_inner(),
-        );
-        frame.set_format(self.sample_fmt);
-        frame.set_sample_rate(self.sample_rate as i32);
-        frame.set_pts(pts);
-        frame.alloc_buffer()?;
-        // SAFETY: alloc_buffer gave us a packed FLT buffer of
-        // frame_size * channels f32s in data[0]; `chunk` is exactly that many.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                chunk.as_ptr().cast::<u8>(),
-                frame.data_mut()[0],
-                std::mem::size_of_val(chunk),
-            );
-        }
-        Ok(frame)
-    }
-
-    fn drain_packets(&mut self, out: &mut Vec<Bytes>) -> Result<()> {
-        loop {
-            match self.ctx.receive_packet() {
-                Ok(pkt) => {
-                    // SAFETY: a received packet's data points to pkt.size valid
-                    // bytes owned by the packet; we copy them out before drop.
-                    let len = usize::try_from(pkt.size).unwrap_or(0);
-                    let data = unsafe { slice::from_raw_parts(pkt.data, len) };
-                    out.push(Bytes::copy_from_slice(data));
-                }
-                Err(RsmpegError::EncoderDrainError | RsmpegError::EncoderFlushedError) => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
+impl Drop for OpusEncoder {
+    fn drop(&mut self) {
+        // SAFETY: `enc` came from opus_encoder_create and is destroyed exactly
+        // once, here.
+        unsafe { opus_sys::opus_encoder_destroy(self.enc) };
     }
 }
 
 /// Opus decoder: Opus packets in, interleaved f32 PCM out.
 pub struct OpusDecoder {
-    ctx: AVCodecContext,
+    dec: *mut opus_sys::OpusDecoder,
     channels: u8,
     sample_rate: u32,
     frame_size: usize,
@@ -255,26 +225,24 @@ pub struct OpusDecoder {
 unsafe impl Send for OpusDecoder {}
 
 impl OpusDecoder {
-    /// Build and open a libopus decoder for `cfg`.
-    ///
-    /// We set channel layout + sample rate on the context rather than relying
-    /// on OpusHead extradata: our packets are raw Opus frames off the wire with
-    /// no container, and both ends share `cfg`, so the config is authoritative.
+    /// Build a libopus decoder for `cfg`. Both ends share `cfg`, so the rate /
+    /// channel count is authoritative (our packets are raw Opus frames off the
+    /// wire, no OpusHead container).
     pub fn new(cfg: OpusConfig) -> Result<Self> {
-        // Bounds the per-channel plane indexing in `append_interleaved` against
-        // an out-of-range (untrusted) channel count.
         if !(1..=2).contains(&cfg.channels) {
             return Err(AudioError::UnsupportedChannelCount(cfg.channels));
         }
-        let codec = AVCodec::find_decoder_by_name(c"libopus")
-            .ok_or(AudioError::CodecNotFound("libopus"))?;
-        let mut ctx = AVCodecContext::new(&codec);
-        ctx.set_sample_rate(cfg.sample_rate as i32);
-        ctx.set_ch_layout(AVChannelLayout::from_nb_channels(i32::from(cfg.channels)).into_inner());
-        ctx.set_pkt_timebase(ra(1, cfg.sample_rate as i32));
-        ctx.open(None)?;
+        let fs = c_int::try_from(cfg.sample_rate)
+            .map_err(|_| AudioError::Opus("sample_rate out of range".to_owned()))?;
+        let mut err: c_int = opus_sys::OPUS_OK;
+        // SAFETY: returns a heap decoder or null with `err` set; both checked.
+        // Freed in Drop.
+        let dec = unsafe { opus_sys::opus_decoder_create(fs, c_int::from(cfg.channels), &mut err) };
+        if dec.is_null() || err != opus_sys::OPUS_OK {
+            return Err(opus_err("opus_decoder_create", err));
+        }
         Ok(Self {
-            ctx,
+            dec,
             channels: cfg.channels,
             sample_rate: cfg.sample_rate,
             frame_size: cfg.frame_size(),
@@ -283,68 +251,46 @@ impl OpusDecoder {
 
     /// Decode one Opus packet into interleaved f32 PCM.
     pub fn decode(&mut self, payload: &[u8]) -> Result<AudioFrame> {
-        let pkt = packet_from_bytes(payload)?;
-        self.ctx.send_packet(Some(&pkt))?;
-        let mut samples = Vec::new();
-        loop {
-            match self.ctx.receive_frame() {
-                Ok(frame) => self.append_interleaved(&frame, &mut samples)?,
-                Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(AudioFrame::new(self.sample_rate, self.channels, samples))
+        let len = c_int::try_from(payload.len())
+            .map_err(|_| AudioError::Opus("packet too large".to_owned()))?;
+        self.decode_into(payload.as_ptr(), len)
     }
 
-    /// Produce one frame of concealment for a lost packet. v1: silence (see
-    /// the module-level note on PLC).
-    #[must_use]
-    pub fn conceal(&self) -> AudioFrame {
-        AudioFrame::silence(self.sample_rate, self.channels, self.frame_size)
+    /// Conceal one lost frame with real Opus PLC (a null-packet decode). On the
+    /// (unexpected) error path, falls back to silence so the playback clock
+    /// still advances.
+    pub fn conceal(&mut self) -> AudioFrame {
+        self.decode_into(ptr::null(), 0).unwrap_or_else(|_| {
+            AudioFrame::silence(self.sample_rate, self.channels, self.frame_size)
+        })
     }
 
-    /// Read a decoded `AVFrame` into the interleaved f32 accumulator,
-    /// converting whatever sample format the decoder produced.
-    #[allow(clippy::cast_sign_loss)] // ffmpeg nb_samples / linesize are non-negative on a decoded frame
-    fn append_interleaved(&self, frame: &AVFrame, out: &mut Vec<f32>) -> Result<()> {
-        let n = frame.nb_samples as usize;
-        let ch = self.channels as usize;
-        match frame.format {
-            // Packed float: already interleaved — straight copy.
-            ffi::AV_SAMPLE_FMT_FLT => {
-                let src = unsafe { slice::from_raw_parts(frame.data[0].cast::<f32>(), n * ch) };
-                out.extend_from_slice(src);
-            }
-            // Planar float: one plane per channel; interleave.
-            ffi::AV_SAMPLE_FMT_FLTP => {
-                let planes: Vec<&[f32]> = (0..ch)
-                    .map(|c| unsafe { slice::from_raw_parts(frame.data[c].cast::<f32>(), n) })
-                    .collect();
-                for i in 0..n {
-                    for plane in &planes {
-                        out.push(plane[i]);
-                    }
-                }
-            }
-            // Packed s16: interleaved i16 → f32.
-            ffi::AV_SAMPLE_FMT_S16 => {
-                let src = unsafe { slice::from_raw_parts(frame.data[0].cast::<i16>(), n * ch) };
-                out.extend(src.iter().map(|&s| f32::from(s) / 32768.0));
-            }
-            // Planar s16: one i16 plane per channel → interleaved f32.
-            ffi::AV_SAMPLE_FMT_S16P => {
-                let planes: Vec<&[i16]> = (0..ch)
-                    .map(|c| unsafe { slice::from_raw_parts(frame.data[c].cast::<i16>(), n) })
-                    .collect();
-                for i in 0..n {
-                    for plane in &planes {
-                        out.push(f32::from(plane[i]) / 32768.0);
-                    }
-                }
-            }
-            other => return Err(AudioError::UnsupportedSampleFormat(other)),
+    /// Shared decode body. `data` is either a valid `len`-byte packet or null
+    /// (PLC); libopus writes up to `frame_size` samples/channel into `pcm`.
+    fn decode_into(&mut self, data: *const u8, len: c_int) -> Result<AudioFrame> {
+        let ch = usize::from(self.channels);
+        let mut pcm = vec![0.0f32; self.frame_size * ch];
+        let frame_size = c_int::try_from(self.frame_size)
+            .map_err(|_| AudioError::Opus("frame_size out of range".to_owned()))?;
+        // SAFETY: `pcm` has frame_size*channels capacity; `data` is null (PLC) or
+        // points to `len` readable bytes. decode_fec is 0 — we don't use FEC.
+        let n = unsafe {
+            opus_sys::opus_decode_float(self.dec, data, len, pcm.as_mut_ptr(), frame_size, 0)
+        };
+        if n < 0 {
+            return Err(opus_err("opus_decode_float", n));
         }
-        Ok(())
+        let n = usize::try_from(n).expect("non-negative after the check above");
+        pcm.truncate(n * ch);
+        Ok(AudioFrame::new(self.sample_rate, self.channels, pcm))
+    }
+}
+
+impl Drop for OpusDecoder {
+    fn drop(&mut self) {
+        // SAFETY: `dec` came from opus_decoder_create and is destroyed exactly
+        // once, here.
+        unsafe { opus_sys::opus_decoder_destroy(self.dec) };
     }
 }
 
@@ -387,21 +333,45 @@ mod tests {
         );
     }
 
-    /// Concealment yields exactly one silent frame of the configured size —
-    /// the jitter buffer drops this in for a missing packet to keep the
-    /// playback clock advancing.
+    /// Real PLC, not silence: after priming the decoder with a steady tone,
+    /// `conceal()` extrapolates the waveform — the concealed frame is the right
+    /// size and carries signal energy rather than digital silence. This is the
+    /// behaviour the direct-libopus migration buys over the old avcodec path
+    /// (which could only splice in zeros).
     #[test]
-    fn conceal_yields_one_silent_frame() {
+    fn plc_after_tone_carries_energy_not_silence() {
         let cfg = OpusConfig::default();
-        let dec = OpusDecoder::new(cfg).unwrap();
-        let frame = dec.conceal();
-        assert_eq!(frame.frames(), cfg.frame_size());
-        assert_eq!(frame.channels, cfg.channels);
-        assert!(frame.is_silent());
+        let mut enc = OpusEncoder::new(cfg).unwrap();
+        let mut dec = OpusDecoder::new(cfg).unwrap();
+        let fs = enc.frame_size();
+
+        for i in 0..10 {
+            let frame = sine_frame(cfg.sample_rate, cfg.channels, 440.0, fs, i * fs);
+            for pkt in enc.encode(&frame.samples).unwrap() {
+                dec.decode(&pkt).unwrap();
+            }
+        }
+
+        let concealed = dec.conceal();
+        assert_eq!(concealed.frames(), fs, "PLC frame is one full frame");
+        assert_eq!(concealed.channels, cfg.channels);
+        let peak = concealed
+            .samples
+            .iter()
+            .fold(0.0f32, |a, &s| a.max(s.abs()));
+        assert!(
+            peak > 0.01,
+            "PLC should extrapolate signal energy, got peak={peak}"
+        );
+        assert!(
+            !concealed.is_silent(),
+            "PLC output must not be digital silence"
+        );
     }
 
     /// A decode-after-gap (packet N+1 with N dropped) still decodes cleanly —
-    /// the FFmpeg decoder doesn't wedge on a missing predecessor.
+    /// the decoder doesn't wedge on a missing predecessor, and the concealment
+    /// call in the gap keeps it in the right state.
     #[test]
     fn decode_survives_a_dropped_packet() {
         let cfg = OpusConfig::default();
@@ -416,8 +386,8 @@ mod tests {
         }
         assert!(packets.len() >= 5);
 
-        // Decode all but skip packet index 2 (simulating loss). Every
-        // delivered packet must still decode to a full frame.
+        // Decode all but skip packet index 2 (simulating loss). Every delivered
+        // packet must still decode to a full frame.
         for (i, pkt) in packets.iter().enumerate() {
             if i == 2 {
                 let _ = dec.conceal(); // jitter buffer would insert concealment here
@@ -428,19 +398,16 @@ mod tests {
         }
     }
 
-    /// The `frame_duration` AVOption can silently fall back to libopus's 20 ms
-    /// default; pin that the opened encoder actually adopted our 10 ms frame
-    /// (480 samples at 48 kHz), so a silent no-op becomes a test failure (per
-    /// the repo convention for knobs that may silently no-op). The decoder's
-    /// conceal-frame size must agree, or concealment frames would be the wrong
-    /// length.
+    /// The encoder and decoder agree on the configured 10 ms frame size (480
+    /// samples at 48 kHz), and concealment frames are that same length — so a
+    /// concealed gap is exactly one frame on the playback clock.
     #[test]
     fn encoder_and_decoder_agree_on_configured_frame_size() {
         let cfg = OpusConfig::default();
         let enc = OpusEncoder::new(cfg).unwrap();
-        let dec = OpusDecoder::new(cfg).unwrap();
+        let mut dec = OpusDecoder::new(cfg).unwrap();
         assert_eq!(cfg.frame_size(), 480, "48 kHz / 10 ms");
-        assert_eq!(enc.frame_size(), cfg.frame_size(), "encoder adopted 10 ms");
+        assert_eq!(enc.frame_size(), cfg.frame_size(), "encoder frame size");
         assert_eq!(
             dec.conceal().frames(),
             cfg.frame_size(),
@@ -448,8 +415,7 @@ mod tests {
         );
     }
 
-    /// An out-of-range channel count is rejected before the unsafe per-channel
-    /// plane indexing in `append_interleaved` can be reached.
+    /// An out-of-range channel count is rejected before any libopus call.
     #[test]
     fn constructors_reject_unsupported_channel_count() {
         for ch in [0u8, 3, 8] {

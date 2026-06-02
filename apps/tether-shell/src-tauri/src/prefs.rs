@@ -130,9 +130,21 @@ mod tests {
     #[test]
     fn round_trips_sharing_enabled() {
         let path = temp_path();
-        save_to(&path, &ShellPrefs { sharing_enabled: true }).unwrap();
+        save_to(
+            &path,
+            &ShellPrefs {
+                sharing_enabled: true,
+            },
+        )
+        .unwrap();
         assert!(load_from(&path).sharing_enabled);
-        save_to(&path, &ShellPrefs { sharing_enabled: false }).unwrap();
+        save_to(
+            &path,
+            &ShellPrefs {
+                sharing_enabled: false,
+            },
+        )
+        .unwrap();
         assert!(!load_from(&path).sharing_enabled);
         let _ = std::fs::remove_file(&path);
     }

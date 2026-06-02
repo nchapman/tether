@@ -366,7 +366,10 @@ mod tests {
             host_peer: Some("Laptop".to_string()),
             ..Default::default()
         };
-        assert_eq!(status_line(&with_peer, &recents), "Sharing · Laptop connected");
+        assert_eq!(
+            status_line(&with_peer, &recents),
+            "Sharing · Laptop connected"
+        );
     }
 
     #[test]

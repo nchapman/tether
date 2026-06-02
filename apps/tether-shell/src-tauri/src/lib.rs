@@ -16,9 +16,16 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
 
-/// Start hosting: spawn `tether-host --ipc` with real screen capture. (The
-/// engine's `--test-pattern` dev fallback is reachable only from the CLI, not
-/// the UI.)
+/// Address the UI-launched host binds to. `0.0.0.0` (all interfaces) rather than
+/// the engine's loopback CLI default, so a paired device on the LAN can actually
+/// reach it — sharing across machines is the whole point. This is not a security
+/// downgrade: access is gated by pairing (PIN first-contact + TLS cert pinning),
+/// not by bind scope. Port matches the engine default.
+const HOST_BIND_ADDR: &str = "0.0.0.0:7654";
+
+/// Start hosting: spawn `tether-host --ipc` with real screen capture, bound to
+/// [`HOST_BIND_ADDR`]. (The engine's `--test-pattern` dev fallback is reachable
+/// only from the CLI, not the UI.)
 ///
 /// The sharing posture is persisted as on only once the host actually reaches
 /// `listening` (in the supervisor reader), not here at spawn time — so a host
@@ -27,7 +34,11 @@ use tether_ipc::ShellCommand;
 #[tauri::command]
 async fn start_host(app: AppHandle, supervisor: State<'_, Supervisor>) -> Result<(), String> {
     supervisor
-        .spawn(&app, ROLE_HOST, &["--ipc".to_string()])
+        .spawn(
+            &app,
+            ROLE_HOST,
+            &["--ipc".to_string(), HOST_BIND_ADDR.to_string()],
+        )
         .await
 }
 

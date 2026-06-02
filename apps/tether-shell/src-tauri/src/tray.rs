@@ -3,7 +3,7 @@
 //! The shell lives in the tray: the window can be closed while a host keeps
 //! sharing in the background. This module owns the tray's dynamic menu — a
 //! status header, a "Connect to" quick-connect submenu of recent computers, a
-//! "Share this computer" toggle, an "Add a device…" entry, and the
+//! "Share this computer" toggle, a "Pair a device…" entry, and the
 //! show/quit items — plus the hover tooltip, and keeps them in sync with the
 //! engines' lifecycle.
 //!
@@ -233,7 +233,7 @@ fn build_menu(
     let share = CheckMenuItemBuilder::with_id(ID_SHARE, "Share this computer")
         .checked(status.sharing)
         .build(app)?;
-    let add_device = MenuItemBuilder::with_id(ID_ADD_DEVICE, "Add a device…").build(app)?;
+    let add_device = MenuItemBuilder::with_id(ID_ADD_DEVICE, "Pair a device…").build(app)?;
     let show = MenuItemBuilder::with_id(ID_SHOW, "Show Tether").build(app)?;
     let quit = MenuItemBuilder::with_id(ID_QUIT, "Quit").build(app)?;
 

@@ -65,7 +65,7 @@ export function AddComputerSheet({
           <PinInput value={pin} onChange={setPin} onComplete={submit} disabled={busy} />
           <span className="field-hint">
             Open Tether on the computer you want to reach, turn on sharing, and
-            read the PIN it shows under “Add a device.”
+            choose “Pair a device” — enter the PIN it shows here.
           </span>
         </div>
 

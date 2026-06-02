@@ -70,7 +70,7 @@ export function SharingSheet({
                 <div className="pin-box">
                   <span className="pin mono">{host.pin}</span>
                   <span className="field-hint">
-                    Enter this PIN on the new computer — expires in {host.secondsLeft}s
+                    Enter this PIN on the other computer — expires in {host.secondsLeft}s
                   </span>
                 </div>
               ) : (
@@ -87,14 +87,14 @@ export function SharingSheet({
                       setNewLabel("");
                     }}
                   >
-                    Add a device
+                    Pair a device
                   </button>
                 </div>
               )}
               {host.pendingPeer && !host.pin && (
                 <p className="field-hint">
-                  {host.pendingPeer} tried to connect but isn't paired. Add a
-                  device, then enter the PIN on it.
+                  {host.pendingPeer} tried to connect but isn't paired. Pair a
+                  device, then give them the PIN it shows.
                 </p>
               )}
             </div>

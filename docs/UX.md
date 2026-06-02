@@ -161,8 +161,8 @@ trust ceremony, so neither the fingerprint nor any debug knob is surfaced here.
   state) — they must never disagree.
 - A host operator needs exactly two things to onboard a new device: the
   **address** (to tell the other person) and the **PIN** (generated on demand
-  via Add a device). Both have one-click Copy.
-- Paired devices, **Add a device** (`StartPairing` → `PairingPin`), and
+  via Pair a device). Both have one-click Copy.
+- Paired devices, **Pair a device** (`StartPairing` → `PairingPin`), and
   **Revoke** (in `⋯`, with confirm) map to existing IPC.
 - No "Advanced" disclosure. The fingerprint isn't shown (the PIN flow already
   authenticates the cert, so an out-of-band code is redundant clutter), and the
@@ -186,7 +186,7 @@ focused sheet, single screen (not a wizard), that frames the trust ceremony.
 │  └──┴──┴──┴──┴──┴──┴──┴──┘                │
 │  Open Tether on the computer you want to  │
 │  reach, turn on sharing, and read the PIN │  ← directional copy: PIN is on the OTHER machine
-│  it shows under "Add a device."           │
+│  it shows under "Pair a device."          │
 │                                           │
 │  Name (optional)      Office desktop      │
 │                                           │
@@ -216,7 +216,7 @@ into a connection.
   Connect to            ▸  Office desktop / Living room PC / New connection…
   ─────────
   ☑ Share this computer              ← toggles start_host / stop_engine (shared state)
-  Add a device…                      ← when sharing; force-shows the window
+  Pair a device…                     ← when sharing; force-shows the window
   ─────────
   Open Tether
   Quit
@@ -229,7 +229,7 @@ into a connection.
 - **Connect to ▸** lists up to ~5 recents by `last_connected_unix` for
   one-click reconnect without opening the window; **New connection…** opens the
   Add sheet.
-- **Add a device…** must **force-show the main window** so the `PairingPin`
+- **Pair a device…** must **force-show the main window** so the `PairingPin`
   event has a surface to display (pairing initiated from a closed window
   otherwise has nowhere to show the PIN).
 - Tray menu, tooltip, and icon are rebuilt from live engine state: the
@@ -253,7 +253,7 @@ fallback. States to handle:
 | Host unreachable (timeout) | Row returns to idle with an inline transient "Couldn't reach Office desktop" — not a global banner. Never strand the spinner. |
 | Revoked / forgotten by host | Resume fails → "Office desktop no longer recognizes this computer." Action: **Pair again** (opens Add sheet pre-filled with that address). |
 | Sharing toggled OFF while a peer connected | Confirm: "Stop sharing? Jane is connected and will be disconnected." (Use `PeerConnected`/`PeerDisconnected` to know.) |
-| Host-side PIN expiry | The displayed PIN visibly counts down, then "expired — Add a device again." |
+| Host-side PIN expiry | The displayed PIN visibly counts down, then "expired — Pair a device again." |
 | Engine fails to launch | One-time setup error (binary missing / broken install), not a transient toast. The supervisor returns a rich message. |
 | Forget a saved computer | Confirm: "Forget Office desktop? You'll need the PIN to connect again." |
 
@@ -411,7 +411,7 @@ Each phase is independently shippable and testable.
 ### Phase 2 — Hosting moves to the tray + settings sheet — DONE
 
 - Host UI lives in the `⚙` sharing-settings sheet (landed with Phase 1): the
-  toggle, Copy on address, live status, paired devices, Add a device, Revoke in
+  toggle, Copy on address, live status, paired devices, Pair a device, Revoke in
   `⋯`. No Advanced section — the fingerprint and the test-pattern dev toggle
   were dropped from the UI (the fingerprint is redundant given PIN pairing; the
   engine's `--test-pattern` stays CLI-only).
@@ -443,13 +443,13 @@ Each phase is independently shippable and testable.
 - Menu: disabled status header (`Not sharing` / `Sharing · waiting` /
   `Sharing · <peer> connected` / `Connected to <host>`), a **Connect to ▸**
   recents submenu (MRU, capped at 8), a **Disconnect** item only while a client
-  session is live, a **Share this computer** check toggle, **Add a device…**,
+  session is live, a **Share this computer** check toggle, **Pair a device…**,
   and Show/Quit.
 - Tray recents connect **headless** when idle (the engine's video window is what
   the user wants); if a session is already live, the tray force-shows the window
   and routes through the webview's "Switch computer?" confirm (`request-connect`
   event) rather than silently killing it. Spawn failures force-show the window.
-- **Add a device…** force-shows the window and opens the Sharing sheet
+- **Pair a device…** force-shows the window and opens the Sharing sheet
   (`open-sharing` event). Rename/forget emit `hosts-changed` so the submenu
   refreshes in-session.
 - Closing the window **hides it to the tray** (`CloseRequested` → `prevent_close`

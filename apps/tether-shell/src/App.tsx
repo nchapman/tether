@@ -102,7 +102,7 @@ function App() {
         setHost(initialHostState);
       }
     });
-    // The tray's "Add a device…" shows the window and asks us to open Sharing.
+    // The tray's "Pair a device…" shows the window and asks us to open Sharing.
     const unsharing = listen("open-sharing", () => {
       setSheet("sharing");
       if (hostRef.current.running) listPeers().catch((e) => console.warn(e));

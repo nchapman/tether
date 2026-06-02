@@ -291,7 +291,11 @@ fn toggle_sharing(app: &AppHandle) {
         if sharing {
             crate::stop_role(&app, supervisor.inner(), ROLE_HOST).await;
         } else if let Err(e) = supervisor
-            .spawn(&app, ROLE_HOST, &["--ipc".to_string()])
+            .spawn(
+                &app,
+                ROLE_HOST,
+                &["--ipc".to_string(), crate::HOST_BIND_ADDR.to_string()],
+            )
             .await
         {
             tracing::warn!(error = %e, "tray: start sharing failed");

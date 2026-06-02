@@ -21,7 +21,7 @@ use tether_ipc::ShellCommand;
 /// reach it — sharing across machines is the whole point. This is not a security
 /// downgrade: access is gated by pairing (PIN first-contact + TLS cert pinning),
 /// not by bind scope. Port matches the engine default.
-const HOST_BIND_ADDR: &str = "0.0.0.0:7654";
+pub(crate) const HOST_BIND_ADDR: &str = "0.0.0.0:7654";
 
 /// Start hosting: spawn `tether-host --ipc` with real screen capture, bound to
 /// [`HOST_BIND_ADDR`]. (The engine's `--test-pattern` dev fallback is reachable

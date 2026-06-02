@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { SavedHost } from "../ipc";
 import { recencyLabel } from "../ipc";
-import type { ClientState } from "../state";
+import type { ClientState, RowError } from "../state";
 import { OverflowMenu } from "./OverflowMenu";
 import { PlusIcon, SettingsIcon, MonitorIcon } from "../icons";
 
@@ -17,21 +17,47 @@ export function ConnectView({
   onRename,
   onForget,
   onCopyAddress,
+  onPairAgain,
   onAdd,
   onOpenSharing,
 }: {
   hosts: SavedHost[];
   client: ClientState;
-  rowErrors: Record<string, string>;
+  rowErrors: Record<string, RowError>;
   onConnect: (addr: string) => void;
   onDisconnect: () => void;
   onRename: (addr: string, label: string) => void;
   onForget: (host: SavedHost) => void;
   onCopyAddress: (addr: string) => void;
+  onPairAgain: (addr: string) => void;
   onAdd: () => void;
   onOpenSharing: () => void;
 }) {
   const [editingAddr, setEditingAddr] = useState<string | null>(null);
+
+  // ↑/↓ move focus between rows (native list nav); Enter activates the focused
+  // row's button. Disabled rows are skipped.
+  function onListKeyDown(e: React.KeyboardEvent<HTMLUListElement>) {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    const items = Array.from(
+      e.currentTarget.querySelectorAll<HTMLButtonElement>("button.host-main:not(:disabled)"),
+    );
+    if (items.length === 0) return;
+    e.preventDefault();
+    const active = document.activeElement as HTMLElement | null;
+    let current = items.indexOf(active as HTMLButtonElement);
+    // Focus may be on a secondary button inside a row (e.g. "Pair again");
+    // anchor navigation to that row rather than jumping to an endpoint.
+    if (current === -1 && active) {
+      const row = active.closest("li.host-row");
+      if (row) current = items.findIndex((btn) => row.contains(btn));
+    }
+    let next: number;
+    if (current === -1) next = e.key === "ArrowDown" ? 0 : items.length - 1;
+    else if (e.key === "ArrowDown") next = Math.min(current + 1, items.length - 1);
+    else next = Math.max(current - 1, 0);
+    items[next].focus();
+  }
 
   const connectingAddr =
     client.kind === "connecting" ? client.addr : null;
@@ -65,12 +91,11 @@ export function ConnectView({
           </p>
         </div>
       ) : (
-        <ul className="host-list">
-          {hosts.map((host, i) => (
+        <ul className="host-list" onKeyDown={onListKeyDown}>
+          {hosts.map((host) => (
             <HostRow
               key={host.addr}
               host={host}
-              index={i}
               editing={editingAddr === host.addr}
               connecting={connectingAddr === host.addr}
               connected={connectedAddr === host.addr}
@@ -85,6 +110,7 @@ export function ConnectView({
               }}
               onForget={() => onForget(host)}
               onCopyAddress={() => onCopyAddress(host.addr)}
+              onPairAgain={() => onPairAgain(host.addr)}
             />
           ))}
         </ul>
@@ -112,7 +138,6 @@ function hostLabel(hosts: SavedHost[], addr: string): string {
 
 function HostRow({
   host,
-  index,
   editing,
   connecting,
   connected,
@@ -124,20 +149,21 @@ function HostRow({
   onCommitRename,
   onForget,
   onCopyAddress,
+  onPairAgain,
 }: {
   host: SavedHost;
-  index: number;
   editing: boolean;
   connecting: boolean;
   connected: boolean;
   disabled: boolean;
-  error?: string;
+  error?: RowError;
   onConnect: () => void;
   onStartRename: () => void;
   onCancelRename: () => void;
   onCommitRename: (label: string) => void;
   onForget: () => void;
   onCopyAddress: () => void;
+  onPairAgain: () => void;
 }) {
   // Seeded once from the prop; rows are keyed by addr so this instance is
   // stable across refreshes. (If a background refresh while editing is ever
@@ -164,30 +190,40 @@ function HostRow({
 
   return (
     <li className={"host-row" + (connected ? " active" : "")}>
-      <button
-        className="host-main"
-        disabled={disabled}
-        onClick={onConnect}
-        title={`Connect to ${host.label}`}
-      >
-        <span className={"row-dot" + (connecting ? " connecting" : connected ? " on" : "")} />
-        <span className="row-text">
-          <span className="row-name">{host.label}</span>
-          <span className="row-sub mono">
-            {host.addr} · {connecting ? "connecting…" : recencyLabel(host)}
+      <div className="host-row-line">
+        <button
+          className="host-main"
+          disabled={disabled}
+          onClick={onConnect}
+          title={`Connect to ${host.label}`}
+        >
+          <span className={"row-dot" + (connecting ? " connecting" : connected ? " on" : "")} />
+          <span className="row-text">
+            <span className="row-name">{host.label}</span>
+            <span className="row-sub mono">
+              {host.addr} · {connecting ? "connecting…" : recencyLabel(host)}
+            </span>
           </span>
-          {error && <span className="row-error">{error}</span>}
-        </span>
-        {index < 9 && <kbd className="row-kbd">⌘{index + 1}</kbd>}
-      </button>
-      <OverflowMenu
-        label={`Actions for ${host.label}`}
-        actions={[
-          { label: "Rename", onSelect: onStartRename },
-          { label: "Copy address", onSelect: onCopyAddress },
-          { label: "Forget", onSelect: onForget, danger: true },
-        ]}
-      />
+        </button>
+        <OverflowMenu
+          label={`Actions for ${host.label}`}
+          actions={[
+            { label: "Rename", onSelect: onStartRename },
+            { label: "Copy address", onSelect: onCopyAddress },
+            { label: "Forget", onSelect: onForget, danger: true },
+          ]}
+        />
+      </div>
+      {error && (
+        <p className="row-error">
+          <span>{error.message}</span>
+          {error.pairAgain && (
+            <button className="link-btn" onClick={onPairAgain}>
+              Pair again
+            </button>
+          )}
+        </p>
+      )}
     </li>
   );
 }

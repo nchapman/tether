@@ -454,10 +454,23 @@ Each phase is independently shippable and testable.
 - A client `error` now force-shows the window (so a tray-initiated failure is
   visible even though it never hid the window through the webview).
 
-### Phase 4 — Native-feel + visual polish pass
+### Phase 4 — Native-feel + visual polish pass — DONE
 
-- Apply the visual spec and native-feel checklist end to end.
-- Error/edge-state copy, empty states, confirms, motion, focus, keyboard.
+- Visual spec (teal dark-first palette, type/spacing/radii/motion, full-bleed
+  rows, tight focus ring, thin scrollbar, no overscroll/selection on chrome,
+  desaturated-not-faded disabled, reduced-motion) landed with the Phase 1 CSS
+  rewrite; this pass adds the remaining native-feel *behaviors*:
+  - Window position/size persists across launches
+    (`tauri-plugin-window-state`, Rust-only lifecycle hooks).
+  - The webview's right-click context menu is suppressed except on editable
+    fields (where copy/paste is expected).
+  - The non-functional `⌘1–9` row hints are gone; `↑/↓` move focus between rows
+    (anchored to the focused row even from a secondary button), Enter activates.
+- Error/edge-state copy: `friendlyError` maps raw engine strings to human
+  guidance and flags the revoked/forgotten case, which the saved row surfaces as
+  a **Pair again** action that re-opens the Add sheet pre-filled with the
+  address. (Confirms, empty state, PIN countdown, switch-host, stop-sharing all
+  landed in earlier phases.)
 
 ---
 

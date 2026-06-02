@@ -110,22 +110,36 @@ export const installUpdate = () => invoke<void>("install_update");
 
 // --- Helpers -----------------------------------------------------------------
 
+/// A human-readable error plus whether the fix is to pair again (the host no
+/// longer trusts this computer), which the UI surfaces as a "Pair again" action.
+export type FriendlyError = { message: string; pairAgain: boolean };
+
 /// Translate a raw engine error string into human guidance. Engine errors are
 /// freeform (`Error{message}`), so we match on the stable phrases the
 /// host/client emit and fall back to the raw text. Never show the user a bare
 /// `connect failed: …` dump — that's the biggest "this is a dev tool" tell.
-export function friendlyError(raw: string, hostName: string): string {
+export function friendlyError(raw: string, hostName: string): FriendlyError {
   const m = raw.toLowerCase();
   if (m.includes("pairing required") || m.includes("refused resume")) {
-    return `${hostName} no longer recognizes this computer. You'll need to pair again with a new PIN.`;
+    return {
+      message: `${hostName} no longer recognizes this computer. You'll need to pair again with a new PIN.`,
+      pairAgain: true,
+    };
   }
   if (m.includes("pairing failed")) {
-    return "That PIN didn't match — it may be wrong or expired. Check the PIN on the other computer and try again.";
+    return {
+      message:
+        "That PIN didn't match — it may be wrong or expired. Check the PIN on the other computer and try again.",
+      pairAgain: false,
+    };
   }
   if (m.includes("connect failed") || m.includes("timed out") || m.includes("timeout") || m.includes("refused")) {
-    return `Couldn't reach ${hostName}. Make sure it's turned on and sharing is enabled there.`;
+    return {
+      message: `Couldn't reach ${hostName}. Make sure it's turned on and sharing is enabled there.`,
+      pairAgain: false,
+    };
   }
-  return raw;
+  return { message: raw, pairAgain: false };
 }
 
 /// "2h ago" / "yesterday" / "Mar 28" style recency for a saved host. Uses

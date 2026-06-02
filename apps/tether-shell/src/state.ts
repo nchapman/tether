@@ -9,6 +9,11 @@ import type { PairedPeer } from "./ipc";
 /// sheet attempt shows the error in the sheet.
 export type ConnectVia = "saved" | "add";
 
+/// An inline error shown under a saved row. `pairAgain` marks the case where
+/// the host no longer recognizes this computer, so the row offers a "Pair
+/// again" action (re-opens the Add sheet pre-filled with that address).
+export type RowError = { message: string; pairAgain?: boolean };
+
 export type ClientState =
   | { kind: "idle" }
   | { kind: "connecting"; addr: string; via: ConnectVia }

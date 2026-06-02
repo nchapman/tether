@@ -28,6 +28,7 @@ import {
   type ClientState,
   type ConnectVia,
   type HostState,
+  type RowError,
   initialHostState,
 } from "./state";
 import { ConnectView } from "./components/ConnectView";
@@ -48,7 +49,7 @@ function App() {
   const [hosts, setHosts] = useState<SavedHost[]>([]);
   const [client, setClient] = useState<ClientState>({ kind: "idle" });
   const [host, setHost] = useState<HostState>(initialHostState);
-  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  const [rowErrors, setRowErrors] = useState<Record<string, RowError>>({});
   const [sheet, setSheet] = useState<Sheet>("none");
   const [addPrefill, setAddPrefill] = useState<string | undefined>(undefined);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
@@ -182,11 +183,11 @@ function App() {
         const addr = prev.kind !== "idle" ? prev.addr : p.host ?? "";
         const via: ConnectVia =
           prev.kind === "connecting" || prev.kind === "error" ? prev.via : "saved";
-        const message = friendlyError(p.message ?? "Something went wrong.", labelFor(addr));
+        const fe = friendlyError(p.message ?? "Something went wrong.", labelFor(addr));
         if (via === "add") {
-          setClient({ kind: "error", addr, via, message });
+          setClient({ kind: "error", addr, via, message: fe.message });
         } else {
-          setRowErrors((e) => ({ ...e, [addr]: message }));
+          setRowErrors((e) => ({ ...e, [addr]: { message: fe.message, pairAgain: fe.pairAgain } }));
           setClient({ kind: "idle" });
         }
         break;
@@ -230,6 +231,19 @@ function App() {
     }
   }
 
+  // Native feel: suppress the webview's right-click menu, except on inputs
+  // where copy/paste is expected.
+  useEffect(() => {
+    const onContextMenu = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      const editable =
+        t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
+      if (!editable) e.preventDefault();
+    };
+    document.addEventListener("contextmenu", onContextMenu);
+    return () => document.removeEventListener("contextmenu", onContextMenu);
+  }, []);
+
   // Tick the host pairing-PIN countdown; clear when it elapses.
   useEffect(() => {
     if (host.pin === null) return;
@@ -261,10 +275,10 @@ function App() {
     try {
       await connectClient({ addr, pin, label });
     } catch (e) {
-      const message = friendlyError(String(e), labelFor(addr));
-      if (via === "add") setClient({ kind: "error", addr, via, message });
+      const fe = friendlyError(String(e), labelFor(addr));
+      if (via === "add") setClient({ kind: "error", addr, via, message: fe.message });
       else {
-        setRowErrors((er) => ({ ...er, [addr]: message }));
+        setRowErrors((er) => ({ ...er, [addr]: { message: fe.message, pairAgain: fe.pairAgain } }));
         setClient({ kind: "idle" });
       }
     }
@@ -386,6 +400,7 @@ function App() {
         onRename={onRename}
         onForget={onForget}
         onCopyAddress={copy}
+        onPairAgain={(addr) => openAdd(addr)}
         onAdd={() => openAdd()}
         onOpenSharing={() => {
           setSheet("sharing");

@@ -169,6 +169,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Remember the window's position/size between launches.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(Supervisor::default())
         .setup(|app| {
             // System tray: the shell keeps running here even when the window is

@@ -1327,6 +1327,15 @@ fn run_audio_playback(
     // long silence or spin. ~80 ms at 10 ms frames.
     const MAX_CONCEAL: u32 = 8;
     let mut last_seq: Option<u32> = None;
+
+    // Periodic playback-health snapshot. The ring's drift/underrun behaviour is
+    // otherwise invisible: cap-and-drop silently absorbs overflow and silence
+    // fills underruns, so without this a multi-minute session shows nothing.
+    // Frame-driven (audio arrives ~every 10 ms), like the host's send-stats —
+    // when audio stops, so does the log. 2 s matches the video stats cadence.
+    const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut last_stats_log = std::time::Instant::now();
+
     while let Ok((seq, payload)) = rx.recv() {
         if let Some(prev) = last_seq {
             // Forward distance from the last delivered frame. A small positive
@@ -1346,6 +1355,21 @@ fn run_audio_playback(
             Err(e) => warn!(error = %e, "opus decode failed; dropping audio frame"),
         }
         last_seq = Some(seq);
+
+        if last_stats_log.elapsed() >= STATS_INTERVAL {
+            let (underruns, dropped_samples, buffered) = sink.stats();
+            // `buffered` is interleaved samples; convert to wall-clock so drift
+            // toward an underrun (→ 0 ms) or the latency cap is legible at a
+            // glance. Cumulative counters climbing across snapshots flags a
+            // clock-drift problem the cap-and-drop policy is papering over.
+            let frames_buffered = buffered / usize::from(cfg.channels).max(1);
+            let buffered_ms = frames_buffered * 1000 / (cfg.sample_rate as usize).max(1);
+            info!(
+                underruns,
+                dropped_samples, buffered_ms, "audio playback stats"
+            );
+            last_stats_log = std::time::Instant::now();
+        }
     }
 
     // Channel closed: drop the player to stop the output stream.

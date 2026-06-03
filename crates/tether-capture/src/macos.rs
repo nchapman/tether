@@ -219,8 +219,10 @@ fn build_and_start_stream(
         if mode.is_null() {
             (0u32, 0u32)
         } else {
-            let w = CGDisplayModeGetPixelWidth(mode) as u32;
-            let h = CGDisplayModeGetPixelHeight(mode) as u32;
+            // Pixel dims always fit u32; the 0 fallback rejoins the
+            // null-mode path below (→ logical dims) if a query ever overflows.
+            let w = u32::try_from(CGDisplayModeGetPixelWidth(mode)).unwrap_or(0);
+            let h = u32::try_from(CGDisplayModeGetPixelHeight(mode)).unwrap_or(0);
             // CGDisplayModeRef is a CFType; balance the +1 retain
             // from Copy.
             cf_release(mode);
@@ -239,7 +241,7 @@ fn build_and_start_stream(
             logical_h,
             "CGDisplayCopyDisplayMode returned null; falling back to logical dims"
         );
-        (logical_w as u32, logical_h as u32)
+        (logical_w, logical_h)
     };
     // Align capture dims down to the encoder's 16-pixel block grid.
     // Without this, the host's encode_dims_for_viewport floor-to-16
@@ -312,8 +314,8 @@ fn build_and_start_stream(
     stream.add_output_handler(handler, SCStreamOutputType::Screen);
     stream.start_capture()?;
     let geom = CaptureGeometry {
-        logical_point_w: logical_w as f64,
-        logical_point_h: logical_h as f64,
+        logical_point_w: f64::from(logical_w),
+        logical_point_h: f64::from(logical_h),
         capture_pixel_w: width,
         capture_pixel_h: height,
     };

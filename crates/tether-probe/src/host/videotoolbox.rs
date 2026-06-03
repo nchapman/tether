@@ -165,32 +165,31 @@ impl ProfileProbe for VideoToolboxProbe {
         }
         dec.signal_eof()
             .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
-        let observed = loop {
-            match dec
-                .next_frame()
-                .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
-            {
-                Some(Frame::Gpu(gpu)) => {
-                    let GpuFrameSource::IOSurface(io) = gpu.source;
-                    break io.pixel_format;
-                }
-                Some(Frame::Cpu(_)) => {
-                    return Err(ProbeError::new(
-                        PipelineStage::Decode,
-                        "VT decoder fell back to software (Frame::Cpu) — \
-                         silent SW fallback",
-                    ))
-                }
-                None => {
-                    return Err(ProbeError::new(
-                        PipelineStage::Decode,
-                        "VT decoder produced no frames after EOF signal",
-                    ))
-                }
+        // One IDR in, EOF signalled — the very next frame is the result.
+        let observed = match dec
+            .next_frame()
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
+        {
+            Some(Frame::Gpu(gpu)) => {
+                let GpuFrameSource::IOSurface(io) = gpu.source;
+                io.pixel_format
+            }
+            Some(Frame::Cpu(_)) => {
+                return Err(ProbeError::new(
+                    PipelineStage::Decode,
+                    "VT decoder fell back to software (Frame::Cpu) — \
+                     silent SW fallback",
+                ))
+            }
+            None => {
+                return Err(ProbeError::new(
+                    PipelineStage::Decode,
+                    "VT decoder produced no frames after EOF signal",
+                ))
             }
         };
         let expected = expected_iosurface_fourccs(profile);
-        if !expected.iter().any(|f| *f == observed) {
+        if !expected.contains(&observed) {
             tracing::debug!(
                 ?profile,
                 observed = format_args!("0x{:08x}", observed),
@@ -227,25 +226,19 @@ impl ProfileProbe for VideoToolboxProbe {
         // one IDR, so signal EOF to force the drain.
         dec.signal_eof()
             .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
-        loop {
-            match dec
-                .next_frame()
-                .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
-            {
-                Some(Frame::Gpu(_)) => return Ok(()),
-                Some(Frame::Cpu(_)) => {
-                    return Err(ProbeError::new(
-                        PipelineStage::Decode,
-                        "VT decoder fell back to software (Frame::Cpu)",
-                    ))
-                }
-                None => {
-                    return Err(ProbeError::new(
-                        PipelineStage::Decode,
-                        "VT decoder produced no frames after EOF signal",
-                    ))
-                }
-            }
+        match dec
+            .next_frame()
+            .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
+        {
+            Some(Frame::Gpu(_)) => Ok(()),
+            Some(Frame::Cpu(_)) => Err(ProbeError::new(
+                PipelineStage::Decode,
+                "VT decoder fell back to software (Frame::Cpu)",
+            )),
+            None => Err(ProbeError::new(
+                PipelineStage::Decode,
+                "VT decoder produced no frames after EOF signal",
+            )),
         }
     }
 }

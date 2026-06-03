@@ -213,6 +213,49 @@ fn roundtrip_colorbars_h264_8bit() {
     assert_colorbars_outcome(&case, run_roundtrip(&case));
 }
 
+/// AV1 4:2:0 8-bit colour bars. AV1 is a production-negotiated profile
+/// (`PROFILE_PREFERENCE` ranks AV1 above HEVC Main / H.264) and decodes
+/// to `RenderLayout::Biplanar8` — the same NV12 import as H.264/HEVC, so
+/// the render side is codec-agnostic. The codec-level
+/// `av1_main_dmabuf_roundtrip` only pushes a uniform grey frame, which
+/// can't catch a hue cast or Cb/Cr swap; this is the AV1 colour guard.
+/// SKIPs (via `Capability::VaapiAv1`) on drivers without AV1 encode.
+#[test]
+#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA3+) + Vulkan dma-buf import"]
+fn roundtrip_colorbars_av1_8bit() {
+    let case = colorbars_case(
+        "colorbars_av1_8bit",
+        AV1_8BIT_420,
+        &[Capability::VaapiAv1, Capability::VulkanDmaBufImport],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+/// AV1 4:2:0 10-bit colour bars. In `PROFILE_PREFERENCE` it ranks below
+/// the HEVC 4:4:4 entries but above HEVC Main10 and AV1 8-bit, and
+/// decodes to `RenderLayout::Biplanar16` — same 10-in-16 import as HEVC
+/// Main10, but from the AV1 decoder, with colour asserted. No codec-level
+/// AV1 10-bit test exists, so this is the only AV1 10-bit coverage
+/// anywhere.
+/// Shares the P010 dma-buf submit path with HEVC Main10 (and the same
+/// `GR32`→`RG32` fourcc fix that unblocked it); verified green on Lunar
+/// Lake. SKIPs only where the driver lacks AV1 10-bit encode or R16/Rg16
+/// storage.
+#[test]
+#[ignore = "requires VAAPI AV1 10-bit encode + storage R16/Rg16 + Vulkan dma-buf import"]
+fn roundtrip_colorbars_av1_10bit() {
+    let case = colorbars_case(
+        "colorbars_av1_10bit",
+        AV1_10BIT_420,
+        &[
+            Capability::VaapiAv1,
+            Capability::VulkanDmaBufImport,
+            Capability::BitDepth10RendererSupport,
+        ],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
 #[test]
 #[ignore = "requires VAAPI HEVC Main + Vulkan dma-buf import"]
 fn roundtrip_colorbars_hevc_main_8bit() {
@@ -225,7 +268,7 @@ fn roundtrip_colorbars_hevc_main_8bit() {
 }
 
 #[test]
-#[ignore = "requires VAAPI HEVC Main 10 (P010) + storage R16/Rg16; may SKIP on Intel iHD/Meteor Lake"]
+#[ignore = "requires VAAPI HEVC Main 10 (P010) + storage R16/Rg16"]
 fn roundtrip_colorbars_hevc_main10() {
     let case = colorbars_case(
         "colorbars_hevc_main10",
@@ -349,6 +392,16 @@ const HEVC_MAIN444_10BIT: VideoProfile = VideoProfile {
     chroma: ChromaSubsampling::Yuv444,
     bit_depth: 10,
 };
+const AV1_8BIT_420: VideoProfile = VideoProfile {
+    codec: CodecKind::Av1,
+    chroma: ChromaSubsampling::Yuv420,
+    bit_depth: 8,
+};
+const AV1_10BIT_420: VideoProfile = VideoProfile {
+    codec: CodecKind::Av1,
+    chroma: ChromaSubsampling::Yuv420,
+    bit_depth: 10,
+};
 
 const FIXTURE_PNG: &str = "test-pattern-3360x2100.png";
 
@@ -373,6 +426,57 @@ fn roundtrip_h264_8bit_identity() {
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
+        floors: FLOOR_IDENTITY,
+    };
+    assert_outcome(&case, run_roundtrip(&case));
+}
+
+/// AV1 4:2:0 8-bit identity. AV1 encoder/decoder pair → Biplanar8
+/// import — the geometric companion to `roundtrip_colorbars_av1_8bit`.
+/// Catches AV1-specific stride / decode-output regressions the
+/// uniform-grey codec-level `av1_main_dmabuf_roundtrip` can't see.
+/// SKIPs on drivers without AV1 encode.
+#[test]
+#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA3+) + Vulkan dma-buf import"]
+fn roundtrip_av1_8bit_identity() {
+    let case = RoundtripCase {
+        name: "av1_8bit_identity",
+        profile: AV1_8BIT_420,
+        fixture: Fixture::CoordEncoded,
+        capture_dims: (1920, 1200),
+        encode_dims: (1920, 1200),
+        surface_dims: (1920, 1200),
+        frames_encoded: 6,
+        assert_steady_state_eps: None,
+        color_space: VideoColorSpec::sdr_desktop(),
+        requires: &[Capability::VaapiAv1, Capability::VulkanDmaBufImport],
+        floors: FLOOR_IDENTITY,
+    };
+    assert_outcome(&case, run_roundtrip(&case));
+}
+
+/// AV1 4:2:0 10-bit identity. AV1 encoder/decoder pair → Biplanar16
+/// import — the geometric companion to `roundtrip_colorbars_av1_10bit`,
+/// and the only AV1 10-bit geometry coverage anywhere. Verified green on
+/// Lunar Lake after the P010 UV-plane fourcc fix.
+#[test]
+#[ignore = "requires VAAPI AV1 10-bit encode + storage R16/Rg16 + Vulkan dma-buf import"]
+fn roundtrip_av1_10bit_identity() {
+    let case = RoundtripCase {
+        name: "av1_10bit_identity",
+        profile: AV1_10BIT_420,
+        fixture: Fixture::CoordEncoded,
+        capture_dims: (1920, 1200),
+        encode_dims: (1920, 1200),
+        surface_dims: (1920, 1200),
+        frames_encoded: 6,
+        assert_steady_state_eps: None,
+        color_space: VideoColorSpec::sdr_desktop(),
+        requires: &[
+            Capability::VaapiAv1,
+            Capability::VulkanDmaBufImport,
+            Capability::BitDepth10RendererSupport,
+        ],
         floors: FLOOR_IDENTITY,
     };
     assert_outcome(&case, run_roundtrip(&case));
@@ -423,10 +527,12 @@ fn roundtrip_hevc_main444_8bit_identity() {
 
 /// HEVC Main 10 identity. P010 dma-buf bridge → encoder.submit_dmabuf
 /// → decoder → Biplanar16 import → `range_kind = LIMITED_10` shader
-/// dispatch. Empirically SKIPs on Intel iHD + Meteor Lake
-/// (FFmpeg vaapi_drm_format_map lacks P010 entries on that combo).
+/// dispatch. Previously SKIP'd across Intel (iHD/Meteor Lake/Lunar
+/// Lake) — misdiagnosed as a driver P010 gap; the real cause was the
+/// UV-plane fourcc (`GR32` vs FFmpeg's `RG1616`), fixed in
+/// `build_p010_dmabuf_frame`. Now runs; verified green on Lunar Lake.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16; may SKIP on Intel iHD/Meteor Lake"]
+#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16"]
 fn roundtrip_hevc_main10_identity() {
     let case = RoundtripCase {
         name: "hevc_main10_identity",
@@ -457,11 +563,12 @@ fn roundtrip_hevc_main10_identity() {
 /// one `Rgb10a2Unorm` texture (`shader_yuv444_10bit.wgsl`). This cell is
 /// the gate that exercises that packed path end-to-end.
 ///
-/// Empirically SKIPs on Intel iHD + Meteor Lake — same driver-side
-/// vaapi_drm_format_map gap as the 4:2:0 10-bit Main10 cell.
+/// Unlike the 4:2:0 Main10 cell, this never hit the P010 fourcc gap —
+/// XV30 is a single packed layer, not the R16+UV biplanar P010 layout —
+/// and runs green on Lunar Lake. SKIPs only where the driver lacks HEVC
+/// 4:4:4 10-bit encode.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Rgb10a2Unorm storage; \
-            may SKIP on Intel iHD/Meteor Lake"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Rgb10a2Unorm storage"]
 fn roundtrip_hevc_main444_10bit_identity() {
     let case = RoundtripCase {
         name: "hevc_main444_10bit_identity",
@@ -712,10 +819,11 @@ fn roundtrip_hevc_main444_8bit_full_chain() {
 /// 10-bit scaler input path doesn't exist in production), surface
 /// > encode so the renderer's Mitchell upscale of the decoded 10-bit
 /// > content gets exercised. Targets the Biplanar16 import + 10-bit
-/// > shader dispatch + Mitchell upscale all at once. Will SKIP on
-/// > Intel iHD + Meteor Lake (P010 dma-buf driver gap).
+/// > shader dispatch + Mitchell upscale all at once. Runs on Lunar Lake
+/// > since the P010 UV-plane fourcc fix; SKIPs only where the driver
+/// > lacks HEVC Main 10 encode or R16/Rg16 storage.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16; may SKIP on Intel iHD/Meteor Lake"]
+#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16"]
 fn roundtrip_hevc_main10_client_upscale() {
     let case = RoundtripCase {
         name: "hevc_main10_client_upscale",

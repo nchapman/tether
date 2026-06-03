@@ -794,6 +794,72 @@ fn encode_via_xv30_bridge(
     packets
 }
 
+/// The gpuconvert bridge the scaler chain feeds, selected by the
+/// negotiated chroma — NV12 for 4:2:0, packed XYUV for 4:4:4 8-bit.
+/// Mirrors production's `GpuConvertBridge` (apps/tether-host) so the
+/// `*_full_chain` cells exercise the real `scale → bridge → encode_gpu`
+/// path for each chroma. Previously this was hardwired to NV12, so the
+/// 4:4:4 full-chain cell fed a 4:2:0 surface to a 4:4:4 encoder and
+/// skipped forever with "encoder not configured for input format" — a
+/// permanently-green test that never ran on any hardware.
+enum ScalerChainBridge {
+    Nv12(tether_gpuconvert::Nv12DmaBuf),
+    Yuv444(tether_gpuconvert::Yuv444DmaBuf),
+}
+
+impl ScalerChainBridge {
+    fn device(&self) -> &wgpu::Device {
+        match self {
+            ScalerChainBridge::Nv12(b) => b.device(),
+            ScalerChainBridge::Yuv444(b) => b.device(),
+        }
+    }
+
+    fn queue(&self) -> &wgpu::Queue {
+        match self {
+            ScalerChainBridge::Nv12(b) => b.queue(),
+            ScalerChainBridge::Yuv444(b) => b.queue(),
+        }
+    }
+
+    fn import_bgra_dmabuf(
+        &self,
+        fd: std::os::fd::OwnedFd,
+        modifier: u64,
+        stride: u64,
+        offset: u64,
+        width: u32,
+        height: u32,
+    ) -> std::result::Result<wgpu::Texture, String> {
+        match self {
+            ScalerChainBridge::Nv12(b) => b
+                .import_bgra_dmabuf(fd, modifier, stride, offset, width, height)
+                .map_err(|e| e.to_string()),
+            ScalerChainBridge::Yuv444(b) => b
+                .import_bgra_dmabuf(fd, modifier, stride, offset, width, height)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Convert a scaled BGRA texture into an encoder-ready codec frame in
+    /// the bridge's chroma — the format the cell's encoder was built for.
+    fn convert_to_codec_frame(
+        &self,
+        scaled: &wgpu::Texture,
+    ) -> std::result::Result<tether_codec::DmaBufFrame, String> {
+        match self {
+            ScalerChainBridge::Nv12(b) => b
+                .convert(scaled)
+                .map(|f| build_codec_dmabuf_frame_nv12(&f))
+                .map_err(|e| e.to_string()),
+            ScalerChainBridge::Yuv444(b) => b
+                .convert(scaled)
+                .map(|f| build_codec_dmabuf_frame_xyuv(&f))
+                .map_err(|e| e.to_string()),
+        }
+    }
+}
+
 fn encode_via_scaler_chain(
     profile: VideoProfile,
     capture: (u32, u32),
@@ -801,7 +867,7 @@ fn encode_via_scaler_chain(
     capture_bgra: &[u8],
     frames: usize,
 ) -> Vec<tether_codec::EncodedPacket> {
-    use tether_gpuconvert::{export_texture_as_dmabuf, Nv12DmaBuf};
+    use tether_gpuconvert::{export_texture_as_dmabuf, Nv12DmaBuf, Yuv444DmaBuf};
     use tether_scaler::{ColorSpace, Pipelines, Scaler};
 
     let mut enc = match VaapiEncoder::new(profile, encode.0, encode.1, 30, 4_000) {
@@ -811,11 +877,28 @@ fn encode_via_scaler_chain(
             return Vec::new();
         }
     };
-    let bridge = match pollster::block_on(Nv12DmaBuf::new(encode.0, encode.1)) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("SKIP: Nv12DmaBuf::new failed: {e}");
-            return Vec::new();
+    // Match the bridge to the encoder's input chroma, exactly as
+    // production's `encode_gpu_frame` does. 10-bit scaler chains aren't
+    // wired (asserted in `encode_chain`), so only the 8-bit bridges
+    // appear here.
+    let bridge = match profile.chroma {
+        ChromaSubsampling::Yuv420 => {
+            match pollster::block_on(Nv12DmaBuf::new(encode.0, encode.1)) {
+                Ok(b) => ScalerChainBridge::Nv12(b),
+                Err(e) => {
+                    eprintln!("SKIP: Nv12DmaBuf::new failed: {e}");
+                    return Vec::new();
+                }
+            }
+        }
+        ChromaSubsampling::Yuv444 => {
+            match pollster::block_on(Yuv444DmaBuf::new(encode.0, encode.1)) {
+                Ok(b) => ScalerChainBridge::Yuv444(b),
+                Err(e) => {
+                    eprintln!("SKIP: Yuv444DmaBuf::new failed: {e}");
+                    return Vec::new();
+                }
+            }
         }
     };
     let src_export = match export_texture_as_dmabuf(
@@ -896,14 +979,13 @@ fn encode_via_scaler_chain(
                 return Vec::new();
             }
         };
-        let nv12 = match bridge.convert(scaled) {
-            Ok(n) => n,
+        let codec_frame = match bridge.convert_to_codec_frame(scaled) {
+            Ok(f) => f,
             Err(e) => {
-                eprintln!("SKIP: nv12 convert failed: {e}");
+                eprintln!("SKIP: scaler-chain bridge convert failed: {e}");
                 return Vec::new();
             }
         };
-        let codec_frame = build_codec_dmabuf_frame_nv12(&nv12);
         let gpu_frame = tether_codec::GpuEncoderFrame::DmaBuf(&codec_frame);
         match enc.encode_gpu(gpu_frame, t, t == 0) {
             Ok(p) => packets.extend(p),
@@ -950,6 +1032,33 @@ fn build_codec_dmabuf_frame_nv12(
                 pitch: [uv_stride, 0, 0, 0],
             },
         ],
+    }
+}
+
+/// Build a packed XYUV (4:4:4 8-bit) `DmaBufFrame` from a Yuv444 bridge
+/// output. Mirrors production's `yuv444_dmabuf_to_codec_frame` — single
+/// object, single XYUV layer.
+fn build_codec_dmabuf_frame_xyuv(
+    yuv: &tether_gpuconvert::Yuv444DmaBufFrame,
+) -> tether_codec::DmaBufFrame {
+    const XYUV_FOURCC: u32 = u32::from_le_bytes(*b"XYUV");
+    let dup_fd = yuv.fd.try_clone().expect("dup XYUV fd");
+    let off = u32::try_from(yuv.offset).expect("offset fits in u32");
+    let stride = u32::try_from(yuv.stride).expect("stride fits in u32");
+    tether_codec::DmaBufFrame {
+        fourcc: XYUV_FOURCC,
+        objects: vec![tether_codec::DmaBufObject {
+            fd: dup_fd,
+            size: yuv.size,
+            drm_format_modifier: yuv.modifier,
+        }],
+        layers: vec![tether_codec::DmaBufLayer {
+            drm_format: XYUV_FOURCC,
+            num_planes: 1,
+            object_index: [0, 0, 0, 0],
+            offset: [off, 0, 0, 0],
+            pitch: [stride, 0, 0, 0],
+        }],
     }
 }
 

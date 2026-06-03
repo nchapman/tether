@@ -344,6 +344,41 @@ fn decode_reference_colorbars_hevc_main444_10bit() {
     );
 }
 
+/// Conformance anchor for the 4:4:4 **8-bit** (packed XYUV) decode path —
+/// the 8-bit sibling of `decode_reference_colorbars_hevc_main444_10bit`.
+/// The XYUV pack convention is hand-authored WGSL (`bgra_to_yuv444.wgsl`
+/// / `shader_yuv444.wgsl`), the same risk class as the XV30/Y410 lane
+/// swap fixed in 28c2d5b: a wrong-but-symmetric Y↔U swap round-trips at
+/// SSIM≈1 and even passes the absolute-colour bars, because the in-loop
+/// VAAPI encode/decode is itself lane-symmetric. Only a foreign decoder
+/// breaks the symmetry — so decode the committed libx265 reference
+/// (already the shared cross-platform fixture macOS `iosurface_test`
+/// uses) through the real VAAPI XYUV → import → shader path. macOS had
+/// this 8-bit anchor; Linux only had the 10-bit one. See the
+/// fixtures/README "Linux/Windows render tests" note.
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 8-bit (XYUV) + Vulkan dma-buf import"]
+fn decode_reference_colorbars_hevc_main444_8bit() {
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_8bit.idr");
+    let dims = (128, 128);
+    let Some(bgra) = crate::test_harness::render_reference_bitstream(
+        HEVC_MAIN444_8BIT,
+        FIXTURE,
+        dims,
+        VideoColorSpec::sdr_desktop(),
+    ) else {
+        eprintln!("SKIPPED decode_reference_colorbars_hevc_main444_8bit: VAAPI/Vulkan 4:4:4 8-bit decode unavailable");
+        return;
+    };
+    crate::color_fixture::assert_colorbars(
+        "ref 4:4:4 8-bit",
+        &bgra,
+        dims.0,
+        dims.1,
+        crate::color_fixture::ChannelOrder::Bgra,
+    );
+}
+
 // =====================================================================
 // Per-cell floors — derived from a green-main run on a real VAAPI box
 // (Intel iHD, Mesa, dev workstation, 2026-05-22). Thresholds sit at

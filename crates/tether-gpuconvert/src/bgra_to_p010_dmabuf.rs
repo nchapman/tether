@@ -9,14 +9,22 @@
 //!
 //! Differences from the NV12 path are all in the output plane formats:
 //! `R16Unorm` Y + `Rg16Unorm` UV (10-bit data MSB-aligned in 16-bit
-//! cells; see `bgra_to_p010.wgsl` for the storage convention) and DRM
-//! fourcc family R16 / GR32 instead of R8 / GR88. The encoder side
-//! consumes this as `AV_PIX_FMT_P010LE` via `av_hwframe_map(DRM_PRIME →
-//! VAAPI)` — the only 10-bit 4:2:0 entry in ffmpeg's
-//! `vaapi_drm_format_map`.
+//! cells; see `bgra_to_p010.wgsl` for the storage convention) instead of
+//! `R8`/`Rg8`. The encoder side consumes this as `AV_PIX_FMT_P010LE` via
+//! `av_hwframe_map(DRM_PRIME → VAAPI)`. Note the fourcc split: the
+//! encoder-facing layer is declared `RG32` (`DRM_FORMAT_RG1616`, the only
+//! 10-bit 4:2:0 UV entry in ffmpeg's `vaapi_drm_format_map` and the true
+//! layout of `R16G16_UNORM`), while the Vulkan storage probe below keys
+//! the same plane internally as `GR32` → `R16G16_UNORM`. The 8-bit NV12
+//! path uses `GR88` and works only because ffmpeg carries both `RG88`
+//! and `GR88`; P010 has `RG1616` alone, so the layer fourcc must be
+//! `RG32` — see `tether_codec::build_p010_dmabuf_frame`.
 //!
 //! Capability gate: the constructor runs [`crate::storable_dmabuf_modifiers`]
-//! against R16 + GR32 before allocating the export. Some drivers
+//! against R16 + the UV plane's `R16G16_UNORM` (keyed by `GR32` in the
+//! modifier table — both `GR32` and `RG32` map to the same VkFormat
+//! there, so either probes the same storage support) before allocating
+//! the export. Some drivers
 //! advertise 16-bit unorm as sampleable but not storage-writable; on
 //! those, `create_compute_pipeline` would fail mid-session with a
 //! validation error. Probing storage support up front lets the host
@@ -107,8 +115,13 @@ pub enum P010DmaBufError {
 
 pub type Result<T> = std::result::Result<T, P010DmaBufError>;
 
-/// DRM fourccs for the 16-bit Y / UV planes of P010. The probe and the
-/// downstream encoder both key on these.
+/// DRM fourccs used to probe Vulkan storage-image support for the 16-bit
+/// Y / UV planes. These are the *modifier-table* keys, not the
+/// encoder-facing layer fourccs: the encoder descriptor declares the UV
+/// plane as `RG32` (`DRM_FORMAT_RG1616`, the only P010 UV entry FFmpeg's
+/// `vaapi_drm_format_map` carries — see `build_p010_dmabuf_frame`). `GR32`
+/// and `RG32` both resolve to `R16G16_UNORM` in `drm_fourcc_to_vk_format`,
+/// so either keys the same storage-capability query here.
 const DRM_FOURCC_R16: u32 = u32::from_le_bytes(*b"R16 ");
 const DRM_FOURCC_GR32: u32 = u32::from_le_bytes(*b"GR32");
 

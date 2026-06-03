@@ -143,9 +143,11 @@ pub(crate) enum Capability {
     /// HEVC 4:4:4 encode at 8-bit while rejecting the 10-bit XV30
     /// descriptor at submit time (see `tether-codec::vaapi::tests::hevc_main444_10bit_xv30_dmabuf_roundtrip`).
     VaapiHevcMain444_10DmaBuf,
-    /// 4:2:0 10-bit dma-buf path: empirically SKIPs on Intel iHD +
-    /// Meteor Lake (FFmpeg's vaapi_drm_format_map lacks P010
-    /// entries on that combo).
+    /// 4:2:0 10-bit dma-buf path (P010). Long misdiagnosed as an Intel
+    /// iHD/Meteor Lake driver gap; the real cause was our UV-plane fourcc
+    /// (`GR32`, absent from FFmpeg's `vaapi_drm_format_map`, which carries
+    /// only `RG1616` for P010) — fixed in `build_p010_dmabuf_frame`. Now
+    /// SKIPs only on drivers genuinely lacking P010 encode or R16/Rg16.
     VaapiHevcMain10DmaBuf,
     /// `VULKAN_EXTERNAL_MEMORY_DMA_BUF` on the wgpu adapter.
     VulkanDmaBufImport,
@@ -240,8 +242,9 @@ pub(crate) fn run_roundtrip(case: &RoundtripCase) -> RoundtripResult {
     // 3. Encode `frames_encoded` frames.
     let packets = encode_chain(case, &capture_bgra);
     if packets.is_empty() {
-        // The encode chain signals capability gaps (e.g. P010 dma-buf
-        // rejection on iHD+MTL) with an empty packet list.
+        // The encode chain signals capability gaps (e.g. a driver
+        // lacking the negotiated profile's encode entrypoint) with an
+        // empty packet list.
         let cap = capability_for_profile(case.profile);
         return RoundtripResult::Skip {
             capability: cap,
@@ -653,11 +656,22 @@ fn encode_via_p010_bridge(
                 return Vec::new();
             }
         };
-        let codec_frame = build_codec_dmabuf_frame_p010(&p010);
+        // Use the production builder directly — same pattern as the XV30
+        // path below — so the test path can't drift from the wire fourcc
+        // the host actually sends (the drift that hid the GR32 bug).
+        let codec_frame = tether_codec::build_p010_dmabuf_frame(
+            p010.fd,
+            p010.size,
+            p010.modifier,
+            p010.y_offset,
+            p010.y_stride,
+            p010.uv_offset,
+            p010.uv_stride,
+        );
         match enc.submit_dmabuf(&codec_frame, t, t == 0) {
             Ok(p) => packets.extend(p),
             Err(e) => {
-                eprintln!("SKIP: submit_dmabuf rejected P010 (driver gap): {e}");
+                eprintln!("SKIP: submit_dmabuf rejected P010: {e}");
                 return Vec::new();
             }
         }
@@ -869,43 +883,6 @@ fn build_codec_dmabuf_frame_nv12(
             },
             tether_codec::DmaBufLayer {
                 drm_format: GR88_FOURCC,
-                num_planes: 1,
-                object_index: [0, 0, 0, 0],
-                offset: [uv_off, 0, 0, 0],
-                pitch: [uv_stride, 0, 0, 0],
-            },
-        ],
-    }
-}
-
-fn build_codec_dmabuf_frame_p010(
-    p010: &tether_gpuconvert::P010DmaBufFrame,
-) -> tether_codec::DmaBufFrame {
-    const P010_FOURCC: u32 = u32::from_le_bytes(*b"P010");
-    const R16_FOURCC: u32 = u32::from_le_bytes(*b"R16 ");
-    const GR32_FOURCC: u32 = u32::from_le_bytes(*b"GR32");
-    let dup_fd = p010.fd.try_clone().expect("dup P010 fd");
-    let y_off = u32::try_from(p010.y_offset).expect("y_offset fits in u32");
-    let y_stride = u32::try_from(p010.y_stride).expect("y_stride fits in u32");
-    let uv_off = u32::try_from(p010.uv_offset).expect("uv_offset fits in u32");
-    let uv_stride = u32::try_from(p010.uv_stride).expect("uv_stride fits in u32");
-    tether_codec::DmaBufFrame {
-        fourcc: P010_FOURCC,
-        objects: vec![tether_codec::DmaBufObject {
-            fd: dup_fd,
-            size: p010.size,
-            drm_format_modifier: p010.modifier,
-        }],
-        layers: vec![
-            tether_codec::DmaBufLayer {
-                drm_format: R16_FOURCC,
-                num_planes: 1,
-                object_index: [0, 0, 0, 0],
-                offset: [y_off, 0, 0, 0],
-                pitch: [y_stride, 0, 0, 0],
-            },
-            tether_codec::DmaBufLayer {
-                drm_format: GR32_FOURCC,
                 num_planes: 1,
                 object_index: [0, 0, 0, 0],
                 offset: [uv_off, 0, 0, 0],

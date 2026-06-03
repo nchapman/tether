@@ -452,9 +452,18 @@ pub struct DmaBufLayer {
 
 /// Build a `DmaBufFrame` matching the P010 (HEVC Main10 / 4:2:0
 /// 10-bit) descriptor shape FFmpeg's `vaapi_drm_format_map` expects:
-/// one DRM object, two layers — Y as R16 and UV as GR32 (R16G16),
-/// both pointing at `object_index=0` with their offsets within the
-/// shared allocation.
+/// one DRM object, two layers — Y as R16 and UV as RG32
+/// (`DRM_FORMAT_RG1616`, the physical layout of `R16G16_UNORM`: R in the
+/// low 16 bits, G in the high), both pointing at `object_index=0` with
+/// their offsets within the shared allocation.
+///
+/// The UV fourcc must be `RG32`, not its byte-swapped sibling `GR32`:
+/// FFmpeg 8.1's `vaapi_drm_format_map` carries both byte-orders for
+/// 8-bit NV12 (`RG88` *and* `GR88`) but only `DRM_FORMAT_RG1616` for
+/// P010. A `GR32` layer misses the only P010 entry and `av_hwframe_map`
+/// fails with "DRM format not supported by VAAPI" (EINVAL) before the
+/// driver is consulted — the failure that previously made every 10-bit
+/// 4:2:0 encode SKIP on Intel iHD/Lunar Lake.
 ///
 /// Single source of truth shared by the production send loop in
 /// `tether-host` and the startup probe in `tether-probe`. A previous
@@ -497,7 +506,7 @@ pub fn build_p010_dmabuf_frame(
                 ],
             },
             DmaBufLayer {
-                drm_format: u32::from_le_bytes(*b"GR32"),
+                drm_format: u32::from_le_bytes(*b"RG32"),
                 num_planes: 1,
                 object_index: [0, 0, 0, 0],
                 offset: [

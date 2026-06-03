@@ -743,13 +743,14 @@ impl VaapiEncoder {
         if rc < 0 {
             // Map failures here are usually a modifier mismatch
             // between the source DMA-BUF and what the encoder's pool
-            // accepts. Log the descriptor shape so field bugs are
-            // tractable without re-running with AV_LOG_DEBUG. Inside
-            // a probe (e.g. the host startup capability probe that
-            // intentionally exercises P010 on Intel iHD to detect
-            // the documented submit-time rejection) drop to debug so
-            // the expected failure doesn't surface as a scary warning
-            // on every host launch.
+            // accepts, or a layer fourcc absent from FFmpeg's
+            // `vaapi_drm_format_map`. Log the descriptor shape so field
+            // bugs are tractable without re-running with AV_LOG_DEBUG.
+            // Inside a probe (the host startup capability probe exercises
+            // every PROFILE_PREFERENCE entry, some of which legitimately
+            // aren't supported on a given driver) drop to debug so the
+            // expected failure doesn't surface as a scary warning on
+            // every host launch.
             if crate::av_log::probe_suppression_active() {
                 debug!(
                     rc,
@@ -988,8 +989,9 @@ fn vaapi_codec_name(kind: CodecKind) -> &'static str {
 ///
 /// Field reference:
 /// - `NV12` — 4:2:0 8-bit biplanar; AV_PIX_FMT_NV12.
-/// - `P010` — 4:2:0 10-bit biplanar (R16 + GR32 layers; 10 bits
-///   MSB-aligned in 16-bit cells); AV_PIX_FMT_P010LE.
+/// - `P010` — 4:2:0 10-bit biplanar (R16 + RG32 layers; 10 bits
+///   MSB-aligned in 16-bit cells); AV_PIX_FMT_P010LE. See
+///   `build_p010_dmabuf_frame` for why the UV layer is RG32 not GR32.
 /// - `XYUV` — 4:4:4 8-bit packed 32 bpp (V,U,Y,X bytes LE);
 ///   AV_PIX_FMT_VUYX. The only 4:4:4 8-bit format in
 ///   `vaapi_drm_format_map`.

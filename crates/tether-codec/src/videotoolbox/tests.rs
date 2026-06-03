@@ -353,10 +353,12 @@ fn videotoolbox_round_trip() {
 /// (Historical context: this test used to cross-check against
 /// `tether-codec::probe::supported_profiles()`, retired in commit
 /// 255289a when probe orchestration moved exclusively to
-/// `tether-probe`. The dual-table agreement check now lives in
-/// `tether-probe`'s own integration tests, which can depend on both
-/// crates; here we keep just the round-trip + fourcc-family invariants
-/// that don't need the probe layer.)
+/// `tether-probe`. The decode-emit ↔ render-accept agreement check now
+/// lives in `tether-probe::host::videotoolbox`: the pure-logic
+/// `decoder_output_is_subset_of_renderer_accept` (no hardware) and the
+/// `#[ignore]` hardware `decoded_fixture_fourcc_is_renderer_accepted`.
+/// Here we keep just the round-trip + fourcc-family invariants that
+/// don't need the probe layer.)
 #[test]
 #[ignore = "requires macOS + VideoToolbox"]
 fn videotoolbox_round_trip_chroma_matrix() {

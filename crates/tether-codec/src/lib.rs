@@ -29,6 +29,9 @@ pub mod videotoolbox;
 #[cfg(target_os = "macos")]
 pub mod macos_interop;
 
+#[cfg(target_os = "linux")]
+pub mod vaapi_interop;
+
 #[cfg(target_os = "windows")]
 pub mod d3d11;
 

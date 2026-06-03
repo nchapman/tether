@@ -6,6 +6,7 @@
 //! packed Y410 in a single Rgb10a2 texture. Pure Linux module — macOS
 //! lands its IOSurface equivalent in `metal.rs`.
 
+use tether_codec::vaapi_interop::{accepts_dmabuf_fourcc, dmabuf_fourcc_expected_label};
 use tether_codec::{DmaBufFrame, GpuFrameGuard};
 use tether_protocol::control::ChromaSubsampling;
 
@@ -96,7 +97,12 @@ fn import_biplanar(
     // Chroma sub-sampling drives the UV plane dimensions directly;
     // the bit depth picks the per-plane formats further down. We
     // never look at the DRM fourcc for layout decisions — the
-    // negotiated `chroma` is the source of truth.
+    // negotiated `chroma` is the source of truth. NOTE: the decode
+    // probe's L2 gate (`tether_probe::host::vaapi`) relies on this
+    // path staying ungated — it checks the surface-level `NV12`/`P010`
+    // fourcc, not the per-layer `R8`/`R16`. If a per-layer fourcc gate
+    // is ever added here, update `tether_codec::vaapi_interop` and that
+    // probe together.
     let (chroma_w, chroma_h) = match chroma {
         ChromaSubsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
         ChromaSubsampling::Yuv444 => (width, height),
@@ -206,11 +212,13 @@ fn import_yuv444_packed(
             layer.num_planes
         )));
     }
-    let expected_fourcc = u32::from_le_bytes(*b"XYUV");
-    if layer.drm_format != expected_fourcc {
+    // Single source of truth for the accept set (shared with the decode
+    // probe in tether-probe) — see `tether_codec::vaapi_interop`.
+    if !accepts_dmabuf_fourcc(ChromaSubsampling::Yuv444, 8, layer.drm_format) {
         return Err(RenderError::DmaBufImport(format!(
-            "YUV444 layer fourcc 0x{:08x} != expected XYUV (0x{:08x})",
-            layer.drm_format, expected_fourcc
+            "YUV444 layer fourcc 0x{:08x} not render-accepted; expected {}",
+            layer.drm_format,
+            dmabuf_fourcc_expected_label(ChromaSubsampling::Yuv444, 8),
         )));
     }
     let packed = import_one_layer(
@@ -280,11 +288,13 @@ fn import_yuv444_packed_y410(
             layer.num_planes
         )));
     }
-    let expected_fourcc = u32::from_le_bytes(*b"Y410");
-    if layer.drm_format != expected_fourcc {
+    // Single source of truth for the accept set (shared with the decode
+    // probe in tether-probe) — see `tether_codec::vaapi_interop`.
+    if !accepts_dmabuf_fourcc(ChromaSubsampling::Yuv444, 10, layer.drm_format) {
         return Err(RenderError::DmaBufImport(format!(
-            "YUV444 10-bit layer fourcc 0x{:08x} != expected Y410 (0x{:08x})",
-            layer.drm_format, expected_fourcc
+            "YUV444 10-bit layer fourcc 0x{:08x} not render-accepted; expected {}",
+            layer.drm_format,
+            dmabuf_fourcc_expected_label(ChromaSubsampling::Yuv444, 10),
         )));
     }
     let packed = import_one_layer(

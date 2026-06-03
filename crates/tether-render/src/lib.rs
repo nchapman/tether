@@ -54,12 +54,15 @@ pub use winit::event::MouseButton;
 pub use winit::keyboard::{KeyCode, ModifiersState};
 
 /// macOS-only — whether the renderer's IOSurface import path accepts
-/// the given `(chroma, bit_depth, fourcc)` triple. Exported so
-/// cross-crate tests (in `tether-host`) can confirm the renderer's
-/// accept set agrees with the encoder's and the VT probe's parallel
-/// tables. Drift between any of the three is the family of bug that
-/// shipped a broken 10-bit session in commit `621badc` — fast
-/// feedback in default CI is cheaper than catching it in a session.
+/// the given `(chroma, bit_depth, fourcc)` triple. The predicate itself
+/// lives in `tether_codec::macos_interop` (so the probe can consult it
+/// without a render dep); re-exported here for renderer callers. The
+/// decode-emit ↔ render-accept agreement is asserted in
+/// `tether-probe::host::videotoolbox` and the encoder/bridge agreement
+/// in `tether-gpuconvert::nv12_iosurface`. Drift between those tables is
+/// the family of bug that shipped a broken 10-bit session in commit
+/// `621badc` — fast feedback in default CI is cheaper than catching it
+/// in a session.
 #[cfg(target_os = "macos")]
 pub use gpu::accepts_iosurface_fourcc;
 

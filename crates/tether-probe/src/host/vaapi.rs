@@ -18,7 +18,10 @@
 //! separate `warm_gpuconvert_capability_cache` used to fill.
 
 use tether_codec::vaapi::{VaapiDecoder, VaapiEncoder};
-use tether_codec::{build_p010_dmabuf_frame, build_xv30_dmabuf_frame, Decoder, Encoder, Frame};
+use tether_codec::vaapi_interop::{accepts_dmabuf_fourcc, dmabuf_fourcc_expected_label};
+use tether_codec::{
+    build_p010_dmabuf_frame, build_xv30_dmabuf_frame, Decoder, Encoder, Frame, GpuFrameSource,
+};
 use tether_gpuconvert::{Bgra2P010DmaBuf, Bgra2Xv30DmaBuf};
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
@@ -98,7 +101,36 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
             .next_frame()
             .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
         {
-            Some(Frame::Gpu(_)) => return Ok(()),
+            Some(Frame::Gpu(gpu)) => {
+                // L2: the decoder already exported the surface via
+                // vaExportSurfaceHandle, so the DRM fourcc is on the
+                // frame. Gate it through the SAME accept set
+                // tether-render::gpu::import uses, so a profile that
+                // decodes to a surface the renderer can't import is
+                // rejected here (graceful degrade at negotiation)
+                // instead of black-screening at first frame — the
+                // failure mode the macOS 'x444' bug exhibited. The
+                // surface-level `fourcc` equals the per-layer
+                // `drm_format` the renderer gates on for the packed
+                // 4:4:4 paths, and is the reliable NV12/P010 family
+                // code for the biplanar paths it doesn't gate on.
+                let GpuFrameSource::DmaBuf(dmabuf) = gpu.source;
+                let observed = dmabuf.fourcc;
+                if accepts_dmabuf_fourcc(profile.chroma, profile.bit_depth, observed) {
+                    return Ok(());
+                }
+                return Err(ProbeError::new(
+                    PipelineStage::Decode,
+                    format!(
+                        "VAAPI decoded surface fourcc 0x{observed:08x} is not render-accepted \
+                         for {:?} {}-bit (expected {}) — the renderer's import path would drop \
+                         every frame; excluding this profile from negotiation",
+                        profile.chroma,
+                        profile.bit_depth,
+                        dmabuf_fourcc_expected_label(profile.chroma, profile.bit_depth),
+                    ),
+                ));
+            }
             Some(Frame::Cpu(_)) => {
                 return Err(ProbeError::new(
                     PipelineStage::Decode,
@@ -193,4 +225,40 @@ fn probe_xv30_submit(enc: &mut VaapiEncoder) -> Result<()> {
     enc.submit_dmabuf(&codec_frame, 0, true)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tether_codec::vaapi_interop::expected_dmabuf_decode_fourcc;
+
+    /// L1 (pure logic, no hardware): for every negotiable profile, every
+    /// DRM fourcc the VAAPI decoder is declared to emit must be one the
+    /// renderer's import path accepts. The Linux analog of the Windows
+    /// `decoder_output_is_subset_of_renderer_accept` and the macOS
+    /// `nv12_fourccs_round_trip_across_tables` — without it, a forgotten
+    /// `import.rs` cell (the 'x444' bug class) ships silently.
+    #[test]
+    fn decoder_output_is_subset_of_renderer_accept() {
+        let mut covered = 0;
+        for profile in crate::PROFILE_PREFERENCE {
+            for &fourcc in expected_dmabuf_decode_fourcc(*profile) {
+                assert!(
+                    accepts_dmabuf_fourcc(profile.chroma, profile.bit_depth, fourcc),
+                    "VAAPI decode emits DRM fourcc 0x{fourcc:08x} for {profile:?}, but \
+                     tether-render's import path rejects it — every frame of a negotiated \
+                     session would be dropped after decode (the 'x444' bug shape)."
+                );
+                covered += 1;
+            }
+        }
+        // Guard against a vacuous pass: the dma-buf decode format depends
+        // only on (chroma, bit_depth), so every PROFILE_PREFERENCE entry
+        // (incl. AV1 4:2:0 → NV12/P010) maps to a fourcc. Expect coverage
+        // of at least the four families.
+        assert!(
+            covered >= 4,
+            "expected ≥4 declared decode fourccs across PROFILE_PREFERENCE, got {covered}"
+        );
+    }
 }

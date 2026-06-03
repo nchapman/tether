@@ -38,6 +38,17 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
         .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?;
     // A decoded frame (now a shared-handle `Frame::Gpu`) means the codec +
     // export path work for this profile.
+    //
+    // L2 render-acceptance gate (the check the Linux/macOS probes add) is
+    // intentionally ABSENT here. D3D11VA decode output is deterministic —
+    // `expected_decode_dxgi_format` (NV12 / P010, no driver-variable
+    // downsample) — and the pure-logic L1 test
+    // `decoder_output_is_subset_of_renderer_accept`
+    // (apps/tether-client) already proves that set ⊆ the renderer's
+    // `decode_plane_srv_formats`. The renderer predicate lives in
+    // `tether-render`, which `tether-probe` must not depend on (it's a
+    // client-only crate; the edge would be a cycle), so an L2 here could
+    // not consult it without contorting the graph to prove nothing new.
     for _ in 0..4 {
         match dec
             .next_frame()

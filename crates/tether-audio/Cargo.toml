@@ -34,6 +34,20 @@ pipewire = "0.10"
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = { version = "6", features = ["macos_13_0"] }
 
+# Windows system-audio capture rides WASAPI loopback — opening the default
+# render endpoint in shared mode with AUDCLNT_STREAMFLAGS_LOOPBACK captures
+# exactly "what's playing." Same `windows` crate + version the host video path
+# (`tether-capture`) already pins; cpal doesn't expose loopback so we bind the
+# Core Audio interfaces directly.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
 [dev-dependencies]
 # Loopback the Opus codec through the real `Datagram::Audio` wire channel,
 # including the lossy variant that exercises gap-driven concealment.

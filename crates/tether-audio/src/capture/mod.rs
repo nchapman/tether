@@ -19,11 +19,14 @@ use crate::{AudioFrame, OpusConfig};
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 /// Consumer handle for captured system audio. Holds the PCM receiver plus the
 /// stop signal + backend thread; dropping it tells the backend to tear down.
 pub struct AudioCaptureHandle {
-    /// Captured interleaved-f32 frames, drop-oldest under backpressure.
+    /// Captured interleaved-f32 frames. Backends `try_send` onto a short bounded
+    /// queue, so the newest frame is dropped when the consumer falls behind.
     pub rx: Receiver<AudioFrame>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -32,7 +35,7 @@ pub struct AudioCaptureHandle {
 impl AudioCaptureHandle {
     // Only the platform backends construct a handle; on backend-less targets
     // `start` returns `Unsupported` without ever calling this.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(crate) fn from_parts(
         rx: Receiver<AudioFrame>,
         stop: Arc<AtomicBool>,
@@ -75,18 +78,20 @@ pub enum CaptureError {
 
 /// Whether a system-audio capture backend exists for this platform. The host
 /// uses this to decide whether to advertise audio at all, so a client never
-/// opts into audio a backend-less host can't deliver. Windows flips to `true`
-/// when its backend lands.
+/// opts into audio a backend-less host can't deliver.
 #[must_use]
 pub fn is_supported() -> bool {
-    cfg!(any(target_os = "linux", target_os = "macos"))
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))
 }
 
 /// Start capturing system-output audio for the current platform.
 ///
 /// Returns [`CaptureError::Unsupported`] on platforms whose backend isn't wired
-/// yet (Windows lands in a follow-up change) so the host can degrade to a
-/// silent session rather than fail.
+/// so the host can degrade to a silent session rather than fail.
 pub fn start(cfg: OpusConfig) -> Result<AudioCaptureHandle, CaptureError> {
     #[cfg(target_os = "linux")]
     {
@@ -96,7 +101,11 @@ pub fn start(cfg: OpusConfig) -> Result<AudioCaptureHandle, CaptureError> {
     {
         macos::start(cfg)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::start(cfg)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = cfg;
         Err(CaptureError::Unsupported)

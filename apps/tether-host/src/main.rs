@@ -2713,6 +2713,15 @@ fn run_audio_capture_and_send(
     };
 
     let mut frame_seq: u32 = 0;
+    // Capture-side health, logged every interval: how many frames the backend
+    // delivered and the peak |sample| among them. A peak of ~0 means the
+    // backend is handing us silence (e.g. a PipeWire sink monitor attached to
+    // the wrong/idle sink) even though buffers are flowing — the decisive
+    // signal for "host plays sound but the client hears nothing".
+    const AUDIO_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut last_stats_log = std::time::Instant::now();
+    let mut peak: f32 = 0.0;
+    let mut frames_captured: u64 = 0;
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
@@ -2728,6 +2737,21 @@ fn run_audio_capture_and_send(
                 break;
             }
         };
+        frames_captured += 1;
+        for &s in &frame.samples {
+            peak = peak.max(s.abs());
+        }
+        if last_stats_log.elapsed() >= AUDIO_STATS_INTERVAL {
+            info!(
+                frames_captured,
+                peak = format!("{peak:.4}"),
+                gated = !audio_ready.load(Ordering::Acquire),
+                "audio capture stats"
+            );
+            last_stats_log = std::time::Instant::now();
+            peak = 0.0;
+            frames_captured = 0;
+        }
         // Drop until the client is ready to play; capturing meanwhile keeps the
         // pipeline warm so audio starts promptly once the gate opens.
         if !audio_ready.load(Ordering::Acquire) {

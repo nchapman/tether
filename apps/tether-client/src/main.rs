@@ -1339,6 +1339,11 @@ fn run_audio_playback(
     // when audio stops, so does the log. 2 s matches the video stats cadence.
     const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
     let mut last_stats_log = std::time::Instant::now();
+    // Peak |sample| of decoded audio since the last log. ~0 means the frames
+    // arriving are silent (the silence is upstream — capture/encode), which
+    // distinguishes that from a local output-routing problem where non-zero
+    // audio is played but not heard.
+    let mut peak: f32 = 0.0;
 
     while let Ok((seq, payload)) = rx.recv() {
         if let Some(prev) = last_seq {
@@ -1355,7 +1360,12 @@ fn run_audio_playback(
             }
         }
         match decoder.decode(&payload) {
-            Ok(pcm) => sink.submit(&pcm),
+            Ok(pcm) => {
+                for &s in &pcm.samples {
+                    peak = peak.max(s.abs());
+                }
+                sink.submit(&pcm);
+            }
             Err(e) => warn!(error = %e, "opus decode failed; dropping audio frame"),
         }
         last_seq = Some(seq);
@@ -1370,9 +1380,13 @@ fn run_audio_playback(
             let buffered_ms = frames_buffered * 1000 / (cfg.sample_rate as usize).max(1);
             info!(
                 underruns,
-                dropped_samples, buffered_ms, "audio playback stats"
+                dropped_samples,
+                buffered_ms,
+                peak = format!("{peak:.4}"),
+                "audio playback stats"
             );
             last_stats_log = std::time::Instant::now();
+            peak = 0.0;
         }
     }
 

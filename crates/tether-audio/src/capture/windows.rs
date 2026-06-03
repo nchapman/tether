@@ -139,11 +139,20 @@ fn run_capture(
         let pwfx = audio_client
             .GetMixFormat()
             .map_err(|e| winerr("get mix format", e))?;
-        let parsed = parse_mix_format(pwfx);
+        // Parse before the side-effecting Initialize: an unsupported/unparseable
+        // mix format should bail before we initialize a client we'd immediately
+        // discard. `parse_mix_format` only reads `pwfx`; free it on the error
+        // path so the bail doesn't leak the CoTaskMemAlloc'd format.
+        let mix = match parse_mix_format(pwfx) {
+            Ok(mix) => mix,
+            Err(e) => {
+                CoTaskMemFree(Some(pwfx.cast::<c_void>()));
+                return Err(e);
+            }
+        };
         // Loopback can only be initialized with the endpoint's own mix format, so
         // hand `pwfx` straight to Initialize. It must stay live across that call —
-        // free only afterwards — so this runs before `CoTaskMemFree`, and before
-        // `parsed?` propagates a parse error (which would otherwise leak `pwfx`).
+        // free only afterwards.
         let init_result = audio_client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -152,11 +161,10 @@ fn run_capture(
             pwfx,
             None,
         );
-        // GetMixFormat allocates with CoTaskMemAlloc; free it now that both the
-        // parse and Initialize are done reading it.
+        // GetMixFormat allocates with CoTaskMemAlloc; free it now that Initialize
+        // is done reading it.
         CoTaskMemFree(Some(pwfx.cast::<c_void>()));
         init_result.map_err(|e| winerr("initialize loopback client", e))?;
-        let mix = parsed?;
         let capture_client: IAudioCaptureClient = audio_client
             .GetService()
             .map_err(|e| winerr("get capture client", e))?;

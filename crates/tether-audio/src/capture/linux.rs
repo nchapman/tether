@@ -135,10 +135,13 @@ fn run(cfg: OpusConfig, tx: Sender<AudioFrame>, stop: Arc<AtomicBool>) -> Result
             }
             // We request an exact format; the adapter converts to it, so the
             // negotiated rate/channels should equal what we asked for. Log the
-            // first negotiation, and warn on *any* divergence — including a
-            // later renegotiation — since the encoder is fixed at the requested
-            // config and `process` interprets bytes with those same values, so a
-            // divergence would corrupt frame framing.
+            // first negotiation. A divergence — including a later renegotiation —
+            // is session-corrupting, not a soft warning: the encoder is fixed at
+            // the requested config and `process` interprets bytes with those same
+            // values, so divergent framing produces garbage for the rest of the
+            // session. Terminate capture cleanly (consistent with the Windows /
+            // macOS teardown and the "fatal mid-session" rule) and let the caller
+            // observe a dry channel rather than corrupted audio.
             let (nr, nc) = (user_data.format.rate(), user_data.format.channels());
             let diverges = nr != user_data.sample_rate || nc != u32::from(user_data.channels);
             if !user_data.logged_format {
@@ -151,13 +154,16 @@ fn run(cfg: OpusConfig, tx: Sender<AudioFrame>, stop: Arc<AtomicBool>) -> Result
                 );
             }
             if diverges {
-                tracing::warn!(
+                tracing::error!(
                     requested_rate = user_data.sample_rate,
                     requested_channels = user_data.channels,
                     negotiated_rate = nr,
                     negotiated_channels = nc,
-                    "pipewire audio format diverged from request; frames may be misframed"
+                    "pipewire audio format diverged from request; terminating capture \
+                     to avoid emitting misframed audio"
                 );
+                user_data.mainloop.quit();
+                return;
             }
         })
         .process(|stream, user_data| {

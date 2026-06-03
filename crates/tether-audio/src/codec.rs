@@ -173,6 +173,16 @@ impl OpusEncoder {
     /// whole frame the accumulated input now covers. Leftover samples are
     /// buffered for the next call.
     pub fn encode(&mut self, interleaved: &[f32]) -> Result<Vec<Bytes>> {
+        // A capture buffer whose length isn't a whole number of frames means the
+        // backend mis-framed it (wrong channel count). Accumulating it would
+        // shift L/R for the rest of the session, so reject loudly instead.
+        let ch = usize::from(self.channels);
+        if !interleaved.is_empty() && interleaved.len() % ch != 0 {
+            return Err(AudioError::Opus(format!(
+                "encode input of {} samples is not a multiple of {ch} channels",
+                interleaved.len()
+            )));
+        }
         self.accum.extend_from_slice(interleaved);
         let chunk = self.frame_size * usize::from(self.channels);
         let frame_size = c_int::try_from(self.frame_size)
@@ -265,17 +275,18 @@ impl OpusDecoder {
     /// (unexpected) error path, falls back to silence so the playback clock
     /// still advances.
     pub fn conceal(&mut self) -> AudioFrame {
-        let frame = self.decode_into(ptr::null(), 0).unwrap_or_else(|_| {
-            AudioFrame::silence(self.sample_rate, self.channels, self.frame_size)
-        });
-        // Gap accounting downstream assumes one conceal() == exactly one frame
-        // on the playback clock; libopus PLC must return the full frame.
-        debug_assert_eq!(
-            frame.frames(),
-            self.frame_size,
-            "PLC must produce exactly one frame"
-        );
-        frame
+        // Gap accounting downstream assumes one conceal() == exactly one frame on
+        // the playback clock. libopus PLC normally returns the full frame, but if
+        // the decoder's internal state was left at a different duration (e.g. a
+        // prior packet of another frame size) it can return a short/long frame.
+        // Enforce the invariant in release too — fall back to silence on either
+        // a decode error or a wrong-length result — so the clock never drifts.
+        self.decode_into(ptr::null(), 0)
+            .ok()
+            .filter(|f| f.frames() == self.frame_size)
+            .unwrap_or_else(|| {
+                AudioFrame::silence(self.sample_rate, self.channels, self.frame_size)
+            })
     }
 
     /// Shared decode body. `data` is either a valid `len`-byte packet or null
@@ -349,6 +360,31 @@ mod tests {
         assert!(
             peak > 0.1,
             "decoded audio should carry signal energy, peak={peak}"
+        );
+    }
+
+    /// A capture buffer whose length isn't a whole number of stereo frames
+    /// (odd sample count) is rejected, not accumulated — accumulating it would
+    /// shift L/R for every subsequent frame in the session. The rejection must
+    /// also leave the accumulator clean so the next valid frame still encodes.
+    #[test]
+    fn encode_rejects_input_not_aligned_to_channels() {
+        let cfg = OpusConfig::default(); // 48 kHz stereo
+        assert_eq!(cfg.channels, 2, "test assumes stereo");
+        let mut enc = OpusEncoder::new(cfg).unwrap();
+
+        let misframed = vec![0.0f32; 401]; // not a multiple of 2 channels
+        assert!(
+            matches!(enc.encode(&misframed), Err(AudioError::Opus(_))),
+            "misframed (odd-length) stereo input must be rejected"
+        );
+
+        // The rejected buffer must not have polluted the accumulator.
+        let fs = enc.frame_size();
+        let frame = sine_frame(cfg.sample_rate, cfg.channels, 440.0, fs, 0);
+        assert!(
+            !enc.encode(&frame.samples).unwrap().is_empty(),
+            "a valid frame after a rejected one must still encode"
         );
     }
 

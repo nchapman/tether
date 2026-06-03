@@ -84,10 +84,17 @@ fn run(cfg: OpusConfig, tx: Sender<AudioFrame>, stop: &AtomicBool) -> Result<(),
     stream
         .start_capture()
         .map_err(|e| CaptureError::Backend(format!("start_capture: {e:?}")))?;
+    // Consistency gap vs the other backends: Linux warns on a PipeWire
+    // `param_changed` rate/channel divergence and Windows re-reads + converts
+    // the endpoint's actual mix format, but the `screencapturekit` wrapper
+    // exposes no way to read back the negotiated ASBD — so we can only assert
+    // the *requested* layout. SCK honours `with_sample_rate`/`with_channel_count`
+    // on supported macOS versions; frames are stamped accordingly below.
     tracing::info!(
         sample_rate = cfg.sample_rate,
         channels = cfg.channels,
-        "macOS system audio capture started (ScreenCaptureKit)"
+        "macOS system audio capture started (ScreenCaptureKit); rate/channels \
+         are as-requested (no ASBD readback available to verify)"
     );
 
     // SCK fires callbacks on its own dispatch queue; this thread only needs to
@@ -182,11 +189,13 @@ fn frame_from_buffer_list(
     }
 }
 
-/// Reinterpret a native-endian f32 byte buffer (SCK's PCM) as `f32`s. Uses
-/// `from_ne_bytes` rather than a pointer cast so we make no alignment
-/// assumption about the SCK buffer.
+/// Reinterpret an f32 byte buffer (SCK's PCM) as `f32`s. CoreAudio PCM is
+/// little-endian on every Apple target (ARM and x86 are both LE), so we use
+/// `from_le_bytes` to match the Linux/Windows backends and keep the wire format
+/// explicit rather than implicitly host-dependent. Reading byte-by-byte (vs a
+/// pointer cast) makes no alignment assumption about the SCK buffer.
 fn bytes_to_f32(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(4)
-        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }

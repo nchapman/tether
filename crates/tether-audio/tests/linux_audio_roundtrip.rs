@@ -37,6 +37,10 @@ fn linux_capture_encode_decode_playback_roundtrip() {
             continue;
         };
         assert_eq!(frame.channels, cfg.channels, "capture channel count");
+        // The encoder is built for cfg.sample_rate and never re-checks it, so
+        // every captured frame must carry the configured rate (parity with the
+        // Windows roundtrip's invariant).
+        assert_eq!(frame.sample_rate, cfg.sample_rate, "capture sample rate");
         captured += 1;
         for pkt in enc.encode(&frame.samples).expect("opus encode") {
             let pcm = dec.decode(&pkt).expect("opus decode");

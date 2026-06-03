@@ -40,6 +40,7 @@ use tether_gpuconvert::{
     Xv30DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
 };
 use tether_ipc::{EngineEvent, Reporter};
+use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ControlMessage, VideoProfile, Viewport,
 };
@@ -188,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
         bind,
         use_test_pattern,
         ipc,
+        audio: audio_enabled,
         ..
     } = args;
     let reporter = Reporter::from_ipc_flag(ipc);
@@ -456,8 +458,14 @@ async fn main() -> anyhow::Result<()> {
             "host video encode capabilities (capture-bridge filtered)"
         );
 
+        // Advertise audio only when enabled *and* this platform has a capture
+        // backend, so a client never opts into audio we can't deliver. Both
+        // ends use the fixed default Opus config (48 kHz stereo).
+        let audio_config = (audio_enabled && tether_audio::capture::is_supported())
+            .then(|| tether_audio::OpusConfig::default().wire_config());
         let cfg = HostSessionConfig {
             server_name: "tether-host".to_string(),
+            audio_config,
         };
         // `HostSession::accept` takes the channel through the
         // `ControlChannel` trait object so it's mockable in tests.
@@ -515,7 +523,7 @@ async fn main() -> anyhow::Result<()> {
                 info!("shell stop received during session; shutting down");
                 break;
             }
-            res = handle_client(session, conn, use_test_pattern) => {
+            res = handle_client(session, conn, use_test_pattern, audio_enabled) => {
                 let reason = if revoked.load(Ordering::Relaxed) {
                     // The session ended because the operator revoked this peer
                     // (its connection was closed out from under handle_client).
@@ -566,6 +574,7 @@ async fn handle_client(
     session: HostSession,
     conn: Arc<Connection>,
     use_test_pattern: bool,
+    audio_enabled: bool,
 ) -> anyhow::Result<()> {
     // The handshake (decode-profile negotiation, pixel-format advert,
     // Goodbye-on-no-match) ran in `HostSession::accept`. Unpack the
@@ -755,6 +764,28 @@ async fn handle_client(
             )
         })?;
 
+    // Audio sender: capture system audio → Opus → unreliable `Datagram::Audio`,
+    // on its own thread parallel to the video send thread. `audio_ready` is the
+    // client's `StreamReady.audio`; until it's set we drop captured audio so we
+    // don't stream into a client with no playback. Reuses `send_shutdown` to
+    // tear down with the session. Skipped (and left silent) when audio is off
+    // or the platform has no capture backend.
+    let audio_ready = Arc::new(AtomicBool::new(false));
+    let audio_handle = if audio_enabled && tether_audio::capture::is_supported() {
+        let conn_audio = conn.clone();
+        let audio_shutdown = send_shutdown.clone();
+        let audio_ready_thread = audio_ready.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("tether-host-audio".into())
+                .spawn(move || {
+                    run_audio_capture_and_send(conn_audio, audio_shutdown, audio_ready_thread);
+                })?,
+        )
+    } else {
+        None
+    };
+
     // Per-connection injector. The backend's virtual devices live inside
     // the injector; when the last Arc drops, they're released. We
     // deliberately hand the three clones to the three recv tasks and don't
@@ -782,6 +813,7 @@ async fn handle_client(
         let conn = conn.clone();
         let force_idr = force_idr.clone();
         let stream_ready_ctl = stream_ready.clone();
+        let audio_ready_ctl = audio_ready.clone();
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
         let force_idr_for_viewport = force_idr.clone();
@@ -863,6 +895,18 @@ async fn handle_client(
                             audio, "client signalled StreamReady; opening the gate"
                         );
                         stream_ready_ctl.store(true, Ordering::Release);
+                        // Defensive IDR at gate-open. A fresh encoder's
+                        // first frame is already an IDR, so this is usually
+                        // redundant — but if StreamReady lands before the
+                        // encoder lazy-inits, the pending flag guarantees
+                        // the first encoded frame is still forced to a
+                        // keyframe. Coalesces harmlessly via IdrSignal.
+                        // Matches Moonlight/Sunshine forcing an IDR at
+                        // stream start.
+                        force_idr.raise();
+                        // Open the audio gate too; the host audio thread drops
+                        // captured frames until the client says it can play them.
+                        audio_ready_ctl.store(audio, Ordering::Release);
                     }
                     Ok(ControlMessage::StreamPause { display }) => {
                         let display_id = display;
@@ -1065,7 +1109,9 @@ async fn handle_client(
                             warn!(error = %e, "cursor inject failed; dropping");
                         }
                     }
-                    Ok(Datagram::Video(_)) | Ok(Datagram::HostCursor(_)) => {
+                    Ok(Datagram::Video(_))
+                    | Ok(Datagram::HostCursor(_))
+                    | Ok(Datagram::Audio(_)) => {
                         tracing::trace!("unexpected host-direction datagram on host; ignoring");
                     }
                     Err(e) => {
@@ -1144,6 +1190,12 @@ async fn handle_client(
     // swallow the result — a panicked send thread is logged inside the
     // join, and we're tearing down anyway.
     let _ = tokio::task::spawn_blocking(move || send_handle.join()).await;
+
+    // Same for the audio thread, if we started one. `send_shutdown` (set above)
+    // is its stop signal too.
+    if let Some(audio_handle) = audio_handle {
+        let _ = tokio::task::spawn_blocking(move || audio_handle.join()).await;
+    }
 
     Ok(())
 }
@@ -2634,6 +2686,106 @@ impl StageLatency {
     }
 }
 
+/// Capture system audio, Opus-encode it, and send each frame as an unreliable
+/// `Datagram::Audio`. Runs on its own thread; returns when `shutdown` is set,
+/// the capture backend disconnects, or the connection dies. Audio is dropped
+/// (not buffered) until `audio_ready` — the client's `StreamReady.audio` — is
+/// set, so we never stream into a client without playback.
+fn run_audio_capture_and_send(
+    conn: Arc<Connection>,
+    shutdown: Arc<AtomicBool>,
+    audio_ready: Arc<AtomicBool>,
+) {
+    let opus_cfg = tether_audio::OpusConfig::default();
+    let capture = match tether_audio::capture::start(opus_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "audio capture unavailable; session will be silent");
+            return;
+        }
+    };
+    let mut encoder = match tether_audio::OpusEncoder::new(opus_cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "opus encoder init failed; session will be silent");
+            return;
+        }
+    };
+
+    let mut frame_seq: u32 = 0;
+    // Capture-side health, logged every interval: how many frames the backend
+    // delivered and the peak |sample| among them. A peak of ~0 means the
+    // backend is handing us silence (e.g. a PipeWire sink monitor attached to
+    // the wrong/idle sink) even though buffers are flowing — the decisive
+    // signal for "host plays sound but the client hears nothing".
+    const AUDIO_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut last_stats_log = std::time::Instant::now();
+    let mut peak: f32 = 0.0;
+    let mut frames_captured: u64 = 0;
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        let frame = match capture
+            .rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+        {
+            Ok(f) => f,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                warn!("audio capture channel disconnected; ending audio sender");
+                break;
+            }
+        };
+        frames_captured += 1;
+        for &s in &frame.samples {
+            peak = peak.max(s.abs());
+        }
+        if last_stats_log.elapsed() >= AUDIO_STATS_INTERVAL {
+            info!(
+                frames_captured,
+                peak = format!("{peak:.4}"),
+                gated = !audio_ready.load(Ordering::Acquire),
+                "audio capture stats"
+            );
+            last_stats_log = std::time::Instant::now();
+            peak = 0.0;
+            frames_captured = 0;
+        }
+        // Drop until the client is ready to play; capturing meanwhile keeps the
+        // pipeline warm so audio starts promptly once the gate opens.
+        if !audio_ready.load(Ordering::Acquire) {
+            continue;
+        }
+        let packets = match encoder.encode(&frame.samples) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "opus encode failed; dropping audio frame");
+                continue;
+            }
+        };
+        for payload in packets {
+            let packet = AudioPacket::Opus {
+                // Audio runs a single encoder for the whole session (no
+                // mid-stream sample-rate/device switch today), so the epoch is
+                // constant. If a device/rate switch is ever added, bump this on
+                // the restart AND reset the client decoder for the new epoch in
+                // the same change — don't pre-wire one half.
+                stream_epoch: 0,
+                frame_seq,
+                t_capture: MonoNanos::now(),
+                payload: payload.to_vec(),
+            };
+            frame_seq = frame_seq.wrapping_add(1);
+            if let Err(e) = conn.send_datagram(&Datagram::Audio(packet)) {
+                warn!(error = ?e, "audio datagram send failed; ending audio sender");
+                return;
+            }
+        }
+    }
+    capture.stop();
+}
+
 // The capture/send loop wires together independently-owned channels, signals,
 // and shared flags; bundling them into a struct would only obscure the seam.
 // The as_nanos()->u64 latency cast is logging-only and never overflows.
@@ -3251,6 +3403,9 @@ struct Args {
     /// on every platform so the flag gives a clear message rather than
     /// being mistaken for a bind address elsewhere.
     setup_input: bool,
+    /// Stream system audio (Opus) alongside video. On by default; the host
+    /// degrades to a silent session if no capture backend is available.
+    audio: bool,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -3258,6 +3413,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut use_test_pattern = false;
     let mut ipc = false;
     let mut setup_input = false;
+    let mut audio = true;
     for arg in std::env::args().skip(1) {
         if arg == "--test-pattern" {
             use_test_pattern = true;
@@ -3265,11 +3421,14 @@ fn parse_args() -> anyhow::Result<Args> {
             ipc = true;
         } else if arg == "--setup-input" {
             setup_input = true;
+        } else if arg == "--no-audio" {
+            audio = false;
         } else if arg == "--help" || arg == "-h" {
             eprintln!(
-                "usage: tether-host [--test-pattern] [--ipc] [--setup-input] [bind_addr]\n\
+                "usage: tether-host [--test-pattern] [--ipc] [--setup-input] [--no-audio] [bind_addr]\n\
                  \n\
-                 --setup-input  (Linux) grant /dev/uinput access for input injection, then exit"
+                 --setup-input  (Linux) grant /dev/uinput access for input injection, then exit\n\
+                 --no-audio     disable system-audio (Opus) streaming"
             );
             std::process::exit(0);
         } else {
@@ -3281,6 +3440,7 @@ fn parse_args() -> anyhow::Result<Args> {
         use_test_pattern,
         ipc,
         setup_input,
+        audio,
     })
 }
 

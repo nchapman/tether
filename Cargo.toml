@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/tether-protocol",
     "crates/tether-transport",
+    "crates/tether-audio",
     "crates/tether-capture",
     "crates/tether-codec",
     "crates/tether-decode",
@@ -33,6 +34,7 @@ license = "Apache-2.0 OR MIT"
 [workspace.dependencies]
 tether-protocol = { path = "crates/tether-protocol" }
 tether-transport = { path = "crates/tether-transport" }
+tether-audio = { path = "crates/tether-audio" }
 tether-capture = { path = "crates/tether-capture" }
 tether-codec = { path = "crates/tether-codec" }
 tether-decode = { path = "crates/tether-decode" }

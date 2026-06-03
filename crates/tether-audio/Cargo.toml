@@ -1,0 +1,59 @@
+[package]
+name = "tether-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Audio pipeline — system-output capture, Opus encode/decode, and playback."
+
+[dependencies]
+tether-protocol = { workspace = true }
+
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+# Cross-platform audio output (CoreAudio / WASAPI / ALSA-PipeWire) under one
+# API — the playback side of every reference impl uses a single abstraction
+# (Moonlight=SDL, RustDesk=cpal); capture stays per-platform because
+# system-output capture is irreducibly OS-specific.
+cpal = "0.17"
+
+# Linux system-audio capture rides PipeWire — the same stack the video path
+# uses (`tether-capture`), but portal-free: a capture stream tagged
+# `stream.capture.sink` auto-connects to the default sink's monitor (system
+# output). The crate re-exports its `libspa` as `pw::spa`, so we need no extra
+# spa/sys deps for the F32 format POD.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.10"
+
+# macOS system-audio capture rides ScreenCaptureKit — the same framework the
+# video path already uses (`tether-capture`), and the only native path to
+# system output on macOS. Same crate + feature floor as tether-capture.
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "6", features = ["macos_13_0"] }
+
+# Windows system-audio capture rides WASAPI loopback — opening the default
+# render endpoint in shared mode with AUDCLNT_STREAMFLAGS_LOOPBACK captures
+# exactly "what's playing." Same `windows` crate + version the host video path
+# (`tether-capture`) already pins; cpal doesn't expose loopback so we bind the
+# Core Audio interfaces directly.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+# Loopback the Opus codec through the real `Datagram::Audio` wire channel,
+# including the lossy variant that exercises gap-driven concealment.
+tether-transport = { workspace = true, features = ["test-support"] }
+tether-protocol = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

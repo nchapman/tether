@@ -1195,9 +1195,11 @@ impl GpuState {
             self.metal_import_supported,
             "apply_gpu reached without Metal HAL; GpuState::new should have failed"
         );
-        // Match shape mirrors the Linux side: an explicit pattern, not
-        // `let else`, so adding a future `GpuFrameSource` variant
-        // surfaces here at compile time.
+        // Match shape mirrors the Linux side (where `GpuFrameSource` has a
+        // second variant, so the match is fallible): an explicit pattern, not
+        // `let else`, so adding a future variant surfaces here at compile time.
+        // Infallible on macOS today, hence the scoped allow.
+        #[allow(clippy::infallible_destructuring_match)]
         let iosurface = match &frame.source {
             GpuFrameSource::IOSurface(s) => s,
         };

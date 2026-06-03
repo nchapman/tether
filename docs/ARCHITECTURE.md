@@ -26,9 +26,12 @@ end-to-end and verified in a live loopback session. Encode picks the
 backend from the DXGI adapter's PCI vendor — Intel→QSV, AMD→AMF,
 NVIDIA→NVENC — with Media Foundation as the vendor-agnostic fallback;
 4:2:0 only (the Video Processor has no 4:4:4 output path, so Windows
-never advertises 4:4:4). Audio remains deferred. See
-`docs/CODEC_CAPABILITIES.md` for the Windows capture/encode layers and
-their per-backend limits.
+never advertises 4:4:4). **System-output audio** is wired end-to-end
+on all three platforms — capture (Linux PipeWire sink monitor, macOS
+ScreenCaptureKit, Windows WASAPI loopback) → Opus → unreliable
+datagrams → cpal playback (see `tether-audio` and the audio packet
+below). See `docs/CODEC_CAPABILITIES.md` for the Windows capture/encode
+layers and their per-backend limits.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -481,9 +484,12 @@ its own QUIC primitive:
   `VideoFrameMeta` so future per-frame metadata (HDR ROI QP) lands
   as additive variants instead of struct-field appends.
 - **Audio** (unreliable datagrams, host → client) — `AudioPacket::Opus
-  { stream_epoch, frame_seq, t_capture, payload }`. The wire shape
-  ships in V1; the Opus capture/encode/decode pipeline is its own
-  future workstream (no protocol bump needed when it lands).
+  { stream_epoch, frame_seq, t_capture, payload }`. The full Opus
+  capture → encode → decode → playback pipeline is implemented in
+  `tether-audio` (per-platform system-output capture, libopus codec
+  with PLC, lock-free jitter ring + cap-and-drop playback policy),
+  negotiated host-authoritatively via the `tether.audio` hello
+  extension.
 - **Cursor** (unreliable datagrams, high priority) — pointer position
   only (`HostCursorPacket::Position`, `ClientCursorPacket`). Sprite
   payloads ride the reliable control stream (too large for a
@@ -752,7 +758,7 @@ Listed to set expectations; each is a real follow-up, not a "never":
   4:2:0); cross-device decode→present sync currently relies on the
   handoff latency rather than a shared device, validated on shared iGPUs
   (discrete GPUs may need the single-device model — see the
-  `import_shared_biplanar` note); and audio is deferred everywhere.
+  `import_shared_biplanar` note).
 - **AV1.** H.264 and HEVC are supported; AV1 needs a different VAAPI
   decoder probe (no `vaapi_av1` encode entrypoint on most current
   Intel iGPUs) and a separate codec_id path. The probe stub returns
@@ -794,7 +800,12 @@ Listed to set expectations; each is a real follow-up, not a "never":
 - **Multi-monitor.** Single primary monitor capture; the
   keyframe-sender path assumes one fragmenter, and `display = 0` is
   hard-coded throughout the host send loop.
-- **Audio.** Video + input only.
+- **Audio: remaining gaps.** System-output capture → Opus → playback is
+  wired on all three platforms and negotiated via the `tether.audio`
+  hello extension, but there is no user-facing control yet — audio is
+  on whenever both peers support it (host `--no-audio` opts out). A
+  per-session mute/volume toggle waits on the user-prefs work. No
+  microphone / client → host audio path; system output only.
 - **Periodic safety-net IDR.** Sunshine deliberately omits this on
   the NVENC path; we follow suit. Worth adding if we ever see a
   "client went silent without observing decode failure" stall mode

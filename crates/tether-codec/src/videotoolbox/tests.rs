@@ -253,11 +253,11 @@ fn videotoolbox_round_trip() {
         // 12 frames is plenty: the first keyframe carries extradata
         // inline (per Phase 1.1) so the decoder doesn't need external
         // priming, and any pipeline latency is < 4 frames on VT.
-        for t in 0..12i64 {
-            let bgra = make_test_bgra(w, h, t as u32);
+        for t in 0..12u32 {
+            let bgra = make_test_bgra(w, h, t);
             let force_key = t == 0;
             let packets = enc
-                .encode_bgra(&bgra, t, force_key)
+                .encode_bgra(&bgra, i64::from(t), force_key)
                 .unwrap_or_else(|e| panic!("{kind:?} encode frame {t}: {e:?}"));
             for p in packets {
                 dec.submit(&p.data)
@@ -428,30 +428,28 @@ fn try_round_trip(
     }
     dec.signal_eof()
         .map_err(|e| format!("decoder signal_eof: {e:?}"))?;
-    loop {
-        match dec
-            .next_frame()
-            .map_err(|e| format!("decoder next_frame: {e:?}"))?
-        {
-            Some(Frame::Gpu(g)) => {
-                let GpuFrameSource::IOSurface(io) = g.source;
-                let expected = expected_iosurface_fourccs_for(profile);
-                if !expected.contains(&io.pixel_format) {
-                    return Err(format!(
-                        "IOSurface fourcc 0x{:08x} not in expected family {:?} \
-                         (likely silent downsample)",
-                        io.pixel_format,
-                        expected
-                            .iter()
-                            .map(|f| format!("0x{f:08x}"))
-                            .collect::<Vec<_>>()
-                    ));
-                }
-                return Ok(io.pixel_format);
+    match dec
+        .next_frame()
+        .map_err(|e| format!("decoder next_frame: {e:?}"))?
+    {
+        Some(Frame::Gpu(g)) => {
+            let GpuFrameSource::IOSurface(io) = g.source;
+            let expected = expected_iosurface_fourccs_for(profile);
+            if !expected.contains(&io.pixel_format) {
+                return Err(format!(
+                    "IOSurface fourcc 0x{:08x} not in expected family {:?} \
+                     (likely silent downsample)",
+                    io.pixel_format,
+                    expected
+                        .iter()
+                        .map(|f| format!("0x{f:08x}"))
+                        .collect::<Vec<_>>()
+                ));
             }
-            Some(Frame::Cpu(_)) => return Err("decoder produced Cpu frame".into()),
-            None => return Err("decoder produced no frame after EOF".into()),
+            Ok(io.pixel_format)
         }
+        Some(Frame::Cpu(_)) => Err("decoder produced Cpu frame".into()),
+        None => Err("decoder produced no frame after EOF".into()),
     }
 }
 
@@ -526,11 +524,11 @@ fn videotoolbox_decoder_recovers_from_mid_session_idr() {
         // IDRs (frame 0 and an explicit force at frame 8). Collect every
         // packet so we can replay a subset of them.
         let mut packets: Vec<crate::EncodedPacket> = Vec::new();
-        for t in 0..16i64 {
-            let bgra = make_test_bgra(w, h, t as u32);
+        for t in 0..16u32 {
+            let bgra = make_test_bgra(w, h, t);
             let force = t == 0 || t == 8;
             let out = enc
-                .encode_bgra(&bgra, t, force)
+                .encode_bgra(&bgra, i64::from(t), force)
                 .unwrap_or_else(|e| panic!("{kind:?} encode {t}: {e:?}"));
             packets.extend(out);
         }

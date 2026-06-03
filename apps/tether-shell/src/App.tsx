@@ -39,6 +39,13 @@ function App() {
   // *any* terminal transition (clean disconnect, error, or crash-exit) without
   // re-showing — and stealing focus — when it was never hidden.
   const windowHidden = useRef(false);
+  // Guards the launch-time sharing auto-restore so it fires exactly once.
+  // React StrictMode (dev) double-invokes the mount effect setup→cleanup→setup,
+  // and the cleanup can't cancel the already-dispatched `getPrefs()` chain, so
+  // without this guard both invocations call `startSharing()` and we spawn the
+  // host engine twice. The ref persists across the StrictMode re-invoke (same
+  // fiber), so the second chain sees it already set and skips.
+  const didAutoRestore = useRef(false);
 
   function restoreWindow() {
     if (windowHidden.current) {
@@ -114,7 +121,12 @@ function App() {
     Promise.all([unstatus, unexit])
       .then(() => getPrefs())
       .then((prefs) => {
-        if (prefs.sharing_enabled) sharing.startSharing();
+        // Once-only: the check-and-set is synchronous (no await between), so
+        // the StrictMode-doubled chains can't both pass it.
+        if (prefs.sharing_enabled && !didAutoRestore.current) {
+          didAutoRestore.current = true;
+          sharing.startSharing();
+        }
       })
       .catch((e) => console.warn("get_prefs failed", e));
 

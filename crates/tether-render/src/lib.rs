@@ -305,6 +305,7 @@ pub fn run(
         last_recorded_t_cap: None,
         refresh_rate_mhz: present_policy::REFRESH_RATE_FALLBACK_HZ.saturating_mul(1000),
         age_tracker: present_policy::FrameAgeTracker::default(),
+        health: RenderHealth::default(),
         cursor_mode: CursorMode::Absolute,
         relative_accum: relative_mouse::SubPixelAccum::default(),
         ctrl_held: false,
@@ -344,6 +345,12 @@ struct App {
     refresh_rate_mhz: u32,
     /// Frame-age skip policy state. See [`present_policy`].
     age_tracker: present_policy::FrameAgeTracker,
+    /// End-to-end present-health counters. Distinct from
+    /// `present_stats` (which only ticks when a frame is actually
+    /// presented): this is ticked every event-loop turn so a *stall* —
+    /// frames decoding but nothing reaching the screen — surfaces as a
+    /// loud log line instead of the silent absence of `present stats`.
+    health: RenderHealth,
     /// Cursor input model. Toggled by Ctrl+Alt+G; on
     /// transition to `Relative` we grab + hide the cursor and
     /// route `DeviceEvent::MouseMotion` through `relative_accum`.
@@ -395,6 +402,100 @@ impl PresentStats {
     }
 }
 
+/// End-to-end present-health accounting for one ~1-second window.
+///
+/// `present_stats` answers "how fast are presented frames?" but only
+/// exists while frames *are* being presented. `RenderHealth` answers the
+/// orthogonal question "are decoded frames actually reaching the
+/// screen?" — and is ticked unconditionally every event-loop turn so the
+/// answer is logged even when it's "no." The green-screen-until-resize
+/// bug presented exactly this way: 36 fps decoded, 0 fps presented, and
+/// every stage counter reading healthy because the un-drawn frames were
+/// overwritten in a path nobody counted.
+#[derive(Default)]
+struct RenderHealth {
+    /// Decoded frames handed to the renderer this window.
+    arrived: u32,
+    /// Frames actually applied + presented this window.
+    presented: u32,
+    /// Frames overwritten in the single-frame slot before they could be
+    /// drawn — a silent drop. Should be ~0 now that `about_to_wait`
+    /// presents on arrival; a non-zero value means frames are landing
+    /// faster than we can draw, or arriving before the GPU is ready.
+    dropped_undrawn: u32,
+    window_start: Option<Instant>,
+}
+
+impl RenderHealth {
+    /// A decoded frame reached the renderer. `displaced_undrawn` is true
+    /// if it overwrote a prior frame that was never presented.
+    fn frame_arrived(&mut self, displaced_undrawn: bool) {
+        self.arrived = self.arrived.saturating_add(1);
+        if displaced_undrawn {
+            self.dropped_undrawn = self.dropped_undrawn.saturating_add(1);
+        }
+    }
+
+    /// A new frame was applied and presented to the screen.
+    fn frame_presented(&mut self) {
+        self.presented = self.presented.saturating_add(1);
+    }
+
+    /// Emit at most one health line per second. Called every event-loop
+    /// turn; the window clock starts on the first call, not on first
+    /// frame arrival. A window with no arrivals classifies as `Idle` and
+    /// resets silently (no noise pre-connection or while paused); windows
+    /// with activity log every second — loudly when frames are arriving
+    /// but none are reaching the screen.
+    fn maybe_log(&mut self) {
+        let now = Instant::now();
+        let start = *self.window_start.get_or_insert(now);
+        if now.duration_since(start) < Duration::from_secs(1) {
+            return;
+        }
+        match classify_health(self.arrived, self.presented) {
+            HealthVerdict::Idle => {}
+            HealthVerdict::Stalled => tracing::warn!(
+                arrived = self.arrived,
+                dropped_undrawn = self.dropped_undrawn,
+                "render stalled: frames decoded but none reached the screen"
+            ),
+            HealthVerdict::Healthy => tracing::info!(
+                presented_fps = self.presented,
+                arrived = self.arrived,
+                dropped_undrawn = self.dropped_undrawn,
+                "render stats"
+            ),
+        }
+        self.arrived = 0;
+        self.presented = 0;
+        self.dropped_undrawn = 0;
+        self.window_start = Some(now);
+    }
+}
+
+/// Verdict for one completed health window. Split out from
+/// [`RenderHealth::maybe_log`] so the decode-vs-present decision is
+/// unit-testable without a clock.
+#[derive(Debug, PartialEq, Eq)]
+enum HealthVerdict {
+    /// No frames arrived or presented — idle / pre-connection. No log.
+    Idle,
+    /// Frames reached the screen this window.
+    Healthy,
+    /// Frames arrived from decode but none were presented — a stall
+    /// (the green-screen signature).
+    Stalled,
+}
+
+fn classify_health(arrived: u32, presented: u32) -> HealthVerdict {
+    match (arrived, presented) {
+        (0, 0) => HealthVerdict::Idle,
+        (_, 0) => HealthVerdict::Stalled,
+        _ => HealthVerdict::Healthy,
+    }
+}
+
 impl App {
     fn emit(&self, event: RenderEvent) {
         if let Some(cb) = &self.on_event {
@@ -440,6 +541,87 @@ impl App {
             }
         }
         self.emit(RenderEvent::CursorModeChanged(new_mode));
+    }
+
+    /// Apply the freshest pending frame (if any) and present.
+    ///
+    /// Driven from two places: `about_to_wait` calls this directly the
+    /// instant a decoded frame lands (frame-arrival is the pacing
+    /// signal), and `RedrawRequested` calls it for OS-initiated repaints
+    /// (expose/resize), which re-present the last applied frame without a
+    /// new upload. We deliberately do NOT rely on `request_redraw()` to
+    /// drive steady-state liveness: on Wayland a redraw request only
+    /// turns into `RedrawRequested` when the compositor delivers a frame
+    /// callback, and that cadence doesn't reliably bootstrap before the
+    /// first real window event — leaving decoded frames undrawn (a green
+    /// screen) until the user happens to resize. Presenting here makes
+    /// liveness depend on our own decode loop, not the compositor.
+    fn draw(&mut self) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        // Apply a new frame at most once per draw. GpuState holds the
+        // imported/uploaded textures across draws, so OS-initiated
+        // redraws (expose, focus) re-render the most recently applied
+        // frame without re-uploading or re-importing.
+        //
+        // Before applying, run the frame-age policy: a sufficiently-stale
+        // frame (>~1.5× refresh period, streak gated) is dropped on the
+        // floor so the refresh slot can carry whatever lands next instead
+        // of stale content the user has already adjusted to. Frames
+        // without a timestamp (test_pattern example) always render — no
+        // policy input to evaluate.
+        let mut skipped = false;
+        let mut applied_new = false;
+        if let Some(frame) = self.latest.take() {
+            let t_capture = frame.t_capture_client_clock();
+            let now = MonoNanos::now();
+            if let Some(t_cap) = t_capture {
+                let age_ns = now.saturating_sub(t_cap);
+                let decision = present_policy::decide_present(
+                    age_ns,
+                    self.refresh_rate_mhz,
+                    &mut self.age_tracker,
+                );
+                if matches!(decision, present_policy::PresentDecision::Skip) {
+                    skipped = true;
+                }
+            }
+            if !skipped {
+                // Only count a present in `RenderHealth` if the upload
+                // actually succeeded — otherwise a persistent apply
+                // failure (DMA-BUF import error) would report Healthy
+                // while the screen shows stale content.
+                match gpu.apply_frame(frame) {
+                    Ok(()) => applied_new = true,
+                    Err(e) => warn!(error = ?e, "applying frame failed"),
+                }
+            }
+            if let Some(t_cap) = t_capture.filter(|_| !skipped) {
+                // Sample present latency only for frames we actually
+                // applied. Dedup against `last_recorded_t_cap` so
+                // OS-initiated redraws don't double-count.
+                if self.last_recorded_t_cap != t_capture {
+                    let latency = MonoNanos::now().saturating_sub(t_cap);
+                    self.present_stats.record_and_maybe_log(latency);
+                    self.last_recorded_t_cap = Some(t_cap);
+                }
+            }
+        }
+        if !skipped {
+            if let Err(e) = gpu.render() {
+                warn!(error = ?e, "render frame failed");
+            }
+            if applied_new {
+                self.health.frame_presented();
+            }
+        } else {
+            tracing::trace!(
+                late_streak = self.age_tracker.late_streak,
+                drops = self.age_tracker.drops_in_window,
+                "skipped stale frame"
+            );
+        }
     }
 }
 
@@ -493,75 +675,28 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(gpu) = self.gpu.as_mut() else {
+        // Existence guard only — individual arms re-acquire `gpu` locally
+        // so `RedrawRequested` can call `self.draw()` (which borrows all
+        // of `self`) without colliding with a function-wide `gpu` borrow.
+        if self.gpu.is_none() {
             return;
-        };
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                gpu.resize(size.width, size.height);
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.resize(size.width, size.height);
+                }
                 self.emit(RenderEvent::Resized {
                     width: size.width,
                     height: size.height,
                 });
             }
             WindowEvent::RedrawRequested => {
-                // Apply a new frame at most once per redraw. GpuState
-                // holds the imported/uploaded textures across redraws,
-                // so OS-initiated redraws (expose, focus) re-render the
-                // most recently applied frame without re-uploading or
-                // re-importing.
-                //
-                // Before applying, run the frame-age policy: a
-                // sufficiently-stale frame (>~1.5× refresh period,
-                // streak gated) is dropped on the floor so the
-                // refresh slot can carry whatever lands next instead
-                // of stale content the user has already adjusted to.
-                // Frames without a timestamp (test_pattern example)
-                // always render — no policy input to evaluate.
-                let mut skipped = false;
-                if let Some(frame) = self.latest.take() {
-                    let t_capture = frame.t_capture_client_clock();
-                    let now = MonoNanos::now();
-                    if let Some(t_cap) = t_capture {
-                        let age_ns = now.saturating_sub(t_cap);
-                        let decision = present_policy::decide_present(
-                            age_ns,
-                            self.refresh_rate_mhz,
-                            &mut self.age_tracker,
-                        );
-                        if matches!(decision, present_policy::PresentDecision::Skip) {
-                            skipped = true;
-                        }
-                    }
-                    if !skipped {
-                        if let Err(e) = gpu.apply_frame(frame) {
-                            warn!(error = ?e, "applying frame failed");
-                        }
-                    }
-                    if let Some(t_cap) = t_capture.filter(|_| !skipped) {
-                        // Sample present latency only for frames we
-                        // actually applied. Dedup against
-                        // `last_recorded_t_cap` so OS-initiated
-                        // redraws don't double-count.
-                        if self.last_recorded_t_cap != t_capture {
-                            let latency = MonoNanos::now().saturating_sub(t_cap);
-                            self.present_stats.record_and_maybe_log(latency);
-                            self.last_recorded_t_cap = Some(t_cap);
-                        }
-                    }
-                }
-                if !skipped {
-                    if let Err(e) = gpu.render() {
-                        warn!(error = ?e, "render frame failed");
-                    }
-                } else {
-                    tracing::trace!(
-                        late_streak = self.age_tracker.late_streak,
-                        drops = self.age_tracker.drops_in_window,
-                        "skipped stale frame"
-                    );
-                }
+                // OS-initiated repaint (expose/resize). Re-present the
+                // last applied frame; steady-state liveness is driven by
+                // `about_to_wait` instead — see `draw`.
+                self.draw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 // PhysicalKey + the resolved text travel together: HID
@@ -600,6 +735,9 @@ impl ApplicationHandler for App {
                 if matches!(self.cursor_mode, CursorMode::Relative) {
                     return;
                 }
+                let Some(gpu) = self.gpu.as_ref() else {
+                    return;
+                };
                 let (texture, surface) = gpu.dimensions();
                 self.emit(RenderEvent::Cursor {
                     video_normalized: cursor_to_video_normalized(position, surface, texture),
@@ -666,12 +804,25 @@ impl ApplicationHandler for App {
         // visible. That's the intended drop-oldest semantics: a
         // remote-desktop viewer wants the freshest picture, not a
         // queued backlog.
+        //
+        // Present directly rather than via `request_redraw()`: under
+        // `ControlFlow::Poll` this runs every loop turn, so frame arrival
+        // paces presentation. Relying on `request_redraw()` here left
+        // decoded frames undrawn on Wayland until the first window event
+        // (the green-screen-until-resize bug) because a redraw request
+        // only becomes `RedrawRequested` once the compositor delivers a
+        // frame callback.
         if let Some(frame) = self.frames.take() {
-            self.latest = Some(frame);
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            // A prior frame still in the slot here is one `draw()` never
+            // consumed (e.g. arrived before the GPU was ready) — a silent
+            // drop worth counting, not hiding.
+            let displaced_undrawn = self.latest.replace(frame).is_some();
+            self.health.frame_arrived(displaced_undrawn);
+            self.draw();
         }
+        // Ticked every turn — independent of whether anything was drawn —
+        // so a present stall logs instead of going silent.
+        self.health.maybe_log();
     }
 }
 
@@ -863,5 +1014,38 @@ mod tests {
             _ => panic!("expected Cpu frame"),
         }
         assert!(frames.take().is_none(), "slot should be empty after take");
+    }
+
+    #[test]
+    fn health_idle_window_is_silent() {
+        // No decode activity and nothing presented: pre-connection or a
+        // paused stream. Must not log (Idle), or every idle second spams.
+        assert_eq!(classify_health(0, 0), HealthVerdict::Idle);
+    }
+
+    #[test]
+    fn health_frames_presented_is_healthy() {
+        assert_eq!(classify_health(30, 30), HealthVerdict::Healthy);
+        // Presenting fewer than arrived (drop-oldest under load) is still
+        // healthy — pixels are reaching the screen.
+        assert_eq!(classify_health(60, 45), HealthVerdict::Healthy);
+    }
+
+    #[test]
+    fn health_decoding_without_presenting_is_a_stall() {
+        // The green-screen signature: frames arriving from decode, none
+        // reaching the screen. This is the case that must be loud.
+        assert_eq!(classify_health(36, 0), HealthVerdict::Stalled);
+    }
+
+    #[test]
+    fn health_counts_undrawn_displacement_as_drop() {
+        let mut h = RenderHealth::default();
+        // Frame arrives into an empty slot: no silent drop.
+        h.frame_arrived(false);
+        // Next frame overwrites one that was never drawn: a silent drop.
+        h.frame_arrived(true);
+        assert_eq!(h.arrived, 2);
+        assert_eq!(h.dropped_undrawn, 1);
     }
 }

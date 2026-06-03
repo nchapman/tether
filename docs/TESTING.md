@@ -6,11 +6,11 @@ each layer covers, and how to extend it.
 
 ## Headline counts
 
-`cargo test --workspace` runs **294 default-on tests** (including
-integration tests; lib-only is 222). Hardware-gated `#[ignore]`
-tests total **~69** across `tether-codec`, `tether-render`,
-`tether-gpuconvert`, and `tether-scaler`. Numbers below are
-authoritative — `docs/ARCHITECTURE.md` and `CLAUDE.md` defer here.
+`cargo test --workspace` runs **332 default-on tests** (including
+integration tests; lib-only is 255). Hardware-gated `#[ignore]`
+tests total **~70** across `tether-codec`, `tether-render`,
+`tether-gpuconvert`, `tether-scaler`, and `tether-audio`. Numbers below
+are authoritative — `docs/ARCHITECTURE.md` and `CLAUDE.md` defer here.
 
 ## Unit and integration tests by crate
 
@@ -26,7 +26,8 @@ authoritative — `docs/ARCHITECTURE.md` and `CLAUDE.md` defer here.
 | `tether-gpuconvert` | 6 lib + 18 `#[ignore]` lib + 7 `#[ignore]` integration (`tests/scaler_roundtrip.rs`) | `drm_fourcc_to_vk_format` table coverage (8 + 10-bit biplanar + packed XV30 → A2B10G10R10_UNORM_PACK32 + unknown rejection); BGRA→NV12 + DMA-BUF round-trip; `convert_solid_{white,red}_roundtrip_packed_xv30` (10-bit channel-mapping + BT.709 math); `storable_probe_returns_linear_for_xv30`; structural alignment regression `convert_reports_64_aligned_y_stride_at_unaligned_width`. Integration: `bgra_dmabuf_roundtrip_{1920×1200,2880×1920}` + `imported_bgra_then_scaler_2880×1920_to_2160×1440` — bisect entry points splitting (scaler isolation) ↔ (BGRA dma-buf import/export) ↔ (scaler-on-dma-buf). |
 | `tether-scaler` | 8 lib + 6 integration (`tests/quality.rs`) + 15 `#[ignore]` integration (`tests/hardware.rs`) | Mitchell-Netravali reference vs CPU parity, fp16 linear-light, mip prefilter, asymmetric scale; `matches_reference_coord_encoded_left_edge` (2880×1920 → 2160×1440 left-edge regression — bottom of the bisect stack). |
 | `tether-capture` | 15 default / 18 with `test-support` | `HashDamage::classify` policy incl. native-damage short-circuit; `native_damage_for_frame_status` (macOS) maps all six `SCFrameStatus`; `native_damage_from_region_count` (Linux) empty-list ⇒ idle; `video_damage_meta_pod_has_choice_range_size` pod-shape snapshot. Test-pattern producer lifecycle + `set_target_fps_changes_cadence_mid_stream` + `set_target_fps_clamps_zero_to_one`. SCK pixel-format probe (`#[ignore]` on macOS). `test_support`: `ScriptedSource` for precise-timing scenarios. **Windows D3D11** (cfg-gated): the capture→encode ownership handshake + freshest-wins handoff — `slot_return_releases_slot_to_free_list_on_drop`, `send_latest_drops_oldest_and_reclaims_its_slot`, `acquire_slot_evicts_mailbox_when_free_list_empty`, `acquire_slot_returns_none_when_every_slot_is_in_flight`, `producer_outrunning_consumer_keeps_freshest_and_leaks_no_slots`, plus the consumer-liveness shutdown contract (`liveness_tracks_frame_receiver_lifetime`, `liveness_drops_when_handle_discarded_without_into_rx`). |
-| `tether-decode` | 0 lib + 14 integration (`tests/run_thread.rs`, requires `test-support`) | `run_thread` (extracted from `apps/tether-client/src/main.rs`) under fault injection: decode success → `LatestFrame`, hard-error → IDR callback, soft-error → IDR callback, rate-limiting, build failure, dropped sender, watchdog escalation, rebuild budget exhaustion. Exercised via `FakeDecoder` (`one_frame_then_idle`, scriptable submit/next_frame outcomes, `flush_count` field). |
+| `tether-decode` | 0 lib + 18 integration (`tests/run_thread.rs`, requires `test-support`) | `run_thread` (extracted from `apps/tether-client/src/main.rs`) under fault injection: decode success → `LatestFrame`, hard-error → IDR callback, soft-error → IDR callback, rate-limiting, build failure, dropped sender, watchdog escalation, rebuild budget exhaustion, plus the first-IDR decode gate (green-screen-on-connect fix). Exercised via `FakeDecoder` (`one_frame_then_idle`, scriptable submit/next_frame outcomes, `flush_count` field). |
+| `tether-audio` | 22 Linux / 19 macOS / 33 Windows lib + 2 integration (`audio_loopback.rs`) | Lib: Opus encode/decode + config hardening against untrusted `OpusConfig` (5, `codec.rs`); lock-free jitter ring drop-oldest + cap-and-drop under overrun (7, `playback/ring.rs`); `playback::policy` prebuffer / starve / resync decisions (6); test-pattern producer (1); Linux PipeWire interleave / truncate / empty-frame adapters (3, `capture/linux.rs`); on Windows the WASAPI `FormatConverter` remix (stereo / 5.1 / 7.1 → stereo) + resampler continuity + mix-format clamping (14, `capture/windows.rs`). Integration: `audio_loopback.rs` (2) — Opus round-trip through the real `Datagram::Audio` unreliable channel, lossless + 1%-loss with gap-driven PLC concealment. Hardware (`#[ignore]`, one per platform): `{linux,macos,windows}_audio_roundtrip.rs` — real system-output capture → Opus → playback (needs a live audio device + capture permission/daemon). |
 | `tether-vaapi` | 0 | Hand-rolled libva FFI bindings; tested transitively through `tether-codec/vaapi/tests.rs`. |
 
 ## Test infrastructure (`test-support` features)

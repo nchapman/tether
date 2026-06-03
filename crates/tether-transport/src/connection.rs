@@ -7,11 +7,11 @@ use tokio::sync::Mutex;
 
 use tether_protocol::MonoNanos;
 use tether_protocol::{
+    audio::AudioPacket,
     control::{ClientHello, ClockSync, ControlMessage, ServerHello},
     cursor::{ClientCursorPacket, HostCursorPacket},
     input::InputEvent,
     video::VideoPacket,
-    MAX_DATAGRAM_PAYLOAD,
 };
 
 use crate::channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
@@ -25,19 +25,24 @@ use crate::{Result, TransportError, MAX_FRAMED_MESSAGE, MAX_VIDEO_STREAM_MESSAGE
 pub(crate) const STREAM_PREAMBLE_LEN: usize = 4;
 pub(crate) const STREAM_PREAMBLE: &[u8; STREAM_PREAMBLE_LEN] = &[0u8; STREAM_PREAMBLE_LEN];
 
-/// What rides on a QUIC datagram. We multiplex three packet types onto
-/// the same unreliable channel — all three prefer drop-on-loss over
+/// What rides on a QUIC datagram. We multiplex four packet types onto
+/// the same unreliable channel — all prefer drop-on-loss over
 /// retransmit. The enum discriminant adds one byte per datagram; the
 /// receiver demuxes via `match`.
 ///
 /// - [`Datagram::Video`] is host → client.
 /// - [`Datagram::HostCursor`] is host → client (cursor sprite + position).
 /// - [`Datagram::ClientCursor`] is client → host (pointer position).
+/// - [`Datagram::Audio`] is host → client (Opus frame; Opus PLC conceals loss).
+///
+/// `Audio` is appended last so the existing variants keep their bincode
+/// discriminants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Datagram {
     Video(VideoPacket),
     HostCursor(HostCursorPacket),
     ClientCursor(ClientCursorPacket),
+    Audio(AudioPacket),
 }
 
 /// An established QUIC connection between host and client.
@@ -147,11 +152,19 @@ impl Connection {
     /// (typically: drop the frame and increment a counter).
     pub fn send_datagram(&self, d: &Datagram) -> Result<()> {
         let bytes = tether_protocol::encode(d)?;
-        if bytes.len() > MAX_DATAGRAM_PAYLOAD {
-            return Err(TransportError::FrameTooLarge {
-                size: bytes.len(),
-                max: MAX_DATAGRAM_PAYLOAD,
-            });
+        // Bound against the path's real datagram capacity (quinn, MTU-derived),
+        // not the soft `MAX_DATAGRAM_PAYLOAD` fragmentation target. A First/Parity
+        // packet carrying an input-echo batch legitimately encodes past 1200, and
+        // quinn delivers it whenever the path MTU allows; rejecting at the soft
+        // target dropped real frames (and the receive-side mirror tore the session
+        // down). An oversized frame is the caller's to drop, never fatal.
+        if let Some(max) = self.conn.max_datagram_size() {
+            if bytes.len() > max {
+                return Err(TransportError::FrameTooLarge {
+                    size: bytes.len(),
+                    max,
+                });
+            }
         }
         self.conn.send_datagram(bytes.into())?;
         Ok(())
@@ -159,7 +172,9 @@ impl Connection {
 
     pub async fn recv_datagram(&self) -> Result<Datagram> {
         let bytes = self.conn.read_datagram().await?;
-        Ok(tether_protocol::decode(&bytes)?)
+        // Untrusted peer input: bound the decode's allocation so a forged
+        // length prefix (e.g. on an Opus payload) can't trigger an OOM abort.
+        Ok(tether_protocol::decode_datagram(&bytes)?)
     }
 
     /// Send a keyframe video packet on a fresh QUIC unidirectional
@@ -465,4 +480,68 @@ async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> 
     recv.read_exact(buf)
         .await
         .map_err(TransportError::from_read_exact)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tether_protocol::{decode, encode, MAX_DATAGRAM_PAYLOAD};
+
+    #[test]
+    fn round_trip_audio_datagram() {
+        // Audio rides the same unreliable `Datagram` channel as video; a
+        // bincode round-trip pins the wire shape (and that the new variant
+        // demuxes back to `Audio`, not a neighbouring discriminant).
+        let dgram = Datagram::Audio(AudioPacket::Opus {
+            stream_epoch: 7,
+            frame_seq: 4321,
+            t_capture: MonoNanos(123_456),
+            payload: vec![0xCD; 80],
+        });
+        let bytes = encode(&dgram).unwrap();
+        assert!(bytes.len() <= MAX_DATAGRAM_PAYLOAD);
+        let back: Datagram = decode(&bytes).unwrap();
+        match back {
+            Datagram::Audio(AudioPacket::Opus {
+                stream_epoch,
+                frame_seq,
+                t_capture,
+                payload,
+            }) => {
+                assert_eq!(stream_epoch, 7);
+                assert_eq!(frame_seq, 4321);
+                assert_eq!(t_capture, MonoNanos(123_456));
+                assert_eq!(payload, vec![0xCD; 80]);
+            }
+            other => panic!("expected Datagram::Audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_was_appended_as_the_fourth_datagram_variant() {
+        // `Audio` is appended last so Video(0) / HostCursor(1) /
+        // ClientCursor(2) keep their bincode discriminants. The leading
+        // varint byte being 3 pins that ordering — a reorder that moves
+        // `Audio` ahead of the others (re-numbering them) trips this.
+        let bytes = encode(&Datagram::Audio(AudioPacket::Opus {
+            stream_epoch: 0,
+            frame_seq: 0,
+            t_capture: MonoNanos(0),
+            payload: Vec::new(),
+        }))
+        .unwrap();
+        assert_eq!(bytes[0], 3, "Audio must be the 4th Datagram variant");
+    }
+
+    #[test]
+    fn unknown_datagram_variant_fails_decode() {
+        // Forward-compat probe (mirrors the protocol crate's variant probes):
+        // a discriminator for a hypothetical 5th variant must error cleanly,
+        // not silently misread the body as an existing variant.
+        let bytes = [4u8, 0, 0, 0, 0];
+        assert!(
+            decode::<Datagram>(&bytes).is_err(),
+            "unknown Datagram variant must fail decode, not silently succeed"
+        );
+    }
 }

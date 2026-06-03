@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use tether_protocol::audio::{AudioConfig, AUDIO_CONFIG_EXTENSION_KEY};
 use tether_protocol::control::{
     is_known_bit_depth, ChromaSubsampling, ClientHello, ClientHelloV1, CodecKind, ControlMessage,
     GoodbyeCode, PixelFormat, ServerHello, ServerHelloV1, VideoColorSpec, VideoProfile,
@@ -56,6 +57,12 @@ const LEGACY_DECODE_PROFILE_FLOOR: VideoProfile = VideoProfile::H264_8BIT_420;
 pub struct HostSessionConfig {
     /// Sent back to the client as `ServerHelloV1::server_name`.
     pub server_name: String,
+    /// Audio format the host will stream, advertised to the client in the
+    /// `ServerHello` under [`AUDIO_CONFIG_EXTENSION_KEY`]. `None` (audio
+    /// disabled or no capture device) omits the extension, so the client sees
+    /// no audio and never opts in. The client decides whether to play it and
+    /// signals readiness via `StreamReady.audio`.
+    pub audio_config: Option<AudioConfig>,
 }
 
 /// Per-connection state produced by a successful [`HostSession::accept`].
@@ -309,6 +316,16 @@ fn build_server_hello(cfg: &HostSessionConfig, chosen: Option<VideoProfile>) -> 
         );
     }
 
+    // Audio advert: present only when the host has audio to stream. The client
+    // decodes it if it can play audio, ignores it otherwise (echo-to-opt-in via
+    // `StreamReady.audio`).
+    if let Some(audio) = &cfg.audio_config {
+        extensions.insert(
+            AUDIO_CONFIG_EXTENSION_KEY.to_string(),
+            tether_protocol::encode(audio).expect("AudioConfig encodes; types under our control"),
+        );
+    }
+
     ServerHelloV1 {
         server_name: cfg.server_name.clone(),
         // On no-match the response carries H.264 / Yuv420 as a placeholder
@@ -394,6 +411,7 @@ mod tests {
     fn server_hello_with_no_match_uses_floor_placeholder() {
         let cfg = HostSessionConfig {
             server_name: "test".to_string(),
+            audio_config: None,
         };
         let hello = build_server_hello(&cfg, None);
         assert_eq!(hello.chosen_codec, CodecKind::H264);
@@ -412,6 +430,7 @@ mod tests {
     fn server_hello_echoes_chosen_profile_and_pixel_format() {
         let cfg = HostSessionConfig {
             server_name: "test".to_string(),
+            audio_config: None,
         };
         let hello = build_server_hello(&cfg, Some(VideoProfile::HEVC_10BIT_444));
         let pf_bytes = hello.extensions.get(PIXEL_FORMAT_EXTENSION_KEY).unwrap();
@@ -424,5 +443,33 @@ mod tests {
             .unwrap();
         let p: VideoProfile = tether_protocol::decode(p_bytes).unwrap();
         assert_eq!(p, VideoProfile::HEVC_10BIT_444);
+    }
+
+    #[test]
+    fn server_hello_advertises_audio_only_when_configured() {
+        // No audio config → no extension; the client sees a silent session.
+        let silent = HostSessionConfig {
+            server_name: "test".to_string(),
+            audio_config: None,
+        };
+        let hello = build_server_hello(&silent, Some(VideoProfile::HEVC_8BIT_420));
+        assert!(!hello.extensions.contains_key(AUDIO_CONFIG_EXTENSION_KEY));
+
+        // With audio config → the extension carries it, round-tripping intact.
+        let audio = AudioConfig {
+            sample_rate_hz: 48_000,
+            channels: 2,
+            streams: 1,
+            coupled_streams: 1,
+            channel_mapping: vec![0, 1],
+        };
+        let cfg = HostSessionConfig {
+            server_name: "test".to_string(),
+            audio_config: Some(audio.clone()),
+        };
+        let hello = build_server_hello(&cfg, Some(VideoProfile::HEVC_8BIT_420));
+        let bytes = hello.extensions.get(AUDIO_CONFIG_EXTENSION_KEY).unwrap();
+        let decoded: AudioConfig = tether_protocol::decode(bytes).unwrap();
+        assert_eq!(decoded, audio);
     }
 }

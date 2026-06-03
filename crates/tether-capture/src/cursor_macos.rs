@@ -290,6 +290,9 @@ unsafe extern "C" {
     fn CFRelease(cf: *const std::ffi::c_void);
 }
 
+// Pointer coords are rounded screen-space values bounded by the display
+// rect; the i32→u32 casts are guarded by the `>= 0` visibility checks.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn read_pointer_position(geom: CaptureGeometry) -> Option<CursorPosition> {
     // SAFETY: passing NULL to CGEventCreate is the documented form for
     // "snapshot the current input state." The returned event is +1
@@ -374,6 +377,10 @@ const NS_BITMAP_FORMAT_ALPHA_FIRST: NSUInteger = 1 << 0;
 const NS_BITMAP_FORMAT_ALPHA_NON_PREMULTIPLIED: NSUInteger = 1 << 1;
 const NS_BITMAP_FORMAT_32_BIT_LITTLE_ENDIAN: NSUInteger = 1 << 2;
 
+// Sprite math: premultiplied-alpha colours are clamped to [0, 255] before the
+// f32→u8 cast, and the f64→u32 dimension/hotspot conversions are rounded,
+// non-negative, and bounded by the (small) displayed cursor size.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn read_cursor_sprite(geom: CaptureGeometry) -> Option<CursorShapeEvent> {
     // SAFETY: every call below is a standard AppKit message send. The
     // returned objects are autoreleased; objc2's autoreleasepool keeps
@@ -573,6 +580,10 @@ fn read_cursor_sprite(geom: CaptureGeometry) -> Option<CursorShapeEvent> {
 /// preserving aspect ratio. Hotspot is rescaled proportionally. The
 /// downscale path runs once per sprite *change* (not per frame), so a
 /// pure-Rust implementation is fine even at ~64 KB input.
+// `scale <= 1` here (we only enter the resize branch when a dim exceeds
+// `max_dim`), so the rounded f64→u32→u16 results are non-negative and never
+// exceed the original u16 dims.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn downscale_if_oversize(
     width: u16,
     height: u16,
@@ -654,6 +665,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // rounded, bounded test arithmetic
     fn downscale_preserves_aspect_and_fits_under_cap() {
         let pixels = vec![0xFFu8; 170 * 230 * 4];
         let (w, h, out, hot) = downscale_if_oversize(170, 230, pixels, (40, 40), 128);
@@ -694,6 +706,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_sign_loss)] // visibility predicate guards `>= 0` before the i32→u32 cast
     fn position_outside_bounds_marks_hidden() {
         let geom = CaptureGeometry {
             logical_point_w: 1000.0,

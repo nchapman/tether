@@ -242,14 +242,14 @@ impl IOSurfaceOwned {
         let (chroma_w, chroma_h) = (width / 2, height / 2);
         let (luma_bpe, chroma_bpe) = nv12_bytes_per_element(fourcc);
 
-        let width_num = CFNumber::from(width as i64);
-        let height_num = CFNumber::from(height as i64);
-        let fourcc_num = CFNumber::from(fourcc as i64);
+        let width_num = CFNumber::from(i64::from(width));
+        let height_num = CFNumber::from(i64::from(height));
+        let fourcc_num = CFNumber::from(i64::from(fourcc));
 
         // Luma plane dict: width × height × `luma_bpe` bytes/element.
-        let luma_plane = make_plane_dict(width as i64, height as i64, luma_bpe);
+        let luma_plane = make_plane_dict(i64::from(width), i64::from(height), luma_bpe);
         // Chroma plane dict: chroma_w × chroma_h × `chroma_bpe`.
-        let chroma_plane = make_plane_dict(chroma_w as i64, chroma_h as i64, chroma_bpe);
+        let chroma_plane = make_plane_dict(i64::from(chroma_w), i64::from(chroma_h), chroma_bpe);
 
         // Plane-info array. CFArray of two CFDictionaries.
         let planes_arr = unsafe {

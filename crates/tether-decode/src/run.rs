@@ -135,6 +135,11 @@ pub struct Worker {
     /// parameter sets and will fail on P-frames, burning through the
     /// rebuild budget in a death spiral. Cleared on the first IDR.
     awaiting_idr: bool,
+    /// P-frames discarded since entering the current `awaiting_idr`
+    /// window. Drives a re-request of the keyframe so a lost or
+    /// un-honoured initial IDR can't strand the stream indefinitely;
+    /// reset to 0 when an IDR finally arrives.
+    awaiting_idr_discards: u64,
 }
 
 impl Worker {
@@ -158,7 +163,25 @@ impl Worker {
             last_successful_decode: None,
             watchdog_armed: false,
             awaiting_idr: false,
+            awaiting_idr_discards: 0,
         }
+    }
+
+    /// Gate the worker on its first IDR before any P-frame is fed.
+    ///
+    /// A freshly-built decoder has no parameter sets, so the P-frames
+    /// that race ahead of the first keyframe on a new connection (the
+    /// IDR rides a reliable uni-stream while P-frames arrive first on
+    /// datagrams) only produce `PPS id out of range` errors and a
+    /// destructive rebuild — which then discards the IDR that's
+    /// arriving. Starting gated makes the worker discard those racing
+    /// P-frames and cleanly latch the first keyframe, the same way
+    /// Moonlight and RustDesk gate a fresh decoder on its first IDR.
+    /// `replace_decoder` already gates after a rebuild; this gates the
+    /// very first decoder too.
+    pub fn gate_on_first_idr(&mut self) {
+        self.awaiting_idr = true;
+        self.awaiting_idr_discards = 0;
     }
 
     /// Swap in a freshly-built decoder after a recovery rebuild.
@@ -169,6 +192,7 @@ impl Worker {
         self.consecutive_failures = 0;
         self.watchdog_armed = false;
         self.awaiting_idr = true;
+        self.awaiting_idr_discards = 0;
         // `last_successful_decode` stays as-is: the watchdog clock
         // shouldn't reset just because we rebuilt; if the rebuild
         // doesn't produce a frame either, we want the *original*
@@ -196,9 +220,34 @@ impl Worker {
         // parameter sets at the start of the body.
         if self.awaiting_idr {
             if job.keyframe || body_starts_with_parameter_sets(&job.body) {
+                info!(
+                    discarded_p_frames = self.awaiting_idr_discards,
+                    "IDR acquired; resuming decode"
+                );
                 self.awaiting_idr = false;
+                self.awaiting_idr_discards = 0;
             } else {
-                return DecodeCompletion::default();
+                // No IDR yet — re-request one (rate-limited). The initial
+                // ForceIdr can be lost or arrive before the host's
+                // encoder is ready to honour it; without re-requesting,
+                // this early return bypasses the failure + watchdog paths
+                // that would otherwise recover, stranding the stream on a
+                // green screen until the user happens to resize (which
+                // forces a host IDR). The 500 ms rate limit prevents a
+                // keyframe storm while P-frames pour in at frame rate.
+                self.awaiting_idr_discards = self.awaiting_idr_discards.saturating_add(1);
+                let fired = self.try_fire_idr(now);
+                if fired {
+                    warn!(
+                        discarded_p_frames = self.awaiting_idr_discards,
+                        keyframe_flag = job.keyframe,
+                        "awaiting IDR; re-requesting keyframe (P-frames discarded while gated)"
+                    );
+                }
+                return DecodeCompletion {
+                    idr_request_fired: fired,
+                    ..DecodeCompletion::default()
+                };
             }
         }
 
@@ -497,6 +546,12 @@ pub fn run_thread_with_init(
             let _ = ready_tx.send(());
 
             let mut worker = Worker::new(decoder, frames, request_idr, warnings);
+            // Gate on the first IDR: a fresh connection's P-frames can
+            // arrive (on datagrams) before the first keyframe (on its
+            // reliable uni-stream), and feeding them to a virgin decoder
+            // would force a destructive rebuild that loses the inbound
+            // IDR. Discard until the keyframe lands instead.
+            worker.gate_on_first_idr();
             let mut rebuilds_used: u32 = 0;
             while let Ok(job) = job_rx.recv() {
                 let now = MonoNanos::now();

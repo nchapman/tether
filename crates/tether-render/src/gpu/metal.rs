@@ -102,13 +102,15 @@ fn import_biplanar(
             surface_ref.plane_count()
         )));
     }
+    // Plane dims fit u32; an impossible overflow maps to 0 and is rejected by
+    // the zero-dimension check below rather than silently truncating.
     let (y_w, y_h) = (
-        surface_ref.width_of_plane(0) as u32,
-        surface_ref.height_of_plane(0) as u32,
+        u32::try_from(surface_ref.width_of_plane(0)).unwrap_or(0),
+        u32::try_from(surface_ref.height_of_plane(0)).unwrap_or(0),
     );
     let (uv_w, uv_h) = (
-        surface_ref.width_of_plane(1) as u32,
-        surface_ref.height_of_plane(1) as u32,
+        u32::try_from(surface_ref.width_of_plane(1)).unwrap_or(0),
+        u32::try_from(surface_ref.height_of_plane(1)).unwrap_or(0),
     );
     if y_w == 0 || y_h == 0 || uv_w == 0 || uv_h == 0 {
         return Err(RenderError::DmaBufImport(format!(

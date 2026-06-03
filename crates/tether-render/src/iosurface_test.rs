@@ -45,6 +45,11 @@ use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
 use crate::gpu;
 
+/// Reconstructed RGB of the two source regions (left, right) read back from the
+/// rendered target. The round-trip helpers return this pair for the caller to
+/// assert against the known input colours.
+type RegionColors = ((u8, u8, u8), (u8, u8, u8));
+
 /// Two solid colour regions — left half red, right half blue. Same
 /// pattern as the Linux dmabuf round-trip test. Chroma sub-sampling
 /// blurs the boundary; region averages reconstruct to the source
@@ -313,7 +318,7 @@ fn build_test_pipeline(
 /// `RUST_BACKTRACE=1` highly recommended on failure — the
 /// IOSurface fourcc the decoder produced is in the import path's
 /// error message and the test panics on the first mismatch.
-fn run_roundtrip(profile: VideoProfile) -> Option<((u8, u8, u8), (u8, u8, u8))> {
+fn run_roundtrip(profile: VideoProfile) -> Option<RegionColors> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (device, queue, adapter) =
@@ -382,9 +387,7 @@ fn run_roundtrip(profile: VideoProfile) -> Option<((u8, u8, u8), (u8, u8, u8))> 
     let codec_gpu = codec_gpu.expect("decoder must produce at least one Frame::Gpu");
     let (gw, gh, _pts, source, guard) = codec_gpu.into_parts();
     assert_eq!((gw, gh), (w, h), "decoded dims must match encoded dims");
-    let iosurface = match source {
-        GpuFrameSource::IOSurface(io) => io,
-    };
+    let GpuFrameSource::IOSurface(iosurface) = source;
     eprintln!(
         "[{profile:?}] decoded IOSurface fourcc: 0x{:08x}",
         iosurface.pixel_format
@@ -575,10 +578,7 @@ fn iosurface_zero_copy_roundtrip_hevc_main10() {
 /// "rendered output is approximately neutral grey" — R≈G≈B with both
 /// near a sane luminance midpoint — rather than the red/blue check the
 /// encode-roundtrip cells use.
-fn run_fixture_render(
-    profile: VideoProfile,
-    bitstream: &[u8],
-) -> Option<((u8, u8, u8), (u8, u8, u8))> {
+fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionColors> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (device, queue, adapter) =
@@ -615,9 +615,7 @@ fn run_fixture_render(
     let codec_gpu = codec_gpu.expect("decoder must produce at least one Frame::Gpu");
     let (gw, gh, _pts, source, guard) = codec_gpu.into_parts();
     assert_eq!((gw, gh), (w, h), "decoded dims must match fixture dims");
-    let iosurface = match source {
-        GpuFrameSource::IOSurface(io) => io,
-    };
+    let GpuFrameSource::IOSurface(iosurface) = source;
     eprintln!(
         "[{profile:?}] decoded IOSurface fourcc: 0x{:08x}",
         iosurface.pixel_format
@@ -984,9 +982,7 @@ fn run_host_scaler_roundtrip_with_input(
         src_dims,
         "decoded src dims must match encoded src dims"
     );
-    let src_iosurface = match source {
-        GpuFrameSource::IOSurface(io) => io,
-    };
+    let GpuFrameSource::IOSurface(src_iosurface) = source;
     eprintln!(
         "[{profile:?}] decoded src IOSurface fourcc: 0x{:08x}",
         src_iosurface.pixel_format
@@ -1157,7 +1153,7 @@ fn run_host_scaler_roundtrip(
     profile: VideoProfile,
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
-) -> Option<((u8, u8, u8), (u8, u8, u8))> {
+) -> Option<RegionColors> {
     let rgba = run_host_scaler_roundtrip_rgba(profile, src_dims, dst_dims)?;
     Some(host_scaler_wide_regions(&rgba, dst_dims.0, dst_dims.1))
 }
@@ -1456,9 +1452,7 @@ fn iosurface_host_scaler_sustained_rate() {
     }
     let codec_gpu = codec_gpu.expect("decoder must produce at least one Frame::Gpu");
     let (_gw, _gh, _pts, source, _guard) = codec_gpu.into_parts();
-    let src_iosurface = match source {
-        GpuFrameSource::IOSurface(io) => io,
-    };
+    let GpuFrameSource::IOSurface(src_iosurface) = source;
 
     let bridge = Nv12IOSurfaceBridge::new(
         device.clone(),

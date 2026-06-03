@@ -20,6 +20,7 @@ tether-pairing = { workspace = true }
 tether-ipc = { workspace = true }
 tether-capture = { workspace = true }
 tether-codec = { workspace = true }
+tether-audio = { workspace = true }
 tether-input = { workspace = true }
 tether-probe = { workspace = true }
 tether-session = { workspace = true }

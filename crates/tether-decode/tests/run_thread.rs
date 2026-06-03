@@ -497,6 +497,145 @@ fn rebuild_request_clears_after_replace_decoder() {
 }
 
 #[test]
+fn awaiting_idr_rerequests_keyframe_then_resumes_on_idr() {
+    // Regression: after a rebuild the worker awaits an IDR. If the
+    // initial ForceIdr is lost or un-honoured, P-frames must not be
+    // discarded in silence forever (the green-screen-until-resize hang) —
+    // each discard re-requests a keyframe (rate-limited), and the first
+    // real IDR resumes decode.
+    let decoder = FakeDecoder::new(vec![FakeOutcome::Solid {
+        width: 8,
+        height: 8,
+        luma: 5,
+    }]);
+    let (mut worker, idr_calls, _warn, frames) = make_worker(decoder);
+    // Enter the awaiting-IDR state via a rebuild onto a fresh decoder
+    // (which will decode the eventual keyframe).
+    let fresh = FakeDecoder::new(vec![FakeOutcome::Solid {
+        width: 8,
+        height: 8,
+        luma: 5,
+    }]);
+    worker.replace_decoder(Box::new(fresh));
+
+    let base = MonoNanos::now();
+    let p_frame = DecodeJob {
+        body: Bytes::from_static(b"pframe"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: false,
+    };
+    let c = worker.process_job(p_frame, base);
+    assert!(
+        !c.decode_err,
+        "P-frame must be discarded, not submitted, while awaiting IDR"
+    );
+    assert!(
+        c.idr_request_fired,
+        "discarding a P-frame while awaiting IDR must re-request a keyframe"
+    );
+    assert_eq!(
+        idr_calls.load(Ordering::Relaxed),
+        1,
+        "exactly one keyframe re-request should have fired"
+    );
+    assert!(
+        frames.take().is_none(),
+        "no frame may be produced while awaiting IDR"
+    );
+
+    // A keyframe arriving later resolves the wait and decodes.
+    let keyframe = DecodeJob {
+        body: Bytes::from_static(b"idr"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: true,
+    };
+    let c2 = worker.process_job(keyframe, at(base, Duration::from_millis(600)));
+    assert!(!c2.decode_err, "keyframe must decode cleanly once awaited");
+    assert!(
+        frames.take().is_some(),
+        "keyframe must produce a rendered frame and clear the awaiting-IDR state"
+    );
+}
+
+#[test]
+fn gate_on_first_idr_discards_pframes_until_first_keyframe() {
+    // A fresh connection: P-frames arrive (on datagrams) before the
+    // first keyframe (on its reliable uni-stream). A gated worker must
+    // discard them — not feed a virgin decoder that would error and
+    // force a rebuild — then latch the first IDR cleanly.
+    let outcomes: Vec<FakeOutcome> = (0..4)
+        .map(|_| FakeOutcome::Solid {
+            width: 8,
+            height: 8,
+            luma: 0x33,
+        })
+        .collect();
+    let (mut worker, idr_calls, _warn, frames) = make_worker(FakeDecoder::new(outcomes));
+    worker.gate_on_first_idr();
+
+    // Racing P-frame before any keyframe: discarded, not submitted.
+    let p = DecodeJob {
+        body: Bytes::from_static(b"pframe"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: false,
+    };
+    let c = worker.process_job(p, MonoNanos::now());
+    assert!(
+        !c.decode_err,
+        "gated P-frame must be discarded, never submitted to the virgin decoder"
+    );
+    assert!(
+        frames.take().is_none(),
+        "no frame may render before the first IDR"
+    );
+    assert_eq!(
+        idr_calls.load(Ordering::Relaxed),
+        1,
+        "a discarded racing P-frame should re-request the keyframe"
+    );
+
+    // First keyframe clears the gate and decodes.
+    let idr = DecodeJob {
+        body: Bytes::from_static(b"idr"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: true,
+    };
+    let c = worker.process_job(idr, MonoNanos::now());
+    assert!(!c.decode_err);
+    assert!(
+        frames.take().is_some(),
+        "first IDR must decode and clear the gate"
+    );
+}
+
+#[test]
+fn awaiting_idr_rerequests_are_rate_limited() {
+    // P-frames pour in at frame rate while awaiting an IDR; the
+    // re-requests must coalesce to the 500 ms rate limit, not become a
+    // keyframe storm.
+    let (mut worker, idr_calls, _warn, _frames) =
+        make_worker(FakeDecoder::new(vec![FakeOutcome::Frames(vec![])]));
+    worker.replace_decoder(Box::new(FakeDecoder::new(vec![FakeOutcome::Frames(
+        vec![],
+    )])));
+    let base = MonoNanos::now();
+    let p = || DecodeJob {
+        body: Bytes::from_static(b"pframe"),
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: false,
+    };
+    // Three discards within the rate-limit window → a single request.
+    let _ = worker.process_job(p(), base);
+    let _ = worker.process_job(p(), at(base, Duration::from_millis(50)));
+    let _ = worker.process_job(p(), at(base, Duration::from_millis(100)));
+    assert_eq!(
+        idr_calls.load(Ordering::Relaxed),
+        1,
+        "rapid awaiting-IDR discards must coalesce to one re-request"
+    );
+}
+
+#[test]
 fn watchdog_fires_after_no_output_window() {
     // Land one success to set last_successful_decode. Then drive
     // soft-failure jobs (warnings bumped) past the watchdog

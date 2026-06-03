@@ -20,6 +20,7 @@ use crossbeam_channel::bounded;
 use tether_decode::{DecodeCompletion, DecodeJob};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
+use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{ControlMessage, GoodbyeCode, Viewport};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
@@ -62,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         fingerprint_hex,
         pin,
         label,
+        audio: audio_enabled,
     } = parse_cli_args(&raw_args)?;
 
     // Decide how to authenticate the host. Precedence: an explicit `--pin`
@@ -476,6 +478,12 @@ async fn main() -> anyhow::Result<()> {
         gpu_export,
     );
 
+    // Audio: if enabled and the host advertised an `AudioConfig`, stand up the
+    // decode → jitter buffer → cpal playback path on its own thread.
+    // `audio_tx` feeds it from the datagram recv loop below; `audio_active`
+    // gates `StreamReady.audio`. Both are moved into the recv task.
+    let (audio_tx, audio_active) = setup_audio_playback(audio_enabled, &server_hello);
+
     let conn_for_recovery_send = conn.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
@@ -499,13 +507,13 @@ async fn main() -> anyhow::Result<()> {
             .await;
             return;
         }
-        // Decoder is up; tell the host to start streaming. `audio: false`
-        // because the Opus pipeline isn't wired yet (the wire-shape lands
-        // in tether-protocol/audio.rs).
+        // Decoder is up; tell the host to start streaming. `audio` is true only
+        // when we built a playback path for the host's advertised AudioConfig —
+        // the host's audio gate keys off this.
         if let Err(e) = conn_ready
             .send_control(&ControlMessage::StreamReady {
                 video: true,
-                audio: false,
+                audio: audio_active,
             })
             .await
         {
@@ -621,6 +629,16 @@ async fn main() -> anyhow::Result<()> {
                         Ok(Datagram::ClientCursor(_)) => {
                             // Client-originated cursor packets should never
                             // come back to the client; ignore defensively.
+                            continue;
+                        }
+                        Ok(Datagram::Audio(AudioPacket::Opus {
+                            frame_seq, payload, ..
+                        })) => {
+                            // Forward to the audio decode thread; drop on a full
+                            // channel (decoder behind) — audio is loss-tolerant.
+                            if let Some(tx) = &audio_tx {
+                                let _ = tx.try_send((frame_seq, payload));
+                            }
                             continue;
                         }
                         Err(e) => {
@@ -1159,6 +1177,9 @@ struct CliArgs {
     pin: Option<String>,
     /// `--label <name>`: display name to record for the host on first pair.
     label: Option<String>,
+    /// Play host audio when the host advertises it. On by default; `--no-audio`
+    /// disables the client's playback path entirely.
+    audio: bool,
 }
 
 /// Parse the client CLI. Positional[0] is the host address (required);
@@ -1169,10 +1190,12 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
     let mut positional: Vec<&str> = Vec::new();
     let mut pin = None;
     let mut label = None;
+    let mut audio = true;
     let mut it = raw_args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ipc" => {}
+            "--no-audio" => audio = false,
             "--pin" => pin = Some(take_flag_value(&mut it, "--pin")?),
             "--label" => label = Some(take_flag_value(&mut it, "--label")?),
             other if other.starts_with("--") => {
@@ -1194,6 +1217,7 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
         fingerprint_hex,
         pin,
         label,
+        audio,
     })
 }
 
@@ -1211,6 +1235,163 @@ fn take_flag_value<'a>(
         Some(v) => Ok(v.clone()),
         None => anyhow::bail!("{flag} requires a value"),
     }
+}
+
+/// `(frame_seq, opus_payload)` handed from the datagram recv loop to the audio
+/// playback thread; the sequence number drives gap-detected concealment.
+type AudioFrameMsg = (u32, Vec<u8>);
+
+/// If audio is enabled and the host advertised an `AudioConfig`, spawn the
+/// playback thread and return a sender the recv loop feeds Opus frames to,
+/// plus `true` (audio active). Otherwise return `(None, false)` and run
+/// video-only. Never fatal — a missing output device just means no sound.
+fn setup_audio_playback(
+    enabled: bool,
+    server_hello: &tether_protocol::control::ServerHelloV1,
+) -> (Option<crossbeam_channel::Sender<AudioFrameMsg>>, bool) {
+    if !enabled {
+        info!("audio disabled via --no-audio");
+        return (None, false);
+    }
+    let Some(audio_cfg) = server_hello
+        .extensions
+        .get(tether_protocol::audio::AUDIO_CONFIG_EXTENSION_KEY)
+        .and_then(|b| tether_protocol::decode::<tether_protocol::audio::AudioConfig>(b).ok())
+    else {
+        info!("host advertised no audio; running video-only");
+        return (None, false);
+    };
+
+    // Validate the host-advertised config before it sizes any buffer. The
+    // `AudioConfig` is attacker-controllable; an out-of-range `sample_rate_hz`
+    // would size the playback ring's allocation into gigabytes (OOM), and an
+    // out-of-range `channels` would drive decoder plane indexing.
+    // v1 ships mono/stereo at an Opus-native rate; reject anything else.
+    const OPUS_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+    if !OPUS_RATES.contains(&audio_cfg.sample_rate_hz) || !(1..=2).contains(&audio_cfg.channels) {
+        warn!(
+            sample_rate = audio_cfg.sample_rate_hz,
+            channels = audio_cfg.channels,
+            "host advertised an unsupported audio config; running video-only"
+        );
+        return (None, false);
+    }
+
+    let opus_cfg = tether_audio::OpusConfig {
+        sample_rate: audio_cfg.sample_rate_hz,
+        channels: audio_cfg.channels,
+        ..tether_audio::OpusConfig::default()
+    };
+    // ~640 ms of 10 ms frames — generous headroom so the recv loop never
+    // blocks; the jitter buffer downstream bounds actual playback latency.
+    let (tx, rx) = crossbeam_channel::bounded::<AudioFrameMsg>(64);
+    match std::thread::Builder::new()
+        .name("tether-client-audio".into())
+        .spawn(move || run_audio_playback(opus_cfg, rx))
+    {
+        Ok(_) => {
+            info!(
+                sample_rate = audio_cfg.sample_rate_hz,
+                channels = audio_cfg.channels,
+                "audio playback enabled"
+            );
+            (Some(tx), true)
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to spawn audio thread; running video-only");
+            (None, false)
+        }
+    }
+}
+
+/// Audio playback thread: decode incoming Opus frames, conceal sequence gaps,
+/// and push PCM into the playback ring feeding the cpal output stream. Owns the
+/// `AudioPlayer` (and thus the cpal stream) for its lifetime; returns when the
+/// channel closes (session ending), dropping the player to stop playback.
+fn run_audio_playback(
+    cfg: tether_audio::OpusConfig,
+    rx: crossbeam_channel::Receiver<AudioFrameMsg>,
+) {
+    let (player, sink) = match tether_audio::AudioPlayer::with_defaults(cfg) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(error = %e, "audio output device unavailable; no playback");
+            return;
+        }
+    };
+    let mut decoder = match tether_audio::OpusDecoder::new(cfg) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "opus decoder init failed; no playback");
+            return;
+        }
+    };
+
+    // Cap concealment per packet so a crafted/huge sequence jump can't insert a
+    // long silence or spin. ~80 ms at 10 ms frames.
+    const MAX_CONCEAL: u32 = 8;
+    let mut last_seq: Option<u32> = None;
+
+    // Periodic playback-health snapshot. The ring's drift/underrun behaviour is
+    // otherwise invisible: cap-and-drop silently absorbs overflow and silence
+    // fills underruns, so without this a multi-minute session shows nothing.
+    // Frame-driven (audio arrives ~every 10 ms), like the host's send-stats —
+    // when audio stops, so does the log. 2 s matches the video stats cadence.
+    const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut last_stats_log = std::time::Instant::now();
+    // Peak |sample| of decoded audio since the last log. ~0 means the frames
+    // arriving are silent (the silence is upstream — capture/encode), which
+    // distinguishes that from a local output-routing problem where non-zero
+    // audio is played but not heard.
+    let mut peak: f32 = 0.0;
+
+    while let Ok((seq, payload)) = rx.recv() {
+        if let Some(prev) = last_seq {
+            // Forward distance from the last delivered frame. A small positive
+            // gap is real loss → conceal the missing frames. A gap of 1 is the
+            // in-order case (nothing missing); 0 (duplicate) or a large value
+            // (reordered late packet, or a future epoch reset) is *not* treated
+            // as loss, so a backward/late packet can't trigger spurious silence.
+            let gap = seq.wrapping_sub(prev);
+            if (2..=MAX_CONCEAL + 1).contains(&gap) {
+                for _ in 0..gap - 1 {
+                    sink.submit(&decoder.conceal());
+                }
+            }
+        }
+        match decoder.decode(&payload) {
+            Ok(pcm) => {
+                for &s in &pcm.samples {
+                    peak = peak.max(s.abs());
+                }
+                sink.submit(&pcm);
+            }
+            Err(e) => warn!(error = %e, "opus decode failed; dropping audio frame"),
+        }
+        last_seq = Some(seq);
+
+        if last_stats_log.elapsed() >= STATS_INTERVAL {
+            let (underruns, dropped_samples, buffered) = sink.stats();
+            // `buffered` is interleaved samples; convert to wall-clock so drift
+            // toward an underrun (→ 0 ms) or the latency cap is legible at a
+            // glance. Cumulative counters climbing across snapshots flags a
+            // clock-drift problem the cap-and-drop policy is papering over.
+            let frames_buffered = buffered / usize::from(cfg.channels).max(1);
+            let buffered_ms = frames_buffered * 1000 / (cfg.sample_rate as usize).max(1);
+            info!(
+                underruns,
+                dropped_samples,
+                buffered_ms,
+                peak = format!("{peak:.4}"),
+                "audio playback stats"
+            );
+            last_stats_log = std::time::Instant::now();
+            peak = 0.0;
+        }
+    }
+
+    // Channel closed: drop the player to stop the output stream.
+    drop(player);
 }
 
 /// Directory the client caches its identity (`client_cert.der`/`client_key.der`)

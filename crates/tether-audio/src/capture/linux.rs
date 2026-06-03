@@ -163,7 +163,6 @@ fn run(cfg: OpusConfig, tx: Sender<AudioFrame>, stop: Arc<AtomicBool>) -> Result
                      to avoid emitting misframed audio"
                 );
                 user_data.mainloop.quit();
-                return;
             }
         })
         .process(|stream, user_data| {

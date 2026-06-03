@@ -835,6 +835,17 @@ impl Pending {
         self.shard_size = shard_size;
         self.total_body_len = Some(total_body_len);
         ensure_capacity(&mut self.fragments, k as usize);
+        // A Continuation received before this descriptor may have allocated and
+        // counted a slot at an index >= k. That's only reachable from a
+        // malformed/hostile peer — a legit sender never emits a fragment_index
+        // >= fragment_count — but if left in place the out-of-range slot keeps
+        // `received_count` above `fragment_count` forever, so the
+        // `received_count == fragment_count` completion check is never true and
+        // the frame never finalizes even once every real primary arrives. Drop
+        // the out-of-range slots and recompute the count from the in-range ones.
+        self.fragments.truncate(k as usize);
+        self.received_count = u16::try_from(self.fragments.iter().filter(|s| s.is_some()).count())
+            .unwrap_or(u16::MAX);
         let layout = fec_layout(k as usize, fec_pct);
         self.parity = layout.iter().map(|&(_, _, m)| vec![None; m]).collect();
         self.block_recovery_attempted = vec![false; layout.len()];
@@ -975,6 +986,16 @@ impl FrameReassembler {
                 ..
             } => {
                 let idx = fragment_index as usize;
+                // Once the descriptor is known, reject an out-of-range index
+                // outright (a legit sender never emits idx >= fragment_count);
+                // storing it would inflate `received_count` past
+                // `fragment_count` and wedge finalization. Before the
+                // descriptor arrives we can't know `k`, so store optimistically
+                // and let `ensure_descriptor` reconcile.
+                if entry.descriptor_known && idx >= entry.fragment_count as usize {
+                    self.fragments_lost = self.fragments_lost.saturating_add(1);
+                    return None;
+                }
                 ensure_capacity(&mut entry.fragments, idx + 1);
                 if entry.fragments[idx].is_none() {
                     entry.fragments[idx] = Some(payload);
@@ -1280,9 +1301,12 @@ fn validate_packet_sizing(packet: &VideoPacket) -> Option<&'static str> {
         if total_body_len as usize > MAX_FRAME_BODY_BYTES {
             return Some("descriptor total_body_len exceeds MAX_FRAME_BODY_BYTES");
         }
-        // `K` shards of `shard_size` must be able to hold `total_body_len`,
-        // and dropping a shard must leave it too small — guards an
-        // inconsistent (K, shard_size, total) triple from mis-sizing recovery.
+        // `K` shards of `shard_size` must be able to hold `total_body_len` —
+        // guards an inconsistent (K, shard_size, total) triple from mis-sizing
+        // the recovery buffer. We deliberately don't also enforce the lower
+        // bound (that `K-1` shards would be too few): an over-claimed
+        // `fragment_count` merely fails to finalize, which the pending-frame
+        // age/wall-clock/count caps already bound.
         let capacity = (fragment_count as usize).saturating_mul(shard_size as usize);
         if (total_body_len as usize) > capacity {
             return Some("descriptor total_body_len exceeds fragment_count * shard_size");
@@ -1582,6 +1606,53 @@ mod validation_tests {
             reassembler.loss_counters().1 > 0,
             "dropped-over-cap fragments must register as fragment losses"
         );
+    }
+
+    /// A malformed/hostile peer can send a `Continuation` with a
+    /// `fragment_index` >= the frame's eventual `fragment_count`. If that
+    /// out-of-range fragment (arriving before the descriptor) were left to
+    /// inflate `received_count`, the `received_count == fragment_count`
+    /// completion check would never be true and the frame would never finalize
+    /// even once every real primary arrived. The reassembler must reconcile the
+    /// count when the descriptor arrives so a legitimate frame still completes.
+    #[test]
+    fn out_of_range_continuation_does_not_wedge_finalization() {
+        let mut fragmenter = FrameFragmenter::new_with_fec(0, 0); // primaries only
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (128, 128),
+        };
+        let body = Bytes::from(vec![0x7Eu8; 3 * 1000]);
+        let packets = fragmenter.fragment(meta, body.clone(), crate::MAX_DATAGRAM_PAYLOAD);
+        assert!(
+            packets.len() >= 3,
+            "3 KB at fec_pct=0 should be ≥3 primary packets"
+        );
+
+        let mut reassembler = FrameReassembler::new();
+        // Inject a bogus out-of-range continuation for the same key BEFORE the
+        // descriptor (First) arrives — stored optimistically at a high index.
+        let bogus = VideoPacket::Continuation {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_index: 99,
+            payload: Bytes::from_static(&[0xFFu8; 16]),
+        };
+        assert!(reassembler.handle(bogus).is_none());
+
+        // Deliver the real packets; the frame must still finalize byte-equal.
+        let mut finalized = None;
+        for pkt in packets {
+            if let Some(frame) = reassembler.handle(pkt) {
+                finalized = Some(frame);
+            }
+        }
+        let frame =
+            finalized.expect("frame must finalize despite the earlier out-of-range continuation");
+        assert_eq!(frame.body, body, "reassembled body must be byte-equal");
     }
 
     /// Steady-state FEC: all primaries arrive before any parity, frame

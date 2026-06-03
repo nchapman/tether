@@ -33,8 +33,8 @@ pub const DEFAULT_MAX_MS: u32 = 120;
 pub enum PlaybackError {
     #[error("no default audio output device")]
     NoDevice,
-    #[error("no output config supports {0} Hz f32 stereo")]
-    NoSupportedConfig(u32),
+    #[error("no output config supports {channels}-channel f32 at {rate} Hz")]
+    NoSupportedConfig { rate: u32, channels: u8 },
     #[error("query output configs: {0}")]
     Configs(#[from] cpal::SupportedStreamConfigsError),
     #[error("build output stream: {0}")]
@@ -143,6 +143,9 @@ fn pick_output_config(
         .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
         .filter(|c| c.channels() == u16::from(channels))
         .find(|c| c.min_sample_rate() <= target && target <= c.max_sample_rate())
-        .ok_or(PlaybackError::NoSupportedConfig(sample_rate))?;
+        .ok_or(PlaybackError::NoSupportedConfig {
+            rate: sample_rate,
+            channels,
+        })?;
     Ok(chosen.with_sample_rate(target).config())
 }

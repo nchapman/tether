@@ -136,7 +136,7 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecErro
 }
 
 /// Decode a value read off the untrusted QUIC datagram path, bounding any
-/// allocation to [`MAX_DATAGRAM_PAYLOAD`] (see [`datagram_config`]). Use this —
+/// allocation to [`MAX_DATAGRAM_DECODE_BYTES`] (see [`datagram_config`]). Use this —
 /// not [`decode`] — for anything deserialized straight from a received
 /// datagram, so a forged length prefix can't trigger an out-of-memory abort.
 pub fn decode_datagram<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> {

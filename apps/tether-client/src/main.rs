@@ -1237,6 +1237,10 @@ fn take_flag_value<'a>(
     }
 }
 
+/// `(frame_seq, opus_payload)` handed from the datagram recv loop to the audio
+/// playback thread; the sequence number drives gap-detected concealment.
+type AudioFrameMsg = (u32, Vec<u8>);
+
 /// If audio is enabled and the host advertised an `AudioConfig`, spawn the
 /// playback thread and return a sender the recv loop feeds Opus frames to,
 /// plus `true` (audio active). Otherwise return `(None, false)` and run
@@ -1244,7 +1248,7 @@ fn take_flag_value<'a>(
 fn setup_audio_playback(
     enabled: bool,
     server_hello: &tether_protocol::control::ServerHelloV1,
-) -> (Option<crossbeam_channel::Sender<(u32, Vec<u8>)>>, bool) {
+) -> (Option<crossbeam_channel::Sender<AudioFrameMsg>>, bool) {
     if !enabled {
         info!("audio disabled via --no-audio");
         return (None, false);
@@ -1280,7 +1284,7 @@ fn setup_audio_playback(
     };
     // ~640 ms of 10 ms frames — generous headroom so the recv loop never
     // blocks; the jitter buffer downstream bounds actual playback latency.
-    let (tx, rx) = crossbeam_channel::bounded::<(u32, Vec<u8>)>(64);
+    let (tx, rx) = crossbeam_channel::bounded::<AudioFrameMsg>(64);
     match std::thread::Builder::new()
         .name("tether-client-audio".into())
         .spawn(move || run_audio_playback(opus_cfg, rx))
@@ -1306,7 +1310,7 @@ fn setup_audio_playback(
 /// channel closes (session ending), dropping the player to stop playback.
 fn run_audio_playback(
     cfg: tether_audio::OpusConfig,
-    rx: crossbeam_channel::Receiver<(u32, Vec<u8>)>,
+    rx: crossbeam_channel::Receiver<AudioFrameMsg>,
 ) {
     let (player, sink) = match tether_audio::AudioPlayer::with_defaults(cfg) {
         Ok(pair) => pair,

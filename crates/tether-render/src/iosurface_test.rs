@@ -573,12 +573,13 @@ fn iosurface_zero_copy_roundtrip_hevc_main10() {
 
 /// Decode-only render path. Used by the 4:4:4 cells: VideoToolbox has
 /// no Main444 encode, but it decodes Main444 fine to an NV24 IOSurface,
-/// so we feed it a Linux-encoded HEVC 4:4:4 IDR fixture and exercise
-/// the import + render half. The fixture is grey, so the assertion is
-/// "rendered output is approximately neutral grey" — R≈G≈B with both
-/// near a sane luminance midpoint — rather than the red/blue check the
-/// encode-roundtrip cells use.
-fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionColors> {
+/// so we feed it an off-platform-encoded HEVC 4:4:4 IDR fixture and
+/// exercise the production decode → IOSurface import → shader render
+/// half, handing the caller the full RGBA readback to assert against
+/// known colours. This is the *only* pixel coverage the macOS 4:4:4
+/// render path has — VT can't encode Main444, so there's no local
+/// encode→decode round-trip for it.
+fn render_fixture_to_rgba(profile: VideoProfile, bitstream: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (device, queue, adapter) =
@@ -598,10 +599,6 @@ fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionC
         info.name, info.driver, info.backend
     );
 
-    // Fixture geometry is fixed at 128×128 by the probe regenerator.
-    let w: u32 = 128;
-    let h: u32 = 128;
-
     let mut dec = VideoToolboxDecoder::new(profile.codec).expect("VT decoder construction");
     dec.submit(bitstream).expect("decoder submit fixture IDR");
     dec.signal_eof().expect("decoder signal_eof");
@@ -613,8 +610,7 @@ fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionC
         }
     }
     let codec_gpu = codec_gpu.expect("decoder must produce at least one Frame::Gpu");
-    let (gw, gh, _pts, source, guard) = codec_gpu.into_parts();
-    assert_eq!((gw, gh), (w, h), "decoded dims must match fixture dims");
+    let (w, h, _pts, source, guard) = codec_gpu.into_parts();
     let GpuFrameSource::IOSurface(iosurface) = source;
     eprintln!(
         "[{profile:?}] decoded IOSurface fourcc: 0x{:08x}",
@@ -731,52 +727,73 @@ fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionC
     drop(mapped);
     readback.unmap();
 
-    let left = region_average_rgb(&rgba, w, w / 8, h / 4, w / 4, h / 2);
-    let right = region_average_rgb(&rgba, w, 5 * w / 8, h / 4, w / 4, h / 2);
-    eprintln!("[{profile:?}] left avg RGB  = {left:?}");
-    eprintln!("[{profile:?}] right avg RGB = {right:?}");
-    Some((left, right))
+    Some((rgba, w, h))
 }
 
-/// Assert that a region average looks like neutral grey near the
-/// fixture's input level. The probe fixtures are generated from
-/// ffmpeg's `color=c=gray` filter, which produces sRGB (128, 128, 128)
-/// — Y'=126 in BT.709 limited-range, Cb=Cr=128. After our shader's
-/// limited-range expansion this should reconstruct to roughly
-/// RGB(128, 128, 128) per channel.
-///
-/// Tolerances:
-///   * `spread <= 24` rejects a wrong-matrix bug that lands a colour
-///     cast (high G, low R/B; or chroma swap producing pink/cyan).
-///   * `avg ∈ 90..=170` rejects "stuck black" / "stuck white" import
-///     failures and gross wrong-range expansion. Loose enough to
-///     absorb HEVC quantisation noise on a 128×128 source.
-fn assert_grey(label: &str, rgb: (u8, u8, u8)) {
-    let (r, g, b) = rgb;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let spread = max - min;
+/// Average RGB of the centre of colour-bar `index` (0..4) in a
+/// colour-bar fixture (four equal vertical bars: red, green, blue,
+/// white). Samples the middle half of the bar to stay clear of the
+/// chroma bleed at the bar boundaries — resolution-agnostic so the
+/// same assertion works at 128×128 and at realistic capture sizes.
+fn bar_rgb(rgba: &[u8], width: u32, height: u32, index: u32) -> (u8, u8, u8) {
+    let bar_w = width / 4;
+    region_average_rgb(
+        rgba,
+        width,
+        index * bar_w + bar_w / 4,
+        height / 4,
+        bar_w / 2,
+        height / 2,
+    )
+}
+
+/// Assert the four colour bars reconstruct to red / green / blue /
+/// white. Generous per-channel bounds (an HEVC + BT.709 limited-range
+/// round-trip can shift a channel by ~25) but tight enough to catch the
+/// real failure modes of the 4:4:4 chroma path:
+///   * a hue cast on neutrals — the **white** bar; a wrong chroma
+///     neutral point renders white as e.g. purple (the live bug);
+///   * a Cb/Cr swap — the red and blue bars trade places;
+///   * a dropped / inverted chroma channel — the green bar.
+fn assert_colorbars(label: &str, rgba: &[u8], width: u32, height: u32) {
+    let red = bar_rgb(rgba, width, height, 0);
+    let green = bar_rgb(rgba, width, height, 1);
+    let blue = bar_rgb(rgba, width, height, 2);
+    let white = bar_rgb(rgba, width, height, 3);
+    eprintln!("{label}: red={red:?} green={green:?} blue={blue:?} white={white:?}");
     assert!(
-        spread <= 24,
-        "{label}: R/G/B spread too wide for grey input — got {rgb:?} (spread {spread})"
+        red.0 > 130 && red.1 < 80 && red.2 < 80,
+        "{label}: bar 0 should be red; got {red:?}"
     );
-    let avg = (u32::from(r) + u32::from(g) + u32::from(b)) / 3;
     assert!(
-        (90..=170).contains(&avg),
-        "{label}: average channel value {avg} not near grey midpoint (expected ~128) — got {rgb:?}"
+        green.1 > 110 && green.0 < 90 && green.2 < 90,
+        "{label}: bar 1 should be green; got {green:?}"
+    );
+    assert!(
+        blue.2 > 130 && blue.0 < 80 && blue.1 < 80,
+        "{label}: bar 2 should be blue; got {blue:?}"
+    );
+    let (wr, wg, wb) = white;
+    let wmin = wr.min(wg).min(wb);
+    let wspread = wr.max(wg).max(wb) - wmin;
+    assert!(
+        wmin > 150 && wspread < 45,
+        "{label}: bar 3 should be neutral white (R≈G≈B, all high) — a hue cast here is the \
+         'colors are wrong' bug; got {white:?}"
     );
 }
 
-/// HEVC 4:4:4 8-bit (Main 4:4:4). Renderer-side coverage for the
-/// Linux-host → Mac-client path: NV24 IOSurface fourcc `'444v'`,
-/// full-res UV stride, biplanar path with the same R8 Y + Rg8 UV
-/// shader as NV12. No local encode — VT can't produce Main444 — so
-/// the fixture is a Linux-encoded HEVC 4:4:4 IDR (128×128 grey).
+/// HEVC 4:4:4 8-bit (Main 4:4:4). Renderer-side colour coverage for the
+/// Linux-host → Mac-client path: `'444v'` NV24 IOSurface, full-res UV,
+/// biplanar R8 Y + Rg8 UV shader. VT can't encode Main444, so the
+/// fixture is an off-platform (x265) HEVC 4:4:4 IDR of a
+/// red/green/blue/white colour-bar pattern — the shared cross-platform
+/// fixture pattern (`fixtures/colorbars_hevc_yuv444_8bit.idr`).
 #[test]
 #[ignore = "requires macOS + VideoToolbox + Metal Main444; run with: cargo test -p tether-render --release -- --ignored iosurface"]
 fn iosurface_zero_copy_roundtrip_hevc_main_444_8bit() {
-    const FIXTURE: &[u8] = include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_8bit.idr");
-    let Some((left, right)) = run_fixture_render(
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_8bit.idr");
+    let Some((rgba, w, h)) = render_fixture_to_rgba(
         VideoProfile {
             codec: tether_protocol::control::CodecKind::Hevc,
             chroma: ChromaSubsampling::Yuv444,
@@ -786,19 +803,18 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_8bit() {
     ) else {
         return;
     };
-    assert_grey("4:4:4 8-bit left", left);
-    assert_grey("4:4:4 8-bit right", right);
+    assert_colorbars("4:4:4 8-bit", &rgba, w, h);
 }
 
-/// HEVC 4:4:4 10-bit (Main 4:4:4 10). The matrix cell that depends on
-/// both `TEXTURE_FORMAT_16BIT_NORM` (R16/Rg16) and the full-res UV
-/// stride of NV24. Same fixture-decode path as the 8-bit cell.
+/// HEVC 4:4:4 10-bit (Main 4:4:4 10): `'x444'`/`'xf44'` biplanar 16-bit
+/// IOSurface, R16/Rg16 shader. Same colour-bar fixture path as 8-bit.
+/// This is the cell the live Linux→Mac session rendered with a purple
+/// cast on neutrals — the white bar is the regression guard.
 #[test]
 #[ignore = "requires macOS + VideoToolbox + Metal Main444 10-bit; run with: cargo test -p tether-render --release -- --ignored iosurface"]
 fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit() {
-    const FIXTURE: &[u8] =
-        include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_10bit.idr");
-    let Some((left, right)) = run_fixture_render(
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_10bit.idr");
+    let Some((rgba, w, h)) = render_fixture_to_rgba(
         VideoProfile {
             codec: tether_protocol::control::CodecKind::Hevc,
             chroma: ChromaSubsampling::Yuv444,
@@ -808,8 +824,31 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit() {
     ) else {
         return;
     };
-    assert_grey("4:4:4 10-bit left", left);
-    assert_grey("4:4:4 10-bit right", right);
+    assert_colorbars("4:4:4 10-bit", &rgba, w, h);
+}
+
+/// HEVC 4:4:4 10-bit at a realistic capture resolution (1920×1200).
+/// 128×128 is too small to expose a chroma-plane stride / row-pitch
+/// alignment bug — the IOSurface chroma plane is padded to a hardware
+/// alignment, and a wrong assumed stride only mis-reads at widths that
+/// aren't a clean multiple of it. This is the cell that distinguishes
+/// "the macOS 4:4:4 render path is wrong" from "the wrongness is
+/// resolution- or host-specific".
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal Main444 10-bit; run with: cargo test -p tether-render --release -- --ignored iosurface"]
+fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit_1920x1200() {
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_10bit_1920x1200.idr");
+    let Some((rgba, w, h)) = render_fixture_to_rgba(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 10,
+        },
+        FIXTURE,
+    ) else {
+        return;
+    };
+    assert_colorbars("4:4:4 10-bit 1920×1200", &rgba, w, h);
 }
 
 /// Which input fixture to feed the host-scaler round-trip. Matches the

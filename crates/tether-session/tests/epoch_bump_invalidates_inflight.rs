@@ -12,6 +12,7 @@
 
 use bytes::Bytes;
 use tether_protocol::video::{FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta};
+use tether_protocol::MAX_DATAGRAM_PAYLOAD;
 use tether_transport::test_support::video_duplex_pair;
 use tether_transport::{Datagram, VideoChannel};
 
@@ -32,7 +33,7 @@ async fn frames_across_epoch_bump_reassemble_independently() {
 
     // Send a complete frame in epoch 0 with a distinctive body.
     let epoch0_body = Bytes::from(vec![0xa5u8; 4096]);
-    for pkt in fragmenter.fragment(meta(), epoch0_body.clone()) {
+    for pkt in fragmenter.fragment(meta(), epoch0_body.clone(), MAX_DATAGRAM_PAYLOAD) {
         host.send_datagram(&Datagram::Video(pkt)).unwrap();
     }
 
@@ -43,7 +44,7 @@ async fn frames_across_epoch_bump_reassemble_independently() {
     fragmenter.bump_epoch();
     assert_eq!(fragmenter.stream_epoch(), 1);
     let epoch1_body = Bytes::from(vec![0x5au8; 4096]);
-    for pkt in fragmenter.fragment(meta(), epoch1_body.clone()) {
+    for pkt in fragmenter.fragment(meta(), epoch1_body.clone(), MAX_DATAGRAM_PAYLOAD) {
         host.send_datagram(&Datagram::Video(pkt)).unwrap();
     }
 

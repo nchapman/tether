@@ -1,13 +1,12 @@
-//! Loopback for the video datagram + IDR uni-stream paths.
+//! Loopback for the unified video datagram path (IDR keyframes + P-frames).
 //!
 //! Drives the production `FrameFragmenter` → `DuplexVideoChannel` →
 //! `FrameReassembler` chain in the lossless case and asserts every
 //! body byte arrives intact.
 
 use bytes::Bytes;
-use tether_protocol::video::{
-    FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta, VideoPacket,
-};
+use tether_protocol::video::{FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta};
+use tether_protocol::MAX_DATAGRAM_PAYLOAD;
 use tether_transport::test_support::video_duplex_pair;
 use tether_transport::{Datagram, VideoChannel};
 
@@ -35,7 +34,7 @@ async fn n_pframes_round_trip_through_duplex_video_channel() {
         .collect();
 
     for body in &bodies {
-        for pkt in fragmenter.fragment(meta(false), body.clone()) {
+        for pkt in fragmenter.fragment(meta(false), body.clone(), MAX_DATAGRAM_PAYLOAD) {
             host.send_datagram(&Datagram::Video(pkt)).unwrap();
         }
     }
@@ -68,30 +67,36 @@ async fn n_pframes_round_trip_through_duplex_video_channel() {
 }
 
 #[tokio::test]
-async fn idr_uni_stream_delivers_keyframe_intact() {
+async fn idr_keyframe_round_trips_through_datagram_channel() {
+    // IDRs ride the same FEC'd datagram channel as P-frames — fragmented,
+    // sent as datagrams, reassembled. Asserts a multi-shard keyframe body
+    // arrives intact over the lossless channel.
     let (host, client) = video_duplex_pair();
-    let mut fragmenter = FrameFragmenter::new(0);
+    let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+    let mut reassembler = FrameReassembler::new();
 
     let body: Bytes = vec![0xa5u8; 16 * 1024].into();
-    let pkt = fragmenter.single_packet(meta(true), body.clone());
-    host.send_video_keyframe(&pkt).await.unwrap();
-
-    let received = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client.accept_video_keyframe(),
-    )
-    .await
-    .expect("timeout")
-    .unwrap();
-    match received {
-        VideoPacket::First {
-            payload,
-            fragment_count,
-            ..
-        } => {
-            assert_eq!(fragment_count, 1, "IDRs ride one packet");
-            assert_eq!(payload, body, "IDR body should round-trip byte-equal");
-        }
-        other => panic!("expected First, got {other:?}"),
+    let packets = fragmenter.fragment(meta(true), body.clone(), MAX_DATAGRAM_PAYLOAD);
+    assert!(packets.len() > 1, "a 16 KB IDR must span multiple shards");
+    for pkt in packets {
+        host.send_datagram(&Datagram::Video(pkt)).unwrap();
     }
+
+    let mut got = None;
+    while got.is_none() {
+        let dgram = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_datagram())
+            .await
+            .expect("timeout")
+            .unwrap();
+        let Datagram::Video(pkt) = dgram else {
+            panic!("expected Video datagram, got {dgram:?}");
+        };
+        got = reassembler.handle(pkt);
+    }
+    let frame = got.unwrap();
+    assert!(
+        frame.meta.keyframe,
+        "reassembled frame must be the keyframe"
+    );
+    assert_eq!(frame.body, body, "IDR body should round-trip byte-equal");
 }

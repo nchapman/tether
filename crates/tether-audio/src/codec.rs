@@ -28,6 +28,29 @@ use crate::{AudioError, AudioFrame, Result};
 /// Recommended safe upper bound for a single encoded Opus packet (libopus docs).
 const MAX_PACKET_BYTES: usize = 4000;
 
+/// Conservative wire framing around an `AudioPacket::Opus` payload inside a
+/// `Datagram::Audio` envelope: the two enum discriminants, `stream_epoch`,
+/// `frame_seq`, `t_capture`, and the payload length prefix. The real cost is
+/// ~20 bytes; this is rounded well up so the static assertion below has slack.
+const AUDIO_DATAGRAM_FRAMING_BYTES: usize = 64;
+
+/// The shared datagram decode ceiling must clear the largest Opus packet a
+/// non-default config can emit plus its wire framing, or such a packet would
+/// be silently rejected by `tether_protocol::decode_datagram` — audio dropouts
+/// with no log. The v1 default (~160 B/packet) is far under, but a high-bitrate
+/// / long-frame config (e.g. 510 kbps @ 60 ms ≈ 3825 B) approaches it.
+const _: () = assert!(
+    tether_protocol::MAX_DATAGRAM_DECODE_BYTES >= MAX_PACKET_BYTES + AUDIO_DATAGRAM_FRAMING_BYTES,
+    "MAX_DATAGRAM_DECODE_BYTES must be >= MAX_PACKET_BYTES + audio datagram framing"
+);
+
+/// libopus-valid frame durations, in tenths of a millisecond: 2.5, 5, 10, 20,
+/// 40, 60 ms. A frame whose sample count doesn't match one of these at the
+/// configured rate makes every `opus_encode`/`opus_decode` return
+/// `OPUS_BAD_ARG` — silent audio plus warning spam — even though
+/// `opus_*_create` succeeds. See [`OpusConfig::frame_size_is_valid`].
+const VALID_FRAME_DURATIONS_TENTHS_MS: [u32; 6] = [25, 50, 100, 200, 400, 600];
+
 /// Expected packet-loss percentage hinted to the encoder. See the
 /// `OPUS_SET_PACKET_LOSS_PERC` call in [`OpusEncoder::new`].
 const EXPECTED_PACKET_LOSS_PERC: c_int = 5;
@@ -60,6 +83,24 @@ impl OpusConfig {
         (self.sample_rate as usize * self.frame_duration_ms as usize) / 1000
     }
 
+    /// Whether [`Self::frame_size`] is a libopus-valid frame for this rate.
+    /// libopus accepts only 2.5/5/10/20/40/60 ms frames; any other sample
+    /// count fails every encode/decode with `OPUS_BAD_ARG` while the
+    /// constructor still succeeds — silent audio. Checked at encoder /
+    /// decoder construction so a non-default (`frame_duration_ms`, rate) pair
+    /// fails loudly up front instead of dropping every packet.
+    #[must_use]
+    pub fn frame_size_is_valid(&self) -> bool {
+        let fs = self.frame_size() as u64;
+        let rate = u64::from(self.sample_rate);
+        // frame_size == rate * tenths_ms / 10_000, checked as an exact
+        // integer cross-multiplication to avoid rounding.
+        fs != 0
+            && VALID_FRAME_DURATIONS_TENTHS_MS
+                .iter()
+                .any(|&tenths| rate * u64::from(tenths) == fs * 10_000)
+    }
+
     /// The wire [`AudioConfig`](tether_protocol::audio::AudioConfig) the host
     /// advertises for this codec config. Stereo maps to one coupled Opus
     /// stream (RFC 7845 family 0); mono to a single uncoupled stream.
@@ -73,6 +114,22 @@ impl OpusConfig {
             channel_mapping: (0..self.channels).collect(),
         }
     }
+}
+
+/// Reject a config whose frame size isn't a libopus-valid duration before the
+/// `opus_*_create` call, so the failure carries an actionable message instead
+/// of surfacing as `OPUS_BAD_ARG` on every subsequent encode/decode.
+fn validate_frame_size(cfg: OpusConfig) -> Result<()> {
+    if cfg.frame_size_is_valid() {
+        return Ok(());
+    }
+    Err(AudioError::Opus(format!(
+        "frame_size {} ({} ms @ {} Hz) is not a valid Opus frame duration \
+         (2.5/5/10/20/40/60 ms)",
+        cfg.frame_size(),
+        cfg.frame_duration_ms,
+        cfg.sample_rate
+    )))
 }
 
 /// Build an [`AudioError::Opus`] from a libopus return code, attaching the
@@ -110,6 +167,7 @@ impl OpusEncoder {
         if !(1..=2).contains(&cfg.channels) {
             return Err(AudioError::UnsupportedChannelCount(cfg.channels));
         }
+        validate_frame_size(cfg)?;
         let fs = c_int::try_from(cfg.sample_rate)
             .map_err(|_| AudioError::Opus("sample_rate out of range".to_owned()))?;
         let mut err: c_int = opus_sys::OPUS_OK;
@@ -247,6 +305,7 @@ impl OpusDecoder {
         if !(1..=2).contains(&cfg.channels) {
             return Err(AudioError::UnsupportedChannelCount(cfg.channels));
         }
+        validate_frame_size(cfg)?;
         let fs = c_int::try_from(cfg.sample_rate)
             .map_err(|_| AudioError::Opus("sample_rate out of range".to_owned()))?;
         let mut err: c_int = opus_sys::OPUS_OK;
@@ -361,6 +420,36 @@ mod tests {
             peak > 0.1,
             "decoded audio should carry signal energy, peak={peak}"
         );
+    }
+
+    #[test]
+    fn frame_size_validity_matches_libopus_durations() {
+        // Default 48 kHz / 10 ms = 480 samples — valid.
+        assert!(OpusConfig::default().frame_size_is_valid());
+        // Every libopus duration at 48 kHz is valid.
+        for ms in [3u32 /* ≈2.5 rounds away */, 5, 10, 20, 40, 60] {
+            let cfg = OpusConfig {
+                frame_duration_ms: ms,
+                ..OpusConfig::default()
+            };
+            // 3 ms is not a real Opus duration; only the genuine ones validate.
+            let expect = matches!(ms, 5 | 10 | 20 | 40 | 60);
+            assert_eq!(
+                cfg.frame_size_is_valid(),
+                expect,
+                "{ms} ms @ 48 kHz validity"
+            );
+        }
+        // A non-Opus duration (15 ms → 720 samples @ 48 kHz) is rejected.
+        let bad = OpusConfig {
+            frame_duration_ms: 15,
+            ..OpusConfig::default()
+        };
+        assert!(!bad.frame_size_is_valid());
+        // Constructors refuse the invalid config up front (no OPUS_BAD_ARG
+        // spam on every later encode/decode).
+        assert!(matches!(OpusEncoder::new(bad), Err(AudioError::Opus(_))));
+        assert!(matches!(OpusDecoder::new(bad), Err(AudioError::Opus(_))));
     }
 
     /// A capture buffer whose length isn't a whole number of stereo frames

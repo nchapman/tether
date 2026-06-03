@@ -48,24 +48,14 @@ use tether_protocol::CodecError;
 /// [`tether_protocol::MAX_DATAGRAM_PAYLOAD`]).
 pub const MAX_FRAMED_MESSAGE: usize = 64 * 1024;
 
-/// Hard cap on the size of a single video-keyframe message delivered on
-/// the per-IDR unidirectional stream. Sized for a worst-case 4K HEVC
-/// IDR plus modest headroom (~2 MiB total). Separate from
-/// [`MAX_FRAMED_MESSAGE`] so the control-stream cap stays tight against
-/// hostile peers while video streams can carry the legitimately-large
-/// keyframe payload. Pre-allocated by `read_framed_with_max` on stream
-/// arrival, so any growth here directly widens a peer-controlled
-/// allocation; only bump if a real keyframe overruns.
-pub const MAX_VIDEO_STREAM_MESSAGE: usize = 2 * 1024 * 1024;
-
-/// Per-connection cap on concurrent host→client unidirectional streams.
-/// The reliable-keyframe protocol needs O(1) streams alive at once
-/// (the previous keyframe's stream finishes before the next is opened
-/// today, but quinn permits in-flight overlap). 4 leaves headroom for
-/// a brief overlap during a back-to-back IDR burst while denying a
-/// malicious peer the ability to open thousands of streams and pin
-/// the receive-side allocations.
-pub const MAX_CONCURRENT_UNI_STREAMS: u32 = 4;
+/// Per-connection cap on concurrent peer-initiated unidirectional streams.
+/// Tether opens exactly one uni stream over a connection's life: the
+/// client→host input event stream (video, IDR keyframes included, rides
+/// datagrams — there is no reliable video stream). 2 covers the single
+/// long-lived input stream with headroom for a transient reconnect overlap
+/// while denying a malicious peer the ability to open thousands of streams
+/// and pin the receive-side allocations.
+pub const MAX_CONCURRENT_UNI_STREAMS: u32 = 2;
 
 /// Cap on concurrent peer-initiated bidirectional streams. Tether opens
 /// two client-initiated bidi streams over a connection's life: the

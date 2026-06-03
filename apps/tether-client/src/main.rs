@@ -2,12 +2,12 @@
 //! frames, decodes them (HEVC/H.264 via VAAPI when available), and
 //! presents them in a wgpu window.
 //!
-//! Recv loop runs on a tokio task and races `recv_datagram` (P-frames,
-//! cursor) against `accept_video_keyframe` (reliable per-IDR uni
-//! streams). Decode runs on a dedicated `std::thread` (`tether-decode`)
-//! so a GPU-driver stall in libavcodec → libva can't starve the QUIC
-//! recv loop. Render is one-deep so a slow renderer drops frames
-//! rather than back-pressuring upstream.
+//! Recv loop runs on a tokio task draining `recv_datagram`: all video — IDR
+//! keyframes and P-frames alike — arrives as FEC'd datagrams and feeds one
+//! reassembler (cursor + audio datagrams share the channel). Decode runs on a
+//! dedicated `std::thread` (`tether-decode`) so a GPU-driver stall in
+//! libavcodec → libva can't starve the QUIC recv loop. Render is one-deep so a
+//! slow renderer drops frames rather than back-pressuring upstream.
 //!
 //! Usage: `tether-client <host_addr> <cert_fingerprint_hex>`.
 
@@ -590,81 +590,62 @@ async fn main() -> anyhow::Result<()> {
         let mut last_cursor_log = std::time::Instant::now();
 
         loop {
-            // Race the unreliable datagram path (P-frames, cursor) against
-            // the reliable per-IDR uni stream path. `biased` so we always
-            // poll datagrams first — they're the latency-critical channel
-            // and the more frequent one; the keyframe stream is woken up
-            // only when an IDR is in flight. Both produce a `VideoPacket`
-            // that feeds the same reassembler.
-            // Fair select (no `biased`): on a high-fps stream the
-            // datagram future is almost always ready, and biasing it
-            // would let an IDR stream sit unaccepted for several
-            // iterations during a P-frame torrent — exactly the
-            // scenario where prompt IDR delivery is load-bearing.
-            let packet: VideoPacket = tokio::select! {
-                d = conn_recv.recv_datagram() => {
-                    match d {
-                        Ok(Datagram::Video(p)) => p,
-                        Ok(Datagram::HostCursor(hc)) => {
-                            // Position datagrams ride latest-wins; the
-                            // overlay's render pass reads the most
-                            // recent value each frame.
-                            use tether_protocol::cursor::HostCursorPacket;
-                            match hc {
-                                HostCursorPacket::Position { x, y, visible, .. } => {
-                                    #[allow(clippy::cast_precision_loss)]
-                                    let (xf, yf) = (x as f32, y as f32);
-                                    cursor_channel_datagram.with(|state| {
-                                        state.set_position(xf, yf, visible);
-                                    });
-                                    cursor_pos_packets += 1;
-                                    if last_cursor_log.elapsed() >= std::time::Duration::from_secs(2) {
-                                        info!(cursor_pos_packets, last_x = x, last_y = y, visible, "cursor position datagrams");
-                                        last_cursor_log = std::time::Instant::now();
-                                    }
-                                }
+            // All video — IDR keyframes and P-frames alike — arrives on the
+            // unreliable datagram channel and feeds the same reassembler; there
+            // is no separate reliable keyframe stream to race. Cursor and audio
+            // datagrams share the channel and are dispatched out here.
+            let packet: VideoPacket = match conn_recv.recv_datagram().await {
+                Ok(Datagram::Video(p)) => p,
+                Ok(Datagram::HostCursor(hc)) => {
+                    // Position datagrams ride latest-wins; the overlay's render
+                    // pass reads the most recent value each frame.
+                    use tether_protocol::cursor::HostCursorPacket;
+                    match hc {
+                        HostCursorPacket::Position { x, y, visible, .. } => {
+                            #[allow(clippy::cast_precision_loss)]
+                            let (xf, yf) = (x as f32, y as f32);
+                            cursor_channel_datagram.with(|state| {
+                                state.set_position(xf, yf, visible);
+                            });
+                            cursor_pos_packets += 1;
+                            if last_cursor_log.elapsed() >= std::time::Duration::from_secs(2) {
+                                info!(
+                                    cursor_pos_packets,
+                                    last_x = x,
+                                    last_y = y,
+                                    visible,
+                                    "cursor position datagrams"
+                                );
+                                last_cursor_log = std::time::Instant::now();
                             }
-                            continue;
-                        }
-                        Ok(Datagram::ClientCursor(_)) => {
-                            // Client-originated cursor packets should never
-                            // come back to the client; ignore defensively.
-                            continue;
-                        }
-                        Ok(Datagram::Audio(AudioPacket::Opus {
-                            frame_seq, payload, ..
-                        })) => {
-                            // Forward to the audio decode thread; drop on a full
-                            // channel (decoder behind) — audio is loss-tolerant.
-                            if let Some(tx) = &audio_tx {
-                                let _ = tx.try_send((frame_seq, payload));
-                            }
-                            continue;
-                        }
-                        Err(e) => {
-                            // Promoted from warn → error: this is terminal for the
-                            // video stream and the user otherwise sees a frozen
-                            // last-frame with no indication anything broke. Also
-                            // close the connection explicitly so the host learns
-                            // about it instead of waiting for the idle timeout.
-                            error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
-                            conn_recv.close(1, b"recv failed");
-                            break;
                         }
                     }
+                    continue;
                 }
-                kf = conn_recv.accept_video_keyframe() => {
-                    match kf {
-                        Ok(p) => p,
-                        Err(e) => {
-                            // Stream-level read errors are transient on a
-                            // healthy connection (peer reset the stream).
-                            // The connection itself is fine; the next IDR
-                            // will arrive on its own fresh stream.
-                            warn!(error = ?e, "accept_video_keyframe failed; awaiting next stream");
-                            continue;
-                        }
+                Ok(Datagram::ClientCursor(_)) => {
+                    // Client-originated cursor packets should never come back to
+                    // the client; ignore defensively.
+                    continue;
+                }
+                Ok(Datagram::Audio(AudioPacket::Opus {
+                    frame_seq, payload, ..
+                })) => {
+                    // Forward to the audio decode thread; drop on a full channel
+                    // (decoder behind) — audio is loss-tolerant.
+                    if let Some(tx) = &audio_tx {
+                        let _ = tx.try_send((frame_seq, payload));
                     }
+                    continue;
+                }
+                Err(e) => {
+                    // Promoted from warn → error: this is terminal for the video
+                    // stream and the user otherwise sees a frozen last-frame with
+                    // no indication anything broke. Also close the connection
+                    // explicitly so the host learns about it instead of waiting
+                    // for the idle timeout.
+                    error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
+                    conn_recv.close(1, b"recv failed");
+                    break;
                 }
             };
 
@@ -1267,7 +1248,13 @@ fn setup_audio_playback(
     // would size the playback ring's allocation into gigabytes (OOM), and an
     // out-of-range `channels` would drive decoder plane indexing.
     // v1 ships mono/stereo at an Opus-native rate; reject anything else.
-    const OPUS_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+    // This is the accept-list the client honours from the host. 8 kHz and
+    // 16 kHz are valid Opus rates but are excluded as a policy choice — no
+    // current capture backend produces them, so narrowing the negotiation
+    // window keeps the surface small. (`OpusDecoder::new` independently rejects
+    // any (rate, frame-duration) pair whose frame size libopus would refuse, so
+    // a future config bug fails loudly rather than dropping every packet.)
+    const OPUS_RATES: [u32; 3] = [12_000, 24_000, 48_000];
     if !OPUS_RATES.contains(&audio_cfg.sample_rate_hz) || !(1..=2).contains(&audio_cfg.channels) {
         warn!(
             sample_rate = audio_cfg.sample_rate_hz,

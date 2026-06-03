@@ -170,11 +170,12 @@ impl Worker {
     /// Gate the worker on its first IDR before any P-frame is fed.
     ///
     /// A freshly-built decoder has no parameter sets, so the P-frames
-    /// that race ahead of the first keyframe on a new connection (the
-    /// IDR rides a reliable uni-stream while P-frames arrive first on
-    /// datagrams) only produce `PPS id out of range` errors and a
-    /// destructive rebuild — which then discards the IDR that's
-    /// arriving. Starting gated makes the worker discard those racing
+    /// that race ahead of the first keyframe on a new connection (all
+    /// frames share the datagram channel, and a P-frame can arrive or
+    /// FEC-complete before the larger first IDR does) only produce
+    /// `PPS id out of range` errors and a destructive rebuild — which
+    /// then discards the IDR that's arriving. Starting gated makes the
+    /// worker discard those racing
     /// P-frames and cleanly latch the first keyframe, the same way
     /// Moonlight and RustDesk gate a fresh decoder on its first IDR.
     /// `replace_decoder` already gates after a rebuild; this gates the
@@ -547,10 +548,10 @@ pub fn run_thread_with_init(
 
             let mut worker = Worker::new(decoder, frames, request_idr, warnings);
             // Gate on the first IDR: a fresh connection's P-frames can
-            // arrive (on datagrams) before the first keyframe (on its
-            // reliable uni-stream), and feeding them to a virgin decoder
-            // would force a destructive rebuild that loses the inbound
-            // IDR. Discard until the keyframe lands instead.
+            // arrive or FEC-complete before the larger first keyframe on
+            // the shared datagram channel, and feeding them to a virgin
+            // decoder would force a destructive rebuild that loses the
+            // inbound IDR. Discard until the keyframe lands instead.
             worker.gate_on_first_idr();
             let mut rebuilds_used: u32 = 0;
             while let Ok(job) = job_rx.recv() {

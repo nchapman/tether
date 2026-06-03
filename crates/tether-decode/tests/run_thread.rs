@@ -559,10 +559,10 @@ fn awaiting_idr_rerequests_keyframe_then_resumes_on_idr() {
 
 #[test]
 fn gate_on_first_idr_discards_pframes_until_first_keyframe() {
-    // A fresh connection: P-frames arrive (on datagrams) before the
-    // first keyframe (on its reliable uni-stream). A gated worker must
-    // discard them — not feed a virgin decoder that would error and
-    // force a rebuild — then latch the first IDR cleanly.
+    // A fresh connection: P-frames arrive or FEC-complete on the shared
+    // datagram channel before the larger first keyframe does. A gated
+    // worker must discard them — not feed a virgin decoder that would
+    // error and force a rebuild — then latch the first IDR cleanly.
     let outcomes: Vec<FakeOutcome> = (0..4)
         .map(|_| FakeOutcome::Solid {
             width: 8,

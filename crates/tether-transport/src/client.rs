@@ -240,10 +240,10 @@ fn transport_config() -> quinn::TransportConfig {
     // embedded.
     t.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     t.datagram_send_buffer_size(4 * 1024 * 1024);
-    // Cap host→client uni streams. The client accepts these for the
-    // reliable-keyframe protocol; without an explicit limit a hostile
-    // host could open enough streams to pin 2 MiB of receive buffer
-    // per stream (see MAX_VIDEO_STREAM_MESSAGE).
+    // Cap peer-initiated uni streams. The host opens none (all video,
+    // keyframes included, rides datagrams); the only uni stream is the
+    // client→host input stream. The cap is purely defensive — without it a
+    // hostile host could open streams to pin receive-side accept slots.
     t.max_concurrent_uni_streams(crate::MAX_CONCURRENT_UNI_STREAMS.into());
     // Cap host→client bidi streams. A well-behaved host opens none —
     // both bidi streams (pairing, control) are client-initiated — so

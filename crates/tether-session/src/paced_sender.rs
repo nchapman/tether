@@ -15,7 +15,7 @@
 //!
 //! ```ignore
 //! pacer.begin_frame(Instant::now());
-//! for packet in fragmenter.fragment(meta, body) {
+//! for packet in fragmenter.fragment(meta, body, datagram_budget) {
 //!     let bytes = bincode::serialized_size(&packet).unwrap() as usize;
 //!     pacer.wait_for_slot(bytes);
 //!     conn.send_datagram(&Datagram::Video(packet))?;

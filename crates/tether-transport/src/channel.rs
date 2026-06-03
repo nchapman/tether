@@ -44,7 +44,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tether_protocol::control::{ClientHello, ClockSync, ControlMessage, ServerHello};
 use tether_protocol::input::InputEvent;
-use tether_protocol::video::VideoPacket;
 use tether_protocol::MonoNanos;
 
 use crate::{Datagram, Result};
@@ -137,7 +136,9 @@ pub trait InputChannel: Send + Sync {
     async fn recv_input(&self) -> Result<InputEvent>;
 }
 
-/// Datagrams + per-IDR reliable unidirectional streams.
+/// The unreliable datagram channel. All video — IDR keyframes and P-frames
+/// alike — rides datagrams, sliced into `VideoPacket`s and FEC-protected; there
+/// is no separate reliable keyframe stream (see `tether_protocol::video`).
 ///
 /// [`send_datagram`] is **sync** by design: the underlying QUIC
 /// datagram send is non-blocking, and the host's encode thread sends
@@ -154,14 +155,6 @@ pub trait VideoChannel: Send + Sync {
 
     /// Await the next datagram off the unreliable channel.
     async fn recv_datagram(&self) -> Result<Datagram>;
-
-    /// Open a fresh QUIC uni stream and write one length-framed
-    /// keyframe `VideoPacket`. Reliable, retransmitted on loss.
-    async fn send_video_keyframe(&self, packet: &VideoPacket) -> Result<()>;
-
-    /// Accept the next host-opened uni stream and read one
-    /// length-framed keyframe.
-    async fn accept_video_keyframe(&self) -> Result<VideoPacket>;
 }
 
 /// Observability handles. Not a channel role; lives separately so

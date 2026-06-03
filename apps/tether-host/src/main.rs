@@ -743,7 +743,6 @@ async fn handle_client(
     //      budget already absorbs an extra round trip for
     //      reliability.
     let runtime_handle_for_send = tokio::runtime::Handle::current();
-    let conn_keyframe = conn.clone();
     let send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
         .spawn(move || {
@@ -757,7 +756,6 @@ async fn handle_client(
                 chosen_profile,
                 stream_ready_for_thread,
                 runtime_handle_for_send,
-                conn_keyframe,
                 latest_client_stats_for_send,
                 latest_viewport_for_send,
                 send_exited_for_thread,
@@ -2800,7 +2798,6 @@ fn run_capture_and_send(
     chosen_profile: VideoProfile,
     stream_ready: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
-    keyframe_conn: Arc<Connection>,
     latest_client_stats: LatestClientStats,
     latest_viewport: LatestViewport,
     send_exited: Arc<tokio::sync::Notify>,
@@ -3315,34 +3312,23 @@ fn run_capture_and_send(
         };
 
         let send_t0 = std::time::Instant::now();
-        if keyframe {
-            // Keyframes ride a reliable per-IDR QUIC uni stream. The
-            // single_packet path doesn't chunk into datagram-sized
-            // pieces because the stream layer handles segmentation;
-            // the receiver's reassembler sees a fragment_count=1
-            // packet that completes immediately. Frame_seq still
-            // advances so the next P-frame fragments slot in
-            // sequentially.
-            //
-            // Synchronous block_on (rather than an mpsc to a separate
-            // task) keeps strict ordering between the IDR and the
-            // P-frames that follow — see the comment on the spawn
-            // site for the epoch-race rationale.
-            let packet = fragmenter.single_packet(meta, body);
-            if let Err(e) = runtime.block_on(keyframe_conn.send_video_keyframe(&packet)) {
-                warn!(error = ?e, "send_video_keyframe failed, terminating send loop");
+        // All frames — IDR keyframes and P-frames alike — ride the FEC'd
+        // datagram channel. A single channel keeps an IDR inherently ordered
+        // ahead of the P-frames that depend on it (no cross-channel overtaking)
+        // and large IDRs get multi-block FEC. Shards are sized to the
+        // connection's real datagram MTU (clamped to the soft payload target)
+        // minus the encoded header, so no datagram exceeds the path MTU even
+        // under an input-echo burst. Burst freely — see the comment at the top
+        // of `run_capture_and_send` for why wire-level pacing was removed.
+        let budget = conn
+            .max_datagram_size()
+            .map_or(tether_protocol::MAX_DATAGRAM_PAYLOAD, |m| {
+                m.min(tether_protocol::MAX_DATAGRAM_PAYLOAD)
+            });
+        for packet in fragmenter.fragment(meta, body, budget) {
+            if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
+                warn!(error = ?e, "send_datagram failed, terminating send loop");
                 return;
-            }
-        } else {
-            // P-frame fragments. Burst freely — see the comment at
-            // the top of `run_capture_and_send` for why wire-level
-            // pacing was removed. FEC parity (FEC_PERCENTAGE) is
-            // the only smoothing the wire gets today.
-            for packet in fragmenter.fragment(meta, body) {
-                if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
-                    warn!(error = ?e, "send_datagram failed, terminating send loop");
-                    return;
-                }
             }
         }
         // Accumulated only for frames that complete encode + send;

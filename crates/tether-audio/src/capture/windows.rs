@@ -370,6 +370,18 @@ fn parse_mix_format(pwfx: *const WAVEFORMATEX) -> Result<MixFormat, CaptureError
             "mix format reports 0 channels".into(),
         ));
     }
+    // Upper-bound the channel count before it multiplies with `frame_count`
+    // into the hot-path `vec![0.0f32; frame_count * mix.channels]` allocation.
+    // 7.1 surround (8 channels) is the practical maximum render endpoint; a
+    // corrupt or hostile driver reporting an extreme `nChannels` could
+    // otherwise drive an OOM. Defense-in-depth — a bad local driver is outside
+    // the network threat model, but the check is free.
+    const MAX_CHANNELS: usize = 8;
+    if channels > MAX_CHANNELS {
+        return Err(CaptureError::Backend(format!(
+            "mix format reports {channels} channels, exceeds supported max {MAX_CHANNELS}"
+        )));
+    }
     if sample_rate == 0 {
         return Err(CaptureError::Backend(
             "mix format reports 0 Hz sample rate".into(),
@@ -604,6 +616,40 @@ impl LinearResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal interleaved-float `WAVEFORMATEX` for `channels` channels
+    /// with a self-consistent `nBlockAlign`.
+    fn float_wfx(channels: u16) -> WAVEFORMATEX {
+        let bits = 32u16;
+        WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nChannels: channels,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 48_000 * u32::from(channels) * u32::from(bits / 8),
+            nBlockAlign: channels * (bits / 8),
+            wBitsPerSample: bits,
+            cbSize: 0,
+        }
+    }
+
+    #[test]
+    fn parse_mix_format_accepts_7_1() {
+        let wfx = float_wfx(8); // 7.1 surround — the supported maximum
+        let parsed = parse_mix_format(&wfx).expect("7.1 float mix format is supported");
+        assert_eq!(parsed.channels, 8);
+        assert_eq!(parsed.sample_format, SampleFormat::F32);
+    }
+
+    #[test]
+    fn parse_mix_format_rejects_excessive_channels() {
+        // A driver reporting an extreme channel count would otherwise multiply
+        // into the hot-path `vec![0.0f32; frame_count * channels]` allocation.
+        let wfx = float_wfx(64);
+        assert!(
+            matches!(parse_mix_format(&wfx), Err(CaptureError::Backend(_))),
+            "channel count above 7.1 must be rejected"
+        );
+    }
 
     #[test]
     fn decode_f32_round_trips_samples() {

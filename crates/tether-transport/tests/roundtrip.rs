@@ -307,3 +307,79 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// #37's guarantee — "no datagram exceeds the path MTU" — validated against
+/// *real* quinn rather than the `MAX_DATAGRAM_PAYLOAD` constant. The host sizes
+/// shards from the live `max_datagram_size()` minus the encoded header; this
+/// test reproduces that budget derivation over a real connection, fragments a
+/// large FEC'd IDR against it, and asserts quinn accepts every datagram (no
+/// `FrameTooLarge`/`TooLarge`) and the far side reassembles the body byte-equal.
+/// If our header accounting were off by even a byte versus quinn's real
+/// datagram-frame overhead, a shard would be rejected here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frame_fragmented_at_live_mtu_is_accepted_and_reassembles() -> anyhow::Result<()> {
+    use tether_protocol::video::{FrameFragmenter, FrameReassembler};
+    use tether_protocol::MAX_DATAGRAM_PAYLOAD;
+
+    let server = Server::bind((Ipv4Addr::LOCALHOST, 0).into()).await?;
+    let server_addr = server.local_addr()?;
+    let fingerprint = server.fingerprint();
+
+    let body = bytes::Bytes::from((0..64u8).cycle().take(64 * 1024).collect::<Vec<u8>>());
+    let body_for_server = body.clone();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("server closed")?;
+        let mut reassembler = FrameReassembler::new();
+        // Localhost is lossless: read datagrams until the frame completes.
+        loop {
+            match conn.recv_datagram().await? {
+                Datagram::Video(pkt) => {
+                    if let Some(frame) = reassembler.handle(pkt) {
+                        assert_eq!(
+                            frame.body, body_for_server,
+                            "reassembled body must be byte-equal to what was sent"
+                        );
+                        break;
+                    }
+                }
+                other => panic!("expected Video datagram, got {other:?}"),
+            }
+        }
+        anyhow::Ok(())
+    });
+
+    let client = Client::new()?;
+    let conn = client
+        .connect(server_addr, "tether-host", fingerprint)
+        .await?;
+
+    // Exactly the host's budget derivation (apps/tether-host/src/main.rs).
+    let budget = conn
+        .max_datagram_size()
+        .map_or(MAX_DATAGRAM_PAYLOAD, |m| m.min(MAX_DATAGRAM_PAYLOAD));
+
+    let meta = VideoFrameMeta {
+        timing: HostFrameTiming::default(),
+        keyframe: true,
+        input_echo: InputEchoBatch::default(),
+        dimensions: (1920, 1080),
+    };
+    let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+    let packets = fragmenter.fragment(meta, body, budget);
+    assert!(
+        packets.len() > 1,
+        "a 64 KB IDR must fragment into many datagrams"
+    );
+
+    for pkt in packets {
+        // The crux: every shard the fragmenter produced for `budget` must be
+        // accepted by quinn. A FrameTooLarge/TooLarge here means our header
+        // accounting disagrees with quinn's real datagram overhead.
+        conn.send_datagram(&Datagram::Video(pkt))
+            .expect("every shard sized to the live budget must be accepted by quinn");
+    }
+
+    server_task.await??;
+    Ok(())
+}

@@ -41,6 +41,22 @@ use client_pairing::HostAuth;
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
 
+/// Whether a `FrameReassembler::handle()` loss-counter delta warrants a
+/// `RequestRecovery`. `before`/`after` are `(frames_dropped, fragments_lost)`
+/// snapshots taken around the `handle()` call.
+///
+/// Fires only on a `frames_dropped` increase — a frame started but pruned
+/// before completing, the genuine "this frame will never arrive" signal.
+/// Never fires on `fragments_lost` alone: that counts stale stragglers (a late
+/// fragment for an already-finalized or already-pruned frame) and malformed
+/// packets, neither of which is independently actionable. Triggering on them
+/// would emit spurious recovery IDRs that add bandwidth and worsen congestion
+/// on an already-lossy path; a frame that truly won't complete still bumps
+/// `frames_dropped` when it's pruned, so the real signal survives.
+fn recovery_warranted(before: (u64, u64), after: (u64, u64)) -> bool {
+    after.0 > before.0
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     // Parse args first so `--ipc` routes tracing off stdout (reserved for
@@ -653,26 +669,26 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            // Snapshot loss counters around the handle() so we can
-            // see if this packet's processing pruned any in-flight
-            // frame. A non-zero delta means the reassembler just
-            // gave up on a frame whose fragments will never
-            // complete — the soonest possible loss signal, well
-            // before the decoder thread would ever notice.
+            // Snapshot loss counters around the handle() so we can see if
+            // this packet's processing caused the reassembler to give up on
+            // a frame. We gate recovery on `frames_dropped` only — the count
+            // of frames started but pruned incomplete. That is the genuine
+            // "a frame will never complete" signal worth a recovery IDR.
             //
-            // False positive note: a `prune_old` eviction of an
-            // *unrelated* frame on this handle() also increments
-            // the counter, so this is an over-trigger. The cost is
-            // an extra RequestRecovery (which collapses to a forced
-            // IDR in Phase 1; the rate limit caps the rate). Phase
-            // 2 should scope the trigger to the specific frame
-            // we're touching by tracking per-frame counters if the
-            // reassembler grows that API.
+            // We deliberately do NOT trigger on `fragments_lost`: that counter
+            // bumps when a *straggler* fragment arrives for a frame that was
+            // already finalized or pruned, or when a malformed packet is
+            // rejected. Neither is independently actionable — by the time a
+            // late fragment shows up the frame is already gone (recovered or
+            // abandoned), so firing on it just emits spurious recovery IDRs
+            // that add bandwidth and worsen congestion exactly when the path
+            // is already lossy. A frame that truly won't complete still bumps
+            // `frames_dropped` when `prune_old` evicts it, so the real signal
+            // is not lost — only the noise.
             let pre_loss = reassembler.loss_counters();
             let result = reassembler.handle(packet);
             let post_loss = reassembler.loss_counters();
-            let new_loss = post_loss.0 > pre_loss.0 || post_loss.1 > pre_loss.1;
-            if new_loss {
+            if recovery_warranted(pre_loss, post_loss) {
                 if let Some(last_reassembled) = last_reassembled_frame_seq {
                     let now = MonoNanos::now();
                     let rate_limit_ns = 500_000_000u64;
@@ -1533,5 +1549,19 @@ mod arg_tests {
     #[test]
     fn missing_flag_value_is_rejected() {
         assert!(parse_cli_args(&args(&["127.0.0.1:7654", "--pin"])).is_err());
+    }
+
+    #[test]
+    fn recovery_fires_only_on_a_pruned_frame_not_a_straggler() {
+        // (frames_dropped, fragments_lost)
+        // A frame pruned incomplete (frames_dropped++) → recover.
+        assert!(recovery_warranted((0, 0), (1, 0)));
+        // A stale straggler / malformed packet (fragments_lost++ only) →
+        // do NOT recover; it's not independently actionable.
+        assert!(!recovery_warranted((0, 0), (0, 1)));
+        // Both moving still recovers — the dropped frame is the reason.
+        assert!(recovery_warranted((0, 0), (1, 1)));
+        // Nothing moved → nothing to recover.
+        assert!(!recovery_warranted((3, 7), (3, 7)));
     }
 }

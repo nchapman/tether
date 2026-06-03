@@ -1553,4 +1553,65 @@ mod validation_tests {
         assert_eq!(drops_before, drops_after, "no frames should drop");
         assert_eq!(lost_before, lost_after, "no fragments should count as lost");
     }
+
+    /// The positive half of the recovery-trigger contract the client relies on
+    /// (`recovery_warranted`): a frame that starts but never completes bumps
+    /// `frames_dropped` (not `fragments_lost`) when `prune_old` evicts it for
+    /// falling more than `max_age` behind the latest seq. The straggler/
+    /// malformed half is covered by `handle_rejected_packet_bumps_fragments_lost`.
+    #[test]
+    fn incomplete_frame_pruned_past_max_age_bumps_frames_dropped() {
+        let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming::default(),
+            keyframe: false,
+            input_echo: InputEchoBatch::default(),
+            dimensions: (128, 128),
+        };
+
+        let mut reassembler = FrameReassembler::new();
+        let (drops_before, lost_before) = reassembler.loss_counters();
+
+        // Frame 0: multi-shard, but feed only its `First` so it stays pending.
+        let incomplete = fragmenter.fragment(
+            meta.clone(),
+            Bytes::from(vec![0x5Au8; 3 * 1000]),
+            crate::MAX_DATAGRAM_PAYLOAD,
+        );
+        let first = incomplete
+            .into_iter()
+            .find(|p| matches!(p, VideoPacket::First { .. }))
+            .expect("multi-shard frame has a First");
+        assert!(
+            reassembler.handle(first).is_none(),
+            "a lone First must not finalize a multi-shard frame"
+        );
+
+        // Frames 1..=5: single-shard, fed complete so each finalizes and
+        // advances latest_seq. With max_age = 4, frame 0 falls out of the
+        // window once latest reaches 5 and prune_old evicts it.
+        for _ in 0..5 {
+            let pkts = fragmenter.fragment(
+                meta.clone(),
+                Bytes::from(vec![0u8; 16]),
+                crate::MAX_DATAGRAM_PAYLOAD,
+            );
+            let first = pkts
+                .into_iter()
+                .find(|p| matches!(p, VideoPacket::First { .. }))
+                .expect("single-shard frame has a First");
+            reassembler.handle(first);
+        }
+
+        let (drops_after, lost_after) = reassembler.loss_counters();
+        assert!(
+            drops_after > drops_before,
+            "the never-completed frame 0 must be counted as a dropped frame \
+             (drops {drops_before} -> {drops_after})"
+        );
+        assert_eq!(
+            lost_after, lost_before,
+            "a pruned incomplete frame is a frame drop, not a fragment loss"
+        );
+    }
 }

@@ -485,13 +485,14 @@ fn expected_iosurface_fourccs_for(profile: VideoProfile) -> &'static [u32] {
     const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
     const P010: u32 = u32::from_be_bytes(*b"P010");
     const X420: u32 = u32::from_be_bytes(*b"x420");
+    const X444: u32 = u32::from_be_bytes(*b"x444");
     const XF44: u32 = u32::from_be_bytes(*b"xf44");
     const P410: u32 = u32::from_be_bytes(*b"P410");
     match (profile.chroma, profile.bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => &[NV12_VIDEO],
         (ChromaSubsampling::Yuv420, 10) => &[P010, X420],
         (ChromaSubsampling::Yuv444, 8) => &[NV24_VIDEO],
-        (ChromaSubsampling::Yuv444, 10) => &[XF44, P410],
+        (ChromaSubsampling::Yuv444, 10) => &[X444, XF44, P410],
         _ => &[],
     }
 }

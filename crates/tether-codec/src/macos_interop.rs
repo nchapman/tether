@@ -48,6 +48,16 @@ pub const NV12_FULL_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"420f");
 pub const NV24_VIDEO_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"444v");
 /// `kCVPixelFormatType_444YpCbCr8BiPlanarFullRange` — `'444f'`.
 pub const NV24_FULL_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"444f");
+/// `kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange` / `'x444'` —
+/// what VT decode lands in for HEVC 4:4:4 10-bit **video-range**
+/// bitstreams, which is the only kind tether hosts emit (VAAPI /
+/// Windows / macOS all tag limited range). Same biplanar 16-bit
+/// MSB-aligned plane shape as `'xf44'`; differs only in declared
+/// range, exactly like `'x420'` vs `'xf20'` for the 4:2:0 family.
+/// A Linux host's stream decodes to this; the macOS↔macOS loopback
+/// only ever produced full-range `'xf44'`, which is why this label
+/// was missing from the accept set and cross-platform decode broke.
+pub const X444_FOURCC: u32 = u32::from_be_bytes(*b"x444");
 /// `'xf44'` — biplanar 10-bit 4:4:4 full-range. 16-bit MSB-aligned
 /// planes.
 pub const XF44_FOURCC: u32 = u32::from_be_bytes(*b"xf44");
@@ -72,15 +82,29 @@ pub const XF20_FOURCC: u32 = u32::from_be_bytes(*b"xf20");
 /// reject `'x420'`.
 ///
 /// **Range policy:** the renderer shader is hardcoded BT.709 limited
-/// (see `tether-render::shader.wgsl`), so only video-range fourccs
-/// are accepted for the 4:2:0 / 4:4:4 8-bit families. The 4:2:0
-/// 10-bit family accepts the canonical `'P010'` MSB-aligned label
-/// alongside `'x420'` (video range); `'xf20'` (full range) and the
-/// 4:4:4 8-bit full-range `'444f'` are rejected. The 4:4:4 10-bit
-/// family has no video-range fourcc on macOS, so `'xf44'` /
-/// `'P410'` are accepted — that path is gated by the encoder probe
-/// anyway. Matches the encoder's range policy in
+/// (see `tether-render::shader.wgsl`), so the surface a real decode
+/// lands in is the **video-range** fourcc of each family — every
+/// tether host (VAAPI / Windows / macOS) tags its bitstream
+/// limited/video-range, so VT decode of a cross-platform stream
+/// always emits the video-range label. Accordingly:
+/// - 4:2:0 8-bit → `'420v'`; 4:4:4 8-bit → `'444v'`.
+/// - 4:2:0 10-bit → `'x420'` (video range) plus the canonical
+///   MSB-aligned `'P010'` label.
+/// - 4:4:4 10-bit → `'x444'` (video range) plus `'xf44'` / `'P410'`.
+///
+/// `'xf44'` / `'P410'` are full-range labels retained because this
+/// function plays a dual role: besides the renderer's decode-import
+/// gate it is also the host-scaler destination gate
+/// (`tether-gpuconvert::nv12_iosurface`), and the macOS encode /
+/// SCK-capture path for 4:4:4 10-bit produces `'xf44'`. That encode
+/// path is probe-gated, so the full-range label never actually
+/// reaches the renderer in a live session; keeping it here preserves
+/// the four-table lockstep with
 /// `videotoolbox::encoder::iosurface_fourcc_matches`.
+///
+/// Full-range siblings that no path produces (`'xf20'`, `'444f'`)
+/// stay rejected: accepting one would only mask a real "host sent a
+/// range we can't display" problem rather than fix it.
 #[must_use]
 pub fn accepts_iosurface_fourcc(chroma: ChromaSubsampling, bit_depth: u8, fourcc: u32) -> bool {
     matches!(
@@ -88,7 +112,11 @@ pub fn accepts_iosurface_fourcc(chroma: ChromaSubsampling, bit_depth: u8, fourcc
         (ChromaSubsampling::Yuv420, 8, NV12_VIDEO_RANGE_FOURCC)
             | (ChromaSubsampling::Yuv444, 8, NV24_VIDEO_RANGE_FOURCC)
             | (ChromaSubsampling::Yuv420, 10, X420_FOURCC | P010_FOURCC)
-            | (ChromaSubsampling::Yuv444, 10, XF44_FOURCC | P410_FOURCC)
+            | (
+                ChromaSubsampling::Yuv444,
+                10,
+                X444_FOURCC | XF44_FOURCC | P410_FOURCC
+            )
     )
 }
 
@@ -102,7 +130,7 @@ pub fn iosurface_fourcc_expected_label(chroma: ChromaSubsampling, bit_depth: u8)
         (ChromaSubsampling::Yuv420, 8) => "'420v' (NV12 biplanar 8-bit)",
         (ChromaSubsampling::Yuv444, 8) => "'444v' (NV24 biplanar 8-bit)",
         (ChromaSubsampling::Yuv420, 10) => "'x420' or 'P010' (biplanar 4:2:0 10-bit)",
-        (ChromaSubsampling::Yuv444, 10) => "'xf44' or 'P410' (biplanar 4:4:4 10-bit)",
+        (ChromaSubsampling::Yuv444, 10) => "'x444', 'xf44' or 'P410' (biplanar 4:4:4 10-bit)",
         _ => {
             "an IOSurface fourcc supported by this build (8-bit 4:2:0/4:4:4 or 10-bit 4:2:0/4:4:4)"
         }
@@ -291,4 +319,96 @@ pub fn import_iosurface_plane(
     let texture =
         unsafe { device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &wgpu_desc) };
     Ok(texture)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decode-output fourcc the renderer MUST accept for each
+    /// tether-negotiated profile, named explicitly so a regression
+    /// shows up as a failed assert rather than a black screen. Every
+    /// tether host encodes video/limited range, so VT decode of a
+    /// cross-platform stream always lands in the **video-range**
+    /// label of the family — that is the one the limited-range
+    /// renderer shader displays correctly.
+    ///
+    /// `'x444'` is the entry this test exists to pin: it was missing
+    /// for months because the macOS↔macOS loopback only ever produced
+    /// full-range `'xf44'`, so cross-platform (Linux→macOS) 4:4:4
+    /// 10-bit decode was rejected at import with the surface intact.
+    #[test]
+    fn renderer_accepts_video_range_decode_fourcc_for_every_negotiated_family() {
+        let cases = [
+            (ChromaSubsampling::Yuv420, 8, NV12_VIDEO_RANGE_FOURCC),
+            (ChromaSubsampling::Yuv444, 8, NV24_VIDEO_RANGE_FOURCC),
+            (ChromaSubsampling::Yuv420, 10, X420_FOURCC),
+            (ChromaSubsampling::Yuv444, 10, X444_FOURCC),
+        ];
+        for (chroma, bit_depth, fourcc) in cases {
+            assert!(
+                accepts_iosurface_fourcc(chroma, bit_depth, fourcc),
+                "renderer must accept the video-range decode fourcc 0x{fourcc:08x} \
+                 for {chroma:?} {bit_depth}-bit — a real cross-platform decode lands here"
+            );
+        }
+    }
+
+    /// The MSB-aligned (`'P010'`/`'P410'`) and probe-gated full-range
+    /// (`'xf44'`) labels the dual-role accept set also tolerates — see
+    /// the function doc for why these stay in.
+    #[test]
+    fn renderer_accepts_alias_and_encode_path_labels() {
+        for (chroma, bit_depth, fourcc) in [
+            (ChromaSubsampling::Yuv420, 10, P010_FOURCC),
+            (ChromaSubsampling::Yuv444, 10, XF44_FOURCC),
+            (ChromaSubsampling::Yuv444, 10, P410_FOURCC),
+        ] {
+            assert!(
+                accepts_iosurface_fourcc(chroma, bit_depth, fourcc),
+                "accept set must keep 0x{fourcc:08x} for {chroma:?} {bit_depth}-bit"
+            );
+        }
+    }
+
+    /// Full-range siblings that no tether path produces are rejected:
+    /// the renderer can't display them (shader is BT.709 limited), and
+    /// silently accepting one would mask a "host sent a range we can't
+    /// display" bug. `'xf44'` is deliberately absent here — it has the
+    /// encode-path dual role covered above.
+    #[test]
+    fn renderer_rejects_unreachable_full_range_fourccs() {
+        let nv12_full = u32::from_be_bytes(*b"420f");
+        let nv24_full = u32::from_be_bytes(*b"444f");
+        for (chroma, bit_depth, fourcc) in [
+            (ChromaSubsampling::Yuv420, 8, nv12_full),
+            (ChromaSubsampling::Yuv444, 8, nv24_full),
+            (ChromaSubsampling::Yuv420, 10, XF20_FOURCC),
+        ] {
+            assert!(
+                !accepts_iosurface_fourcc(chroma, bit_depth, fourcc),
+                "renderer must reject unreachable full-range fourcc 0x{fourcc:08x} \
+                 for {chroma:?} {bit_depth}-bit"
+            );
+        }
+    }
+
+    /// A fourcc from the wrong chroma/bit-depth family is rejected —
+    /// e.g. a 4:2:0 surface arriving on a 4:4:4-negotiated session
+    /// (the silent-downsample failure mode) must not import.
+    #[test]
+    fn renderer_rejects_cross_family_fourcc() {
+        assert!(
+            !accepts_iosurface_fourcc(ChromaSubsampling::Yuv444, 10, X420_FOURCC),
+            "4:2:0 10-bit fourcc must not import on a 4:4:4 10-bit session"
+        );
+        assert!(
+            !accepts_iosurface_fourcc(ChromaSubsampling::Yuv420, 10, X444_FOURCC),
+            "4:4:4 10-bit fourcc must not import on a 4:2:0 10-bit session"
+        );
+        assert!(
+            !accepts_iosurface_fourcc(ChromaSubsampling::Yuv444, 8, X444_FOURCC),
+            "10-bit fourcc must not import on an 8-bit session"
+        );
+    }
 }

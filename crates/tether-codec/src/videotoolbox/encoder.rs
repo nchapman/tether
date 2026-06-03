@@ -722,8 +722,12 @@ mod fourcc_match_tests {
         // Only video-range fourccs are accepted for families that
         // have both range variants — the encoder VUI is hardcoded
         // AVCOL_RANGE_MPEG, so a full-range surface would mis-tag.
-        // 4:4:4 10-bit has no video-range fourcc on macOS, so
-        // `'xf44'` is accepted (and the path is probe-gated anyway).
+        // 4:4:4 10-bit is the exception: the encoder's input is
+        // SCK capture, which delivers the full-range `'xf44'`, so
+        // that is what's accepted here (the path is probe-gated
+        // anyway). The video-range sibling `'x444'` exists but is a
+        // *decode* output, not an encode input — see
+        // `macos_interop::accepts_iosurface_fourcc`.
         for (chroma, bd, fourcc, accept) in [
             (
                 ChromaSubsampling::Yuv420,

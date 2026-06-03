@@ -264,3 +264,101 @@ fn probe_bgra_with_chroma_detail() -> Vec<u8> {
     }
     data
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile_probe::fixture_for;
+    use tether_codec::macos_interop::accepts_iosurface_fourcc;
+
+    /// Decode every committed probe fixture through VideoToolbox and
+    /// assert the IOSurface fourcc VT actually emits is one the
+    /// renderer would import (`accepts_iosurface_fourcc`).
+    ///
+    /// This is the closed-loop guard for the bug class that kept
+    /// recurring: the renderer accept set was hand-maintained against
+    /// what *macOS encode* produces, while a real session decodes
+    /// streams from a Linux/Windows host. The fixtures here are
+    /// x264/x265-encoded (i.e. **not** VideoToolbox), so they exercise
+    /// exactly the cross-platform decode path. With the renderer
+    /// limited to BT.709, the surface a video-range stream lands in is
+    /// the video-range fourcc of its family — e.g. HEVC 4:4:4 10-bit
+    /// decodes to `'x444'`, which the accept set rejected until this
+    /// test pinned it.
+    ///
+    /// Hardware: needs an Apple-Silicon VT decoder. A profile whose
+    /// fixture this machine genuinely can't decode is reported as SKIP
+    /// rather than failing, but the 4:4:4 10-bit regression target is
+    /// required to land — every Apple Silicon Mac decodes it.
+    #[test]
+    #[ignore = "requires macOS + VideoToolbox"]
+    fn decoded_fixture_fourcc_is_renderer_accepted() {
+        // The macOS-negotiated decode set that ships a fixture. AV1
+        // fixtures exist but AV1 is out of the HEVC/H.264 bug domain
+        // this guard covers, and decode is M3+-only.
+        let profiles = [
+            VideoProfile::H264_8BIT_420,
+            VideoProfile::HEVC_8BIT_420,
+            VideoProfile::HEVC_10BIT_420,
+            VideoProfile::HEVC_8BIT_444,
+            VideoProfile::HEVC_10BIT_444,
+        ];
+
+        let mut decoded_444_10bit = false;
+        for profile in profiles {
+            let Some(fixture) = fixture_for(profile) else {
+                panic!("{profile:?} has no committed decode fixture");
+            };
+            match decode_fixture_fourcc(profile, fixture) {
+                Ok(fourcc) => {
+                    assert!(
+                        accepts_iosurface_fourcc(profile.chroma, profile.bit_depth, fourcc),
+                        "{profile:?} decoded to IOSurface fourcc 0x{fourcc:08x}, which the \
+                         renderer's accepts_iosurface_fourcc rejects — the import path would \
+                         drop every frame with the surface intact (the 'x444' bug)"
+                    );
+                    eprintln!("decode-accept: {profile:?} OK (IOSurface 0x{fourcc:08x} accepted)");
+                    if profile == VideoProfile::HEVC_10BIT_444 {
+                        decoded_444_10bit = true;
+                    }
+                }
+                Err(reason) => {
+                    eprintln!("decode-accept: {profile:?} SKIP ({reason})");
+                }
+            }
+        }
+
+        assert!(
+            decoded_444_10bit,
+            "HEVC 4:4:4 10-bit fixture failed to decode — this is the regression target and \
+             every Apple Silicon VT decoder handles it; a failure here means the decode path \
+             itself broke, not just the accept set"
+        );
+    }
+
+    /// Decode a single-IDR fixture and return the observed IOSurface
+    /// fourcc, or a reason string if any step failed (treated as a
+    /// hardware SKIP by the caller).
+    fn decode_fixture_fourcc(
+        profile: VideoProfile,
+        fixture: &[u8],
+    ) -> std::result::Result<u32, String> {
+        let mut dec = VideoToolboxDecoder::new(profile.codec)
+            .map_err(|e| format!("decoder construction: {e:?}"))?;
+        dec.submit(fixture)
+            .map_err(|e| format!("decoder submit: {e:?}"))?;
+        dec.signal_eof()
+            .map_err(|e| format!("decoder signal_eof: {e:?}"))?;
+        match dec
+            .next_frame()
+            .map_err(|e| format!("decoder next_frame: {e:?}"))?
+        {
+            Some(Frame::Gpu(gpu)) => {
+                let GpuFrameSource::IOSurface(io) = gpu.source;
+                Ok(io.pixel_format)
+            }
+            Some(Frame::Cpu(_)) => Err("VT fell back to software (Frame::Cpu)".into()),
+            None => Err("no frame produced after EOF".into()),
+        }
+    }
+}

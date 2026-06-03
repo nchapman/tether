@@ -46,14 +46,16 @@ use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 /// Restricted to the **video-range** fourcc of each family. The
 /// renderer shader is hardcoded BT.709 *limited* range, so it only
 /// imports video-range surfaces (`macos_interop::accepts_iosurface_fourcc`),
-/// and the host encoder only ever emits video-range
-/// (`videotoolbox::encoder::iosurface_fourcc_matches`). A full-range
-/// surface (`'420f'` / `'xf20'` / `'444f'`) therefore can't arise in a
-/// tether↔tether session and wouldn't be displayable if it did, so
-/// listing it here would only mask a real renderer-accept gap rather
-/// than describe a reachable decode. The 4:4:4 10-bit family has no
-/// video-range fourcc on macOS, so both `'xf44'` and `'P410'` are
-/// listed (the renderer accepts both).
+/// and every tether host (VAAPI / Windows / macOS) tags its bitstream
+/// video-range, so VT decode of a cross-platform stream lands in the
+/// video-range label. A full-range surface (`'420f'` / `'xf20'` /
+/// `'444f'`) therefore can't arise in a tether↔tether session and
+/// wouldn't be displayable if it did, so listing it here would only
+/// mask a real renderer-accept gap rather than describe a reachable
+/// decode. The 4:4:4 10-bit family's video-range label is `'x444'`
+/// (what a Linux host's stream decodes to); `'xf44'` / `'P410'`
+/// remain listed for the probe-gated macOS encode path, which
+/// produces the full-range label.
 ///
 /// Exposed at `pub` so cross-crate consistency tests can confirm the
 /// renderer's IOSurface accept set (`tether-render::gpu::metal`) is a
@@ -66,13 +68,14 @@ pub fn expected_iosurface_fourccs(profile: VideoProfile) -> &'static [u32] {
     const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
     const P010: u32 = u32::from_be_bytes(*b"P010");
     const X420: u32 = u32::from_be_bytes(*b"x420");
+    const X444: u32 = u32::from_be_bytes(*b"x444");
     const XF44: u32 = u32::from_be_bytes(*b"xf44");
     const P410: u32 = u32::from_be_bytes(*b"P410");
     match (profile.chroma, profile.bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => &[NV12_VIDEO],
         (ChromaSubsampling::Yuv420, 10) => &[P010, X420],
         (ChromaSubsampling::Yuv444, 8) => &[NV24_VIDEO],
-        (ChromaSubsampling::Yuv444, 10) => &[XF44, P410],
+        (ChromaSubsampling::Yuv444, 10) => &[X444, XF44, P410],
         _ => &[],
     }
 }

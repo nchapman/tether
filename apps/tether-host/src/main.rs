@@ -895,6 +895,15 @@ async fn handle_client(
                             audio, "client signalled StreamReady; opening the gate"
                         );
                         stream_ready_ctl.store(true, Ordering::Release);
+                        // Defensive IDR at gate-open. A fresh encoder's
+                        // first frame is already an IDR, so this is usually
+                        // redundant — but if StreamReady lands before the
+                        // encoder lazy-inits, the pending flag guarantees
+                        // the first encoded frame is still forced to a
+                        // keyframe. Coalesces harmlessly via IdrSignal.
+                        // Matches Moonlight/Sunshine forcing an IDR at
+                        // stream start.
+                        force_idr.raise();
                         // Open the audio gate too; the host audio thread drops
                         // captured frames until the client says it can play them.
                         audio_ready_ctl.store(audio, Ordering::Release);

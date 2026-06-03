@@ -426,8 +426,10 @@ mod tests {
     fn frame_size_validity_matches_libopus_durations() {
         // Default 48 kHz / 10 ms = 480 samples — valid.
         assert!(OpusConfig::default().frame_size_is_valid());
-        // Every libopus duration at 48 kHz is valid.
-        for ms in [3u32 /* ≈2.5 rounds away */, 5, 10, 20, 40, 60] {
+        // 3 ms is not a libopus duration (valid: 2.5/5/10/20/40/60 ms — 2.5 is
+        // unrepresentable here since frame_duration_ms is integer); the rest
+        // are genuine. Confirm only the genuine ones validate.
+        for ms in [3u32, 5, 10, 20, 40, 60] {
             let cfg = OpusConfig {
                 frame_duration_ms: ms,
                 ..OpusConfig::default()

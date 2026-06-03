@@ -319,8 +319,10 @@ impl VideoPacket {
 pub const DATAGRAM_WRAPPER_BYTES: usize = 1;
 
 /// Slack added on top of the measured empty-payload header when computing the
-/// shard size, covering the payload length-prefix growing from 1 byte (empty
-/// sample) to 2 bytes (a real ≤-MTU shard) plus a couple bytes of margin.
+/// shard size, covering the payload length-prefix growing under bincode's
+/// varint encoding: a length < 251 takes 1 byte (the empty-payload sample
+/// used to measure the header), while a real shard ≥ 251 bytes takes 3 (a
+/// marker byte + u16) — a 2-byte growth, plus 2 bytes of margin.
 const SHARD_HEADER_SAFETY: usize = 4;
 
 /// Floor on the per-frame shard size. Reached only if the meta envelope is so
@@ -374,6 +376,19 @@ pub const MAX_FRAGMENTS_PER_FRAME: usize = 4096;
 /// legitimate sender could fragment under [`MAX_FRAGMENTS_PER_FRAME`] at the
 /// soft datagram payload budget.
 pub const MAX_FRAME_BODY_BYTES: usize = MAX_FRAGMENTS_PER_FRAME * crate::MAX_DATAGRAM_PAYLOAD;
+
+/// Hard cap on the number of simultaneously-pending (incomplete) frames the
+/// [`FrameReassembler`] buffers. The per-stream `max_age` window and the
+/// `max_pending_age` wall-clock timeout bound steady-state memory but not the
+/// *instantaneous* entry count: a peer that sends one fragment each for a flood
+/// of distinct `(display, stream_epoch, frame_seq)` keys — never completing any
+/// — accumulates entries faster than the prune can evict them, and each new
+/// entry's descriptor can pre-allocate up to [`MAX_FRAGMENTS_PER_FRAME`] shard
+/// slots. This cap bounds that worst case: once reached, fragments for *new*
+/// keys are dropped (frames already pending still complete). The legitimate
+/// working set is a few frames per active display (the `max_age` window), so
+/// 256 is generous headroom.
+pub const MAX_PENDING_FRAMES: usize = 256;
 
 /// One FEC block's position in the frame: `(primary_start, primary_count,
 /// parity_count)`. The primaries are the global shards
@@ -661,7 +676,10 @@ fn cap_input_echo(meta: &mut VideoFrameMeta, datagram_budget: usize) {
 
     // Bytes left for echo IDs while still fitting MIN_SHARD_SIZE of payload.
     // Each u64 ID costs at most 9 bytes under bincode's varint encoding; the
-    // extra slack covers the Vec length prefix growing as the count rises.
+    // slack covers the Vec length prefix, which grows from 1 byte to at most 3
+    // (marker + u16) as the count crosses 251 — 2 bytes, rounded up to 8 for
+    // headroom. The `every_fragment_fits...input_echo` test would catch a
+    // too-tight value.
     const ECHO_ID_MAX_BYTES: usize = 9;
     const ECHO_PREFIX_SLACK: usize = 8;
     let avail = datagram_budget.saturating_sub(base + MIN_SHARD_SIZE + ECHO_PREFIX_SLACK);
@@ -918,6 +936,18 @@ impl FrameReassembler {
                     return None;
                 }
             }
+        }
+
+        // Hard cap on concurrent pending frames (see [`MAX_PENDING_FRAMES`]). A
+        // fragment for a *new* key that would exceed the cap is dropped rather
+        // than allocating another descriptor, bounding the memory a peer can
+        // pin by flooding distinct keys (e.g. unique `stream_epoch`s) without
+        // ever completing a frame. Frames already pending are unaffected and
+        // still complete. Counted as a fragment loss (overload, not a genuine
+        // frame drop), which deliberately does not drive recovery.
+        if !self.pending.contains_key(&key) && self.pending.len() >= MAX_PENDING_FRAMES {
+            self.fragments_lost = self.fragments_lost.saturating_add(1);
+            return None;
         }
 
         let entry = self.pending.entry(key).or_insert_with(Pending::new);
@@ -1366,6 +1396,20 @@ mod validation_tests {
     }
 
     #[test]
+    fn validate_rejects_continuation_index_zero() {
+        // Shard 0 is always the `First`; a Continuation claiming index 0 is
+        // malformed and must be rejected before it reaches the reassembler.
+        let packet = VideoPacket::Continuation {
+            display: 0,
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_index: 0,
+            payload: Bytes::new(),
+        };
+        assert!(validate_packet_sizing(&packet).is_some());
+    }
+
+    #[test]
     fn validate_rejects_oversized_shard_size() {
         let packet = VideoPacket::First {
             display: 0,
@@ -1497,6 +1541,46 @@ mod validation_tests {
             reassembler.finalized_seq.len() <= 4,
             "finalized_seq leaked: {} entries",
             reassembler.finalized_seq.len()
+        );
+    }
+
+    /// A peer flooding distinct `stream_epoch`s with *incomplete* frames (a
+    /// lone `First` of a multi-shard frame that never completes) must not grow
+    /// the `pending` buffer without bound. Unlike the watermark-map test above
+    /// these frames never finalize, so they exercise the `MAX_PENDING_FRAMES`
+    /// hard cap rather than the wall-clock/age prune. Each `First` declares the
+    /// maximum `fragment_count`, the worst case for per-entry allocation.
+    #[test]
+    fn flood_of_incomplete_frames_is_capped_at_max_pending_frames() {
+        let mut reassembler = FrameReassembler::new();
+        let frag_count = u16::try_from(MAX_FRAGMENTS_PER_FRAME).unwrap();
+        let flood = u32::try_from(MAX_PENDING_FRAMES * 4).unwrap();
+        for epoch in 0..flood {
+            let packet = VideoPacket::First {
+                display: 0,
+                stream_epoch: epoch,
+                frame_seq: 0,
+                // Multi-shard so the lone First never completes the frame.
+                fragment_count: frag_count,
+                fec_pct: 20,
+                shard_size: 1100,
+                total_body_len: 1100 * u32::from(frag_count),
+                meta: dummy_envelope(),
+                payload: Bytes::from_static(&[0u8; 16]),
+            };
+            // Never finalizes (only 1 of fragment_count primaries present).
+            assert!(reassembler.handle(packet).is_none());
+        }
+        assert!(
+            reassembler.pending.len() <= MAX_PENDING_FRAMES,
+            "pending buffer exceeded the cap: {} entries (cap {})",
+            reassembler.pending.len(),
+            MAX_PENDING_FRAMES
+        );
+        // The over-cap fragments are counted as losses, not silently ignored.
+        assert!(
+            reassembler.loss_counters().1 > 0,
+            "dropped-over-cap fragments must register as fragment losses"
         );
     }
 

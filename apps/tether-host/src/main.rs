@@ -2774,6 +2774,14 @@ fn run_audio_capture_and_send(
             };
             frame_seq = frame_seq.wrapping_add(1);
             if let Err(e) = conn.send_datagram(&Datagram::Audio(packet)) {
+                if e.is_transient_send() {
+                    // MTU shrank mid-stream (PLPMTUD / path change): drop this
+                    // audio packet and keep the stream alive, same as the video
+                    // send loop. Audio is unreliable anyway; a single dropped
+                    // packet is concealed by the client's PLC.
+                    tracing::debug!(error = ?e, "dropping audio packet on transient send error");
+                    continue;
+                }
                 warn!(error = ?e, "audio datagram send failed; ending audio sender");
                 return;
             }
@@ -2832,8 +2840,9 @@ fn run_capture_and_send(
     let mut fragmenter = FrameFragmenter::new_with_fec(0, FEC_PERCENTAGE);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
     // Frames sacrificed because a datagram send failed transiently (the path
-    // MTU shrank mid-frame). Surfaced in the periodic stats log so a flapping
-    // path is visible rather than silent.
+    // MTU shrank mid-frame). Reset each stats window and logged alongside the
+    // per-window rates, so a flapping path shows up as recent drops rather than
+    // a silent monotonic total.
     let mut transient_send_drops: u64 = 0;
     // Per-stage latency (handoff + send), averaged over the same window
     // as `stats` and logged alongside it. See [`StageLatency`].
@@ -3379,6 +3388,9 @@ fn run_capture_and_send(
                     "send stats"
                 );
                 stage_latency = StageLatency::default();
+                // Per-window like the rates above: zero so the next log shows
+                // drops in that window, not a monotonic lifetime total.
+                transient_send_drops = 0;
             }
         }
     }

@@ -743,7 +743,6 @@ async fn handle_client(
     //      budget already absorbs an extra round trip for
     //      reliability.
     let runtime_handle_for_send = tokio::runtime::Handle::current();
-    let conn_keyframe = conn.clone();
     let send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
         .spawn(move || {
@@ -757,7 +756,6 @@ async fn handle_client(
                 chosen_profile,
                 stream_ready_for_thread,
                 runtime_handle_for_send,
-                conn_keyframe,
                 latest_client_stats_for_send,
                 latest_viewport_for_send,
                 send_exited_for_thread,
@@ -861,31 +859,29 @@ async fn handle_client(
                         }
                     }
                     Ok(ControlMessage::RequestRecovery {
-                        last_known_good_frame_id,
+                        last_reassembled_frame_id,
                     }) => {
                         let now = std::time::Instant::now();
                         if last_idr_request
                             .is_some_and(|t| now.duration_since(t) < IDR_REQUEST_MIN_INTERVAL)
                         {
                             tracing::trace!(
-                                last_known_good_frame_id,
+                                last_reassembled_frame_id,
                                 "RequestRecovery rate-limited"
                             );
                             continue;
                         }
                         last_idr_request = Some(now);
-                        // Without LTR plumbing, recovery means a full
-                        // IDR — same response as ForceIdr. The
-                        // client's `last_known_good_frame_id` is
-                        // logged for diagnostics but isn't actionable
-                        // until an encoder backend supports
-                        // long-term-reference re-prediction (see GH
-                        // #11 for the upstream blocker on VAAPI;
-                        // NVENC in #16 is the most plausible first
-                        // backend to wire end-to-end).
+                        // Recovery means a full IDR. `last_reassembled_frame_id`
+                        // is logged for diagnostics only — it is the client's
+                        // reassembler high-water mark, not a decode-verified
+                        // reference, so it can't drive LTR re-prediction even if
+                        // an encoder supported it. RFI is intentionally not
+                        // implemented (see the `RequestRecovery` doc); FEC + the
+                        // bounded GOP cover its failure mode.
                         tracing::info!(
-                            last_known_good_frame_id,
-                            "client requested recovery; falling back to forced IDR"
+                            last_reassembled_frame_id,
+                            "client requested recovery; emitting forced IDR"
                         );
                         force_idr.raise();
                     }
@@ -2778,6 +2774,14 @@ fn run_audio_capture_and_send(
             };
             frame_seq = frame_seq.wrapping_add(1);
             if let Err(e) = conn.send_datagram(&Datagram::Audio(packet)) {
+                if e.is_transient_send() {
+                    // MTU shrank mid-stream (PLPMTUD / path change): drop this
+                    // audio packet and keep the stream alive, same as the video
+                    // send loop. Audio is unreliable anyway; a single dropped
+                    // packet is concealed by the client's PLC.
+                    tracing::debug!(error = ?e, "dropping audio packet on transient send error");
+                    continue;
+                }
                 warn!(error = ?e, "audio datagram send failed; ending audio sender");
                 return;
             }
@@ -2800,7 +2804,6 @@ fn run_capture_and_send(
     chosen_profile: VideoProfile,
     stream_ready: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
-    keyframe_conn: Arc<Connection>,
     latest_client_stats: LatestClientStats,
     latest_viewport: LatestViewport,
     send_exited: Arc<tokio::sync::Notify>,
@@ -2836,6 +2839,11 @@ fn run_capture_and_send(
     const FEC_PERCENTAGE: u8 = 20;
     let mut fragmenter = FrameFragmenter::new_with_fec(0, FEC_PERCENTAGE);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
+    // Frames sacrificed because a datagram send failed transiently (the path
+    // MTU shrank mid-frame). Reset each stats window and logged alongside the
+    // per-window rates, so a flapping path shows up as recent drops rather than
+    // a silent monotonic total.
+    let mut transient_send_drops: u64 = 0;
     // Per-stage latency (handoff + send), averaged over the same window
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
@@ -3315,34 +3323,36 @@ fn run_capture_and_send(
         };
 
         let send_t0 = std::time::Instant::now();
-        if keyframe {
-            // Keyframes ride a reliable per-IDR QUIC uni stream. The
-            // single_packet path doesn't chunk into datagram-sized
-            // pieces because the stream layer handles segmentation;
-            // the receiver's reassembler sees a fragment_count=1
-            // packet that completes immediately. Frame_seq still
-            // advances so the next P-frame fragments slot in
-            // sequentially.
-            //
-            // Synchronous block_on (rather than an mpsc to a separate
-            // task) keeps strict ordering between the IDR and the
-            // P-frames that follow — see the comment on the spawn
-            // site for the epoch-race rationale.
-            let packet = fragmenter.single_packet(meta, body);
-            if let Err(e) = runtime.block_on(keyframe_conn.send_video_keyframe(&packet)) {
-                warn!(error = ?e, "send_video_keyframe failed, terminating send loop");
-                return;
-            }
-        } else {
-            // P-frame fragments. Burst freely — see the comment at
-            // the top of `run_capture_and_send` for why wire-level
-            // pacing was removed. FEC parity (FEC_PERCENTAGE) is
-            // the only smoothing the wire gets today.
-            for packet in fragmenter.fragment(meta, body) {
-                if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
-                    warn!(error = ?e, "send_datagram failed, terminating send loop");
-                    return;
+        // All frames — IDR keyframes and P-frames alike — ride the FEC'd
+        // datagram channel. A single channel keeps an IDR inherently ordered
+        // ahead of the P-frames that depend on it (no cross-channel overtaking)
+        // and large IDRs get multi-block FEC. Shards are sized to the
+        // connection's real datagram MTU (clamped to the soft payload target)
+        // minus the encoded header, so no datagram exceeds the path MTU even
+        // under an input-echo burst. Burst freely — see the comment at the top
+        // of `run_capture_and_send` for why wire-level pacing was removed.
+        let budget = conn
+            .max_datagram_size()
+            .map_or(tether_protocol::MAX_DATAGRAM_PAYLOAD, |m| {
+                m.min(tether_protocol::MAX_DATAGRAM_PAYLOAD)
+            });
+        for packet in fragmenter.fragment(meta, body, budget) {
+            if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
+                if e.is_transient_send() {
+                    // MTU shrank mid-frame (PLPMTUD black-hole / path change),
+                    // so a shard fragmented against the old budget no longer
+                    // fits. Every remaining shard of this frame is the same
+                    // size, so drop the rest of the frame and keep the session
+                    // alive — the next frame re-fragments against the new MTU.
+                    // FEC can't rebuild a lost contiguous tail, so this frame is
+                    // sacrificed, but a single dropped frame is recoverable and
+                    // a torn-down session is not.
+                    transient_send_drops += 1;
+                    tracing::debug!(error = ?e, "dropping frame on transient datagram send error");
+                    break;
                 }
+                warn!(error = ?e, "send_datagram failed (fatal), terminating send loop");
+                return;
             }
         }
         // Accumulated only for frames that complete encode + send;
@@ -3374,9 +3384,13 @@ fn run_capture_and_send(
                     ),
                     kbps_out = format!("{:.0}", snap.kbps_out),
                     kf_per_s = format!("{kf_per_s:.2}"),
+                    transient_send_drops,
                     "send stats"
                 );
                 stage_latency = StageLatency::default();
+                // Per-window like the rates above: zero so the next log shows
+                // drops in that window, not a monotonic lifetime total.
+                transient_send_drops = 0;
             }
         }
     }

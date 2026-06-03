@@ -27,15 +27,10 @@
 //! - [`ControlChannel`] and [`InputChannel`] are stream-shaped on the
 //!   wire (length-prefix + bincode over a QUIC reliable stream); they
 //!   ride `tokio::io::duplex` here with the same framing.
-//! - [`VideoChannel`] datagrams are message-framed on the wire (one
-//!   `Datagram` per QUIC datagram); they ride
+//! - [`VideoChannel`] carries all video — IDR keyframes included — as
+//!   message-framed datagrams (one `Datagram` per QUIC datagram); they ride
 //!   `tokio::sync::mpsc::channel<Datagram>` here — adding length-prefix
 //!   over a duplex stream would itself be a shadow serializer.
-//! - [`VideoChannel`] keyframes (IDR uni-streams) are reliable and
-//!   effectively unbounded; they ride
-//!   `tokio::sync::mpsc::unbounded_channel<VideoPacket>` here.
-//!   Real QUIC reliable streams stall the sender's flow control rather
-//!   than dropping, which `unbounded_channel` matches.
 //!
 //! The drop-on-overflow semantics of datagrams are preserved: when the
 //! bounded mpsc is full, `send_datagram` silently drops the frame
@@ -50,7 +45,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tether_protocol::control::{ClientHello, ClockSync, ControlMessage, ServerHello};
 use tether_protocol::input::InputEvent;
-use tether_protocol::video::VideoPacket;
 use tether_protocol::MonoNanos;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex};
@@ -292,20 +286,17 @@ impl InputChannel for DuplexInputChannel {
 }
 
 // ---------------------------------------------------------------------
-// VideoChannel: mpsc<Datagram> for unreliable, mpsc<VideoPacket> for IDR
+// VideoChannel: mpsc<Datagram> — all video rides datagrams
 // ---------------------------------------------------------------------
 
 /// One end of an in-memory video channel pair.
 ///
-/// Two separate transport directions modeled by two pairs of mpsc
-/// channels:
-/// - **Datagrams**: bounded `mpsc::channel<Datagram>`; `send_datagram`
-///   silently drops on overflow (matches production: quinn's UDP queue
-///   can overflow without surfacing through `Result`) and bumps the
-///   `datagrams_dropped` counter for tests.
-/// - **IDR uni-streams**: unbounded `mpsc::unbounded_channel<VideoPacket>`;
-///   matches production's QUIC reliable-stream flow-control behavior
-///   (stall the sender rather than drop).
+/// A single transport direction's worth of datagrams modeled by a bounded
+/// `mpsc::channel<Datagram>`; `send_datagram` silently drops on overflow
+/// (matches production: quinn's UDP queue can overflow without surfacing
+/// through `Result`) and bumps the `datagrams_dropped` counter for tests.
+/// All video — IDR keyframes included — rides datagrams, so there is no
+/// separate reliable-stream model here.
 ///
 /// Wire serialization uses the production `tether_protocol::encode` /
 /// `decode` round-trip via `Datagram::Video(packet)` so payload-format
@@ -313,8 +304,6 @@ impl InputChannel for DuplexInputChannel {
 pub struct DuplexVideoChannel {
     dgram_tx: mpsc::Sender<Datagram>,
     dgram_rx: Mutex<mpsc::Receiver<Datagram>>,
-    keyframe_tx: mpsc::UnboundedSender<VideoPacket>,
-    keyframe_rx: Mutex<mpsc::UnboundedReceiver<VideoPacket>>,
     datagrams_dropped: std::sync::atomic::AtomicU64,
 }
 
@@ -346,25 +335,17 @@ pub fn video_duplex_pair_with_depth(
 ) -> (Arc<DuplexVideoChannel>, Arc<DuplexVideoChannel>) {
     // Host → client direction.
     let (h2c_dgram_tx, h2c_dgram_rx) = mpsc::channel::<Datagram>(depth);
-    let (h2c_kf_tx, h2c_kf_rx) = mpsc::unbounded_channel::<VideoPacket>();
-    // Client → host direction (cursor datagrams flow this way today;
-    // keyframes are host → client only, but the unbounded mpsc costs
-    // nothing to keep symmetric and avoids surprising callers).
+    // Client → host direction (cursor datagrams flow this way today).
     let (c2h_dgram_tx, c2h_dgram_rx) = mpsc::channel::<Datagram>(depth);
-    let (c2h_kf_tx, c2h_kf_rx) = mpsc::unbounded_channel::<VideoPacket>();
 
     let host = Arc::new(DuplexVideoChannel {
         dgram_tx: h2c_dgram_tx,
         dgram_rx: Mutex::new(c2h_dgram_rx),
-        keyframe_tx: h2c_kf_tx,
-        keyframe_rx: Mutex::new(c2h_kf_rx),
         datagrams_dropped: Default::default(),
     });
     let client = Arc::new(DuplexVideoChannel {
         dgram_tx: c2h_dgram_tx,
         dgram_rx: Mutex::new(h2c_dgram_rx),
-        keyframe_tx: c2h_kf_tx,
-        keyframe_rx: Mutex::new(h2c_kf_rx),
         datagrams_dropped: Default::default(),
     });
     (host, client)
@@ -395,21 +376,6 @@ impl VideoChannel for DuplexVideoChannel {
 
     async fn recv_datagram(&self) -> Result<Datagram> {
         let mut rx = self.dgram_rx.lock().await;
-        rx.recv().await.ok_or(TransportError::StreamClosed)
-    }
-
-    async fn send_video_keyframe(&self, packet: &VideoPacket) -> Result<()> {
-        // Round-trip through the production serializer the same way
-        // datagrams do.
-        let bytes = tether_protocol::encode(packet)?;
-        let decoded: VideoPacket = tether_protocol::decode(&bytes)?;
-        self.keyframe_tx
-            .send(decoded)
-            .map_err(|_| TransportError::StreamClosed)
-    }
-
-    async fn accept_video_keyframe(&self) -> Result<VideoPacket> {
-        let mut rx = self.keyframe_rx.lock().await;
         rx.recv().await.ok_or(TransportError::StreamClosed)
     }
 }
@@ -464,11 +430,9 @@ pub struct DropEvent {
 
 /// Wrap any [`VideoChannel`] in a configurable loss + reorder layer.
 ///
-/// Only the **datagram path** is affected: `send_datagram` /
-/// `recv_datagram` apply the configured loss and reorder. The IDR
-/// uni-stream path (`send_video_keyframe` / `accept_video_keyframe`)
-/// is reliable in production and stays untouched here — matches QUIC
-/// reliable-stream semantics.
+/// `send_datagram` / `recv_datagram` apply the configured loss and reorder to
+/// the single video datagram channel (all video — IDR keyframes included —
+/// rides it).
 ///
 /// Drops are recorded in [`Self::drop_log`] as full [`DropEvent`]s so
 /// a failing test can name the exact sequence numbers it dropped,
@@ -586,15 +550,6 @@ impl<V: VideoChannel + ?Sized> VideoChannel for LossyChannel<V> {
             // invariant.
             TransportError::StreamClosed
         })
-    }
-
-    async fn send_video_keyframe(&self, packet: &VideoPacket) -> Result<()> {
-        // Reliable stream — pass through unchanged.
-        self.inner.send_video_keyframe(packet).await
-    }
-
-    async fn accept_video_keyframe(&self) -> Result<VideoPacket> {
-        self.inner.accept_video_keyframe().await
     }
 }
 
@@ -741,7 +696,11 @@ mod tests {
     async fn video_datagrams_round_trip_in_order() {
         let (host, client) = video_duplex_pair();
         let mut fragmenter = FrameFragmenter::new(0);
-        let packets = fragmenter.fragment(make_video_meta(), b"hello".to_vec().into());
+        let packets = fragmenter.fragment(
+            make_video_meta(),
+            b"hello".to_vec().into(),
+            tether_protocol::MAX_DATAGRAM_PAYLOAD,
+        );
         let dgram = Datagram::Video(packets.into_iter().next().unwrap());
         host.send_datagram(&dgram).unwrap();
         let received = tokio::time::timeout(Duration::from_secs(1), client.recv_datagram())
@@ -757,7 +716,11 @@ mod tests {
         let (host, _client) = video_duplex_pair_with_depth(1);
         let mut fragmenter = FrameFragmenter::new(0);
         let pkt = fragmenter
-            .fragment(make_video_meta(), b"x".to_vec().into())
+            .fragment(
+                make_video_meta(),
+                b"x".to_vec().into(),
+                tether_protocol::MAX_DATAGRAM_PAYLOAD,
+            )
             .into_iter()
             .next()
             .unwrap();
@@ -769,30 +732,6 @@ mod tests {
         host.send_datagram(&dgram).unwrap();
         host.send_datagram(&dgram).unwrap();
         assert_eq!(host.datagrams_dropped(), 2);
-    }
-
-    #[tokio::test]
-    async fn video_keyframe_uni_stream_round_trips() {
-        let (host, client) = video_duplex_pair();
-        let mut fragmenter = FrameFragmenter::new(0);
-        let pkt = fragmenter.single_packet(
-            VideoFrameMeta {
-                dimensions: (16, 16),
-                keyframe: true,
-                timing: tether_protocol::video::HostFrameTiming::default(),
-                input_echo: Default::default(),
-            },
-            b"idr-body".to_vec().into(),
-        );
-        host.send_video_keyframe(&pkt).await.unwrap();
-        let received = tokio::time::timeout(Duration::from_secs(1), client.accept_video_keyframe())
-            .await
-            .expect("timeout")
-            .unwrap();
-        match received {
-            VideoPacket::First { payload, .. } => assert_eq!(payload.as_ref(), b"idr-body"),
-            other => panic!("expected First, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -809,7 +748,11 @@ mod tests {
         let mut fragmenter = FrameFragmenter::new(0);
         for _ in 0..10 {
             let pkt = fragmenter
-                .fragment(make_video_meta(), b"x".to_vec().into())
+                .fragment(
+                    make_video_meta(),
+                    b"x".to_vec().into(),
+                    tether_protocol::MAX_DATAGRAM_PAYLOAD,
+                )
                 .into_iter()
                 .next()
                 .unwrap();
@@ -830,7 +773,11 @@ mod tests {
         let lossy = LossyChannel::new(host.clone(), LossyConfig::default());
         let mut fragmenter = FrameFragmenter::new(0);
         let pkt = fragmenter
-            .fragment(make_video_meta(), b"hello".to_vec().into())
+            .fragment(
+                make_video_meta(),
+                b"hello".to_vec().into(),
+                tether_protocol::MAX_DATAGRAM_PAYLOAD,
+            )
             .into_iter()
             .next()
             .unwrap();

@@ -598,21 +598,30 @@ pub enum CursorMode {
 pub enum ControlMessage {
     /// Client requests an immediate IDR (e.g., after detected packet loss).
     ForceIdr,
-    /// Client → host. Loss-driven recovery request. Names the most
-    /// recent frame the client successfully decoded; the host should
-    /// invalidate any newer references it might be relying on and
-    /// emit the next P-frame predicted against an earlier still-good
-    /// reference (Long-Term Reference path) or, when no usable LTR
-    /// is available, fall back to a fresh IDR.
+    /// Client → host. Loss-driven recovery request: the host emits a
+    /// fresh IDR.
     ///
-    /// Today the host always falls back to IDR (the LTR plumbing on
-    /// the VAAPI encoder is a Phase 2 follow-up). Even with the
-    /// fallback, this message is a latency win over waiting for the
-    /// next decoder-driven `ForceIdr`: the client signals as soon as
-    /// the reassembler observes a stale-dropped fragment, before
-    /// the decoder even gets a chance to fail.
+    /// This message is a latency win over waiting for the next
+    /// decoder-driven `ForceIdr`: the client signals as soon as the
+    /// reassembler observes a stale-dropped fragment, before the
+    /// decoder even gets a chance to fail.
+    ///
+    /// `last_reassembled_frame_id` carries the newest frame the *client's
+    /// reassembler* completed when it fired this request. It is a
+    /// diagnostic hint only — the host logs it and always responds with a
+    /// full IDR. **It is NOT decode-verified:** a frame can reassemble (FEC
+    /// rebuilt every shard) yet still be a P-frame referencing an earlier
+    /// frame the decoder concealed or skipped, so "reassembled" is strictly
+    /// weaker than "decoded cleanly". Do not use this value to select an
+    /// encoder reference (e.g. a Long-Term Reference re-prediction): that
+    /// requires a decode-success signal fed back from the decode thread,
+    /// which we deliberately do not have. Reference-frame invalidation is
+    /// intentionally not implemented — it is NVENC-/Windows-mostly and
+    /// structurally unavailable on the VAAPI path (FFmpeg's `vaapi_encode.c`
+    /// builds the picture/rate-control params once at init), while FEC + a
+    /// bounded GOP already cover its failure mode.
     RequestRecovery {
-        last_known_good_frame_id: u32,
+        last_reassembled_frame_id: u32,
     },
     /// Periodic clock-sync re-probe (either side may initiate).
     ClockProbeRequest {

@@ -48,24 +48,14 @@ use tether_protocol::CodecError;
 /// [`tether_protocol::MAX_DATAGRAM_PAYLOAD`]).
 pub const MAX_FRAMED_MESSAGE: usize = 64 * 1024;
 
-/// Hard cap on the size of a single video-keyframe message delivered on
-/// the per-IDR unidirectional stream. Sized for a worst-case 4K HEVC
-/// IDR plus modest headroom (~2 MiB total). Separate from
-/// [`MAX_FRAMED_MESSAGE`] so the control-stream cap stays tight against
-/// hostile peers while video streams can carry the legitimately-large
-/// keyframe payload. Pre-allocated by `read_framed_with_max` on stream
-/// arrival, so any growth here directly widens a peer-controlled
-/// allocation; only bump if a real keyframe overruns.
-pub const MAX_VIDEO_STREAM_MESSAGE: usize = 2 * 1024 * 1024;
-
-/// Per-connection cap on concurrent host→client unidirectional streams.
-/// The reliable-keyframe protocol needs O(1) streams alive at once
-/// (the previous keyframe's stream finishes before the next is opened
-/// today, but quinn permits in-flight overlap). 4 leaves headroom for
-/// a brief overlap during a back-to-back IDR burst while denying a
-/// malicious peer the ability to open thousands of streams and pin
-/// the receive-side allocations.
-pub const MAX_CONCURRENT_UNI_STREAMS: u32 = 4;
+/// Per-connection cap on concurrent peer-initiated unidirectional streams.
+/// Tether opens exactly one uni stream over a connection's life: the
+/// client→host input event stream (video, IDR keyframes included, rides
+/// datagrams — there is no reliable video stream). 2 covers the single
+/// long-lived input stream with headroom for a transient reconnect overlap
+/// while denying a malicious peer the ability to open thousands of streams
+/// and pin the receive-side allocations.
+pub const MAX_CONCURRENT_UNI_STREAMS: u32 = 2;
 
 /// Cap on concurrent peer-initiated bidirectional streams. Tether opens
 /// two client-initiated bidi streams over a connection's life: the
@@ -122,10 +112,69 @@ pub enum TransportError {
 pub type Result<T> = std::result::Result<T, TransportError>;
 
 impl TransportError {
+    /// True when a `send_datagram` failure affects only the current frame, so
+    /// the caller should drop the frame and keep the session alive rather than
+    /// tear it down.
+    ///
+    /// The motivating case is MTU shrinkage mid-stream: quinn's
+    /// `max_datagram_size()` can drop (PLPMTUD black-hole detection, a Wi-Fi →
+    /// cellular handoff, NAT rebinding to a lower-MTU path) *after* a frame has
+    /// already been fragmented against a larger budget. The remaining shards
+    /// then exceed the new limit — `FrameTooLarge` (our guard) or quinn's
+    /// `TooLarge`. That is transient: the next frame re-fragments against the
+    /// smaller MTU and recovers. Tearing the session down on either is a
+    /// self-inflicted disconnect on a recoverable event. (A full datagram send
+    /// buffer is *not* surfaced here: quinn's buffered `send_datagram` drops
+    /// the oldest queued datagram instead of erroring.)
+    ///
+    /// Connection-level failures (peer gone, datagrams unsupported or disabled,
+    /// connection lost) are *not* transient: continuing would spin uselessly,
+    /// so the caller should end the loop.
+    pub fn is_transient_send(&self) -> bool {
+        matches!(
+            self,
+            TransportError::FrameTooLarge { .. }
+                | TransportError::SendDatagram(quinn::SendDatagramError::TooLarge)
+        )
+    }
+
     pub(crate) fn from_read_exact(e: quinn::ReadExactError) -> Self {
         match e {
             quinn::ReadExactError::FinishedEarly(_) => TransportError::StreamClosed,
             quinn::ReadExactError::ReadError(re) => TransportError::Read(re),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_send_errors_drop_the_frame_not_the_session() {
+        // Per-frame failures the send loop should survive by dropping the
+        // current frame's remaining shards (MTU shrank mid-frame).
+        assert!(TransportError::FrameTooLarge {
+            size: 2000,
+            max: 1200
+        }
+        .is_transient_send());
+        assert!(
+            TransportError::SendDatagram(quinn::SendDatagramError::TooLarge).is_transient_send()
+        );
+    }
+
+    #[test]
+    fn connection_level_send_errors_are_fatal() {
+        // A peer that can't or won't receive datagrams will never accept video;
+        // continuing would spin. These must end the send loop.
+        assert!(
+            !TransportError::SendDatagram(quinn::SendDatagramError::UnsupportedByPeer)
+                .is_transient_send()
+        );
+        assert!(
+            !TransportError::SendDatagram(quinn::SendDatagramError::Disabled).is_transient_send()
+        );
+        assert!(!TransportError::StreamClosed.is_transient_send());
     }
 }

@@ -2,12 +2,12 @@
 //! frames, decodes them (HEVC/H.264 via VAAPI when available), and
 //! presents them in a wgpu window.
 //!
-//! Recv loop runs on a tokio task and races `recv_datagram` (P-frames,
-//! cursor) against `accept_video_keyframe` (reliable per-IDR uni
-//! streams). Decode runs on a dedicated `std::thread` (`tether-decode`)
-//! so a GPU-driver stall in libavcodec → libva can't starve the QUIC
-//! recv loop. Render is one-deep so a slow renderer drops frames
-//! rather than back-pressuring upstream.
+//! Recv loop runs on a tokio task draining `recv_datagram`: all video — IDR
+//! keyframes and P-frames alike — arrives as FEC'd datagrams and feeds one
+//! reassembler (cursor + audio datagrams share the channel). Decode runs on a
+//! dedicated `std::thread` (`tether-decode`) so a GPU-driver stall in
+//! libavcodec → libva can't starve the QUIC recv loop. Render is one-deep so a
+//! slow renderer drops frames rather than back-pressuring upstream.
 //!
 //! Usage: `tether-client <host_addr> <cert_fingerprint_hex>`.
 
@@ -40,6 +40,22 @@ use client_pairing::HostAuth;
 // texture on dimension change.
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
+
+/// Whether a `FrameReassembler::handle()` loss-counter delta warrants a
+/// `RequestRecovery`. `before`/`after` are `(frames_dropped, fragments_lost)`
+/// snapshots taken around the `handle()` call.
+///
+/// Fires only on a `frames_dropped` increase — a frame started but pruned
+/// before completing, the genuine "this frame will never arrive" signal.
+/// Never fires on `fragments_lost` alone: that counts stale stragglers (a late
+/// fragment for an already-finalized or already-pruned frame) and malformed
+/// packets, neither of which is independently actionable. Triggering on them
+/// would emit spurious recovery IDRs that add bandwidth and worsen congestion
+/// on an already-lossy path; a frame that truly won't complete still bumps
+/// `frames_dropped` when it's pruned, so the real signal survives.
+fn recovery_warranted(before: (u64, u64), after: (u64, u64)) -> bool {
+    after.0 > before.0
+}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
@@ -525,13 +541,17 @@ async fn main() -> anyhow::Result<()> {
         // per-interval drop and fragment-loss rates for ClientStats.
         let mut last_frames_dropped: u64 = 0;
         let mut last_fragments_lost: u64 = 0;
-        // Most-recent successfully-reassembled frame_seq. Quoted in
-        // RequestRecovery when the reassembler observes a stale
-        // drop. The host currently logs the value for diagnostics
-        // and collapses to a forced IDR; an encoder-side LTR
-        // backend (GH #16) would use it to select a still-trusted
-        // reference for re-prediction.
-        let mut last_known_good_frame_seq: Option<u32> = None;
+        // Most-recent frame_seq the reassembler *completed*. Quoted in
+        // RequestRecovery when the reassembler observes a stale drop, and
+        // doubles as the "have we received any frame yet" sentinel that gates
+        // the recovery request. NOTE: this is "reassembled", NOT "decoded
+        // cleanly" — a frame can reassemble (FEC rebuilt every shard) yet be a
+        // P-frame referencing an earlier frame the decoder concealed. The host
+        // only logs the value and always responds with a full IDR, so the
+        // distinction is harmless today; it must not be used to select an
+        // encoder reference without a decode-success signal we don't have. See
+        // the `RequestRecovery` doc in tether-protocol.
+        let mut last_reassembled_frame_seq: Option<u32> = None;
         // Last time we emitted a RequestRecovery. Rate-limits the
         // signal to one every IDR_RATE_LIMIT (500 ms) so a burst
         // of drops collapses into a single recovery action — same
@@ -590,105 +610,86 @@ async fn main() -> anyhow::Result<()> {
         let mut last_cursor_log = std::time::Instant::now();
 
         loop {
-            // Race the unreliable datagram path (P-frames, cursor) against
-            // the reliable per-IDR uni stream path. `biased` so we always
-            // poll datagrams first — they're the latency-critical channel
-            // and the more frequent one; the keyframe stream is woken up
-            // only when an IDR is in flight. Both produce a `VideoPacket`
-            // that feeds the same reassembler.
-            // Fair select (no `biased`): on a high-fps stream the
-            // datagram future is almost always ready, and biasing it
-            // would let an IDR stream sit unaccepted for several
-            // iterations during a P-frame torrent — exactly the
-            // scenario where prompt IDR delivery is load-bearing.
-            let packet: VideoPacket = tokio::select! {
-                d = conn_recv.recv_datagram() => {
-                    match d {
-                        Ok(Datagram::Video(p)) => p,
-                        Ok(Datagram::HostCursor(hc)) => {
-                            // Position datagrams ride latest-wins; the
-                            // overlay's render pass reads the most
-                            // recent value each frame.
-                            use tether_protocol::cursor::HostCursorPacket;
-                            match hc {
-                                HostCursorPacket::Position { x, y, visible, .. } => {
-                                    #[allow(clippy::cast_precision_loss)]
-                                    let (xf, yf) = (x as f32, y as f32);
-                                    cursor_channel_datagram.with(|state| {
-                                        state.set_position(xf, yf, visible);
-                                    });
-                                    cursor_pos_packets += 1;
-                                    if last_cursor_log.elapsed() >= std::time::Duration::from_secs(2) {
-                                        info!(cursor_pos_packets, last_x = x, last_y = y, visible, "cursor position datagrams");
-                                        last_cursor_log = std::time::Instant::now();
-                                    }
-                                }
+            // All video — IDR keyframes and P-frames alike — arrives on the
+            // unreliable datagram channel and feeds the same reassembler; there
+            // is no separate reliable keyframe stream to race. Cursor and audio
+            // datagrams share the channel and are dispatched out here.
+            let packet: VideoPacket = match conn_recv.recv_datagram().await {
+                Ok(Datagram::Video(p)) => p,
+                Ok(Datagram::HostCursor(hc)) => {
+                    // Position datagrams ride latest-wins; the overlay's render
+                    // pass reads the most recent value each frame.
+                    use tether_protocol::cursor::HostCursorPacket;
+                    match hc {
+                        HostCursorPacket::Position { x, y, visible, .. } => {
+                            #[allow(clippy::cast_precision_loss)]
+                            let (xf, yf) = (x as f32, y as f32);
+                            cursor_channel_datagram.with(|state| {
+                                state.set_position(xf, yf, visible);
+                            });
+                            cursor_pos_packets += 1;
+                            if last_cursor_log.elapsed() >= std::time::Duration::from_secs(2) {
+                                info!(
+                                    cursor_pos_packets,
+                                    last_x = x,
+                                    last_y = y,
+                                    visible,
+                                    "cursor position datagrams"
+                                );
+                                last_cursor_log = std::time::Instant::now();
                             }
-                            continue;
-                        }
-                        Ok(Datagram::ClientCursor(_)) => {
-                            // Client-originated cursor packets should never
-                            // come back to the client; ignore defensively.
-                            continue;
-                        }
-                        Ok(Datagram::Audio(AudioPacket::Opus {
-                            frame_seq, payload, ..
-                        })) => {
-                            // Forward to the audio decode thread; drop on a full
-                            // channel (decoder behind) — audio is loss-tolerant.
-                            if let Some(tx) = &audio_tx {
-                                let _ = tx.try_send((frame_seq, payload));
-                            }
-                            continue;
-                        }
-                        Err(e) => {
-                            // Promoted from warn → error: this is terminal for the
-                            // video stream and the user otherwise sees a frozen
-                            // last-frame with no indication anything broke. Also
-                            // close the connection explicitly so the host learns
-                            // about it instead of waiting for the idle timeout.
-                            error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
-                            conn_recv.close(1, b"recv failed");
-                            break;
                         }
                     }
+                    continue;
                 }
-                kf = conn_recv.accept_video_keyframe() => {
-                    match kf {
-                        Ok(p) => p,
-                        Err(e) => {
-                            // Stream-level read errors are transient on a
-                            // healthy connection (peer reset the stream).
-                            // The connection itself is fine; the next IDR
-                            // will arrive on its own fresh stream.
-                            warn!(error = ?e, "accept_video_keyframe failed; awaiting next stream");
-                            continue;
-                        }
+                Ok(Datagram::ClientCursor(_)) => {
+                    // Client-originated cursor packets should never come back to
+                    // the client; ignore defensively.
+                    continue;
+                }
+                Ok(Datagram::Audio(AudioPacket::Opus {
+                    frame_seq, payload, ..
+                })) => {
+                    // Forward to the audio decode thread; drop on a full channel
+                    // (decoder behind) — audio is loss-tolerant.
+                    if let Some(tx) = &audio_tx {
+                        let _ = tx.try_send((frame_seq, payload));
                     }
+                    continue;
+                }
+                Err(e) => {
+                    // Promoted from warn → error: this is terminal for the video
+                    // stream and the user otherwise sees a frozen last-frame with
+                    // no indication anything broke. Also close the connection
+                    // explicitly so the host learns about it instead of waiting
+                    // for the idle timeout.
+                    error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
+                    conn_recv.close(1, b"recv failed");
+                    break;
                 }
             };
 
-            // Snapshot loss counters around the handle() so we can
-            // see if this packet's processing pruned any in-flight
-            // frame. A non-zero delta means the reassembler just
-            // gave up on a frame whose fragments will never
-            // complete — the soonest possible loss signal, well
-            // before the decoder thread would ever notice.
+            // Snapshot loss counters around the handle() so we can see if
+            // this packet's processing caused the reassembler to give up on
+            // a frame. We gate recovery on `frames_dropped` only — the count
+            // of frames started but pruned incomplete. That is the genuine
+            // "a frame will never complete" signal worth a recovery IDR.
             //
-            // False positive note: a `prune_old` eviction of an
-            // *unrelated* frame on this handle() also increments
-            // the counter, so this is an over-trigger. The cost is
-            // an extra RequestRecovery (which collapses to a forced
-            // IDR in Phase 1; the rate limit caps the rate). Phase
-            // 2 should scope the trigger to the specific frame
-            // we're touching by tracking per-frame counters if the
-            // reassembler grows that API.
+            // We deliberately do NOT trigger on `fragments_lost`: that counter
+            // bumps when a *straggler* fragment arrives for a frame that was
+            // already finalized or pruned, or when a malformed packet is
+            // rejected. Neither is independently actionable — by the time a
+            // late fragment shows up the frame is already gone (recovered or
+            // abandoned), so firing on it just emits spurious recovery IDRs
+            // that add bandwidth and worsen congestion exactly when the path
+            // is already lossy. A frame that truly won't complete still bumps
+            // `frames_dropped` when `prune_old` evicts it, so the real signal
+            // is not lost — only the noise.
             let pre_loss = reassembler.loss_counters();
             let result = reassembler.handle(packet);
             let post_loss = reassembler.loss_counters();
-            let new_loss = post_loss.0 > pre_loss.0 || post_loss.1 > pre_loss.1;
-            if new_loss {
-                if let Some(last_good) = last_known_good_frame_seq {
+            if recovery_warranted(pre_loss, post_loss) {
+                if let Some(last_reassembled) = last_reassembled_frame_seq {
                     let now = MonoNanos::now();
                     let rate_limit_ns = 500_000_000u64;
                     let fire = last_request_recovery_at
@@ -699,7 +700,7 @@ async fn main() -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             if let Err(e) = send_conn
                                 .send_control(&ControlMessage::RequestRecovery {
-                                    last_known_good_frame_id: last_good,
+                                    last_reassembled_frame_id: last_reassembled,
                                 })
                                 .await
                             {
@@ -713,7 +714,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let Some(frame) = result else { continue };
-            last_known_good_frame_seq = Some(frame.frame_seq);
+            // Reassembled, not yet decoded — see the declaration comment.
+            last_reassembled_frame_seq = Some(frame.frame_seq);
             let now = MonoNanos::now();
             // Host timestamps -> client clock via the handshake
             // offset. host_in_client_clock is the moment the
@@ -1267,7 +1269,13 @@ fn setup_audio_playback(
     // would size the playback ring's allocation into gigabytes (OOM), and an
     // out-of-range `channels` would drive decoder plane indexing.
     // v1 ships mono/stereo at an Opus-native rate; reject anything else.
-    const OPUS_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+    // This is the accept-list the client honours from the host. 8 kHz and
+    // 16 kHz are valid Opus rates but are excluded as a policy choice — no
+    // current capture backend produces them, so narrowing the negotiation
+    // window keeps the surface small. (`OpusDecoder::new` independently rejects
+    // any (rate, frame-duration) pair whose frame size libopus would refuse, so
+    // a future config bug fails loudly rather than dropping every packet.)
+    const OPUS_RATES: [u32; 3] = [12_000, 24_000, 48_000];
     if !OPUS_RATES.contains(&audio_cfg.sample_rate_hz) || !(1..=2).contains(&audio_cfg.channels) {
         warn!(
             sample_rate = audio_cfg.sample_rate_hz,
@@ -1541,5 +1549,19 @@ mod arg_tests {
     #[test]
     fn missing_flag_value_is_rejected() {
         assert!(parse_cli_args(&args(&["127.0.0.1:7654", "--pin"])).is_err());
+    }
+
+    #[test]
+    fn recovery_fires_only_on_a_pruned_frame_not_a_straggler() {
+        // (frames_dropped, fragments_lost)
+        // A frame pruned incomplete (frames_dropped++) → recover.
+        assert!(recovery_warranted((0, 0), (1, 0)));
+        // A stale straggler / malformed packet (fragments_lost++ only) →
+        // do NOT recover; it's not independently actionable.
+        assert!(!recovery_warranted((0, 0), (0, 1)));
+        // Both moving still recovers — the dropped frame is the reason.
+        assert!(recovery_warranted((0, 0), (1, 1)));
+        // Nothing moved → nothing to recover.
+        assert!(!recovery_warranted((3, 7), (3, 7)));
     }
 }

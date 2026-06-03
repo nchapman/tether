@@ -73,6 +73,9 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
         stream_epoch: 0,
         frame_seq: 7,
         fragment_count: 1,
+        fec_pct: 0,
+        shard_size: 100,
+        total_body_len: 100,
         meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: true,
@@ -260,9 +263,7 @@ async fn input_stream_wrong_role_errors() -> anyhow::Result<()> {
 // length-prefix mismatch when the body doesn't match the schema.
 // Direct test of the length-prefix check inside `read_framed` would
 // require either a test-only raw write hook on Connection or a unit
-// test inside connection.rs against a quinn SendStream pair. The
-// public send_video_keyframe path below exercises the same code
-// inside read_framed_with_max via MAX_VIDEO_STREAM_MESSAGE.
+// test inside connection.rs against a quinn SendStream pair.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
@@ -285,6 +286,9 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
         stream_epoch: 0,
         frame_seq: 0,
         fragment_count: 1,
+        fec_pct: 0,
+        shard_size: 4096,
+        total_body_len: 4096,
         meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: false,
@@ -304,92 +308,44 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #37's guarantee — "no datagram exceeds the path MTU" — validated against
+/// *real* quinn rather than the `MAX_DATAGRAM_PAYLOAD` constant. The host sizes
+/// shards from the live `max_datagram_size()` minus the encoded header; this
+/// test reproduces that budget derivation over a real connection, fragments a
+/// large FEC'd IDR against it, and asserts quinn accepts every datagram (no
+/// `FrameTooLarge`/`TooLarge`) and the far side reassembles the body byte-equal.
+/// If our header accounting were off by even a byte versus quinn's real
+/// datagram-frame overhead, a shard would be rejected here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn video_keyframe_stream_roundtrips() -> anyhow::Result<()> {
-    // Reliable-IDR path: host opens a uni stream, writes one
-    // length-framed VideoPacket::First with fragment_count=1, and
-    // finishes. Client accepts the stream and reads the same packet
-    // back. Exercises send_video_keyframe + accept_video_keyframe and
-    // the underlying write_framed_with_max / read_framed_with_max at
-    // the larger video-stream cap.
+async fn frame_fragmented_at_live_mtu_is_accepted_and_reassembles() -> anyhow::Result<()> {
+    use tether_protocol::video::{FrameFragmenter, FrameReassembler};
+    use tether_protocol::MAX_DATAGRAM_PAYLOAD;
+
     let server = Server::bind((Ipv4Addr::LOCALHOST, 0).into()).await?;
     let server_addr = server.local_addr()?;
     let fingerprint = server.fingerprint();
 
-    // 200 KiB body — comfortably inside MAX_VIDEO_STREAM_MESSAGE (2 MiB)
-    // and large enough that the underlying QUIC stream actually has to
-    // segment, exercising the partial-read path inside read_exact.
-    let body: Vec<u8> = (0..200_000).map(|i| (i & 0xff) as u8).collect();
+    let body = bytes::Bytes::from((0..64u8).cycle().take(64 * 1024).collect::<Vec<u8>>());
     let body_for_server = body.clone();
 
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("server closed")?;
-        let packet = VideoPacket::First {
-            display: 0,
-            stream_epoch: 7,
-            frame_seq: 42,
-            fragment_count: 1,
-            meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
-                timing: HostFrameTiming::default(),
-                keyframe: true,
-                input_echo: InputEchoBatch::default(),
-                dimensions: (1920, 1080),
-            }),
-            payload: bytes::Bytes::from(body_for_server),
-        };
-        conn.send_video_keyframe(&packet).await?;
-        // Wait for the client to confirm receipt by sending a
-        // control message. Otherwise the conn drops here and quinn
-        // closes the connection before the keyframe stream's
-        // fin/data has been flushed to the wire.
-        let _ = conn.recv_control().await?;
-        anyhow::Ok(())
-    });
-
-    let client = Client::new()?;
-    let conn = client
-        .connect(server_addr, "tether-host", fingerprint)
-        .await?;
-    let received = conn.accept_video_keyframe().await?;
-    match received {
-        VideoPacket::First {
-            stream_epoch,
-            frame_seq,
-            fragment_count,
-            payload,
-            ..
-        } => {
-            assert_eq!(stream_epoch, 7);
-            assert_eq!(frame_seq, 42);
-            assert_eq!(fragment_count, 1);
-            assert_eq!(payload.as_ref(), body.as_slice());
+        let mut reassembler = FrameReassembler::new();
+        // Localhost is lossless: read datagrams until the frame completes.
+        loop {
+            match conn.recv_datagram().await? {
+                Datagram::Video(pkt) => {
+                    if let Some(frame) = reassembler.handle(pkt) {
+                        assert_eq!(
+                            frame.body, body_for_server,
+                            "reassembled body must be byte-equal to what was sent"
+                        );
+                        break;
+                    }
+                }
+                other => panic!("expected Video datagram, got {other:?}"),
+            }
         }
-        other => panic!("expected First, got {other:?}"),
-    }
-    // Tell the server we got it so it can exit cleanly.
-    conn.send_control(&ControlMessage::ForceIdr).await?;
-    server_task.await??;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oversize_video_keyframe_is_rejected_on_send() -> anyhow::Result<()> {
-    // The send-side check inside write_framed_with_max guards against
-    // accidentally building a keyframe larger than the receive-side
-    // cap. Test it locally — exceeds MAX_VIDEO_STREAM_MESSAGE (2 MiB).
-    let server = Server::bind((Ipv4Addr::LOCALHOST, 0).into()).await?;
-    let server_addr = server.local_addr()?;
-    let fingerprint = server.fingerprint();
-
-    // Hold the server-side connection alive while the client builds
-    // and submits its (rejected) packet. The reject happens locally
-    // inside write_framed_with_max — the connection itself stays
-    // healthy — but quinn still needs the server's conn alive for
-    // open_uni to succeed in the first place.
-    let server_task = tokio::spawn(async move {
-        let conn = server.accept().await.expect("server closed")?;
-        // Hold the connection until the client tells us it's done.
-        let _ = conn.recv_control().await?;
         anyhow::Ok(())
     });
 
@@ -398,28 +354,32 @@ async fn oversize_video_keyframe_is_rejected_on_send() -> anyhow::Result<()> {
         .connect(server_addr, "tether-host", fingerprint)
         .await?;
 
-    let oversized = VideoPacket::First {
-        display: 0,
-        stream_epoch: 0,
-        frame_seq: 0,
-        fragment_count: 1,
-        meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
-            timing: HostFrameTiming::default(),
-            keyframe: true,
-            input_echo: InputEchoBatch::default(),
-            dimensions: (3840, 2160),
-        }),
-        payload: bytes::Bytes::from(vec![0u8; tether_transport::MAX_VIDEO_STREAM_MESSAGE + 1]),
+    // Exactly the host's budget derivation (apps/tether-host/src/main.rs).
+    let budget = conn
+        .max_datagram_size()
+        .map_or(MAX_DATAGRAM_PAYLOAD, |m| m.min(MAX_DATAGRAM_PAYLOAD));
+
+    let meta = VideoFrameMeta {
+        timing: HostFrameTiming::default(),
+        keyframe: true,
+        input_echo: InputEchoBatch::default(),
+        dimensions: (1920, 1080),
     };
-    let err = conn.send_video_keyframe(&oversized).await;
+    let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+    let packets = fragmenter.fragment(meta, body, budget);
     assert!(
-        matches!(
-            err,
-            Err(tether_transport::TransportError::FrameTooLarge { .. })
-        ),
-        "expected FrameTooLarge, got {err:?}"
+        packets.len() > 1,
+        "a 64 KB IDR must fragment into many datagrams"
     );
-    conn.send_control(&ControlMessage::ForceIdr).await?;
+
+    for pkt in packets {
+        // The crux: every shard the fragmenter produced for `budget` must be
+        // accepted by quinn. A FrameTooLarge/TooLarge here means our header
+        // accounting disagrees with quinn's real datagram overhead.
+        conn.send_datagram(&Datagram::Video(pkt))
+            .expect("every shard sized to the live budget must be accepted by quinn");
+    }
+
     server_task.await??;
     Ok(())
 }

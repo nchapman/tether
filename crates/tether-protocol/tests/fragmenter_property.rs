@@ -5,7 +5,10 @@
 //! `src/lib.rs#mod tests`. This file targets the multi-frame loss
 //! accounting that hand-written cases can't enumerate efficiently —
 //! specifically the `latest_seq`-driven stale-fragment classification
-//! that bumps `fragments_lost`.
+//! that bumps `fragments_lost` — plus the FEC block-layout invariants
+//! (`fec_layout` partitions primaries within the RS 255-shard ceiling, and the
+//! receiver re-derives the sender's exact layout from the wire descriptor)
+//! that the transport review flagged as untested.
 
 // Test-only sequence numbers derived from small loop indices; casts are in range.
 #![allow(clippy::cast_possible_truncation)]
@@ -18,6 +21,8 @@ use tether_protocol::video::{
 
 const MAX_AGE: u32 = 4;
 const NUM_FRAMES: usize = 12;
+/// Datagram budget the fragmenter sizes shards against in these tests.
+const BUDGET: usize = tether_protocol::MAX_DATAGRAM_PAYLOAD;
 
 fn meta() -> VideoFrameMeta {
     VideoFrameMeta {
@@ -28,23 +33,29 @@ fn meta() -> VideoFrameMeta {
     }
 }
 
-/// Body that fragments into exactly 2 packets (FIRST_PAYLOAD_BUDGET =
-/// 1100, CONTINUATION_PAYLOAD_BUDGET = 1180 in `video.rs`).
-fn two_packet_body_strategy() -> impl Strategy<Value = Bytes> {
-    // [1101, 2280]: > FIRST_PAYLOAD_BUDGET (1100) so a continuation
-    // exists, ≤ FIRST + CONTINUATION (1100 + 1180) so exactly one
-    // continuation is emitted.
-    (1101usize..=2280).prop_map(|n| Bytes::from(vec![0u8; n]))
+/// The uniform shard size the fragmenter derives for [`meta`] at [`BUDGET`].
+/// Probed at runtime (it depends on the encoded meta + header) by reading the
+/// `First` payload length of a large multi-shard frame, so the two-packet body
+/// strategy can target it without hard-coding the budget arithmetic.
+fn probe_shard_size() -> usize {
+    let mut frag = FrameFragmenter::new(0);
+    let pkts = frag.fragment(meta(), Bytes::from(vec![0u8; 50_000]), BUDGET);
+    match &pkts[0] {
+        VideoPacket::First { payload, .. } => payload.len(),
+        other => panic!("expected First, got {other:?}"),
+    }
 }
 
-/// Per-frame keep-mask of exactly 2 booleans. The proptest forces the
-/// LAST frame's first fragment to be kept (asserted in-test) so
-/// phase-1 reliably advances `latest_seq` to NUM_FRAMES-1 — making
-/// every dropped fragment from frames more than MAX_AGE behind that
+/// Per-frame keep-mask of exactly 2 booleans paired with an `extra` body
+/// length in `1..=900`. The test turns `extra` into a body of
+/// `shard_size + extra` bytes, which fragments to exactly two packets (the
+/// probed `shard_size` is comfortably above 900). The LAST frame's first
+/// fragment is forced kept in-test so phase 1 advances `latest_seq` to
+/// NUM_FRAMES-1, making every dropped fragment more than MAX_AGE behind it
 /// classifiably stale in phase 2.
-fn trace_strategy() -> impl Strategy<Value = Vec<(Bytes, [bool; 2])>> {
+fn trace_strategy() -> impl Strategy<Value = Vec<(usize, [bool; 2])>> {
     proptest::collection::vec(
-        (two_packet_body_strategy(), [any::<bool>(), any::<bool>()]),
+        (1usize..=900, [any::<bool>(), any::<bool>()]),
         NUM_FRAMES..=NUM_FRAMES,
     )
 }
@@ -79,12 +90,14 @@ proptest! {
         let mut trace = trace;
         trace[NUM_FRAMES - 1].1[0] = true;
 
+        let shard_size = probe_shard_size();
         let mut fragmenter = FrameFragmenter::new(0);
         let frame_packets: Vec<([bool; 2], Vec<VideoPacket>)> = trace
             .iter()
-            .map(|(body, mask)| {
-                let pkts = fragmenter.fragment(meta(), body.clone());
-                // Bodies are chosen to fragment to exactly 2 packets;
+            .map(|(extra, mask)| {
+                let body = Bytes::from(vec![0u8; shard_size + extra]);
+                let pkts = fragmenter.fragment(meta(), body, BUDGET);
+                // shard_size < body <= 2*shard_size ⇒ exactly 2 packets;
                 // any deviation would invalidate the mask shape.
                 assert_eq!(pkts.len(), 2, "body should fragment to 2 packets");
                 (*mask, pkts)
@@ -152,7 +165,7 @@ proptest! {
                     "new epoch starts with no observed seq"
                 );
             } else {
-                let pkts = fragmenter.fragment(meta(), Bytes::from(vec![0u8; 100]));
+                let pkts = fragmenter.fragment(meta(), Bytes::from(vec![0u8; 100]), BUDGET);
                 for pkt in pkts {
                     let (_, epoch, seq) = pkt.route_key();
                     let entry = last_seq_per_epoch.entry(epoch).or_insert(None);
@@ -167,5 +180,111 @@ proptest! {
                 }
             }
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        ..ProptestConfig::default()
+    })]
+
+    /// The FEC block layout is the load-bearing invariant of the whole scheme:
+    /// sender and receiver each call `fec_layout(K, fec_pct)` to derive an
+    /// *identical* block structure from the wire descriptor alone. This sweeps
+    /// the full `(K, fec_pct)` space the wire bounds allow and asserts the
+    /// layout is always reconstructible without panic or corruption:
+    /// - blocks are contiguous and cover exactly K primaries (no gap/overlap),
+    /// - every block stays under RS's 255-shard GF(2⁸) ceiling (a violation
+    ///   would panic `ReedSolomon::new` at runtime),
+    /// - parity presence matches the ratio (zero iff `fec_pct == 0`).
+    ///
+    /// Pure math, no I/O — the catch-net the QUIC/transport review asked for so
+    /// an edit to the block-splitting arithmetic can't silently produce an
+    /// un-encodable or un-recoverable layout.
+    #[test]
+    fn fec_layout_partitions_primaries_and_respects_rs_ceiling(
+        k in 1usize..=tether_protocol::video::MAX_FRAGMENTS_PER_FRAME,
+        fec_pct in 0u8..=tether_protocol::video::MAX_FEC_PCT,
+    ) {
+        let layout = tether_protocol::video::fec_layout(k, fec_pct);
+        prop_assert!(!layout.is_empty(), "non-zero K must yield at least one block");
+
+        let mut next_start = 0usize;
+        let mut primary_total = 0usize;
+        for (start, k_b, m_b) in &layout {
+            prop_assert_eq!(*start, next_start, "blocks must be contiguous (no gap/overlap)");
+            prop_assert!(*k_b >= 1, "every block carries at least one primary");
+            if fec_pct == 0 {
+                // No RS encode happens, so the 255 ceiling doesn't apply; there
+                // is a single zero-parity block spanning all primaries.
+                prop_assert_eq!(*m_b, 0, "fec_pct == 0 ⇒ no parity");
+            } else {
+                prop_assert!(*m_b >= 1, "fec_pct > 0 ⇒ ≥1 parity shard per block");
+                prop_assert!(
+                    k_b + m_b <= 255,
+                    "block {}+{} exceeds RS 255-shard ceiling (K={}, fec_pct={})",
+                    *k_b, *m_b, k, fec_pct
+                );
+            }
+            next_start += *k_b;
+            primary_total += *k_b;
+        }
+        prop_assert_eq!(primary_total, k, "blocks must cover exactly K primaries");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 192,
+        ..ProptestConfig::default()
+    })]
+
+    /// End-to-end agreement: the parity the fragmenter actually emits must
+    /// equal what a receiver, reading only the wire descriptor
+    /// `(fragment_count, fec_pct)` off the `First`, would re-derive via
+    /// `fec_layout`. Spans single- and multi-block frames. Catches the
+    /// sender/receiver layout-drift bug class where the receiver can't
+    /// reconstruct the blocks the sender encoded (e.g. an edit to one side's
+    /// parity math, or a descriptor that no longer carries enough to re-derive
+    /// the layout).
+    #[test]
+    fn receiver_rederives_emitted_fec_layout_from_descriptor(
+        body_len in 1usize..=400_000,
+        fec_pct in 1u8..=50,
+    ) {
+        let mut frag = FrameFragmenter::new_with_fec(0, fec_pct);
+        let pkts = frag.fragment(meta(), Bytes::from(vec![0x33u8; body_len]), BUDGET);
+
+        // The descriptor the receiver reads off the wire.
+        let (fragment_count, wire_fec_pct) = pkts
+            .iter()
+            .find_map(|p| match p {
+                VideoPacket::First { fragment_count, fec_pct, .. } => {
+                    Some((*fragment_count as usize, *fec_pct))
+                }
+                _ => None,
+            })
+            .expect("a fragmented frame always has a First");
+
+        let parity_emitted = pkts
+            .iter()
+            .filter(|p| matches!(p, VideoPacket::Parity { .. }))
+            .count();
+        let primaries_emitted = pkts.len() - parity_emitted;
+
+        prop_assert_eq!(
+            primaries_emitted, fragment_count,
+            "emitted primary count must equal the descriptor's fragment_count"
+        );
+
+        let layout = tether_protocol::video::fec_layout(fragment_count, wire_fec_pct);
+        let parity_expected: usize = layout.iter().map(|(_, _, m_b)| *m_b).sum();
+        prop_assert_eq!(
+            parity_emitted, parity_expected,
+            "emitted parity must equal the layout the receiver re-derives \
+             (K={}, fec_pct={})",
+            fragment_count, wire_fec_pct
+        );
     }
 }

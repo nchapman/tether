@@ -16,7 +16,7 @@ use tether_protocol::{
 
 use crate::channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
 use crate::tls::CertFingerprint;
-use crate::{Result, TransportError, MAX_FRAMED_MESSAGE, MAX_VIDEO_STREAM_MESSAGE};
+use crate::{Result, TransportError, MAX_FRAMED_MESSAGE};
 
 /// Length of the per-stream preamble written by the client and consumed by
 /// the server immediately after `open_*` / `accept_*`. The bytes themselves
@@ -175,44 +175,6 @@ impl Connection {
         // Untrusted peer input: bound the decode's allocation so a forged
         // length prefix (e.g. on an Opus payload) can't trigger an OOM abort.
         Ok(tether_protocol::decode_datagram(&bytes)?)
-    }
-
-    /// Send a keyframe video packet on a fresh QUIC unidirectional
-    /// stream. Reliable, ordered, retransmitted on loss — turns IDR
-    /// delivery from stochastic-recovery (wait for the next encoder
-    /// IDR after a lost fragment) into deterministic 1-RTT recovery.
-    /// One stream per IDR keeps the streams independent: a stalled
-    /// retransmit on one IDR doesn't head-of-line-block the next.
-    ///
-    /// Caller is responsible for only sending packets that are
-    /// genuinely keyframes — there is no protocol-level enforcement.
-    /// P-frames continue to ride [`Self::send_datagram`] for low
-    /// latency.
-    pub async fn send_video_keyframe(&self, packet: &VideoPacket) -> Result<()> {
-        let bytes = tether_protocol::encode(packet)?;
-        let mut s = self.conn.open_uni().await?;
-        // Size check is owned by write_framed_with_max — the
-        // FrameTooLarge error attributes correctly without an
-        // outer guard.
-        write_framed_with_max(&mut s, &bytes, MAX_VIDEO_STREAM_MESSAGE).await?;
-        // Finish signals EOF to the receiver, which is what the
-        // accept_video_keyframe loop uses to delimit the message.
-        // Ignored errors only happen if the peer reset the stream
-        // before our finish landed — in which case the packet was
-        // also not delivered, and the caller will see the loss via
-        // the auto-IDR path soon enough.
-        let _ = s.finish();
-        Ok(())
-    }
-
-    /// Accept the next host-opened unidirectional stream and read a
-    /// single keyframe video packet from it. The peer is expected to
-    /// `open_uni` → write one length-framed [`VideoPacket`] → `finish`.
-    /// Returns once that one packet has been fully read.
-    pub async fn accept_video_keyframe(&self) -> Result<VideoPacket> {
-        let mut s = self.conn.accept_uni().await?;
-        let bytes = read_framed_with_max(&mut s, MAX_VIDEO_STREAM_MESSAGE).await?;
-        Ok(tether_protocol::decode(&bytes)?)
     }
 
     /// Client side of the post-QUIC application handshake. Sends the
@@ -384,12 +346,6 @@ impl VideoChannel for Connection {
     }
     async fn recv_datagram(&self) -> Result<Datagram> {
         Connection::recv_datagram(self).await
-    }
-    async fn send_video_keyframe(&self, packet: &VideoPacket) -> Result<()> {
-        Connection::send_video_keyframe(self, packet).await
-    }
-    async fn accept_video_keyframe(&self) -> Result<VideoPacket> {
-        Connection::accept_video_keyframe(self).await
     }
 }
 

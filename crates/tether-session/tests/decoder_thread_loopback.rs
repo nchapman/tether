@@ -72,7 +72,8 @@ async fn pframes_flow_through_full_chain_to_latest_frame() {
 
     let bodies: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![i; 1024])).collect();
     for body in &bodies {
-        for pkt in fragmenter.fragment(meta(), body.clone()) {
+        for pkt in fragmenter.fragment(meta(), body.clone(), tether_protocol::MAX_DATAGRAM_PAYLOAD)
+        {
             host.send_datagram(&Datagram::Video(pkt)).unwrap();
         }
     }

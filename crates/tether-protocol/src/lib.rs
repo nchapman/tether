@@ -37,22 +37,29 @@ pub const MAX_DATAGRAM_PAYLOAD: usize = 1200;
 
 /// Hard ceiling on the bytes a single *received* datagram decode may allocate.
 ///
-/// Distinct from [`MAX_DATAGRAM_PAYLOAD`], which is only the soft size the
-/// fragmenter *aims* for. The real wire size of a `First`/`Parity` packet is
-/// `FEC_SHARD_SIZE` (1100) plus a variable meta envelope — chiefly the
-/// `InputEchoBatch`, which grows with input activity — plus the packet header,
-/// so a busy frame legitimately encodes well past 1200. quinn delivers those:
-/// its actual `max_datagram_size` is MTU-derived and routinely above the soft
-/// target. Bounding the decode at the soft target therefore rejected
-/// quinn-delivered datagrams and tore the connection down after a few echoed
-/// input events.
+/// Distinct from [`MAX_DATAGRAM_PAYLOAD`], the soft per-datagram size the video
+/// fragmenter *aims* for. This ceiling exists purely to stop a forged length
+/// prefix on an untrusted datagram from driving a giant pre-allocation; quinn
+/// already caps the real wire size to the path MTU.
 ///
-/// This ceiling exists purely to stop a forged length prefix on an untrusted
-/// datagram from driving a giant pre-allocation; quinn already caps the real
-/// wire size to the path MTU. Set generously above any datagram the fragmenter
-/// can emit on a normal path while still bounding a hostile allocation to a few
-/// KB.
-pub const MAX_DATAGRAM_DECODE_BYTES: usize = 2048;
+/// Two channels share the datagram path, and the ceiling must clear the
+/// largest legitimate packet on either:
+/// - **Video:** the fragmenter sizes every shard so the encoded `First` /
+///   `Parity` datagram stays `<= MAX_DATAGRAM_PAYLOAD` (it derives the shard
+///   size from the connection's real `max_datagram_size` minus the encoded
+///   meta + header — see `video::FrameFragmenter`). Video therefore never
+///   approaches this ceiling.
+/// - **Audio:** an `AudioPacket::Opus` payload can be up to
+///   `tether_audio::MAX_PACKET_BYTES` (4000, libopus's recommended max) plus
+///   ~20 bytes of enum/varint framing. A high-bitrate / long-frame config
+///   (e.g. 510 kbps @ 60 ms) lands near that ceiling; the v1 default
+///   (~160 B/packet) is comfortably under.
+///
+/// Set to clear `MAX_PACKET_BYTES + framing` so a non-default audio config is
+/// not silently dropped, while still bounding a hostile allocation to ~4 KB.
+/// `tether-audio` carries a static assertion that this stays `>= MAX_PACKET_BYTES
+/// + framing`.
+pub const MAX_DATAGRAM_DECODE_BYTES: usize = 4100;
 
 /// Wire-protocol version string. Bumped on any breaking change to the
 /// control/handshake/pairing wire contract.
@@ -177,9 +184,9 @@ mod tests {
     use crate::cursor::*;
     use crate::input::*;
     use crate::video::{
-        FrameFragmenter, FrameReassembler, HostFrameTiming, HostFrameTimingBuilder, InputEchoBatch,
-        VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket, CONTINUATION_PAYLOAD_BUDGET,
-        FEC_MAX_PRIMARY_SHARDS, FEC_SHARD_SIZE, FIRST_PAYLOAD_BUDGET,
+        fec_layout, FrameFragmenter, FrameReassembler, HostFrameTiming, HostFrameTimingBuilder,
+        InputEchoBatch, VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket,
+        DATAGRAM_WRAPPER_BYTES, FEC_MAX_PRIMARY_SHARDS,
     };
 
     /// The datagram decoder bounds allocation: a payload larger than
@@ -212,57 +219,51 @@ mod tests {
         assert_eq!(back, payload);
     }
 
-    /// Regression for the datagram-too-big teardown: a real FEC frame whose
-    /// `First`/`Parity` packets carry an `input_echo` batch encodes *larger*
-    /// than the soft [`MAX_DATAGRAM_PAYLOAD`] target — quinn delivers it fine
-    /// (its real `max_datagram_size` is MTU-bound, often above 1200), so the
-    /// receive-side decode must accept it. Tying the decode limit to the soft
-    /// target closed the connection after ~8 echoed input events. The decode
-    /// guard caps allocation at the larger [`MAX_DATAGRAM_DECODE_BYTES`].
+    /// #37: the fragmenter sizes shards from the datagram budget *minus* the
+    /// encoded meta envelope, so even a `First`/`Parity` packet carrying a
+    /// fat `input_echo` batch stays within the budget once wrapped in
+    /// `Datagram::Video`. The pre-fix fixed shard size ignored the meta and
+    /// pushed those packets past a low-MTU path's datagram size (dropped at
+    /// send under active input). Asserts every emitted datagram fits, across a
+    /// range of input-echo sizes and budgets.
     #[test]
-    fn fec_packets_with_input_echo_exceed_soft_target_but_still_decode() {
-        let mut frag = FrameFragmenter::new_with_fec(0, 20);
-        let meta = VideoFrameMeta {
-            timing: HostFrameTiming {
-                t_capture_kernel: MonoNanos(u64::MAX / 2),
-                t_capture_userspace: MonoNanos(u64::MAX / 2),
-                t_encode_submit: MonoNanos(u64::MAX / 2),
-                t_encode_done: MonoNanos(u64::MAX / 2),
-                t_send: MonoNanos(u64::MAX / 2),
-            },
-            keyframe: false,
-            // A modest input burst — well within a single frame's worth of
-            // mouse/key events — already pushes First/Parity over the soft
-            // target once the 1100-byte FEC shard and header are added.
-            input_echo: InputEchoBatch {
-                event_ids: vec![u64::MAX; 16],
-            },
-            dimensions: (3840, 2160),
-        };
-        let body = bytes::Bytes::from(vec![0xABu8; 3 * FEC_SHARD_SIZE]);
-        let packets = frag.fragment(meta, body);
-
-        let mut saw_over_soft_target = false;
-        for p in &packets {
-            let bytes = encode(p).unwrap();
-            // Sanity: at least one packet must exceed the soft target, or the
-            // test isn't exercising the regression at all.
-            if bytes.len() > MAX_DATAGRAM_PAYLOAD {
-                saw_over_soft_target = true;
+    fn every_fragment_fits_the_datagram_budget_under_input_echo() {
+        for budget in [1200usize, 1280, 1100] {
+            for echo in [0usize, 8, 16, 64, 256] {
+                let mut frag = FrameFragmenter::new_with_fec(0, 20);
+                let meta = VideoFrameMeta {
+                    timing: HostFrameTiming {
+                        t_capture_kernel: MonoNanos(u64::MAX / 2),
+                        t_capture_userspace: MonoNanos(u64::MAX / 2),
+                        t_encode_submit: MonoNanos(u64::MAX / 2),
+                        t_encode_done: MonoNanos(u64::MAX / 2),
+                        t_send: MonoNanos(u64::MAX / 2),
+                    },
+                    keyframe: true,
+                    input_echo: InputEchoBatch {
+                        event_ids: vec![u64::MAX; echo],
+                    },
+                    dimensions: (3840, 2160),
+                };
+                // A multi-shard, multi-block-eligible body.
+                let body = bytes::Bytes::from(vec![0xABu8; 8000]);
+                let packets = frag.fragment(meta, body, budget);
+                for p in &packets {
+                    // +1 for the outer Datagram::Video discriminant — the real
+                    // on-wire size the path MTU bounds.
+                    let wire = p.wire_size() + DATAGRAM_WRAPPER_BYTES;
+                    assert!(
+                        wire <= budget,
+                        "packet wire size {wire} exceeds budget {budget} \
+                         (echo={echo}): {p:?}"
+                    );
+                    // And every datagram still decodes through the guarded path.
+                    let bytes = encode(p).unwrap();
+                    decode_datagram::<VideoPacket>(&bytes)
+                        .expect("a budget-sized datagram must decode");
+                }
             }
-            assert!(
-                bytes.len() <= MAX_DATAGRAM_DECODE_BYTES,
-                "fragmenter packet {} exceeds the decode ceiling {}",
-                bytes.len(),
-                MAX_DATAGRAM_DECODE_BYTES
-            );
-            decode_datagram::<VideoPacket>(&bytes)
-                .expect("a quinn-deliverable datagram must decode, not tear down the session");
         }
-        assert!(
-            saw_over_soft_target,
-            "expected a First/Parity packet larger than the soft {MAX_DATAGRAM_PAYLOAD} target"
-        );
     }
 
     #[test]
@@ -832,6 +833,40 @@ mod tests {
         assert_eq!(AUDIO_CONFIG_EXTENSION_KEY, "tether.audio");
     }
 
+    /// A near-maximum Opus payload (a high-bitrate / long-frame config can
+    /// approach `tether_audio::MAX_PACKET_BYTES` = 4000) must survive the
+    /// untrusted-decode allocation guard in [`decode_datagram`]. Regression
+    /// for the ceiling sitting below the largest legitimate audio packet,
+    /// which silently dropped such datagrams (audio dropouts, no log).
+    #[test]
+    fn near_max_audio_datagram_decodes() {
+        use crate::audio::AudioPacket;
+        // 4000-byte payload (tether_audio::MAX_PACKET_BYTES), above the prior
+        // 2048 decode ceiling. The `Datagram::Audio` wrapper (in
+        // tether-transport) adds ~1 byte; decode the AudioPacket directly here
+        // since the payload Vec is what the allocation guard bounds.
+        let payload = vec![0x5Au8; 4000];
+        assert!(payload.len() > 2048, "test must exceed the old ceiling");
+        let packet = AudioPacket::Opus {
+            stream_epoch: 7,
+            frame_seq: 999,
+            t_capture: MonoNanos(424242),
+            payload: payload.clone(),
+        };
+        let bytes = encode(&packet).unwrap();
+        assert!(
+            bytes.len() <= MAX_DATAGRAM_DECODE_BYTES,
+            "encoded {} must fit the decode ceiling {}",
+            bytes.len(),
+            MAX_DATAGRAM_DECODE_BYTES
+        );
+        let decoded: AudioPacket =
+            decode_datagram(&bytes).expect("near-max audio datagram must decode");
+        match decoded {
+            AudioPacket::Opus { payload: p, .. } => assert_eq!(p, payload),
+        }
+    }
+
     #[test]
     fn round_trip_client_stats() {
         let msg = ControlMessage::ClientStats {
@@ -908,6 +943,9 @@ mod tests {
             stream_epoch: 0,
             frame_seq: 42,
             fragment_count: 3,
+            fec_pct: 20,
+            shard_size: 1100,
+            total_body_len: 3000,
             meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
                 timing: HostFrameTiming {
                     t_capture_kernel: MonoNanos(1_000),
@@ -932,6 +970,9 @@ mod tests {
                 stream_epoch,
                 frame_seq,
                 fragment_count,
+                fec_pct,
+                shard_size,
+                total_body_len,
                 meta,
                 payload,
             } => {
@@ -939,6 +980,9 @@ mod tests {
                 assert_eq!(stream_epoch, 0);
                 assert_eq!(frame_seq, 42);
                 assert_eq!(fragment_count, 3);
+                assert_eq!(fec_pct, 20);
+                assert_eq!(shard_size, 1100);
+                assert_eq!(total_body_len, 3000);
                 let meta = meta.into_meta();
                 assert!(meta.keyframe);
                 assert_eq!(meta.input_echo.event_ids, vec![1, 2, 3]);
@@ -989,20 +1033,21 @@ mod tests {
 
     #[test]
     fn video_packet_parity_round_trips_all_fields() {
-        // Every field on VideoPacket::Parity must round-trip: the
-        // shard math depends on data_shards, parity_shards, and
-        // shard_index agreeing wire-to-receiver, and total_body_len
-        // sizes the reassembler's BytesMut. Bincode positional
-        // encoding makes any field reordering a silent data
-        // corruption — assert each value individually.
+        // Every field on VideoPacket::Parity must round-trip: recovery depends
+        // on fragment_count, fec_pct, shard_size, block_index, and parity_index
+        // agreeing wire-to-receiver, and total_body_len sizes the reassembler's
+        // BytesMut. Bincode positional encoding makes any field reordering a
+        // silent data corruption — assert each value individually.
         let p = VideoPacket::Parity {
             display: 3,
             stream_epoch: 42,
             frame_seq: 1001,
-            data_shards: 8,
-            parity_shards: 2,
-            shard_index: 1,
-            total_body_len: 9000,
+            fragment_count: 8,
+            fec_pct: 25,
+            shard_size: 1100,
+            total_body_len: 8500,
+            block_index: 1,
+            parity_index: 1,
             meta: VideoFrameMetaEnvelope::V1(default_meta()),
             payload: bytes::Bytes::from(vec![0xee; 128]),
         };
@@ -1013,20 +1058,24 @@ mod tests {
                 display,
                 stream_epoch,
                 frame_seq,
-                data_shards,
-                parity_shards,
-                shard_index,
+                fragment_count,
+                fec_pct,
+                shard_size,
                 total_body_len,
+                block_index,
+                parity_index,
                 meta,
                 payload,
             } => {
                 assert_eq!(display, 3);
                 assert_eq!(stream_epoch, 42);
                 assert_eq!(frame_seq, 1001);
-                assert_eq!(data_shards, 8);
-                assert_eq!(parity_shards, 2);
-                assert_eq!(shard_index, 1);
-                assert_eq!(total_body_len, 9000);
+                assert_eq!(fragment_count, 8);
+                assert_eq!(fec_pct, 25);
+                assert_eq!(shard_size, 1100);
+                assert_eq!(total_body_len, 8500);
+                assert_eq!(block_index, 1);
+                assert_eq!(parity_index, 1);
                 assert_eq!(meta.into_meta().dimensions, (640, 480));
                 assert_eq!(payload.len(), 128);
                 assert!(payload.iter().all(|&b| b == 0xee));
@@ -1038,14 +1087,14 @@ mod tests {
     #[test]
     fn request_recovery_control_message_round_trips() {
         let m = ControlMessage::RequestRecovery {
-            last_known_good_frame_id: 12345,
+            last_reassembled_frame_id: 12345,
         };
         let bytes = encode(&m).unwrap();
         let m2: ControlMessage = decode(&bytes).unwrap();
         match m2 {
             ControlMessage::RequestRecovery {
-                last_known_good_frame_id,
-            } => assert_eq!(last_known_good_frame_id, 12345),
+                last_reassembled_frame_id,
+            } => assert_eq!(last_reassembled_frame_id, 12345),
             _ => panic!("wrong variant"),
         }
     }
@@ -1080,6 +1129,9 @@ mod tests {
             stream_epoch: epoch,
             frame_seq: 0,
             fragment_count: 1,
+            fec_pct: 0,
+            shard_size: 256,
+            total_body_len: 0,
             meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
                 timing: HostFrameTiming::default(),
                 keyframe: true,
@@ -1158,6 +1210,9 @@ mod tests {
             stream_epoch: u32::MAX,
             frame_seq: u32::MAX,
             fragment_count: u16::MAX,
+            fec_pct: u8::MAX,
+            shard_size: u32::MAX,
+            total_body_len: u32::MAX,
             meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
                 timing: HostFrameTiming {
                     t_capture_kernel: MonoNanos(u64::MAX / 2),
@@ -1172,7 +1227,7 @@ mod tests {
                 },
                 dimensions: (u32::MAX, u32::MAX),
             }),
-            payload: bytes::Bytes::from(vec![0u8; 1080]),
+            payload: bytes::Bytes::from(vec![0u8; 1040]),
         };
         let bytes = encode(&p).unwrap();
         assert!(
@@ -1185,15 +1240,13 @@ mod tests {
 
     #[test]
     fn fragmenter_with_fec_zero_is_wire_identical_to_no_fec() {
-        // Default fec_percentage=0 means no Parity packets emitted
-        // and primary fragmentation stays in the original
-        // 1100/1180 mixed-budget shape — i.e. wire-compatible with
-        // pre-FEC reassemblers.
+        // fec_percentage=0 emits no Parity packets; the two constructors are
+        // equivalent, producing byte-identical primary fragmentation.
         let body: bytes::Bytes = vec![0xab; 5000].into();
         let mut a = FrameFragmenter::new(0);
         let mut b = FrameFragmenter::new_with_fec(0, 0);
-        let pa = a.fragment(default_meta(), body.clone());
-        let pb = b.fragment(default_meta(), body);
+        let pa = a.fragment(default_meta(), body.clone(), MAX_DATAGRAM_PAYLOAD);
+        let pb = b.fragment(default_meta(), body, MAX_DATAGRAM_PAYLOAD);
         assert_eq!(pa.len(), pb.len());
         for (x, y) in pa.iter().zip(pb.iter()) {
             assert_eq!(encode(x).unwrap(), encode(y).unwrap());
@@ -1213,9 +1266,9 @@ mod tests {
 
     #[test]
     fn fragmenter_with_fec_emits_parity_proportional_to_percentage() {
-        let body: bytes::Bytes = vec![0u8; 11_000].into(); // ~10 primary shards
+        let body: bytes::Bytes = vec![0u8; 11_000].into();
         let mut frag = FrameFragmenter::new_with_fec(0, 20);
-        let pkts = frag.fragment(default_meta(), body);
+        let pkts = frag.fragment(default_meta(), body, MAX_DATAGRAM_PAYLOAD);
         let primary = pkts
             .iter()
             .filter(|p| {
@@ -1229,9 +1282,12 @@ mod tests {
             .iter()
             .filter(|p| matches!(p, VideoPacket::Parity { .. }))
             .count();
-        // 11_000 / 1100 = 10 primaries; 20% parity = 2.
-        assert_eq!(primary, 10);
-        assert_eq!(parity, 2);
+        // Shard size is derived from the datagram budget, so the exact primary
+        // count depends on the meta size — assert the FEC relationship instead:
+        // a single block (this body is well under the per-block ceiling) gets
+        // ceil(primary * 20 / 100) parity shards.
+        assert!(primary > 1, "multi-shard body expected, got {primary}");
+        assert_eq!(parity, primary.div_ceil(5), "20% parity, single block");
     }
 
     #[test]
@@ -1243,7 +1299,7 @@ mod tests {
             .collect::<Vec<u8>>()
             .into();
         let mut frag = FrameFragmenter::new_with_fec(0, 25); // 25% parity
-        let pkts = frag.fragment(default_meta(), body.clone());
+        let pkts = frag.fragment(default_meta(), body.clone(), MAX_DATAGRAM_PAYLOAD);
         let parity_count = pkts
             .iter()
             .filter(|p| matches!(p, VideoPacket::Parity { .. }))
@@ -1275,7 +1331,7 @@ mod tests {
         // produce a reconstructed frame.
         let body: bytes::Bytes = vec![0xff; 5000].into();
         let mut frag = FrameFragmenter::new_with_fec(0, 20); // 1 parity for 5 primaries
-        let pkts = frag.fragment(default_meta(), body);
+        let pkts = frag.fragment(default_meta(), body, MAX_DATAGRAM_PAYLOAD);
         let parity_count = pkts
             .iter()
             .filter(|p| matches!(p, VideoPacket::Parity { .. }))
@@ -1298,75 +1354,72 @@ mod tests {
     }
 
     #[test]
-    fn fec_falls_back_to_legacy_when_frame_exceeds_max_primary_shards() {
-        // A frame above FEC_MAX_PRIMARY_SHARDS × FEC_SHARD_SIZE
-        // can't fit in a single FEC block — fragmenter falls back
-        // to the pre-FEC mixed-budget shape with zero parity. Test
-        // that fec stays a no-op for this case (no Parity packets)
-        // and that the fallback counter bumps so the host can
-        // surface this in stats.
-        let oversize = (FEC_MAX_PRIMARY_SHARDS + 5) * FEC_SHARD_SIZE;
-        let body: bytes::Bytes = vec![0u8; oversize].into();
+    fn large_frame_splits_into_multiple_fec_blocks() {
+        // #36: a frame whose primary count exceeds a single block's per-pct
+        // ceiling is split into multiple independent RS blocks and stays
+        // loss-protected — no more no-FEC fallback for big IDRs.
+        let body: bytes::Bytes = vec![0x5au8; 300_000].into();
         let mut frag = FrameFragmenter::new_with_fec(0, 20);
-        assert_eq!(frag.no_fec_fallback_count(), 0);
-        let pkts = frag.fragment(default_meta(), body);
+        let pkts = frag.fragment(default_meta(), body, MAX_DATAGRAM_PAYLOAD);
+        let primary = pkts
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    VideoPacket::First { .. } | VideoPacket::Continuation { .. }
+                )
+            })
+            .count();
         assert!(
-            pkts.iter()
-                .all(|p| !matches!(p, VideoPacket::Parity { .. })),
-            "oversize frames must fall back to no-FEC fragmentation"
+            primary > FEC_MAX_PRIMARY_SHARDS,
+            "body should need more than one block's worth of primaries, got {primary}"
         );
-        assert_eq!(
-            frag.no_fec_fallback_count(),
-            1,
-            "oversize FEC frame must bump the fallback counter"
+        let max_block = pkts
+            .iter()
+            .filter_map(|p| match p {
+                VideoPacket::Parity { block_index, .. } => Some(*block_index),
+                _ => None,
+            })
+            .max()
+            .expect("multi-block frame must carry parity");
+        assert!(
+            max_block >= 1,
+            "expected >1 FEC block, max block_index {max_block}"
         );
+        // The block layout the receiver derives from (K, fec_pct) matches the
+        // number of blocks the sender actually emitted parity for.
+        assert_eq!(fec_layout(primary, 20).len() as u16, max_block + 1);
     }
 
     #[test]
-    fn fec_falls_back_when_primary_count_exceeds_per_pct_ceiling() {
-        // At fec_percentage = 25, the GF(2^8) ceiling on total
-        // shards gives (255 * 100) / 125 = 204 primaries max — well
-        // under FEC_MAX_PRIMARY_SHARDS (212). A frame that needs
-        // 205-212 primaries used to silently fall through to
-        // ReedSolomon::new with total=257 > 255 and emit a misleading
-        // "construction failed" warning; the fix routes it cleanly
-        // to the no-FEC legacy path.
-        use crate::video::max_primary_shards_for_pct;
-        let ceiling_25 = max_primary_shards_for_pct(25);
-        assert!(
-            ceiling_25 < FEC_MAX_PRIMARY_SHARDS,
-            "25% parity should narrow the per-pct ceiling below the hard cap"
-        );
-        // One shard above the per-pct ceiling but inside the hard
-        // cap exercises the new gating without exceeding it.
-        let primaries = ceiling_25 + 1;
-        let body: bytes::Bytes = vec![0u8; primaries * FEC_SHARD_SIZE].into();
-        let mut frag = FrameFragmenter::new_with_fec(0, 25);
-        let pkts = frag.fragment(default_meta(), body);
-        assert!(
-            pkts.iter()
-                .all(|p| !matches!(p, VideoPacket::Parity { .. })),
-            "frame above per-pct ceiling must fall back to no-FEC"
-        );
-        assert_eq!(frag.no_fec_fallback_count(), 1);
-    }
-
-    #[test]
-    fn fec_at_25_pct_inside_ceiling_still_emits_parity() {
-        // Sanity check the other direction of the per-pct guard:
-        // at fec_percentage = 25 with a frame at the ceiling, FEC
-        // must still engage. Catches regressions that swap the
-        // comparison.
-        use crate::video::max_primary_shards_for_pct;
-        let primaries = max_primary_shards_for_pct(25);
-        let body: bytes::Bytes = vec![0u8; primaries * FEC_SHARD_SIZE].into();
-        let mut frag = FrameFragmenter::new_with_fec(0, 25);
-        let pkts = frag.fragment(default_meta(), body);
-        assert!(
-            pkts.iter().any(|p| matches!(p, VideoPacket::Parity { .. })),
-            "frame exactly at the per-pct ceiling must still emit parity"
-        );
-        assert_eq!(frag.no_fec_fallback_count(), 0);
+    fn multi_block_frame_recovers_lost_primaries() {
+        // End-to-end multi-block recovery: drop several primaries from the
+        // first block (within its parity budget) and confirm the reassembler
+        // rebuilds the exact body. Losing the First also exercises descriptor
+        // + meta recovery from a parity packet.
+        let body: bytes::Bytes = (0..300_000u32)
+            .map(|i| (i & 0xff) as u8)
+            .collect::<Vec<u8>>()
+            .into();
+        let mut frag = FrameFragmenter::new_with_fec(0, 20);
+        let pkts = frag.fragment(default_meta(), body.clone(), MAX_DATAGRAM_PAYLOAD);
+        // Packets are ordered First, Continuations…, then Parity. Drop the
+        // first 3 primaries (all in block 0); keep the rest + all parity.
+        let kept: Vec<_> = pkts
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= 3)
+            .map(|(_, p)| p)
+            .collect();
+        let mut r = FrameReassembler::new();
+        let mut got = None;
+        for p in kept {
+            if let Some(f) = r.handle(p) {
+                got = Some(f);
+            }
+        }
+        let f = got.expect("multi-block frame reassembled via per-block FEC");
+        assert_eq!(f.body.as_ref(), body.as_ref());
     }
 
     #[test]
@@ -1375,12 +1428,14 @@ mod tests {
             display: 7,
             stream_epoch: 42,
             frame_seq: 100,
-            data_shards: 5,
-            parity_shards: 1,
-            shard_index: 0,
+            fragment_count: 5,
+            fec_pct: 20,
+            shard_size: 1100,
             total_body_len: 5000,
+            block_index: 0,
+            parity_index: 0,
             meta: VideoFrameMetaEnvelope::V1(default_meta()),
-            payload: bytes::Bytes::from(vec![0x42; FEC_SHARD_SIZE]),
+            payload: bytes::Bytes::from(vec![0x42; 1100]),
         };
         let bytes = encode(&p).unwrap();
         assert!(
@@ -1393,23 +1448,27 @@ mod tests {
                 display,
                 stream_epoch,
                 frame_seq,
-                data_shards,
-                parity_shards,
-                shard_index,
+                fragment_count,
+                fec_pct,
+                shard_size,
                 total_body_len,
+                block_index,
+                parity_index,
                 meta,
                 payload,
             } => {
                 assert_eq!(display, 7);
                 assert_eq!(stream_epoch, 42);
                 assert_eq!(frame_seq, 100);
-                assert_eq!(data_shards, 5);
-                assert_eq!(parity_shards, 1);
-                assert_eq!(shard_index, 0);
+                assert_eq!(fragment_count, 5);
+                assert_eq!(fec_pct, 20);
+                assert_eq!(shard_size, 1100);
                 assert_eq!(total_body_len, 5000);
+                assert_eq!(block_index, 0);
+                assert_eq!(parity_index, 0);
                 let m = meta.into_meta();
                 assert_eq!(m.dimensions, (640, 480));
-                assert_eq!(payload.len(), FEC_SHARD_SIZE);
+                assert_eq!(payload.len(), 1100);
             }
             _ => panic!("expected Parity"),
         }
@@ -1428,7 +1487,7 @@ mod tests {
         };
         let body: bytes::Bytes = vec![0u8; 8 * 1024].into();
         let mut frag = FrameFragmenter::new(0);
-        let packets = frag.fragment(meta.clone(), body.clone());
+        let packets = frag.fragment(meta.clone(), body.clone(), MAX_DATAGRAM_PAYLOAD);
         for p in &packets {
             assert_eq!(
                 p.wire_size(),
@@ -1441,7 +1500,7 @@ mod tests {
         // change to Parity's fields can't silently desync wire_size
         // from the actual encoded length.
         let mut frag_fec = FrameFragmenter::new_with_fec(0, 20);
-        let packets_fec = frag_fec.fragment(meta, body);
+        let packets_fec = frag_fec.fragment(meta, body, MAX_DATAGRAM_PAYLOAD);
         assert!(
             packets_fec
                 .iter()
@@ -1468,15 +1527,12 @@ mod tests {
         };
 
         let mut fragmenter = FrameFragmenter::new(0);
-        let packets = fragmenter.fragment(meta.clone(), bytes::Bytes::from(body.clone()));
-
-        // First fragment carries FIRST_PAYLOAD_BUDGET, remainder split into
-        // CONTINUATION_PAYLOAD_BUDGET chunks.
-        let expected_count = 1 + body
-            .len()
-            .saturating_sub(FIRST_PAYLOAD_BUDGET)
-            .div_ceil(CONTINUATION_PAYLOAD_BUDGET);
-        assert_eq!(packets.len(), expected_count);
+        let packets = fragmenter.fragment(
+            meta.clone(),
+            bytes::Bytes::from(body.clone()),
+            MAX_DATAGRAM_PAYLOAD,
+        );
+        assert!(packets.len() > 1, "10 KB body must span multiple shards");
 
         // Encode every packet to wire and back to simulate the network
         // boundary, then reassemble.
@@ -1507,7 +1563,8 @@ mod tests {
             dimensions: (320, 240),
         };
         let mut fragmenter = FrameFragmenter::new(2);
-        let mut packets = fragmenter.fragment(meta, bytes::Bytes::from(body.clone()));
+        let mut packets =
+            fragmenter.fragment(meta, bytes::Bytes::from(body.clone()), MAX_DATAGRAM_PAYLOAD);
         // Reverse the order — reassembler should still produce the frame.
         packets.reverse();
 
@@ -1538,7 +1595,11 @@ mod tests {
         // Advance latest_seq on the reassembler to 5 by feeding it 6
         // fully-assembled tiny frames (seqs 0..=5).
         for _ in 0..6 {
-            for p in fragmenter.fragment(meta.clone(), bytes::Bytes::from_static(&[0u8; 100])) {
+            for p in fragmenter.fragment(
+                meta.clone(),
+                bytes::Bytes::from_static(&[0u8; 100]),
+                MAX_DATAGRAM_PAYLOAD,
+            ) {
                 reassembler.handle(p);
             }
         }
@@ -1579,6 +1640,9 @@ mod tests {
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: 2,
+            fec_pct: 0,
+            shard_size: 100,
+            total_body_len: 200,
             meta: VideoFrameMetaEnvelope::V1(meta.clone()),
             payload: bytes::Bytes::from_static(&[0u8; 100]),
         };
@@ -1595,6 +1659,9 @@ mod tests {
             stream_epoch: 0,
             frame_seq: 1,
             fragment_count: 1,
+            fec_pct: 0,
+            shard_size: 10,
+            total_body_len: 10,
             meta: VideoFrameMetaEnvelope::V1(meta),
             payload: bytes::Bytes::from_static(&[0u8; 10]),
         };
@@ -1709,8 +1776,11 @@ mod tests {
 
         // Deliver a complete frame under epoch 0.
         let mut fragmenter_epoch0 = FrameFragmenter::new(0);
-        let packets_e0 =
-            fragmenter_epoch0.fragment(meta.clone(), bytes::Bytes::from_static(&[1u8; 200]));
+        let packets_e0 = fragmenter_epoch0.fragment(
+            meta.clone(),
+            bytes::Bytes::from_static(&[1u8; 200]),
+            MAX_DATAGRAM_PAYLOAD,
+        );
         let mut out0 = None;
         for p in packets_e0 {
             if let Some(f) = reassembler.handle(p) {
@@ -1730,7 +1800,11 @@ mod tests {
         let mut fragmenter_epoch1 = FrameFragmenter::new(0);
         fragmenter_epoch1.bump_epoch();
         assert_eq!(fragmenter_epoch1.stream_epoch(), 1);
-        let packets_e1 = fragmenter_epoch1.fragment(meta, bytes::Bytes::from_static(&[2u8; 200]));
+        let packets_e1 = fragmenter_epoch1.fragment(
+            meta,
+            bytes::Bytes::from_static(&[2u8; 200]),
+            MAX_DATAGRAM_PAYLOAD,
+        );
         let mut out1 = None;
         for p in packets_e1 {
             if let Some(f) = reassembler.handle(p) {
@@ -1746,13 +1820,12 @@ mod tests {
     }
 
     #[test]
-    fn fragmenter_single_packet_roundtrips_through_reassembler() {
-        // The reliable-keyframe path uses single_packet instead of
-        // fragment() — produces one VideoPacket::First with
-        // fragment_count=1 carrying the whole body. Receiver must
-        // accept this directly and complete the frame on the first
-        // (and only) fragment.
-        let mut fragmenter = FrameFragmenter::new(3);
+    fn keyframe_sized_frame_roundtrips_through_unified_datagram_path() {
+        // #36: IDRs no longer ride a separate reliable stream — a large
+        // keyframe-sized body goes through the same fragment() + FEC datagram
+        // path as every P-frame and reassembles to the exact body. Loss-free
+        // delivery here is the happy path; FEC recovery is covered elsewhere.
+        let mut fragmenter = FrameFragmenter::new_with_fec(3, 20);
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: true,
@@ -1760,40 +1833,35 @@ mod tests {
             dimensions: (1920, 1080),
         };
         let body: Vec<u8> = (0..50_000).map(|i| (i & 0xff) as u8).collect();
-        let packet = fragmenter.single_packet(meta.clone(), bytes::Bytes::from(body.clone()));
-        match &packet {
-            VideoPacket::First {
-                fragment_count,
-                payload,
-                ..
-            } => {
-                assert_eq!(
-                    *fragment_count, 1,
-                    "single_packet must produce fragment_count=1"
-                );
-                assert_eq!(payload.len(), body.len());
-            }
-            other => panic!("expected First, got {other:?}"),
-        }
+        let packets = fragmenter.fragment(
+            meta.clone(),
+            bytes::Bytes::from(body.clone()),
+            MAX_DATAGRAM_PAYLOAD,
+        );
+        assert!(packets.len() > 1, "a 50 KB IDR must span many shards");
 
-        // Also advances the seq counter so subsequent P-frames slot in.
-        let next = fragmenter.fragment(meta, bytes::Bytes::from_static(&[0u8; 100]));
+        // The seq counter advances so subsequent P-frames slot in sequentially.
+        let next = fragmenter.fragment(
+            meta,
+            bytes::Bytes::from_static(&[0u8; 100]),
+            MAX_DATAGRAM_PAYLOAD,
+        );
         match &next[0] {
-            VideoPacket::First { frame_seq, .. } => {
-                assert_eq!(
-                    *frame_seq, 1,
-                    "next frame_seq must be 1 after single_packet"
-                );
-            }
+            VideoPacket::First { frame_seq, .. } => assert_eq!(*frame_seq, 1),
             other => panic!("expected First, got {other:?}"),
         }
 
         let mut reassembler = FrameReassembler::new();
-        let frame = reassembler
-            .handle(packet)
-            .expect("single_packet must complete reassembly on first fragment");
+        let mut got = None;
+        for p in packets {
+            if let Some(f) = reassembler.handle(p) {
+                got = Some(f);
+            }
+        }
+        let frame = got.expect("keyframe must reassemble from its datagrams");
         assert_eq!(frame.body.as_ref(), body.as_slice());
         assert_eq!(frame.display, 3);
+        assert!(frame.meta.keyframe);
     }
 
     #[test]
@@ -1810,7 +1878,8 @@ mod tests {
             dimensions: (320, 240),
         };
         let body = vec![0xabu8; 2_500];
-        let packets = fragmenter.fragment(meta, bytes::Bytes::from(body.clone()));
+        let packets =
+            fragmenter.fragment(meta, bytes::Bytes::from(body.clone()), MAX_DATAGRAM_PAYLOAD);
         assert!(packets.len() >= 2, "test needs a multi-fragment frame");
 
         let mut reassembler = FrameReassembler::new();
@@ -1847,7 +1916,8 @@ mod tests {
             dimensions: (320, 240),
         };
         let body = vec![0x5au8; 3_000];
-        let packets = fragmenter.fragment(meta, bytes::Bytes::from(body.clone()));
+        let packets =
+            fragmenter.fragment(meta, bytes::Bytes::from(body.clone()), MAX_DATAGRAM_PAYLOAD);
         assert!(packets.len() >= 2);
 
         let mut reassembler = FrameReassembler::new();

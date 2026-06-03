@@ -146,27 +146,30 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │         │                                                           │
 │         ▼                                                           │
 │   tether-protocol::video::FrameFragmenter                           │
-│     • P-frame:  fragment() → MTU-sized VideoPackets + Reed-Solomon  │
-│                 parity (20% default; GF(2^8) caps primaries at      │
-│                 FEC_MAX_PRIMARY_SHARDS=212 at 20%, oversize frames  │
-│                 fall back to no-FEC); shard size = FEC_SHARD_SIZE   │
-│                 = FIRST_PAYLOAD_BUDGET (1100 B)                     │
-│     • Keyframe: single_packet() → one fragment_count=1 packet,      │
-│                 reliable per-IDR uni stream path                    │
+│     • ALL frames (IDR + P): fragment(meta, body, datagram_budget)   │
+│                 → MTU-sized VideoPackets + Reed-Solomon parity (20% │
+│                 default). Primaries split into FEC blocks each ≤    │
+│                 FEC_MAX_PRIMARY_SHARDS=212 (GF(2^8) cap), so large  │
+│                 IDRs stay loss-protected (no no-FEC fallback).      │
+│                 shard size derived per frame from the connection's  │
+│                 max_datagram_size minus the encoded meta+header, so │
+│                 every datagram fits the path MTU (#37).             │
 │         │       attach HostFrameTiming + stream_epoch + frame_seq   │
 │         ▼                                                           │
-│   tether-session::PacedSender                                       │
-│     • begin_frame(now) + per-packet wait_for_slot(wire_size) spread │
-│       fragments across the frame interval so a burst doesn't pin    │
-│       the network queue and induce correlated loss. Bitrate is an   │
-│       Arc<AtomicU64> shared with the ABR controller so retunes      │
-│       are live without rebuilding the pacer.                        │
+│   (no app-level pacer)                                              │
+│     • The host bursts a frame's datagrams straight to the          │
+│       transport. quinn's own pacer + congestion controller is the  │
+│       single wire-rate governor; an earlier in-line token bucket   │
+│       throttled capture and double-paced against quinn, so it was  │
+│       removed. The ABR controller still retunes the encoder        │
+│       bitrate via an Arc<AtomicU64>.                                │
 │         │                                                           │
 │         ▼                                                           │
 │   tether-transport::Server                                          │
-│     • P-frames + Parity → QUIC datagrams (unreliable, low latency)  │
-│     • IDRs → fresh QUIC uni stream per IDR (reliable, ~1 RTT        │
-│       deterministic recovery on loss vs one GOP stochastic)         │
+│     • ALL video (IDR + P + Parity) → QUIC datagrams (unreliable,    │
+│       low latency). One channel keeps an IDR inherently ordered     │
+│       ahead of its dependent P-frames; lost IDRs recover via FEC    │
+│       or the client's rate-limited re-request. No reliable stream.  │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
@@ -176,18 +179,17 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │ CLIENT                                                              │
 │                                                                     │
 │   tether-transport::Connection                                      │
-│     • tokio::select! races recv_datagram (P-frames, cursor) and     │
-│       accept_video_keyframe (per-IDR uni stream); both produce      │
-│       VideoPackets fed to the same reassembler                      │
+│     • recv_datagram drains the single video channel — IDR + P-frame │
+│       + cursor + audio datagrams; VideoPackets feed one reassembler │
 │         │                                                           │
 │         ▼                                                           │
 │   FrameReassembler                                                  │
 │     • validate_packet_sizing first: rejects fragment_count >        │
-│       MAX_FRAGMENTS_PER_FRAME (1024) or total_body_len >            │
+│       MAX_FRAGMENTS_PER_FRAME (4096) or total_body_len >            │
 │       MAX_FRAME_BODY_BYTES before any allocation                    │
 │     • drops cross-epoch fragments                                   │
-│     • Reed-Solomon recovery from Parity packets when primaries      │
-│       arrive incomplete                                             │
+│     • per-block Reed-Solomon recovery from Parity packets when      │
+│       primaries arrive incomplete                                   │
 │     • wall-clock-evicts pending frames older than max_pending_age   │
 │       (500ms default) on every fragment                             │
 │         │   complete encoded frame                                  │
@@ -238,13 +240,12 @@ thread — the recv loop keeps polling QUIC and the input-send task
 keeps responding.
 
 **Threading model on the host.** Capture + encode + send live on a
-dedicated `std::thread` (`tether-host-send`). The sync thread calls
-into async transport via `tokio::runtime::Handle::block_on` for the
-reliable-IDR write (which is the only blocking call in the loop); the
-P-frame datagram path is sync inside quinn. Blocking on the IDR write
-preserves ordering — by the time the next iteration of the loop runs,
-the keyframe is queued in quinn's send buffer and quinn's FIFO send
-order keeps it ahead of the following P-frames on the wire.
+dedicated `std::thread` (`tether-host-send`). Every frame — IDR and
+P-frame alike — is fragmented and pushed through `send_datagram`, which
+is sync inside quinn, so the loop has no blocking transport call. An IDR
+and its dependent P-frames share the one datagram channel, so quinn's
+FIFO send order keeps the IDR's fragments ahead of the following
+P-frames on the wire without a separate reliable write.
 
 **60 fps budget audit (Intel Arc iGPU, Meteor Lake; 60 fps budget =
 16.67 ms/frame; p99 over 60 sampled frames):**
@@ -418,8 +419,8 @@ documented in `docs/INVESTIGATION_lan_freeze.md`:
   than `max_pending_age` (500 ms default) are evicted on every
   fragment in addition to the existing frame_seq-distance eviction.
   Stops a quiet-stream encoder restart from leaking incomplete frames.
-- **Reliable per-IDR uni streams.** Detailed in "Protocol shape"
-  below.
+- **Single FEC'd video datagram channel.** All frames ride it; large
+  IDRs get multi-block FEC. Detailed in "Protocol shape" below.
 - **Dedicated decode thread (`tether-decode`).** Owns the VAAPI
   decoder and the auto-IDR 500 ms rate-limit. A GPU-driver stall
   inside libavcodec/libva can't starve the recv loop's tokio task
@@ -440,17 +441,16 @@ documented in `docs/INVESTIGATION_lan_freeze.md`:
   channel's happens-before edge is sufficient — no GPU fence/keyed-mutex
   needed. Shutdown is detected via a consumer-liveness token, since the
   evict-clone the producer holds masks channel `Disconnected`.
-- **DoS-relevant transport limits.** `MAX_VIDEO_STREAM_MESSAGE = 2 MiB`
-  caps per-keyframe-stream allocation; `max_concurrent_uni_streams = 4`
-  prevents a peer from opening thousands of streams and pinning
-  receive-side buffers. On the datagram path,
-  `validate_packet_sizing` is the *first* call in
-  `FrameReassembler::handle`: any packet declaring
-  `fragment_count > MAX_FRAGMENTS_PER_FRAME` (1024) or implying a
-  body larger than `MAX_FRAME_BODY_BYTES` is dropped before the
-  reassembler allocates anything keyed on that frame. The host's
-  control recv loop applies the same defensive shape on the other
-  direction (250 ms IDR-trigger floor — see invariant 3).
+- **DoS-relevant transport limits.** `max_concurrent_uni_streams = 2`
+  bounds peer-initiated uni streams (only the client→host input stream
+  uses one now). On the datagram path, `validate_packet_sizing` is the
+  *first* call in `FrameReassembler::handle`: any packet declaring
+  `fragment_count > MAX_FRAGMENTS_PER_FRAME` (4096), `fec_pct >
+  MAX_FEC_PCT` (100), `shard_size > MAX_DATAGRAM_PAYLOAD`, or a body
+  larger than `MAX_FRAME_BODY_BYTES` is dropped before the reassembler
+  allocates anything keyed on that frame. The host's control recv loop
+  applies the same defensive shape on the other direction (250 ms
+  IDR-trigger floor — see invariant 3).
 
 ## Protocol shape
 
@@ -467,22 +467,29 @@ its own QUIC primitive:
   telemetry (`ClientStats`), and the open-ended `Extension { key,
   payload }` escape for future features that aren't worth a typed
   variant yet (clipboard, file transfer, gamepad rumble, auth, …).
-- **Video** — `VideoPacket::First { display, stream_epoch, frame_seq,
-  fragment_count, meta: VideoFrameMetaEnvelope, payload }` or
-  `::Continuation { …, fragment_index, payload }`. Two transport
-  paths share the same wire shape: **P-frames** ride unreliable QUIC
-  datagrams (split MTU-sized via `FrameFragmenter::fragment`);
-  **IDR keyframes** ride a fresh QUIC unidirectional stream per IDR
-  via `Connection::send_video_keyframe`, carrying one
-  fragment_count=1 packet built by `FrameFragmenter::single_packet`.
-  Reliable streams turn IDR recovery from stochastic (wait for next
-  encoder IDR) into deterministic 1-RTT QUIC retransmit on loss. The
-  receiver's `FrameReassembler` doesn't care which path delivered
-  the fragment — it keys on `(display, stream_epoch, frame_seq)`
-  regardless. `stream_epoch` is `u32` so encoder restarts can't wrap.
-  `VideoFrameMetaEnvelope` is a versioned wrap around
-  `VideoFrameMeta` so future per-frame metadata (HDR ROI QP) lands
-  as additive variants instead of struct-field appends.
+- **Video** (unreliable datagrams) — `VideoPacket::First { display,
+  stream_epoch, frame_seq, fragment_count, fec_pct, shard_size,
+  total_body_len, meta: VideoFrameMetaEnvelope, payload }`,
+  `::Continuation { …, fragment_index, payload }`, or `::Parity { …,
+  block_index, parity_index, … }`. **Every frame — IDR keyframes and
+  P-frames alike — rides one FEC'd datagram channel** via
+  `FrameFragmenter::fragment(meta, body, datagram_budget)`. A split
+  transport (reliable IDR + unreliable P) gave no cross-channel ordering
+  guarantee, so an IDR could be overtaken by the P-frames depending on
+  it; one channel makes that impossible. Lost IDRs recover via FEC or
+  the client's rate-limited re-request rather than a reliable retransmit.
+  Primaries are split into independent Reed-Solomon **FEC blocks** (each
+  ≤ `FEC_MAX_PRIMARY_SHARDS`), so a large IDR stays loss-protected
+  instead of falling back to no-FEC. `shard_size` is derived per frame
+  from the connection's `max_datagram_size` minus the encoded header
+  (incl. the meta envelope), so every datagram fits the path MTU even
+  under an input-echo burst (#37); the receiver derives the identical
+  block layout from `fragment_count` + `fec_pct`. `FrameReassembler`
+  keys on `(display, stream_epoch, frame_seq)`; `stream_epoch` is `u32`
+  so encoder restarts can't wrap. `VideoFrameMetaEnvelope` is a
+  versioned wrap around `VideoFrameMeta` so future per-frame metadata
+  (HDR ROI QP) lands as additive variants instead of struct-field
+  appends.
 - **Audio** (unreliable datagrams, host → client) — `AudioPacket::Opus
   { stream_epoch, frame_seq, t_capture, payload }`. The full Opus
   capture → encode → decode → playback pipeline is implemented in
@@ -662,20 +669,29 @@ Four non-negotiable invariants tracked end-to-end:
    preventing fusion of a partial old frame with a new one.
 3. **On-demand IDR.** Client can request a keyframe at any time via
    `ControlMessage::ForceIdr` or `ControlMessage::RequestRecovery
-   { last_known_good_frame_id }`. The host swap-and-zeros an
+   { last_reassembled_frame_id }`. The host swap-and-zeros an
    `AtomicBool` so multiple requests between encode calls coalesce
    to one; the control recv loop additionally enforces a 250 ms
    floor between any IDR-triggering messages so a client flood
-   can't pin the encoder in perpetual-keyframe mode. GOP is long
-   (~240 frames); IDRs are driven by request, not cadence — the GOP
-   is the safety net, not the primary recovery mechanism. The
-   client's decode run-thread also rate-limits IDR emission to one
-   per `IDR_RATE_LIMIT` (500 ms). Phase-1 `RequestRecovery` collapses
-   to IDR on the host side — an LTR-aware recovery path that uses
-   `last_known_good_frame_id` to pick a reference instead of
-   sending a fresh keyframe is parked until NVENC lands; FFmpeg's
-   `h264_vaapi` / `hevc_vaapi` wrappers expose no LTR plumbing
-   (see CODEC_CAPABILITIES.md).
+   can't pin the encoder in perpetual-keyframe mode. GOP is
+   time-based (`GOP_SECONDS = 2`, so ~120 frames at 60 fps); IDRs
+   are driven by request, not cadence — the GOP is the safety net
+   that bounds worst-case "garbled until next IDR" at 2 s, not the
+   primary recovery mechanism. The client's decode run-thread also
+   rate-limits IDR emission to one per `IDR_RATE_LIMIT` (500 ms).
+   `RequestRecovery` always collapses to a full IDR on the host.
+   Reference-frame invalidation (RFI / LTR re-prediction) is
+   **intentionally not implemented**: it is structurally
+   unavailable on the VAAPI path (FFmpeg's `vaapi_encode.c` builds
+   the picture/rate-control params once at `init()`, so per-frame
+   reference selection is a silent no-op — same family as the
+   intra_refresh/qmin/bitrate no-ops) and only real on `hevc_nvenc`,
+   so it would be a one-backend-one-platform feature. FEC on every
+   frame plus the 2 s GOP already cover its failure mode.
+   `last_reassembled_frame_id` is the client's reassembler
+   high-water mark, logged for diagnostics only — it is **not**
+   decode-verified and must not select an encoder reference (see
+   the `RequestRecovery` doc + CODEC_CAPABILITIES.md).
 4. **Self-decodable IDRs.** Every keyframe carries its own codec
    parameter sets (SPS/PPS for H.264, VPS+SPS+PPS for HEVC).
    Achieved by setting `AV_CODEC_FLAG_GLOBAL_HEADER` on the VAAPI
@@ -810,12 +826,6 @@ Listed to set expectations; each is a real follow-up, not a "never":
   the NVENC path; we follow suit. Worth adding if we ever see a
   "client went silent without observing decode failure" stall mode
   (display sleep, decoder lockup) — cheap insurance, ~20 LOC.
-- **FEC on keyframes specifically.** P-frame datagrams now carry
-  Reed-Solomon parity (see hot path), but IDR keyframes still ride
-  reliable per-IDR QUIC uni streams for deterministic 1-RTT recovery
-  — no FEC overhead on the keyframe path. Sunshine/Apollo/Moonlight
-  use FEC on keyframes because RTP-over-UDP has no reliable side-
-  channel; we have QUIC streams and don't.
 - **Reference frame invalidation (RFI).** Cheaper than a full IDR for
   recovering from limited reference loss, but adds wire complexity
   and the benefit at our resolutions is marginal. Skip.

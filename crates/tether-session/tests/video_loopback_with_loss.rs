@@ -1,13 +1,13 @@
-//! Datagram loss + IDR reliability assertions through `LossyChannel`.
+//! Datagram loss + IDR recovery assertions through `LossyChannel`.
 //!
 //! Wraps the duplex video channel in `LossyChannel` at a configured
 //! drop rate, deterministic via seed. Asserts:
 //! - `FrameReassembler::loss_counters()` reports loss in the right
 //!   ballpark (lower bound: bounded above by per-event drop log).
-//! - The IDR uni-stream path is unaffected — keyframes always arrive
-//!   intact.
-//! - An `IdrSignal::raise()` mirrors the production "loss → force IDR"
-//!   trigger and the resulting keyframe round-trips reliably.
+//! - An IDR keyframe rides the same FEC'd datagram path as P-frames and
+//!   per-block FEC reconstructs it when loss stays within the parity budget.
+//! - A libavcodec soft-failure drives the production request_idr path and the
+//!   resulting keyframe round-trips through the datagram channel.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,10 +15,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tether_decode::test_support::{FakeDecoder, FakeOutcome};
 use tether_decode::Worker;
-use tether_protocol::video::{
-    FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta, VideoPacket,
-};
-use tether_protocol::MonoNanos;
+use tether_protocol::video::{FrameFragmenter, FrameReassembler, HostFrameTiming, VideoFrameMeta};
+use tether_protocol::{MonoNanos, MAX_DATAGRAM_PAYLOAD};
 use tether_render::LatestFrame;
 use tether_transport::test_support::{video_duplex_pair, LossyChannel, LossyConfig};
 use tether_transport::{Datagram, VideoChannel};
@@ -50,7 +48,7 @@ async fn lossy_pframe_path_increments_reassembler_loss_counter() {
     let bodies: Vec<Bytes> = (0..64u8).map(|i| Bytes::from(vec![i; 4096])).collect();
     let mut expected_packets = 0u64;
     for body in &bodies {
-        let pkts = fragmenter.fragment(meta(false), body.clone());
+        let pkts = fragmenter.fragment(meta(false), body.clone(), MAX_DATAGRAM_PAYLOAD);
         expected_packets += pkts.len() as u64;
         for pkt in pkts {
             host.send_datagram(&Datagram::Video(pkt)).unwrap();
@@ -118,36 +116,45 @@ async fn lossy_pframe_path_increments_reassembler_loss_counter() {
 }
 
 #[tokio::test]
-async fn idr_uni_stream_unaffected_by_lossy_wrapper() {
-    let (host_raw, client) = video_duplex_pair();
-    let host = LossyChannel::new(
-        host_raw.clone(),
-        LossyConfig {
-            drop_probability: 1.0, // drop everything on the datagram path
-            reorder_window: 0,
-            seed: 1,
-        },
-    );
+async fn idr_keyframe_recovers_via_fec_under_bounded_loss() {
+    // IDRs ride the same FEC'd datagram channel as P-frames. Drop a bounded
+    // number of primary shards (within the parity budget) and confirm the
+    // reassembler reconstructs the keyframe body exactly — the property that
+    // replaces the old reliable-stream guarantee.
+    let (host, client) = video_duplex_pair();
+    let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+    let mut reassembler = FrameReassembler::new();
 
-    let mut fragmenter = FrameFragmenter::new(0);
-    let body: Bytes = vec![0xa5u8; 4096].into();
-    let pkt = fragmenter.single_packet(meta(true), body.clone());
+    let body: Bytes = vec![0xa5u8; 16 * 1024].into();
+    let packets = fragmenter.fragment(meta(true), body.clone(), MAX_DATAGRAM_PAYLOAD);
+    let parity_count = packets
+        .iter()
+        .filter(|p| matches!(p, tether_protocol::video::VideoPacket::Parity { .. }))
+        .count();
+    assert!(parity_count >= 1, "16 KB IDR at 20% must carry parity");
 
-    // Hand the IDR through the lossy wrapper. The wrapper must NOT
-    // tamper with the reliable stream — keyframes always arrive intact.
-    host.send_video_keyframe(&pkt).await.unwrap();
-
-    let received = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client.accept_video_keyframe(),
-    )
-    .await
-    .expect("timeout")
-    .unwrap();
-    match received {
-        VideoPacket::First { payload, .. } => assert_eq!(payload, body),
-        other => panic!("expected First, got {other:?}"),
+    // Drop exactly the first `parity_count` primaries (First + leading
+    // continuations) — the minimum-shards boundary for recovery. Primaries
+    // come first in the packet list, so skipping `parity_count` keeps the
+    // remaining primaries plus all parity; FEC must rebuild the dropped ones.
+    for pkt in packets.into_iter().skip(parity_count) {
+        host.send_datagram(&Datagram::Video(pkt)).unwrap();
     }
+
+    let mut got = None;
+    while got.is_none() {
+        let dgram = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_datagram())
+            .await
+            .expect("timeout")
+            .unwrap();
+        let Datagram::Video(pkt) = dgram else {
+            panic!("expected Video datagram, got {dgram:?}");
+        };
+        got = reassembler.handle(pkt);
+    }
+    let frame = got.unwrap();
+    assert!(frame.meta.keyframe, "recovered frame must be the keyframe");
+    assert_eq!(frame.body, body, "FEC must rebuild the IDR body byte-equal");
 }
 
 #[tokio::test]
@@ -157,7 +164,7 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
     //   → Worker::process_job sees a libavcodec "warnings bumped"
     //     soft failure → Worker invokes request_idr callback
     //   → (production: host receives ForceIdr) → host sends an IDR
-    //     via the reliable keyframe stream → client receives it.
+    //     fragmented over the FEC'd datagram channel → client reassembles it.
     //
     // This test drives the entire chain via the production code
     // paths (LossyChannel → reassembler → Worker → request_idr →
@@ -179,7 +186,7 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
 
     // Pump lossy P-frames through the production datagram path.
     for i in 0..16u8 {
-        for pkt in fragmenter.fragment(meta(false), vec![i; 1024].into()) {
+        for pkt in fragmenter.fragment(meta(false), vec![i; 1024].into(), MAX_DATAGRAM_PAYLOAD) {
             lossy.send_datagram(&Datagram::Video(pkt)).unwrap();
         }
     }
@@ -255,17 +262,33 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
         "production code rate-limits ForceIdr to one per IDR_RATE_LIMIT window"
     );
 
-    // Final hop: the IDR rides the reliable keyframe stream and must
-    // arrive intact even though the datagram path is dropping
-    // everything.
-    let kf = fragmenter.single_packet(meta(true), Bytes::from(vec![0xff; 4096]));
-    lossy.send_video_keyframe(&kf).await.unwrap();
-    let received = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client.accept_video_keyframe(),
-    )
-    .await
-    .expect("timeout")
-    .unwrap();
-    assert!(matches!(received, VideoPacket::First { .. }));
+    // Final hop: the recovery IDR rides the FEC'd datagram channel like every
+    // other frame. Send its fragments through the underlying (lossless) channel
+    // — modelling the IDR datagrams that get through — and confirm the client
+    // reassembles the keyframe.
+    let kf_body = Bytes::from(vec![0xffu8; 4096]);
+    let mut kf_reassembler = FrameReassembler::new();
+    let mut recovered = None;
+    for pkt in fragmenter.fragment(meta(true), kf_body.clone(), MAX_DATAGRAM_PAYLOAD) {
+        host_raw.send_datagram(&Datagram::Video(pkt)).unwrap();
+    }
+    while recovered.is_none() {
+        let dgram = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_datagram())
+            .await
+            .expect("timeout")
+            .unwrap();
+        if let Datagram::Video(pkt) = dgram {
+            // Accept only the keyframe: any leftover P-frame fragments still
+            // draining from the lossy bursts above share this channel, so wait
+            // for the IDR specifically rather than the first frame to complete.
+            if let Some(frame) = kf_reassembler.handle(pkt) {
+                if frame.meta.keyframe {
+                    recovered = Some(frame);
+                }
+            }
+        }
+    }
+    let frame = recovered.unwrap();
+    assert!(frame.meta.keyframe);
+    assert_eq!(frame.body, kf_body);
 }

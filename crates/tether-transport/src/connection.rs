@@ -12,7 +12,6 @@ use tether_protocol::{
     cursor::{ClientCursorPacket, HostCursorPacket},
     input::InputEvent,
     video::VideoPacket,
-    MAX_DATAGRAM_PAYLOAD,
 };
 
 use crate::channel::{AbrSnapshot, ConnectionInfo, ControlChannel, InputChannel, VideoChannel};
@@ -486,7 +485,7 @@ async fn read_exact(recv: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tether_protocol::{decode, encode};
+    use tether_protocol::{decode, encode, MAX_DATAGRAM_PAYLOAD};
 
     #[test]
     fn round_trip_audio_datagram() {

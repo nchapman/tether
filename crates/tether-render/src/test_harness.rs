@@ -975,25 +975,55 @@ fn decode_all(
             eprintln!("SKIP: decoder submit failed: {e}");
             return Vec::new();
         }
-        while let Ok(Some(f)) = dec.next_frame() {
-            match f {
-                CodecFrame::Gpu(g) => out.push(g),
-                // VAAPI decoder must produce Gpu frames; a Cpu frame
-                // here would mean the decoder probe was wrong or the
-                // driver fell back. Fail loudly — silently dropping
-                // would make the harness count packets it can't
-                // actually use, which would skew the steady-state
-                // check.
-                CodecFrame::Cpu(_) => {
-                    panic!("decode_all: VAAPI decoder produced a Cpu frame — driver fallback?");
-                }
-            }
+        if let Err(e) = drain_ready(&mut dec, &mut out) {
+            eprintln!("SKIP: decoder next_frame failed: {e}");
+            return Vec::new();
         }
+    }
+    // ffmpeg's HEVC/AV1 decoders hold the first frame in the reorder
+    // DPB until a subsequent packet or EOF arrives. The multi-frame
+    // roundtrip cells flush each frame implicitly with the next packet,
+    // but the single-IDR decode-reference cell emits nothing without an
+    // explicit drain — without this the conformance anchor silently
+    // skips on the one box that has the hardware. See
+    // `VaapiDecoder::signal_eof`.
+    if let Err(e) = dec.signal_eof() {
+        eprintln!("SKIP: decoder signal_eof failed: {e}");
+        return Vec::new();
+    }
+    if let Err(e) = drain_ready(&mut dec, &mut out) {
+        eprintln!("SKIP: decoder drain-at-eof failed: {e}");
+        return Vec::new();
     }
     // Caller checks dims after into_parts(); tether_codec::GpuFrame
     // doesn't expose width/height by reference today.
     let _ = encode_dims;
     out
+}
+
+/// Pull every frame the decoder is ready to emit into `out`, stopping
+/// when it signals drain (`Ok(None)`). A real decode error is surfaced
+/// to the caller as a loud SKIP rather than swallowed by a `while let
+/// Ok(Some)` loop.
+fn drain_ready(
+    dec: &mut VaapiDecoder,
+    out: &mut Vec<tether_codec::GpuFrame>,
+) -> std::result::Result<(), String> {
+    loop {
+        match dec.next_frame() {
+            Ok(Some(CodecFrame::Gpu(g))) => out.push(g),
+            // VAAPI decoder must produce Gpu frames; a Cpu frame here
+            // would mean the decoder probe was wrong or the driver fell
+            // back. Fail loudly — silently dropping would make the
+            // harness count packets it can't actually use, which would
+            // skew the steady-state check.
+            Ok(Some(CodecFrame::Cpu(_))) => {
+                panic!("decode_all: VAAPI decoder produced a Cpu frame — driver fallback?");
+            }
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// Map a VideoProfile to the capability whose absence is the most

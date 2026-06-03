@@ -20,6 +20,14 @@ crossbeam-channel = { workspace = true }
 # system-output capture is irreducibly OS-specific.
 cpal = "0.17"
 
+# Linux system-audio capture rides PipeWire — the same stack the video path
+# uses (`tether-capture`), but portal-free: a capture stream tagged
+# `stream.capture.sink` auto-connects to the default sink's monitor (system
+# output). The crate re-exports its `libspa` as `pw::spa`, so we need no extra
+# spa/sys deps for the F32 format POD.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.10"
+
 # macOS system-audio capture rides ScreenCaptureKit — the same framework the
 # video path already uses (`tether-capture`), and the only native path to
 # system output on macOS. Same crate + feature floor as tether-capture.

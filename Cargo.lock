@@ -3651,6 +3651,7 @@ dependencies = [
  "bytes",
  "cpal",
  "crossbeam-channel",
+ "pipewire",
  "screencapturekit",
  "tether-protocol",
  "tether-transport",

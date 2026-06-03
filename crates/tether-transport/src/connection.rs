@@ -153,11 +153,19 @@ impl Connection {
     /// (typically: drop the frame and increment a counter).
     pub fn send_datagram(&self, d: &Datagram) -> Result<()> {
         let bytes = tether_protocol::encode(d)?;
-        if bytes.len() > MAX_DATAGRAM_PAYLOAD {
-            return Err(TransportError::FrameTooLarge {
-                size: bytes.len(),
-                max: MAX_DATAGRAM_PAYLOAD,
-            });
+        // Bound against the path's real datagram capacity (quinn, MTU-derived),
+        // not the soft `MAX_DATAGRAM_PAYLOAD` fragmentation target. A First/Parity
+        // packet carrying an input-echo batch legitimately encodes past 1200, and
+        // quinn delivers it whenever the path MTU allows; rejecting at the soft
+        // target dropped real frames (and the receive-side mirror tore the session
+        // down). An oversized frame is the caller's to drop, never fatal.
+        if let Some(max) = self.conn.max_datagram_size() {
+            if bytes.len() > max {
+                return Err(TransportError::FrameTooLarge {
+                    size: bytes.len(),
+                    max,
+                });
+            }
         }
         self.conn.send_datagram(bytes.into())?;
         Ok(())

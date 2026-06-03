@@ -35,6 +35,25 @@ use serde::{Deserialize, Serialize};
 /// payload chunk size that keeps the encoded packet under this budget.
 pub const MAX_DATAGRAM_PAYLOAD: usize = 1200;
 
+/// Hard ceiling on the bytes a single *received* datagram decode may allocate.
+///
+/// Distinct from [`MAX_DATAGRAM_PAYLOAD`], which is only the soft size the
+/// fragmenter *aims* for. The real wire size of a `First`/`Parity` packet is
+/// `FEC_SHARD_SIZE` (1100) plus a variable meta envelope — chiefly the
+/// `InputEchoBatch`, which grows with input activity — plus the packet header,
+/// so a busy frame legitimately encodes well past 1200. quinn delivers those:
+/// its actual `max_datagram_size` is MTU-derived and routinely above the soft
+/// target. Bounding the decode at the soft target therefore rejected
+/// quinn-delivered datagrams and tore the connection down after a few echoed
+/// input events.
+///
+/// This ceiling exists purely to stop a forged length prefix on an untrusted
+/// datagram from driving a giant pre-allocation; quinn already caps the real
+/// wire size to the path MTU. Set generously above any datagram the fragmenter
+/// can emit on a normal path while still bounding a hostile allocation to a few
+/// KB.
+pub const MAX_DATAGRAM_DECODE_BYTES: usize = 2048;
+
 /// Wire-protocol version string. Bumped on any breaking change to the
 /// control/handshake/pairing wire contract.
 ///
@@ -96,14 +115,16 @@ fn bincode_config() -> impl bincode::config::Config {
 }
 
 /// Like [`bincode_config`] but caps the total bytes a single decode may claim
-/// at [`MAX_DATAGRAM_PAYLOAD`]. Datagrams arrive from an untrusted peer, and a
-/// forged length prefix on a `Vec<u8>` field (e.g. `AudioPacket::Opus.payload`)
+/// at [`MAX_DATAGRAM_DECODE_BYTES`]. Datagrams arrive from an untrusted peer, and
+/// a forged length prefix on a `Vec<u8>` field (e.g. `AudioPacket::Opus.payload`)
 /// would otherwise drive bincode to pre-allocate gigabytes. bincode claims a
 /// container's bytes against this limit *before* allocating, so an over-long
-/// field is rejected up front. A legitimate datagram is at most
-/// `MAX_DATAGRAM_PAYLOAD` bytes, so it never trips the limit.
+/// field is rejected up front. The ceiling is [`MAX_DATAGRAM_DECODE_BYTES`], not
+/// the soft [`MAX_DATAGRAM_PAYLOAD`] target — a legitimate `First`/`Parity`
+/// packet with an input-echo batch encodes past 1200 yet is delivered fine by
+/// quinn, so bounding at the soft target would reject real traffic.
 fn datagram_config() -> impl bincode::config::Config {
-    bincode::config::standard().with_limit::<MAX_DATAGRAM_PAYLOAD>()
+    bincode::config::standard().with_limit::<MAX_DATAGRAM_DECODE_BYTES>()
 }
 
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
@@ -162,12 +183,14 @@ mod tests {
     };
 
     /// The datagram decoder bounds allocation: a payload larger than
-    /// `MAX_DATAGRAM_PAYLOAD` is rejected before allocation (where the unbounded
-    /// `decode` would accept it). This is the guard against a forged length
-    /// prefix on an untrusted datagram (e.g. an Opus payload) driving an OOM.
+    /// `MAX_DATAGRAM_DECODE_BYTES` is rejected before allocation (where the
+    /// unbounded `decode` would accept it). This is the guard against a forged
+    /// length prefix on an untrusted datagram (e.g. an Opus payload) driving an
+    /// OOM. The ceiling is the decode bound, not the soft `MAX_DATAGRAM_PAYLOAD`
+    /// fragmentation target (see `MAX_DATAGRAM_DECODE_BYTES`).
     #[test]
     fn decode_datagram_rejects_oversize_payload() {
-        let big = vec![0u8; MAX_DATAGRAM_PAYLOAD + 64];
+        let big = vec![0u8; MAX_DATAGRAM_DECODE_BYTES + 64];
         let bytes = encode(&big).unwrap();
         assert!(
             decode::<Vec<u8>>(&bytes).is_ok(),
@@ -187,6 +210,59 @@ mod tests {
         let bytes = encode(&payload).unwrap();
         let back: Vec<u8> = decode_datagram(&bytes).unwrap();
         assert_eq!(back, payload);
+    }
+
+    /// Regression for the datagram-too-big teardown: a real FEC frame whose
+    /// `First`/`Parity` packets carry an `input_echo` batch encodes *larger*
+    /// than the soft [`MAX_DATAGRAM_PAYLOAD`] target — quinn delivers it fine
+    /// (its real `max_datagram_size` is MTU-bound, often above 1200), so the
+    /// receive-side decode must accept it. Tying the decode limit to the soft
+    /// target closed the connection after ~8 echoed input events. The decode
+    /// guard caps allocation at the larger [`MAX_DATAGRAM_DECODE_BYTES`].
+    #[test]
+    fn fec_packets_with_input_echo_exceed_soft_target_but_still_decode() {
+        let mut frag = FrameFragmenter::new_with_fec(0, 20);
+        let meta = VideoFrameMeta {
+            timing: HostFrameTiming {
+                t_capture_kernel: MonoNanos(u64::MAX / 2),
+                t_capture_userspace: MonoNanos(u64::MAX / 2),
+                t_encode_submit: MonoNanos(u64::MAX / 2),
+                t_encode_done: MonoNanos(u64::MAX / 2),
+                t_send: MonoNanos(u64::MAX / 2),
+            },
+            keyframe: false,
+            // A modest input burst — well within a single frame's worth of
+            // mouse/key events — already pushes First/Parity over the soft
+            // target once the 1100-byte FEC shard and header are added.
+            input_echo: InputEchoBatch {
+                event_ids: vec![u64::MAX; 16],
+            },
+            dimensions: (3840, 2160),
+        };
+        let body = bytes::Bytes::from(vec![0xABu8; 3 * FEC_SHARD_SIZE]);
+        let packets = frag.fragment(meta, body);
+
+        let mut saw_over_soft_target = false;
+        for p in &packets {
+            let bytes = encode(p).unwrap();
+            // Sanity: at least one packet must exceed the soft target, or the
+            // test isn't exercising the regression at all.
+            if bytes.len() > MAX_DATAGRAM_PAYLOAD {
+                saw_over_soft_target = true;
+            }
+            assert!(
+                bytes.len() <= MAX_DATAGRAM_DECODE_BYTES,
+                "fragmenter packet {} exceeds the decode ceiling {}",
+                bytes.len(),
+                MAX_DATAGRAM_DECODE_BYTES
+            );
+            decode_datagram::<VideoPacket>(&bytes)
+                .expect("a quinn-deliverable datagram must decode, not tear down the session");
+        }
+        assert!(
+            saw_over_soft_target,
+            "expected a First/Parity packet larger than the soft {MAX_DATAGRAM_PAYLOAD} target"
+        );
     }
 
     #[test]

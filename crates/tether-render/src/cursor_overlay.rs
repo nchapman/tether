@@ -322,7 +322,7 @@ pub(crate) fn cursor_uniform_for(
         // Diagnostic-only: rounded sprite extents logged as integers.
         #[allow(clippy::cast_possible_truncation)]
         let rendered_sprite_px = (sprite_px.0.round() as i32, sprite_px.1.round() as i32);
-        tracing::info!(
+        tracing::debug!(
             sprite_wh = ?(snap.width, snap.height),
             video_wh = ?(vw, vh),
             surface_wh = ?(surf_w, surf_h),

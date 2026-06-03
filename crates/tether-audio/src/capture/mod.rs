@@ -28,6 +28,9 @@ pub struct AudioCaptureHandle {
 }
 
 impl AudioCaptureHandle {
+    // Only the platform backends construct a handle; on backend-less targets
+    // `start` returns `Unsupported` without ever calling this.
+    #[cfg(target_os = "macos")]
     pub(crate) fn from_parts(
         rx: Receiver<AudioFrame>,
         stop: Arc<AtomicBool>,

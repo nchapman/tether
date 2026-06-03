@@ -225,15 +225,21 @@ impl VaapiEncoder {
             // HEVC profile pin. Sunshine's reference pattern (see
             // refs/Sunshine/src/video.cpp:1687) sets `profile` on the
             // context field rather than via the `profile=` AVOption
-            // string; the string form is brittle for the Rext
-            // umbrella (covers 4:4:4 8/10-bit, 4:2:2 10-bit, Main
-            // Intra, etc.) where the actual sub-profile is inferred
-            // from the hwframes `sw_format`. We pick:
-            //   - REXT for any 4:4:4 (Main 4:4:4 8/10-bit) — packed
-            //     pix_fmt + this profile is what hevc_vaapi picks up.
-            //   - MAIN_10 for Yuv420 10-bit so VAAPI doesn't fall
-            //     through to MAIN and produce a stream the driver
-            //     rejects against the negotiated bit depth.
+            // string. FFmpeg derives the bit depth and chroma of the
+            // VAProfile match from the hwframes `sw_format` descriptor
+            // (`vaapi_encode.c` walks `vaapi_encode_h265_profiles[]`
+            // keyed on depth + components), and treats `avctx->profile`
+            // as an extra filter that's skipped when AV_PROFILE_UNKNOWN.
+            // So these pins are *defensive*, not corrective — FFmpeg
+            // already reaches the right VAProfile from sw_format alone:
+            //   - REXT is the only `av_profile` on the two 4:4:4 rows
+            //     (`{REXT,8,...,Main444}` / `{REXT,10,...,Main444_10}`),
+            //     so packed 4:4:4 selects it regardless. We pin it to
+            //     keep the choice explicit across FFmpeg versions.
+            //   - MAIN_10 for Yuv420 10-bit. (The MAIN row is rejected
+            //     on the depth check before the profile compare, so a
+            //     10-bit sw_format can't actually fall through to MAIN;
+            //     pinning just documents intent.)
             // For Yuv420 8-bit we leave the field at FFmpeg's default
             // and let the `profile=main` AVOption (below) drive it.
             if kind == CodecKind::Hevc {

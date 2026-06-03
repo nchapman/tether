@@ -2,20 +2,26 @@
 //! `VkDeviceMemory`, exported as one DMA-BUF.
 //!
 //! Sister to [`shared_yuv444`] (the 8-bit packed bridge) — same
-//! single-plane shape, just one step up in bit depth. DRM_FORMAT_XV30
-//! is the only 4:4:4 10-bit format ffmpeg's `vaapi_drm_format_map`
-//! knows how to import (`MAP(XV30, YUV444_10, XV30, 0)` in
-//! `libavutil/hwcontext_vaapi.c`); biplanar P410 has no entry, so the
-//! packed layout isn't a stylistic choice, it's the only viable
-//! input for HEVC Main 4:4:4 10-bit encode via VAAPI.
+//! single-plane shape, just one step up in bit depth. The fourcc bytes
+//! `"XV30"` are `DRM_FORMAT_XVYU2101010`, the only 4:4:4 10-bit format
+//! ffmpeg's `vaapi_drm_format_map` knows how to import: the table row is
+//! `DRM_MAP(Y410, 1, DRM_FORMAT_XVYU2101010)` →
+//! `MAP(Y410, YUV444_10, XV30, 0)` in `libavutil/hwcontext_vaapi.c`, i.e.
+//! the importer maps it to `VA_FOURCC_Y410` (FFmpeg pix_fmt `XV30`).
+//! Biplanar P410 has no entry, so the packed layout isn't a stylistic
+//! choice — it's the only viable input for HEVC Main 4:4:4 10-bit
+//! encode via VAAPI.
 //!
-//! Per-pixel layout from `<drm/drm_fourcc.h>`:
-//!   DRM_FORMAT_XV30 = [31:0] X:V:U:Y 2:10:10:10 little endian
-//!
-//! In Vulkan's `A2B10G10R10_UNORM_PACK32` mapping (R→[9:0],
-//! G→[19:10], B→[29:20], A→[31:30]) and wgpu's `Rgb10a2Unorm` storage
-//! format, that lands as `R=Y, G=U, B=V, A=X`. The compute shader
-//! (`bgra_to_xv30.wgsl`) writes `vec4<f32>(Y, U, V, 1.0)` to match.
+//! Channel order: the compute shader (`bgra_to_xv30.wgsl`) writes
+//! `vec4<f32>(Y, U, V, 1.0)` into a wgpu `Rgb10a2Unorm` /
+//! `A2B10G10R10_UNORM_PACK32` cell (R→[9:0], G→[19:10], B→[29:20],
+//! A→[31:30]), so the low 10 bits hold Y. This is the layout the Intel
+//! VAAPI `VA_FOURCC_Y410` encode path consumes — verified end-to-end by
+//! `roundtrip_colorbars_hevc_main444_10bit` (correct red/green/blue/
+//! white, no luma/chroma swap). Note it is NOT the nominal
+//! `DRM_FORMAT_XVYU2101010` order in `<drm/drm_fourcc.h>`
+//! (`[31:0] X:Cr:Y:Cb`, i.e. Cb in the low bits) — the fourcc is only a
+//! VAAPI lookup key here, not a literal channel-order spec.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 

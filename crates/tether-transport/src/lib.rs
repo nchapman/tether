@@ -112,10 +112,69 @@ pub enum TransportError {
 pub type Result<T> = std::result::Result<T, TransportError>;
 
 impl TransportError {
+    /// True when a `send_datagram` failure affects only the current frame, so
+    /// the caller should drop the frame and keep the session alive rather than
+    /// tear it down.
+    ///
+    /// The motivating case is MTU shrinkage mid-stream: quinn's
+    /// `max_datagram_size()` can drop (PLPMTUD black-hole detection, a Wi-Fi →
+    /// cellular handoff, NAT rebinding to a lower-MTU path) *after* a frame has
+    /// already been fragmented against a larger budget. The remaining shards
+    /// then exceed the new limit — `FrameTooLarge` (our guard) or quinn's
+    /// `TooLarge`. That is transient: the next frame re-fragments against the
+    /// smaller MTU and recovers. Tearing the session down on either is a
+    /// self-inflicted disconnect on a recoverable event. (A full datagram send
+    /// buffer is *not* surfaced here: quinn's buffered `send_datagram` drops
+    /// the oldest queued datagram instead of erroring.)
+    ///
+    /// Connection-level failures (peer gone, datagrams unsupported or disabled,
+    /// connection lost) are *not* transient: continuing would spin uselessly,
+    /// so the caller should end the loop.
+    pub fn is_transient_send(&self) -> bool {
+        matches!(
+            self,
+            TransportError::FrameTooLarge { .. }
+                | TransportError::SendDatagram(quinn::SendDatagramError::TooLarge)
+        )
+    }
+
     pub(crate) fn from_read_exact(e: quinn::ReadExactError) -> Self {
         match e {
             quinn::ReadExactError::FinishedEarly(_) => TransportError::StreamClosed,
             quinn::ReadExactError::ReadError(re) => TransportError::Read(re),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_send_errors_drop_the_frame_not_the_session() {
+        // Per-frame failures the send loop should survive by dropping the
+        // current frame's remaining shards (MTU shrank mid-frame).
+        assert!(TransportError::FrameTooLarge {
+            size: 2000,
+            max: 1200
+        }
+        .is_transient_send());
+        assert!(
+            TransportError::SendDatagram(quinn::SendDatagramError::TooLarge).is_transient_send()
+        );
+    }
+
+    #[test]
+    fn connection_level_send_errors_are_fatal() {
+        // A peer that can't or won't receive datagrams will never accept video;
+        // continuing would spin. These must end the send loop.
+        assert!(
+            !TransportError::SendDatagram(quinn::SendDatagramError::UnsupportedByPeer)
+                .is_transient_send()
+        );
+        assert!(
+            !TransportError::SendDatagram(quinn::SendDatagramError::Disabled).is_transient_send()
+        );
+        assert!(!TransportError::StreamClosed.is_transient_send());
     }
 }

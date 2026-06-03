@@ -1087,14 +1087,14 @@ mod tests {
     #[test]
     fn request_recovery_control_message_round_trips() {
         let m = ControlMessage::RequestRecovery {
-            last_known_good_frame_id: 12345,
+            last_reassembled_frame_id: 12345,
         };
         let bytes = encode(&m).unwrap();
         let m2: ControlMessage = decode(&bytes).unwrap();
         match m2 {
             ControlMessage::RequestRecovery {
-                last_known_good_frame_id,
-            } => assert_eq!(last_known_good_frame_id, 12345),
+                last_reassembled_frame_id,
+            } => assert_eq!(last_reassembled_frame_id, 12345),
             _ => panic!("wrong variant"),
         }
     }

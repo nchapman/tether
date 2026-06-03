@@ -156,12 +156,13 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │                 every datagram fits the path MTU (#37).             │
 │         │       attach HostFrameTiming + stream_epoch + frame_seq   │
 │         ▼                                                           │
-│   tether-session::PacedSender                                       │
-│     • begin_frame(now) + per-packet wait_for_slot(wire_size) spread │
-│       fragments across the frame interval so a burst doesn't pin    │
-│       the network queue and induce correlated loss. Bitrate is an   │
-│       Arc<AtomicU64> shared with the ABR controller so retunes      │
-│       are live without rebuilding the pacer.                        │
+│   (no app-level pacer)                                              │
+│     • The host bursts a frame's datagrams straight to the          │
+│       transport. quinn's own pacer + congestion controller is the  │
+│       single wire-rate governor; an earlier in-line token bucket   │
+│       throttled capture and double-paced against quinn, so it was  │
+│       removed. The ABR controller still retunes the encoder        │
+│       bitrate via an Arc<AtomicU64>.                                │
 │         │                                                           │
 │         ▼                                                           │
 │   tether-transport::Server                                          │
@@ -668,20 +669,29 @@ Four non-negotiable invariants tracked end-to-end:
    preventing fusion of a partial old frame with a new one.
 3. **On-demand IDR.** Client can request a keyframe at any time via
    `ControlMessage::ForceIdr` or `ControlMessage::RequestRecovery
-   { last_known_good_frame_id }`. The host swap-and-zeros an
+   { last_reassembled_frame_id }`. The host swap-and-zeros an
    `AtomicBool` so multiple requests between encode calls coalesce
    to one; the control recv loop additionally enforces a 250 ms
    floor between any IDR-triggering messages so a client flood
-   can't pin the encoder in perpetual-keyframe mode. GOP is long
-   (~240 frames); IDRs are driven by request, not cadence — the GOP
-   is the safety net, not the primary recovery mechanism. The
-   client's decode run-thread also rate-limits IDR emission to one
-   per `IDR_RATE_LIMIT` (500 ms). Phase-1 `RequestRecovery` collapses
-   to IDR on the host side — an LTR-aware recovery path that uses
-   `last_known_good_frame_id` to pick a reference instead of
-   sending a fresh keyframe is parked until NVENC lands; FFmpeg's
-   `h264_vaapi` / `hevc_vaapi` wrappers expose no LTR plumbing
-   (see CODEC_CAPABILITIES.md).
+   can't pin the encoder in perpetual-keyframe mode. GOP is
+   time-based (`GOP_SECONDS = 2`, so ~120 frames at 60 fps); IDRs
+   are driven by request, not cadence — the GOP is the safety net
+   that bounds worst-case "garbled until next IDR" at 2 s, not the
+   primary recovery mechanism. The client's decode run-thread also
+   rate-limits IDR emission to one per `IDR_RATE_LIMIT` (500 ms).
+   `RequestRecovery` always collapses to a full IDR on the host.
+   Reference-frame invalidation (RFI / LTR re-prediction) is
+   **intentionally not implemented**: it is structurally
+   unavailable on the VAAPI path (FFmpeg's `vaapi_encode.c` builds
+   the picture/rate-control params once at `init()`, so per-frame
+   reference selection is a silent no-op — same family as the
+   intra_refresh/qmin/bitrate no-ops) and only real on `hevc_nvenc`,
+   so it would be a one-backend-one-platform feature. FEC on every
+   frame plus the 2 s GOP already cover its failure mode.
+   `last_reassembled_frame_id` is the client's reassembler
+   high-water mark, logged for diagnostics only — it is **not**
+   decode-verified and must not select an encoder reference (see
+   the `RequestRecovery` doc + CODEC_CAPABILITIES.md).
 4. **Self-decodable IDRs.** Every keyframe carries its own codec
    parameter sets (SPS/PPS for H.264, VPS+SPS+PPS for HEVC).
    Achieved by setting `AV_CODEC_FLAG_GLOBAL_HEADER` on the VAAPI

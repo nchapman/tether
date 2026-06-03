@@ -859,31 +859,29 @@ async fn handle_client(
                         }
                     }
                     Ok(ControlMessage::RequestRecovery {
-                        last_known_good_frame_id,
+                        last_reassembled_frame_id,
                     }) => {
                         let now = std::time::Instant::now();
                         if last_idr_request
                             .is_some_and(|t| now.duration_since(t) < IDR_REQUEST_MIN_INTERVAL)
                         {
                             tracing::trace!(
-                                last_known_good_frame_id,
+                                last_reassembled_frame_id,
                                 "RequestRecovery rate-limited"
                             );
                             continue;
                         }
                         last_idr_request = Some(now);
-                        // Without LTR plumbing, recovery means a full
-                        // IDR — same response as ForceIdr. The
-                        // client's `last_known_good_frame_id` is
-                        // logged for diagnostics but isn't actionable
-                        // until an encoder backend supports
-                        // long-term-reference re-prediction (see GH
-                        // #11 for the upstream blocker on VAAPI;
-                        // NVENC in #16 is the most plausible first
-                        // backend to wire end-to-end).
+                        // Recovery means a full IDR. `last_reassembled_frame_id`
+                        // is logged for diagnostics only — it is the client's
+                        // reassembler high-water mark, not a decode-verified
+                        // reference, so it can't drive LTR re-prediction even if
+                        // an encoder supported it. RFI is intentionally not
+                        // implemented (see the `RequestRecovery` doc); FEC + the
+                        // bounded GOP cover its failure mode.
                         tracing::info!(
-                            last_known_good_frame_id,
-                            "client requested recovery; falling back to forced IDR"
+                            last_reassembled_frame_id,
+                            "client requested recovery; emitting forced IDR"
                         );
                         force_idr.raise();
                     }
@@ -2833,6 +2831,10 @@ fn run_capture_and_send(
     const FEC_PERCENTAGE: u8 = 20;
     let mut fragmenter = FrameFragmenter::new_with_fec(0, FEC_PERCENTAGE);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
+    // Frames sacrificed because a datagram send failed transiently (the path
+    // MTU shrank mid-frame). Surfaced in the periodic stats log so a flapping
+    // path is visible rather than silent.
+    let mut transient_send_drops: u64 = 0;
     // Per-stage latency (handoff + send), averaged over the same window
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
@@ -3327,7 +3329,20 @@ fn run_capture_and_send(
             });
         for packet in fragmenter.fragment(meta, body, budget) {
             if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
-                warn!(error = ?e, "send_datagram failed, terminating send loop");
+                if e.is_transient_send() {
+                    // MTU shrank mid-frame (PLPMTUD black-hole / path change),
+                    // so a shard fragmented against the old budget no longer
+                    // fits. Every remaining shard of this frame is the same
+                    // size, so drop the rest of the frame and keep the session
+                    // alive — the next frame re-fragments against the new MTU.
+                    // FEC can't rebuild a lost contiguous tail, so this frame is
+                    // sacrificed, but a single dropped frame is recoverable and
+                    // a torn-down session is not.
+                    transient_send_drops += 1;
+                    tracing::debug!(error = ?e, "dropping frame on transient datagram send error");
+                    break;
+                }
+                warn!(error = ?e, "send_datagram failed (fatal), terminating send loop");
                 return;
             }
         }
@@ -3360,6 +3375,7 @@ fn run_capture_and_send(
                     ),
                     kbps_out = format!("{:.0}", snap.kbps_out),
                     kf_per_s = format!("{kf_per_s:.2}"),
+                    transient_send_drops,
                     "send stats"
                 );
                 stage_latency = StageLatency::default();

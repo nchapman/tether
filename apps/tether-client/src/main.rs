@@ -525,13 +525,17 @@ async fn main() -> anyhow::Result<()> {
         // per-interval drop and fragment-loss rates for ClientStats.
         let mut last_frames_dropped: u64 = 0;
         let mut last_fragments_lost: u64 = 0;
-        // Most-recent successfully-reassembled frame_seq. Quoted in
-        // RequestRecovery when the reassembler observes a stale
-        // drop. The host currently logs the value for diagnostics
-        // and collapses to a forced IDR; an encoder-side LTR
-        // backend (GH #16) would use it to select a still-trusted
-        // reference for re-prediction.
-        let mut last_known_good_frame_seq: Option<u32> = None;
+        // Most-recent frame_seq the reassembler *completed*. Quoted in
+        // RequestRecovery when the reassembler observes a stale drop, and
+        // doubles as the "have we received any frame yet" sentinel that gates
+        // the recovery request. NOTE: this is "reassembled", NOT "decoded
+        // cleanly" — a frame can reassemble (FEC rebuilt every shard) yet be a
+        // P-frame referencing an earlier frame the decoder concealed. The host
+        // only logs the value and always responds with a full IDR, so the
+        // distinction is harmless today; it must not be used to select an
+        // encoder reference without a decode-success signal we don't have. See
+        // the `RequestRecovery` doc in tether-protocol.
+        let mut last_reassembled_frame_seq: Option<u32> = None;
         // Last time we emitted a RequestRecovery. Rate-limits the
         // signal to one every IDR_RATE_LIMIT (500 ms) so a burst
         // of drops collapses into a single recovery action — same
@@ -669,7 +673,7 @@ async fn main() -> anyhow::Result<()> {
             let post_loss = reassembler.loss_counters();
             let new_loss = post_loss.0 > pre_loss.0 || post_loss.1 > pre_loss.1;
             if new_loss {
-                if let Some(last_good) = last_known_good_frame_seq {
+                if let Some(last_reassembled) = last_reassembled_frame_seq {
                     let now = MonoNanos::now();
                     let rate_limit_ns = 500_000_000u64;
                     let fire = last_request_recovery_at
@@ -680,7 +684,7 @@ async fn main() -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             if let Err(e) = send_conn
                                 .send_control(&ControlMessage::RequestRecovery {
-                                    last_known_good_frame_id: last_good,
+                                    last_reassembled_frame_id: last_reassembled,
                                 })
                                 .await
                             {
@@ -694,7 +698,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let Some(frame) = result else { continue };
-            last_known_good_frame_seq = Some(frame.frame_seq);
+            // Reassembled, not yet decoded — see the declaration comment.
+            last_reassembled_frame_seq = Some(frame.frame_seq);
             let now = MonoNanos::now();
             // Host timestamps -> client clock via the handshake
             // offset. host_in_client_clock is the moment the

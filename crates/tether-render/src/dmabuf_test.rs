@@ -146,6 +146,129 @@ fn assert_outcome(case: &RoundtripCase, result: RoundtripResult) {
 }
 
 // =====================================================================
+// Colour-decode cells (Fixture::ColorBars)
+//
+// SSIM / geometric residual run on the near-constant-chroma
+// CoordEncoded fixture, so they can't catch a hue cast or Cb/Cr swap.
+// These drive the shared red/green/blue/white colour-bar pattern
+// through the SAME production host pipeline (BGRA → gpuconvert
+// NV12/P010/XYUV/XV30 bridge → VAAPI encode → decode → render) and
+// assert each bar reconstructs to its colour on the readback. The
+// white bar is the regression guard for the host-side "colors are
+// wrong" hue-cast bug. Uniform with macOS `iosurface_test` and the
+// Windows `d3d11` colour cells via `crate::color_fixture`.
+// =====================================================================
+
+/// SKIP-aware colour-bar assertion on the rendered readback (BGRA,
+/// matching the production `Bgra8UnormSrgb` swapchain).
+fn assert_colorbars_outcome(case: &RoundtripCase, result: RoundtripResult) {
+    match result {
+        RoundtripResult::Skip { capability, detail } => {
+            eprintln!("SKIPPED {} (missing {capability:?}): {detail}", case.name);
+        }
+        RoundtripResult::Ok(outcome) => {
+            crate::color_fixture::assert_colorbars(
+                case.name,
+                &outcome.readback_bgra,
+                case.surface_dims.0,
+                case.surface_dims.1,
+                crate::color_fixture::ChannelOrder::Bgra,
+            );
+        }
+    }
+}
+
+/// Build an identity (no-scaler) colour-bar case at 1920×1200 for
+/// `profile` with the given capability prereqs. `floors` is unused by
+/// the colour assertion but required by the struct; `FLOOR_IDENTITY`
+/// keeps it honest if a future edit routes this through `assert_outcome`.
+fn colorbars_case(
+    name: &'static str,
+    profile: VideoProfile,
+    requires: &'static [Capability],
+) -> RoundtripCase {
+    RoundtripCase {
+        name,
+        profile,
+        fixture: Fixture::ColorBars,
+        capture_dims: (1920, 1200),
+        encode_dims: (1920, 1200),
+        surface_dims: (1920, 1200),
+        frames_encoded: 6,
+        assert_steady_state_eps: None,
+        color_space: VideoColorSpec::sdr_desktop(),
+        requires,
+        floors: FLOOR_IDENTITY,
+    }
+}
+
+#[test]
+#[ignore = "requires VAAPI H.264 + Vulkan dma-buf import"]
+fn roundtrip_colorbars_h264_8bit() {
+    let case = colorbars_case(
+        "colorbars_h264_8bit",
+        H264_8BIT_420,
+        &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+#[test]
+#[ignore = "requires VAAPI HEVC Main + Vulkan dma-buf import"]
+fn roundtrip_colorbars_hevc_main_8bit() {
+    let case = colorbars_case(
+        "colorbars_hevc_main_8bit",
+        HEVC_MAIN_8BIT,
+        &[Capability::VaapiHevcMain, Capability::VulkanDmaBufImport],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+#[test]
+#[ignore = "requires VAAPI HEVC Main 10 (P010) + storage R16/Rg16; may SKIP on Intel iHD/Meteor Lake"]
+fn roundtrip_colorbars_hevc_main10() {
+    let case = colorbars_case(
+        "colorbars_hevc_main10",
+        HEVC_MAIN10,
+        &[
+            Capability::VaapiHevcMain10DmaBuf,
+            Capability::VulkanDmaBufImport,
+            Capability::BitDepth10RendererSupport,
+        ],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 8-bit (XYUV) + Vulkan dma-buf import"]
+fn roundtrip_colorbars_hevc_main444_8bit() {
+    let case = colorbars_case(
+        "colorbars_hevc_main444_8bit",
+        HEVC_MAIN444_8BIT,
+        &[Capability::VaapiHevcMain444, Capability::VulkanDmaBufImport],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+/// The host path that produces the live purple cast: HEVC 4:4:4 10-bit
+/// via `Bgra2Xv30DmaBuf`. If the host miscolors 4:4:4 10-bit, the white
+/// bar comes back tinted here even though SSIM/geom stay green.
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit (XV30) + storage R16/Rg16 + Vulkan dma-buf import"]
+fn roundtrip_colorbars_hevc_main444_10bit() {
+    let case = colorbars_case(
+        "colorbars_hevc_main444_10bit",
+        HEVC_MAIN444_10BIT,
+        &[
+            Capability::VaapiHevcMain444_10DmaBuf,
+            Capability::VulkanDmaBufImport,
+            Capability::BitDepth10RendererSupport,
+        ],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+// =====================================================================
 // Per-cell floors — derived from a green-main run on a real VAAPI box
 // (Intel iHD, Mesa, dev workstation, 2026-05-22). Thresholds sit at
 // `observed - 0.01` (SSIM) / `observed - 1.5 dB` (PSNR-Y) / `observed +

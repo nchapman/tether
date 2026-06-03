@@ -120,6 +120,13 @@ pub(crate) enum Fixture {
     /// channel-swapped to BGRA. Use for photometric cells where
     /// per-pixel coordinate encoding isn't applicable.
     Png(&'static str),
+    /// Procedural BGRA colour-bar pattern (red/green/blue/white) from
+    /// [`crate::color_fixture::colorbars_bgra`]. The cross-platform
+    /// colour-decode fixture: `CoordEncoded` has near-constant chroma so
+    /// it can't catch a hue cast / Cb/Cr swap. Geometric residual is
+    /// skipped (not coordinate-encoded); the caller asserts colour on the
+    /// readback via [`crate::color_fixture::assert_colorbars`].
+    ColorBars,
 }
 
 /// Explicit prerequisites for a cell — declared on the struct so
@@ -317,7 +324,7 @@ pub(crate) fn run_roundtrip(case: &RoundtripCase) -> RoundtripResult {
             let map = LetterboxMap::new(case.capture_dims, case.surface_dims);
             coord_fixture_residual_px_rms(&readback_bgra, case.surface_dims, &map)
         }
-        Fixture::Png(_) => f64::NAN,
+        Fixture::Png(_) | Fixture::ColorBars => f64::NAN,
     };
     let ssim = ssim_rgb(
         &readback_bgra,
@@ -394,6 +401,7 @@ fn load_fixture(fixture: Fixture, dims: (u32, u32)) -> Vec<u8> {
             coord_fixture_fill(dims)
         }
         Fixture::Png(name) => load_png_fixture_at(name, dims),
+        Fixture::ColorBars => crate::color_fixture::colorbars_bgra(dims),
     }
 }
 

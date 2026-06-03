@@ -16,6 +16,11 @@ mod gpu;
 pub mod present_policy;
 pub mod relative_mouse;
 
+/// Shared cross-platform colour-bar fixture + assertion used by every
+/// platform's round-trip test harness.
+#[cfg(test)]
+mod color_fixture;
+
 #[cfg(all(test, target_os = "linux"))]
 mod dmabuf_test;
 

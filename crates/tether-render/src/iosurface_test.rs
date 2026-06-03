@@ -43,6 +43,7 @@ use tether_codec::videotoolbox::{VideoToolboxDecoder, VideoToolboxEncoder};
 use tether_codec::{Decoder, Encoder, Frame as CodecFrame, GpuFrameSource};
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
+use crate::color_fixture::{assert_colorbars, ChannelOrder};
 use crate::gpu;
 
 /// Reconstructed RGB of the two source regions (left, right) read back from the
@@ -730,59 +731,6 @@ fn render_fixture_to_rgba(profile: VideoProfile, bitstream: &[u8]) -> Option<(Ve
     Some((rgba, w, h))
 }
 
-/// Average RGB of the centre of colour-bar `index` (0..4) in a
-/// colour-bar fixture (four equal vertical bars: red, green, blue,
-/// white). Samples the middle half of the bar to stay clear of the
-/// chroma bleed at the bar boundaries — resolution-agnostic so the
-/// same assertion works at 128×128 and at realistic capture sizes.
-fn bar_rgb(rgba: &[u8], width: u32, height: u32, index: u32) -> (u8, u8, u8) {
-    let bar_w = width / 4;
-    region_average_rgb(
-        rgba,
-        width,
-        index * bar_w + bar_w / 4,
-        height / 4,
-        bar_w / 2,
-        height / 2,
-    )
-}
-
-/// Assert the four colour bars reconstruct to red / green / blue /
-/// white. Generous per-channel bounds (an HEVC + BT.709 limited-range
-/// round-trip can shift a channel by ~25) but tight enough to catch the
-/// real failure modes of the 4:4:4 chroma path:
-///   * a hue cast on neutrals — the **white** bar; a wrong chroma
-///     neutral point renders white as e.g. purple (the live bug);
-///   * a Cb/Cr swap — the red and blue bars trade places;
-///   * a dropped / inverted chroma channel — the green bar.
-fn assert_colorbars(label: &str, rgba: &[u8], width: u32, height: u32) {
-    let red = bar_rgb(rgba, width, height, 0);
-    let green = bar_rgb(rgba, width, height, 1);
-    let blue = bar_rgb(rgba, width, height, 2);
-    let white = bar_rgb(rgba, width, height, 3);
-    eprintln!("{label}: red={red:?} green={green:?} blue={blue:?} white={white:?}");
-    assert!(
-        red.0 > 130 && red.1 < 80 && red.2 < 80,
-        "{label}: bar 0 should be red; got {red:?}"
-    );
-    assert!(
-        green.1 > 110 && green.0 < 90 && green.2 < 90,
-        "{label}: bar 1 should be green; got {green:?}"
-    );
-    assert!(
-        blue.2 > 130 && blue.0 < 80 && blue.1 < 80,
-        "{label}: bar 2 should be blue; got {blue:?}"
-    );
-    let (wr, wg, wb) = white;
-    let wmin = wr.min(wg).min(wb);
-    let wspread = wr.max(wg).max(wb) - wmin;
-    assert!(
-        wmin > 150 && wspread < 45,
-        "{label}: bar 3 should be neutral white (R≈G≈B, all high) — a hue cast here is the \
-         'colors are wrong' bug; got {white:?}"
-    );
-}
-
 /// HEVC 4:4:4 8-bit (Main 4:4:4). Renderer-side colour coverage for the
 /// Linux-host → Mac-client path: `'444v'` NV24 IOSurface, full-res UV,
 /// biplanar R8 Y + Rg8 UV shader. VT can't encode Main444, so the
@@ -803,7 +751,7 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_8bit() {
     ) else {
         return;
     };
-    assert_colorbars("4:4:4 8-bit", &rgba, w, h);
+    assert_colorbars("4:4:4 8-bit", &rgba, w, h, ChannelOrder::Rgba);
 }
 
 /// HEVC 4:4:4 10-bit (Main 4:4:4 10): `'x444'`/`'xf44'` biplanar 16-bit
@@ -824,7 +772,7 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit() {
     ) else {
         return;
     };
-    assert_colorbars("4:4:4 10-bit", &rgba, w, h);
+    assert_colorbars("4:4:4 10-bit", &rgba, w, h, ChannelOrder::Rgba);
 }
 
 /// HEVC 4:4:4 10-bit at a realistic capture resolution (1920×1200).
@@ -848,7 +796,7 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit_1920x1200() {
     ) else {
         return;
     };
-    assert_colorbars("4:4:4 10-bit 1920×1200", &rgba, w, h);
+    assert_colorbars("4:4:4 10-bit 1920×1200", &rgba, w, h, ChannelOrder::Rgba);
 }
 
 /// Which input fixture to feed the host-scaler round-trip. Matches the

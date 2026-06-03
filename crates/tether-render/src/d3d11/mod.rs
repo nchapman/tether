@@ -1330,16 +1330,33 @@ mod tests {
     #[test]
     #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
     fn d3d11_coord_fixture_decode_render_roundtrip_8bit() {
-        coord_fixture_roundtrip(8);
+        d3d11_roundtrip(8, false);
     }
 
     #[test]
     #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10)"]
     fn d3d11_coord_fixture_decode_render_roundtrip_10bit() {
-        coord_fixture_roundtrip(10);
+        d3d11_roundtrip(10, false);
     }
 
-    fn coord_fixture_roundtrip(bit_depth: u8) {
+    /// Colour-decode validation: red/green/blue/white bars through the
+    /// production QSV encode → D3D11VA decode → native D3D11 render path.
+    /// CoordEncoded's near-constant chroma can't catch a hue cast / Cb/Cr
+    /// swap; the white bar here can. Shared pattern with macOS/Linux via
+    /// `crate::color_fixture`. Windows is 4:2:0 only (NV12 / P010).
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    fn d3d11_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(8, true);
+    }
+
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10)"]
+    fn d3d11_colorbars_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(10, true);
+    }
+
+    fn d3d11_roundtrip(bit_depth: u8, colorbars: bool) {
         use tether_codec::d3d11::{D3D11Decoder, D3D11Encoder};
         use tether_codec::{D3D11TextureFrame, Decoder, Encoder, Frame as CodecFrame};
         use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
@@ -1396,9 +1413,13 @@ mod tests {
             return;
         }
 
-        // Coordinate-fixture BGRA source at capture==encode dims (identity
-        // VP scale keeps the residual a pure encode/decode/render metric).
-        let fixture = coord_fixture_fill((w, h));
+        // BGRA source at capture==encode dims (identity VP scale keeps
+        // the metric a pure encode/decode/render measurement).
+        let fixture = if colorbars {
+            crate::color_fixture::colorbars_bgra((w, h))
+        } else {
+            coord_fixture_fill((w, h))
+        };
         let tex_desc = D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
@@ -1494,19 +1515,29 @@ mod tests {
         state.render().expect("render");
         let bgra = state.read_back_bgra();
 
-        let map = LetterboxMap::new((w, h), (w, h));
-        let residual = coord_fixture_residual_px_rms(&bgra, (w, h), &map);
-        let mid = (((h / 2) * w + (w / 2)) * 4) as usize;
-        eprintln!(
-            "coord-fixture residual = {residual:.1}px  center BGRA = ({}, {}, {})",
-            bgra[mid],
-            bgra[mid + 1],
-            bgra[mid + 2]
-        );
-        assert!(
-            residual < 80.0,
-            "geometric residual {residual:.1}px too high — decode-export or render corruption \
-             (uniform-green / scrambled chroma blows this metric past the quantisation floor)"
-        );
+        if colorbars {
+            crate::color_fixture::assert_colorbars(
+                "d3d11 colorbars",
+                &bgra,
+                w,
+                h,
+                crate::color_fixture::ChannelOrder::Bgra,
+            );
+        } else {
+            let map = LetterboxMap::new((w, h), (w, h));
+            let residual = coord_fixture_residual_px_rms(&bgra, (w, h), &map);
+            let mid = (((h / 2) * w + (w / 2)) * 4) as usize;
+            eprintln!(
+                "coord-fixture residual = {residual:.1}px  center BGRA = ({}, {}, {})",
+                bgra[mid],
+                bgra[mid + 1],
+                bgra[mid + 2]
+            );
+            assert!(
+                residual < 80.0,
+                "geometric residual {residual:.1}px too high — decode-export or render corruption \
+                 (uniform-green / scrambled chroma blows this metric past the quantisation floor)"
+            );
+        }
     }
 }

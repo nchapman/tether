@@ -348,6 +348,67 @@ pub(crate) fn run_roundtrip(case: &RoundtripCase) -> RoundtripResult {
     })
 }
 
+/// Decode a **committed conformant reference bitstream** (encoded
+/// off-platform by libx265, not by our own encoder) through the real
+/// VAAPI decode → import → shader path and return the rendered BGRA at
+/// `surface_dims`. `None` is a capability SKIP (no panic), so callers
+/// degrade loudly on a driver/feature gap.
+///
+/// This is the conformance anchor `run_roundtrip` structurally cannot be.
+/// The round-trip encodes with our own pass and decodes with our own
+/// shader, so it only proves the two agree with *each other*: a packing
+/// convention that is wrong-but-symmetric (e.g. a Y↔Cb lane swap in the
+/// XV30/Y410 10:10:10:2 word) round-trips at SSIM≈1.0 while emitting a
+/// bitstream that any conformant decoder — macOS VideoToolbox — mis-renders
+/// (luma lands on the blue-yellow axis as a bright→purple / dark→olive
+/// cast). Feeding a reference stream pins the decode side to the standard;
+/// combined with a passing round-trip it transitively pins the encode
+/// side too (conformant decode + faithful round-trip ⟹ conformant encode).
+pub(crate) fn render_reference_bitstream(
+    profile: VideoProfile,
+    bitstream: &[u8],
+    surface_dims: (u32, u32),
+    color_space: VideoColorSpec,
+) -> Option<Vec<u8>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (device, queue) =
+        pollster::block_on(try_init_wgpu_for_dmabuf(profile.bit_depth)).map(|(d, q, _)| (d, q))?;
+
+    let packets = vec![tether_codec::EncodedPacket {
+        data: bitstream.to_vec().into(),
+        pts: Some(0),
+        keyframe: true,
+    }];
+    // `decode_all` returns empty on a decoder/driver gap (it SKIP-logs);
+    // an empty result here is the capability SKIP, surfaced as `None`.
+    let frame = decode_all(profile, &packets, surface_dims)
+        .into_iter()
+        .last()?;
+
+    let mut renderer = GpuState::new_headless(
+        device.clone(),
+        queue.clone(),
+        surface_dims,
+        color_space,
+        profile.chroma,
+        profile.bit_depth,
+    )
+    .ok()?;
+
+    let (w, h, _pts, source, guard) = frame.into_parts();
+    renderer
+        .apply_frame(Frame::Gpu(RenderGpuFrame {
+            width: w,
+            height: h,
+            t_capture_client_clock: None,
+            source,
+            guard,
+        }))
+        .expect("apply_frame");
+    renderer.render().expect("render");
+    Some(readback_offscreen(&renderer, &device))
+}
+
 // =====================================================================
 // Capability + adapter setup
 // =====================================================================

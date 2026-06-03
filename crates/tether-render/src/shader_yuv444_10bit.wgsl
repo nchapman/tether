@@ -5,16 +5,22 @@
 // as VK_FORMAT_A2B10G10R10_UNORM_PACK32 / wgpu `Rgb10a2Unorm`): one
 // 32-bit 10:10:10:2 word per pixel.
 //
-//   Channel mapping (EMPIRICALLY VERIFIED, not the DRM-standard reading):
-//     .r = Y, .g = U, .b = V, .a = don't-care
+//   Channel mapping (DRM_FORMAT_Y410 / AV_PIX_FMT_Y410LE spec order):
+//     .r = U(Cb), .g = Y, .b = V(Cr), .a = don't-care
 //
-//   Intel's media-driver emits Y410 with the SAME Rgb10a2 channel→
-//   component layout it consumes as XV30 input (see the encode-side
-//   `bgra_to_xv30.wgsl`, which packs R=Y/G=U/B=V) — *not* the
-//   DRM_FORMAT_Y410 spec order ("A:Cr:Y:Cb" → R=Cb). Reading it the
-//   spec way scrambles the channels: the `roundtrip_hevc_main444_10bit_
-//   identity` hardware cell drops to SSIM≈0.75 / 9.6 dB on the spec
-//   order and passes at SSIM≈0.998 / 61.7 dB on this one.
+//   Y410 is the decode-output sibling of the encoder-input XV30 — same
+//   "[31:0] X:Cr:Y:Cb" packing (bits[9:0]=Cb→R, bits[19:10]=Y→G,
+//   bits[29:20]=Cr→B). This must match the encode-side `bgra_to_xv30.wgsl`
+//   lane order, which is pinned to XV30LE's pixdesc.
+//
+//   NOTE: an earlier revision read this back as .r=Y/.g=U to match a
+//   then-swapped encoder. That round-trips with high SSIM (the two swaps
+//   cancel) but is NOT conformance — the `roundtrip_*_identity` hardware
+//   cell only proves encode and decode agree with *each other*, not with
+//   the standard. The SSIM≈0.75 "on spec order" figure was measured
+//   against the broken encoder's output, not against a reference stream.
+//   The real guard is decoding a conformant reference fixture
+//   (`colorbars_hevc_yuv444_10bit.idr`); see `dmabuf_test.rs`.
 //
 // Unlike P010/P410 (10-bit MSB-aligned in a 16-bit `R16Unorm` cell, which
 // the sampler reads back as `value*64/65535`), `Rgb10a2Unorm` is a native
@@ -114,14 +120,12 @@ fn apply_eotf(rgb_gamma: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    // Channel mapping mirrors the encoder side (`bgra_to_xv30.wgsl`):
-    // .r = Y, .g = U, .b = V. Intel's VAAPI decoder emits Y410 with the
-    // same Rgb10a2 channel→component layout it consumed as XV30, so the
-    // import unpacks exactly what the encode pass packed. (Pinned by the
-    // `roundtrip_hevc_main444_10bit_identity` hardware cell.)
+    // Y410 spec lane order (bits[9:0]=Cb→.r, bits[19:10]=Y→.g,
+    // bits[29:20]=Cr→.b), mirroring the conformant XV30LE encode pack in
+    // `bgra_to_xv30.wgsl`.
     let p = textureSample(packed_tex, s, in.uv);
-    let y = limited_y_to_normalized(p.r);
-    let u = limited_c_to_normalized(p.g);
+    let y = limited_y_to_normalized(p.g);
+    let u = limited_c_to_normalized(p.r);
     let v = limited_c_to_normalized(p.b);
 
     let rgb_gamma = bt709_ycbcr_to_rgb_gamma(y, u, v);

@@ -30,7 +30,8 @@ use crate::{
 };
 
 /// One frame's worth of packed XV30 — a single dma-buf fd carrying one
-/// `R=Y, G=U, B=V, A=X` packed 10:10:10:2 plane.
+/// `R=U, G=Y, B=V, A=X` packed 10:10:10:2 plane (XV30LE "X:Cr:Y:Cb" lane
+/// order: bits[9:0]=Cb, bits[19:10]=Y, bits[29:20]=Cr).
 ///
 /// Field shape matches [`crate::yuv444_dmabuf::Yuv444DmaBufFrame`]; the
 /// downstream encoder doesn't distinguish 8-bit from 10-bit at this
@@ -518,9 +519,9 @@ mod tests {
     /// BGRA through it, re-import the packed XV30 plane, read it back
     /// as 32-bit words, and assert each pixel has the expected 10-bit
     /// Y / U / V code values for BT.709 limited-range. Catches both
-    /// the colour math and the R=Y / G=U / B=V / A=X channel mapping
-    /// — a shader that wrote (Y, V, U, X) into RGBA would still get
-    /// the right Y for solid white but U and V would swap.
+    /// the colour math and the R=U / G=Y / B=V / A=X channel mapping
+    /// (XV30LE "X:Cr:Y:Cb") — the red cell additionally catches a U↔V
+    /// swap, since pure red has very distinct Cb vs Cr codes.
     #[test]
     #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF and Rgb10a2Unorm storage"]
     fn convert_solid_white_roundtrip_packed_xv30() {
@@ -558,9 +559,12 @@ mod tests {
 
         // BT.709 limited-range 10-bit for pure white:
         //   Y = 940, U = V = 512.
-        // DRM_FORMAT_XV30: [31:30]X | [29:20]V | [19:10]U | [9:0]Y.
-        let extract_y = |w: u32| w & 0x3FF;
-        let extract_u = |w: u32| (w >> 10) & 0x3FF;
+        // DRM_FORMAT_XV30 (Y410 family, "[31:0] X:Cr:Y:Cb"):
+        //   [31:30]X | [29:20]Cr | [19:10]Y | [9:0]Cb. (Was extracted with
+        //   Y↔Cb swapped, which is why this passed against a swapped pack
+        //   while macOS VideoToolbox rendered the live stream purple.)
+        let extract_u = |w: u32| w & 0x3FF;
+        let extract_y = |w: u32| (w >> 10) & 0x3FF;
         let extract_v = |w: u32| (w >> 20) & 0x3FF;
         let assert_near = |label: &str, got: u32, expected: u32| {
             let diff = i64::from(got) - i64::from(expected);
@@ -625,8 +629,10 @@ mod tests {
         //   Y' = 0.2126                  → Y  = 64 + 876 * 0.2126 ≈ 250
         //   U  = -0.11457                → Cb = 512 + 896 * -0.11457 ≈ 409
         //   V  =  0.50000                → Cr = 512 + 896 *  0.5     = 960
-        let extract_y = |w: u32| w & 0x3FF;
-        let extract_u = |w: u32| (w >> 10) & 0x3FF;
+        // XV30 "[31:0] X:Cr:Y:Cb": Cb in bits[9:0], Y in bits[19:10],
+        // Cr in bits[29:20].
+        let extract_u = |w: u32| w & 0x3FF;
+        let extract_y = |w: u32| (w >> 10) & 0x3FF;
         let extract_v = |w: u32| (w >> 20) & 0x3FF;
         let assert_near = |label: &str, got: u32, expected: u32| {
             let diff = i64::from(got) - i64::from(expected);

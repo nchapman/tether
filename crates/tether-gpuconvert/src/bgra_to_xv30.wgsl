@@ -2,18 +2,32 @@
 //
 // XV30 (DRM_FORMAT_XV30 / VK_FORMAT_A2B10G10R10_UNORM_PACK32 /
 // AV_PIX_FMT_XV30LE) is a single-plane packed 10:10:10:2 layout. Each
-// pixel is one little-endian 32-bit word:
+// pixel is one little-endian 32-bit word. The component order is the
+// Y410 family — DRM_FORMAT_Y410 documents it as "[31:0] X:Cr:Y:Cb" and
+// FFmpeg's `AV_PIX_FMT_XV30LE` pixdesc (the literal definition of what
+// the VAAPI encoder reads off this surface) pins it as:
+//   U(Cb) → byte 0 shift 0 → bits[ 9: 0]
+//   Y     → byte 1 shift 2 → bits[19:10]
+//   V(Cr) → byte 2 shift 4 → bits[29:20]
+//   X     → byte 3 shift 6 → bits[31:30]
 //
 //   bits [31:30] X (unused / 2-bit padding)
-//   bits [29:20] V
-//   bits [19:10] U
-//   bits [ 9: 0] Y
+//   bits [29:20] V (Cr)
+//   bits [19:10] Y
+//   bits [ 9: 0] U (Cb)
 //
 // In Vulkan's A2B10G10R10_UNORM_PACK32 channel mapping (R→[9:0],
 // G→[19:10], B→[29:20], A→[31:30]) and the corresponding wgpu
 // `Rgb10a2Unorm` storage texture, that lands as:
 //
-//   R = Y, G = U, B = V, A = X
+//   R = U, G = Y, B = V, A = X
+//
+// (An earlier revision packed R=Y/G=U here and the Y410 decode shader
+// read it back the same way. That round-trips with high SSIM on Linux
+// because the two swaps cancel — but the bitstream it produces is
+// non-conformant: its coded luma plane carries Cb. A spec decoder
+// (macOS VideoToolbox) plays it straight and the luminance lands on the
+// blue-yellow axis as a bright→purple / dark→olive cast. Keep R=U/G=Y.)
 //
 // `textureStore` on `rgb10a2unorm` writes `round(clamp(v, 0, 1) * 1023)`
 // for R/G/B and `round(clamp(v, 0, 1) * 3)` for A. The 10-bit value
@@ -76,7 +90,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rgb = textureLoad(src, coord, 0).rgb;
     let y = rgb_to_y(rgb);
     let uv = rgb_to_uv(rgb);
-    // R=Y, G=U, B=V, A=X. The 2-bit A is unused per VAAPI; write 1.0
+    // R=U, G=Y, B=V, A=X — XV30LE lane order (bits[9:0]=Cb, bits[19:10]=Y,
+    // bits[29:20]=Cr). The 2-bit A is unused per VAAPI; write 1.0
     // (saturates to 0b11) so unsuspecting readers see a defined value.
-    textureStore(packed_dst, coord, vec4<f32>(y, uv.x, uv.y, 1.0));
+    textureStore(packed_dst, coord, vec4<f32>(uv.x, y, uv.y, 1.0));
 }

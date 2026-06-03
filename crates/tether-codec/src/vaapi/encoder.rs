@@ -1001,8 +1001,8 @@ fn vaapi_codec_name(kind: CodecKind) -> &'static str {
 /// - `XYUV` — 4:4:4 8-bit packed 32 bpp (V,U,Y,X bytes LE);
 ///   AV_PIX_FMT_VUYX. The only 4:4:4 8-bit format in
 ///   `vaapi_drm_format_map`.
-/// - `XV30` — 4:4:4 10-bit packed 10:10:10:2 (V:U:Y:X);
-///   AV_PIX_FMT_XV30LE. No gpuconvert bridge produces this today; the
+/// - `XV30` — 4:4:4 10-bit packed 10:10:10:2 ("X:Cr:Y:Cb": bits[9:0]=Cb,
+///   bits[19:10]=Y, bits[29:20]=Cr); AV_PIX_FMT_XV30LE. The
 ///   entry is preserved so adding an XV30 bridge later doesn't need
 ///   to touch this table.
 pub fn expected_dmabuf_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {

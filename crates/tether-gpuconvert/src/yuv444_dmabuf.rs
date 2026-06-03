@@ -521,4 +521,102 @@ mod tests {
             // (the alpha channel) but a consumer must not rely on it.
         }
     }
+
+    /// Chroma-distinguishing sibling of the white cell. White has
+    /// U=V=128, so it cannot catch a Cb↔Cr swap or a wrong chroma matrix
+    /// row — only the byte *position* (V vs U) and luma. Pure red has
+    /// very distinct Cb vs Cr (102 vs 240), so this cell pins the actual
+    /// chroma math and a U↔V swap. Asserts against the BT.709 limited-
+    /// range spec directly (the compliant reference), not a round-trip.
+    #[test]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    fn convert_solid_red_roundtrip_packed_xyuv() {
+        let width = 64u32;
+        let height = 32u32;
+
+        let bridge = match pollster::block_on(Yuv444DmaBuf::new(width, height)) {
+            Ok(b) => b,
+            Err(Yuv444DmaBufError::NoAdapter | Yuv444DmaBufError::FeatureUnsupported) => {
+                eprintln!("SKIP: no wgpu adapter with DMA-BUF export feature");
+                return;
+            }
+            Err(e) => panic!("Yuv444DmaBuf::new: {e}"),
+        };
+
+        let src = bridge.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("test bgra red"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let n = (width * height) as usize;
+        // BGRA layout: B, G, R, A. Pure red = (0, 0, 255, 255).
+        let mut bgra = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            bgra.extend_from_slice(&[0, 0, 255, 255]);
+        }
+        bridge.queue().write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bgra,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let out = bridge.convert(&src).expect("convert");
+
+        let packed = read_packed(
+            &bridge,
+            out.fd.try_clone().expect("dup fd"),
+            out.modifier,
+            out.stride,
+            out.offset,
+            width,
+            height,
+        );
+
+        // BT.709 limited-range 8-bit, pure red (R=1, G=0, B=0):
+        //   Y  = round(0.2126 * 219 + 16)           = 63
+        //   Cb = round(-0.11457 * 224 + 128)        = 102
+        //   Cr = round( 0.50000 * 224 + 128)        = 240
+        // DRM_FORMAT_XYUV8888 byte order [V, U, Y, X]: Cr/Cb are far
+        // enough apart (240 vs 102) that a U↔V swap fails loudly.
+        let assert_near = |label: &str, got: u8, expected: u8| {
+            let diff = i32::from(got) - i32::from(expected);
+            assert!(
+                diff.abs() <= 2,
+                "{label} = {got}, expected ~{expected} (diff {diff})"
+            );
+        };
+        for &(x, y) in &[
+            (0u32, 0u32),
+            (width / 2, height / 2),
+            (width - 1, height - 1),
+        ] {
+            let idx = ((y * width + x) * 4) as usize;
+            assert_near(&format!("V[{x},{y}]"), packed[idx], 240);
+            assert_near(&format!("U[{x},{y}]"), packed[idx + 1], 102);
+            assert_near(&format!("Y[{x},{y}]"), packed[idx + 2], 63);
+        }
+    }
 }

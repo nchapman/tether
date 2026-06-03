@@ -311,6 +311,39 @@ fn roundtrip_colorbars_hevc_main444_10bit() {
     assert_colorbars_outcome(&case, run_roundtrip(&case));
 }
 
+/// Conformance anchor for the 4:4:4 10-bit decode path. The round-trip
+/// cell above encodes with our own gpuconvert pass and decodes with our
+/// own shader, so it cannot catch a wrong-but-symmetric packing (a Y↔Cb
+/// lane swap round-trips at SSIM≈1.0 yet ships a non-conformant bitstream
+/// that macOS VideoToolbox renders as the bright→purple / dark→olive
+/// cast). This cell instead decodes the committed **reference** bitstream
+/// (libx265-encoded, standards-correct — the exact fixture the macOS
+/// `iosurface_test` cell decodes) through the real VAAPI Y410 → import →
+/// shader path, pinning the decode side to the standard. Decode-conformant
+/// here + a passing round-trip above ⟹ the encode side is conformant too.
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit (Y410) + storage R16/Rg16 + Vulkan dma-buf import"]
+fn decode_reference_colorbars_hevc_main444_10bit() {
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_10bit_1920x1200.idr");
+    let dims = (1920, 1200);
+    let Some(bgra) = crate::test_harness::render_reference_bitstream(
+        HEVC_MAIN444_10BIT,
+        FIXTURE,
+        dims,
+        VideoColorSpec::sdr_desktop(),
+    ) else {
+        eprintln!("SKIPPED decode_reference_colorbars_hevc_main444_10bit: VAAPI/Vulkan 4:4:4 10-bit decode unavailable");
+        return;
+    };
+    crate::color_fixture::assert_colorbars(
+        "ref 4:4:4 10-bit",
+        &bgra,
+        dims.0,
+        dims.1,
+        crate::color_fixture::ChannelOrder::Bgra,
+    );
+}
+
 // =====================================================================
 // Per-cell floors — derived from a green-main run on a real VAAPI box
 // (Intel iHD, Mesa, dev workstation, 2026-05-22). Thresholds sit at

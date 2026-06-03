@@ -25,7 +25,6 @@
 /// limited-range clamp doesn't have to handle super-white / -black
 /// excursions — the bars stay unambiguously their colour after the
 /// BT.709 limited round-trip.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn colorbars_bgra(dims: (u32, u32)) -> Vec<u8> {
     let (w, h) = dims;
     let bar = (w / 4).max(1);

@@ -1,11 +1,12 @@
 //! macOS screen capture via ScreenCaptureKit.
 //!
 //! Calling [`start`] discovers the primary display via `SCShareableContent`,
-//! builds an NV12 (`YCbCr_420v`) stream, and spawns a delegate that emits
-//! one [`CapturedFrame::Gpu`] per `CMSampleBuffer` carrying a live
-//! `IOSurface`. The sample-buffer dispatch queue is owned by SCK; we
-//! retain each `CMSampleBuffer` in the per-frame `release_guard` so the
-//! underlying IOSurface stays valid until the consumer drops the frame.
+//! builds a stream for the requested pixel format (BGRA in the live macOS
+//! host path), and spawns a delegate that emits one [`CapturedFrame::Gpu`]
+//! per `CMSampleBuffer` carrying a live `IOSurface`. The sample-buffer
+//! dispatch queue is owned by SCK; we retain each `CMSampleBuffer` in the
+//! per-frame `release_guard` so the underlying IOSurface stays valid until
+//! the consumer drops the frame.
 //!
 //! Permission model: the first `start_capture` call triggers the macOS
 //! ScreenRecording TCC prompt. There's no synchronous preflight that
@@ -22,11 +23,11 @@
 //! callbacks without leaking it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use std::sync::atomic::AtomicU32;
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
 use screencapturekit::cv::CVPixelBuffer;
 use screencapturekit::prelude::{
@@ -35,12 +36,12 @@ use screencapturekit::prelude::{
 };
 use screencapturekit::stream::configuration::SCCaptureResolutionType;
 use screencapturekit::FourCharCode;
-use tether_protocol::control::{ChromaSubsampling, VideoProfile, Viewport};
+use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 use tether_protocol::MonoNanos;
 
 use crate::{
-    damage::NativeDamage, CaptureError, CaptureHandle, CaptureViewportHandle, CapturedFrame,
-    CapturedIOSurface, GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, Result,
+    damage::NativeDamage, CaptureError, CaptureHandle, CapturedFrame, CapturedIOSurface,
+    GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, Result,
 };
 
 /// Channel depth matches the Linux path's `CAPTURE_CHANNEL_DEPTH` — small,
@@ -71,7 +72,7 @@ const ENV_SCK_CAPTURE_SIZE: &str = "TETHER_SCK_CAPTURE_SIZE";
 /// Runs [`probe_capture_pixel_formats`] first and logs the result, so
 /// every host startup leaves an empirical "what could this Mac do?"
 /// alongside "what are we asking it for?" record.
-pub async fn start(pixel_format: PixelFormat, viewport: Option<Viewport>) -> Result<CaptureHandle> {
+pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
     // The capability probe shares the SCK TCC prompt with the real
     // session — first attempt to start a stream triggers ScreenRecording
     // permission once per process. Whether the prompt fires from a
@@ -104,21 +105,13 @@ pub async fn start(pixel_format: PixelFormat, viewport: Option<Viewport>) -> Res
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
     let (ready_tx, ready_rx) = bounded::<Result<CaptureReady>>(1);
-    let (viewport_tx, viewport_rx) = unbounded::<Option<Viewport>>();
     let stop = Arc::new(AtomicBool::new(false));
 
     let stop_thread = Arc::clone(&stop);
     std::thread::Builder::new()
         .name("tether-capture-sck".into())
         .spawn(move || {
-            run_capture_thread(
-                tx,
-                ready_tx,
-                stop_thread,
-                pixel_format,
-                viewport,
-                viewport_rx,
-            );
+            run_capture_thread(tx, ready_tx, stop_thread, pixel_format);
         })?;
 
     // Block on the readiness signal from the capture thread without
@@ -139,23 +132,15 @@ pub async fn start(pixel_format: PixelFormat, viewport: Option<Viewport>) -> Res
     // observable via `CaptureHandle::target_fps` but don't change
     // the actual SCK cadence — see `CaptureHandle` docs.
     let target_fps = Arc::new(AtomicU32::new(CAPTURE_FPS));
-    let cursor_source = crate::cursor_macos::start_shared(ready.cursor_geom.inner());
-    Ok(CaptureHandle::from_parts(rx, target_fps)
-        .with_cursor_source(cursor_source)
-        .with_viewport_handle(CaptureViewportHandle::new(viewport_tx)))
+    let cursor_source = crate::cursor_macos::start(ready.cursor_geom);
+    Ok(CaptureHandle::from_parts(rx, target_fps).with_cursor_source(cursor_source))
 }
 
 /// Geometry of the live capture stream, plumbed from the capture
 /// thread back to `start` so it can hand the cursor source the
 /// point-to-pixel scale.
-#[derive(Clone, Copy, Debug)]
-struct CaptureGeometry {
-    raw_pixel_w: u32,
-    raw_pixel_h: u32,
-}
-
 struct CaptureReady {
-    cursor_geom: SharedCaptureGeometry,
+    cursor_geom: crate::cursor_macos::CaptureGeometry,
 }
 
 /// Drive the SCStream lifecycle on a dedicated thread.
@@ -171,60 +156,22 @@ fn run_capture_thread(
     ready_tx: Sender<Result<CaptureReady>>,
     stop: Arc<AtomicBool>,
     pixel_format: PixelFormat,
-    viewport: Option<Viewport>,
-    viewport_rx: Receiver<Option<Viewport>>,
 ) {
     let stop_handler = Arc::clone(&stop);
-    let (stream, geom, cursor_geom) =
-        match build_and_start_stream(tx, stop_handler, pixel_format, viewport) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        };
-    let _ = ready_tx.send(Ok(CaptureReady {
-        cursor_geom: cursor_geom.clone(),
-    }));
+    let (stream, cursor_geom) = match build_and_start_stream(tx, stop_handler, pixel_format) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+    let _ = ready_tx.send(Ok(CaptureReady { cursor_geom }));
 
     // Park until the frame handler signals shutdown. SCK delivers
     // samples on its own dispatch queue, so this thread has nothing to
     // do besides keep the stream alive.
     while !stop.load(Ordering::Acquire) {
-        match viewport_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(viewport) => {
-                let dims = sck_configured_capture_dims(geom.raw_pixel_w, geom.raw_pixel_h);
-                let (width, height) = (dims.width, dims.height);
-                if (width, height) == cursor_geom.capture_dims() {
-                    continue;
-                }
-                let config = stream_config(pixel_format, width, height);
-                match stream.update_configuration(&config) {
-                    Ok(()) => {
-                        cursor_geom.set_capture_dims(width, height);
-                        tracing::info!(
-                            capture_w = width,
-                            capture_h = height,
-                            viewport_w = viewport.map(|v| v.width),
-                            viewport_h = viewport.map(|v| v.height),
-                            capture_resolution = %SCCaptureResolutionType::Best,
-                            capture_size_override = dims.override_label.as_deref(),
-                            "SCK stream configuration updated"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            capture_w = width,
-                            capture_h = height,
-                            "SCStream::update_configuration failed; keeping previous capture dims"
-                        );
-                    }
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        }
+        std::thread::park_timeout(std::time::Duration::from_millis(100));
     }
 
     if let Err(e) = stream.stop_capture() {
@@ -237,8 +184,7 @@ fn build_and_start_stream(
     tx: Sender<CapturedFrame>,
     stop: Arc<AtomicBool>,
     pixel_format: PixelFormat,
-    viewport: Option<Viewport>,
-) -> Result<(SCStream, CaptureGeometry, SharedCaptureGeometry)> {
+) -> Result<(SCStream, crate::cursor_macos::CaptureGeometry)> {
     let content = SCShareableContent::get()?;
     let primary =
         content.displays().into_iter().next().ok_or_else(|| {
@@ -302,8 +248,6 @@ fn build_and_start_stream(
         logical_h,
         raw_pixel_w = raw_w,
         raw_pixel_h = raw_h,
-        viewport_w = viewport.map(|v| v.width),
-        viewport_h = viewport.map(|v| v.height),
         capture_w = width,
         capture_h = height,
         fps = CAPTURE_FPS,
@@ -325,12 +269,12 @@ fn build_and_start_stream(
 
     let mut stream = SCStream::new(&filter, &config);
     let thread_handle = std::thread::current();
-    let shared_geom = SharedCaptureGeometry::new(crate::cursor_macos::CaptureGeometry {
+    let cursor_geom = crate::cursor_macos::CaptureGeometry {
         logical_point_w: f64::from(logical_w),
         logical_point_h: f64::from(logical_h),
         capture_pixel_w: width,
         capture_pixel_h: height,
-    });
+    };
     let handler = FrameHandler {
         tx,
         stop,
@@ -338,42 +282,7 @@ fn build_and_start_stream(
     };
     stream.add_output_handler(handler, SCStreamOutputType::Screen);
     stream.start_capture()?;
-    let geom = CaptureGeometry {
-        raw_pixel_w: raw_w,
-        raw_pixel_h: raw_h,
-    };
-    Ok((stream, geom, shared_geom))
-}
-
-#[derive(Clone)]
-struct SharedCaptureGeometry {
-    inner: Arc<Mutex<crate::cursor_macos::CaptureGeometry>>,
-}
-
-impl SharedCaptureGeometry {
-    fn new(geom: crate::cursor_macos::CaptureGeometry) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(geom)),
-        }
-    }
-
-    fn inner(&self) -> Arc<Mutex<crate::cursor_macos::CaptureGeometry>> {
-        Arc::clone(&self.inner)
-    }
-
-    fn capture_dims(&self) -> (u32, u32) {
-        self.inner
-            .lock()
-            .map(|g| (g.capture_pixel_w, g.capture_pixel_h))
-            .unwrap_or((0, 0))
-    }
-
-    fn set_capture_dims(&self, width: u32, height: u32) {
-        if let Ok(mut geom) = self.inner.lock() {
-            geom.capture_pixel_w = width;
-            geom.capture_pixel_h = height;
-        }
-    }
+    Ok((stream, cursor_geom))
 }
 
 fn stream_config(pixel_format: PixelFormat, width: u32, height: u32) -> SCStreamConfiguration {

@@ -272,27 +272,12 @@ async fn main() -> anyhow::Result<()> {
         println!("cert dir:        {} (rm to rotate)", cert_dir.display());
     }
 
-    // Warm the SCK capture-capability cache *before* the first client
-    // connects. The probe runs eight short `SCStream::start_capture`
-    // cycles (~300–900 ms total wall time) and triggers the macOS
-    // ScreenRecording TCC prompt on first run. Running it lazily on
-    // first-connection inside `handle_client` straddles the
-    // application-layer clock-probe RTT measurement, biasing the
-    // negotiated `clock_offset` by ~half the probe duration and
-    // producing phantom hundred-millisecond `latency_ms` values for
-    // every frame stat that session. Running it here moves the
-    // probe out of the handshake's critical path entirely; the TCC
-    // prompt also fires on host launch (better UX than on first
-    // remote connect).
-    //
     // Warm the unified capability probe. `tether_probe::host_supported_profiles`
     // round-trips every `PROFILE_PREFERENCE` entry through the full
     // production chain (capture → bridge → encoder → decoder) and
-    // OnceLock-caches the result for process lifetime. This is one
-    // call that replaces what used to be three caches:
-    //   - tether-codec's supported_profiles
-    //   - tether-host's SCK_CAPS_CACHE (macOS)
-    //   - tether-host's LINUX_P010_DELIVERABLE_CACHE
+    // OnceLock-caches the result for process lifetime. This replaces
+    // the older per-backend cache warmers with one host-authoritative
+    // answer.
     // Running it here keeps the probe off the handshake's critical
     // path — see the historical comment about clock-sync offset bias.
     //
@@ -600,8 +585,6 @@ async fn handle_client(
         stream_ready,
     } = session;
     let initial_viewport = client_hello.viewport.filter(|v| v.is_valid());
-    #[cfg(target_os = "macos")]
-    let macos_bgra_bridge_enabled = !use_test_pattern;
 
     // `use_test_pattern` from here on only switches the capture source;
     // the handshake-time profile floor it implied is already baked into
@@ -653,7 +636,6 @@ async fn handle_client(
     // through. See `tether_capture::CaptureHandle` docs.
     let mut capture_handle =
         pick_capture_source(use_test_pattern, chosen_profile, initial_viewport).await?;
-    let capture_viewport_handle = capture_handle.viewport_handle();
     // Take the per-backend cursor source out before we drop the
     // handle. Wayland/PipeWire fills this with a `SPA_META_Cursor`
     // parser; the test-pattern and macOS-stub backends leave it
@@ -714,13 +696,6 @@ async fn handle_client(
     // Latest viewport-target the client has communicated. Seeded
     // from ClientHello; mutated by SetClientViewport.
     let latest_viewport: LatestViewport = Arc::new(StdMutex::new(ViewportState {
-        #[cfg(target_os = "macos")]
-        viewport: if use_test_pattern || macos_bgra_bridge_enabled {
-            initial_viewport
-        } else {
-            None
-        },
-        #[cfg(not(target_os = "macos"))]
         viewport: initial_viewport,
         seq: if initial_viewport.is_some() { 1 } else { 0 },
     }));
@@ -826,7 +801,6 @@ async fn handle_client(
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
         let force_idr_for_viewport = force_idr.clone();
-        let capture_viewport_for_ctl = capture_viewport_handle.clone();
         tasks.spawn(async move {
             // Per-message rate limit for IDR-triggering control messages.
             // A client flooding ForceIdr / RequestRecovery on the
@@ -959,20 +933,6 @@ async fn handle_client(
                             height = v.height,
                             "client viewport changed"
                         );
-                        #[cfg(target_os = "macos")]
-                        if !use_test_pattern && !macos_bgra_bridge_enabled {
-                            if let Some(handle) = &capture_viewport_for_ctl {
-                                let next = if v.is_valid() { Some(v) } else { None };
-                                handle.set_viewport(next);
-                            }
-                            tracing::debug!(
-                                width = v.width,
-                                height = v.height,
-                                "SetClientViewport forwarded to macOS SCK reconfiguration"
-                            );
-                            force_idr_for_viewport.raise();
-                            continue;
-                        }
                         // Latch the new viewport. The send thread
                         // notices the seq bump on its next iteration
                         // and rebuilds the encoder only if encode dims
@@ -3518,7 +3478,7 @@ async fn real_capture(
     // the single live conversion path: MPS Lanczos handles viewport
     // downscale, then the compute kernel writes the VideoToolbox input
     // fourcc for the negotiated chroma/bit-depth.
-    tether_capture::macos::start(tether_capture::macos::sck_bgra_pixel_format(), None)
+    tether_capture::macos::start(tether_capture::macos::sck_bgra_pixel_format())
         .await
         .map_err(anyhow::Error::from)
 }

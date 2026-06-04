@@ -84,12 +84,10 @@ pub struct CaptureGeometry {
 
 /// Build the source and spawn the poll thread.
 pub fn start(geom: CaptureGeometry) -> Box<dyn CursorSource> {
-    start_shared(Arc::new(Mutex::new(geom)))
+    start_with_shared_geometry(Arc::new(Mutex::new(geom)))
 }
 
-/// Build the source around shared geometry. The SCK backend uses this
-/// when live stream reconfiguration can change capture-pixel dims.
-pub fn start_shared(geom: Arc<Mutex<CaptureGeometry>>) -> Box<dyn CursorSource> {
+fn start_with_shared_geometry(geom: Arc<Mutex<CaptureGeometry>>) -> Box<dyn CursorSource> {
     let (shape_tx, shape_rx) = unbounded::<CursorEvent>();
     let position_state = Arc::new(Mutex::new(None::<CursorPosition>));
     let stop = Arc::new(AtomicBool::new(false));

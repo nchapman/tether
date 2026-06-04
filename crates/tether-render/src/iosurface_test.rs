@@ -1172,7 +1172,6 @@ fn iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix() {
 /// photometric region checks, coord-encoded for geometric residual.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // `SolidSplit` is API-surface; the existing region cells call `make_test_bgra` directly via the `_rgba` helper.
 enum HostScalerFixture {
     /// Solid red-left + blue-right BGRA split. Survives lossy
     /// encode well; targeted by region-average / seam-region tests.
@@ -1195,11 +1194,8 @@ fn host_scaler_input_bgra(w: u32, h: u32, fixture: HostScalerFixture) -> Vec<u8>
 }
 
 /// Artifacts produced by [`run_host_scaler_roundtrip_artifacts`]:
-/// the rendered downscaled output (BGRA at dst_dims) alongside a
-/// CPU reference for the same scaling (also BGRA at dst_dims).
-/// Mirrors the Linux harness's reference-vs-actual structure so
-/// metric helpers ([`assert_host_scaler_metrics`]) can run the
-/// same SSIM / Y-PSNR / geometric residual computations.
+/// the rendered downscaled output (BGRA at dst_dims) and its
+/// dimensions, used for structural assertions on the rendered output.
 #[cfg(target_os = "macos")]
 struct HostScalerArtifacts {
     /// Rendered output at `dst_dims`, packed BGRA (B, G, R, A). The
@@ -1208,16 +1204,7 @@ struct HostScalerArtifacts {
     /// (`ssim_rgb` is symmetric in channel order but `psnr_db_y_bgra`
     /// reads B from byte 0; both buffers must use the same layout).
     bgra_dst: Vec<u8>,
-    /// CPU reference: `cpu_mitchell_resize_bgra(input, src, dst)`.
-    /// Skips chroma roundtrip for the same reason the Linux harness
-    /// does — see `test_harness::build_reference`'s comment for
-    /// the swscale-limited-range vs textbook-full-range gap.
-    reference_bgra: Vec<u8>,
     dst_dims: (u32, u32),
-    /// Echo of the input for any cell that wants to e.g. compare
-    /// geometric residual at the source resolution.
-    #[allow(dead_code)]
-    input_bgra: Vec<u8>,
 }
 
 /// Wide-region averages (left half + right half, sampled away from
@@ -1497,7 +1484,7 @@ fn run_host_scaler_roundtrip_rgba(
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
 ) -> Option<Vec<u8>> {
-    let input_bgra = make_test_bgra(src_dims.0, src_dims.1);
+    let input_bgra = host_scaler_input_bgra(src_dims.0, src_dims.1, HostScalerFixture::SolidSplit);
     run_host_scaler_roundtrip_with_input(profile, src_dims, dst_dims, &input_bgra)
 }
 
@@ -1514,17 +1501,8 @@ fn run_host_scaler_roundtrip(
 }
 
 /// Artifact-returning wrapper: runs the full chain with the chosen
-/// fixture and returns both the rendered output (BGRA at dst_dims)
-/// and a CPU reference (Mitchell-downscaled input at dst_dims, also
-/// BGRA). Caller drives SSIM / Y-PSNR / geometric-residual
-/// assertions on top via [`assert_host_scaler_metrics`].
-///
-/// The CPU reference mirrors `tether-render::test_harness::build_reference`
-/// — skipping the chroma roundtrip step for the same reason
-/// (swscale limited-range vs textbook full-range divergence inflates
-/// the floor without catching real bugs). The coord-encoded fixture's
-/// constant B-channel makes the omission invisible; a future PNG
-/// fixture with high-frequency chroma would need the step re-enabled.
+/// fixture and returns the rendered output (BGRA at dst_dims). The
+/// coord-encoded smoke cell consumes this for structural range checks.
 #[cfg(target_os = "macos")]
 fn run_host_scaler_roundtrip_artifacts(
     profile: VideoProfile,
@@ -1532,8 +1510,6 @@ fn run_host_scaler_roundtrip_artifacts(
     dst_dims: (u32, u32),
     fixture: HostScalerFixture,
 ) -> Option<HostScalerArtifacts> {
-    use tether_scaler::test_util::cpu_mitchell_resize_bgra;
-
     let input_bgra = host_scaler_input_bgra(src_dims.0, src_dims.1, fixture);
     let rgba_dst = run_host_scaler_roundtrip_with_input(profile, src_dims, dst_dims, &input_bgra)?;
 
@@ -1545,59 +1521,7 @@ fn run_host_scaler_roundtrip_artifacts(
         chunk.swap(0, 2);
     }
 
-    // CPU reference: Mitchell-resize the input to dst_dims. No
-    // letterbox padding because every cell here has surface_dims
-    // == dst_dims (the renderer's identity-scale uniform is set
-    // accordingly).
-    let reference_bgra = if src_dims == dst_dims {
-        input_bgra.clone()
-    } else {
-        cpu_mitchell_resize_bgra(&input_bgra, src_dims, dst_dims)
-    };
-
-    Some(HostScalerArtifacts {
-        bgra_dst,
-        reference_bgra,
-        dst_dims,
-        input_bgra,
-    })
-}
-
-/// SSIM + Y-PSNR floor assertion against the artifacts' CPU
-/// reference. Computes both metrics and asserts they meet the given
-/// floors; prints both numbers (with the floor for context) on the
-/// eprintln channel before panicking so CI logs are useful for
-/// triage even without PNG diagnostic dumps.
-///
-/// Currently unused — the macOS coord-encoded smoke cell ships with
-/// a range-based assertion instead. Kept as ready-to-use
-/// infrastructure for a future calibrated pass that lands a
-/// macOS-tuned `cpu_chroma_roundtrip_bgra` reference (see the smoke
-/// cell's doc-comment for why floors are deferred).
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-fn assert_host_scaler_metrics(
-    label: &str,
-    artifacts: &HostScalerArtifacts,
-    ssim_floor: f64,
-    psnr_y_floor_db: f64,
-) {
-    use tether_scaler::test_util::{psnr_db_y_bgra, ssim_rgb};
-    let (dw, dh) = artifacts.dst_dims;
-    let ssim = ssim_rgb(&artifacts.bgra_dst, &artifacts.reference_bgra, dw, dh);
-    let psnr_y = psnr_db_y_bgra(&artifacts.bgra_dst, &artifacts.reference_bgra);
-    eprintln!(
-        "[{label}] {dw}×{dh}: SSIM {ssim:.4} (floor {ssim_floor:.4}), \
-         Y-PSNR {psnr_y:.2} dB (floor {psnr_y_floor_db:.2} dB)"
-    );
-    assert!(
-        ssim >= ssim_floor,
-        "{label}: SSIM {ssim:.4} below floor {ssim_floor:.4}"
-    );
-    assert!(
-        psnr_y >= psnr_y_floor_db,
-        "{label}: Y-PSNR {psnr_y:.2} dB below floor {psnr_y_floor_db:.2} dB"
-    );
+    Some(HostScalerArtifacts { bgra_dst, dst_dims })
 }
 
 /// HEVC 4:2:0 8-bit, host-scaler round-trip 640×480 → 320×240. The

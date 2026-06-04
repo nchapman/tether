@@ -17,10 +17,9 @@
 //! routing through a native SW decoder for unsupported profiles) and
 //! genuine hardware-decoder absence.
 //!
-//! Step 2 of the migration: this is a verbatim move from
-//! `tether-codec::videotoolbox::probe`. Step 3 folds in the SCK
-//! capture capability check (today done at the host layer as a
-//! separate cache).
+//! The probe owns the macOS host capability answer end to end, including
+//! SCK BGRA availability, Metal bridge construction, VideoToolbox encode,
+//! VideoToolbox decode, and renderer IOSurface acceptance.
 
 use std::sync::OnceLock;
 
@@ -55,12 +54,6 @@ const PROBE_BITRATE_KBPS: u32 = 1_000;
 /// a Mac with a broken SCK setup still negotiates H.264/HEVC 4:2:0
 /// 8-bit (the universal floor) rather than refusing all profiles.
 ///
-/// TODO(probe-migration step 5): the tether-host `SCK_CAPS_CACHE` and
-/// `warm_sck_capture_capability_cache` are still alive during the
-/// migration window. After step 5 cuts the host over to call
-/// `tether_probe::host_supported_profiles()` directly, those become
-/// dead code and get deleted; this OnceLock is then the only cache
-/// of the SCK probe result.
 fn sck_capability() -> &'static SckCaptureCapability {
     static CACHED: OnceLock<SckCaptureCapability> = OnceLock::new();
     CACHED.get_or_init(|| match pollster::block_on(probe_capture_pixel_formats()) {

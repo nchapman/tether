@@ -263,8 +263,9 @@ impl Decoder for VideoToolboxDecoder {
     }
 }
 
-/// FFmpeg `AVCodecID` for the given codec kind. Errors for codecs we
-/// don't have a VideoToolbox decode path for yet.
+/// FFmpeg `AVCodecID` for the given codec kind. VideoToolbox hwaccel
+/// support is verified later by codec construction and the decode
+/// capability probe.
 fn vt_av_codec_id(kind: CodecKind) -> Result<ffi::AVCodecID> {
     match kind {
         CodecKind::H264 => Ok(ffi::AV_CODEC_ID_H264),

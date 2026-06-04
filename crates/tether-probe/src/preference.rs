@@ -81,8 +81,10 @@ pub fn forced_video_profile_from_env() -> Result<Option<VideoProfile>, String> {
     }
 }
 
-/// Pick `forced` when provided and mutually supported; otherwise use
-/// normal preference order.
+/// Pick `forced` when provided and mutually supported. If `forced` is
+/// present but either side lacks it, return `None` so callers fail
+/// loudly instead of silently falling back to a different profile.
+/// Without a forced profile, use normal preference order.
 #[must_use]
 pub fn pick_supported_profile_with_force(
     host_caps: &[VideoProfile],

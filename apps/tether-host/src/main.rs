@@ -193,6 +193,16 @@ async fn main() -> anyhow::Result<()> {
         ..
     } = args;
     let reporter = Reporter::from_ipc_flag(ipc);
+    let forced_video_profile = match tether_probe::forced_video_profile_from_env() {
+        Ok(profile) => profile,
+        Err(e) => {
+            reporter.emit(&EngineEvent::Error { message: e.clone() });
+            if reporter.is_json() {
+                std::process::exit(1);
+            }
+            anyhow::bail!(e);
+        }
+    };
 
     // Both host (encoder) and client (decoder) call av_log::install(),
     // so FFmpeg messages can land on either side's hot thread. The
@@ -437,14 +447,6 @@ async fn main() -> anyhow::Result<()> {
             vec![VideoProfile::H264_8BIT_420]
         } else {
             tether_probe::host_encode_profiles()
-        };
-        let forced_video_profile = match tether_probe::forced_video_profile_from_env() {
-            Ok(profile) => profile,
-            Err(e) => {
-                reporter.emit(&EngineEvent::PeerDisconnected { reason: e.clone() });
-                warn!(error = %e, "invalid forced video profile; session ended");
-                continue;
-            }
         };
         tracing::debug!(
             host_encode_profiles = ?host_encode_profiles,

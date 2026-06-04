@@ -324,32 +324,38 @@ impl D3D11Encoder {
             raw.colorspace = ffi::AVCOL_SPC_BT709;
             raw.color_range = ffi::AVCOL_RANGE_MPEG;
 
-            // HEVC Main10 (4:2:0 10-bit) must pin the profile explicitly for
-            // EVERY D3D11 backend (not just AMF) — this lives outside the
-            // per-backend `dict` branch below on purpose. amfenc is the one
-            // that *demonstrated* the failure: fed a P010 surface with
-            // `avctx->profile` left at the 8-bit Main default, it emits a
-            // bitstream whose SPS disagrees with its 10-bit samples and the
-            // decoder rejects it (`SendPacketError`). QSV/NVENC/MF take the
-            // same pin harmlessly. (VAAPI does the identical thing for all
-            // its backends — see `vaapi/encoder.rs`.) Do NOT move this into
-            // the AMF branch. 8-bit keeps FFmpeg's Main default. Verified by
+            // ALWAYS pin an explicit profile — never rely on a backend's
+            // default. Unset `avctx->profile` lets each encoder pick its own
+            // default, and those defaults bite in backend-specific ways that
+            // only surface at decode time:
+            //   - amfenc fed a P010 surface defaults to 8-bit Main, emitting
+            //     an SPS that disagrees with its 10-bit samples → the decoder
+            //     rejects it (`SendPacketError`). This is the case that first
+            //     forced an explicit HEVC Main10 pin.
+            //   - AMD's H.264 Media Foundation MFT defaults to **Baseline**
+            //     (`profile_idc=66`, `constraint_set1_flag=0`). FFmpeg's
+            //     D3D11VA H.264 hwaccel rejects it with AVERROR_INVALIDDATA at
+            //     `send_packet` — hardware decode GUIDs cover Constrained
+            //     Baseline / Main / High but not full Baseline (FMO/ASO/
+            //     redundant slices). The *software* decoder accepts the same
+            //     stream, proving it's a hwaccel profile gap, not a malformed
+            //     bitstream. Pinning Main → `profile_idc=77`, which decodes.
+            // Pinning every (codec, bit depth) closes the whole class rather
+            // than patching each default as it breaks. Main/Main10/AV1-Main
+            // are the broadly-decodable choices (same rationale as VAAPI's
+            // `profile=main`, which pins all its profiles — `vaapi/encoder.rs`).
+            // 4:4:4 is rejected at construction, so only 4:2:0 reaches here.
+            // Verified by `d3d11_h264_encode_decode_roundtrip` (MF → Main) and
             // `d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip`.
-            if kind == CodecKind::Hevc
-                && profile.chroma == ChromaSubsampling::Yuv420
-                && profile.bit_depth == 10
-            {
-                raw.profile = ffi::AV_PROFILE_HEVC_MAIN_10 as i32;
-            }
-
-            // AV1 Main (Profile 0) covers 4:2:0 at both 8 and 10-bit; the
-            // encoder infers the bit depth from the hw_frames `sw_format`
-            // (NV12 vs P010LE), so one pin serves both. Mirrors the VAAPI
-            // encoder's AV1 pin (`vaapi/encoder.rs`) — deterministic across
-            // driver versions rather than relying on the FFmpeg auto-pick.
-            if kind == CodecKind::Av1 {
-                raw.profile = ffi::AV_PROFILE_AV1_MAIN as i32;
-            }
+            raw.profile = match (kind, profile.bit_depth) {
+                (CodecKind::H264, _) => ffi::AV_PROFILE_H264_MAIN as i32,
+                (CodecKind::Hevc, 10) => ffi::AV_PROFILE_HEVC_MAIN_10 as i32,
+                (CodecKind::Hevc, _) => ffi::AV_PROFILE_HEVC_MAIN as i32,
+                // AV1 Main (Profile 0) covers 4:2:0 at both 8 and 10-bit; the
+                // encoder reads the bit depth from the hw_frames `sw_format`
+                // (NV12 vs P010LE), so one profile value serves both.
+                (CodecKind::Av1, _) => ffi::AV_PROFILE_AV1_MAIN as i32,
+            };
         }
 
         let dict = if backend_name == "av1_amf" {

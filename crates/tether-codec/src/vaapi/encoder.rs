@@ -240,14 +240,32 @@ impl VaapiEncoder {
             //     on the depth check before the profile compare, so a
             //     10-bit sw_format can't actually fall through to MAIN;
             //     pinning just documents intent.)
-            // For Yuv420 8-bit we leave the field at FFmpeg's default
-            // and let the `profile=main` AVOption (below) drive it.
+            //
+            // ALWAYS pin every case (incl. H.264 and HEVC 4:2:0 8-bit Main),
+            // matching the D3D11 and VideoToolbox siblings — never leave
+            // `avctx->profile` at AV_PROFILE_UNKNOWN and rely on the
+            // `profile=main` AVOption string alone. The string still rides
+            // below as belt-and-suspenders (an older driver might consult a
+            // different code path), but pinning the field makes the selection
+            // authoritative and resilient to AVOption-table drift — the same
+            // "don't trust the backend default" lesson the D3D11 H.264 path
+            // learned (an unpinned MF encoder defaulted to Baseline). Setting
+            // the field can only narrow FFmpeg's VAProfile match, never
+            // mis-select it, since the value always agrees with `sw_format`.
             if kind == CodecKind::Hevc {
-                if matches!(chroma, ChromaSubsampling::Yuv444) {
-                    raw.profile = ffi::AV_PROFILE_HEVC_REXT as i32;
-                } else if matches!(chroma, ChromaSubsampling::Yuv420) && bit_depth == 10 {
-                    raw.profile = ffi::AV_PROFILE_HEVC_MAIN_10 as i32;
-                }
+                raw.profile = match (chroma, bit_depth) {
+                    (ChromaSubsampling::Yuv444, _) => ffi::AV_PROFILE_HEVC_REXT as i32,
+                    (_, 10) => ffi::AV_PROFILE_HEVC_MAIN_10 as i32,
+                    _ => ffi::AV_PROFILE_HEVC_MAIN as i32,
+                };
+            }
+            // H.264: pin Main. FFmpeg defaults H.264 to High, which fails to
+            // open on a VAAPI entrypoint that exposes only Main (the exact
+            // reason the `profile=main` AVOption exists below); pinning the
+            // field makes Main authoritative rather than relying on the
+            // string option being consumed.
+            if kind == CodecKind::H264 {
+                raw.profile = ffi::AV_PROFILE_H264_MAIN as i32;
             }
             // AV1 Main profile (Profile 0) covers 4:2:0 at both 8 and
             // 10-bit; FFmpeg's `av1_vaapi` infers the bit depth from

@@ -43,6 +43,22 @@ mod tests {
         }
     }
 
+    fn av1_profile() -> VideoProfile {
+        VideoProfile {
+            codec: CodecKind::Av1,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        }
+    }
+
+    fn av1_10bit_profile() -> VideoProfile {
+        VideoProfile {
+            codec: CodecKind::Av1,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        }
+    }
+
     fn hevc_444_profile() -> VideoProfile {
         VideoProfile {
             codec: CodecKind::Hevc,
@@ -615,6 +631,13 @@ mod tests {
         let sps = sps.unwrap();
         assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
         assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
+        // Guard the `AV_PROFILE_HEVC_MAIN` arm of the exhaustive profile
+        // match: 8-bit 4:2:0 must declare general_profile_idc=1 (Main),
+        // not fall through to some backend default.
+        assert_eq!(
+            sps.profile_idc, 1,
+            "HEVC 8-bit 4:2:0 SPS must be Main (general_profile_idc 1)"
+        );
     }
 
     #[test]
@@ -668,6 +691,17 @@ mod tests {
         let sps = sps.unwrap();
         assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
         assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
+        // The SPS must declare profile_idc=77 (Main). Direct guard for the
+        // `AV_PROFILE_H264_MAIN` pin: a regression that drops the pin lets
+        // AMD's MF MFT default to Baseline (profile_idc=66), which the
+        // D3D11VA hardware decoder rejects (INVALIDDATA) even though the
+        // stream is otherwise valid — so a decode-only check wouldn't catch
+        // it on the software path.
+        assert_eq!(
+            sps.profile_idc, 77,
+            "H.264 SPS must be Main (77); 66 = Baseline means the \
+             AV_PROFILE_H264_MAIN pin regressed"
+        );
     }
 
     /// Reproduce the live HEVC first-IDR failure: encode a keyframe,
@@ -1069,6 +1103,16 @@ mod tests {
         gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", false, hevc_profile());
     }
 
+    /// AV1 via Intel QSV (`av1_qsv`) — the AV1 analogue of the HEVC QSV
+    /// round trip, exercising the wired AV1 encode + D3D11VA AV1 decode on
+    /// Arc. Asserts `av1_qsv` opened (not the `av1_mf` fallback). SKIPs on
+    /// non-Intel GPUs via the helper's vendor gate.
+    #[test]
+    #[ignore = "requires Intel Arc AV1 QSV (Windows) + FFmpeg oneVPL-over-D3D11"]
+    fn d3d11_qsv_av1_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_INTEL, "av1_qsv", false, av1_profile());
+    }
+
     /// AMF via the zero-copy GPU submit path — the only coverage of the
     /// AMD backend (dynamic hw_frames pool, async session, `async_depth=1`).
     #[test]
@@ -1099,6 +1143,163 @@ mod tests {
     #[ignore = "requires AMD GPU with AMF HEVC Main10 (Windows)"]
     fn d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", true, hevc_main10_profile());
+    }
+
+    /// AV1 via the vendor-agnostic `av1_mf` (Media Foundation) fallback —
+    /// the `encode_bgra` path with `vendor_id=0`, mirroring
+    /// `d3d11_hevc_encode_decode_roundtrip`. This is the AV1 encoder a host
+    /// reaches on any GPU whose vendor isn't AMD/Intel/NVIDIA, AND the only
+    /// AV1 encoder left after `av1_amf` fail-fasts on a pre-RDNA-3 AMD card —
+    /// so the production fallback needs its own coverage, not just `av1_amf`.
+    /// Runs on any Windows GPU with an AV1 MF encoder + D3D11VA AV1 decode.
+    #[test]
+    #[ignore = "requires Windows GPU with AV1 MF encode + D3D11VA AV1 decode"]
+    fn d3d11_av1_mf_encode_decode_roundtrip() {
+        let mut enc = D3D11Encoder::new(
+            av1_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+        .expect("av1_mf encoder construction");
+        assert_eq!(enc.name(), "av1_mf", "expected av1_mf; got {}", enc.name());
+
+        let mut dec = D3D11Decoder::new(CodecKind::Av1, false).expect("decoder construction");
+        let bgra = vec![96u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
+
+        let mut all_packets = Vec::new();
+        for pts in 0..30 {
+            let pkts = enc
+                .encode_bgra(&bgra, pts, pts == 0)
+                .expect("encode_bgra failed");
+            all_packets.extend(pkts);
+            if !all_packets.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !all_packets.is_empty(),
+            "av1_mf produced no packets after 30 frames"
+        );
+        for pkt in &all_packets {
+            dec.submit(&pkt.data).expect("submit failed");
+        }
+
+        let mut decoded = None;
+        for pts in 30..60 {
+            if let Some(f) = dec.next_frame().expect("next_frame") {
+                decoded = Some(f);
+                break;
+            }
+            let pkts = enc.encode_bgra(&bgra, pts, false).expect("encode_bgra");
+            for pkt in &pkts {
+                dec.submit(&pkt.data).expect("submit");
+            }
+        }
+        let frame = decoded.expect("decoder never produced a frame from av1_mf output");
+        match frame {
+            Frame::Cpu(f) => assert_eq!((f.width, f.height), (TEST_WIDTH, TEST_HEIGHT)),
+            Frame::Gpu(g) => assert_eq!((g.width, g.height), (TEST_WIDTH, TEST_HEIGHT)),
+        }
+    }
+
+    /// AMF AV1 (`av1_amf`) via the zero-copy GPU submit path — the AV1
+    /// analogue of `d3d11_amf_gpu_encode_decode_roundtrip`. RDNA 3+ does AV1
+    /// in hardware; this is the direct exercise of the wired AV1 encode +
+    /// D3D11VA AV1 decode chain on AMD. Asserts `av1_amf` opened (not the
+    /// `av1_mf` fallback), so a build missing the AV1 AMF encoder fails loud.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 (Windows, RDNA 3+)"]
+    fn d3d11_amf_av1_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "av1_amf", false, av1_profile());
+    }
+
+    /// AMF AV1 10-bit (P010) via the zero-copy GPU submit path. AV1 Main
+    /// covers both 8 and 10-bit 4:2:0 off one profile pin; a P010 surface
+    /// has no 8-bit CPU-download representation, so `gpu_export = true` is
+    /// the only valid path (mirrors the Main10 HEVC test).
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 10-bit (Windows, RDNA 3+)"]
+    fn d3d11_amf_av1_10bit_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "av1_amf", true, av1_10bit_profile());
+    }
+
+    /// On-demand IDR for AV1: `av1_amf` sets `forced_idr=1` and we stamp
+    /// `pict_type = I` on forced frames. AV1's AVOption set differs from
+    /// hevc_amf (no `gops_per_idr`, enum `latency`), so this confirms the
+    /// AV1-specific dict still yields a mid-stream keyframe — the load-
+    /// bearing behaviour for loss recovery. Mirrors the HEVC forced-IDR test.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 (Windows, RDNA 3+)"]
+    fn d3d11_amf_av1_forced_idr_midstream_produces_keyframe() {
+        use crate::D3D11TextureFrame;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+        let Some((device, context)) =
+            amd_video_device_or_skip("d3d11_amf_av1_forced_idr_midstream_produces_keyframe")
+        else {
+            return;
+        };
+
+        let texture = make_bgra_texture(&device, TEST_WIDTH, TEST_HEIGHT);
+        let mut enc = D3D11Encoder::new(
+            av1_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            VENDOR_AMD,
+        )
+        .expect("AMF AV1 encoder construction");
+        assert_eq!(
+            enc.name(),
+            "av1_amf",
+            "av1_amf unavailable; got {}",
+            enc.name()
+        );
+
+        let frame = D3D11TextureFrame {
+            texture: texture.as_raw() as *mut _,
+            device: device.as_raw() as *mut _,
+            device_context: context.as_raw() as *mut _,
+            width: TEST_WIDTH,
+            height: TEST_HEIGHT,
+            format: DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32,
+        };
+
+        // Warm the stream: frame 0 is an implicit keyframe. With
+        // `async_depth=1` each submit drains synchronously, so discarding
+        // the returned packets here means the frame-0 keyframe never reaches
+        // the forced-IDR scan window below — any keyframe seen there is the
+        // mid-stream ForceIdr, not a leftover.
+        for pts in 0..30 {
+            let _ = enc
+                .submit_d3d11_texture(&frame, pts, false)
+                .expect("warmup submit");
+        }
+
+        let mut saw_forced_keyframe = false;
+        for pts in 30..45 {
+            let pkts = enc
+                .submit_d3d11_texture(&frame, pts, pts == 30)
+                .expect("submit");
+            if pkts.iter().any(|p| p.keyframe) {
+                saw_forced_keyframe = true;
+                break;
+            }
+        }
+        assert!(
+            saw_forced_keyframe,
+            "av1_amf emitted no keyframe after a mid-stream ForceIdr — \
+             forced_idr / pict_type=I is being ignored, breaking loss recovery"
+        );
     }
 
     /// Build an AMF encoder, drop it, then build another at different dims
@@ -1369,6 +1570,15 @@ mod tests {
     #[ignore = "requires NVIDIA GPU with NVENC (Windows)"]
     fn d3d11_nvenc_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "hevc_nvenc", false, hevc_profile());
+    }
+
+    /// AV1 via NVIDIA NVENC (`av1_nvenc`) — the AV1 analogue of the HEVC
+    /// NVENC round trip (Ada+ does AV1 in hardware). Asserts `av1_nvenc`
+    /// opened, not the `av1_mf` fallback. SKIPs on non-NVIDIA GPUs.
+    #[test]
+    #[ignore = "requires NVIDIA Ada+ GPU with AV1 NVENC (Windows)"]
+    fn d3d11_nvenc_av1_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "av1_nvenc", false, av1_profile());
     }
 
     /// Diagnostic probe for QSV encode latency. Measures `submit_d3d11_texture`

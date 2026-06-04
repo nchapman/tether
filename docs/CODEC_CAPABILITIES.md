@@ -542,12 +542,18 @@ The host converts the captured BGRA texture to NV12 (8-bit) or P010
 an FFmpeg hardware encoder selected by GPU vendor in
 `backends_for_vendor(codec, vendor_id)`:
 
-| Vendor (PCI ID)   | HEVC chain              | H.264 chain             |
-| ----------------- | ----------------------- | ----------------------- |
-| Intel (`0x8086`)  | `hevc_qsv` → `hevc_mf`  | `h264_qsv` → `h264_mf`  |
-| AMD (`0x1002`)    | `hevc_amf` → `hevc_mf`  | `h264_amf` → `h264_mf`  |
-| NVIDIA (`0x10de`) | `hevc_nvenc` → `hevc_mf`| `h264_nvenc` → `h264_mf`|
-| unknown           | `hevc_mf` **only**      | `h264_mf` **only**      |
+| Vendor (PCI ID)   | HEVC chain              | H.264 chain             | AV1 chain               |
+| ----------------- | ----------------------- | ----------------------- | ----------------------- |
+| Intel (`0x8086`)  | `hevc_qsv` → `hevc_mf`  | `h264_qsv` → `h264_mf`  | `av1_qsv` → `av1_mf`    |
+| AMD (`0x1002`)    | `hevc_amf` → `hevc_mf`  | `h264_amf` → `h264_mf`  | `av1_amf` → `av1_mf`    |
+| NVIDIA (`0x10de`) | `hevc_nvenc` → `hevc_mf`| `h264_nvenc` → `h264_mf`| `av1_nvenc` → `av1_mf`  |
+| unknown           | `hevc_mf` **only**      | `h264_mf` **only**      | `av1_mf` **only**       |
+
+AV1 hardware encode needs a recent GPU (RDNA 3+, Ada, Arc); the static
+FFmpeg build links every backend in (`ff_av1_{amf,nvenc,qsv,mf}_encoder`).
+A card too old to AV1-encode fail-fasts at `D3D11Encoder::new`, the same
+way an AMD card that can't do HEVC Main10 fail-fasts today — the host
+advertises AV1 statically and the live encoder is the backstop.
 
 Unknown-vendor is MF-only on purpose: speculatively constructing a
 foreign vendor's encoder (e.g. `hevc_amf` on an Intel GPU) faults inside
@@ -576,7 +582,11 @@ live path only ever falls back to MF.)
   (`AVERROR_INVALIDDATA`). They gave no measured latency win either (the
   real cost is GPU contention, below). Verified by
   `d3d11_qsv_gpu_encode_decode_roundtrip`.
-- **AV1: not wired** (`backends_for_vendor` returns empty).
+- **AV1 4:2:0 is wired** (8-bit NV12 / 10-bit P010), encode + D3D11VA
+  decode. Like HEVC it pins the profile explicitly (`AV_PROFILE_AV1_MAIN`,
+  covering 8 and 10-bit off the hw_frames `sw_format`). Advertised
+  statically; the live encoder fail-fasts on a GPU too old to AV1-encode.
+  4:4:4 AV1 is out of scope (no Video Processor 4:4:4 path).
 - **HEVC Main10 pins the profile explicitly.** The encoder sets
   `avctx->profile = AV_PROFILE_HEVC_MAIN_10` for 4:2:0 10-bit. Unlike VAAPI
   (which derives the HEVC profile from the hw_frames `sw_format`), amfenc
@@ -593,10 +603,17 @@ B-frames are off everywhere (`max_b_frames=0`, no reorder delay). Beyond
 that, grounded in `ffmpeg -h encoder=…` on the linked build:
 
 - **QSV**: `forced_idr=1`, `async_depth=1` (default would be 4).
-- **AMF**: `usage=ultralowlatency`, `quality=speed`, `latency=1`,
-  **`async_depth=1`** (amfenc defaults this to **16** — "higher values
-  increase output latency"; this was a real latency bug), `forced_idr=1`,
-  `gops_per_idr=1`.
+- **AMF (HEVC/H.264)**: `usage=ultralowlatency`, `quality=speed`,
+  `latency=1`, **`async_depth=1`** (amfenc defaults this to **16** —
+  "higher values increase output latency"; this was a real latency bug),
+  `forced_idr=1`, `gops_per_idr=1`.
+- **AMF (AV1)**: `av1_amf`'s AVOption table differs from hevc/h264_amf
+  (`ffmpeg -h encoder=av1_amf`): **no `gops_per_idr`** (would warn as an
+  ignored option) and `latency` is an **enum**, not the hevc boolean. So
+  the AV1 dict is `usage=ultralowlatency`, `quality=speed`,
+  `latency=lowest_latency`, `async_depth=1`, `forced_idr=1`. Periodic
+  keyframes come from `gop_size`; on-demand IDR from `forced_idr` +
+  `pict_type=I` (same mechanism as HEVC).
 - **NVENC**: **`delay=0`** (default is `INT_MAX`), `zerolatency=1`,
   `tune=ull`, `rc=cbr`, `surfaces=1`, `forced-idr=1`.
 - **MF**: `hw_encoding=1`.
@@ -607,9 +624,10 @@ Unlike VAAPI/VideoToolbox, the Windows host does **not** run a
 destructive per-profile encode probe: AMF has a single-session limit and
 doesn't reliably release sessions on drop, so probing N profiles would
 exhaust it for the live encoder. Instead `probe_host()` reports every
-4:2:0 profile (H.264, HEVC Main, HEVC Main10) as supported and excludes
-4:4:4; the live encoder fail-fasts with a clear error if the hardware
-genuinely can't encode the negotiated profile. The QSV/AMF/NVENC GPU
+4:2:0 profile (H.264, HEVC Main, HEVC Main10, AV1 8/10-bit) as supported
+and excludes 4:4:4; the live encoder fail-fasts with a clear error if the
+hardware genuinely can't encode the negotiated profile (this is what
+gates AV1 on a GPU older than RDNA 3 / Ada / Arc). The QSV/AMF/NVENC GPU
 round-trip *is* covered by hardware tests
 (`d3d11_{qsv,amf,nvenc}_gpu_encode_decode_roundtrip`), each gated on the
 present GPU vendor so it asserts on matching hardware and SKIPs elsewhere.
@@ -645,8 +663,10 @@ native oneVPL / NvEncodeAPI path is the lever if it doesn't.
 
 ## Layer 5 (Windows) — D3D11VA decode (client)
 
-`D3D11Decoder` decodes H.264 / HEVC via D3D11VA and exports each decoded
-surface **GPU-resident**: it `CopySubresourceRegion`s both planes of the
+`D3D11Decoder` decodes H.264 / HEVC / AV1 via D3D11VA (AV1 through
+`ff_av1_d3d11va_hwaccel`; RDNA 2+ / Ada / Arc decode it in hardware) and
+exports each decoded surface **GPU-resident**: it
+`CopySubresourceRegion`s both planes of the
 decode pool slice into a single `MISC_SHARED` biplanar staging texture
 and hands the renderer a shared NT handle (`Frame::Gpu`). The format
 follows the decode surface — `DXGI_FORMAT_NV12` for 4:2:0 8-bit,
@@ -852,8 +872,8 @@ previous three-cache scaffolding.
 | macOS M-series | Linux  | HEVC 4:2:0 10-bit (Main10)       | SCK BGRA → Metal bridge emits `'x420'` → VT encodes P010 → client decodes via VAAPI |
 | macOS M-series | macOS  | HEVC 4:2:0 10-bit (Main10)       | Same encode side; client decodes back to `'x420'` IOSurface |
 | Linux      | macOS      | HEVC 4:4:4 8-bit                 | VT client decodes 4:4:4 via NV24 even though encode side is 4:2:0-only |
-| Windows    | Windows    | HEVC 4:2:0 (Main10 / Main)       | Vendor-selected encode (QSV/AMF/NVENC, MF fallback) → D3D11VA decode; loopback-verified. **4:2:0 only — 4:4:4 excluded** (no VP path). Encode profiles are advertised without a per-profile probe (AMF single-session limit), so a 10-bit pick relies on the live encoder, not a warm-time round-trip. |
-| Windows    | any        | HEVC 4:2:0 or H.264              | Host advertises H.264 + HEVC Main + Main10; intersection with the client's decode set picks the best 4:2:0 rung. |
+| Windows    | Windows    | AV1 4:2:0 10-bit, else HEVC Main10/Main | Vendor-selected encode (QSV/AMF/NVENC, MF fallback) → D3D11VA decode; loopback-verified for HEVC. **4:2:0 only — 4:4:4 excluded** (no VP path). AV1 sits above HEVC 4:2:0 in preference order, so it wins when both ends advertise it (client decode is per-GPU probed; encode is advertised statically and fail-fasts on a pre-RDNA-3 / pre-Ada / pre-Arc card). |
+| Windows    | any        | AV1 / HEVC 4:2:0 / H.264         | Host advertises H.264 + HEVC Main/Main10 + AV1 8/10-bit; intersection with the client's decode set picks the best rung in preference order. |
 | any        | legacy 8-bit only | H.264 4:2:0 8-bit         | Universal floor; legacy client without decode-profiles extension |
 
 HEVC 4:2:2 8/10-bit is *not* yet in the matrix — it requires

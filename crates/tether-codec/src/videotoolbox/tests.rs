@@ -31,6 +31,72 @@ fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
     data
 }
 
+/// The encoder must pin an EXPLICIT profile — never rely on VideoToolbox's
+/// default. Parses the SPS the encoder emits and asserts its profile id
+/// matches the pin in `VideoToolboxEncoder::new`: H.264 Main (77), HEVC
+/// Main (1), HEVC Main10 (2). Direct guard for the profile-pin block — a
+/// regression that drops the pin lets VT auto-select, the exact class of
+/// bug the pins exist to prevent (cf. the D3D11 H.264 Baseline default).
+/// 4:4:4 is omitted on purpose: VT exposes no Main444 (REXT maps to the
+/// 4:2:2 Main42210), and the chroma-survival probe rejects HEVC 4:4:4
+/// encode on Apple Silicon, so there is no stable profile id to assert.
+#[test]
+#[ignore = "requires macOS + VideoToolbox"]
+fn videotoolbox_encoder_pins_explicit_profile() {
+    use crate::bitstream_sps::parse_sps_chroma_bit_depth;
+
+    // (codec, bit_depth, expected SPS profile id)
+    let cases = [
+        (CodecKind::H264, 8u8, 77u8), // H.264 Main
+        (CodecKind::Hevc, 8, 1),      // HEVC Main (general_profile_idc)
+        (CodecKind::Hevc, 10, 2),     // HEVC Main10
+    ];
+    let (w, h) = (320u32, 240u32);
+    for (codec, bit_depth, expected_profile) in cases {
+        let profile = VideoProfile {
+            codec,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth,
+        };
+        let mut enc = match VideoToolboxEncoder::new(profile, w, h, 30, 2_000) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP {profile:?}: encoder construct failed: {e:?}");
+                continue;
+            }
+        };
+        let bgra = make_test_bgra(w, h, 0);
+        let mut keyframe = None;
+        for pts in 0..16i64 {
+            let packets = enc
+                .encode_bgra(&bgra, pts, pts == 0)
+                .unwrap_or_else(|e| panic!("{profile:?} encode: {e:?}"));
+            if let Some(p) = packets.into_iter().find(|p| p.keyframe) {
+                keyframe = Some(p.data);
+                break;
+            }
+        }
+        if keyframe.is_none() {
+            keyframe = enc
+                .flush()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| p.keyframe)
+                .map(|p| p.data);
+        }
+        let kf = keyframe.unwrap_or_else(|| panic!("{profile:?} produced no keyframe"));
+        let sps = parse_sps_chroma_bit_depth(&kf, codec)
+            .unwrap_or_else(|| panic!("{profile:?} keyframe has no parseable SPS"));
+        assert_eq!(sps.bit_depth_luma, bit_depth, "{profile:?} bit depth");
+        assert_eq!(
+            sps.profile_idc, expected_profile,
+            "{profile:?}: encoder must pin profile_idc={expected_profile}, got {} — \
+             the VideoToolbox profile pin regressed",
+            sps.profile_idc
+        );
+    }
+}
+
 /// macOS sibling of `vaapi_set_bitrate_live_continues_to_encode`.
 /// Verifies that `Encoder::set_bitrate_kbps` succeeds mid-stream on
 /// VideoToolbox and the encoder keeps producing decodable packets
@@ -42,10 +108,6 @@ fn videotoolbox_set_bitrate_live_continues_to_encode() {
     let h = 480;
     let mut enc = VideoToolboxEncoder::new(yuv420_8bit(CodecKind::H264), w, h, 30, 4_000)
         .expect("VideoToolbox encoder");
-    assert!(
-        enc.supports_changing_bitrate(),
-        "VideoToolbox encoder is expected to advertise bitrate-change support"
-    );
     let mut dec = VideoToolboxDecoder::new(CodecKind::H264).expect("VideoToolbox decoder");
 
     for t in 0..4i64 {

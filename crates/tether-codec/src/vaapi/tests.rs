@@ -93,6 +93,59 @@ fn vaapi_encoder_smoke() {
     }
 }
 
+/// The encoder must pin an EXPLICIT profile for every path — including
+/// H.264 and HEVC 4:2:0 8-bit, which previously relied on the
+/// `profile=main` AVOption *string* rather than `avctx->profile`. Parses
+/// the emitted SPS and asserts the profile id matches the pin: H.264 Main
+/// (77), HEVC Main (general_profile_idc 1), HEVC RExt (4) for 4:4:4.
+/// Direct guard for the VAAPI profile-pin block (the 8-bit arms are the
+/// ones this change newly pins). 10-bit is covered by the probe's P010
+/// dma-buf round trip, not the BGRA path here.
+#[test]
+#[ignore = "requires a working VAAPI device"]
+fn vaapi_encoder_pins_explicit_profile() {
+    use crate::bitstream_sps::parse_sps_chroma_bit_depth;
+    use tether_protocol::control::{CodecKind, VideoProfile};
+
+    // (profile, codec, expected SPS profile id)
+    let cases = [
+        (VideoProfile::H264_8BIT_420, CodecKind::H264, 77u8),
+        (VideoProfile::HEVC_8BIT_420, CodecKind::Hevc, 1u8),
+        (VideoProfile::HEVC_8BIT_444, CodecKind::Hevc, 4u8),
+    ];
+    let (w, h) = (640u32, 480u32);
+    for (profile, codec, expected_profile) in cases {
+        let mut enc = match VaapiEncoder::new(profile, w, h, 30, 4_000) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("SKIP {profile:?}: encoder construct failed: {e:?}");
+                continue;
+            }
+        };
+        let mut keyframe = None;
+        for t in 0..8i64 {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let bgra = make_test_bgra(w, h, t as u32);
+            let packets = enc
+                .encode_bgra(&bgra, t, t == 0)
+                .unwrap_or_else(|e| panic!("{profile:?} encode: {e:?}"));
+            if let Some(p) = packets.into_iter().find(|p| p.keyframe) {
+                keyframe = Some(p.data);
+                break;
+            }
+        }
+        let kf = keyframe.unwrap_or_else(|| panic!("{profile:?} produced no keyframe"));
+        let sps = parse_sps_chroma_bit_depth(&kf, codec)
+            .unwrap_or_else(|| panic!("{profile:?} keyframe has no parseable SPS"));
+        assert_eq!(
+            sps.profile_idc, expected_profile,
+            "{profile:?}: encoder must pin profile_idc={expected_profile}, got {} — \
+             the VAAPI profile pin regressed",
+            sps.profile_idc
+        );
+    }
+}
+
 fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
     let mut data = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {

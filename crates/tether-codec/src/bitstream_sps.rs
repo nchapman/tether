@@ -34,6 +34,14 @@ use tether_protocol::control::{ChromaSubsampling, CodecKind};
 pub struct SpsChromaAndBitDepth {
     pub(crate) chroma_format_idc: u8,
     pub(crate) bit_depth_luma: u8,
+    /// The codec's profile id straight from the SPS — H.264 `profile_idc`
+    /// (Main = 77, High = 100, …) or HEVC `general_profile_idc` (Main = 1,
+    /// Main10 = 2, RExt = 4). This is the field the encoder profile pins
+    /// drive, so tests assert it to prove a pin took effect (an unpinned
+    /// backend defaulting to e.g. H.264 Baseline = 66 is exactly the bug
+    /// the pins exist to prevent). The two codecs use different value
+    /// spaces; callers interpret it per `codec`.
+    pub(crate) profile_idc: u8,
 }
 
 impl SpsChromaAndBitDepth {
@@ -220,7 +228,7 @@ fn parse_hevc_sps(rbsp: &[u8]) -> Option<SpsChromaAndBitDepth> {
     let _sps_temporal_id_nesting_flag = r.read_bits(1)?;
     // profile_tier_level(1, sps_max_sub_layers_minus1): the "1" means
     // include the general PTL. We skip the bits without interpreting.
-    skip_hevc_ptl(&mut r, sps_max_sub_layers_minus1)?;
+    let general_profile_idc = skip_hevc_ptl(&mut r, sps_max_sub_layers_minus1)?;
     let _sps_seq_parameter_set_id = r.read_ue()?;
     let chroma_format_idc = r.read_ue()? as u8;
     if chroma_format_idc == 3 {
@@ -242,13 +250,16 @@ fn parse_hevc_sps(rbsp: &[u8]) -> Option<SpsChromaAndBitDepth> {
     Some(SpsChromaAndBitDepth {
         chroma_format_idc,
         bit_depth_luma: bit_depth_luma_minus8.checked_add(8)?,
+        profile_idc: general_profile_idc,
     })
 }
 
 /// Skip the `profile_tier_level(1, max_sub_layers_minus1)` structure
 /// in an HEVC SPS. We don't need its contents — just bit-accurate
 /// advancement past it.
-fn skip_hevc_ptl(r: &mut BitReader<'_>, max_sub_layers_minus1: usize) -> Option<()> {
+/// Returns `general_profile_idc` (the one PTL field we keep — HEVC Main =
+/// 1, Main10 = 2, RExt = 4), advancing the reader past the whole PTL.
+fn skip_hevc_ptl(r: &mut BitReader<'_>, max_sub_layers_minus1: usize) -> Option<u8> {
     // General profile / tier / level: 2 + 1 + 5 + 32 + 4 + 43 + 1 + 8
     // = 96 bits. The penultimate 1-bit slot is `general_inbld_flag` or
     // `general_reserved_zero_bit` depending on profile_idc; either way
@@ -256,7 +267,7 @@ fn skip_hevc_ptl(r: &mut BitReader<'_>, max_sub_layers_minus1: usize) -> Option<
     // level_idc, and we don't interpret it.
     r.read_bits(2)?; // general_profile_space
     r.read_bits(1)?; // general_tier_flag
-    r.read_bits(5)?; // general_profile_idc
+    let general_profile_idc = r.read_bits(5)? as u8;
     r.read_bits(32)?; // general_profile_compatibility_flag[32]
     r.read_bits(4)?; // progressive/interlaced/non-packed/frame-only
     r.read_bits(43)?; // constraint flags + reserved (total 43, all branches)
@@ -290,7 +301,7 @@ fn skip_hevc_ptl(r: &mut BitReader<'_>, max_sub_layers_minus1: usize) -> Option<
             r.read_bits(8)?;
         }
     }
-    Some(())
+    Some(general_profile_idc)
 }
 
 /// Parse just enough of an H.264 SPS RBSP to extract `chroma_format_idc`
@@ -316,11 +327,13 @@ fn parse_h264_sps(rbsp: &[u8]) -> Option<SpsChromaAndBitDepth> {
         Some(SpsChromaAndBitDepth {
             chroma_format_idc,
             bit_depth_luma: bit_depth_luma_minus8.checked_add(8)?,
+            profile_idc,
         })
     } else {
         Some(SpsChromaAndBitDepth {
             chroma_format_idc: 1, // 4:2:0
             bit_depth_luma: 8,
+            profile_idc,
         })
     }
 }
@@ -336,6 +349,7 @@ mod tests {
             .expect("hevc 4:2:0 8-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 1, "chroma_format_idc 1 = 4:2:0");
         assert_eq!(sps.bit_depth_luma, 8);
+        assert_eq!(sps.profile_idc, 1, "HEVC Main = general_profile_idc 1");
     }
 
     #[test]
@@ -345,6 +359,7 @@ mod tests {
             .expect("hevc 4:4:4 8-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 3, "chroma_format_idc 3 = 4:4:4");
         assert_eq!(sps.bit_depth_luma, 8);
+        assert_eq!(sps.profile_idc, 4, "HEVC RExt = general_profile_idc 4");
     }
 
     #[test]
@@ -354,6 +369,7 @@ mod tests {
             .expect("hevc 4:2:0 10-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 1);
         assert_eq!(sps.bit_depth_luma, 10);
+        assert_eq!(sps.profile_idc, 2, "HEVC Main10 = general_profile_idc 2");
     }
 
     #[test]
@@ -363,6 +379,7 @@ mod tests {
             .expect("hevc 4:4:4 10-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 3);
         assert_eq!(sps.bit_depth_luma, 10);
+        assert_eq!(sps.profile_idc, 4, "HEVC RExt = general_profile_idc 4");
     }
 
     #[test]
@@ -372,6 +389,7 @@ mod tests {
             .expect("h264 4:2:0 8-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 1);
         assert_eq!(sps.bit_depth_luma, 8);
+        assert_eq!(sps.profile_idc, 66, "this h264 fixture is Baseline (profile_idc 66)");
     }
 
     #[test]
@@ -431,6 +449,7 @@ mod tests {
             let s = SpsChromaAndBitDepth {
                 chroma_format_idc: idc,
                 bit_depth_luma: bd,
+                profile_idc: 0, // not consulted by to_profile_chroma_bit_depth
             };
             assert_eq!(s.to_profile_chroma_bit_depth(), Some((expected_chroma, bd)));
         }
@@ -442,6 +461,7 @@ mod tests {
         assert!(SpsChromaAndBitDepth {
             chroma_format_idc: 2,
             bit_depth_luma: 8,
+            profile_idc: 0,
         }
         .to_profile_chroma_bit_depth()
         .is_none());
@@ -449,6 +469,7 @@ mod tests {
         assert!(SpsChromaAndBitDepth {
             chroma_format_idc: 1,
             bit_depth_luma: 12,
+            profile_idc: 0,
         }
         .to_profile_chroma_bit_depth()
         .is_none());

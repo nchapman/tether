@@ -631,6 +631,13 @@ mod tests {
         let sps = sps.unwrap();
         assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
         assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
+        // Guard the `AV_PROFILE_HEVC_MAIN` arm of the exhaustive profile
+        // match: 8-bit 4:2:0 must declare general_profile_idc=1 (Main),
+        // not fall through to some backend default.
+        assert_eq!(
+            sps.profile_idc, 1,
+            "HEVC 8-bit 4:2:0 SPS must be Main (general_profile_idc 1)"
+        );
     }
 
     #[test]
@@ -684,41 +691,16 @@ mod tests {
         let sps = sps.unwrap();
         assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
         assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
-
-        // The SPS must declare profile_idc=77 (Main). This is the direct
-        // guard for the `AV_PROFILE_H264_MAIN` pin: a regression that drops
-        // the pin lets AMD's MF MFT default to Baseline (profile_idc=66),
-        // which the D3D11VA hardware decoder rejects (INVALIDDATA) even
-        // though the stream is otherwise valid. "Decodes" alone wouldn't
-        // catch it on every path, so assert the byte. In an H.264 SPS NAL
-        // (Annex-B: start code, 0x67 header), profile_idc is the byte right
-        // after the 0x67 NAL header.
-        let mut profile_idc = None;
-        let d = &kf.data;
-        let mut i = 0;
-        while i + 5 < d.len() {
-            let sc4 = d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1;
-            let sc3 = d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1;
-            let (hdr, after) = if sc4 {
-                (i + 4, i + 5)
-            } else if sc3 {
-                (i + 3, i + 4)
-            } else {
-                i += 1;
-                continue;
-            };
-            if d[hdr] & 0x1f == 7 {
-                profile_idc = Some(d[after]);
-                break;
-            }
-            i = after;
-        }
+        // The SPS must declare profile_idc=77 (Main). Direct guard for the
+        // `AV_PROFILE_H264_MAIN` pin: a regression that drops the pin lets
+        // AMD's MF MFT default to Baseline (profile_idc=66), which the
+        // D3D11VA hardware decoder rejects (INVALIDDATA) even though the
+        // stream is otherwise valid — so a decode-only check wouldn't catch
+        // it on the software path.
         assert_eq!(
-            profile_idc,
-            Some(77),
-            "H.264 SPS must declare profile_idc=77 (Main) — the \
-             AV_PROFILE_H264_MAIN pin likely regressed (66 = Baseline, \
-             which the D3D11VA decoder rejects)"
+            sps.profile_idc, 77,
+            "H.264 SPS must be Main (77); 66 = Baseline means the \
+             AV_PROFILE_H264_MAIN pin regressed"
         );
     }
 
@@ -1119,6 +1101,16 @@ mod tests {
     #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
     fn d3d11_qsv_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", false, hevc_profile());
+    }
+
+    /// AV1 via Intel QSV (`av1_qsv`) — the AV1 analogue of the HEVC QSV
+    /// round trip, exercising the wired AV1 encode + D3D11VA AV1 decode on
+    /// Arc. Asserts `av1_qsv` opened (not the `av1_mf` fallback). SKIPs on
+    /// non-Intel GPUs via the helper's vendor gate.
+    #[test]
+    #[ignore = "requires Intel Arc AV1 QSV (Windows) + FFmpeg oneVPL-over-D3D11"]
+    fn d3d11_qsv_av1_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_INTEL, "av1_qsv", false, av1_profile());
     }
 
     /// AMF via the zero-copy GPU submit path — the only coverage of the
@@ -1578,6 +1570,15 @@ mod tests {
     #[ignore = "requires NVIDIA GPU with NVENC (Windows)"]
     fn d3d11_nvenc_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "hevc_nvenc", false, hevc_profile());
+    }
+
+    /// AV1 via NVIDIA NVENC (`av1_nvenc`) — the AV1 analogue of the HEVC
+    /// NVENC round trip (Ada+ does AV1 in hardware). Asserts `av1_nvenc`
+    /// opened, not the `av1_mf` fallback. SKIPs on non-NVIDIA GPUs.
+    #[test]
+    #[ignore = "requires NVIDIA Ada+ GPU with AV1 NVENC (Windows)"]
+    fn d3d11_nvenc_av1_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "av1_nvenc", false, av1_profile());
     }
 
     /// Diagnostic probe for QSV encode latency. Measures `submit_d3d11_texture`

@@ -67,8 +67,12 @@ export function SharingSheet({
 
             <div className="pairing">
               {host.pin ? (
-                <div className="pin-box">
-                  <span className="pin mono">{host.pin}</span>
+                <div className="pin-display">
+                  <span className="pin mono">
+                    {host.pin.length === 8
+                      ? `${host.pin.slice(0, 4)}-${host.pin.slice(4)}`
+                      : host.pin}
+                  </span>
                   <span className="field-hint">
                     Enter this PIN on the other computer — expires in {host.secondsLeft}s
                   </span>

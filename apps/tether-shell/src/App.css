@@ -657,10 +657,20 @@ input::placeholder {
   font-size: 13px;
   color: var(--text-2);
 }
-.pin {
-  font-size: 28px;
+.pin-display {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+  padding: 12px;
+  background: var(--bg);
+  border-radius: 8px;
+}
+.pin-display .pin {
+  font-size: 40px;
   font-weight: 600;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.16em;
+  line-height: 1.1;
 }
 .add-device {
   display: flex;

@@ -315,6 +315,24 @@ impl D3D11Encoder {
             raw.color_trc = ffi::AVCOL_TRC_BT709;
             raw.colorspace = ffi::AVCOL_SPC_BT709;
             raw.color_range = ffi::AVCOL_RANGE_MPEG;
+
+            // HEVC Main10 (4:2:0 10-bit) must pin the profile explicitly for
+            // EVERY D3D11 backend (not just AMF) — this lives outside the
+            // per-backend `dict` branch below on purpose. amfenc is the one
+            // that *demonstrated* the failure: fed a P010 surface with
+            // `avctx->profile` left at the 8-bit Main default, it emits a
+            // bitstream whose SPS disagrees with its 10-bit samples and the
+            // decoder rejects it (`SendPacketError`). QSV/NVENC/MF take the
+            // same pin harmlessly. (VAAPI does the identical thing for all
+            // its backends — see `vaapi/encoder.rs`.) Do NOT move this into
+            // the AMF branch. 8-bit keeps FFmpeg's Main default. Verified by
+            // `d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip`.
+            if kind == CodecKind::Hevc
+                && profile.chroma == ChromaSubsampling::Yuv420
+                && profile.bit_depth == 10
+            {
+                raw.profile = ffi::AV_PROFILE_HEVC_MAIN_10 as i32;
+            }
         }
 
         let dict = if backend_name.contains("amf") {

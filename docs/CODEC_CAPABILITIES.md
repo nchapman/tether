@@ -551,6 +551,15 @@ live path only ever falls back to MF.)
   real cost is GPU contention, below). Verified by
   `d3d11_qsv_gpu_encode_decode_roundtrip`.
 - **AV1: not wired** (`backends_for_vendor` returns empty).
+- **HEVC Main10 pins the profile explicitly.** The encoder sets
+  `avctx->profile = AV_PROFILE_HEVC_MAIN_10` for 4:2:0 10-bit. Unlike VAAPI
+  (which derives the HEVC profile from the hw_frames `sw_format`), amfenc
+  leaves `profile` at the 8-bit Main default; fed a P010 surface without the
+  pin it emits a bitstream whose SPS disagrees with its 10-bit samples and
+  the decoder rejects it (`SendPacketError`). Verified by
+  `d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip` (full round trip) and
+  `d3d11_hevc_main10_encode_produces_packets` (asserts the SPS declares
+  10-bit luma — guards the pin on any backend).
 
 ### Low-latency option set (per backend)
 
@@ -578,6 +587,21 @@ genuinely can't encode the negotiated profile. The QSV/AMF/NVENC GPU
 round-trip *is* covered by hardware tests
 (`d3d11_{qsv,amf,nvenc}_gpu_encode_decode_roundtrip`), each gated on the
 present GPU vendor so it asserts on matching hardware and SKIPs elsewhere.
+The AMF backend (first developed on AMD, then largely unexercised while the
+pipeline matured on Intel QSV) has the broadest coverage, all verified on a
+Radeon 8060S / RDNA 4: HEVC Main 8-bit, **HEVC Main10**, and H.264 round
+trips; encoder rebuild on the same device (the single-session `Drop` flush);
+mid-stream forced-IDR; VPS-first extradata (the AMF-specific reorder, which
+the vendor-0 test only ever drove through MF); and an `async_depth=1`
+output-delay diagnostic (first packet within ~2 frames, not amfenc's
+default 16). Constructing all of these AMF sessions serially in one process
+is fine — AMF's single-session limit releases cleanly on the `Drop` flush.
+NOTE: **Media Foundation HEVC Main10 hangs** the `encode_bgra` MFT on AMD
+Radeon 8060S / RDNA 4, driver 32.0.23033.1002: the encode call blocks
+indefinitely (no error, no timeout) — observed only on this AMD MF path, not
+on Intel/NVIDIA. So the Main10 encode tests route through the present GPU's
+hardware encoder and skip the unknown-vendor → MF path rather than wedge.
+Re-check against later AMD drivers before re-enabling MF Main10.
 
 ### Latency note (loopback)
 

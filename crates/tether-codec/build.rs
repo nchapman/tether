@@ -30,10 +30,21 @@ fn main() {
         return;
     }
 
-    // oneVPL dispatcher ships as a static lib in the staged prefix alongside the
-    // FFmpeg .lib files; the rest are Windows SDK import libs found on PATH.
+    // oneVPL dispatcher and libopus both ship as static libs in the staged
+    // prefix alongside the FFmpeg .lib files; the rest are Windows SDK import
+    // libs found on PATH. `opus.lib` resolves the libopus wrapper objects in
+    // libavcodec (`--enable-libopus`): `libavcodec.pc`'s `Libs:` line names it.
+    // Without it the tether-codec test binary fails to link
+    // (`unresolved external symbol opus_strerror` / `opus_multistream_*`).
+    // `tether-audio/build.rs` links the *same* staged `opus.lib` for its own
+    // direct libopus binding; the host/client binaries (which pull in both
+    // crates) get a single copy of the archive. But this crate owns the
+    // FFmpeg link, so it must name opus itself — a binary using tether-codec
+    // without tether-audio (e.g. this crate's own test binary) has no other
+    // source for the symbol.
     println!("cargo:rustc-link-search=native={libs_dir}");
     println!("cargo:rustc-link-lib=static=vpl");
+    println!("cargo:rustc-link-lib=static=opus");
 
     // Win32 import libs the FFmpeg static archives reference, grouped by the
     // .pc that pulls them in (libavutil/libavcodec/libavfilter, libavdevice,

@@ -11,10 +11,13 @@
 //! 4. Sends the hw frame to the encoder.
 //!
 //! Encoder backend is selected by GPU vendor (DXGI VendorId):
-//! - Intel (0x8086): `hevc_qsv` / `h264_qsv` via derived QSV device
-//! - AMD   (0x1002): `hevc_amf` / `h264_amf` via D3D11VA device
-//! - NVIDIA(0x10de): `hevc_nvenc` / `h264_nvenc` via D3D11VA device
-//! - Fallback:       `hevc_mf` / `h264_mf` (Media Foundation)
+//! - Intel (0x8086): `hevc_qsv` / `h264_qsv` / `av1_qsv` via derived QSV device
+//! - AMD   (0x1002): `hevc_amf` / `h264_amf` / `av1_amf` via D3D11VA device
+//! - NVIDIA(0x10de): `hevc_nvenc` / `h264_nvenc` / `av1_nvenc` via D3D11VA device
+//! - Fallback:       `hevc_mf` / `h264_mf` / `av1_mf` (Media Foundation)
+//!
+//! AV1 hardware encode requires a recent GPU (RDNA 3+ / Ada / Arc); a card
+//! too old fail-fasts here and the probe relies on that (see `tether-probe`).
 //!
 //! QSV requires an FFmpeg build with a working oneVPL-over-D3D11 path
 //! (see [`backends_for_vendor`]).
@@ -107,7 +110,15 @@ fn backends_for_vendor(kind: CodecKind, vendor_id: u32) -> &'static [&'static st
         (CodecKind::H264, VENDOR_AMD) => &["h264_amf", "h264_mf"],
         (CodecKind::H264, VENDOR_NVIDIA) => &["h264_nvenc", "h264_mf"],
         (CodecKind::H264, _) => &["h264_mf"],
-        (CodecKind::Av1, _) => &[],
+        // AV1 hardware encode: RDNA 3+ (AMF), Ada+ (NVENC), Arc (QSV) all do
+        // AV1 in hardware. The static FFmpeg build links every backend in
+        // (`ff_av1_{amf,nvenc,qsv,mf}_encoder`). A card too old to AV1-encode
+        // fail-fasts at construction here; the Windows host probe advertises
+        // AV1 like HEVC and relies on that fail-fast (see `tether-probe`).
+        (CodecKind::Av1, VENDOR_INTEL) => &["av1_qsv", "av1_mf"],
+        (CodecKind::Av1, VENDOR_AMD) => &["av1_amf", "av1_mf"],
+        (CodecKind::Av1, VENDOR_NVIDIA) => &["av1_nvenc", "av1_mf"],
+        (CodecKind::Av1, _) => &["av1_mf"],
     }
 }
 
@@ -188,9 +199,6 @@ impl D3D11Encoder {
         }
 
         let backends = backends_for_vendor(kind, vendor_id);
-        if backends.is_empty() {
-            return Err(CodecError::CodecNotFound("av1 d3d11 (not yet supported)"));
-        }
 
         let mut last_err = CodecError::CodecNotFound("d3d11 encoder");
         for &backend_name in backends {
@@ -333,9 +341,41 @@ impl D3D11Encoder {
             {
                 raw.profile = ffi::AV_PROFILE_HEVC_MAIN_10 as i32;
             }
+
+            // AV1 Main (Profile 0) covers 4:2:0 at both 8 and 10-bit; the
+            // encoder infers the bit depth from the hw_frames `sw_format`
+            // (NV12 vs P010LE), so one pin serves both. Mirrors the VAAPI
+            // encoder's AV1 pin (`vaapi/encoder.rs`) — deterministic across
+            // driver versions rather than relying on the FFmpeg auto-pick.
+            if kind == CodecKind::Av1 {
+                raw.profile = ffi::AV_PROFILE_AV1_MAIN as i32;
+            }
         }
 
-        let dict = if backend_name.contains("amf") {
+        let dict = if backend_name == "av1_amf" {
+            // av1_amf's AVOption table differs from hevc/h264_amf (confirmed
+            // against `ffmpeg -h encoder=av1_amf` on the linked build):
+            //   - NO `gops_per_idr` — setting it lands in `unused_avoptions`
+            //     and triggers the "encoder ignored some private options"
+            //     warn on every construction. Periodic keyframes come from
+            //     `gop_size` (set above); on-demand IDR from `forced_idr` +
+            //     `pict_type=I` (stamped per forced frame, like hevc_amf).
+            //   - `latency` is an ENUM here (none/…/lowest_latency), not the
+            //     hevc boolean, so `latency=1` would mean a different thing.
+            //     `lowest_latency` is the realtime intent ("as fast as
+            //     possible"); `usage=ultralowlatency` already selects the
+            //     low-latency RC path, so this is belt-and-suspenders.
+            // `usage`, `quality`, `async_depth` (default 16), and
+            // `forced_idr` all exist on av1_amf with the same string forms.
+            // B-frames are already off via `max_b_frames=0`.
+            Some(
+                AVDictionary::new(c"usage", c"ultralowlatency", 0)
+                    .set(c"quality", c"speed", 0)
+                    .set(c"latency", c"lowest_latency", 0)
+                    .set(c"async_depth", c"1", 0)
+                    .set(c"forced_idr", c"1", 0),
+            )
+        } else if backend_name.contains("amf") {
             // `async_depth=1` is critical: amfenc defaults it to 16
             // ("Higher values increase output latency" per its AVOption
             // help), so without this the AMD path runs with 16 frames of
@@ -352,6 +392,11 @@ impl D3D11Encoder {
                     .set(c"gops_per_idr", c"1", 0),
             )
         } else if backend_name.contains("nvenc") {
+            // Covers hevc/h264/av1_nvenc — unlike amfenc, the nvenc AVOption
+            // table is shared across codecs, so every option below exists on
+            // `av1_nvenc` (verified against `ffmpeg -h encoder=av1_nvenc`:
+            // `delay`, `forced-idr`, `zerolatency`, `tune` incl. `ull`, `rc`
+            // incl. `cbr`, `surfaces`). No AV1-specific split needed.
             // `delay=0` is critical: nvenc defaults it to INT_MAX (output
             // is held indefinitely waiting to reorder). `zerolatency=1`
             // removes the reordering delay, `tune=ull` is the ultra-low-
@@ -365,6 +410,10 @@ impl D3D11Encoder {
                     .set(c"surfaces", c"1", 0),
             )
         } else if backend_name.contains("qsv") {
+            // Covers hevc/h264/av1_qsv — both options exist on `av1_qsv`
+            // (verified against `ffmpeg -h encoder=av1_qsv`: `forced_idr`,
+            // `async_depth`), and the `low_delay_brc`/`low_power` warning
+            // below applies identically (they're present on av1_qsv too).
             // `async_depth=1` keeps latency low (one frame in flight) and
             // bounds the surface pool. `forced_idr` honours ForceIdr.
             // Do NOT add `low_delay_brc` / `low_power`: both put the QSV
@@ -376,8 +425,10 @@ impl D3D11Encoder {
             Some(AVDictionary::new(c"forced_idr", c"1", 0).set(c"async_depth", c"1", 0))
         } else if backend_name.contains("mf") {
             // Force the hardware MFT (`hw_encoding=1`). Without it
-            // `hevc_mf` / `h264_mf` may select a software MFT, which
-            // defeats the zero-copy D3D11 texture input path.
+            // `hevc_mf` / `h264_mf` / `av1_mf` may select a software MFT,
+            // which defeats the zero-copy D3D11 texture input path. `av1_mf`
+            // is also the only encoder left after `av1_amf` fail-fasts on a
+            // pre-RDNA-3 AMD card, so this fallback matters for AV1 too.
             Some(AVDictionary::new(c"hw_encoding", c"1", 0))
         } else {
             None
@@ -867,6 +918,31 @@ mod backend_selection_tests {
         assert_eq!(
             backends_for_vendor(CodecKind::Hevc, VENDOR_NVIDIA),
             &["hevc_nvenc", "hevc_mf"]
+        );
+    }
+
+    /// AV1 is wired for every vendor: native hardware encoder first, MF
+    /// fallback second (unknown vendor is MF-only, same fault-avoidance
+    /// rule as HEVC/H.264). Guards against the empty-list regression that
+    /// used to gate AV1 off entirely.
+    #[test]
+    fn av1_backends_are_wired_per_vendor() {
+        assert_eq!(
+            backends_for_vendor(CodecKind::Av1, VENDOR_INTEL),
+            &["av1_qsv", "av1_mf"]
+        );
+        assert_eq!(
+            backends_for_vendor(CodecKind::Av1, VENDOR_AMD),
+            &["av1_amf", "av1_mf"]
+        );
+        assert_eq!(
+            backends_for_vendor(CodecKind::Av1, VENDOR_NVIDIA),
+            &["av1_nvenc", "av1_mf"]
+        );
+        let unknown = backends_for_vendor(CodecKind::Av1, 0);
+        assert!(
+            !unknown.is_empty() && unknown.iter().all(|n| n.contains("_mf")),
+            "unknown-vendor AV1 must be MF-only (no foreign-vendor fault); got {unknown:?}"
         );
     }
 }

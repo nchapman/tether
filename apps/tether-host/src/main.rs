@@ -3584,8 +3584,8 @@ fn derive_bitrate_kbps(profile: VideoProfile, width: u32, height: u32, fps: u32)
         CodecKind::H264 => scaled,
         // HEVC: 70% of H.264 for similar visual quality.
         CodecKind::Hevc => scaled * 7 / 10,
-        // AV1: not yet supported; if it gets here the encoder build
-        // will fail anyway. 60% is the standard reference number.
+        // AV1: ~60% of H.264 for similar visual quality (standard
+        // reference number). Wired on VAAPI (Linux) and D3D11 (Windows).
         CodecKind::Av1 => scaled * 6 / 10,
     };
 

@@ -48,13 +48,12 @@ const D3D11_BIND_SHADER_RESOURCE: u32 = 0x8;
 /// given negotiated profile's GPU export, or `None` when Windows has no
 /// decode path for it.
 ///
-/// Windows decodes H.264/HEVC 4:2:0 only. The Video Processor and encode
-/// path reject 4:4:4 at construction, and `d3d11_av_codec_id` rejects AV1
-/// (no D3D11VA AV1 decoder in this build), so a Windows client never
-/// advertises either — anything outside `{H.264, HEVC} × 4:2:0 × {8,10}`
-/// returns `None`. Note `PROFILE_PREFERENCE` *does* list AV1 4:2:0; this
-/// function returning `None` for it is what keeps the cross-crate test
-/// from asserting renderer support for a codec the decoder can't open.
+/// Windows decodes H.264/HEVC/AV1 4:2:0. The Video Processor and encode
+/// path reject 4:4:4 at construction, so a Windows client never advertises
+/// 4:4:4 — anything outside `{H.264, HEVC, AV1} × 4:2:0 × {8,10}` returns
+/// `None`. AV1 4:2:0 (8-bit NV12 / 10-bit P010) is wired here and in
+/// `d3d11_av_codec_id`; the per-GPU `D3D11Decoder::new` hw_config gate still
+/// rejects a card whose driver doesn't advertise D3D11VA AV1 decode.
 ///
 /// For the formats it does decode, FFmpeg's d3d11va decoder picks the
 /// surface format from the bit depth: NV12 for 8-bit, P010 (MSB-aligned
@@ -72,10 +71,10 @@ const D3D11_BIND_SHADER_RESOURCE: u32 = 0x8;
 #[allow(clippy::cast_sign_loss)]
 pub fn expected_decode_dxgi_format(profile: VideoProfile) -> Option<u32> {
     match (profile.codec, profile.chroma, profile.bit_depth) {
-        (CodecKind::H264 | CodecKind::Hevc, ChromaSubsampling::Yuv420, 8) => {
+        (CodecKind::H264 | CodecKind::Hevc | CodecKind::Av1, ChromaSubsampling::Yuv420, 8) => {
             Some(DXGI_FORMAT_NV12.0 as u32)
         }
-        (CodecKind::H264 | CodecKind::Hevc, ChromaSubsampling::Yuv420, 10) => {
+        (CodecKind::H264 | CodecKind::Hevc | CodecKind::Av1, ChromaSubsampling::Yuv420, 10) => {
             Some(DXGI_FORMAT_P010.0 as u32)
         }
         _ => None,
@@ -555,9 +554,12 @@ fn d3d11_av_codec_id(kind: CodecKind) -> Result<ffi::AVCodecID> {
     Ok(match kind {
         CodecKind::H264 => ffi::AV_CODEC_ID_H264,
         CodecKind::Hevc => ffi::AV_CODEC_ID_HEVC,
-        CodecKind::Av1 => {
-            return Err(CodecError::CodecNotFound("av1 d3d11va decoder"));
-        }
+        // D3D11VA AV1 decode: RDNA 2+ / Ada / Arc do it in hardware, and the
+        // static FFmpeg build links `ff_av1_decoder` + `ff_av1_d3d11va_hwaccel`.
+        // The hw_config loop in `D3D11Decoder::new` still gates on the driver
+        // actually advertising D3D11VA for AV1, so a card without AV1 decode
+        // reports CodecNotFound there rather than here.
+        CodecKind::Av1 => ffi::AV_CODEC_ID_AV1,
     })
 }
 
@@ -619,50 +621,57 @@ mod tests {
             Some(DXGI_FORMAT_P010.0 as u32)
         );
         assert_eq!(d3d11_sw_format(profile(10)), ffi::AV_PIX_FMT_P010LE);
+
+        // AV1 4:2:0 shares the same surface-format table: NV12 at 8-bit,
+        // P010 at 10-bit, agreeing with the encoder's `sw_format`.
+        let av1 = |bit_depth| VideoProfile {
+            codec: CodecKind::Av1,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth,
+        };
+        assert_eq!(
+            expected_decode_dxgi_format(av1(8)),
+            Some(DXGI_FORMAT_NV12.0 as u32)
+        );
+        assert_eq!(d3d11_sw_format(av1(8)), ffi::AV_PIX_FMT_NV12);
+        assert_eq!(
+            expected_decode_dxgi_format(av1(10)),
+            Some(DXGI_FORMAT_P010.0 as u32)
+        );
+        assert_eq!(d3d11_sw_format(av1(10)), ffi::AV_PIX_FMT_P010LE);
     }
 
     /// Profiles the Windows decoder can't open must return `None`, so the
     /// cross-crate test never asserts renderer support for a profile Windows
-    /// can't carry. Covers all three axes of the `_` arm:
-    ///   * **AV1 4:2:0** — listed in `PROFILE_PREFERENCE` but rejected at
-    ///     `d3d11_av_codec_id`; the most important case, since it's a
-    ///     negotiable profile, not a hypothetical one.
-    ///   * **4:4:4** — rejected at encoder construction.
+    /// can't carry. Covers the two remaining axes of the `_` arm:
+    ///   * **4:4:4** (HEVC and AV1) — rejected at encoder construction; the
+    ///     Video Processor has no 4:4:4 output path, so the client never
+    ///     advertises it. AV1 4:2:0 is now wired, so only its 4:4:4 rung is
+    ///     out of scope.
     ///   * **Out-of-range bit depth** (12-bit 4:2:0) — D3D11VA emits neither
     ///     NV12 nor P010 for it.
     ///
     /// The encoder's `d3d11_sw_format` falls back to NV12 for some of these,
     /// but that fallback is unreachable: 4:4:4 is rejected at construction
-    /// and the negotiator never selects AV1 or an unmodeled bit depth on
-    /// Windows.
+    /// and the negotiator never selects an unmodeled bit depth on Windows.
     #[test]
     fn expected_decode_format_rejects_unmodeled_profiles() {
-        // AV1 4:2:0 at both bit depths — in PROFILE_PREFERENCE, no D3D11VA
-        // decoder, so the Windows client never advertises it.
-        for bit_depth in [8, 10] {
-            let av1 = VideoProfile {
-                codec: CodecKind::Av1,
-                chroma: ChromaSubsampling::Yuv420,
-                bit_depth,
-            };
-            assert_eq!(
-                expected_decode_dxgi_format(av1),
-                None,
-                "Windows has no AV1 {bit_depth}-bit decode path (d3d11_av_codec_id rejects AV1)"
-            );
-        }
-        // Non-4:2:0 chroma at every modeled bit depth.
-        for bit_depth in [8, 10] {
-            let profile = VideoProfile {
-                codec: CodecKind::Hevc,
-                chroma: ChromaSubsampling::Yuv444,
-                bit_depth,
-            };
-            assert_eq!(
-                expected_decode_dxgi_format(profile),
-                None,
-                "Windows has no 4:4:4 {bit_depth}-bit decode path"
-            );
+        // 4:4:4 chroma at every modeled bit depth, across codecs. AV1's
+        // 4:2:0 rung IS supported now — only the 4:4:4 rung is out of scope
+        // (no Video Processor path), same as HEVC 4:4:4.
+        for codec in [CodecKind::Hevc, CodecKind::Av1] {
+            for bit_depth in [8, 10] {
+                let profile = VideoProfile {
+                    codec,
+                    chroma: ChromaSubsampling::Yuv444,
+                    bit_depth,
+                };
+                assert_eq!(
+                    expected_decode_dxgi_format(profile),
+                    None,
+                    "Windows has no 4:4:4 {bit_depth}-bit decode path for {codec:?}"
+                );
+            }
         }
         // Out-of-range bit depth on the otherwise-supported 4:2:0 path.
         let odd_depth = VideoProfile {

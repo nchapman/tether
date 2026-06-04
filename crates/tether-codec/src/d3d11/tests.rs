@@ -43,6 +43,22 @@ mod tests {
         }
     }
 
+    fn av1_profile() -> VideoProfile {
+        VideoProfile {
+            codec: CodecKind::Av1,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        }
+    }
+
+    fn av1_10bit_profile() -> VideoProfile {
+        VideoProfile {
+            codec: CodecKind::Av1,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        }
+    }
+
     fn hevc_444_profile() -> VideoProfile {
         VideoProfile {
             codec: CodecKind::Hevc,
@@ -1099,6 +1115,101 @@ mod tests {
     #[ignore = "requires AMD GPU with AMF HEVC Main10 (Windows)"]
     fn d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", true, hevc_main10_profile());
+    }
+
+    /// AMF AV1 (`av1_amf`) via the zero-copy GPU submit path — the AV1
+    /// analogue of `d3d11_amf_gpu_encode_decode_roundtrip`. RDNA 3+ does AV1
+    /// in hardware; this is the direct exercise of the wired AV1 encode +
+    /// D3D11VA AV1 decode chain on AMD. Asserts `av1_amf` opened (not the
+    /// `av1_mf` fallback), so a build missing the AV1 AMF encoder fails loud.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 (Windows, RDNA 3+)"]
+    fn d3d11_amf_av1_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "av1_amf", false, av1_profile());
+    }
+
+    /// AMF AV1 10-bit (P010) via the zero-copy GPU submit path. AV1 Main
+    /// covers both 8 and 10-bit 4:2:0 off one profile pin; a P010 surface
+    /// has no 8-bit CPU-download representation, so `gpu_export = true` is
+    /// the only valid path (mirrors the Main10 HEVC test).
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 10-bit (Windows, RDNA 3+)"]
+    fn d3d11_amf_av1_10bit_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "av1_amf", true, av1_10bit_profile());
+    }
+
+    /// On-demand IDR for AV1: `av1_amf` sets `forced_idr=1` and we stamp
+    /// `pict_type = I` on forced frames. AV1's AVOption set differs from
+    /// hevc_amf (no `gops_per_idr`, enum `latency`), so this confirms the
+    /// AV1-specific dict still yields a mid-stream keyframe — the load-
+    /// bearing behaviour for loss recovery. Mirrors the HEVC forced-IDR test.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 (Windows, RDNA 3+)"]
+    fn d3d11_amf_av1_forced_idr_midstream_produces_keyframe() {
+        use crate::D3D11TextureFrame;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+        let Some((device, context)) =
+            amd_video_device_or_skip("d3d11_amf_av1_forced_idr_midstream_produces_keyframe")
+        else {
+            return;
+        };
+
+        let texture = make_bgra_texture(&device, TEST_WIDTH, TEST_HEIGHT);
+        let mut enc = D3D11Encoder::new(
+            av1_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            VENDOR_AMD,
+        )
+        .expect("AMF AV1 encoder construction");
+        assert_eq!(
+            enc.name(),
+            "av1_amf",
+            "av1_amf unavailable; got {}",
+            enc.name()
+        );
+
+        let frame = D3D11TextureFrame {
+            texture: texture.as_raw() as *mut _,
+            device: device.as_raw() as *mut _,
+            device_context: context.as_raw() as *mut _,
+            width: TEST_WIDTH,
+            height: TEST_HEIGHT,
+            format: DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32,
+        };
+
+        // Warm the stream: frame 0 is an implicit keyframe. With
+        // `async_depth=1` each submit drains synchronously, so discarding
+        // the returned packets here means the frame-0 keyframe never reaches
+        // the forced-IDR scan window below — any keyframe seen there is the
+        // mid-stream ForceIdr, not a leftover.
+        for pts in 0..30 {
+            let _ = enc
+                .submit_d3d11_texture(&frame, pts, false)
+                .expect("warmup submit");
+        }
+
+        let mut saw_forced_keyframe = false;
+        for pts in 30..45 {
+            let pkts = enc
+                .submit_d3d11_texture(&frame, pts, pts == 30)
+                .expect("submit");
+            if pkts.iter().any(|p| p.keyframe) {
+                saw_forced_keyframe = true;
+                break;
+            }
+        }
+        assert!(
+            saw_forced_keyframe,
+            "av1_amf emitted no keyframe after a mid-stream ForceIdr — \
+             forced_idr / pict_type=I is being ignored, breaking loss recovery"
+        );
     }
 
     /// Build an AMF encoder, drop it, then build another at different dims

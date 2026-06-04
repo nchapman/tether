@@ -622,10 +622,12 @@ async fn main() -> anyhow::Result<()> {
                     use tether_protocol::cursor::HostCursorPacket;
                     match hc {
                         HostCursorPacket::Position { x, y, visible, .. } => {
-                            #[allow(clippy::cast_precision_loss)]
-                            let (xf, yf) = (x as f32, y as f32);
+                            // The host position is ignored for rendering —
+                            // the overlay is anchored to the local pointer
+                            // (zero round-trip lag). Only the host's
+                            // visibility intent is consumed here.
                             cursor_channel_datagram.with(|state| {
-                                state.set_position(xf, yf, visible);
+                                state.set_host_visible(visible);
                             });
                             cursor_pos_packets += 1;
                             if last_cursor_log.elapsed() >= std::time::Duration::from_secs(2) {

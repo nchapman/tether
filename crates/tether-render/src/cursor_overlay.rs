@@ -30,12 +30,18 @@
 //!
 //! ## Coordinate frame
 //!
-//! Host sends cursor position in *captured frame* pixels and sprite
-//! size in physical pixels. The client transforms through the same
-//! letterbox the blit pass uses — sprite stays at 1:1 capture-pixel
-//! scale relative to the video rect, so it doesn't bloat on upscaled
-//! windows. Hotspot is per-sprite (cached with the texture), so it's
-//! subtracted at draw time, not on the wire.
+//! The sprite is anchored to the *local* pointer, not the host echo:
+//! the client feeds [`CursorState::set_local_pointer`] its own
+//! `WindowEvent::CursorMoved` position (in video-pixel coordinates), so
+//! the cursor tracks motion with zero round-trip latency. Only the
+//! sprite *shape* and the host's visibility intent come from the wire
+//! (`HostCursorPacket` / `CursorShape`). The client transforms through
+//! the same letterbox the blit pass uses — sprite stays at 1:1 scale
+//! relative to the video rect, so it doesn't bloat on upscaled windows.
+//! Hotspot is per-sprite (cached with the texture), so it's subtracted
+//! at draw time, not on the wire. The local OS cursor is hidden exactly
+//! while the overlay draws (pointer over the video region), so the user
+//! sees one cursor with the correct remote shape.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -74,20 +80,29 @@ struct CachedSprite {
     last_used: u64,
 }
 
-/// Shared cursor state. Written by the wire-receive task; read by the
-/// renderer.
+/// Shared cursor state. Written by the wire-receive task (sprite cache,
+/// active id, host visibility) and the renderer's event loop (local
+/// pointer position); read by the renderer at draw time.
 pub struct CursorState {
     cache: HashMap<u64, CachedSprite>,
     /// Currently-active sprite id (set by `CursorUseShape` after an
     /// `enqueue_shape`). `None` until the host names one.
     active: Option<u64>,
-    /// Latest cursor position in *capture-pixel* coordinates. The
-    /// renderer applies the letterbox transform at draw time.
+    /// The *local* pointer position, in video-pixel coordinates, where
+    /// the host's cursor sprite is drawn. Sourced from the client's own
+    /// `WindowEvent::CursorMoved` (not the host echo) so the sprite
+    /// tracks the pointer with zero round-trip latency; the renderer
+    /// applies the letterbox transform at draw time. Only meaningful
+    /// while `over_video` is true.
     position_x: f32,
     position_y: f32,
+    /// Whether the local pointer is currently over the video region (vs.
+    /// a letterbox bar or outside the window). The overlay only draws
+    /// while this holds — otherwise the real OS cursor is shown instead.
+    over_video: bool,
     /// `false` whenever the host reports no cursor (text input field
-    /// hides it, app set NSCursor::hide, etc.) or `CursorMode::Relative`
-    /// is active on the client.
+    /// hides it, app set NSCursor::hide, etc.). Honoured so we don't draw
+    /// a sprite the remote intentionally hid.
     visible: bool,
     /// Cursor input mode. `Relative` suppresses overlay drawing — the
     /// client is rendering its own locked pointer.
@@ -103,6 +118,7 @@ impl CursorState {
             active: None,
             position_x: 0.0,
             position_y: 0.0,
+            over_video: false,
             visible: false,
             relative_mode: false,
             access_counter: 0,
@@ -184,12 +200,38 @@ impl CursorState {
         }
     }
 
-    /// Update position + visibility. Wire-task entry point for
-    /// `HostCursorPacket::Position`.
-    pub fn set_position(&mut self, x: f32, y: f32, visible: bool) {
-        self.position_x = x;
-        self.position_y = y;
+    /// Wire-task entry point for `HostCursorPacket::Position`: record
+    /// whether the host currently shows a cursor. The host's *position*
+    /// is deliberately ignored for rendering — the overlay is anchored
+    /// to the local pointer (see [`set_local_pointer`]) so it has no
+    /// round-trip lag — but the host's visibility intent is honoured.
+    ///
+    /// [`set_local_pointer`]: Self::set_local_pointer
+    pub fn set_host_visible(&mut self, visible: bool) {
         self.visible = visible;
+    }
+
+    /// Renderer entry point: the local pointer's position in video-pixel
+    /// coordinates, or `None` when the pointer is off the video region
+    /// (letterbox bar / outside the window). `Some` anchors the sprite
+    /// and marks the pointer over-video; `None` suppresses the overlay.
+    pub fn set_local_pointer(&mut self, pos: Option<(f32, f32)>) {
+        match pos {
+            Some((x, y)) => {
+                self.position_x = x;
+                self.position_y = y;
+                self.over_video = true;
+            }
+            None => self.over_video = false,
+        }
+    }
+
+    /// Whether the overlay would draw a sprite this frame — i.e.
+    /// [`snapshot`](Self::snapshot) would return `Some`. The client uses
+    /// this to hide the local OS cursor exactly when the overlay draws in
+    /// its place, so the user never sees two cursors or none.
+    pub fn overlay_active(&self) -> bool {
+        self.snapshot().is_some()
     }
 
     /// Suppress overlay draw while the local pointer is in
@@ -200,11 +242,12 @@ impl CursorState {
 
     /// Renderer-side snapshot: the active sprite's pixels + placement
     /// inputs, or `None` if the overlay should not draw this frame
-    /// (relative mode, hidden, no active sprite, or the active sprite
-    /// was evicted from the cache). The borrowed `pixels` are valid for
-    /// as long as the [`CursorChannel`] lock is held.
+    /// (relative mode, host-hidden, pointer off the video region, no
+    /// active sprite, or the active sprite was evicted from the cache).
+    /// The borrowed `pixels` are valid for as long as the
+    /// [`CursorChannel`] lock is held.
     pub(crate) fn snapshot(&self) -> Option<CursorSnapshot<'_>> {
-        if self.relative_mode || !self.visible {
+        if self.relative_mode || !self.visible || !self.over_video {
             return None;
         }
         let id = self.active?;
@@ -659,18 +702,40 @@ mod tests {
     #[test]
     fn snapshot_skipped_when_relative_mode() {
         let mut s = CursorState::new();
-        // No sprite, no position — but flip relative mode to confirm
-        // the gate fires before we even check the cache.
+        // No sprite — but flip relative mode to confirm the gate fires
+        // before we even check the cache.
         s.set_relative_mode(true);
-        s.set_position(10.0, 20.0, true);
+        s.set_host_visible(true);
+        s.set_local_pointer(Some((10.0, 20.0)));
         assert!(s.snapshot().is_none());
     }
 
     #[test]
-    fn snapshot_skipped_when_invisible() {
+    fn snapshot_skipped_when_host_hidden() {
         let mut s = CursorState::new();
-        s.set_position(10.0, 20.0, false);
+        // Full sprite + local pointer so the *only* thing suppressing the
+        // draw is the host-hidden gate (not a missing active sprite).
+        s.enqueue_shape(5, 2, 2, 0, 0, vec![0xAB; 16]);
+        s.activate(5);
+        s.set_local_pointer(Some((10.0, 20.0)));
+        s.set_host_visible(true);
+        assert!(s.overlay_active(), "precondition: draws while host-visible");
+        s.set_host_visible(false);
         assert!(s.snapshot().is_none());
+        assert!(!s.overlay_active());
+    }
+
+    #[test]
+    fn snapshot_skipped_when_pointer_off_video() {
+        let mut s = CursorState::new();
+        // Active visible sprite, but the local pointer is off the video
+        // region — the overlay yields to the real OS cursor.
+        s.enqueue_shape(3, 2, 2, 0, 0, vec![0xAB; 16]);
+        s.activate(3);
+        s.set_host_visible(true);
+        s.set_local_pointer(None);
+        assert!(s.snapshot().is_none());
+        assert!(!s.overlay_active());
     }
 
     #[test]
@@ -686,12 +751,15 @@ mod tests {
         // 2×2 RGBA8 = 16 bytes.
         s.enqueue_shape(7, 2, 2, 1, 1, vec![0xAB; 16]);
         s.activate(7);
-        s.set_position(40.0, 30.0, true);
+        s.set_host_visible(true);
+        s.set_local_pointer(Some((40.0, 30.0)));
         let snap = s.snapshot().expect("active visible sprite");
         assert_eq!(snap.id, 7);
         assert_eq!((snap.width, snap.height), (2, 2));
         assert_eq!((snap.hotspot_x, snap.hotspot_y), (1, 1));
         assert_eq!(snap.pixels.len(), 16);
+        assert_eq!((snap.position_x, snap.position_y), (40.0, 30.0));
+        assert!(s.overlay_active());
     }
 
     #[test]

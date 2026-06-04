@@ -1289,7 +1289,8 @@ mod tests {
         channel.with(|s| {
             s.enqueue_shape(1, cur_w, cur_h, cur_w / 2, cur_h / 2, pixels);
             s.activate(1);
-            s.set_position((w / 2) as f32, (h / 2) as f32, true);
+            s.set_host_visible(true);
+            s.set_local_pointer(Some(((w / 2) as f32, (h / 2) as f32)));
         });
 
         state.render().expect("render");

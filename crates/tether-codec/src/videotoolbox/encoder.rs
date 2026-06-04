@@ -220,9 +220,7 @@ impl VideoToolboxEncoder {
             // exhaustiveness).
             raw.profile = match (kind, chroma, bit_depth) {
                 (CodecKind::H264, _, _) => ffi::AV_PROFILE_H264_MAIN as i32,
-                (CodecKind::Hevc, ChromaSubsampling::Yuv444, _) => {
-                    ffi::AV_PROFILE_HEVC_REXT as i32
-                }
+                (CodecKind::Hevc, ChromaSubsampling::Yuv444, _) => ffi::AV_PROFILE_HEVC_REXT as i32,
                 (CodecKind::Hevc, _, 10) => ffi::AV_PROFILE_HEVC_MAIN_10 as i32,
                 (CodecKind::Hevc, _, _) => ffi::AV_PROFILE_HEVC_MAIN as i32,
                 // Unreachable: `vt_codec_cname(Av1)` rejects AV1 before

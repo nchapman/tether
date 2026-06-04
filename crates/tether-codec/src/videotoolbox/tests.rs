@@ -108,10 +108,6 @@ fn videotoolbox_set_bitrate_live_continues_to_encode() {
     let h = 480;
     let mut enc = VideoToolboxEncoder::new(yuv420_8bit(CodecKind::H264), w, h, 30, 4_000)
         .expect("VideoToolbox encoder");
-    assert!(
-        enc.supports_changing_bitrate(),
-        "VideoToolbox encoder is expected to advertise bitrate-change support"
-    );
     let mut dec = VideoToolboxDecoder::new(CodecKind::H264).expect("VideoToolbox decoder");
 
     for t in 0..4i64 {

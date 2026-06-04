@@ -389,7 +389,10 @@ mod tests {
             .expect("h264 4:2:0 8-bit fixture must contain a parseable SPS");
         assert_eq!(sps.chroma_format_idc, 1);
         assert_eq!(sps.bit_depth_luma, 8);
-        assert_eq!(sps.profile_idc, 66, "this h264 fixture is Baseline (profile_idc 66)");
+        assert_eq!(
+            sps.profile_idc, 66,
+            "this h264 fixture is Baseline (profile_idc 66)"
+        );
     }
 
     #[test]

@@ -146,6 +146,240 @@ fn assert_outcome(case: &RoundtripCase, result: RoundtripResult) {
 }
 
 // =====================================================================
+// Colour-decode cells (Fixture::ColorBars)
+//
+// SSIM / geometric residual run on the near-constant-chroma
+// CoordEncoded fixture, so they can't catch a hue cast or Cb/Cr swap.
+// These drive the shared red/green/blue/white colour-bar pattern
+// through the SAME production host pipeline (BGRA → gpuconvert
+// NV12/P010/XYUV/XV30 bridge → VAAPI encode → decode → render) and
+// assert each bar reconstructs to its colour on the readback. The
+// white bar is the regression guard for the host-side "colors are
+// wrong" hue-cast bug. Uniform with macOS `iosurface_test` and the
+// Windows `d3d11` colour cells via `crate::color_fixture`.
+// =====================================================================
+
+/// SKIP-aware colour-bar assertion on the rendered readback (BGRA,
+/// matching the production `Bgra8UnormSrgb` swapchain).
+fn assert_colorbars_outcome(case: &RoundtripCase, result: RoundtripResult) {
+    match result {
+        RoundtripResult::Skip { capability, detail } => {
+            eprintln!("SKIPPED {} (missing {capability:?}): {detail}", case.name);
+        }
+        RoundtripResult::Ok(outcome) => {
+            crate::color_fixture::assert_colorbars(
+                case.name,
+                &outcome.readback_bgra,
+                case.surface_dims.0,
+                case.surface_dims.1,
+                crate::color_fixture::ChannelOrder::Bgra,
+            );
+        }
+    }
+}
+
+/// Build an identity (no-scaler) colour-bar case at 1920×1200 for
+/// `profile` with the given capability prereqs. `floors` is unused by
+/// the colour assertion but required by the struct; `FLOOR_IDENTITY`
+/// keeps it honest if a future edit routes this through `assert_outcome`.
+fn colorbars_case(
+    name: &'static str,
+    profile: VideoProfile,
+    requires: &'static [Capability],
+) -> RoundtripCase {
+    RoundtripCase {
+        name,
+        profile,
+        fixture: Fixture::ColorBars,
+        capture_dims: (1920, 1200),
+        encode_dims: (1920, 1200),
+        surface_dims: (1920, 1200),
+        frames_encoded: 6,
+        assert_steady_state_eps: None,
+        color_space: VideoColorSpec::sdr_desktop(),
+        requires,
+        floors: FLOOR_IDENTITY,
+    }
+}
+
+#[test]
+#[ignore = "requires VAAPI H.264 + Vulkan dma-buf import"]
+fn roundtrip_colorbars_h264_8bit() {
+    let case = colorbars_case(
+        "colorbars_h264_8bit",
+        H264_8BIT_420,
+        &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+/// AV1 4:2:0 8-bit colour bars. AV1 is a production-negotiated profile
+/// (`PROFILE_PREFERENCE` ranks AV1 above HEVC Main / H.264) and decodes
+/// to `RenderLayout::Biplanar8` — the same NV12 import as H.264/HEVC, so
+/// the render side is codec-agnostic. The codec-level
+/// `av1_main_dmabuf_roundtrip` only pushes a uniform grey frame, which
+/// can't catch a hue cast or Cb/Cr swap; this is the AV1 colour guard.
+/// SKIPs (via `Capability::VaapiAv1`) on drivers without AV1 encode.
+#[test]
+#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA3+) + Vulkan dma-buf import"]
+fn roundtrip_colorbars_av1_8bit() {
+    let case = colorbars_case(
+        "colorbars_av1_8bit",
+        AV1_8BIT_420,
+        &[Capability::VaapiAv1, Capability::VulkanDmaBufImport],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+/// AV1 4:2:0 10-bit colour bars. In `PROFILE_PREFERENCE` it ranks below
+/// the HEVC 4:4:4 entries but above HEVC Main10 and AV1 8-bit, and
+/// decodes to `RenderLayout::Biplanar16` — same 10-in-16 import as HEVC
+/// Main10, but from the AV1 decoder, with colour asserted. No codec-level
+/// AV1 10-bit test exists, so this is the only AV1 10-bit coverage
+/// anywhere.
+/// Shares the P010 dma-buf submit path with HEVC Main10 (and the same
+/// `GR32`→`RG32` fourcc fix that unblocked it); verified green on Lunar
+/// Lake. SKIPs only where the driver lacks AV1 10-bit encode or R16/Rg16
+/// storage.
+#[test]
+#[ignore = "requires VAAPI AV1 10-bit encode + storage R16/Rg16 + Vulkan dma-buf import"]
+fn roundtrip_colorbars_av1_10bit() {
+    let case = colorbars_case(
+        "colorbars_av1_10bit",
+        AV1_10BIT_420,
+        &[
+            Capability::VaapiAv1,
+            Capability::VulkanDmaBufImport,
+            Capability::BitDepth10RendererSupport,
+        ],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+#[test]
+#[ignore = "requires VAAPI HEVC Main + Vulkan dma-buf import"]
+fn roundtrip_colorbars_hevc_main_8bit() {
+    let case = colorbars_case(
+        "colorbars_hevc_main_8bit",
+        HEVC_MAIN_8BIT,
+        &[Capability::VaapiHevcMain, Capability::VulkanDmaBufImport],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+#[test]
+#[ignore = "requires VAAPI HEVC Main 10 (P010) + storage R16/Rg16"]
+fn roundtrip_colorbars_hevc_main10() {
+    let case = colorbars_case(
+        "colorbars_hevc_main10",
+        HEVC_MAIN10,
+        &[
+            Capability::VaapiHevcMain10DmaBuf,
+            Capability::VulkanDmaBufImport,
+            Capability::BitDepth10RendererSupport,
+        ],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 8-bit (XYUV) + Vulkan dma-buf import"]
+fn roundtrip_colorbars_hevc_main444_8bit() {
+    let case = colorbars_case(
+        "colorbars_hevc_main444_8bit",
+        HEVC_MAIN444_8BIT,
+        &[Capability::VaapiHevcMain444, Capability::VulkanDmaBufImport],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+/// The host path that produces the live purple cast: HEVC 4:4:4 10-bit
+/// via `Bgra2Xv30DmaBuf`. If the host miscolors 4:4:4 10-bit, the white
+/// bar comes back tinted here even though SSIM/geom stay green.
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit (XV30) + storage R16/Rg16 + Vulkan dma-buf import"]
+fn roundtrip_colorbars_hevc_main444_10bit() {
+    let case = colorbars_case(
+        "colorbars_hevc_main444_10bit",
+        HEVC_MAIN444_10BIT,
+        &[
+            Capability::VaapiHevcMain444_10DmaBuf,
+            Capability::VulkanDmaBufImport,
+            Capability::BitDepth10RendererSupport,
+        ],
+    );
+    assert_colorbars_outcome(&case, run_roundtrip(&case));
+}
+
+/// Conformance anchor for the 4:4:4 10-bit decode path. The round-trip
+/// cell above encodes with our own gpuconvert pass and decodes with our
+/// own shader, so it cannot catch a wrong-but-symmetric packing (a Y↔Cb
+/// lane swap round-trips at SSIM≈1.0 yet ships a non-conformant bitstream
+/// that macOS VideoToolbox renders as the bright→purple / dark→olive
+/// cast). This cell instead decodes the committed **reference** bitstream
+/// (libx265-encoded, standards-correct — the exact fixture the macOS
+/// `iosurface_test` cell decodes) through the real VAAPI Y410 → import →
+/// shader path, pinning the decode side to the standard. Decode-conformant
+/// here + a passing round-trip above ⟹ the encode side is conformant too.
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit (Y410) + storage R16/Rg16 + Vulkan dma-buf import"]
+fn decode_reference_colorbars_hevc_main444_10bit() {
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_10bit_1920x1200.idr");
+    let dims = (1920, 1200);
+    let Some(bgra) = crate::test_harness::render_reference_bitstream(
+        HEVC_MAIN444_10BIT,
+        FIXTURE,
+        dims,
+        VideoColorSpec::sdr_desktop(),
+    ) else {
+        eprintln!("SKIPPED decode_reference_colorbars_hevc_main444_10bit: VAAPI/Vulkan 4:4:4 10-bit decode unavailable");
+        return;
+    };
+    crate::color_fixture::assert_colorbars(
+        "ref 4:4:4 10-bit",
+        &bgra,
+        dims.0,
+        dims.1,
+        crate::color_fixture::ChannelOrder::Bgra,
+    );
+}
+
+/// Conformance anchor for the 4:4:4 **8-bit** (packed XYUV) decode path —
+/// the 8-bit sibling of `decode_reference_colorbars_hevc_main444_10bit`.
+/// The XYUV pack convention is hand-authored WGSL (`bgra_to_yuv444.wgsl`
+/// / `shader_yuv444.wgsl`), the same risk class as the XV30/Y410 lane
+/// swap fixed in 28c2d5b: a wrong-but-symmetric Y↔U swap round-trips at
+/// SSIM≈1 and even passes the absolute-colour bars, because the in-loop
+/// VAAPI encode/decode is itself lane-symmetric. Only a foreign decoder
+/// breaks the symmetry — so decode the committed libx265 reference
+/// (already the shared cross-platform fixture macOS `iosurface_test`
+/// uses) through the real VAAPI XYUV → import → shader path. macOS had
+/// this 8-bit anchor; Linux only had the 10-bit one. See the
+/// fixtures/README "Linux/Windows render tests" note.
+#[test]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 8-bit (XYUV) + Vulkan dma-buf import"]
+fn decode_reference_colorbars_hevc_main444_8bit() {
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_8bit.idr");
+    let dims = (128, 128);
+    let Some(bgra) = crate::test_harness::render_reference_bitstream(
+        HEVC_MAIN444_8BIT,
+        FIXTURE,
+        dims,
+        VideoColorSpec::sdr_desktop(),
+    ) else {
+        eprintln!("SKIPPED decode_reference_colorbars_hevc_main444_8bit: VAAPI/Vulkan 4:4:4 8-bit decode unavailable");
+        return;
+    };
+    crate::color_fixture::assert_colorbars(
+        "ref 4:4:4 8-bit",
+        &bgra,
+        dims.0,
+        dims.1,
+        crate::color_fixture::ChannelOrder::Bgra,
+    );
+}
+
+// =====================================================================
 // Per-cell floors — derived from a green-main run on a real VAAPI box
 // (Intel iHD, Mesa, dev workstation, 2026-05-22). Thresholds sit at
 // `observed - 0.01` (SSIM) / `observed - 1.5 dB` (PSNR-Y) / `observed +
@@ -226,6 +460,16 @@ const HEVC_MAIN444_10BIT: VideoProfile = VideoProfile {
     chroma: ChromaSubsampling::Yuv444,
     bit_depth: 10,
 };
+const AV1_8BIT_420: VideoProfile = VideoProfile {
+    codec: CodecKind::Av1,
+    chroma: ChromaSubsampling::Yuv420,
+    bit_depth: 8,
+};
+const AV1_10BIT_420: VideoProfile = VideoProfile {
+    codec: CodecKind::Av1,
+    chroma: ChromaSubsampling::Yuv420,
+    bit_depth: 10,
+};
 
 const FIXTURE_PNG: &str = "test-pattern-3360x2100.png";
 
@@ -250,6 +494,57 @@ fn roundtrip_h264_8bit_identity() {
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
         requires: &[Capability::VaapiH264, Capability::VulkanDmaBufImport],
+        floors: FLOOR_IDENTITY,
+    };
+    assert_outcome(&case, run_roundtrip(&case));
+}
+
+/// AV1 4:2:0 8-bit identity. AV1 encoder/decoder pair → Biplanar8
+/// import — the geometric companion to `roundtrip_colorbars_av1_8bit`.
+/// Catches AV1-specific stride / decode-output regressions the
+/// uniform-grey codec-level `av1_main_dmabuf_roundtrip` can't see.
+/// SKIPs on drivers without AV1 encode.
+#[test]
+#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA3+) + Vulkan dma-buf import"]
+fn roundtrip_av1_8bit_identity() {
+    let case = RoundtripCase {
+        name: "av1_8bit_identity",
+        profile: AV1_8BIT_420,
+        fixture: Fixture::CoordEncoded,
+        capture_dims: (1920, 1200),
+        encode_dims: (1920, 1200),
+        surface_dims: (1920, 1200),
+        frames_encoded: 6,
+        assert_steady_state_eps: None,
+        color_space: VideoColorSpec::sdr_desktop(),
+        requires: &[Capability::VaapiAv1, Capability::VulkanDmaBufImport],
+        floors: FLOOR_IDENTITY,
+    };
+    assert_outcome(&case, run_roundtrip(&case));
+}
+
+/// AV1 4:2:0 10-bit identity. AV1 encoder/decoder pair → Biplanar16
+/// import — the geometric companion to `roundtrip_colorbars_av1_10bit`,
+/// and the only AV1 10-bit geometry coverage anywhere. Verified green on
+/// Lunar Lake after the P010 UV-plane fourcc fix.
+#[test]
+#[ignore = "requires VAAPI AV1 10-bit encode + storage R16/Rg16 + Vulkan dma-buf import"]
+fn roundtrip_av1_10bit_identity() {
+    let case = RoundtripCase {
+        name: "av1_10bit_identity",
+        profile: AV1_10BIT_420,
+        fixture: Fixture::CoordEncoded,
+        capture_dims: (1920, 1200),
+        encode_dims: (1920, 1200),
+        surface_dims: (1920, 1200),
+        frames_encoded: 6,
+        assert_steady_state_eps: None,
+        color_space: VideoColorSpec::sdr_desktop(),
+        requires: &[
+            Capability::VaapiAv1,
+            Capability::VulkanDmaBufImport,
+            Capability::BitDepth10RendererSupport,
+        ],
         floors: FLOOR_IDENTITY,
     };
     assert_outcome(&case, run_roundtrip(&case));
@@ -300,10 +595,12 @@ fn roundtrip_hevc_main444_8bit_identity() {
 
 /// HEVC Main 10 identity. P010 dma-buf bridge → encoder.submit_dmabuf
 /// → decoder → Biplanar16 import → `range_kind = LIMITED_10` shader
-/// dispatch. Empirically SKIPs on Intel iHD + Meteor Lake
-/// (FFmpeg vaapi_drm_format_map lacks P010 entries on that combo).
+/// dispatch. Previously SKIP'd across Intel (iHD/Meteor Lake/Lunar
+/// Lake) — misdiagnosed as a driver P010 gap; the real cause was the
+/// UV-plane fourcc (`GR32` vs FFmpeg's `RG1616`), fixed in
+/// `build_p010_dmabuf_frame`. Now runs; verified green on Lunar Lake.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16; may SKIP on Intel iHD/Meteor Lake"]
+#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16"]
 fn roundtrip_hevc_main10_identity() {
     let case = RoundtripCase {
         name: "hevc_main10_identity",
@@ -334,11 +631,12 @@ fn roundtrip_hevc_main10_identity() {
 /// one `Rgb10a2Unorm` texture (`shader_yuv444_10bit.wgsl`). This cell is
 /// the gate that exercises that packed path end-to-end.
 ///
-/// Empirically SKIPs on Intel iHD + Meteor Lake — same driver-side
-/// vaapi_drm_format_map gap as the 4:2:0 10-bit Main10 cell.
+/// Unlike the 4:2:0 Main10 cell, this never hit the P010 fourcc gap —
+/// XV30 is a single packed layer, not the R16+UV biplanar P010 layout —
+/// and runs green on Lunar Lake. SKIPs only where the driver lacks HEVC
+/// 4:4:4 10-bit encode.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Rgb10a2Unorm storage; \
-            may SKIP on Intel iHD/Meteor Lake"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Rgb10a2Unorm storage"]
 fn roundtrip_hevc_main444_10bit_identity() {
     let case = RoundtripCase {
         name: "hevc_main444_10bit_identity",
@@ -589,10 +887,11 @@ fn roundtrip_hevc_main444_8bit_full_chain() {
 /// 10-bit scaler input path doesn't exist in production), surface
 /// > encode so the renderer's Mitchell upscale of the decoded 10-bit
 /// > content gets exercised. Targets the Biplanar16 import + 10-bit
-/// > shader dispatch + Mitchell upscale all at once. Will SKIP on
-/// > Intel iHD + Meteor Lake (P010 dma-buf driver gap).
+/// > shader dispatch + Mitchell upscale all at once. Runs on Lunar Lake
+/// > since the P010 UV-plane fourcc fix; SKIPs only where the driver
+/// > lacks HEVC Main 10 encode or R16/Rg16 storage.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16; may SKIP on Intel iHD/Meteor Lake"]
+#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16"]
 fn roundtrip_hevc_main10_client_upscale() {
     let case = RoundtripCase {
         name: "hevc_main10_client_upscale",

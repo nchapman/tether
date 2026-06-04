@@ -8,10 +8,12 @@
 //! 10-bit data MSB-aligned in 16-bit cells (bits [15:6]; bits [5:0]
 //! must read zero for spec-conforming consumers).
 //!
-//! The bytes-on-the-wire DRM fourccs are `R16` (Y) and `GR32` (UV) —
-//! same family as P010 layer descriptors. FFmpeg's `vaapi_drm_format_map`
-//! recognises this layer pair as `AV_PIX_FMT_P010LE` for both VAAPI
-//! encoder *input* and decoder *output*.
+//! The encoder-facing DRM fourccs are `R16` (Y) and `RG32` (UV,
+//! `DRM_FORMAT_RG1616` — the physical layout of `R16G16_UNORM`).
+//! FFmpeg's `vaapi_drm_format_map` recognises this layer pair as
+//! `AV_PIX_FMT_P010LE` for both VAAPI encoder *input* and decoder
+//! *output*. The UV fourcc must be `RG32`, not `GR32`: FFmpeg carries
+//! only `RG1616` for P010 — see `tether_codec::build_p010_dmabuf_frame`.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;

@@ -73,7 +73,8 @@ pub(crate) enum YuvPlanes {
     Biplanar16 { y: wgpu::Texture, uv: wgpu::Texture },
     /// Packed 4:4:4 in a single texture: 8-bit XYUV8888 (Rgba8, byte
     /// order V/U/Y/X — see `shader_yuv444.wgsl`) or 10-bit Y410 (Rgb10a2,
-    /// 10:10:10:2, channels R=Y/G=U/B=V — see `shader_yuv444_10bit.wgsl`).
+    /// 10:10:10:2, channels R=U/G=Y/B=V — DRM "X:Cr:Y:Cb" spec order, see
+    /// `shader_yuv444_10bit.wgsl`).
     /// The variant holds one texture either way; the `RenderLayout`
     /// (`PackedXYUV` vs `PackedY410`) picks the matching shader.
     Yuv444Packed { packed: wgpu::Texture },
@@ -330,8 +331,9 @@ pub(crate) fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> Ren
         // macOS decodes to biplanar `'P410'`/`'xf44'` (16-bit cells →
         // Biplanar16). Linux's VAAPI decoder exports packed Y410 (single
         // 10:10:10:2 plane → PackedY410). Mirrors the `Yuv444, 8` XYUV
-        // split above. (Note: the decode-output Y410 differs in component
-        // order from the encoder-input XV30 the gpuconvert bridge writes.)
+        // split above. (Encoder-input XV30 and decode-output Y410 share the
+        // same "X:Cr:Y:Cb" lane order — AV_PIX_FMT_XV30LE / Y410LE — so both
+        // are conformant; they carry different fourccs but identical packing.)
         (ChromaSubsampling::Yuv444, 10) => {
             if cfg!(target_os = "macos") {
                 RenderLayout::Biplanar16

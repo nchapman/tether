@@ -6,6 +6,7 @@
 //! packed Y410 in a single Rgb10a2 texture. Pure Linux module — macOS
 //! lands its IOSurface equivalent in `metal.rs`.
 
+use tether_codec::vaapi_interop::{accepts_dmabuf_fourcc, dmabuf_fourcc_expected_label};
 use tether_codec::{DmaBufFrame, GpuFrameGuard};
 use tether_protocol::control::ChromaSubsampling;
 
@@ -96,7 +97,12 @@ fn import_biplanar(
     // Chroma sub-sampling drives the UV plane dimensions directly;
     // the bit depth picks the per-plane formats further down. We
     // never look at the DRM fourcc for layout decisions — the
-    // negotiated `chroma` is the source of truth.
+    // negotiated `chroma` is the source of truth. NOTE: the decode
+    // probe's L2 gate (`tether_probe::host::vaapi`) relies on this
+    // path staying ungated — it checks the surface-level `NV12`/`P010`
+    // fourcc, not the per-layer `R8`/`R16`. If a per-layer fourcc gate
+    // is ever added here, update `tether_codec::vaapi_interop` and that
+    // probe together.
     let (chroma_w, chroma_h) = match chroma {
         ChromaSubsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
         ChromaSubsampling::Yuv444 => (width, height),
@@ -206,11 +212,13 @@ fn import_yuv444_packed(
             layer.num_planes
         )));
     }
-    let expected_fourcc = u32::from_le_bytes(*b"XYUV");
-    if layer.drm_format != expected_fourcc {
+    // Single source of truth for the accept set (shared with the decode
+    // probe in tether-probe) — see `tether_codec::vaapi_interop`.
+    if !accepts_dmabuf_fourcc(ChromaSubsampling::Yuv444, 8, layer.drm_format) {
         return Err(RenderError::DmaBufImport(format!(
-            "YUV444 layer fourcc 0x{:08x} != expected XYUV (0x{:08x})",
-            layer.drm_format, expected_fourcc
+            "YUV444 layer fourcc 0x{:08x} not render-accepted; expected {}",
+            layer.drm_format,
+            dmabuf_fourcc_expected_label(ChromaSubsampling::Yuv444, 8),
         )));
     }
     let packed = import_one_layer(
@@ -247,17 +255,17 @@ fn import_yuv444_packed(
 
 /// VAAPI decodes a Main444 10-bit surface to a single packed Y410 layer:
 /// one DRM object, one layer, fourcc `Y410` (DRM_FORMAT_Y410, "[31:0]
-/// A:Cr:Y:Cb"), one plane (32 bpp, 10:10:10:2 little-endian). Imported as
+/// X:Cr:Y:Cb"), one plane (32 bpp, 10:10:10:2 little-endian). Imported as
 /// a single `Rgb10a2Unorm` texture — native 10-bit, so no MSB-align — and
-/// sampled by `shader_yuv444_10bit.wgsl` (channel map R=Y, G=U, B=V,
-/// empirically verified — Intel's Y410 output uses the same Rgb10a2
-/// layout it consumes as XV30 input, not the DRM-spec Y410 order).
+/// sampled by `shader_yuv444_10bit.wgsl` in DRM-spec lane order
+/// (bits[9:0]=Cb→R, bits[19:10]=Y→G, bits[29:20]=Cr→B).
 ///
 /// NOTE the decode-output fourcc (Y410) differs from the encoder-input
-/// fourcc (XV30 that gpuconvert's BGRA→XV30 pass writes), but the bit
-/// layout is identical on Intel media-driver — our 4:4:4 reference. A
-/// driver that emits a genuinely different layout (e.g. biplanar P410)
-/// would need its own cell.
+/// fourcc (XV30 that gpuconvert's BGRA→XV30 pass writes), but both are the
+/// same "X:Cr:Y:Cb" lane order — the pack and unpack are conformant, so a
+/// conformant decoder (macOS VideoToolbox) and ours agree. A driver that
+/// emits a genuinely different layout (e.g. biplanar P410) needs its own
+/// cell.
 fn import_yuv444_packed_y410(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -280,11 +288,13 @@ fn import_yuv444_packed_y410(
             layer.num_planes
         )));
     }
-    let expected_fourcc = u32::from_le_bytes(*b"Y410");
-    if layer.drm_format != expected_fourcc {
+    // Single source of truth for the accept set (shared with the decode
+    // probe in tether-probe) — see `tether_codec::vaapi_interop`.
+    if !accepts_dmabuf_fourcc(ChromaSubsampling::Yuv444, 10, layer.drm_format) {
         return Err(RenderError::DmaBufImport(format!(
-            "YUV444 10-bit layer fourcc 0x{:08x} != expected Y410 (0x{:08x})",
-            layer.drm_format, expected_fourcc
+            "YUV444 10-bit layer fourcc 0x{:08x} not render-accepted; expected {}",
+            layer.drm_format,
+            dmabuf_fourcc_expected_label(ChromaSubsampling::Yuv444, 10),
         )));
     }
     let packed = import_one_layer(

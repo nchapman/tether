@@ -367,7 +367,12 @@ fn nv12_bytes_per_element(fourcc: u32) -> (i64, i64) {
         // for completeness so the same code can fall under a
         // future 4:4:4-host path.
         NV24_VIDEO_RANGE_FOURCC | NV24_FULL_RANGE_FOURCC => (1, 2),
-        XF44_FOURCC | P410_FOURCC => (2, 4),
+        // `'x444'` is the video-range sibling of `'xf44'`/`'P410'` —
+        // same MSB-aligned 16-bit biplanar shape, so same per-plane
+        // bytes-per-element. Listed for identification parity with
+        // `accepts_iosurface_fourcc`; like the rest of the 4:4:4
+        // arm it's unreachable on the macOS encoder path today.
+        X444_FOURCC | XF44_FOURCC | P410_FOURCC => (2, 4),
         // Unknown fourcc — caller validates against
         // `accepts_iosurface_fourcc` before reaching here.
         _ => (1, 2),
@@ -872,7 +877,11 @@ fn chroma_bit_depth_for_fourcc(
         NV12_VIDEO_RANGE_FOURCC | NV12_FULL_RANGE_FOURCC => Some((ChromaSubsampling::Yuv420, 8)),
         X420_FOURCC | XF20_FOURCC | P010_FOURCC => Some((ChromaSubsampling::Yuv420, 10)),
         NV24_VIDEO_RANGE_FOURCC | NV24_FULL_RANGE_FOURCC => Some((ChromaSubsampling::Yuv444, 8)),
-        XF44_FOURCC | P410_FOURCC => Some((ChromaSubsampling::Yuv444, 10)),
+        // `'x444'` (video range) shares the plane shape of
+        // `'xf44'`/`'P410'`; identified here so a stray 4:4:4 10-bit
+        // surface reports `UnsupportedFourcc` (known family, bridge
+        // can't produce it) rather than the misleading `UnknownFourcc`.
+        X444_FOURCC | XF44_FOURCC | P410_FOURCC => Some((ChromaSubsampling::Yuv444, 10)),
         _ => None,
     }
 }

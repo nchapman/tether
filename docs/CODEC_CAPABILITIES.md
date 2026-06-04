@@ -406,46 +406,43 @@ catches three failure modes the spec doesn't:
 - Format-map mismatches between encoder input and what
   gpuconvert can produce.
 
-### Linux 10-bit encode — empirical state (post-handoff)
+### Linux 10-bit encode — working (post-fourcc-fix)
 
-The handoff plan (`Bgra2P010DmaBuf` bridge + encoder bit_depth gate
-lift + storage-image probe + host capture filter) shipped across
-five commits. Each layer of the chain works on its own; the
-end-to-end path stops at the driver layer.
+The `Bgra2P010DmaBuf` bridge + encoder bit_depth gate + storage-image
+probe + host capture filter carry the 10-bit 4:2:0 path end-to-end.
+This was briefly believed to dead-end at a driver "P010 dma-buf gap";
+that diagnosis was wrong. The real cause was a fourcc mislabel on our
+side, fixed in commit `eab4ca1`.
 
-| Layer | Build cell | Run cell |
-|-------|-----------|----------|
-| `tether_gpuconvert::Bgra2P010DmaBuf` | ✅ | ✅ Y plane reads back BT.709-correct red Y=250 and Cb=409 / Cr=960 on 10-bit storage |
-| `tether_gpuconvert::storable_dmabuf_modifiers(R16/GR32)` | ✅ | ✅ Mesa intel-Vulkan advertises STORAGE_IMAGE on both for LINEAR |
-| `tether_codec::vaapi::VaapiEncoder::new(Main10)` (avcodec_open2) | ✅ | ✅ on Intel iHD + FFmpeg 8.1 |
-| `tether_codec::vaapi::VaapiEncoder::submit_dmabuf` (P010 fourcc match) | ✅ | ✅ table accepts P010 + R16/GR32 layer shapes |
-| `av_hwframe_map(DRM_PRIME → VAAPI)` on P010 dma-buf | ✅ | ❌ **driver gap** — Intel iHD + Mesa + FFmpeg 8.1 rejects with "DRM format not supported by VAAPI". Both single-layer P010+2-planes and two-layer R16+GR32+1-plane descriptor shapes fail. |
+FFmpeg's `vaapi_drm_format_map` carries **both** byte-orders for 8-bit
+NV12 (`DRM_FORMAT_RG88` *and* `GR88`) but only `DRM_FORMAT_RG1616` for
+P010. The bridge declared the UV plane as `GR32` (`DRM_FORMAT_GR1616`)
+— the natural sibling of the `GR88` used at 8-bit — so 8-bit matched
+the `GR88` entry while 10-bit missed the only P010 entry, and
+`av_hwframe_map` returned `EINVAL` ("DRM format not supported by
+VAAPI") *before the driver was ever consulted*. `R16G16_UNORM` is
+physically R-low/G-high = `RG1616`, so `GR32` was simply the wrong
+label; `build_p010_dmabuf_frame` now declares `RG32`.
 
-The driver layer's `vaapi_drm_format_map` table doesn't include an
-entry that matches the P010 descriptor on this combination. This is
-the empirical answer to the earlier "no documented driver supports
-any 10-bit VAAPI encode profile" question — confirmed for the M-series
-hardware available locally (Intel Arc on Meteor Lake). AMD radeonsi
-and NVIDIA nvidia-vaapi-driver are untested but documentation
-suggests the same gap.
+| Layer | Status |
+|-------|--------|
+| `tether_gpuconvert::Bgra2P010DmaBuf` | ✅ Y plane reads back BT.709-correct red Y=250 and Cb=409 / Cr=960 on 10-bit storage |
+| `tether_gpuconvert::storable_dmabuf_modifiers` (Vulkan storage probe, keyed `R16`/`GR32` → `R16G16_UNORM`) | ✅ Mesa intel-Vulkan advertises STORAGE_IMAGE on both for LINEAR |
+| `tether_codec::vaapi::VaapiEncoder::new(Main10)` (avcodec_open2) | ✅ on Intel iHD + FFmpeg 8.1 |
+| `av_hwframe_map(DRM_PRIME → VAAPI)` on P010 dma-buf (`R16` + `RG32` layers) | ✅ accepted — the `RG32` UV fourcc is the fix |
 
-**Host doesn't advertise Main10 to clients** on a driver that hits
-this gap: `apps/tether-host/src/main.rs::warm_gpuconvert_capability_cache`
-runs a real `submit_dmabuf` round-trip at startup (not just the
-storage-image probe), and the cache populates `false` if the round-trip
-fails. The codec-side probe alone is construction-only for 10-bit
-(can't tell apart "driver lacks dma-buf map entry" from "driver
-genuinely supports the path") so the host's warm-time check is the
-authoritative gate.
+Verified on Intel Lunar Lake (Arc 140V): Hevc and AV1 4:2:0 10-bit
+encode now probe `Supported`, the host advertises Main10, and the
+renderer round-trips `roundtrip_hevc_main10_identity` /
+`roundtrip_colorbars_hevc_main10` (plus the AV1 10-bit pair, which
+shares the same P010 bridge) pass with correct colour — no Cb/Cr swap.
+The fix is at the FFmpeg-table / fourcc level, not driver-specific, so
+it applies to any Intel driver with a P010 encode entrypoint (Meteor
+Lake included, untested locally). AMD radeonsi and NVIDIA
+nvidia-vaapi-driver remain untested.
 
-**Path forward** if/when a driver gains P010 dma-buf support:
-- No code changes needed in tether — the probe will populate `true`
-  and Main10 will appear in the advertised profile set
-- The renderer round-trip test
-  (`crates/tether-render/src/dmabuf_test.rs::dmabuf_zero_copy_roundtrip_hevc_main10`)
-  will go from SKIP to PASS on that driver
-- Cross-platform path (macOS host → Linux client at Main10) already
-  works today; it's only the Linux *encode* side that hits the gap
+The cross-platform path (macOS host → Linux client at Main10) was
+already fine; only the Linux *encode* side was blocked.
 
 ### 4:4:4 10-bit — wired on the encode side via packed XV30
 
@@ -554,6 +551,15 @@ live path only ever falls back to MF.)
   real cost is GPU contention, below). Verified by
   `d3d11_qsv_gpu_encode_decode_roundtrip`.
 - **AV1: not wired** (`backends_for_vendor` returns empty).
+- **HEVC Main10 pins the profile explicitly.** The encoder sets
+  `avctx->profile = AV_PROFILE_HEVC_MAIN_10` for 4:2:0 10-bit. Unlike VAAPI
+  (which derives the HEVC profile from the hw_frames `sw_format`), amfenc
+  leaves `profile` at the 8-bit Main default; fed a P010 surface without the
+  pin it emits a bitstream whose SPS disagrees with its 10-bit samples and
+  the decoder rejects it (`SendPacketError`). Verified by
+  `d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip` (full round trip) and
+  `d3d11_hevc_main10_encode_produces_packets` (asserts the SPS declares
+  10-bit luma — guards the pin on any backend).
 
 ### Low-latency option set (per backend)
 
@@ -581,6 +587,21 @@ genuinely can't encode the negotiated profile. The QSV/AMF/NVENC GPU
 round-trip *is* covered by hardware tests
 (`d3d11_{qsv,amf,nvenc}_gpu_encode_decode_roundtrip`), each gated on the
 present GPU vendor so it asserts on matching hardware and SKIPs elsewhere.
+The AMF backend (first developed on AMD, then largely unexercised while the
+pipeline matured on Intel QSV) has the broadest coverage, all verified on a
+Radeon 8060S / RDNA 4: HEVC Main 8-bit, **HEVC Main10**, and H.264 round
+trips; encoder rebuild on the same device (the single-session `Drop` flush);
+mid-stream forced-IDR; VPS-first extradata (the AMF-specific reorder, which
+the vendor-0 test only ever drove through MF); and an `async_depth=1`
+output-delay diagnostic (first packet within ~2 frames, not amfenc's
+default 16). Constructing all of these AMF sessions serially in one process
+is fine — AMF's single-session limit releases cleanly on the `Drop` flush.
+NOTE: **Media Foundation HEVC Main10 hangs** the `encode_bgra` MFT on AMD
+Radeon 8060S / RDNA 4, driver 32.0.23033.1002: the encode call blocks
+indefinitely (no error, no timeout) — observed only on this AMD MF path, not
+on Intel/NVIDIA. So the Main10 encode tests route through the present GPU's
+hardware encoder and skip the unknown-vendor → MF path rather than wedge.
+Re-check against later AMD drivers before re-enabling MF Main10.
 
 ### Latency note (loopback)
 

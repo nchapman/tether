@@ -16,6 +16,11 @@ mod gpu;
 pub mod present_policy;
 pub mod relative_mouse;
 
+/// Shared cross-platform colour-bar fixture + assertion used by every
+/// platform's round-trip test harness.
+#[cfg(test)]
+mod color_fixture;
+
 #[cfg(all(test, target_os = "linux"))]
 mod dmabuf_test;
 
@@ -54,12 +59,15 @@ pub use winit::event::MouseButton;
 pub use winit::keyboard::{KeyCode, ModifiersState};
 
 /// macOS-only — whether the renderer's IOSurface import path accepts
-/// the given `(chroma, bit_depth, fourcc)` triple. Exported so
-/// cross-crate tests (in `tether-host`) can confirm the renderer's
-/// accept set agrees with the encoder's and the VT probe's parallel
-/// tables. Drift between any of the three is the family of bug that
-/// shipped a broken 10-bit session in commit `621badc` — fast
-/// feedback in default CI is cheaper than catching it in a session.
+/// the given `(chroma, bit_depth, fourcc)` triple. The predicate itself
+/// lives in `tether_codec::macos_interop` (so the probe can consult it
+/// without a render dep); re-exported here for renderer callers. The
+/// decode-emit ↔ render-accept agreement is asserted in
+/// `tether-probe::host::videotoolbox` and the encoder/bridge agreement
+/// in `tether-gpuconvert::nv12_iosurface`. Drift between those tables is
+/// the family of bug that shipped a broken 10-bit session in commit
+/// `621badc` — fast feedback in default CI is cheaper than catching it
+/// in a session.
 #[cfg(target_os = "macos")]
 pub use gpu::accepts_iosurface_fourcc;
 
@@ -73,8 +81,8 @@ pub use gpu::supports_10bit_render;
 pub use d3d11::decode_plane_srv_formats;
 
 /// Shared cursor state for the overlay render pass. Construct one,
-/// hand a clone to the wire-receive side (call `with(|s| s.set_position(...))`
-/// / `with(|s| s.upload_shape(...))`), pass another clone into
+/// hand a clone to the wire-receive side (call `with(|s| s.set_host_visible(...))`
+/// / `with(|s| s.enqueue_shape(...))`), pass another clone into
 /// [`run`] which threads it to the renderer.
 pub use cursor_overlay::{CursorChannel, CursorState};
 
@@ -308,6 +316,7 @@ pub fn run(
         health: RenderHealth::default(),
         cursor_mode: CursorMode::Absolute,
         relative_accum: relative_mouse::SubPixelAccum::default(),
+        local_cursor_hidden: false,
         ctrl_held: false,
         alt_held: false,
         cursor_channel,
@@ -356,6 +365,12 @@ struct App {
     /// route `DeviceEvent::MouseMotion` through `relative_accum`.
     cursor_mode: CursorMode,
     relative_accum: relative_mouse::SubPixelAccum,
+    /// Whether we've hidden the local OS cursor. In absolute mode we
+    /// hide it exactly while the host-cursor overlay draws in its place
+    /// (pointer over the video, host shows a cursor), and show it again
+    /// over letterbox bars / off-window. Tracked so we only call winit's
+    /// `set_cursor_visible` on an actual change, not every motion event.
+    local_cursor_hidden: bool,
     /// Modifier-key edge tracker for the hotkey. We watch
     /// `WindowEvent::ModifiersChanged` for the actual state but
     /// also need the Ctrl+Alt+G three-key combo to fire on the
@@ -505,7 +520,8 @@ impl App {
 
     /// Try `Locked` first (true pointer-lock, supported on most
     /// platforms in 2026), fall back to `Confined` on X11/Wayland
-    /// combos that reject Locked. Hide the cursor either way.
+    /// combos that reject Locked. Cursor visibility is handled
+    /// separately via [`set_local_cursor_hidden`](Self::set_local_cursor_hidden).
     fn apply_cursor_grab(&self, window: &Window) {
         if window
             .set_cursor_grab(winit::window::CursorGrabMode::Locked)
@@ -513,7 +529,19 @@ impl App {
         {
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
         }
-        window.set_cursor_visible(false);
+    }
+
+    /// Show or hide the local OS cursor, calling winit only on an actual
+    /// state change (`WindowEvent::CursorMoved` fires this every motion
+    /// event, so the dedup matters).
+    fn set_local_cursor_hidden(&mut self, hidden: bool) {
+        if self.local_cursor_hidden == hidden {
+            return;
+        }
+        self.local_cursor_hidden = hidden;
+        if let Some(window) = &self.window {
+            window.set_cursor_visible(!hidden);
+        }
     }
 
     fn toggle_cursor_mode(&mut self) {
@@ -522,11 +550,14 @@ impl App {
             CursorMode::Relative => CursorMode::Absolute,
         };
         self.cursor_mode = new_mode;
-        // Mirror into the renderer's cursor state so the overlay
-        // pass doesn't draw the host pointer while we're rendering
-        // our own locked pointer locally.
+        // Mirror into the renderer's cursor state: suppress overlay
+        // drawing in relative mode (we render our own locked pointer),
+        // and clear the local-pointer anchor so a stale over-video
+        // position from the prior mode can't briefly draw the overlay
+        // before the next `CursorMoved`.
         self.cursor_channel.with(|state| {
             state.set_relative_mode(matches!(new_mode, CursorMode::Relative));
+            state.set_local_pointer(None);
         });
         // Drop sub-pixel residue so stale fractional motion from
         // the prior mode doesn't leak into the first delta.
@@ -536,9 +567,15 @@ impl App {
                 CursorMode::Relative => self.apply_cursor_grab(window),
                 CursorMode::Absolute => {
                     let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
-                    window.set_cursor_visible(true);
                 }
             }
+        }
+        match new_mode {
+            // Relative locks + hides the pointer; we render our own.
+            CursorMode::Relative => self.set_local_cursor_hidden(true),
+            // Show the OS cursor now; the next `CursorMoved` re-hides it
+            // if the pointer is over the video and the overlay draws.
+            CursorMode::Absolute => self.set_local_cursor_hidden(false),
         }
         self.emit(RenderEvent::CursorModeChanged(new_mode));
     }
@@ -739,9 +776,55 @@ impl ApplicationHandler for App {
                     return;
                 };
                 let (texture, surface) = gpu.dimensions();
-                self.emit(RenderEvent::Cursor {
-                    video_normalized: cursor_to_video_normalized(position, surface, texture),
+                let video_normalized = cursor_to_video_normalized(position, surface, texture);
+                // Anchor the host-cursor overlay to the local pointer for
+                // zero-latency motion (the host still gets the absolute
+                // position below, to move its real cursor). Convert the
+                // normalized position into the video-pixel space the
+                // overlay shader expects, then hide the local OS cursor
+                // exactly when the overlay draws in its place.
+                #[allow(clippy::cast_precision_loss)]
+                let local_px =
+                    video_normalized.map(|(nx, ny)| (nx * texture.0 as f32, ny * texture.1 as f32));
+                let overlay_active = self.cursor_channel.with(|state| {
+                    state.set_local_pointer(local_px);
+                    state.overlay_active()
                 });
+                let was_hidden = self.local_cursor_hidden;
+                // Known edge: if the host flips `visible` false after this
+                // `overlay_active` read but before the next render, the OS
+                // cursor stays hidden while nothing draws (no cursor) until
+                // the next motion event re-evaluates. Self-correcting and
+                // rare (the host's cursor stays in-bounds while driven), so
+                // not worth cross-thread redraw plumbing.
+                self.set_local_cursor_hidden(overlay_active);
+                // Cursor-only motion produces no new video frame (the host
+                // drops idle frames; the cursor is out-of-band), so the
+                // frame-arrival present loop won't redraw the moved sprite.
+                // Request a coalesced redraw while the overlay is drawing,
+                // plus one final redraw when it just stopped (to erase the
+                // last sprite). winit collapses bursts into one present per
+                // refresh, so a high-rate mouse can't over-present.
+                if overlay_active || was_hidden {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                self.emit(RenderEvent::Cursor { video_normalized });
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // Pointer left the window: drop the overlay anchor and
+                // restore the local OS cursor. (Relative mode keeps the
+                // pointer grabbed, so this won't fire there.)
+                self.cursor_channel
+                    .with(|state| state.set_local_pointer(None));
+                let needs_erase = self.local_cursor_hidden;
+                self.set_local_cursor_hidden(false);
+                if needs_erase {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 self.emit(RenderEvent::MouseButton {
@@ -770,11 +853,19 @@ impl ApplicationHandler for App {
                 if let Some(window) = &self.window {
                     if !b {
                         let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
-                        window.set_cursor_visible(true);
                     } else if matches!(self.cursor_mode, CursorMode::Relative) {
                         // Re-acquire on focus regain.
                         self.apply_cursor_grab(window);
                     }
+                }
+                if !b {
+                    // Blur: hand the OS cursor back and drop the overlay
+                    // anchor, regardless of mode.
+                    self.cursor_channel
+                        .with(|state| state.set_local_pointer(None));
+                    self.set_local_cursor_hidden(false);
+                } else if matches!(self.cursor_mode, CursorMode::Relative) {
+                    self.set_local_cursor_hidden(true);
                 }
                 self.emit(RenderEvent::Focused(b));
             }

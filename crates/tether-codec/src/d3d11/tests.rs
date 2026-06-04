@@ -273,7 +273,7 @@ mod tests {
     #[test]
     #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
     fn d3d11_qsv_decode_exports_gpu_shared_handles() {
-        gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", true);
+        gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", true, hevc_profile());
     }
 
     #[test]
@@ -483,18 +483,42 @@ mod tests {
         }
     }
 
+    /// HEVC Main10 encode must declare 10-bit in its SPS. Routes through the
+    /// *present* GPU's hardware encoder via the CPU-upload `encode_bgra`
+    /// path, complementing the GPU-submit
+    /// `d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip`. "Produces
+    /// packets" alone is half-credit — an encoder missing the Main10 profile
+    /// pin still emits a (malformed, 8-bit-SPS) bitstream that passes a
+    /// length check — so we parse the SPS and assert 10-bit, which catches a
+    /// dropped `AV_PROFILE_HEVC_MAIN_10` regardless of backend.
+    ///
+    /// NOT routed through vendor 0 → Media Foundation: MF's HEVC Main10 MFT
+    /// hangs `encode_bgra` on some drivers (observed on AMD RDNA 4). Skips on
+    /// unknown-vendor GPUs (which would fall back to that MF path).
     #[test]
     #[ignore = "requires D3D11VA-capable GPU with HEVC Main10 (Windows)"]
     fn d3d11_hevc_main10_encode_produces_packets() {
+        use windows::core::Interface;
+
+        let (device, context) = create_video_device();
+        let vendor_id = device_vendor_id(&device);
+        if !matches!(vendor_id, VENDOR_INTEL | VENDOR_AMD | VENDOR_NVIDIA) {
+            eprintln!(
+                "SKIP d3d11_hevc_main10_encode_produces_packets: unknown vendor \
+                 0x{vendor_id:04x} routes to MF, whose Main10 MFT can hang"
+            );
+            return;
+        }
+
         let mut enc = D3D11Encoder::new(
             hevc_main10_profile(),
             TEST_WIDTH,
             TEST_HEIGHT,
             TEST_FPS,
             TEST_BITRATE_KBPS,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            vendor_id,
         )
         .expect("HEVC Main10 encoder construction");
 
@@ -519,6 +543,21 @@ mod tests {
         assert!(
             all_packets[0].data.len() > 4,
             "packet too small to contain HEVC NALUs"
+        );
+        // The SPS must actually declare 10-bit 4:2:0. "Produces packets" is
+        // half-credit: an encoder missing the Main10 profile pin still emits
+        // a (malformed) bitstream that passes the length check but reports
+        // 8-bit, then fails to decode. Parsing the bit depth here catches a
+        // dropped `AV_PROFILE_HEVC_MAIN_10` on any backend (incl. MF/QSV),
+        // not just on the AMF decode round trip.
+        use crate::bitstream_sps::parse_sps_chroma_bit_depth;
+        let sps = parse_sps_chroma_bit_depth(&all_packets[0].data, CodecKind::Hevc)
+            .expect("SPS parse from Main10 keyframe");
+        assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
+        assert_eq!(
+            sps.bit_depth_luma, 10,
+            "Main10 SPS must declare 10-bit luma — the encoder's \
+             AV_PROFILE_HEVC_MAIN_10 pin likely regressed"
         );
     }
 
@@ -807,6 +846,71 @@ mod tests {
     /// NVIDIA PCI vendor ID — routes `D3D11Encoder::new` to NVENC.
     const VENDOR_NVIDIA: u32 = 0x10de;
 
+    /// Create a video device, returning it only if the present GPU is AMD;
+    /// otherwise print a SKIP diagnostic and return `None`. AMF-specific
+    /// tests must gate on the real vendor *before* constructing the encoder:
+    /// `D3D11Encoder::new(.., VENDOR_AMD)` on non-AMD hardware faults inside
+    /// a foreign vendor runtime (STATUS_ACCESS_VIOLATION), not a catchable
+    /// error. Run these on an AMF-capable AMD GPU.
+    fn amd_video_device_or_skip(
+        test: &str,
+    ) -> Option<(
+        windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    )> {
+        let (device, context) = create_video_device();
+        let present = device_vendor_id(&device);
+        if present != VENDOR_AMD {
+            eprintln!(
+                "SKIP {test}: GPU vendor 0x{present:04x} != AMD 0x{VENDOR_AMD:04x}; \
+                 run on an AMF-capable AMD GPU"
+            );
+            return None;
+        }
+        Some((device, context))
+    }
+
+    /// Allocate a mid-grey BGRA `ID3D11Texture2D` to feed the zero-copy
+    /// `submit_d3d11_texture` path. Shared by the AMF latency / forced-IDR
+    /// tests so each isn't re-declaring the same texture descriptor.
+    fn make_bgra_texture(
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        w: u32,
+        h: u32,
+    ) -> windows::Win32::Graphics::Direct3D11::ID3D11Texture2D {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        let data = vec![128u8; (w * h * 4) as usize];
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: data.as_ptr().cast(),
+            SysMemPitch: w * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut t = None;
+        unsafe { device.CreateTexture2D(&desc, Some(&init), Some(&mut t)) }
+            .expect("CreateTexture2D");
+        t.unwrap()
+    }
+
     /// Shared zero-copy GPU encode→decode round trip for one vendor — the
     /// path the host actually uses (`submit_d3d11_texture`). Exercises
     /// the backend's device setup, the VP BGRA→NV12 blit, the
@@ -817,7 +921,12 @@ mod tests {
     /// Asserts the *intended* backend opened, not the `hevc_mf` fallback
     /// `backends_for_vendor` appends — so on the wrong GPU the test fails
     /// loudly rather than silently passing through Media Foundation.
-    fn gpu_roundtrip_for_vendor(vendor_id: u32, expected_backend: &str, gpu_export: bool) {
+    fn gpu_roundtrip_for_vendor(
+        vendor_id: u32,
+        expected_backend: &str,
+        gpu_export: bool,
+        profile: VideoProfile,
+    ) {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D11::{
@@ -875,7 +984,7 @@ mod tests {
         let texture = texture.unwrap();
 
         let mut enc = D3D11Encoder::new(
-            hevc_profile(),
+            profile,
             encode_w,
             encode_h,
             TEST_FPS,
@@ -896,7 +1005,7 @@ mod tests {
             enc.name()
         );
 
-        let mut dec = D3D11Decoder::new(CodecKind::Hevc, gpu_export).expect("decoder construction");
+        let mut dec = D3D11Decoder::new(profile.codec, gpu_export).expect("decoder construction");
         let frame = D3D11TextureFrame {
             texture: texture.as_raw() as *mut _,
             device: device.as_raw() as *mut _,
@@ -957,7 +1066,7 @@ mod tests {
     #[test]
     #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
     fn d3d11_qsv_gpu_encode_decode_roundtrip() {
-        gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", false);
+        gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", false, hevc_profile());
     }
 
     /// AMF via the zero-copy GPU submit path — the only coverage of the
@@ -965,7 +1074,293 @@ mod tests {
     #[test]
     #[ignore = "requires AMD GPU with AMF (Windows)"]
     fn d3d11_amf_gpu_encode_decode_roundtrip() {
-        gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", false);
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", false, hevc_profile());
+    }
+
+    /// AMF H.264 via the zero-copy GPU submit path. The AMF backend was
+    /// first developed on this AMD GPU but every refinement since landed on
+    /// Intel QSV, so the AMD H.264 encode path (`h264_amf`, distinct from
+    /// the HEVC one) had no coverage at all.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF (Windows)"]
+    fn d3d11_amf_h264_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "h264_amf", false, h264_profile());
+    }
+
+    /// AMF HEVC Main10 (10-bit / P010) via the zero-copy GPU submit path.
+    /// The Windows host probe reports Main10 as Supported *statically* for
+    /// every vendor without ever exercising it; if AMF can't encode 10-bit
+    /// the live encoder dies with Goodbye(InternalError) at lazy-init. This
+    /// is the test that turns that unverified claim into a checked one.
+    /// `gpu_export = true`: a Main10 P010 surface has no 8-bit CPU-download
+    /// representation, so the GPU shared-handle export is the only valid
+    /// path (mirrors the host decode probe).
+    #[test]
+    #[ignore = "requires AMD GPU with AMF HEVC Main10 (Windows)"]
+    fn d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip() {
+        gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", true, hevc_main10_profile());
+    }
+
+    /// Build an AMF encoder, drop it, then build another at different dims
+    /// on the SAME D3D11 device. The AMD analogue of
+    /// `d3d11_qsv_encoder_rebuild_same_device`, and the direct regression
+    /// for `D3D11Encoder::drop`'s `flush_buffers`: AMF has a single hardware
+    /// session that releases asynchronously, so without the flush the second
+    /// construction can fail the single-session limit. The host rebuilds the
+    /// encoder on every viewport change, so this must hold.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF (Windows)"]
+    fn d3d11_amf_encoder_rebuild_same_device() {
+        use windows::core::Interface;
+
+        let Some((device, context)) =
+            amd_video_device_or_skip("d3d11_amf_encoder_rebuild_same_device")
+        else {
+            return;
+        };
+        // `as_raw()` borrows without an AddRef, so these raw pointers are
+        // only valid while `device`/`context` live. Both outlive `enc_a` and
+        // `enc_b` (dropped at end of function), and `D3D11Encoder::new`
+        // AddRefs internally for its own retained reference — so dropping
+        // `enc_a` can't free the device out from under `enc_b`. Don't drop
+        // `device`/`context` early.
+        let dev_ptr = device.as_raw() as *mut _;
+        let ctx_ptr = context.as_raw() as *mut _;
+
+        let enc_a = D3D11Encoder::new(
+            hevc_profile(),
+            1152,
+            720,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            dev_ptr,
+            ctx_ptr,
+            VENDOR_AMD,
+        )
+        .expect("first AMF encoder construction");
+        assert_eq!(
+            enc_a.name(),
+            "hevc_amf",
+            "AMF unavailable; got {}",
+            enc_a.name()
+        );
+        drop(enc_a);
+
+        let enc_b = D3D11Encoder::new(
+            hevc_profile(),
+            1440,
+            896,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            dev_ptr,
+            ctx_ptr,
+            VENDOR_AMD,
+        )
+        .expect("rebuilt AMF encoder on same device — was the first session released on drop?");
+        assert_eq!(enc_b.name(), "hevc_amf");
+    }
+
+    /// The HEVC VPS-reorder fix exists *because AMF* emits SPS→PPS→VPS;
+    /// `snapshot_extradata` rewrites it to VPS→SPS→PPS. The existing
+    /// `d3d11_hevc_extradata_starts_with_vps` routes through vendor 0 → Media
+    /// Foundation, so it never exercises AMF's ordering. This constructs the
+    /// real `hevc_amf` encoder and asserts the stored extradata leads with
+    /// VPS — covering the actual backend the fix was written for.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows)"]
+    fn d3d11_amf_hevc_extradata_starts_with_vps() {
+        use windows::core::Interface;
+
+        let Some((device, context)) =
+            amd_video_device_or_skip("d3d11_amf_hevc_extradata_starts_with_vps")
+        else {
+            return;
+        };
+
+        let enc = D3D11Encoder::new(
+            hevc_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            VENDOR_AMD,
+        )
+        .expect("AMF HEVC encoder construction");
+        assert_eq!(
+            enc.name(),
+            "hevc_amf",
+            "AMF unavailable; got {}",
+            enc.name()
+        );
+
+        let extradata = enc.extradata();
+        assert!(extradata.len() > 5, "extradata too short");
+        assert_eq!(
+            &extradata[..4],
+            &[0x00, 0x00, 0x00, 0x01],
+            "extradata not Annex-B"
+        );
+        let nalu_type = (extradata[4] >> 1) & 0x3F;
+        assert_eq!(
+            nalu_type, 32,
+            "first NALU in AMF extradata should be VPS (32), got {nalu_type} — \
+             the SPS→PPS→VPS reorder fix regressed on the real AMF backend"
+        );
+    }
+
+    /// On-demand IDR (`ControlMessage::ForceIdr`) is load-bearing for loss
+    /// recovery. The AMF path sets `forced_idr=1` and stamps `pict_type = I`
+    /// on the forced frame; this verifies AMF honours it *mid-stream* — a
+    /// forced submit after the stream is warm must yield a keyframe packet,
+    /// not just at frame 0. If AMF ignored it, recovery would silently fail.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows)"]
+    fn d3d11_amf_forced_idr_midstream_produces_keyframe() {
+        use crate::D3D11TextureFrame;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+        let Some((device, context)) =
+            amd_video_device_or_skip("d3d11_amf_forced_idr_midstream_produces_keyframe")
+        else {
+            return;
+        };
+
+        let texture = make_bgra_texture(&device, TEST_WIDTH, TEST_HEIGHT);
+        let mut enc = D3D11Encoder::new(
+            hevc_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            VENDOR_AMD,
+        )
+        .expect("AMF encoder construction");
+        assert_eq!(
+            enc.name(),
+            "hevc_amf",
+            "AMF unavailable; got {}",
+            enc.name()
+        );
+
+        let frame = D3D11TextureFrame {
+            texture: texture.as_raw() as *mut _,
+            device: device.as_raw() as *mut _,
+            device_context: context.as_raw() as *mut _,
+            width: TEST_WIDTH,
+            height: TEST_HEIGHT,
+            format: DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32,
+        };
+
+        // Warm the stream — frame 0 is an implicit IDR (the encoder forces
+        // it on `first_frame` regardless of `force_keyframe`), frames 1..29
+        // are P-frames — draining packets so the frame-0 keyframe is long
+        // gone before we force the next one.
+        for pts in 0..30 {
+            let _ = enc
+                .submit_d3d11_texture(&frame, pts, false)
+                .expect("warmup submit");
+        }
+
+        // Request a keyframe mid-stream; a keyframe packet must follow.
+        let mut saw_forced_keyframe = false;
+        for pts in 30..45 {
+            let pkts = enc
+                .submit_d3d11_texture(&frame, pts, pts == 30)
+                .expect("submit");
+            if pkts.iter().any(|p| p.keyframe) {
+                saw_forced_keyframe = true;
+                break;
+            }
+        }
+        assert!(
+            saw_forced_keyframe,
+            "AMF emitted no keyframe after a mid-stream ForceIdr — \
+             forced_idr / pict_type=I is being ignored, breaking loss recovery"
+        );
+    }
+
+    /// SKIP-with-diagnostic for the AMF latency knobs (`async_depth=1`,
+    /// `usage=ultralowlatency`, `latency=1`). amfenc defaults `async_depth`
+    /// to 16; if our override silently no-ops the encoder buffers ~16 frames
+    /// before the first packet (16 frames of added latency — exactly what
+    /// the encoder.rs comment warns about). We can't read the option back,
+    /// so we observe its effect: count submits before the first packet.
+    /// async_depth=1 ⇒ a frame or two; a double-digit count ⇒ the override
+    /// didn't take. Records the negative per the codec-knob rule in CLAUDE.md.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows)"]
+    fn d3d11_amf_async_depth_one_bounds_output_delay() {
+        use crate::D3D11TextureFrame;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+        let Some((device, context)) =
+            amd_video_device_or_skip("d3d11_amf_async_depth_one_bounds_output_delay")
+        else {
+            return;
+        };
+
+        let texture = make_bgra_texture(&device, TEST_WIDTH, TEST_HEIGHT);
+        let mut enc = D3D11Encoder::new(
+            hevc_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            VENDOR_AMD,
+        )
+        .expect("AMF encoder construction");
+        assert_eq!(
+            enc.name(),
+            "hevc_amf",
+            "AMF unavailable; got {}",
+            enc.name()
+        );
+
+        let frame = D3D11TextureFrame {
+            texture: texture.as_raw() as *mut _,
+            device: device.as_raw() as *mut _,
+            device_context: context.as_raw() as *mut _,
+            width: TEST_WIDTH,
+            height: TEST_HEIGHT,
+            format: DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32,
+        };
+
+        let mut frames_to_first = None;
+        for pts in 0..32 {
+            let pkts = enc
+                .submit_d3d11_texture(&frame, pts, pts == 0)
+                .expect("submit");
+            if !pkts.is_empty() {
+                frames_to_first = Some(pts + 1);
+                break;
+            }
+        }
+        let n = frames_to_first.expect("AMF produced no packet in 32 frames");
+        eprintln!(
+            "AMF frames-to-first-packet = {n} (async_depth=1 expects ~1-2; \
+             ~16 ⇒ the async_depth override no-op'd)"
+        );
+        // Threshold rationale: with B-frames disabled (`max_b_frames=0`) and
+        // `async_depth=1`, at most one encode is in flight and there is no
+        // reorder DPB, so output should appear within ~1-2 submits; 4 is a 2×
+        // tolerance for pipeline fill. The amfenc default of 16 (or any value
+        // the override failed to apply) lands far above this. Observed 2 on
+        // the Radeon 8060S. If a future driver legitimately needs >4 at
+        // async_depth=1, revisit — but a double-digit count means the knob
+        // no-op'd, which is the regression this guards.
+        assert!(
+            n <= 4,
+            "AMF buffered {n} frames before the first packet — async_depth=1 \
+             is likely being ignored (amfenc default is 16)"
+        );
     }
 
     /// NVENC via the zero-copy GPU submit path — the only coverage of the
@@ -973,7 +1368,7 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU with NVENC (Windows)"]
     fn d3d11_nvenc_gpu_encode_decode_roundtrip() {
-        gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "hevc_nvenc", false);
+        gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "hevc_nvenc", false, hevc_profile());
     }
 
     /// Diagnostic probe for QSV encode latency. Measures `submit_d3d11_texture`

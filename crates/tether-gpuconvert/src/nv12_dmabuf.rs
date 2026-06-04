@@ -615,6 +615,144 @@ mod tests {
                 "Y[{x},{y}] = {got}, expected ~{expected_y} (diff {diff})",
             );
         }
+        drop(mapped);
+        readback.unmap();
+
+        // UV plane (Cb/Cr) verification. The Y-only check above can't
+        // catch a Cb↔Cr swap or a wrong chroma matrix row; pure red has
+        // distinct Cb vs Cr (102 vs 240) so this pins the chroma math
+        // against the BT.709 limited-range spec directly (not a round-
+        // trip). The 10-bit sibling does the same in `bgra_to_p010_dmabuf`.
+        let chroma_w = width.div_ceil(2);
+        let chroma_h = height.div_ceil(2);
+        let uv_import_desc = wgpu::hal::TextureDescriptor {
+            label: Some("uv reimport"),
+            size: wgpu::Extent3d {
+                width: chroma_w,
+                height: chroma_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg8Unorm,
+            usage: wgpu::TextureUses::COPY_SRC,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+        // SAFETY: out.fd / modifier / uv_stride / uv_offset come from the
+        // bridge's own export — the authoritative UV-plane descriptor.
+        let uv_hal_tex = unsafe {
+            bridge
+                .device()
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("vulkan backend")
+                .texture_from_dmabuf_fd(
+                    out.fd
+                        .try_clone()
+                        .expect("dup shared NV12 fd for UV reimport"),
+                    &uv_import_desc,
+                    out.modifier,
+                    out.uv_stride,
+                    out.uv_offset,
+                )
+                .expect("uv texture_from_dmabuf_fd")
+        };
+        let uv_import_tex = unsafe {
+            bridge
+                .device()
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                    uv_hal_tex,
+                    &wgpu::TextureDescriptor {
+                        label: Some("uv reimport"),
+                        size: wgpu::Extent3d {
+                            width: chroma_w,
+                            height: chroma_h,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rg8Unorm,
+                        usage: wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    },
+                )
+        };
+
+        // Rg8Unorm is 2 bytes/texel. 256-byte row align for the copy.
+        let uv_row_bytes = u64::from(chroma_w) * 2;
+        let uv_padded_row = uv_row_bytes.div_ceil(256) * 256;
+        let uv_readback = bridge.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uv readback"),
+            size: uv_padded_row * u64::from(chroma_h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut uv_enc = bridge
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("uv readback enc"),
+            });
+        uv_enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &uv_import_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &uv_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(u32::try_from(uv_padded_row).unwrap()),
+                    rows_per_image: Some(chroma_h),
+                },
+            },
+            wgpu::Extent3d {
+                width: chroma_w,
+                height: chroma_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        bridge.queue().submit(Some(uv_enc.finish()));
+        let uv_slice = uv_readback.slice(..);
+        let (uv_tx, uv_rx) = std::sync::mpsc::channel();
+        uv_slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = uv_tx.send(r);
+        });
+        bridge
+            .device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll uv readback");
+        uv_rx.recv().expect("cb").expect("map");
+        let uv_mapped = uv_slice.get_mapped_range().expect("range");
+
+        // BT.709 limited-range 8-bit, pure red: Cb=102, Cr=240. NV12 UV
+        // byte order is Cb then Cr (Rg8: R→Cb, G→Cr).
+        let expected_cb: u8 = 102;
+        let expected_cr: u8 = 240;
+        for &(x, y) in &[
+            (0u32, 0u32),
+            (chroma_w / 2, chroma_h / 2),
+            (chroma_w - 1, chroma_h - 1),
+        ] {
+            let off = (u64::from(y) * uv_padded_row + u64::from(x) * 2) as usize;
+            let cb = uv_mapped[off];
+            let cr = uv_mapped[off + 1];
+            let cb_diff = i32::from(cb) - i32::from(expected_cb);
+            let cr_diff = i32::from(cr) - i32::from(expected_cr);
+            assert!(
+                cb_diff.abs() <= 2,
+                "Cb[{x},{y}] = {cb}, expected ~{expected_cb} (diff {cb_diff})",
+            );
+            assert!(
+                cr_diff.abs() <= 2,
+                "Cr[{x},{y}] = {cr}, expected ~{expected_cr} (diff {cr_diff})",
+            );
+        }
+        drop(uv_mapped);
+        uv_readback.unmap();
     }
 
     /// Same conversion math as the test above, but the BGRA source

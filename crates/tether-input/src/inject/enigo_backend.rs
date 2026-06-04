@@ -349,11 +349,20 @@ impl EnigoBackend {
         }
         let px = (cursor.x.clamp(0.0, 1.0) * self.display.0 as f32) as i32;
         let py = (cursor.y.clamp(0.0, 1.0) * self.display.1 as f32) as i32;
-        // macOS note: CGEvent expects screen points (Retina-scaled),
-        // not raw pixels. enigo's macOS backend already does the
-        // points-vs-pixels conversion internally via NSScreen scale,
-        // so the absolute pixel coordinates we pass here are correct
-        // for both libei (linux) and CGEvent (macos).
+        // `self.display` must be in whatever absolute coordinate space
+        // the backend's `move_mouse(Abs)` consumes:
+        //   - libei (Linux): pixels of the captured output.
+        //   - SendInput (Windows): enigo re-normalises against
+        //     `GetSystemMetrics` (primary-monitor pixels), so any
+        //     pixel-space dims that match the screen round-trip correctly.
+        //   - CGEvent (macOS): enigo posts the coordinates *verbatim*
+        //     (see enigo `macos_impl::move_mouse` → `CGPoint` → no
+        //     scaling). CGEvent's global space is in *points*, NOT
+        //     backing pixels — so the macOS backend must store the
+        //     display's logical-point dims here, which `MacOsInjector`
+        //     supplies by overriding `set_display_size`. Feeding raw
+        //     backing pixels warps the cursor by the backing scale
+        //     factor (≈2× on Retina), landing it hundreds of points off.
         self.enigo
             .move_mouse(px, py, Coordinate::Abs)
             .map_err(|e| InjectError::Inject(format!("move_mouse: {e:?}")))?;

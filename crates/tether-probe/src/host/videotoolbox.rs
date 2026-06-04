@@ -28,6 +28,7 @@ use tether_capture::macos::{
     probe_capture_pixel_formats, sck_pixel_format_for_profile, SckCaptureCapability,
 };
 use tether_codec::bitstream_sps::parse_sps_chroma_bit_depth;
+use tether_codec::macos_interop::{accepts_iosurface_fourcc, iosurface_fourcc_expected_label};
 use tether_codec::videotoolbox::{
     expected_iosurface_fourccs, VideoToolboxDecoder, VideoToolboxEncoder,
 };
@@ -211,12 +212,6 @@ impl ProfileProbe for VideoToolboxProbe {
     }
 
     fn probe_decode(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
-        // `profile` is otherwise unused on this path — the codec is
-        // encoded in the fixture's NAL header and that's the only
-        // thing the decoder construction needs. Keep the full
-        // `profile` in the signature for symmetry with `probe_encode`
-        // and so log lines have the requested profile to anchor to.
-        let _ = profile;
         let mut dec = VideoToolboxDecoder::new(profile.codec)
             .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
         dec.submit(fixture)
@@ -230,7 +225,33 @@ impl ProfileProbe for VideoToolboxProbe {
             .next_frame()
             .map_err(|e| ProbeError::from_codec(PipelineStage::Decode, e))?
         {
-            Some(Frame::Gpu(_)) => Ok(()),
+            Some(Frame::Gpu(gpu)) => {
+                // L2: gate the decoded IOSurface fourcc through the SAME
+                // accept set the renderer's IOSurface import uses, so a
+                // profile that VT decodes to a fourcc the renderer rejects
+                // is excluded at negotiation instead of black-screening at
+                // first frame. This is the check that would have caught
+                // the 'x444' bug (a Linux-host 4:4:4 10-bit stream decoding
+                // to the video-range 'x444' while the accept set listed
+                // only the full-range 'xf44').
+                let GpuFrameSource::IOSurface(io) = gpu.source;
+                let observed = io.pixel_format;
+                if accepts_iosurface_fourcc(profile.chroma, profile.bit_depth, observed) {
+                    Ok(())
+                } else {
+                    Err(ProbeError::new(
+                        PipelineStage::Decode,
+                        format!(
+                            "VT decoded IOSurface fourcc 0x{observed:08x} is not render-accepted \
+                             for {:?} {}-bit (expected {}) — the renderer's import path would \
+                             drop every frame; excluding this profile from negotiation",
+                            profile.chroma,
+                            profile.bit_depth,
+                            iosurface_fourcc_expected_label(profile.chroma, profile.bit_depth),
+                        ),
+                    ))
+                }
+            }
             Some(Frame::Cpu(_)) => Err(ProbeError::new(
                 PipelineStage::Decode,
                 "VT decoder fell back to software (Frame::Cpu)",
@@ -263,4 +284,131 @@ fn probe_bgra_with_chroma_detail() -> Vec<u8> {
         }
     }
     data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile_probe::fixture_for;
+
+    /// L1 (pure logic, no hardware): for every negotiable profile, every
+    /// IOSurface fourcc the VT decoder is declared to emit
+    /// (`expected_iosurface_fourccs`) must be one the renderer's import
+    /// path accepts (`accepts_iosurface_fourcc`). The macOS sibling of the
+    /// Windows `decoder_output_is_subset_of_renderer_accept` and the Linux
+    /// VAAPI version — this is the cheap CI guard that would have caught
+    /// the missing `'x444'` accept entry without any hardware.
+    #[test]
+    fn decoder_output_is_subset_of_renderer_accept() {
+        let mut covered = 0;
+        for profile in crate::PROFILE_PREFERENCE {
+            for &fourcc in expected_iosurface_fourccs(*profile) {
+                assert!(
+                    accepts_iosurface_fourcc(profile.chroma, profile.bit_depth, fourcc),
+                    "VT decode emits IOSurface fourcc 0x{fourcc:08x} for {profile:?}, but the \
+                     renderer's accepts_iosurface_fourcc rejects it — every frame of a negotiated \
+                     session would be dropped at import (the 'x444' bug shape)."
+                );
+                covered += 1;
+            }
+        }
+        // Vacuity guard: every HEVC entry plus H.264 4:2:0 declares ≥1
+        // decode fourcc (only AV1 adds none — `expected_iosurface_fourccs`
+        // has no AV1 arm), so coverage comfortably clears the four families.
+        assert!(
+            covered >= 4,
+            "expected ≥4 declared decode fourccs across PROFILE_PREFERENCE, got {covered}"
+        );
+    }
+
+    /// Decode every committed probe fixture through VideoToolbox and
+    /// assert the IOSurface fourcc VT actually emits is one the
+    /// renderer would import (`accepts_iosurface_fourcc`).
+    ///
+    /// This is the closed-loop guard for the bug class that kept
+    /// recurring: the renderer accept set was hand-maintained against
+    /// what *macOS encode* produces, while a real session decodes
+    /// streams from a Linux/Windows host. The fixtures here are
+    /// x264/x265-encoded (i.e. **not** VideoToolbox), so they exercise
+    /// exactly the cross-platform decode path. With the renderer
+    /// limited to BT.709, the surface a video-range stream lands in is
+    /// the video-range fourcc of its family — e.g. HEVC 4:4:4 10-bit
+    /// decodes to `'x444'`, which the accept set rejected until this
+    /// test pinned it.
+    ///
+    /// Hardware: needs an Apple-Silicon VT decoder. A profile whose
+    /// fixture this machine genuinely can't decode is reported as SKIP
+    /// rather than failing, but the 4:4:4 10-bit regression target is
+    /// required to land — every Apple Silicon Mac decodes it.
+    #[test]
+    #[ignore = "requires macOS + VideoToolbox"]
+    fn decoded_fixture_fourcc_is_renderer_accepted() {
+        // The macOS-negotiated decode set that ships a fixture. AV1
+        // fixtures exist but AV1 is out of the HEVC/H.264 bug domain
+        // this guard covers, and decode is M3+-only.
+        let profiles = [
+            VideoProfile::H264_8BIT_420,
+            VideoProfile::HEVC_8BIT_420,
+            VideoProfile::HEVC_10BIT_420,
+            VideoProfile::HEVC_8BIT_444,
+            VideoProfile::HEVC_10BIT_444,
+        ];
+
+        let mut decoded_444_10bit = false;
+        for profile in profiles {
+            let Some(fixture) = fixture_for(profile) else {
+                panic!("{profile:?} has no committed decode fixture");
+            };
+            match decode_fixture_fourcc(profile, fixture) {
+                Ok(fourcc) => {
+                    assert!(
+                        accepts_iosurface_fourcc(profile.chroma, profile.bit_depth, fourcc),
+                        "{profile:?} decoded to IOSurface fourcc 0x{fourcc:08x}, which the \
+                         renderer's accepts_iosurface_fourcc rejects — the import path would \
+                         drop every frame with the surface intact (the 'x444' bug)"
+                    );
+                    eprintln!("decode-accept: {profile:?} OK (IOSurface 0x{fourcc:08x} accepted)");
+                    if profile == VideoProfile::HEVC_10BIT_444 {
+                        decoded_444_10bit = true;
+                    }
+                }
+                Err(reason) => {
+                    eprintln!("decode-accept: {profile:?} SKIP ({reason})");
+                }
+            }
+        }
+
+        assert!(
+            decoded_444_10bit,
+            "HEVC 4:4:4 10-bit fixture failed to decode — this is the regression target and \
+             every Apple Silicon VT decoder handles it; a failure here means the decode path \
+             itself broke, not just the accept set"
+        );
+    }
+
+    /// Decode a single-IDR fixture and return the observed IOSurface
+    /// fourcc, or a reason string if any step failed (treated as a
+    /// hardware SKIP by the caller).
+    fn decode_fixture_fourcc(
+        profile: VideoProfile,
+        fixture: &[u8],
+    ) -> std::result::Result<u32, String> {
+        let mut dec = VideoToolboxDecoder::new(profile.codec)
+            .map_err(|e| format!("decoder construction: {e:?}"))?;
+        dec.submit(fixture)
+            .map_err(|e| format!("decoder submit: {e:?}"))?;
+        dec.signal_eof()
+            .map_err(|e| format!("decoder signal_eof: {e:?}"))?;
+        match dec
+            .next_frame()
+            .map_err(|e| format!("decoder next_frame: {e:?}"))?
+        {
+            Some(Frame::Gpu(gpu)) => {
+                let GpuFrameSource::IOSurface(io) = gpu.source;
+                Ok(io.pixel_format)
+            }
+            Some(Frame::Cpu(_)) => Err("VT fell back to software (Frame::Cpu)".into()),
+            None => Err("no frame produced after EOF".into()),
+        }
+    }
 }

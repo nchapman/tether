@@ -43,6 +43,7 @@ use tether_codec::videotoolbox::{VideoToolboxDecoder, VideoToolboxEncoder};
 use tether_codec::{Decoder, Encoder, Frame as CodecFrame, GpuFrameSource};
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
+use crate::color_fixture::{assert_colorbars, ChannelOrder};
 use crate::gpu;
 
 /// Reconstructed RGB of the two source regions (left, right) read back from the
@@ -318,7 +319,12 @@ fn build_test_pipeline(
 /// `RUST_BACKTRACE=1` highly recommended on failure — the
 /// IOSurface fourcc the decoder produced is in the import path's
 /// error message and the test panics on the first mismatch.
-fn run_roundtrip(profile: VideoProfile) -> Option<RegionColors> {
+fn run_roundtrip(
+    profile: VideoProfile,
+    input_bgra: &[u8],
+    w: u32,
+    h: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (device, queue, adapter) =
@@ -338,20 +344,13 @@ fn run_roundtrip(profile: VideoProfile) -> Option<RegionColors> {
         info.name, info.driver, info.backend
     );
 
-    let w: u32 = 320;
-    let h: u32 = 240;
-    let input_bgra = make_test_bgra(w, h);
-
     // Encode several frames so the decoder has enough to flush at
     // least one decoded surface. First frame is an IDR.
     let mut enc = VideoToolboxEncoder::new(profile, w, h, 30, 4_000)
         .expect("VT encoder construction must succeed for a probed profile");
     let mut packets = Vec::new();
     for t in 0..6i64 {
-        packets.extend(
-            enc.encode_bgra(&input_bgra, t, t == 0)
-                .expect("encode_bgra"),
-        );
+        packets.extend(enc.encode_bgra(input_bgra, t, t == 0).expect("encode_bgra"));
     }
     // VT typically buffers the latest one or two frames internally;
     // an explicit flush drains them before we hand the packet stream
@@ -507,11 +506,7 @@ fn run_roundtrip(profile: VideoProfile) -> Option<RegionColors> {
     drop(mapped);
     readback.unmap();
 
-    let left = region_average_rgb(&rgba, w, w / 8, h / 4, w / 4, h / 2);
-    let right = region_average_rgb(&rgba, w, 5 * w / 8, h / 4, w / 4, h / 2);
-    eprintln!("[{profile:?}] left avg RGB  = {left:?}");
-    eprintln!("[{profile:?}] right avg RGB = {right:?}");
-    Some((left, right))
+    Some((rgba, w, h))
 }
 
 /// HEVC 4:2:0 8-bit (Main). The cheapest cell — every M-series Mac
@@ -521,24 +516,25 @@ fn run_roundtrip(profile: VideoProfile) -> Option<RegionColors> {
 #[test]
 #[ignore = "requires macOS + VideoToolbox + Metal; run with: cargo test -p tether-render --release -- --ignored iosurface"]
 fn iosurface_zero_copy_roundtrip_hevc_main_8bit() {
-    let Some((left, right)) = run_roundtrip(VideoProfile {
-        codec: tether_protocol::control::CodecKind::Hevc,
-        chroma: ChromaSubsampling::Yuv420,
-        bit_depth: 8,
-    }) else {
+    let dims = (320u32, 240u32);
+    let bgra = crate::color_fixture::colorbars_bgra(dims);
+    let Some((rgba, w, h)) = run_roundtrip(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        &bgra,
+        dims.0,
+        dims.1,
+    ) else {
         return;
     };
-    // Generous bounds: HEVC at 4 Mbps on a 320×240 source preserves
-    // these flat colour regions easily. BT.709 limited-range
-    // round-trip + quantisation can shift channels by ~20.
-    assert!(
-        left.0 > 130 && left.1 < 80 && left.2 < 80,
-        "left region should be reddish; got {left:?}"
-    );
-    assert!(
-        right.2 > 130 && right.0 < 80 && right.1 < 80,
-        "right region should be blueish; got {right:?}"
-    );
+    // Full red/green/blue/white bars through the real VT-encode →
+    // decode → import → shader path. Strictly stronger than the old
+    // red/blue region check: green catches a dropped chroma channel and
+    // the white bar catches a hue cast (the "colors are wrong" bug).
+    assert_colorbars("4:2:0 8-bit", &rgba, w, h, ChannelOrder::Rgba);
 }
 
 /// HEVC 4:2:0 10-bit (Main10). The cell that bit us across three
@@ -550,35 +546,35 @@ fn iosurface_zero_copy_roundtrip_hevc_main_8bit() {
 #[test]
 #[ignore = "requires macOS + VideoToolbox + Metal Main10; run with: cargo test -p tether-render --release -- --ignored iosurface"]
 fn iosurface_zero_copy_roundtrip_hevc_main10() {
-    let Some((left, right)) = run_roundtrip(VideoProfile {
-        codec: tether_protocol::control::CodecKind::Hevc,
-        chroma: ChromaSubsampling::Yuv420,
-        bit_depth: 10,
-    }) else {
+    let dims = (320u32, 240u32);
+    let bgra = crate::color_fixture::colorbars_bgra(dims);
+    let Some((rgba, w, h)) = run_roundtrip(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        },
+        &bgra,
+        dims.0,
+        dims.1,
+    ) else {
         return;
     };
-    // Same bounds as 8-bit — 10-bit's added precision doesn't change
-    // the average colour of a flat region, only how cleanly we hit
-    // it. If anything, the 10-bit cell should reconstruct *closer*
-    // to the source.
-    assert!(
-        left.0 > 130 && left.1 < 80 && left.2 < 80,
-        "left region should be reddish; got {left:?}"
-    );
-    assert!(
-        right.2 > 130 && right.0 < 80 && right.1 < 80,
-        "right region should be blueish; got {right:?}"
-    );
+    // Same full color-bar check as 8-bit — 10-bit's added precision
+    // reconstructs the bars at least as cleanly. Exercises the
+    // Biplanar16 import + 10-bit range branch with real colour.
+    assert_colorbars("4:2:0 10-bit", &rgba, w, h, ChannelOrder::Rgba);
 }
 
 /// Decode-only render path. Used by the 4:4:4 cells: VideoToolbox has
 /// no Main444 encode, but it decodes Main444 fine to an NV24 IOSurface,
-/// so we feed it a Linux-encoded HEVC 4:4:4 IDR fixture and exercise
-/// the import + render half. The fixture is grey, so the assertion is
-/// "rendered output is approximately neutral grey" — R≈G≈B with both
-/// near a sane luminance midpoint — rather than the red/blue check the
-/// encode-roundtrip cells use.
-fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionColors> {
+/// so we feed it an off-platform-encoded HEVC 4:4:4 IDR fixture and
+/// exercise the production decode → IOSurface import → shader render
+/// half, handing the caller the full RGBA readback to assert against
+/// known colours. This is the *only* pixel coverage the macOS 4:4:4
+/// render path has — VT can't encode Main444, so there's no local
+/// encode→decode round-trip for it.
+fn render_fixture_to_rgba(profile: VideoProfile, bitstream: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (device, queue, adapter) =
@@ -598,10 +594,6 @@ fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionC
         info.name, info.driver, info.backend
     );
 
-    // Fixture geometry is fixed at 128×128 by the probe regenerator.
-    let w: u32 = 128;
-    let h: u32 = 128;
-
     let mut dec = VideoToolboxDecoder::new(profile.codec).expect("VT decoder construction");
     dec.submit(bitstream).expect("decoder submit fixture IDR");
     dec.signal_eof().expect("decoder signal_eof");
@@ -613,8 +605,7 @@ fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionC
         }
     }
     let codec_gpu = codec_gpu.expect("decoder must produce at least one Frame::Gpu");
-    let (gw, gh, _pts, source, guard) = codec_gpu.into_parts();
-    assert_eq!((gw, gh), (w, h), "decoded dims must match fixture dims");
+    let (w, h, _pts, source, guard) = codec_gpu.into_parts();
     let GpuFrameSource::IOSurface(iosurface) = source;
     eprintln!(
         "[{profile:?}] decoded IOSurface fourcc: 0x{:08x}",
@@ -731,52 +722,20 @@ fn run_fixture_render(profile: VideoProfile, bitstream: &[u8]) -> Option<RegionC
     drop(mapped);
     readback.unmap();
 
-    let left = region_average_rgb(&rgba, w, w / 8, h / 4, w / 4, h / 2);
-    let right = region_average_rgb(&rgba, w, 5 * w / 8, h / 4, w / 4, h / 2);
-    eprintln!("[{profile:?}] left avg RGB  = {left:?}");
-    eprintln!("[{profile:?}] right avg RGB = {right:?}");
-    Some((left, right))
+    Some((rgba, w, h))
 }
 
-/// Assert that a region average looks like neutral grey near the
-/// fixture's input level. The probe fixtures are generated from
-/// ffmpeg's `color=c=gray` filter, which produces sRGB (128, 128, 128)
-/// — Y'=126 in BT.709 limited-range, Cb=Cr=128. After our shader's
-/// limited-range expansion this should reconstruct to roughly
-/// RGB(128, 128, 128) per channel.
-///
-/// Tolerances:
-///   * `spread <= 24` rejects a wrong-matrix bug that lands a colour
-///     cast (high G, low R/B; or chroma swap producing pink/cyan).
-///   * `avg ∈ 90..=170` rejects "stuck black" / "stuck white" import
-///     failures and gross wrong-range expansion. Loose enough to
-///     absorb HEVC quantisation noise on a 128×128 source.
-fn assert_grey(label: &str, rgb: (u8, u8, u8)) {
-    let (r, g, b) = rgb;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let spread = max - min;
-    assert!(
-        spread <= 24,
-        "{label}: R/G/B spread too wide for grey input — got {rgb:?} (spread {spread})"
-    );
-    let avg = (u32::from(r) + u32::from(g) + u32::from(b)) / 3;
-    assert!(
-        (90..=170).contains(&avg),
-        "{label}: average channel value {avg} not near grey midpoint (expected ~128) — got {rgb:?}"
-    );
-}
-
-/// HEVC 4:4:4 8-bit (Main 4:4:4). Renderer-side coverage for the
-/// Linux-host → Mac-client path: NV24 IOSurface fourcc `'444v'`,
-/// full-res UV stride, biplanar path with the same R8 Y + Rg8 UV
-/// shader as NV12. No local encode — VT can't produce Main444 — so
-/// the fixture is a Linux-encoded HEVC 4:4:4 IDR (128×128 grey).
+/// HEVC 4:4:4 8-bit (Main 4:4:4). Renderer-side colour coverage for the
+/// Linux-host → Mac-client path: `'444v'` NV24 IOSurface, full-res UV,
+/// biplanar R8 Y + Rg8 UV shader. VT can't encode Main444, so the
+/// fixture is an off-platform (x265) HEVC 4:4:4 IDR of a
+/// red/green/blue/white colour-bar pattern — the shared cross-platform
+/// fixture pattern (`fixtures/colorbars_hevc_yuv444_8bit.idr`).
 #[test]
 #[ignore = "requires macOS + VideoToolbox + Metal Main444; run with: cargo test -p tether-render --release -- --ignored iosurface"]
 fn iosurface_zero_copy_roundtrip_hevc_main_444_8bit() {
-    const FIXTURE: &[u8] = include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_8bit.idr");
-    let Some((left, right)) = run_fixture_render(
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_8bit.idr");
+    let Some((rgba, w, h)) = render_fixture_to_rgba(
         VideoProfile {
             codec: tether_protocol::control::CodecKind::Hevc,
             chroma: ChromaSubsampling::Yuv444,
@@ -786,19 +745,18 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_8bit() {
     ) else {
         return;
     };
-    assert_grey("4:4:4 8-bit left", left);
-    assert_grey("4:4:4 8-bit right", right);
+    assert_colorbars("4:4:4 8-bit", &rgba, w, h, ChannelOrder::Rgba);
 }
 
-/// HEVC 4:4:4 10-bit (Main 4:4:4 10). The matrix cell that depends on
-/// both `TEXTURE_FORMAT_16BIT_NORM` (R16/Rg16) and the full-res UV
-/// stride of NV24. Same fixture-decode path as the 8-bit cell.
+/// HEVC 4:4:4 10-bit (Main 4:4:4 10): `'x444'`/`'xf44'` biplanar 16-bit
+/// IOSurface, R16/Rg16 shader. Same colour-bar fixture path as 8-bit.
+/// This is the cell the live Linux→Mac session rendered with a purple
+/// cast on neutrals — the white bar is the regression guard.
 #[test]
 #[ignore = "requires macOS + VideoToolbox + Metal Main444 10-bit; run with: cargo test -p tether-render --release -- --ignored iosurface"]
 fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit() {
-    const FIXTURE: &[u8] =
-        include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv444_10bit.idr");
-    let Some((left, right)) = run_fixture_render(
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_10bit.idr");
+    let Some((rgba, w, h)) = render_fixture_to_rgba(
         VideoProfile {
             codec: tether_protocol::control::CodecKind::Hevc,
             chroma: ChromaSubsampling::Yuv444,
@@ -808,8 +766,31 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit() {
     ) else {
         return;
     };
-    assert_grey("4:4:4 10-bit left", left);
-    assert_grey("4:4:4 10-bit right", right);
+    assert_colorbars("4:4:4 10-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+/// HEVC 4:4:4 10-bit at a realistic capture resolution (1920×1200).
+/// 128×128 is too small to expose a chroma-plane stride / row-pitch
+/// alignment bug — the IOSurface chroma plane is padded to a hardware
+/// alignment, and a wrong assumed stride only mis-reads at widths that
+/// aren't a clean multiple of it. This is the cell that distinguishes
+/// "the macOS 4:4:4 render path is wrong" from "the wrongness is
+/// resolution- or host-specific".
+#[test]
+#[ignore = "requires macOS + VideoToolbox + Metal Main444 10-bit; run with: cargo test -p tether-render --release -- --ignored iosurface"]
+fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit_1920x1200() {
+    const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_10bit_1920x1200.idr");
+    let Some((rgba, w, h)) = render_fixture_to_rgba(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 10,
+        },
+        FIXTURE,
+    ) else {
+        return;
+    };
+    assert_colorbars("4:4:4 10-bit 1920×1200", &rgba, w, h, ChannelOrder::Rgba);
 }
 
 /// Which input fixture to feed the host-scaler round-trip. Matches the
@@ -1507,49 +1488,84 @@ fn iosurface_host_scaler_10bit_construction() {
     };
     let has_16bit = caps.supports_10bit;
 
-    for &fcc in &[X420_FOURCC, XF20_FOURCC] {
-        let result = Nv12IOSurfaceBridge::new(
-            device.clone(),
-            queue.clone(),
-            (1920, 1080),
-            (1280, 720),
-            fcc,
-        );
-        match (has_16bit, result) {
-            (true, Ok(bridge)) => {
-                eprintln!(
-                    "10-bit fourcc 0x{fcc:08x}: bridge built successfully \
-                     (has_16bit=true; R16/Rg16 pipelines wired)"
-                );
-                drop(bridge);
-            }
-            (false, Err(BridgeError::TenBitNotImplemented { fourcc })) => {
-                assert_eq!(
-                    fourcc, fcc,
-                    "TenBitNotImplemented error must carry the rejected fourcc"
-                );
-                eprintln!(
-                    "10-bit fourcc 0x{fcc:08x}: bridge correctly refused — adapter lacks 16BIT_NORM"
-                );
-            }
-            (true, Err(e)) => {
-                panic!(
-                    "10-bit fourcc 0x{fcc:08x}: device opted into 16BIT_NORM but bridge \
-                     construction failed: {e}"
-                );
-            }
-            (false, Ok(_)) => {
-                panic!(
-                    "10-bit fourcc 0x{fcc:08x}: device lacks 16BIT_NORM but bridge built \
-                     successfully — should have refused with TenBitNotImplemented"
-                );
-            }
-            (false, Err(other)) => {
-                panic!(
-                    "10-bit fourcc 0x{fcc:08x}: expected TenBitNotImplemented on \
-                     a non-16BIT_NORM device; got {other}"
-                );
-            }
+    // x420 (limited-range 10-bit 4:2:0) is the fourcc the host actually
+    // targets. Construction depends only on the 16BIT_NORM opt-in: it
+    // builds the R16/Rg16 plane pipelines on a capable device and refuses
+    // with `TenBitNotImplemented` otherwise.
+    let fcc = X420_FOURCC;
+    let result = Nv12IOSurfaceBridge::new(
+        device.clone(),
+        queue.clone(),
+        (1920, 1080),
+        (1280, 720),
+        fcc,
+    );
+    match (has_16bit, result) {
+        (true, Ok(bridge)) => {
+            eprintln!(
+                "10-bit fourcc 0x{fcc:08x}: bridge built successfully \
+                 (has_16bit=true; R16/Rg16 pipelines wired)"
+            );
+            drop(bridge);
+        }
+        (false, Err(BridgeError::TenBitNotImplemented { fourcc })) => {
+            assert_eq!(
+                fourcc, fcc,
+                "TenBitNotImplemented error must carry the rejected fourcc"
+            );
+            eprintln!(
+                "10-bit fourcc 0x{fcc:08x}: bridge correctly refused — adapter lacks 16BIT_NORM"
+            );
+        }
+        (true, Err(e)) => {
+            panic!(
+                "10-bit fourcc 0x{fcc:08x}: device opted into 16BIT_NORM but bridge \
+                 construction failed: {e}"
+            );
+        }
+        (false, Ok(_)) => {
+            panic!(
+                "10-bit fourcc 0x{fcc:08x}: device lacks 16BIT_NORM but bridge built \
+                 successfully — should have refused with TenBitNotImplemented"
+            );
+        }
+        (false, Err(other)) => {
+            panic!(
+                "10-bit fourcc 0x{fcc:08x}: expected TenBitNotImplemented on \
+                 a non-16BIT_NORM device; got {other}"
+            );
+        }
+    }
+
+    // xf20 (full-range 10-bit) is rejected up front regardless of
+    // 16BIT_NORM: the encoder and renderer both pin BT.709 limited, so the
+    // host never targets a full-range output (see the table-consistency
+    // test `nv12_fourccs_round_trip_across_tables`). The fourcc gate fires
+    // before the 10-bit feature check, so this is `UnsupportedFourcc`, not
+    // `TenBitNotImplemented`.
+    let fcc = XF20_FOURCC;
+    match Nv12IOSurfaceBridge::new(
+        device.clone(),
+        queue.clone(),
+        (1920, 1080),
+        (1280, 720),
+        fcc,
+    ) {
+        Err(BridgeError::UnsupportedFourcc { fourcc, .. }) => {
+            assert_eq!(
+                fourcc, fcc,
+                "UnsupportedFourcc must carry the rejected fourcc"
+            );
+            eprintln!(
+                "full-range fourcc 0x{fcc:08x}: bridge correctly rejected (BT.709 limited pinned)"
+            );
+        }
+        Ok(_) => panic!(
+            "full-range fourcc 0x{fcc:08x} must be rejected — the host pins BT.709 limited \
+             and never targets a full-range output"
+        ),
+        Err(other) => {
+            panic!("full-range fourcc 0x{fcc:08x}: expected UnsupportedFourcc; got {other}")
         }
     }
 }

@@ -254,6 +254,33 @@ fn save_restore_token_to(path: &std::path::Path, token: &str) -> std::io::Result
     file.write_all(token.as_bytes())
 }
 
+/// Pick a portal cursor mode from the set the portal advertises.
+///
+/// The portal validates the requested cursor mode against its
+/// `AvailableCursorModes` and rejects anything outside the set with
+/// `InvalidArgument` ("Unavailable cursor mode N"), which fails the
+/// whole session. So we only ever request a mode that is actually
+/// advertised. Some backends report an *empty* set despite a recent
+/// interface version (observed: xdg-desktop-portal-gnome interface v5
+/// reporting 0 on GNOME/Wayland) — there we return `None` so the caller
+/// omits the option and lets the portal fall back to its own default,
+/// rather than forcing a mode it will reject.
+///
+/// Preference order: Metadata (cursor delivered as PipeWire stream meta,
+/// so we can render it client-side) over Embedded (burned into the video
+/// stream) over Hidden.
+fn select_cursor_mode(available: BitFlags<CursorMode>) -> Option<CursorMode> {
+    if available.contains(CursorMode::Metadata) {
+        Some(CursorMode::Metadata)
+    } else if available.contains(CursorMode::Embedded) {
+        Some(CursorMode::Embedded)
+    } else if available.contains(CursorMode::Hidden) {
+        Some(CursorMode::Hidden)
+    } else {
+        None
+    }
+}
+
 async fn open_portal() -> Result<(u32, OwnedFd, Session<Screencast>)> {
     let proxy = Screencast::new().await?;
     // Query supported cursor modes up front. GNOME 45+ and KDE
@@ -267,11 +294,7 @@ async fn open_portal() -> Result<(u32, OwnedFd, Session<Screencast>)> {
         .available_cursor_modes()
         .await
         .map_err(|e| CaptureError::Portal(format!("AvailableCursorModes query: {e}")))?;
-    let chosen_cursor_mode = if available.contains(CursorMode::Metadata) {
-        CursorMode::Metadata
-    } else {
-        CursorMode::Embedded
-    };
+    let chosen_cursor_mode = select_cursor_mode(available);
     tracing::info!(
         ?available,
         ?chosen_cursor_mode,
@@ -1332,6 +1355,36 @@ mod tests {
     #[test]
     fn region_count_zero_is_idle() {
         assert!(native_damage_from_region_count(0).idle);
+    }
+
+    #[test]
+    fn cursor_mode_prefers_metadata() {
+        let available = CursorMode::Metadata | CursorMode::Embedded | CursorMode::Hidden;
+        assert_eq!(select_cursor_mode(available), Some(CursorMode::Metadata));
+    }
+
+    #[test]
+    fn cursor_mode_falls_back_to_embedded_without_metadata() {
+        // wlroots-style portals advertise Embedded + Hidden but not Metadata.
+        let available = CursorMode::Embedded | CursorMode::Hidden;
+        assert_eq!(select_cursor_mode(available), Some(CursorMode::Embedded));
+    }
+
+    #[test]
+    fn cursor_mode_falls_back_to_hidden_when_only_option() {
+        assert_eq!(
+            select_cursor_mode(CursorMode::Hidden.into()),
+            Some(CursorMode::Hidden)
+        );
+    }
+
+    #[test]
+    fn cursor_mode_empty_set_requests_nothing() {
+        // Regression: xdg-desktop-portal-gnome (interface v5) reports an
+        // empty AvailableCursorModes and rejects any explicit mode with
+        // "Unavailable cursor mode N", which previously killed the whole
+        // session. With no advertised mode we must omit the option.
+        assert_eq!(select_cursor_mode(BitFlags::empty()), None);
     }
 
     #[test]

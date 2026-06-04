@@ -120,6 +120,13 @@ pub(crate) enum Fixture {
     /// channel-swapped to BGRA. Use for photometric cells where
     /// per-pixel coordinate encoding isn't applicable.
     Png(&'static str),
+    /// Procedural BGRA colour-bar pattern (red/green/blue/white) from
+    /// [`crate::color_fixture::colorbars_bgra`]. The cross-platform
+    /// colour-decode fixture: `CoordEncoded` has near-constant chroma so
+    /// it can't catch a hue cast / Cb/Cr swap. Geometric residual is
+    /// skipped (not coordinate-encoded); the caller asserts colour on the
+    /// readback via [`crate::color_fixture::assert_colorbars`].
+    ColorBars,
 }
 
 /// Explicit prerequisites for a cell — declared on the struct so
@@ -136,9 +143,11 @@ pub(crate) enum Capability {
     /// HEVC 4:4:4 encode at 8-bit while rejecting the 10-bit XV30
     /// descriptor at submit time (see `tether-codec::vaapi::tests::hevc_main444_10bit_xv30_dmabuf_roundtrip`).
     VaapiHevcMain444_10DmaBuf,
-    /// 4:2:0 10-bit dma-buf path: empirically SKIPs on Intel iHD +
-    /// Meteor Lake (FFmpeg's vaapi_drm_format_map lacks P010
-    /// entries on that combo).
+    /// 4:2:0 10-bit dma-buf path (P010). Long misdiagnosed as an Intel
+    /// iHD/Meteor Lake driver gap; the real cause was our UV-plane fourcc
+    /// (`GR32`, absent from FFmpeg's `vaapi_drm_format_map`, which carries
+    /// only `RG1616` for P010) — fixed in `build_p010_dmabuf_frame`. Now
+    /// SKIPs only on drivers genuinely lacking P010 encode or R16/Rg16.
     VaapiHevcMain10DmaBuf,
     /// `VULKAN_EXTERNAL_MEMORY_DMA_BUF` on the wgpu adapter.
     VulkanDmaBufImport,
@@ -233,8 +242,9 @@ pub(crate) fn run_roundtrip(case: &RoundtripCase) -> RoundtripResult {
     // 3. Encode `frames_encoded` frames.
     let packets = encode_chain(case, &capture_bgra);
     if packets.is_empty() {
-        // The encode chain signals capability gaps (e.g. P010 dma-buf
-        // rejection on iHD+MTL) with an empty packet list.
+        // The encode chain signals capability gaps (e.g. a driver
+        // lacking the negotiated profile's encode entrypoint) with an
+        // empty packet list.
         let cap = capability_for_profile(case.profile);
         return RoundtripResult::Skip {
             capability: cap,
@@ -317,7 +327,7 @@ pub(crate) fn run_roundtrip(case: &RoundtripCase) -> RoundtripResult {
             let map = LetterboxMap::new(case.capture_dims, case.surface_dims);
             coord_fixture_residual_px_rms(&readback_bgra, case.surface_dims, &map)
         }
-        Fixture::Png(_) => f64::NAN,
+        Fixture::Png(_) | Fixture::ColorBars => f64::NAN,
     };
     let ssim = ssim_rgb(
         &readback_bgra,
@@ -336,6 +346,67 @@ pub(crate) fn run_roundtrip(case: &RoundtripCase) -> RoundtripResult {
         reference_bgra,
         steady_state_delta,
     })
+}
+
+/// Decode a **committed conformant reference bitstream** (encoded
+/// off-platform by libx265, not by our own encoder) through the real
+/// VAAPI decode → import → shader path and return the rendered BGRA at
+/// `surface_dims`. `None` is a capability SKIP (no panic), so callers
+/// degrade loudly on a driver/feature gap.
+///
+/// This is the conformance anchor `run_roundtrip` structurally cannot be.
+/// The round-trip encodes with our own pass and decodes with our own
+/// shader, so it only proves the two agree with *each other*: a packing
+/// convention that is wrong-but-symmetric (e.g. a Y↔Cb lane swap in the
+/// XV30/Y410 10:10:10:2 word) round-trips at SSIM≈1.0 while emitting a
+/// bitstream that any conformant decoder — macOS VideoToolbox — mis-renders
+/// (luma lands on the blue-yellow axis as a bright→purple / dark→olive
+/// cast). Feeding a reference stream pins the decode side to the standard;
+/// combined with a passing round-trip it transitively pins the encode
+/// side too (conformant decode + faithful round-trip ⟹ conformant encode).
+pub(crate) fn render_reference_bitstream(
+    profile: VideoProfile,
+    bitstream: &[u8],
+    surface_dims: (u32, u32),
+    color_space: VideoColorSpec,
+) -> Option<Vec<u8>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (device, queue) =
+        pollster::block_on(try_init_wgpu_for_dmabuf(profile.bit_depth)).map(|(d, q, _)| (d, q))?;
+
+    let packets = vec![tether_codec::EncodedPacket {
+        data: bitstream.to_vec().into(),
+        pts: Some(0),
+        keyframe: true,
+    }];
+    // `decode_all` returns empty on a decoder/driver gap (it SKIP-logs);
+    // an empty result here is the capability SKIP, surfaced as `None`.
+    let frame = decode_all(profile, &packets, surface_dims)
+        .into_iter()
+        .last()?;
+
+    let mut renderer = GpuState::new_headless(
+        device.clone(),
+        queue.clone(),
+        surface_dims,
+        color_space,
+        profile.chroma,
+        profile.bit_depth,
+    )
+    .ok()?;
+
+    let (w, h, _pts, source, guard) = frame.into_parts();
+    renderer
+        .apply_frame(Frame::Gpu(RenderGpuFrame {
+            width: w,
+            height: h,
+            t_capture_client_clock: None,
+            source,
+            guard,
+        }))
+        .expect("apply_frame");
+    renderer.render().expect("render");
+    Some(readback_offscreen(&renderer, &device))
 }
 
 // =====================================================================
@@ -394,6 +465,7 @@ fn load_fixture(fixture: Fixture, dims: (u32, u32)) -> Vec<u8> {
             coord_fixture_fill(dims)
         }
         Fixture::Png(name) => load_png_fixture_at(name, dims),
+        Fixture::ColorBars => crate::color_fixture::colorbars_bgra(dims),
     }
 }
 
@@ -645,11 +717,22 @@ fn encode_via_p010_bridge(
                 return Vec::new();
             }
         };
-        let codec_frame = build_codec_dmabuf_frame_p010(&p010);
+        // Use the production builder directly — same pattern as the XV30
+        // path below — so the test path can't drift from the wire fourcc
+        // the host actually sends (the drift that hid the GR32 bug).
+        let codec_frame = tether_codec::build_p010_dmabuf_frame(
+            p010.fd,
+            p010.size,
+            p010.modifier,
+            p010.y_offset,
+            p010.y_stride,
+            p010.uv_offset,
+            p010.uv_stride,
+        );
         match enc.submit_dmabuf(&codec_frame, t, t == 0) {
             Ok(p) => packets.extend(p),
             Err(e) => {
-                eprintln!("SKIP: submit_dmabuf rejected P010 (driver gap): {e}");
+                eprintln!("SKIP: submit_dmabuf rejected P010: {e}");
                 return Vec::new();
             }
         }
@@ -711,6 +794,72 @@ fn encode_via_xv30_bridge(
     packets
 }
 
+/// The gpuconvert bridge the scaler chain feeds, selected by the
+/// negotiated chroma — NV12 for 4:2:0, packed XYUV for 4:4:4 8-bit.
+/// Mirrors production's `GpuConvertBridge` (apps/tether-host) so the
+/// `*_full_chain` cells exercise the real `scale → bridge → encode_gpu`
+/// path for each chroma. Previously this was hardwired to NV12, so the
+/// 4:4:4 full-chain cell fed a 4:2:0 surface to a 4:4:4 encoder and
+/// skipped forever with "encoder not configured for input format" — a
+/// permanently-green test that never ran on any hardware.
+enum ScalerChainBridge {
+    Nv12(tether_gpuconvert::Nv12DmaBuf),
+    Yuv444(tether_gpuconvert::Yuv444DmaBuf),
+}
+
+impl ScalerChainBridge {
+    fn device(&self) -> &wgpu::Device {
+        match self {
+            ScalerChainBridge::Nv12(b) => b.device(),
+            ScalerChainBridge::Yuv444(b) => b.device(),
+        }
+    }
+
+    fn queue(&self) -> &wgpu::Queue {
+        match self {
+            ScalerChainBridge::Nv12(b) => b.queue(),
+            ScalerChainBridge::Yuv444(b) => b.queue(),
+        }
+    }
+
+    fn import_bgra_dmabuf(
+        &self,
+        fd: std::os::fd::OwnedFd,
+        modifier: u64,
+        stride: u64,
+        offset: u64,
+        width: u32,
+        height: u32,
+    ) -> std::result::Result<wgpu::Texture, String> {
+        match self {
+            ScalerChainBridge::Nv12(b) => b
+                .import_bgra_dmabuf(fd, modifier, stride, offset, width, height)
+                .map_err(|e| e.to_string()),
+            ScalerChainBridge::Yuv444(b) => b
+                .import_bgra_dmabuf(fd, modifier, stride, offset, width, height)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Convert a scaled BGRA texture into an encoder-ready codec frame in
+    /// the bridge's chroma — the format the cell's encoder was built for.
+    fn convert_to_codec_frame(
+        &self,
+        scaled: &wgpu::Texture,
+    ) -> std::result::Result<tether_codec::DmaBufFrame, String> {
+        match self {
+            ScalerChainBridge::Nv12(b) => b
+                .convert(scaled)
+                .map(|f| build_codec_dmabuf_frame_nv12(&f))
+                .map_err(|e| e.to_string()),
+            ScalerChainBridge::Yuv444(b) => b
+                .convert(scaled)
+                .map(|f| build_codec_dmabuf_frame_xyuv(&f))
+                .map_err(|e| e.to_string()),
+        }
+    }
+}
+
 fn encode_via_scaler_chain(
     profile: VideoProfile,
     capture: (u32, u32),
@@ -718,7 +867,7 @@ fn encode_via_scaler_chain(
     capture_bgra: &[u8],
     frames: usize,
 ) -> Vec<tether_codec::EncodedPacket> {
-    use tether_gpuconvert::{export_texture_as_dmabuf, Nv12DmaBuf};
+    use tether_gpuconvert::{export_texture_as_dmabuf, Nv12DmaBuf, Yuv444DmaBuf};
     use tether_scaler::{ColorSpace, Pipelines, Scaler};
 
     let mut enc = match VaapiEncoder::new(profile, encode.0, encode.1, 30, 4_000) {
@@ -728,11 +877,28 @@ fn encode_via_scaler_chain(
             return Vec::new();
         }
     };
-    let bridge = match pollster::block_on(Nv12DmaBuf::new(encode.0, encode.1)) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("SKIP: Nv12DmaBuf::new failed: {e}");
-            return Vec::new();
+    // Match the bridge to the encoder's input chroma, exactly as
+    // production's `encode_gpu_frame` does. 10-bit scaler chains aren't
+    // wired (asserted in `encode_chain`), so only the 8-bit bridges
+    // appear here.
+    let bridge = match profile.chroma {
+        ChromaSubsampling::Yuv420 => {
+            match pollster::block_on(Nv12DmaBuf::new(encode.0, encode.1)) {
+                Ok(b) => ScalerChainBridge::Nv12(b),
+                Err(e) => {
+                    eprintln!("SKIP: Nv12DmaBuf::new failed: {e}");
+                    return Vec::new();
+                }
+            }
+        }
+        ChromaSubsampling::Yuv444 => {
+            match pollster::block_on(Yuv444DmaBuf::new(encode.0, encode.1)) {
+                Ok(b) => ScalerChainBridge::Yuv444(b),
+                Err(e) => {
+                    eprintln!("SKIP: Yuv444DmaBuf::new failed: {e}");
+                    return Vec::new();
+                }
+            }
         }
     };
     let src_export = match export_texture_as_dmabuf(
@@ -813,14 +979,13 @@ fn encode_via_scaler_chain(
                 return Vec::new();
             }
         };
-        let nv12 = match bridge.convert(scaled) {
-            Ok(n) => n,
+        let codec_frame = match bridge.convert_to_codec_frame(scaled) {
+            Ok(f) => f,
             Err(e) => {
-                eprintln!("SKIP: nv12 convert failed: {e}");
+                eprintln!("SKIP: scaler-chain bridge convert failed: {e}");
                 return Vec::new();
             }
         };
-        let codec_frame = build_codec_dmabuf_frame_nv12(&nv12);
         let gpu_frame = tether_codec::GpuEncoderFrame::DmaBuf(&codec_frame);
         match enc.encode_gpu(gpu_frame, t, t == 0) {
             Ok(p) => packets.extend(p),
@@ -870,40 +1035,30 @@ fn build_codec_dmabuf_frame_nv12(
     }
 }
 
-fn build_codec_dmabuf_frame_p010(
-    p010: &tether_gpuconvert::P010DmaBufFrame,
+/// Build a packed XYUV (4:4:4 8-bit) `DmaBufFrame` from a Yuv444 bridge
+/// output. Mirrors production's `yuv444_dmabuf_to_codec_frame` — single
+/// object, single XYUV layer.
+fn build_codec_dmabuf_frame_xyuv(
+    yuv: &tether_gpuconvert::Yuv444DmaBufFrame,
 ) -> tether_codec::DmaBufFrame {
-    const P010_FOURCC: u32 = u32::from_le_bytes(*b"P010");
-    const R16_FOURCC: u32 = u32::from_le_bytes(*b"R16 ");
-    const GR32_FOURCC: u32 = u32::from_le_bytes(*b"GR32");
-    let dup_fd = p010.fd.try_clone().expect("dup P010 fd");
-    let y_off = u32::try_from(p010.y_offset).expect("y_offset fits in u32");
-    let y_stride = u32::try_from(p010.y_stride).expect("y_stride fits in u32");
-    let uv_off = u32::try_from(p010.uv_offset).expect("uv_offset fits in u32");
-    let uv_stride = u32::try_from(p010.uv_stride).expect("uv_stride fits in u32");
+    const XYUV_FOURCC: u32 = u32::from_le_bytes(*b"XYUV");
+    let dup_fd = yuv.fd.try_clone().expect("dup XYUV fd");
+    let off = u32::try_from(yuv.offset).expect("offset fits in u32");
+    let stride = u32::try_from(yuv.stride).expect("stride fits in u32");
     tether_codec::DmaBufFrame {
-        fourcc: P010_FOURCC,
+        fourcc: XYUV_FOURCC,
         objects: vec![tether_codec::DmaBufObject {
             fd: dup_fd,
-            size: p010.size,
-            drm_format_modifier: p010.modifier,
+            size: yuv.size,
+            drm_format_modifier: yuv.modifier,
         }],
-        layers: vec![
-            tether_codec::DmaBufLayer {
-                drm_format: R16_FOURCC,
-                num_planes: 1,
-                object_index: [0, 0, 0, 0],
-                offset: [y_off, 0, 0, 0],
-                pitch: [y_stride, 0, 0, 0],
-            },
-            tether_codec::DmaBufLayer {
-                drm_format: GR32_FOURCC,
-                num_planes: 1,
-                object_index: [0, 0, 0, 0],
-                offset: [uv_off, 0, 0, 0],
-                pitch: [uv_stride, 0, 0, 0],
-            },
-        ],
+        layers: vec![tether_codec::DmaBufLayer {
+            drm_format: XYUV_FOURCC,
+            num_planes: 1,
+            object_index: [0, 0, 0, 0],
+            offset: [off, 0, 0, 0],
+            pitch: [stride, 0, 0, 0],
+        }],
     }
 }
 
@@ -929,25 +1084,55 @@ fn decode_all(
             eprintln!("SKIP: decoder submit failed: {e}");
             return Vec::new();
         }
-        while let Ok(Some(f)) = dec.next_frame() {
-            match f {
-                CodecFrame::Gpu(g) => out.push(g),
-                // VAAPI decoder must produce Gpu frames; a Cpu frame
-                // here would mean the decoder probe was wrong or the
-                // driver fell back. Fail loudly — silently dropping
-                // would make the harness count packets it can't
-                // actually use, which would skew the steady-state
-                // check.
-                CodecFrame::Cpu(_) => {
-                    panic!("decode_all: VAAPI decoder produced a Cpu frame — driver fallback?");
-                }
-            }
+        if let Err(e) = drain_ready(&mut dec, &mut out) {
+            eprintln!("SKIP: decoder next_frame failed: {e}");
+            return Vec::new();
         }
+    }
+    // ffmpeg's HEVC/AV1 decoders hold the first frame in the reorder
+    // DPB until a subsequent packet or EOF arrives. The multi-frame
+    // roundtrip cells flush each frame implicitly with the next packet,
+    // but the single-IDR decode-reference cell emits nothing without an
+    // explicit drain — without this the conformance anchor silently
+    // skips on the one box that has the hardware. See
+    // `VaapiDecoder::signal_eof`.
+    if let Err(e) = dec.signal_eof() {
+        eprintln!("SKIP: decoder signal_eof failed: {e}");
+        return Vec::new();
+    }
+    if let Err(e) = drain_ready(&mut dec, &mut out) {
+        eprintln!("SKIP: decoder drain-at-eof failed: {e}");
+        return Vec::new();
     }
     // Caller checks dims after into_parts(); tether_codec::GpuFrame
     // doesn't expose width/height by reference today.
     let _ = encode_dims;
     out
+}
+
+/// Pull every frame the decoder is ready to emit into `out`, stopping
+/// when it signals drain (`Ok(None)`). A real decode error is surfaced
+/// to the caller as a loud SKIP rather than swallowed by a `while let
+/// Ok(Some)` loop.
+fn drain_ready(
+    dec: &mut VaapiDecoder,
+    out: &mut Vec<tether_codec::GpuFrame>,
+) -> std::result::Result<(), String> {
+    loop {
+        match dec.next_frame() {
+            Ok(Some(CodecFrame::Gpu(g))) => out.push(g),
+            // VAAPI decoder must produce Gpu frames; a Cpu frame here
+            // would mean the decoder probe was wrong or the driver fell
+            // back. Fail loudly — silently dropping would make the
+            // harness count packets it can't actually use, which would
+            // skew the steady-state check.
+            Ok(Some(CodecFrame::Cpu(_))) => {
+                panic!("decode_all: VAAPI decoder produced a Cpu frame — driver fallback?");
+            }
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// Map a VideoProfile to the capability whose absence is the most

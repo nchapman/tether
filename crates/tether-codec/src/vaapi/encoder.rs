@@ -225,15 +225,21 @@ impl VaapiEncoder {
             // HEVC profile pin. Sunshine's reference pattern (see
             // refs/Sunshine/src/video.cpp:1687) sets `profile` on the
             // context field rather than via the `profile=` AVOption
-            // string; the string form is brittle for the Rext
-            // umbrella (covers 4:4:4 8/10-bit, 4:2:2 10-bit, Main
-            // Intra, etc.) where the actual sub-profile is inferred
-            // from the hwframes `sw_format`. We pick:
-            //   - REXT for any 4:4:4 (Main 4:4:4 8/10-bit) — packed
-            //     pix_fmt + this profile is what hevc_vaapi picks up.
-            //   - MAIN_10 for Yuv420 10-bit so VAAPI doesn't fall
-            //     through to MAIN and produce a stream the driver
-            //     rejects against the negotiated bit depth.
+            // string. FFmpeg derives the bit depth and chroma of the
+            // VAProfile match from the hwframes `sw_format` descriptor
+            // (`vaapi_encode.c` walks `vaapi_encode_h265_profiles[]`
+            // keyed on depth + components), and treats `avctx->profile`
+            // as an extra filter that's skipped when AV_PROFILE_UNKNOWN.
+            // So these pins are *defensive*, not corrective — FFmpeg
+            // already reaches the right VAProfile from sw_format alone:
+            //   - REXT is the only `av_profile` on the two 4:4:4 rows
+            //     (`{REXT,8,...,Main444}` / `{REXT,10,...,Main444_10}`),
+            //     so packed 4:4:4 selects it regardless. We pin it to
+            //     keep the choice explicit across FFmpeg versions.
+            //   - MAIN_10 for Yuv420 10-bit. (The MAIN row is rejected
+            //     on the depth check before the profile compare, so a
+            //     10-bit sw_format can't actually fall through to MAIN;
+            //     pinning just documents intent.)
             // For Yuv420 8-bit we leave the field at FFmpeg's default
             // and let the `profile=main` AVOption (below) drive it.
             if kind == CodecKind::Hevc {
@@ -743,13 +749,14 @@ impl VaapiEncoder {
         if rc < 0 {
             // Map failures here are usually a modifier mismatch
             // between the source DMA-BUF and what the encoder's pool
-            // accepts. Log the descriptor shape so field bugs are
-            // tractable without re-running with AV_LOG_DEBUG. Inside
-            // a probe (e.g. the host startup capability probe that
-            // intentionally exercises P010 on Intel iHD to detect
-            // the documented submit-time rejection) drop to debug so
-            // the expected failure doesn't surface as a scary warning
-            // on every host launch.
+            // accepts, or a layer fourcc absent from FFmpeg's
+            // `vaapi_drm_format_map`. Log the descriptor shape so field
+            // bugs are tractable without re-running with AV_LOG_DEBUG.
+            // Inside a probe (the host startup capability probe exercises
+            // every PROFILE_PREFERENCE entry, some of which legitimately
+            // aren't supported on a given driver) drop to debug so the
+            // expected failure doesn't surface as a scary warning on
+            // every host launch.
             if crate::av_log::probe_suppression_active() {
                 debug!(
                     rc,
@@ -988,13 +995,14 @@ fn vaapi_codec_name(kind: CodecKind) -> &'static str {
 ///
 /// Field reference:
 /// - `NV12` — 4:2:0 8-bit biplanar; AV_PIX_FMT_NV12.
-/// - `P010` — 4:2:0 10-bit biplanar (R16 + GR32 layers; 10 bits
-///   MSB-aligned in 16-bit cells); AV_PIX_FMT_P010LE.
+/// - `P010` — 4:2:0 10-bit biplanar (R16 + RG32 layers; 10 bits
+///   MSB-aligned in 16-bit cells); AV_PIX_FMT_P010LE. See
+///   `build_p010_dmabuf_frame` for why the UV layer is RG32 not GR32.
 /// - `XYUV` — 4:4:4 8-bit packed 32 bpp (V,U,Y,X bytes LE);
 ///   AV_PIX_FMT_VUYX. The only 4:4:4 8-bit format in
 ///   `vaapi_drm_format_map`.
-/// - `XV30` — 4:4:4 10-bit packed 10:10:10:2 (V:U:Y:X);
-///   AV_PIX_FMT_XV30LE. No gpuconvert bridge produces this today; the
+/// - `XV30` — 4:4:4 10-bit packed 10:10:10:2 ("X:Cr:Y:Cb": bits[9:0]=Cb,
+///   bits[19:10]=Y, bits[29:20]=Cr); AV_PIX_FMT_XV30LE. The
 ///   entry is preserved so adding an XV30 bridge later doesn't need
 ///   to touch this table.
 pub fn expected_dmabuf_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {

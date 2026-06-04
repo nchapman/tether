@@ -28,6 +28,7 @@ tether-gpuconvert = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 tether-capture = { workspace = true }
 tether-gpuconvert = { workspace = true }
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["metal"] }
 
 [lints]
 workspace = true

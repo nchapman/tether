@@ -472,15 +472,16 @@ fn native_damage_for_frame_status(status: SCFrameStatus) -> NativeDamage {
     }
 }
 
-/// Encoder alignment in pixels. SCK can produce odd sizes, but the
-/// downstream H.264 / HEVC hardware encoders are happiest on a 16-pixel
-/// grid, especially Main444. Flooring the backing-pixel capture trims
-/// only the encoder-invisible edge slack; the decoder crops via the
-/// coded dimensions.
+/// Diagnostic capture-size override alignment in pixels. Native SCK
+/// capture preserves the display's backing-pixel dimensions so capture
+/// aspect ratio and cursor point→pixel mapping stay exact; the host
+/// encode path handles viewport sizing downstream. The override is an
+/// explicit test knob for asking SCK to resize, so we floor only that
+/// requested size to the encoder-friendly grid.
 const SCK_CAPTURE_ALIGN: u32 = 16;
 
 fn sck_native_capture_dims(raw_w: u32, raw_h: u32) -> (u32, u32) {
-    align_capture_dims(raw_w, raw_h)
+    (raw_w.max(1), raw_h.max(1))
 }
 
 fn align_capture_dims(width: u32, height: u32) -> (u32, u32) {
@@ -518,8 +519,8 @@ mod tests {
     }
 
     #[test]
-    fn sck_native_dims_align_backing_pixels() {
-        assert_eq!(sck_native_capture_dims(3024, 1964), (3024, 1952));
+    fn sck_native_dims_preserve_backing_pixels() {
+        assert_eq!(sck_native_capture_dims(3024, 1964), (3024, 1964));
     }
 
     #[test]
@@ -529,11 +530,10 @@ mod tests {
     }
 
     #[test]
-    fn sck_native_dims_floor_to_alignment() {
+    fn diagnostic_override_floors_to_alignment() {
         let (w, h) = sck_native_capture_dims(1920, 1080);
-        assert_eq!(w % SCK_CAPTURE_ALIGN, 0);
-        assert_eq!(h % SCK_CAPTURE_ALIGN, 0);
-        assert_eq!((w, h), (1920, 1072));
+        assert_eq!((w, h), (1920, 1080));
+        assert_eq!(align_capture_dims(w, h), (1920, 1072));
     }
 
     #[test]

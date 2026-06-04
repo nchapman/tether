@@ -33,6 +33,7 @@ use tether_codec::videotoolbox::{
     expected_iosurface_fourccs, VideoToolboxDecoder, VideoToolboxEncoder,
 };
 use tether_codec::{Decoder, Encoder, Frame, GpuFrameSource};
+use tether_gpuconvert::nv12_iosurface::BridgeDeviceCapabilities;
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
 use crate::profile_probe::{ProbeError, ProfileProbe, Result};
@@ -70,6 +71,22 @@ fn sck_capability() -> &'static SckCaptureCapability {
             }
         }
     })
+}
+
+fn bridge_device() -> Result<(wgpu::Device, wgpu::Queue, BridgeDeviceCapabilities)> {
+    static CACHED: OnceLock<
+        std::result::Result<(wgpu::Device, wgpu::Queue, BridgeDeviceCapabilities), String>,
+    > = OnceLock::new();
+    match CACHED.get_or_init(|| {
+        pollster::block_on(tether_gpuconvert::nv12_iosurface::build_bridge_device())
+            .map_err(|e| e.to_string())
+    }) {
+        Ok((device, queue, caps)) => Ok((device.clone(), queue.clone(), *caps)),
+        Err(e) => Err(ProbeError::new(
+            PipelineStage::Capture,
+            format!("macOS BGRA IOSurface bridge device init failed: {e}"),
+        )),
+    }
 }
 
 impl ProfileProbe for VideoToolboxProbe {
@@ -271,15 +288,7 @@ fn gate_capture_and_bridge(profile: VideoProfile) -> Result<()> {
             ));
         }
     };
-    let (device, queue, _caps) = pollster::block_on(
-        tether_gpuconvert::nv12_iosurface::build_bridge_device(),
-    )
-    .map_err(|e| {
-        ProbeError::new(
-            PipelineStage::Capture,
-            format!("macOS BGRA IOSurface bridge device init failed: {e}"),
-        )
-    })?;
+    let (device, queue, _caps) = bridge_device()?;
     tether_gpuconvert::nv12_iosurface::BgraIOSurfaceBridge::new(
         device,
         queue,

@@ -3845,6 +3845,7 @@ dependencies = [
  "tether-gpuconvert",
  "tether-protocol",
  "tracing",
+ "wgpu",
 ]
 
 [[package]]

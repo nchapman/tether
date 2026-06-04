@@ -29,9 +29,9 @@ use core_foundation::string::{CFString, CFStringRef};
 use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLPixelFormat, MTLSize, MTLStorageMode,
-    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLPixelFormat,
+    MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use objc2_metal_performance_shaders::MPSImageLanczosScale;
 use tether_codec::macos_interop::{
@@ -1307,7 +1307,22 @@ impl BgraIOSurfaceBridge {
         encoder.endEncoding();
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
-        Ok(())
+        match command_buffer.status() {
+            MTLCommandBufferStatus::Completed => Ok(()),
+            MTLCommandBufferStatus::Error => {
+                let error = command_buffer
+                    .error()
+                    .map(|e| ns_error(&e))
+                    .unwrap_or_else(|| "no NSError attached".to_string());
+                Err(BridgeError::Metal(format!(
+                    "BGRA bridge command buffer failed: {error}"
+                )))
+            }
+            status => Err(BridgeError::Metal(format!(
+                "BGRA bridge command buffer ended with unexpected status {}",
+                status.0
+            ))),
+        }
     }
 }
 

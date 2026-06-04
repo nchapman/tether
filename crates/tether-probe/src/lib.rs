@@ -57,7 +57,10 @@ mod preference;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod profile_probe;
 
-pub use preference::{pick_supported_profile, PROFILE_PREFERENCE};
+pub use preference::{
+    forced_video_profile_from_env, parse_forced_video_profile, pick_supported_profile,
+    pick_supported_profile_with_force, FORCE_VIDEO_PROFILE_ENV, PROFILE_PREFERENCE,
+};
 
 /// Per-profile capability verdict. Carries an `encode` and a `decode`
 /// status independently because the host cares about encode and the

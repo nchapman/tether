@@ -193,6 +193,16 @@ async fn main() -> anyhow::Result<()> {
         ..
     } = args;
     let reporter = Reporter::from_ipc_flag(ipc);
+    let forced_video_profile = match tether_probe::forced_video_profile_from_env() {
+        Ok(profile) => profile,
+        Err(e) => {
+            reporter.emit(&EngineEvent::Error { message: e.clone() });
+            if reporter.is_json() {
+                std::process::exit(1);
+            }
+            anyhow::bail!(e);
+        }
+    };
 
     // Both host (encoder) and client (decoder) call av_log::install(),
     // so FFmpeg messages can land on either side's hot thread. The
@@ -440,6 +450,7 @@ async fn main() -> anyhow::Result<()> {
         };
         tracing::debug!(
             host_encode_profiles = ?host_encode_profiles,
+            forced_video_profile = ?forced_video_profile,
             "host video encode capabilities (capture-bridge filtered)"
         );
 
@@ -461,7 +472,13 @@ async fn main() -> anyhow::Result<()> {
         let session = match HostSession::accept(
             conn.clone() as Arc<dyn tether_transport::ControlChannel>,
             cfg,
-            |client_caps| tether_probe::pick_supported_profile(&host_encode_profiles, client_caps),
+            |client_caps| {
+                tether_probe::pick_supported_profile_with_force(
+                    &host_encode_profiles,
+                    client_caps,
+                    forced_video_profile,
+                )
+            },
         )
         .await
         {

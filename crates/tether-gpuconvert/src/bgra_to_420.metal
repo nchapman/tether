@@ -118,3 +118,31 @@ kernel void bgra_to_x420(texture2d<float, access::read> src [[texture(0)]],
     float2 uv = rgb_to_uv10(chroma_rgb);
     uv_dst.write(float4(uv.x, uv.y, 0.0, 1.0), gid);
 }
+
+kernel void bgra_to_444v(texture2d<float, access::read> src [[texture(0)]],
+                         texture2d<float, access::write> y_dst [[texture(1)]],
+                         texture2d<float, access::write> uv_dst [[texture(2)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= y_dst.get_width() || gid.y >= y_dst.get_height()) {
+        return;
+    }
+
+    float3 rgb = src.read(gid).rgb;
+    y_dst.write(float4(rgb_to_y8(rgb), 0.0, 0.0, 1.0), gid);
+    float2 uv = rgb_to_uv8(rgb);
+    uv_dst.write(float4(uv.x, uv.y, 0.0, 1.0), gid);
+}
+
+kernel void bgra_to_x444(texture2d<float, access::read> src [[texture(0)]],
+                         texture2d<float, access::write> y_dst [[texture(1)]],
+                         texture2d<float, access::write> uv_dst [[texture(2)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= y_dst.get_width() || gid.y >= y_dst.get_height()) {
+        return;
+    }
+
+    float3 rgb = src.read(gid).rgb;
+    y_dst.write(float4(rgb_to_y10(rgb), 0.0, 0.0, 1.0), gid);
+    float2 uv = rgb_to_uv10(rgb);
+    uv_dst.write(float4(uv.x, uv.y, 0.0, 1.0), gid);
+}

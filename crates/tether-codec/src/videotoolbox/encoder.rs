@@ -368,7 +368,7 @@ impl VideoToolboxEncoder {
         //   - (Yuv420, 10) → `'x420'` / `'xf20'` (P010-family video
         //                    range / full range)
         //   - (Yuv444, 8)  → `'444v'` / `'444f'` (NV24)  *
-        //   - (Yuv444, 10) → `'xf44'` (P410-family full range)        *
+        //   - (Yuv444, 10) → `'x444'` / `'xf44'` (P410-family)        *
         //
         // (*) the encoder probe currently rejects 4:4:4 on macOS due
         // to a VT silent-downsample bug, so those rows aren't
@@ -705,30 +705,29 @@ fn vt_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
 /// limited; a full-range IOSurface (`'420f'`, `'xf20'`, `'444f'`)
 /// would land as full-range bytes in a limited-tagged bitstream and
 /// decode with crushed blacks and clipped whites on the client. The
-/// capture layer (`sck_pixel_format_for_profile`) already asks for
-/// video range; rejecting full range here is the defence-in-depth
-/// guard if that ever changes. The 4:4:4 10-bit family has no
-/// video-range fourcc on macOS — `'xf44'` is accepted, but the 4:4:4
-/// encoder path is gated off by the probe anyway due to VT's silent
-/// 4:4:4 → 4:2:0 downsample bug.
+/// macOS live host path captures BGRA and the Metal bridge asks for
+/// video range where CoreVideo exposes such a label. Rejecting full
+/// range here is the defence-in-depth guard if that ever changes.
+/// The 4:4:4 10-bit bridge path uses the video-range `'x444'` label;
+/// `'xf44'` remains accepted for direct SCK/diagnostic submissions.
 ///
 /// Exposed at `pub` so cross-crate consistency tests can confirm the
-/// encoder's accept set is a superset of what the capture layer
-/// (`tether-capture::macos::sck_pixel_format_for_profile`) can
-/// deliver — drift in either direction would crash a session at
-/// first frame.
+/// encoder's accept set is a superset of what the macOS host bridge
+/// can deliver — drift in either direction would crash a session at
+/// first bridged frame.
 #[must_use]
 pub fn iosurface_fourcc_matches(chroma: ChromaSubsampling, bit_depth: u8, fourcc: u32) -> bool {
     const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
     const P010_VIDEO: u32 = u32::from_be_bytes(*b"x420");
     const NV24_VIDEO: u32 = u32::from_be_bytes(*b"444v");
+    const P410_VIDEO: u32 = u32::from_be_bytes(*b"x444");
     const P410_FULL: u32 = u32::from_be_bytes(*b"xf44");
     matches!(
         (chroma, bit_depth, fourcc),
         (ChromaSubsampling::Yuv420, 8, NV12_VIDEO)
             | (ChromaSubsampling::Yuv420, 10, P010_VIDEO)
             | (ChromaSubsampling::Yuv444, 8, NV24_VIDEO)
-            | (ChromaSubsampling::Yuv444, 10, P410_FULL)
+            | (ChromaSubsampling::Yuv444, 10, P410_VIDEO | P410_FULL)
     )
 }
 
@@ -742,12 +741,8 @@ mod fourcc_match_tests {
         // Only video-range fourccs are accepted for families that
         // have both range variants — the encoder VUI is hardcoded
         // AVCOL_RANGE_MPEG, so a full-range surface would mis-tag.
-        // 4:4:4 10-bit is the exception: the encoder's input is
-        // SCK capture, which delivers the full-range `'xf44'`, so
-        // that is what's accepted here (the path is probe-gated
-        // anyway). The video-range sibling `'x444'` exists but is a
-        // *decode* output, not an encode input — see
-        // `macos_interop::accepts_iosurface_fourcc`.
+        // 4:4:4 10-bit accepts the bridge's video-range `'x444'`
+        // and the direct-SCK / diagnostic full-range `'xf44'` label.
         for (chroma, bd, fourcc, accept) in [
             (
                 ChromaSubsampling::Yuv420,
@@ -765,6 +760,12 @@ mod fourcc_match_tests {
                 ChromaSubsampling::Yuv444,
                 8,
                 u32::from_be_bytes(*b"444v"),
+                true,
+            ),
+            (
+                ChromaSubsampling::Yuv444,
+                10,
+                u32::from_be_bytes(*b"x444"),
                 true,
             ),
             (

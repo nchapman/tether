@@ -70,6 +70,20 @@ fn make_test_bgra(w: u32, h: u32) -> Vec<u8> {
     data
 }
 
+fn make_chroma_detail_bgra(width: u32, height: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for _y in 0..height {
+        for x in 0..width {
+            if x % 2 == 0 {
+                data.extend_from_slice(&[0, 0, 255, 255]);
+            } else {
+                data.extend_from_slice(&[0, 255, 0, 255]);
+            }
+        }
+    }
+    data
+}
+
 fn region_average_rgb(rgba: &[u8], w: u32, x0: u32, y0: u32, rw: u32, rh: u32) -> (u8, u8, u8) {
     let mut sum = [0u64; 3];
     let mut count = 0u64;
@@ -791,6 +805,366 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit_1920x1200() {
         return;
     };
     assert_colorbars("4:4:4 10-bit 1920×1200", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[cfg(target_os = "macos")]
+fn bgra_bridge_fourcc_for_profile(profile: VideoProfile) -> u32 {
+    use tether_codec::macos_interop::{
+        NV12_VIDEO_RANGE_FOURCC, NV24_VIDEO_RANGE_FOURCC, X420_FOURCC, X444_FOURCC,
+    };
+
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => NV12_VIDEO_RANGE_FOURCC,
+        (ChromaSubsampling::Yuv420, 10) => X420_FOURCC,
+        (ChromaSubsampling::Yuv444, 8) => NV24_VIDEO_RANGE_FOURCC,
+        (ChromaSubsampling::Yuv444, 10) => X444_FOURCC,
+        _ => panic!("unsupported test profile: {profile:?}"),
+    }
+}
+
+/// Production macOS host replacement path: BGRA IOSurface capture →
+/// `BgraIOSurfaceBridge` Metal resize/convert → YUV IOSurface import
+/// → renderer shader → readback. This specifically covers the new
+/// host path; the older host-scaler tests below still exercise
+/// `Nv12IOSurfaceBridge`, and the zero-copy cells above exercise
+/// decode-side IOSurface import.
+#[cfg(target_os = "macos")]
+fn run_bgra_bridge_roundtrip(
+    profile: VideoProfile,
+    src_dims: (u32, u32),
+    dst_dims: (u32, u32),
+) -> Option<(Vec<u8>, u32, u32)> {
+    use tether_gpuconvert::nv12_iosurface::{
+        build_bridge_device, create_bgra_iosurface_fixture, BgraIOSurfaceBridge,
+    };
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (device, queue, caps) = match pollster::block_on(build_bridge_device()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SKIPPED: build_bridge_device failed: {e}");
+            return None;
+        }
+    };
+    if profile.bit_depth == 10 && !caps.supports_10bit {
+        eprintln!(
+            "SKIPPED: 10-bit BGRA bridge profile needs TEXTURE_FORMAT_16BIT_NORM and the \
+             adapter does not advertise it"
+        );
+        return None;
+    }
+
+    let input_bgra = crate::color_fixture::colorbars_bgra(src_dims);
+    let fixture =
+        create_bgra_iosurface_fixture(src_dims.0, src_dims.1, &input_bgra).expect("BGRA fixture");
+    let (src_frame, src_guard) = fixture.into_frame_parts();
+    let dst_fourcc = bgra_bridge_fourcc_for_profile(profile);
+    eprintln!(
+        "[{profile:?}] BGRA bridge roundtrip {}x{} -> {}x{} dst fourcc 0x{dst_fourcc:08x}",
+        src_dims.0, src_dims.1, dst_dims.0, dst_dims.1
+    );
+
+    let bridge = BgraIOSurfaceBridge::new(
+        device.clone(),
+        queue.clone(),
+        src_dims,
+        dst_dims,
+        dst_fourcc,
+    )
+    .expect("BgraIOSurfaceBridge::new");
+    let pooled = bridge
+        .convert_to_iosurface(&src_frame)
+        .expect("convert_to_iosurface");
+    drop(src_guard);
+
+    let target_format = wgpu::TextureFormat::Rgba8Unorm;
+    let pipeline = build_test_pipeline(&device, &queue, target_format, profile.bit_depth);
+    let textures = gpu::import_iosurface_textures(
+        &device,
+        &pipeline.yuv_bgl,
+        &pipeline.sampler,
+        profile.chroma,
+        profile.bit_depth,
+        &pooled.frame,
+        tether_codec::GpuFrameGuard::new(()),
+    )
+    .expect("import_iosurface_textures (BGRA bridge dst)");
+
+    let (dw, dh) = dst_dims;
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen target (BGRA bridge)"),
+        size: wgpu::Extent3d {
+            width: dw,
+            height: dh,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: target_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let unpadded_bpr = u64::from(dw * 4);
+    let padded_bpr = unpadded_bpr.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback (BGRA bridge)"),
+        size: padded_bpr * u64::from(dh),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("BGRA bridge render encoder"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("BGRA bridge render pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_bind_group(0, &textures.bind_group, &[]);
+        pass.set_bind_group(1, &pipeline.scale_bind_group, &[]);
+        pass.set_bind_group(2, &pipeline.color_params_bind_group, &[]);
+        pass.draw(0..6, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bpr as u32),
+                rows_per_image: Some(dh),
+            },
+        },
+        wgpu::Extent3d {
+            width: dw,
+            height: dh,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let (tx, rx) = mpsc::channel();
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("send"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("device poll");
+    rx.recv().expect("map callback").expect("map ok");
+    let mapped = readback.slice(..).get_mapped_range().expect("range");
+    let mut rgba = Vec::with_capacity((dw * dh * 4) as usize);
+    for row in 0..dh as usize {
+        let start = row * padded_bpr as usize;
+        let end = start + unpadded_bpr as usize;
+        rgba.extend_from_slice(&mapped[start..end]);
+    }
+    drop(mapped);
+    readback.unmap();
+    drop(textures);
+    drop(pooled);
+    drop(bridge);
+
+    Some((rgba, dw, dh))
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA IOSurface bridge; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge"]
+fn iosurface_bgra_bridge_roundtrip_hevc_main_8bit() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+    let Some((rgba, w, h)) = run_bgra_bridge_roundtrip(profile, (320, 240), (320, 240)) else {
+        return;
+    };
+    assert_colorbars("BGRA bridge 4:2:0 8-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA IOSurface bridge + 16-bit storage; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge"]
+fn iosurface_bgra_bridge_roundtrip_hevc_main10() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 10,
+    };
+    let Some((rgba, w, h)) = run_bgra_bridge_roundtrip(profile, (320, 240), (320, 240)) else {
+        return;
+    };
+    assert_colorbars("BGRA bridge 4:2:0 10-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA IOSurface bridge; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge"]
+fn iosurface_bgra_bridge_roundtrip_hevc_main_444_8bit() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv444,
+        bit_depth: 8,
+    };
+    let Some((rgba, w, h)) = run_bgra_bridge_roundtrip(profile, (320, 240), (320, 240)) else {
+        return;
+    };
+    assert_colorbars("BGRA bridge 4:4:4 8-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA IOSurface bridge + 16-bit storage; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge"]
+fn iosurface_bgra_bridge_roundtrip_hevc_main_444_10bit() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv444,
+        bit_depth: 10,
+    };
+    let Some((rgba, w, h)) = run_bgra_bridge_roundtrip(profile, (320, 240), (320, 240)) else {
+        return;
+    };
+    assert_colorbars("BGRA bridge 4:4:4 10-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[cfg(target_os = "macos")]
+fn try_bgra_bridge_vt_encode_roundtrip(profile: VideoProfile) -> std::result::Result<u32, String> {
+    use tether_gpuconvert::nv12_iosurface::{
+        build_bridge_device, create_bgra_iosurface_fixture, BgraIOSurfaceBridge,
+    };
+
+    let src_dims = (128, 128);
+    let dst_dims = src_dims;
+    let (device, queue, caps) =
+        pollster::block_on(build_bridge_device()).map_err(|e| format!("bridge device: {e}"))?;
+    if profile.bit_depth == 10 && !caps.supports_10bit {
+        return Err("bridge device lacks TEXTURE_FORMAT_16BIT_NORM".into());
+    }
+
+    let input_bgra = make_chroma_detail_bgra(src_dims.0, src_dims.1);
+    let fixture = create_bgra_iosurface_fixture(src_dims.0, src_dims.1, &input_bgra)
+        .map_err(|e| format!("BGRA IOSurface fixture {}x{}: {e}", src_dims.0, src_dims.1))?;
+    let (src_frame, src_guard) = fixture.into_frame_parts();
+    let dst_fourcc = bgra_bridge_fourcc_for_profile(profile);
+    let bridge = BgraIOSurfaceBridge::new(device, queue, src_dims, dst_dims, dst_fourcc)
+        .map_err(|e| format!("BgraIOSurfaceBridge::new dst_fourcc=0x{dst_fourcc:08x}: {e}"))?;
+    let pooled = bridge
+        .convert_to_iosurface(&src_frame)
+        .map_err(|e| format!("BGRA bridge convert_to_iosurface: {e}"))?;
+
+    let mut enc = VideoToolboxEncoder::new(profile, dst_dims.0, dst_dims.1, 30, 2_000)
+        .map_err(|e| format!("encoder construction: {e:?}"))?;
+    let mut packets = enc
+        .submit_iosurface(&pooled.frame, 0, true)
+        .map_err(|e| format!("submit_iosurface: {e:?}"))?;
+    if packets.is_empty() {
+        packets = enc.flush().map_err(|e| format!("flush: {e:?}"))?;
+    }
+    drop(pooled);
+    drop(src_guard);
+    drop(bridge);
+    if packets.is_empty() {
+        return Err("no packets produced".into());
+    }
+
+    let mut dec = VideoToolboxDecoder::new(profile.codec)
+        .map_err(|e| format!("decoder construction: {e:?}"))?;
+    for p in &packets {
+        dec.submit(&p.data)
+            .map_err(|e| format!("decoder submit: {e:?}"))?;
+    }
+    dec.signal_eof()
+        .map_err(|e| format!("decoder signal_eof: {e:?}"))?;
+    match dec
+        .next_frame()
+        .map_err(|e| format!("decoder next_frame: {e:?}"))?
+    {
+        Some(CodecFrame::Gpu(g)) => {
+            let GpuFrameSource::IOSurface(io) = g.source;
+            let expected = tether_codec::videotoolbox::expected_iosurface_fourccs(profile);
+            if !expected.contains(&io.pixel_format) {
+                return Err(format!(
+                    "decoded IOSurface fourcc 0x{:08x} not in expected family {:?}",
+                    io.pixel_format,
+                    expected
+                        .iter()
+                        .map(|f| format!("0x{f:08x}"))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            Ok(io.pixel_format)
+        }
+        Some(CodecFrame::Cpu(_)) => Err("decoder produced Cpu frame".into()),
+        None => Err("decoder produced no frame after EOF".into()),
+    }
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA bridge + VideoToolbox; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix"]
+fn iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix() {
+    let profiles = [
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        },
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 8,
+        },
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 10,
+        },
+    ];
+
+    for profile in profiles {
+        match try_bgra_bridge_vt_encode_roundtrip(profile) {
+            Ok(fourcc) => {
+                eprintln!(
+                    "BGRA bridge → VT encode matrix: {profile:?} OK (IOSurface 0x{fourcc:08x})"
+                );
+                assert_ne!(
+                    profile.chroma,
+                    ChromaSubsampling::Yuv444,
+                    "{profile:?} unexpectedly encodes 4:4:4 on this host; update probe/docs if this is a real hardware capability"
+                );
+            }
+            Err(reason) => {
+                eprintln!("BGRA bridge → VT encode matrix: {profile:?} unsupported ({reason})");
+                assert_eq!(
+                    profile.chroma,
+                    ChromaSubsampling::Yuv444,
+                    "{profile:?} should encode through the BGRA bridge"
+                );
+            }
+        }
+    }
 }
 
 /// Which input fixture to feed the host-scaler round-trip. Matches the

@@ -601,8 +601,7 @@ async fn handle_client(
     } = session;
     let initial_viewport = client_hello.viewport.filter(|v| v.is_valid());
     #[cfg(target_os = "macos")]
-    let macos_bgra_bridge_enabled =
-        !use_test_pattern && chosen_profile.chroma == ChromaSubsampling::Yuv420;
+    let macos_bgra_bridge_enabled = !use_test_pattern;
 
     // `use_test_pattern` from here on only switches the capture source;
     // the handshake-time profile floor it implied is already baked into
@@ -1816,10 +1815,14 @@ fn is_macos_bgra_fourcc(fourcc: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn macos_iosurface_encode_fourcc(profile: VideoProfile) -> Option<u32> {
-    use tether_codec::macos_interop::{NV12_VIDEO_RANGE_FOURCC, X420_FOURCC};
+    use tether_codec::macos_interop::{
+        NV12_VIDEO_RANGE_FOURCC, NV24_VIDEO_RANGE_FOURCC, X420_FOURCC, X444_FOURCC,
+    };
     match (profile.chroma, profile.bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => Some(NV12_VIDEO_RANGE_FOURCC),
         (ChromaSubsampling::Yuv420, 10) => Some(X420_FOURCC),
+        (ChromaSubsampling::Yuv444, 8) => Some(NV24_VIDEO_RANGE_FOURCC),
+        (ChromaSubsampling::Yuv444, 10) => Some(X444_FOURCC),
         _ => None,
     }
 }
@@ -2894,11 +2897,10 @@ fn run_capture_and_send(
         //   - Linux GPU dma-buf: `tether-scaler` (Mitchell-Netravali
         //     in linear-light) runs inside `encode_gpu_frame` between
         //     PipeWire's BGRA import and the chroma bridge.
-        //   - macOS GPU IOSurface: 4:2:0 sessions capture full-res
-        //     BGRA from SCK, then `BgraIOSurfaceBridge` runs the same
-        //     Mitchell scaler before converting into VT-ready NV12/P010
-        //     IOSurfaces. 4:4:4 sessions stay full-res SCK passthrough
-        //     until a matching BGRA->4:4:4 IOSurface bridge lands.
+        //   - macOS GPU IOSurface: capture full-res BGRA from SCK,
+        //     then `BgraIOSurfaceBridge` runs MPS Lanczos before
+        //     converting into VT-ready NV12/P010/NV24/P410-family
+        //     IOSurfaces for the negotiated profile.
         let (encode_width, encode_height) =
             encode_dims_for_viewport(frame_width, frame_height, current_viewport);
         // viewport_seq isn't part of the rebuild check: only an actual
@@ -3509,32 +3511,14 @@ async fn real_capture(
 
 #[cfg(target_os = "macos")]
 async fn real_capture(
-    chosen_profile: VideoProfile,
-    initial_viewport: Option<Viewport>,
+    _chosen_profile: VideoProfile,
+    _initial_viewport: Option<Viewport>,
 ) -> anyhow::Result<tether_capture::CaptureHandle> {
-    // For 4:2:0 sessions, capture BGRA so text/UI edges survive until
-    // our scaler runs; the host-side IOSurface bridge converts to the
-    // negotiated VideoToolbox YUV input format immediately before encode.
-    // 4:4:4 sessions still use direct SCK YUV IOSurfaces until we wire a
-    // matching BGRA->4:4:4 IOSurface conversion path.
-    let (pixel_format, capture_viewport) = if chosen_profile.chroma == ChromaSubsampling::Yuv420 {
-        (tether_capture::macos::sck_bgra_pixel_format(), None)
-    } else {
-        let pixel_format = match tether_capture::macos::sck_pixel_format_for_profile(chosen_profile)
-        {
-            tether_capture::macos::SckCapabilityCheck::Supported(p) => p,
-            tether_capture::macos::SckCapabilityCheck::Unsupported => {
-                anyhow::bail!(
-                    "no SCK pixel format models the negotiated profile {:?} — the \
-                         capture-bridge filter should have prevented this profile from \
-                         reaching negotiation",
-                    chosen_profile
-                );
-            }
-        };
-        (pixel_format, initial_viewport)
-    };
-    tether_capture::macos::start(pixel_format, capture_viewport)
+    // Capture BGRA for every macOS host profile. The Metal bridge is
+    // the single live conversion path: MPS Lanczos handles viewport
+    // downscale, then the compute kernel writes the VideoToolbox input
+    // fourcc for the negotiated chroma/bit-depth.
+    tether_capture::macos::start(tether_capture::macos::sck_bgra_pixel_format(), None)
         .await
         .map_err(anyhow::Error::from)
 }
@@ -3888,8 +3872,8 @@ mod tests {
     /// path. Four crates each carry a `(chroma, bit_depth) → fourcc`
     /// table:
     ///
-    ///   * `tether_capture::macos::sck_pixel_format_for_profile` — the
-    ///     fourcc SCK will deliver for a chosen `VideoProfile`.
+    ///   * `macos_iosurface_encode_fourcc` — the fourcc the macOS
+    ///     Metal bridge will deliver for a chosen `VideoProfile`.
     ///   * `tether_codec::videotoolbox::encoder::iosurface_fourcc_matches`
     ///     — the fourccs the VT encoder accepts as zero-copy input.
     ///   * `tether_codec::videotoolbox::probe::expected_iosurface_fourccs`
@@ -3899,12 +3883,12 @@ mod tests {
     ///   * `tether_render::accepts_iosurface_fourcc` — the fourccs the
     ///     renderer's IOSurface import path accepts.
     ///
-    /// The full pipeline is `SCK → encoder → decoder → renderer`. For
+    /// The full pipeline is `SCK BGRA → Metal bridge → encoder → decoder → renderer`. For
     /// each profile we negotiate, the per-link invariants are:
     ///
-    ///   * **SCK output ⊆ encoder accept** — the encoder must accept
-    ///     whatever the capture layer delivers. A miss here crashes
-    ///     the first frame after handshake.
+    ///   * **Bridge output ⊆ encoder accept** — the encoder must accept
+    ///     whatever the Metal bridge produces. A miss here crashes
+    ///     the first bridged frame after handshake.
     ///   * **Decoder output (probe expected) ⊆ renderer accept** —
     ///     the renderer must accept anything the VT decoder might
     ///     emit. A miss here silently drops every frame after
@@ -3920,7 +3904,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_iosurface_fourcc_tables_agree_across_crates() {
-        use tether_capture::macos::sck_pixel_format_for_profile;
         use tether_codec::videotoolbox::encoder::iosurface_fourcc_matches;
         use tether_codec::videotoolbox::expected_iosurface_fourccs;
         use tether_probe::PROFILE_PREFERENCE;
@@ -3931,16 +3914,20 @@ mod tests {
             let chroma = profile.chroma;
             let bd = profile.bit_depth;
 
-            // (1) SCK output ⊆ encoder accept.
-            // If SCK has a mapping for this profile, whatever it
-            // would deliver must be in the encoder's accept set.
-            if let Some(fourcc) = sck_pixel_format_for_profile(*profile).fourcc() {
-                assert!(
-                    iosurface_fourcc_matches(chroma, bd, fourcc),
-                    "SCK delivers 0x{fourcc:08x} for profile {profile:?} but the VT encoder \
-                     does not accept it via submit_iosurface. This would crash at first frame."
-                );
-            }
+            // (1) Metal bridge output ⊆ encoder + renderer accept.
+            let Some(fourcc) = macos_iosurface_encode_fourcc(*profile) else {
+                continue;
+            };
+            assert!(
+                iosurface_fourcc_matches(chroma, bd, fourcc),
+                "Metal bridge produces 0x{fourcc:08x} for profile {profile:?} but the VT encoder \
+                 does not accept it via submit_iosurface. This would crash at first bridged frame."
+            );
+            assert!(
+                accepts_iosurface_fourcc(chroma, bd, fourcc),
+                "Metal bridge produces 0x{fourcc:08x} for profile {profile:?} but the renderer \
+                 rejects that IOSurface family. The encode/decode loopback would not be displayable."
+            );
 
             // (2) Probe expected ⊆ renderer accept.
             // Every fourcc the VT decoder might emit for a confirmed

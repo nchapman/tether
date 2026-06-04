@@ -24,12 +24,11 @@
 
 use std::sync::OnceLock;
 
-use tether_capture::macos::{
-    probe_capture_pixel_formats, sck_pixel_format_for_profile, SckCaptureCapability,
-};
+use tether_capture::macos::{probe_capture_pixel_formats, SckCaptureCapability};
 use tether_codec::bitstream_sps::parse_sps_chroma_bit_depth;
 use tether_codec::macos_interop::{
-    accepts_iosurface_fourcc, iosurface_fourcc_expected_label, NV12_VIDEO_RANGE_FOURCC, X420_FOURCC,
+    accepts_iosurface_fourcc, iosurface_fourcc_expected_label, NV12_VIDEO_RANGE_FOURCC,
+    NV24_VIDEO_RANGE_FOURCC, X420_FOURCC, X444_FOURCC,
 };
 use tether_codec::videotoolbox::{
     expected_iosurface_fourccs, VideoToolboxDecoder, VideoToolboxEncoder,
@@ -254,65 +253,53 @@ impl ProfileProbe for VideoToolboxProbe {
 
 fn gate_capture_and_bridge(profile: VideoProfile) -> Result<()> {
     let caps = sck_capability();
-    if profile.chroma == ChromaSubsampling::Yuv420 {
-        if !caps.bgra {
-            return Err(ProbeError::new(
-                PipelineStage::Capture,
-                format!(
-                    "ScreenCaptureKit cannot deliver BGRA for the macOS \
-                     host-side scaler path ({:?} {:?} {}-bit)",
-                    profile.codec, profile.chroma, profile.bit_depth
-                ),
-            ));
-        }
-        let dst_fourcc = match profile.bit_depth {
-            8 => NV12_VIDEO_RANGE_FOURCC,
-            10 => X420_FOURCC,
-            _ => {
-                return Err(ProbeError::new(
-                    PipelineStage::Capture,
-                    format!(
-                        "no BGRA IOSurface bridge output fourcc for {:?} {}-bit",
-                        profile.chroma, profile.bit_depth
-                    ),
-                ));
-            }
-        };
-        let (device, queue, _caps) = pollster::block_on(
-            tether_gpuconvert::nv12_iosurface::build_bridge_device(),
-        )
-        .map_err(|e| {
-            ProbeError::new(
-                PipelineStage::Capture,
-                format!("macOS BGRA IOSurface bridge device init failed: {e}"),
-            )
-        })?;
-        tether_gpuconvert::nv12_iosurface::BgraIOSurfaceBridge::new(
-            device,
-            queue,
-            (PROBE_DIM * 2, PROBE_DIM * 2),
-            (PROBE_DIM, PROBE_DIM),
-            dst_fourcc,
-        )
-        .map_err(|e| {
-            ProbeError::new(
-                PipelineStage::Capture,
-                format!("macOS BGRA IOSurface bridge construction failed: {e}"),
-            )
-        })?;
-        return Ok(());
-    }
-
-    if !sck_pixel_format_for_profile(profile).is_deliverable(caps) {
+    if !caps.bgra {
         return Err(ProbeError::new(
             PipelineStage::Capture,
             format!(
-                "ScreenCaptureKit cannot deliver the pixel format for \
-                 {:?} {:?} {}-bit on this Mac",
+                "ScreenCaptureKit cannot deliver BGRA for the macOS \
+                 host-side Metal bridge ({:?} {:?} {}-bit)",
                 profile.codec, profile.chroma, profile.bit_depth
             ),
         ));
     }
+    let dst_fourcc = match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => NV12_VIDEO_RANGE_FOURCC,
+        (ChromaSubsampling::Yuv420, 10) => X420_FOURCC,
+        (ChromaSubsampling::Yuv444, 8) => NV24_VIDEO_RANGE_FOURCC,
+        (ChromaSubsampling::Yuv444, 10) => X444_FOURCC,
+        _ => {
+            return Err(ProbeError::new(
+                PipelineStage::Capture,
+                format!(
+                    "no BGRA IOSurface bridge output fourcc for {:?} {}-bit",
+                    profile.chroma, profile.bit_depth
+                ),
+            ));
+        }
+    };
+    let (device, queue, _caps) = pollster::block_on(
+        tether_gpuconvert::nv12_iosurface::build_bridge_device(),
+    )
+    .map_err(|e| {
+        ProbeError::new(
+            PipelineStage::Capture,
+            format!("macOS BGRA IOSurface bridge device init failed: {e}"),
+        )
+    })?;
+    tether_gpuconvert::nv12_iosurface::BgraIOSurfaceBridge::new(
+        device,
+        queue,
+        (PROBE_DIM * 2, PROBE_DIM * 2),
+        (PROBE_DIM, PROBE_DIM),
+        dst_fourcc,
+    )
+    .map_err(|e| {
+        ProbeError::new(
+            PipelineStage::Capture,
+            format!("macOS BGRA IOSurface bridge construction failed: {e}"),
+        )
+    })?;
     Ok(())
 }
 

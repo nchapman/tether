@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Host-side GPU colour-space conversions (BGRA → NV12) for the zero-copy capture → encode path."
+description = "Host-side GPU colour-space conversions for the zero-copy capture → encode path."
 
 [dependencies]
 thiserror = { workspace = true }
@@ -67,7 +67,6 @@ objc2-metal-performance-shaders = { version = "0.3.2", default-features = false,
 ] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef"] }
 core-foundation = "0.10"
-png = "0.18"
 # `build_bridge_device` returns anyhow::Error so callers (the host
 # binary and the iosurface_test hardware suite) can wrap setup
 # failures without inventing a bridge-specific error type.

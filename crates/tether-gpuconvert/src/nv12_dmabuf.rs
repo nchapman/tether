@@ -751,6 +751,8 @@ mod tests {
                 "Cr[{x},{y}] = {cr}, expected ~{expected_cr} (diff {cr_diff})",
             );
         }
+        drop(uv_mapped);
+        uv_readback.unmap();
     }
 
     /// Same conversion math as the test above, but the BGRA source

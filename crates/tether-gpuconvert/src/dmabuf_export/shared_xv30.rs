@@ -13,15 +13,20 @@
 //! encode via VAAPI.
 //!
 //! Channel order: the compute shader (`bgra_to_xv30.wgsl`) writes
-//! `vec4<f32>(Y, U, V, 1.0)` into a wgpu `Rgb10a2Unorm` /
+//! `vec4<f32>(U, Y, V, 1.0)` into a wgpu `Rgb10a2Unorm` /
 //! `A2B10G10R10_UNORM_PACK32` cell (R→[9:0], G→[19:10], B→[29:20],
-//! A→[31:30]), so the low 10 bits hold Y. This is the layout the Intel
-//! VAAPI `VA_FOURCC_Y410` encode path consumes — verified end-to-end by
+//! A→[31:30]), so the low 10 bits hold U(Cb), the middle hold Y, and the
+//! high hold V(Cr). This matches FFmpeg's `AV_PIX_FMT_XV30LE` pixdesc —
+//! the literal definition of what the VAAPI `VA_FOURCC_Y410` encode path
+//! reads off this surface — and the nominal `DRM_FORMAT_XVYU2101010`
+//! order in `<drm/drm_fourcc.h>` (`[31:0] X:Cr:Y:Cb`, i.e. Cb in the low
+//! bits); the two agree. Verified end-to-end by
 //! `roundtrip_colorbars_hevc_main444_10bit` (correct red/green/blue/
-//! white, no luma/chroma swap). Note it is NOT the nominal
-//! `DRM_FORMAT_XVYU2101010` order in `<drm/drm_fourcc.h>`
-//! (`[31:0] X:Cr:Y:Cb`, i.e. Cb in the low bits) — the fourcc is only a
-//! VAAPI lookup key here, not a literal channel-order spec.
+//! white, no luma/chroma swap). An earlier revision packed R=Y/G=U and
+//! the decode shader read it back swapped — round-tripping clean on
+//! Linux while shipping a non-conformant bitstream that a spec decoder
+//! (macOS VideoToolbox) rendered purple. See `bgra_to_xv30.wgsl` for the
+//! full failure-mode note; keep R=U/G=Y/B=V.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 

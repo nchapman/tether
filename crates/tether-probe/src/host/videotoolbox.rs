@@ -353,9 +353,9 @@ mod tests {
                 covered += 1;
             }
         }
-        // Vacuity guard: every HEVC entry plus H.264 4:2:0 declares ≥1
-        // decode fourcc (only AV1 adds none — `expected_iosurface_fourccs`
-        // has no AV1 arm), so coverage comfortably clears the four families.
+        // Vacuity guard: H.264/HEVC plus AV1 4:2:0 entries all declare
+        // at least one decode fourcc, so coverage comfortably clears
+        // the four surface families.
         assert!(
             covered >= 4,
             "expected ≥4 declared decode fourccs across PROFILE_PREFERENCE, got {covered}"
@@ -377,17 +377,18 @@ mod tests {
     /// decodes to `'x444'`, which the accept set rejected until this
     /// test pinned it.
     ///
-    /// Hardware: needs an Apple-Silicon VT decoder. A profile whose
-    /// fixture this machine genuinely can't decode is reported as SKIP
-    /// rather than failing, but the 4:4:4 10-bit regression target is
-    /// required to land — every Apple Silicon Mac decodes it.
+    /// Hardware: needs an Apple-Silicon VT decoder, with M3+ for AV1.
+    /// A profile whose fixture this machine genuinely can't decode is
+    /// reported as SKIP rather than failing, but the 4:4:4 10-bit
+    /// regression target is required to land — every Apple Silicon Mac
+    /// decodes it.
     #[test]
     #[ignore = "requires macOS + VideoToolbox"]
     fn decoded_fixture_fourcc_is_renderer_accepted() {
-        // The macOS-negotiated decode set that ships a fixture. AV1
-        // fixtures exist but AV1 is out of the HEVC/H.264 bug domain
-        // this guard covers, and decode is M3+-only.
+        // The macOS-negotiated decode set that ships a fixture.
         let profiles = [
+            VideoProfile::AV1_10BIT_420,
+            VideoProfile::AV1_8BIT_420,
             VideoProfile::H264_8BIT_420,
             VideoProfile::HEVC_8BIT_420,
             VideoProfile::HEVC_10BIT_420,

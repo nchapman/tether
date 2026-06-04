@@ -622,9 +622,7 @@ fn videotoolbox_codec_name_maps() {
     use crate::videotoolbox::encoder::vt_codec_name;
     assert_eq!(vt_codec_name(CodecKind::H264), "h264_videotoolbox");
     assert_eq!(vt_codec_name(CodecKind::Hevc), "hevc_videotoolbox");
-    // AV1: kept in the match for exhaustiveness, but `vt_codec_cname`
-    // errors before this name is ever read — macOS reports AV1 as
-    // unsupported on both encode and decode (see comments on
-    // `vt_codec_cname` and `vt_av_codec_id`).
+    // AV1 encode is still unsupported by FFmpeg's VideoToolbox wrapper;
+    // decode is wired through `VideoToolboxDecoder`.
     assert_eq!(vt_codec_name(CodecKind::Av1), "av1_videotoolbox");
 }

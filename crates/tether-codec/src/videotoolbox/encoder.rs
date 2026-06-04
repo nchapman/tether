@@ -644,9 +644,8 @@ impl Encoder for VideoToolboxEncoder {
 /// wrapper (none found as of 2026-05). Whether any currently-shipped
 /// Apple Silicon exposes hardware AV1 encode at all is independently
 /// unconfirmed in public sources; either way, this codepath needs a
-/// direct `VTCompressionSession` integration to reach it. Paired
-/// with the matching `decoder.rs` arm so macOS reports AV1 as
-/// unsupported in both directions today.
+/// direct `VTCompressionSession` integration to reach it. Decode is
+/// handled independently by `VideoToolboxDecoder`.
 fn vt_codec_cname(kind: CodecKind) -> Result<&'static std::ffi::CStr> {
     match kind {
         CodecKind::H264 => Ok(c"h264_videotoolbox"),

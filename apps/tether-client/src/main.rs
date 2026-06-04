@@ -209,11 +209,36 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    let forced_video_profile = match tether_probe::forced_video_profile_from_env() {
+        Ok(profile) => profile,
+        Err(e) => {
+            reporter.emit(&EngineEvent::Error { message: e.clone() });
+            anyhow::bail!(e);
+        }
+    };
+    if let Some(profile) = forced_video_profile {
+        let before = client_decode_profiles.len();
+        client_decode_profiles.retain(|p| *p == profile);
+        info!(
+            forced_profile = ?profile,
+            profiles_before_force = before,
+            profiles_after_force = client_decode_profiles.len(),
+            env = tether_probe::FORCE_VIDEO_PROFILE_ENV,
+            "forced video profile applied to client decode-capability advert"
+        );
+    }
     if client_decode_profiles.is_empty() {
-        let message = "no hardware video decoder is available on this client \
-             (no codec in PROFILE_PREFERENCE constructed). Tether requires \
-             GPU decode; there is no software fallback."
-            .to_string();
+        let message = if let Some(profile) = forced_video_profile {
+            format!(
+                "{}={profile:?} was requested, but this client cannot decode/render it",
+                tether_probe::FORCE_VIDEO_PROFILE_ENV
+            )
+        } else {
+            "no hardware video decoder is available on this client \
+                 (no codec in PROFILE_PREFERENCE constructed). Tether requires \
+                 GPU decode; there is no software fallback."
+                .to_string()
+        };
         reporter.emit(&EngineEvent::Error {
             message: message.clone(),
         });

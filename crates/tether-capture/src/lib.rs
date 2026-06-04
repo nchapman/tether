@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use tether_protocol::control::Viewport;
 
 /// Capture-source handle returned by every backend's `start()`. Bundles
 /// the [`CapturedFrame`] receiver with a runtime-mutable target-FPS
@@ -62,6 +63,10 @@ pub struct CaptureHandle {
     /// an `NSCursor` poller; the test pattern leaves it `None` and
     /// the host falls back to [`PlaceholderCursorSource`].
     cursor_source: Option<Box<dyn CursorSource>>,
+    /// Optional per-backend viewport updater. Backends that can
+    /// reconfigure their capture dimensions attach this; callers can
+    /// clone the handle before consuming `self` into a [`FrameReceiver`].
+    viewport_handle: Option<CaptureViewportHandle>,
     /// Consumer-liveness token. Moves into the [`FrameReceiver`] on
     /// [`Self::into_rx`] so its strong count tracks whether the consumer
     /// still holds the receiver. A backend producer that keeps its own
@@ -81,6 +86,7 @@ impl CaptureHandle {
             rx,
             target_fps,
             cursor_source: None,
+            viewport_handle: None,
             alive: Arc::new(()),
         }
     }
@@ -101,6 +107,20 @@ impl CaptureHandle {
     pub fn with_cursor_source(mut self, src: Box<dyn CursorSource>) -> Self {
         self.cursor_source = Some(src);
         self
+    }
+
+    /// Attach a viewport update handle. Called by backends that can
+    /// retarget capture dimensions without rebuilding the capture source.
+    #[must_use]
+    pub fn with_viewport_handle(mut self, handle: CaptureViewportHandle) -> Self {
+        self.viewport_handle = Some(handle);
+        self
+    }
+
+    /// Clone the optional viewport update handle before [`Self::into_rx`].
+    #[must_use]
+    pub fn viewport_handle(&self) -> Option<CaptureViewportHandle> {
+        self.viewport_handle.clone()
     }
 
     /// Take the cursor source out, leaving `None`. The host pump
@@ -151,6 +171,26 @@ impl CaptureHandle {
     #[must_use]
     pub fn fps_handle(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.target_fps)
+    }
+}
+
+/// Runtime viewport retarget seam for capture backends that can resize
+/// their produced frames in place. `None` means native capture size.
+#[derive(Clone)]
+pub struct CaptureViewportHandle {
+    tx: Sender<Option<Viewport>>,
+}
+
+impl CaptureViewportHandle {
+    #[must_use]
+    pub(crate) fn new(tx: Sender<Option<Viewport>>) -> Self {
+        Self { tx }
+    }
+
+    pub fn set_viewport(&self, viewport: Option<Viewport>) {
+        if let Err(e) = self.tx.send(viewport) {
+            tracing::warn!(error = %e, "capture viewport update dropped; backend is gone");
+        }
     }
 }
 

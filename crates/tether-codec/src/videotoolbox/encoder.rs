@@ -198,15 +198,26 @@ impl VideoToolboxEncoder {
             // class of bug the D3D11 path hit (an unpinned backend picking a
             // profile a downstream decoder rejects). Pin every case; the
             // mapping matches the VAAPI sibling (`vaapi/encoder.rs`):
-            //   H.264          → Main           (kVTProfileLevel_H264_Main)
-            //   HEVC 4:2:0  8b → Main           (…_HEVC_Main)
-            //   HEVC 4:2:0 10b → Main10         (…_HEVC_Main10)
-            //   HEVC 4:4:4     → Range Ext      (…_HEVC_Main42210)
-            // videotoolboxenc maps all four and HARD-ERRORS on an unsupported
-            // profile (encoder fails to open — surfaced cleanly by the probe
-            // as a Construct failure, never a silent downsample). Only the
-            // profiles `vt_codec_cname` accepts (H.264/HEVC) reach here; AV1
-            // bails earlier. Verified against FFmpeg 8.1 videotoolboxenc.c.
+            //   H.264          → Main    (kVTProfileLevel_H264_Main)
+            //   HEVC 4:2:0  8b → Main    (…_HEVC_Main)
+            //   HEVC 4:2:0 10b → Main10  (…_HEVC_Main10)
+            //   HEVC 4:4:4     → REXT    (…_HEVC_Main42210)
+            // videotoolboxenc maps all four (HARD-ERRORS on an unsupported
+            // profile — surfaced cleanly by the probe as Construct, never a
+            // silent downsample). Verified against FFmpeg 8.1 videotoolboxenc.c.
+            //
+            // IMPORTANT (4:4:4): VT exposes NO Main444 profile-level — REXT
+            // maps to `kVTProfileLevel_HEVC_Main42210_AutoLevel`, which is
+            // **4:2:2**, not 4:4:4 (see docs/CODEC_CAPABILITIES.md: forcing
+            // `rext` turns the failure from 4:2:0 into `x422`). So this arm
+            // does NOT make HEVC 4:4:4 encode work — the end-to-end chroma-
+            // survival probe still rejects 4:4:4 on Apple Silicon, and the
+            // host never advertises it. The arm exists only so the pin is
+            // exhaustive and reads in parity with VAAPI; it fires only during
+            // a probe attempt that is expected to fail. Only the profiles
+            // `vt_codec_cname` accepts (H.264/HEVC) reach here; AV1 bails
+            // earlier (the AV1 arm below is unreachable, present for
+            // exhaustiveness).
             raw.profile = match (kind, chroma, bit_depth) {
                 (CodecKind::H264, _, _) => ffi::AV_PROFILE_H264_MAIN as i32,
                 (CodecKind::Hevc, ChromaSubsampling::Yuv444, _) => {

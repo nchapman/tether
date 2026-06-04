@@ -684,6 +684,42 @@ mod tests {
         let sps = sps.unwrap();
         assert_eq!(sps.chroma_format_idc, 1, "expected 4:2:0");
         assert_eq!(sps.bit_depth_luma, 8, "expected 8-bit");
+
+        // The SPS must declare profile_idc=77 (Main). This is the direct
+        // guard for the `AV_PROFILE_H264_MAIN` pin: a regression that drops
+        // the pin lets AMD's MF MFT default to Baseline (profile_idc=66),
+        // which the D3D11VA hardware decoder rejects (INVALIDDATA) even
+        // though the stream is otherwise valid. "Decodes" alone wouldn't
+        // catch it on every path, so assert the byte. In an H.264 SPS NAL
+        // (Annex-B: start code, 0x67 header), profile_idc is the byte right
+        // after the 0x67 NAL header.
+        let mut profile_idc = None;
+        let d = &kf.data;
+        let mut i = 0;
+        while i + 5 < d.len() {
+            let sc4 = d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 && d[i + 3] == 1;
+            let sc3 = d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1;
+            let (hdr, after) = if sc4 {
+                (i + 4, i + 5)
+            } else if sc3 {
+                (i + 3, i + 4)
+            } else {
+                i += 1;
+                continue;
+            };
+            if d[hdr] & 0x1f == 7 {
+                profile_idc = Some(d[after]);
+                break;
+            }
+            i = after;
+        }
+        assert_eq!(
+            profile_idc,
+            Some(77),
+            "H.264 SPS must declare profile_idc=77 (Main) — the \
+             AV_PROFILE_H264_MAIN pin likely regressed (66 = Baseline, \
+             which the D3D11VA decoder rejects)"
+        );
     }
 
     /// Reproduce the live HEVC first-IDR failure: encode a keyframe,
@@ -1115,6 +1151,68 @@ mod tests {
     #[ignore = "requires AMD GPU with AMF HEVC Main10 (Windows)"]
     fn d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", true, hevc_main10_profile());
+    }
+
+    /// AV1 via the vendor-agnostic `av1_mf` (Media Foundation) fallback —
+    /// the `encode_bgra` path with `vendor_id=0`, mirroring
+    /// `d3d11_hevc_encode_decode_roundtrip`. This is the AV1 encoder a host
+    /// reaches on any GPU whose vendor isn't AMD/Intel/NVIDIA, AND the only
+    /// AV1 encoder left after `av1_amf` fail-fasts on a pre-RDNA-3 AMD card —
+    /// so the production fallback needs its own coverage, not just `av1_amf`.
+    /// Runs on any Windows GPU with an AV1 MF encoder + D3D11VA AV1 decode.
+    #[test]
+    #[ignore = "requires Windows GPU with AV1 MF encode + D3D11VA AV1 decode"]
+    fn d3d11_av1_mf_encode_decode_roundtrip() {
+        let mut enc = D3D11Encoder::new(
+            av1_profile(),
+            TEST_WIDTH,
+            TEST_HEIGHT,
+            TEST_FPS,
+            TEST_BITRATE_KBPS,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+        .expect("av1_mf encoder construction");
+        assert_eq!(enc.name(), "av1_mf", "expected av1_mf; got {}", enc.name());
+
+        let mut dec = D3D11Decoder::new(CodecKind::Av1, false).expect("decoder construction");
+        let bgra = vec![96u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
+
+        let mut all_packets = Vec::new();
+        for pts in 0..30 {
+            let pkts = enc
+                .encode_bgra(&bgra, pts, pts == 0)
+                .expect("encode_bgra failed");
+            all_packets.extend(pkts);
+            if !all_packets.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !all_packets.is_empty(),
+            "av1_mf produced no packets after 30 frames"
+        );
+        for pkt in &all_packets {
+            dec.submit(&pkt.data).expect("submit failed");
+        }
+
+        let mut decoded = None;
+        for pts in 30..60 {
+            if let Some(f) = dec.next_frame().expect("next_frame") {
+                decoded = Some(f);
+                break;
+            }
+            let pkts = enc.encode_bgra(&bgra, pts, false).expect("encode_bgra");
+            for pkt in &pkts {
+                dec.submit(&pkt.data).expect("submit");
+            }
+        }
+        let frame = decoded.expect("decoder never produced a frame from av1_mf output");
+        match frame {
+            Frame::Cpu(f) => assert_eq!((f.width, f.height), (TEST_WIDTH, TEST_HEIGHT)),
+            Frame::Gpu(g) => assert_eq!((g.width, g.height), (TEST_WIDTH, TEST_HEIGHT)),
+        }
     }
 
     /// AMF AV1 (`av1_amf`) via the zero-copy GPU submit path — the AV1

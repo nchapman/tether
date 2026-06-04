@@ -716,4 +716,26 @@ mod tests {
             "HEVC Main10 should be offered on a Main10-capable GPU; got {profiles:?}"
         );
     }
+
+    /// On a GPU that decodes AV1, the client must advertise AV1 4:2:0.
+    /// Regression guard for the AV1 unlock: the client decode probe runs
+    /// the AV1 fixture through `D3D11Decoder::new(Av1, ..)` → the per-GPU
+    /// `hw_config` D3D11VA gate → GPU-export path. This is the decode-side
+    /// analogue of `client_offers_hevc_main10`, and the only test that
+    /// catches a regression silently flipping AV1 back off (e.g. reverting
+    /// `d3d11_av_codec_id`). SKIPs implicitly on a GPU without AV1 decode
+    /// (the assert would fail there — run only on RDNA 2+ / Ada / Arc).
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires D3D11 GPU with AV1 decode (RDNA 2+ / Ada / Arc, Windows)"]
+    fn client_offers_av1_420() {
+        let profiles = client_decode_profiles();
+        eprintln!("client decode profiles: {profiles:?}");
+        assert!(
+            profiles
+                .iter()
+                .any(|p| p.codec == CodecKind::Av1 && p.chroma == ChromaSubsampling::Yuv420),
+            "AV1 4:2:0 should be offered on an AV1-decode-capable GPU; got {profiles:?}"
+        );
+    }
 }

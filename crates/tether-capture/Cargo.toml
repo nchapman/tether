@@ -26,9 +26,13 @@ test-support = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Safe SCK bindings — wraps Apple's framework via the doom-fish Swift
-# FFI shim. `macos_13_0` is the minimum feature level Tether targets;
-# bump alongside Apple's SDK floor.
-screencapturekit = { version = "6", features = ["macos_13_0"] }
+# FFI shim. `macos_14_0` exposes `SCStreamConfiguration.captureResolution`,
+# which we pin to `.best` for crisp Retina capture before SCK downscales to
+# the client viewport.
+screencapturekit = { version = "6", features = ["macos_14_0"] }
+# One-shot SCK source diagnostics write the first delivered CVPixelBuffer
+# to PNG when TETHER_SCK_DUMP_DIR is set.
+png = "0.18"
 # Need tokio's `task::spawn_blocking` to run SCK's synchronous
 # `SCShareableContent::get` off the async runtime. The Linux target
 # pulls tokio via ashpd; macOS pulls it explicitly.

@@ -28,7 +28,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_io_surface::IOSurfaceRef;
 use objc2_metal::{
-    MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTextureDescriptor, MTLTextureType,
+    MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
     MTLTextureUsage,
 };
 use tether_protocol::control::ChromaSubsampling;
@@ -236,6 +236,42 @@ pub fn import_iosurface_plane(
     surface_ref: &IOSurfaceRef,
     opts: ImportPlaneOptions<'_>,
 ) -> Result<wgpu::Texture, IOSurfaceImportError> {
+    let mtl_texture = create_iosurface_mtl_texture(device, surface_ref, opts)?;
+    wrap_mtl_texture_as_wgpu(device, mtl_texture, opts)
+}
+
+/// Return the native Metal device backing a `wgpu::Device`.
+///
+/// This is used by macOS host paths that need to mix Apple's native
+/// Metal APIs (for example MPS image filters) with the existing wgpu
+/// conversion shaders. The returned Objective-C object is retained by
+/// the caller.
+pub fn metal_device_from_wgpu(
+    device: &wgpu::Device,
+) -> Result<Retained<ProtocolObject<dyn MTLDevice>>, IOSurfaceImportError> {
+    // SAFETY: the caller expects a Metal-backed wgpu device; `as_hal`
+    // returns `None` when that precondition is false.
+    let mtl_device = unsafe {
+        device
+            .as_hal::<wgpu::hal::api::Metal>()
+            .ok_or(IOSurfaceImportError::NotMetalBacked)?
+            .raw_device()
+            .clone()
+    };
+    Ok(mtl_device)
+}
+
+/// Wrap one IOSurface plane as a native Metal texture without promoting
+/// it to wgpu.
+///
+/// The source IOSurface remains GPU-resident. Callers may pass the
+/// returned texture to native Metal/MPS code, then separately wrap a
+/// resulting Metal texture into wgpu via [`wrap_mtl_texture_as_wgpu`].
+pub fn create_iosurface_mtl_texture(
+    device: &wgpu::Device,
+    surface_ref: &IOSurfaceRef,
+    opts: ImportPlaneOptions<'_>,
+) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, IOSurfaceImportError> {
     if opts.width == 0 || opts.height == 0 {
         return Err(IOSurfaceImportError::Other(format!(
             "plane dims must be non-zero (got {}x{})",
@@ -243,18 +279,7 @@ pub fn import_iosurface_plane(
         )));
     }
 
-    // Pull the MTLDevice out of wgpu via the Metal HAL escape hatch.
-    // Clone it so the borrow on `as_hal` doesn't last across the
-    // MTLTexture construction below.
-    // SAFETY: the wgpu device is built on the Metal backend by the
-    // caller (precondition); `as_hal::<Metal>` returns Some.
-    let mtl_device: Retained<ProtocolObject<dyn MTLDevice>> = unsafe {
-        device
-            .as_hal::<wgpu::hal::api::Metal>()
-            .ok_or(IOSurfaceImportError::NotMetalBacked)?
-            .raw_device()
-            .clone()
-    };
+    let mtl_device = metal_device_from_wgpu(device)?;
 
     let descriptor = MTLTextureDescriptor::new();
     descriptor.setTextureType(MTLTextureType::Type2D);
@@ -279,7 +304,16 @@ pub fn import_iosurface_plane(
         .ok_or(IOSurfaceImportError::MtlImportReturnedNil {
             plane: opts.plane_index,
         })?;
+    Ok(mtl_texture)
+}
 
+/// Promote a native Metal texture created from the same `MTLDevice` as
+/// `device` into a `wgpu::Texture`.
+pub fn wrap_mtl_texture_as_wgpu(
+    device: &wgpu::Device,
+    mtl_texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    opts: ImportPlaneOptions<'_>,
+) -> Result<wgpu::Texture, IOSurfaceImportError> {
     let copy_size = wgpu::hal::CopyExtent {
         width: opts.width,
         height: opts.height,

@@ -2363,6 +2363,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-metal-performance-shaders"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46a10f15ff4e2045f947ffca8a17fc351b155c321de16f04278a008a1f446784"
+dependencies = [
+ "bitflags 2.11.1",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
+]
+
+[[package]]
 name = "objc2-quartz-core"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3673,6 +3685,7 @@ dependencies = [
  "libspa-sys",
  "objc2 0.6.4",
  "pipewire",
+ "png",
  "screencapturekit",
  "tether-protocol",
  "thiserror 2.0.18",
@@ -3747,6 +3760,8 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-io-surface",
  "objc2-metal 0.3.2",
+ "objc2-metal-performance-shaders",
+ "png",
  "pollster",
  "tether-codec",
  "tether-protocol",

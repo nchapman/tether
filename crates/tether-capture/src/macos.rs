@@ -21,6 +21,9 @@
 //! signal arrives — keeps the SCStream alive across the dispatch-queue
 //! callbacks without leaking it.
 
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,11 +31,12 @@ use std::sync::atomic::AtomicU32;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
-use screencapturekit::cv::CVPixelBuffer;
+use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
 use screencapturekit::prelude::{
     CMSampleBuffer, PixelFormat, SCContentFilter, SCShareableContent, SCStream,
     SCStreamConfiguration, SCStreamOutputTrait, SCStreamOutputType,
 };
+use screencapturekit::stream::configuration::SCCaptureResolutionType;
 use screencapturekit::FourCharCode;
 use tether_protocol::control::{ChromaSubsampling, VideoProfile, Viewport};
 use tether_protocol::MonoNanos;
@@ -52,6 +56,10 @@ const CAPTURE_CHANNEL_DEPTH: usize = 2;
 /// as a producer cap, so they don't need to be the same call site —
 /// just the same value.
 const CAPTURE_FPS: u32 = 60;
+
+const ENV_SCK_CAPTURE_SIZE: &str = "TETHER_SCK_CAPTURE_SIZE";
+const ENV_SCK_DUMP_DIR: &str = "TETHER_SCK_DUMP_DIR";
+const ENV_SCK_DUMP_LABEL: &str = "TETHER_SCK_DUMP_LABEL";
 
 /// Start ScreenCaptureKit on the primary display with the requested
 /// pixel format.
@@ -190,8 +198,8 @@ fn run_capture_thread(
     while !stop.load(Ordering::Acquire) {
         match viewport_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(viewport) => {
-                let (width, height) =
-                    sck_capture_dims_for_viewport(geom.raw_pixel_w, geom.raw_pixel_h, viewport);
+                let dims = sck_configured_capture_dims(geom.raw_pixel_w, geom.raw_pixel_h);
+                let (width, height) = (dims.width, dims.height);
                 if (width, height) == cursor_geom.capture_dims() {
                     continue;
                 }
@@ -204,7 +212,9 @@ fn run_capture_thread(
                             capture_h = height,
                             viewport_w = viewport.map(|v| v.width),
                             viewport_h = viewport.map(|v| v.height),
-                            "SCK stream configuration updated for client viewport"
+                            capture_resolution = %SCCaptureResolutionType::Best,
+                            capture_size_override = dims.override_label.as_deref(),
+                            "SCK stream configuration updated"
                         );
                     }
                     Err(e) => {
@@ -289,7 +299,8 @@ fn build_and_start_stream(
         );
         (logical_w, logical_h)
     };
-    let (width, height) = sck_capture_dims_for_viewport(raw_w, raw_h, viewport);
+    let dims = sck_configured_capture_dims(raw_w, raw_h);
+    let (width, height) = (dims.width, dims.height);
     tracing::info!(
         display_id,
         logical_w,
@@ -302,6 +313,8 @@ fn build_and_start_stream(
         capture_h = height,
         fps = CAPTURE_FPS,
         pixel_format = %pixel_format,
+        capture_resolution = %SCCaptureResolutionType::Best,
+        capture_size_override = dims.override_label.as_deref(),
         "capture source: macOS (ScreenCaptureKit, primary display)"
     );
 
@@ -309,12 +322,10 @@ fn build_and_start_stream(
         .with_display(&primary)
         .with_excluding_windows(&[])
         .build();
-    // Configure SCK at the encoder target size. With no viewport we
-    // use the display's backing-pixel grid, aligned to the encoder
-    // block size. With an initial client viewport we ask SCK itself to
-    // downscale into the aspect-fit target, keeping the macOS host on
-    // the zero-copy SCK IOSurface → VideoToolbox path and avoiding the
-    // lower-quality in-process IOSurface scaler.
+    // Configure SCK at the display's backing-pixel grid, aligned to the
+    // encoder block size. Viewport sizing happens downstream in the host
+    // encode path; `TETHER_SCK_CAPTURE_SIZE` remains as an explicit
+    // diagnostic override for comparing Apple's native downscale.
     let config = stream_config(pixel_format, width, height);
 
     let mut stream = SCStream::new(&filter, &config);
@@ -329,6 +340,7 @@ fn build_and_start_stream(
         tx,
         stop,
         wake: thread_handle,
+        dump: SckFrameDump::from_env(),
     };
     stream.add_output_handler(handler, SCStreamOutputType::Screen);
     stream.start_capture()?;
@@ -375,6 +387,11 @@ fn stream_config(pixel_format: PixelFormat, width: u32, height: u32) -> SCStream
         .with_pixel_format(pixel_format)
         .with_width(width)
         .with_height(height)
+        // Default `Automatic` may trade source fidelity for bandwidth.
+        // We do our own explicit viewport sizing and bitrate control, so
+        // ask SCK to sample the source at the best available resolution
+        // before delivering our configured output dimensions.
+        .with_capture_resolution_type(SCCaptureResolutionType::Best)
         .with_fps(CAPTURE_FPS)
         // Low queue depth keeps capture-side latency tight; the wire
         // path already absorbs jitter via the fragmenter. Previously
@@ -391,6 +408,313 @@ fn stream_config(pixel_format: PixelFormat, width: u32, height: u32) -> SCStream
         .with_shows_cursor(false)
 }
 
+#[derive(Debug)]
+struct SckCaptureDims {
+    width: u32,
+    height: u32,
+    override_label: Option<String>,
+}
+
+fn sck_configured_capture_dims(raw_w: u32, raw_h: u32) -> SckCaptureDims {
+    let (native_w, native_h) = sck_native_capture_dims(raw_w, raw_h);
+    let Some(requested) = std::env::var(ENV_SCK_CAPTURE_SIZE)
+        .ok()
+        .and_then(|v| parse_capture_size(&v))
+    else {
+        return SckCaptureDims {
+            width: native_w,
+            height: native_h,
+            override_label: None,
+        };
+    };
+
+    let (width, height) = align_capture_dims(requested.0, requested.1);
+    if (width, height) != requested {
+        tracing::warn!(
+            requested_w = requested.0,
+            requested_h = requested.1,
+            capture_w = width,
+            capture_h = height,
+            "TETHER_SCK_CAPTURE_SIZE floored to encoder alignment"
+        );
+    }
+    SckCaptureDims {
+        width,
+        height,
+        override_label: Some(format!("{}x{}", width, height)),
+    }
+}
+
+fn parse_capture_size(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value
+        .trim()
+        .split_once('x')
+        .or_else(|| value.trim().split_once('X'))?;
+    let w = w.trim().parse::<u32>().ok()?;
+    let h = h.trim().parse::<u32>().ok()?;
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+struct SckFrameDump {
+    dir: PathBuf,
+    label: Option<String>,
+    saved: AtomicBool,
+}
+
+impl SckFrameDump {
+    fn from_env() -> Option<Arc<Self>> {
+        let dir = std::env::var_os(ENV_SCK_DUMP_DIR).map(PathBuf::from)?;
+        let label = std::env::var(ENV_SCK_DUMP_LABEL)
+            .ok()
+            .map(|s| sanitize_filename_part(&s))
+            .filter(|s| !s.is_empty());
+        Some(Arc::new(Self {
+            dir,
+            label,
+            saved: AtomicBool::new(false),
+        }))
+    }
+
+    fn maybe_dump(&self, pixel_buffer: &CVPixelBuffer) {
+        if self.saved.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        match self.dump(pixel_buffer) {
+            Ok(path) => {
+                tracing::info!(path = %path.display(), "SCK source frame dumped");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SCK source frame dump failed");
+            }
+        }
+    }
+
+    fn dump(&self, pixel_buffer: &CVPixelBuffer) -> std::result::Result<PathBuf, String> {
+        let width = u32::try_from(pixel_buffer.width()).map_err(|_| "width overflow")?;
+        let height = u32::try_from(pixel_buffer.height()).map_err(|_| "height overflow")?;
+        let fourcc = fourcc_label(pixel_buffer.pixel_format());
+        let rgba = cv_pixel_buffer_to_rgba(pixel_buffer)?;
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("create {}: {e}", self.dir.display()))?;
+
+        let label = self.label.as_deref().unwrap_or("frame");
+        let filename = format!(
+            "sck-{}-{}x{}-{}-pid{}.png",
+            label,
+            width,
+            height,
+            fourcc,
+            std::process::id()
+        );
+        let path = self.dir.join(filename);
+        write_rgba_png(&path, width, height, &rgba)?;
+        Ok(path)
+    }
+}
+
+fn cv_pixel_buffer_to_rgba(pixel_buffer: &CVPixelBuffer) -> std::result::Result<Vec<u8>, String> {
+    let guard = pixel_buffer
+        .lock(CVPixelBufferLockFlags::READ_ONLY)
+        .map_err(|e| format!("CVPixelBufferLockBaseAddress: {e}"))?;
+    let width = guard.width();
+    let height = guard.height();
+    let fourcc = pixel_buffer.pixel_format();
+    let mut rgba = vec![
+        0u8;
+        width
+            .checked_mul(height)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or("RGBA size overflow")?
+    ];
+
+    let fourcc_bytes = fourcc.to_be_bytes();
+    if fourcc_bytes == *b"BGRA" {
+        copy_bgra_to_rgba(&guard, &mut rgba)?;
+    } else if fourcc_bytes == *b"420v" {
+        copy_yuv420_to_rgba(&guard, &mut rgba, Yuv420Format::Limited8)?;
+    } else if fourcc_bytes == *b"420f" {
+        copy_yuv420_to_rgba(&guard, &mut rgba, Yuv420Format::Full8)?;
+    } else if fourcc_bytes == *b"x420" {
+        copy_yuv420_to_rgba(&guard, &mut rgba, Yuv420Format::Limited10)?;
+    } else if fourcc_bytes == *b"xf20" {
+        copy_yuv420_to_rgba(&guard, &mut rgba, Yuv420Format::Full10)?;
+    } else {
+        return Err(format!(
+            "unsupported dump pixel format {}",
+            fourcc_label(fourcc)
+        ));
+    }
+
+    Ok(rgba)
+}
+
+fn copy_bgra_to_rgba(
+    guard: &screencapturekit::cv::CVPixelBufferLockGuard<'_>,
+    rgba: &mut [u8],
+) -> std::result::Result<(), String> {
+    let width = guard.width();
+    let height = guard.height();
+    for y in 0..height {
+        let row = guard.row(y).ok_or("BGRA row missing")?;
+        let needed = width.checked_mul(4).ok_or("BGRA row size overflow")?;
+        if row.len() < needed {
+            return Err("BGRA row shorter than visible width".into());
+        }
+        for x in 0..width {
+            let src = x * 4;
+            let dst = (y * width + x) * 4;
+            rgba[dst] = row[src + 2];
+            rgba[dst + 1] = row[src + 1];
+            rgba[dst + 2] = row[src];
+            rgba[dst + 3] = row[src + 3];
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Yuv420Format {
+    Limited8,
+    Full8,
+    Limited10,
+    Full10,
+}
+
+impl Yuv420Format {
+    fn is_10_bit(self) -> bool {
+        matches!(self, Self::Limited10 | Self::Full10)
+    }
+
+    fn is_full_range(self) -> bool {
+        matches!(self, Self::Full8 | Self::Full10)
+    }
+}
+
+fn copy_yuv420_to_rgba(
+    guard: &screencapturekit::cv::CVPixelBufferLockGuard<'_>,
+    rgba: &mut [u8],
+    format: Yuv420Format,
+) -> std::result::Result<(), String> {
+    if guard.plane_count() < 2 {
+        return Err("YUV420 dump expected at least two planes".into());
+    }
+    let width = guard.width();
+    let height = guard.height();
+    for y in 0..height {
+        let y_row = guard.plane_row(0, y).ok_or("Y plane row missing")?;
+        let uv_row = guard.plane_row(1, y / 2).ok_or("UV plane row missing")?;
+        for x in 0..width {
+            let (yy, cb, cr) = if format.is_10_bit() {
+                let y_byte = x.checked_mul(2).ok_or("Y byte offset overflow")?;
+                let uv_byte = (x / 2).checked_mul(4).ok_or("UV byte offset overflow")?;
+                (
+                    u32::from(read_le_u16(y_row, y_byte)? >> 6),
+                    u32::from(read_le_u16(uv_row, uv_byte)? >> 6),
+                    u32::from(read_le_u16(uv_row, uv_byte + 2)? >> 6),
+                )
+            } else {
+                let uv_byte = (x / 2).checked_mul(2).ok_or("UV byte offset overflow")?;
+                (
+                    u32::from(*y_row.get(x).ok_or("Y byte out of range")?),
+                    u32::from(*uv_row.get(uv_byte).ok_or("Cb byte out of range")?),
+                    u32::from(*uv_row.get(uv_byte + 1).ok_or("Cr byte out of range")?),
+                )
+            };
+            let [r, g, b] = yuv_bt709_to_rgb8(yy, cb, cr, format);
+            let dst = (y * width + x) * 4;
+            rgba[dst] = r;
+            rgba[dst + 1] = g;
+            rgba[dst + 2] = b;
+            rgba[dst + 3] = 255;
+        }
+    }
+    Ok(())
+}
+
+fn read_le_u16(row: &[u8], offset: usize) -> std::result::Result<u16, String> {
+    let bytes = row
+        .get(offset..offset + 2)
+        .ok_or("16-bit sample out of range")?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn yuv_bt709_to_rgb8(y: u32, cb: u32, cr: u32, format: Yuv420Format) -> [u8; 3] {
+    let (y_norm, u_norm, v_norm) = if format.is_full_range() {
+        let max = if format.is_10_bit() { 1023.0 } else { 255.0 };
+        let center = if format.is_10_bit() { 512.0 } else { 128.0 };
+        (
+            y as f32 / max,
+            (cb as f32 - center) / (max + 1.0),
+            (cr as f32 - center) / (max + 1.0),
+        )
+    } else if format.is_10_bit() {
+        (
+            (y as f32 - 64.0) / 876.0,
+            (cb as f32 - 512.0) / 896.0,
+            (cr as f32 - 512.0) / 896.0,
+        )
+    } else {
+        (
+            (y as f32 - 16.0) / 219.0,
+            (cb as f32 - 128.0) / 224.0,
+            (cr as f32 - 128.0) / 224.0,
+        )
+    };
+
+    let r = y_norm + 1.5748 * v_norm;
+    let g = y_norm - 0.1873 * u_norm - 0.4681 * v_norm;
+    let b = y_norm + 1.8556 * u_norm;
+    [float_to_u8(r), float_to_u8(g), float_to_u8(b)]
+}
+
+// Clamp and round before narrowing; this is the final PNG byte quantization.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn float_to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn write_rgba_png(
+    path: &Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> std::result::Result<(), String> {
+    let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png = encoder
+        .write_header()
+        .map_err(|e| format!("png header {}: {e}", path.display()))?;
+    png.write_image_data(rgba)
+        .map_err(|e| format!("png write {}: {e}", path.display()))
+}
+
+fn fourcc_label(fourcc: u32) -> String {
+    let bytes = fourcc.to_be_bytes();
+    if bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        format!("0x{fourcc:08x}")
+    }
+}
+
+fn sanitize_filename_part(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                Some(c)
+            } else if c.is_ascii_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 struct FrameHandler {
     tx: Sender<CapturedFrame>,
     /// Signal that the supervisor thread should stop the stream. Raised
@@ -400,6 +724,9 @@ struct FrameHandler {
     /// `park_timeout` immediately on disconnect rather than waiting for
     /// the next 100 ms tick.
     wake: std::thread::Thread,
+    /// Optional one-shot source-frame dump. Enabled only by env vars
+    /// for SCK quality diagnostics.
+    dump: Option<Arc<SckFrameDump>>,
 }
 
 impl SCStreamOutputTrait for FrameHandler {
@@ -411,7 +738,7 @@ impl SCStreamOutputTrait for FrameHandler {
             return;
         }
         let t_capture_userspace = MonoNanos::now();
-        let Some(frame) = build_frame(&sample, t_capture_userspace) else {
+        let Some(frame) = build_frame(&sample, t_capture_userspace, self.dump.as_deref()) else {
             return;
         };
         match self.tx.try_send(frame) {
@@ -433,8 +760,15 @@ impl SCStreamOutputTrait for FrameHandler {
     }
 }
 
-fn build_frame(sample: &CMSampleBuffer, t_capture_userspace: MonoNanos) -> Option<CapturedFrame> {
+fn build_frame(
+    sample: &CMSampleBuffer,
+    t_capture_userspace: MonoNanos,
+    dump: Option<&SckFrameDump>,
+) -> Option<CapturedFrame> {
     let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
+    if let Some(dump) = dump {
+        dump.maybe_dump(&pixel_buffer);
+    }
     let iosurface = pixel_buffer.io_surface()?;
     let pixel_format = pixel_buffer.pixel_format();
     let width = u32::try_from(pixel_buffer.width()).ok()?;
@@ -507,28 +841,18 @@ fn native_damage_for_frame_status(status: SCFrameStatus) -> NativeDamage {
 
 /// Encoder alignment in pixels. SCK can produce odd sizes, but the
 /// downstream H.264 / HEVC hardware encoders are happiest on a 16-pixel
-/// grid, especially Main444. Flooring keeps the requested SCK stream
-/// inside the client's viewport budget.
+/// grid, especially Main444. Flooring the backing-pixel capture trims
+/// only the encoder-invisible edge slack; the decoder crops via the
+/// coded dimensions.
 const SCK_CAPTURE_ALIGN: u32 = 16;
 
-// Scaled dimensions are positive and bounded by display dimensions; casts are
-// intentional after clamping scale to <= 1.0.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn sck_capture_dims_for_viewport(raw_w: u32, raw_h: u32, viewport: Option<Viewport>) -> (u32, u32) {
-    let (target_w, target_h) = match viewport.filter(|v| v.is_valid()) {
-        Some(v) => {
-            let scale_w = f64::from(v.width) / f64::from(raw_w);
-            let scale_h = f64::from(v.height) / f64::from(raw_h);
-            let scale = scale_w.min(scale_h).min(1.0);
-            (
-                (f64::from(raw_w) * scale).round() as u32,
-                (f64::from(raw_h) * scale).round() as u32,
-            )
-        }
-        None => (raw_w, raw_h),
-    };
-    let aligned_w = (target_w / SCK_CAPTURE_ALIGN) * SCK_CAPTURE_ALIGN;
-    let aligned_h = (target_h / SCK_CAPTURE_ALIGN) * SCK_CAPTURE_ALIGN;
+fn sck_native_capture_dims(raw_w: u32, raw_h: u32) -> (u32, u32) {
+    align_capture_dims(raw_w, raw_h)
+}
+
+fn align_capture_dims(width: u32, height: u32) -> (u32, u32) {
+    let aligned_w = (width / SCK_CAPTURE_ALIGN) * SCK_CAPTURE_ALIGN;
+    let aligned_h = (height / SCK_CAPTURE_ALIGN) * SCK_CAPTURE_ALIGN;
     (
         aligned_w.max(SCK_CAPTURE_ALIGN),
         aligned_h.max(SCK_CAPTURE_ALIGN),
@@ -561,31 +885,36 @@ mod tests {
     }
 
     #[test]
-    fn sck_dims_without_viewport_align_backing_pixels() {
-        assert_eq!(
-            sck_capture_dims_for_viewport(3024, 1964, None),
-            (3024, 1952)
-        );
+    fn sck_native_dims_align_backing_pixels() {
+        assert_eq!(sck_native_capture_dims(3024, 1964), (3024, 1952));
     }
 
     #[test]
-    fn sck_dims_fit_initial_viewport_without_upscale() {
-        assert_eq!(
-            sck_capture_dims_for_viewport(3840, 2160, Some(Viewport::new(1280, 720))),
-            (1280, 720)
-        );
-        assert_eq!(
-            sck_capture_dims_for_viewport(1280, 720, Some(Viewport::new(3840, 2160))),
-            (1280, 720)
-        );
+    fn sck_native_dims_never_use_viewport_size() {
+        assert_eq!(sck_native_capture_dims(3840, 2160), (3840, 2160));
+        assert_eq!(sck_native_capture_dims(1280, 720), (1280, 720));
     }
 
     #[test]
-    fn sck_dims_letterbox_and_floor_to_alignment() {
-        let (w, h) = sck_capture_dims_for_viewport(1920, 1080, Some(Viewport::new(1000, 600)));
+    fn sck_native_dims_floor_to_alignment() {
+        let (w, h) = sck_native_capture_dims(1920, 1080);
         assert_eq!(w % SCK_CAPTURE_ALIGN, 0);
         assert_eq!(h % SCK_CAPTURE_ALIGN, 0);
-        assert!(w <= 1000 && h <= 600);
+        assert_eq!((w, h), (1920, 1072));
+    }
+
+    #[test]
+    fn parses_diagnostic_capture_size_override() {
+        assert_eq!(parse_capture_size("1712x1104"), Some((1712, 1104)));
+        assert_eq!(parse_capture_size(" 1600 X 900 "), Some((1600, 900)));
+        assert_eq!(parse_capture_size("0x900"), None);
+        assert_eq!(parse_capture_size("nope"), None);
+    }
+
+    #[test]
+    fn diagnostic_capture_size_override_aligns_like_native_dims() {
+        assert_eq!(align_capture_dims(1600, 900), (1600, 896));
+        assert_eq!(align_capture_dims(1712, 1104), (1712, 1104));
     }
 }
 
@@ -615,6 +944,13 @@ pub fn sck_pixel_format_for_profile(profile: VideoProfile) -> SckCapabilityCheck
         (ChromaSubsampling::Yuv444, 10) => Supported(PixelFormat::xf44),
         _ => Unsupported,
     }
+}
+
+/// SCK's packed BGRA capture format. Exposed so the host can request
+/// BGRA without depending directly on the ScreenCaptureKit crate.
+#[must_use]
+pub fn sck_bgra_pixel_format() -> PixelFormat {
+    PixelFormat::BGRA
 }
 
 /// Outcome of mapping a `VideoProfile` to an SCK `PixelFormat`. Two

@@ -70,12 +70,12 @@ the relevant crate (e.g. `tether-capture/src/macos.rs`).
 
 End-to-end for one frame, host on a Linux Wayland session, client on
 any Linux machine. The **macOS host** variant diverges only inside the
-capture→encoder hop: at 1:1 (capture_dims == encode_dims)
-ScreenCaptureKit hands NV12 IOSurfaces straight to VideoToolbox with
-no gpuconvert step; when the client viewport asks for a smaller
-encode, the `Nv12IOSurfaceBridge` runs the same Mitchell scaler
-pipelines as Linux on the Y and UV planes into a pooled destination
-IOSurface that's then fed to VideoToolbox. The rest of the pipeline
+capture→encoder hop: 4:2:0 sessions capture full-resolution BGRA
+IOSurfaces from ScreenCaptureKit, run the same Mitchell scaler as Linux
+when the client viewport asks for a smaller encode, then convert into a
+pooled NV12/P010 IOSurface that's fed to VideoToolbox. 4:4:4 sessions
+remain full-resolution SCK YUV passthrough until a matching BGRA→4:4:4
+IOSurface bridge lands. The rest of the pipeline
 from `FrameFragmenter` onward is identical. See the dedicated
 **macOS host (shipping today)** subsection further down.
 
@@ -110,9 +110,9 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │       run tether-scaler (Mitchell-Netravali in linear-light)        │
 │       between PipeWire's BGRA dma-buf import and the chroma         │
 │       bridge; CPU paths bilinear-resize before encode_bgra.         │
-│       macOS GPU paths run the same Mitchell pipelines via the       │
-│       Nv12IOSurfaceBridge (gpuconvert) — see Mac host scaler        │
-│       below.                                                        │
+│       macOS 4:2:0 GPU paths capture BGRA and run the same Mitchell  │
+│       pipelines via the BGRA IOSurface bridge before NV12/P010      │
+│       conversion; 4:4:4 stays full-res SCK passthrough for now.     │
 │     • ABR tick: drains the latest ClientStats + quinn path stats    │
 │       into tether_session::abr::AbrController; calls                │
 │       set_bitrate_kbps when the controller crosses a hysteresis     │

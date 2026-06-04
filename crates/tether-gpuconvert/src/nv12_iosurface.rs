@@ -1,52 +1,54 @@
-//! macOS NV12 IOSurface scaler bridge.
+//! macOS IOSurface bridge helpers for VideoToolbox encode.
 //!
-//! Drives the [`tether_scaler`] YUV-plane paths against a pool of
-//! IOSurface-backed destination textures so the host can hand
-//! VideoToolbox a downscaled NV12 surface without a CPU round-trip.
-//! Stage 3 of the macOS host GPU scaling plan.
+//! The production macOS 4:2:0 host path uses [`BgraIOSurfaceBridge`]:
+//! ScreenCaptureKit supplies a full-resolution BGRA IOSurface, MPS
+//! Lanczos resizes it on Metal, and a tiny Metal compute kernel packs
+//! the result into a VideoToolbox-ready NV12/P010-family IOSurface.
+//! This keeps desktop text in RGB through the resize step and only
+//! chroma-subsamples at the encoder boundary.
 //!
-//! Per frame the bridge:
+//! This module also keeps the older [`Nv12IOSurfaceBridge`] around for
+//! YUV-plane IOSurface scaling tests. Both bridges use the same
+//! IOSurface pool and diagnostic dump helpers.
 //!
-//! 1. Imports the source IOSurface's Y + UV planes as `wgpu::Texture`
-//!    handles (read-only, `ShaderRead | Private`) via the shared
-//!    `tether_codec::macos_interop::import_iosurface_plane`.
-//! 2. Acquires a destination slot from [`IOSurfacePool`]; the slot
-//!    owns one CF-retained IOSurface at the destination dimensions
-//!    plus pre-built `wgpu::Texture` wrappers (`ShaderRead |
-//!    ShaderWrite | PixelFormatView | Shared`) for both planes.
-//! 3. Copies the four colorimetry attachments
-//!    (`kCVImageBufferYCbCrMatrixKey`, `…ColorPrimariesKey`,
-//!    `…TransferFunctionKey`, `…ChromaLocationTopFieldKey`) from
-//!    source to destination on the first scale, so the encoded HEVC
-//!    VUI carries the correct matrix/primaries/transfer/siting
-//!    instead of "unspecified" — the macOS analog of the Linux libva
-//!    pitch-alignment bug the project nearly shipped.
-//! 4. Runs the two pre-built scalers (Y plane R8Unorm, UV plane
-//!    Rg8Unorm) directly into the slot's destination textures via
-//!    [`tether_scaler::Scaler::scale_into`], with the cosited UV
-//!    siting offset baked into the chroma scaler. The encoder's
-//!    `submit_iosurface` takes a CF retain on the destination
-//!    IOSurface, so the slot's storage stays alive as long as VT
-//!    needs it.
-//! 5. Returns a [`PooledIOSurface`] guard — the host holds it until
-//!    VideoToolbox's compression-output callback fires, then drops
-//!    it to return the slot to the pool.
+//! Per frame the BGRA bridge acquires a destination pool slot, copies
+//! colorimetry metadata from the source on first use, runs the Metal
+//! resize/convert command buffer, optionally dumps a readback PNG for
+//! diagnostics, and returns a [`PooledIOSurface`] guard. The host keeps
+//! that guard alive until VideoToolbox's compression-output callback
+//! fires, then dropping it returns the slot to the pool.
 
 use std::ffi::c_void;
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
-use objc2_metal::MTLStorageMode;
+use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLPixelFormat, MTLSize, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+};
+use objc2_metal_performance_shaders::MPSImageLanczosScale;
 use tether_codec::macos_interop::{
-    accepts_iosurface_fourcc, import_iosurface_plane, iosurface_as_ref, ImportPlaneOptions,
+    accepts_iosurface_fourcc, create_iosurface_mtl_texture, import_iosurface_plane,
+    iosurface_as_ref, metal_device_from_wgpu, wrap_mtl_texture_as_wgpu, ImportPlaneOptions,
     READ_ONLY_MTL_USAGE, READ_WRITE_MTL_USAGE,
 };
 use tether_codec::IOSurfaceFrame;
 use tether_scaler::{ColorSpace, Pipelines, Scaler, ScalerError};
+
+const ENV_BGRA_BRIDGE_DUMP_DIR: &str = "TETHER_BGRA_BRIDGE_DUMP_DIR";
+const ENV_BGRA_BRIDGE_DUMP_LABEL: &str = "TETHER_BGRA_BRIDGE_DUMP_LABEL";
+const BGRA_TO_420_METAL: &str = include_str!("bgra_to_420.metal");
 
 /// Construct a wgpu Metal device + queue suitable for driving the
 /// [`Nv12IOSurfaceBridge`]. Opts into
@@ -63,9 +65,9 @@ use tether_scaler::{ColorSpace, Pipelines, Scaler, ScalerError};
 ///
 /// Fails with `anyhow::Error` if no adapter is present or the
 /// adapter doesn't advertise the mandatory format-features set. The
-/// 16-bit feature is best-effort — its absence is logged but doesn't
-/// fail construction; the bridge will then refuse 10-bit sessions
-/// via [`BridgeError::TenBitNotImplemented`] when those come up.
+/// 16-bit feature is best-effort — its absence doesn't fail
+/// construction; the bridge will then refuse 10-bit sessions via
+/// [`BridgeError::TenBitStorageUnsupported`] when those come up.
 pub async fn build_bridge_device(
 ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, BridgeDeviceCapabilities)> {
     let instance = wgpu::Instance::default();
@@ -160,19 +162,16 @@ pub enum BridgeError {
     #[error("destination fourcc 0x{fourcc:08x} is not recognised as any NV12-family fourcc")]
     UnknownFourcc { fourcc: u32 },
 
-    /// 10-bit NV12 (`'x420'`/`'xf20'`) hosting was requested, but the
-    /// bridge's scaler currently only ships R8Unorm / Rg8Unorm plane
-    /// pipelines — R16Unorm / Rg16Unorm variants are a deferred
-    /// follow-up. The macOS host should refuse 10-bit profiles at
-    /// negotiation when the scaler bridge would be in the loop;
-    /// reaching this error means the negotiator advertised 10-bit
-    /// encode on a session that also needs viewport scaling.
+    /// 10-bit NV12 (`'x420'`/`'xf20'`) hosting was requested on a
+    /// Metal/wgpu device that cannot create the required R16Unorm /
+    /// Rg16Unorm plane textures. The macOS host should refuse 10-bit
+    /// profiles at probe/negotiation when the bridge would be in the
+    /// loop on such a device.
     #[error(
-        "10-bit NV12 host scaling is not yet implemented (fourcc 0x{fourcc:08x}); \
-         scaler bridge ships R8/Rg8 plane pipelines only. Either disable viewport \
-         scaling for 10-bit sessions or land the R16/Rg16 follow-up."
+        "10-bit NV12 host scaling requires TEXTURE_FORMAT_16BIT_NORM \
+         for fourcc 0x{fourcc:08x}; this Metal/wgpu device did not advertise it"
     )]
-    TenBitNotImplemented { fourcc: u32 },
+    TenBitStorageUnsupported { fourcc: u32 },
 
     /// `IOSurfaceCreate` returned null. The properties dictionary is
     /// rejected: typically a zero dimension or an unsupported
@@ -187,8 +186,25 @@ pub enum BridgeError {
     #[error("scaler construction: {0}")]
     Scaler(#[from] ScalerError),
 
+    #[error("Metal BGRA bridge: {0}")]
+    Metal(String),
+
     #[error("IOSurface import: {0}")]
     Import(#[from] tether_codec::macos_interop::IOSurfaceImportError),
+
+    #[error("source IOSurface fourcc 0x{fourcc:08x} is not BGRA")]
+    SourceNotBgra { fourcc: u32 },
+
+    #[error("input texture format must be Bgra8Unorm or Rgba8Unorm, got {0:?}")]
+    InputFormat(wgpu::TextureFormat),
+
+    #[error("BGRA source dimensions {input_w}x{input_h} do not match bridge source dimensions {width}x{height}")]
+    InputDimMismatch {
+        width: u32,
+        height: u32,
+        input_w: u32,
+        input_h: u32,
+    },
 
     /// The pool is exhausted — every slot is currently held by an
     /// outstanding [`PooledIOSurface`]. The host should drop the
@@ -384,6 +400,8 @@ fn nv12_bytes_per_element(fourcc: u32) -> (i64, i64) {
 /// and dispatches the two scalers.
 struct PoolSlot {
     iosurface: IOSurfaceOwned,
+    y_mtl: Retained<ProtocolObject<dyn MTLTexture>>,
+    uv_mtl: Retained<ProtocolObject<dyn MTLTexture>>,
     y_tex: wgpu::Texture,
     uv_tex: wgpu::Texture,
     in_use: bool,
@@ -531,7 +549,7 @@ impl Nv12IOSurfaceBridge {
                 .features()
                 .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
             {
-                return Err(BridgeError::TenBitNotImplemented { fourcc: dst_fourcc });
+                return Err(BridgeError::TenBitStorageUnsupported { fourcc: dst_fourcc });
             }
             Arc::new(Pipelines::build_with_plane_storage_16bit(&device))
         } else {
@@ -617,42 +635,40 @@ impl Nv12IOSurfaceBridge {
                 Box::leak(format!("nv12-iosurface dst y (slot {slot_idx})").into_boxed_str());
             let uv_label =
                 Box::leak(format!("nv12-iosurface dst uv (slot {slot_idx})").into_boxed_str());
-            let y_tex = import_iosurface_plane(
-                &device,
-                surface_ref,
-                ImportPlaneOptions {
-                    label: y_label,
-                    plane_index: 0,
-                    width: dst_dims.0,
-                    height: dst_dims.1,
-                    metal_format: luma_format.metal,
-                    wgpu_format: luma_format.wgpu,
-                    mtl_usage: READ_WRITE_MTL_USAGE,
-                    mtl_storage: MTLStorageMode::Shared,
-                    wgpu_usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::COPY_SRC,
-                },
-            )?;
-            let uv_tex = import_iosurface_plane(
-                &device,
-                surface_ref,
-                ImportPlaneOptions {
-                    label: uv_label,
-                    plane_index: 1,
-                    width: dst_dims.0 / 2,
-                    height: dst_dims.1 / 2,
-                    metal_format: chroma_format.metal,
-                    wgpu_format: chroma_format.wgpu,
-                    mtl_usage: READ_WRITE_MTL_USAGE,
-                    mtl_storage: MTLStorageMode::Shared,
-                    wgpu_usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::COPY_SRC,
-                },
-            )?;
+            let y_opts = ImportPlaneOptions {
+                label: y_label,
+                plane_index: 0,
+                width: dst_dims.0,
+                height: dst_dims.1,
+                metal_format: luma_format.metal,
+                wgpu_format: luma_format.wgpu,
+                mtl_usage: READ_WRITE_MTL_USAGE,
+                mtl_storage: MTLStorageMode::Shared,
+                wgpu_usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+            };
+            let y_mtl = create_iosurface_mtl_texture(&device, surface_ref, y_opts)?;
+            let y_tex = wrap_mtl_texture_as_wgpu(&device, y_mtl.clone(), y_opts)?;
+            let uv_opts = ImportPlaneOptions {
+                label: uv_label,
+                plane_index: 1,
+                width: dst_dims.0 / 2,
+                height: dst_dims.1 / 2,
+                metal_format: chroma_format.metal,
+                wgpu_format: chroma_format.wgpu,
+                mtl_usage: READ_WRITE_MTL_USAGE,
+                mtl_storage: MTLStorageMode::Shared,
+                wgpu_usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+            };
+            let uv_mtl = create_iosurface_mtl_texture(&device, surface_ref, uv_opts)?;
+            let uv_tex = wrap_mtl_texture_as_wgpu(&device, uv_mtl.clone(), uv_opts)?;
             slots.push(PoolSlot {
                 iosurface,
+                y_mtl,
+                uv_mtl,
                 y_tex,
                 uv_tex,
                 in_use: false,
@@ -820,6 +836,419 @@ impl Nv12IOSurfaceBridge {
     }
 }
 
+struct MetalBgraPipeline {
+    mtl_device: Retained<ProtocolObject<dyn MTLDevice>>,
+    command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    lanczos: Retained<MPSImageLanczosScale>,
+    convert_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+}
+
+impl MetalBgraPipeline {
+    fn new(device: &wgpu::Device, dst_fourcc: u32) -> Result<Self, BridgeError> {
+        let mtl_device = metal_device_from_wgpu(device)?;
+        let command_queue = mtl_device
+            .newCommandQueue()
+            .ok_or_else(|| BridgeError::Metal("MTLDevice::newCommandQueue returned nil".into()))?;
+        command_queue.setLabel(Some(&NSString::from_str(
+            "tether bgra-iosurface metal bridge",
+        )));
+        let lanczos = unsafe {
+            MPSImageLanczosScale::initWithDevice(MPSImageLanczosScale::alloc(), &mtl_device)
+        };
+        let convert_pipeline = build_bgra_to_420_pipeline(&mtl_device, dst_fourcc)?;
+        Ok(Self {
+            mtl_device,
+            command_queue,
+            lanczos,
+            convert_pipeline,
+        })
+    }
+}
+
+/// BGRA IOSurface -> optional BGRA scale -> VideoToolbox-ready
+/// NV12-family IOSurface.
+///
+/// This is the macOS analogue of the Linux host path: keep desktop
+/// capture in BGRA through MPS Lanczos resize, then chroma-subsample
+/// with a native Metal compute shader only at the encoder input
+/// boundary.
+pub struct BgraIOSurfaceBridge {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    src_dims: (u32, u32),
+    dst_dims: (u32, u32),
+    dst_fourcc: u32,
+    metal: MetalBgraPipeline,
+    pool: Arc<IOSurfacePool>,
+    dump: Option<Arc<BridgeFrameDump>>,
+}
+
+impl BgraIOSurfaceBridge {
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        src_dims: (u32, u32),
+        dst_dims: (u32, u32),
+        dst_fourcc: u32,
+    ) -> Result<Self, BridgeError> {
+        Self::with_pool_depth(
+            device,
+            queue,
+            src_dims,
+            dst_dims,
+            dst_fourcc,
+            DEFAULT_POOL_DEPTH,
+        )
+    }
+
+    pub fn with_pool_depth(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        src_dims: (u32, u32),
+        dst_dims: (u32, u32),
+        dst_fourcc: u32,
+        pool_depth: usize,
+    ) -> Result<Self, BridgeError> {
+        assert!(pool_depth > 0, "pool_depth must be > 0");
+        if src_dims.0 == 0 || src_dims.1 == 0 || dst_dims.0 == 0 || dst_dims.1 == 0 {
+            return Err(BridgeError::ZeroDim {
+                src: src_dims,
+                dst: dst_dims,
+            });
+        }
+
+        let (chroma, bit_depth) = chroma_bit_depth_for_fourcc(dst_fourcc)
+            .ok_or(BridgeError::UnknownFourcc { fourcc: dst_fourcc })?;
+        if chroma != tether_protocol::control::ChromaSubsampling::Yuv420
+            || !accepts_iosurface_fourcc(chroma, bit_depth, dst_fourcc)
+            || !tether_codec::videotoolbox::encoder::iosurface_fourcc_matches(
+                chroma, bit_depth, dst_fourcc,
+            )
+        {
+            return Err(BridgeError::UnsupportedFourcc {
+                chroma,
+                bit_depth,
+                fourcc: dst_fourcc,
+            });
+        }
+        if bit_depth == 10
+            && !device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        {
+            return Err(BridgeError::TenBitStorageUnsupported { fourcc: dst_fourcc });
+        }
+
+        let metal = MetalBgraPipeline::new(&device, dst_fourcc)?;
+        tracing::info!(
+            "using native Metal BGRA bridge for macOS IOSurface encode (MPS Lanczos + Metal 4:2:0 conversion, {}x{} -> {}x{})",
+            src_dims.0,
+            src_dims.1,
+            dst_dims.0,
+            dst_dims.1
+        );
+
+        let (luma_format, chroma_format) = plane_wgpu_formats(dst_fourcc);
+        let mut slots = Vec::with_capacity(pool_depth);
+        for slot_idx in 0..pool_depth {
+            let iosurface = IOSurfaceOwned::create(dst_dims.0, dst_dims.1, dst_fourcc)?;
+            let frame_view = iosurface.as_frame(dst_fourcc, dst_dims.0, dst_dims.1);
+            let surface_ref = iosurface_as_ref(&frame_view)?;
+            let y_label =
+                Box::leak(format!("bgra-iosurface dst y (slot {slot_idx})").into_boxed_str());
+            let uv_label =
+                Box::leak(format!("bgra-iosurface dst uv (slot {slot_idx})").into_boxed_str());
+            let y_opts = ImportPlaneOptions {
+                label: y_label,
+                plane_index: 0,
+                width: dst_dims.0,
+                height: dst_dims.1,
+                metal_format: luma_format.metal,
+                wgpu_format: luma_format.wgpu,
+                mtl_usage: READ_WRITE_MTL_USAGE,
+                mtl_storage: MTLStorageMode::Shared,
+                wgpu_usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+            };
+            let y_mtl = create_iosurface_mtl_texture(&device, surface_ref, y_opts)?;
+            let y_tex = wrap_mtl_texture_as_wgpu(&device, y_mtl.clone(), y_opts)?;
+            let uv_opts = ImportPlaneOptions {
+                label: uv_label,
+                plane_index: 1,
+                width: dst_dims.0 / 2,
+                height: dst_dims.1 / 2,
+                metal_format: chroma_format.metal,
+                wgpu_format: chroma_format.wgpu,
+                mtl_usage: READ_WRITE_MTL_USAGE,
+                mtl_storage: MTLStorageMode::Shared,
+                wgpu_usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+            };
+            let uv_mtl = create_iosurface_mtl_texture(&device, surface_ref, uv_opts)?;
+            let uv_tex = wrap_mtl_texture_as_wgpu(&device, uv_mtl.clone(), uv_opts)?;
+            slots.push(PoolSlot {
+                iosurface,
+                y_mtl,
+                uv_mtl,
+                y_tex,
+                uv_tex,
+                in_use: false,
+                attachments_seeded: false,
+            });
+        }
+
+        Ok(Self {
+            device,
+            queue,
+            src_dims,
+            dst_dims,
+            dst_fourcc,
+            metal,
+            pool: Arc::new(IOSurfacePool {
+                inner: Mutex::new(PoolInner { slots }),
+            }),
+            dump: BridgeFrameDump::from_env(),
+        })
+    }
+
+    pub fn convert_to_iosurface(
+        &self,
+        src: &IOSurfaceFrame,
+    ) -> Result<PooledIOSurface, BridgeError> {
+        const BGRA_FOURCC: u32 = u32::from_be_bytes(*b"BGRA");
+        if src.pixel_format != BGRA_FOURCC {
+            return Err(BridgeError::SourceNotBgra {
+                fourcc: src.pixel_format,
+            });
+        }
+        if src.width != self.src_dims.0 || src.height != self.src_dims.1 {
+            return Err(BridgeError::InputDimMismatch {
+                width: self.src_dims.0,
+                height: self.src_dims.1,
+                input_w: src.width,
+                input_h: src.height,
+            });
+        }
+
+        let pool_depth = self.pool.inner.lock().unwrap().slots.len();
+        let slot_idx = self
+            .pool
+            .acquire()
+            .ok_or(BridgeError::PoolExhausted { depth: pool_depth })?;
+
+        struct SlotGuard<'a> {
+            pool: &'a IOSurfacePool,
+            slot_idx: usize,
+            released: bool,
+        }
+        impl<'a> Drop for SlotGuard<'a> {
+            fn drop(&mut self) {
+                if !self.released {
+                    self.pool.release(self.slot_idx);
+                }
+            }
+        }
+        let mut guard = SlotGuard {
+            pool: &self.pool,
+            slot_idx,
+            released: false,
+        };
+
+        let (frame, attachments_already_seeded, y_dst_mtl, uv_dst_mtl, y_dst_tex, uv_dst_tex) = {
+            let g = self.pool.inner.lock().unwrap();
+            let slot = &g.slots[slot_idx];
+            (
+                slot.iosurface
+                    .as_frame(self.dst_fourcc, self.dst_dims.0, self.dst_dims.1),
+                slot.attachments_seeded,
+                slot.y_mtl.clone(),
+                slot.uv_mtl.clone(),
+                slot.y_tex.clone(),
+                slot.uv_tex.clone(),
+            )
+        };
+        if !attachments_already_seeded {
+            let mut g = self.pool.inner.lock().unwrap();
+            let slot = &mut g.slots[slot_idx];
+            slot.iosurface.copy_colorimetry_attachments(src.surface);
+            slot.attachments_seeded = true;
+        }
+
+        let src_ref = iosurface_as_ref(src)?;
+        let src_bgra = create_iosurface_mtl_texture(
+            &self.device,
+            src_ref,
+            ImportPlaneOptions {
+                label: "bgra-iosurface metal src",
+                plane_index: 0,
+                width: self.src_dims.0,
+                height: self.src_dims.1,
+                metal_format: MTLPixelFormat::BGRA8Unorm,
+                wgpu_format: wgpu::TextureFormat::Bgra8Unorm,
+                mtl_usage: READ_ONLY_MTL_USAGE,
+                mtl_storage: MTLStorageMode::Shared,
+                wgpu_usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            },
+        )?;
+        self.convert_with_metal(&src_bgra, &y_dst_mtl, &uv_dst_mtl)?;
+
+        if let Some(dump) = &self.dump {
+            dump.maybe_dump(
+                &self.device,
+                &self.queue,
+                &y_dst_tex,
+                &uv_dst_tex,
+                self.dst_dims,
+                self.dst_fourcc,
+            );
+        }
+
+        guard.released = true;
+        Ok(PooledIOSurface {
+            pool: self.pool.clone(),
+            slot_idx,
+            frame,
+        })
+    }
+
+    pub fn src_dims(&self) -> (u32, u32) {
+        self.src_dims
+    }
+
+    pub fn dst_dims(&self) -> (u32, u32) {
+        self.dst_dims
+    }
+
+    fn convert_with_metal(
+        &self,
+        src_bgra: &ProtocolObject<dyn MTLTexture>,
+        y_dst: &ProtocolObject<dyn MTLTexture>,
+        uv_dst: &ProtocolObject<dyn MTLTexture>,
+    ) -> Result<(), BridgeError> {
+        let command_buffer = self.metal.command_queue.commandBuffer().ok_or_else(|| {
+            BridgeError::Metal("MTLCommandQueue::commandBuffer returned nil".into())
+        })?;
+
+        let convert_src;
+        let convert_src_ref: &ProtocolObject<dyn MTLTexture> = if self.src_dims == self.dst_dims {
+            src_bgra
+        } else {
+            convert_src = create_mps_destination_texture(
+                &self.metal.mtl_device,
+                self.dst_dims,
+                MTLPixelFormat::BGRA8Unorm,
+            )?;
+            // SAFETY: the MPS kernel, command buffer, and textures are
+            // all created from the same Metal device. The following
+            // compute encoder is appended to this same command buffer,
+            // so Metal orders the conversion after the resize.
+            unsafe {
+                self.metal
+                    .lanczos
+                    .encodeToCommandBuffer_sourceTexture_destinationTexture(
+                        &command_buffer,
+                        src_bgra,
+                        &convert_src,
+                    );
+            }
+            &convert_src
+        };
+
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or_else(|| BridgeError::Metal("computeCommandEncoder returned nil".into()))?;
+        encoder.setComputePipelineState(&self.metal.convert_pipeline);
+        unsafe {
+            encoder.setTexture_atIndex(Some(convert_src_ref), 0);
+            encoder.setTexture_atIndex(Some(y_dst), 1);
+            encoder.setTexture_atIndex(Some(uv_dst), 2);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (self.dst_dims.0 / 2).div_ceil(8) as usize,
+                height: (self.dst_dims.1 / 2).div_ceil(8) as usize,
+                depth: 1,
+            },
+            MTLSize {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+        );
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+        Ok(())
+    }
+}
+
+fn create_mps_destination_texture(
+    mtl_device: &ProtocolObject<dyn MTLDevice>,
+    dims: (u32, u32),
+    pixel_format: MTLPixelFormat,
+) -> Result<objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLTexture>>, BridgeError> {
+    let descriptor = MTLTextureDescriptor::new();
+    descriptor.setTextureType(MTLTextureType::Type2D);
+    descriptor.setPixelFormat(pixel_format);
+    unsafe {
+        descriptor.setWidth(dims.0 as usize);
+        descriptor.setHeight(dims.1 as usize);
+        descriptor.setMipmapLevelCount(1);
+        descriptor.setSampleCount(1);
+        descriptor.setArrayLength(1);
+    }
+    descriptor.setUsage(MTLTextureUsage(
+        MTLTextureUsage::ShaderRead.0 | MTLTextureUsage::ShaderWrite.0,
+    ));
+    descriptor.setStorageMode(MTLStorageMode::Private);
+    mtl_device
+        .newTextureWithDescriptor(&descriptor)
+        .ok_or_else(|| {
+            BridgeError::Metal(format!(
+                "MTLDevice::newTextureWithDescriptor returned nil for {}x{} BGRA",
+                dims.0, dims.1
+            ))
+        })
+}
+
+fn build_bgra_to_420_pipeline(
+    mtl_device: &ProtocolObject<dyn MTLDevice>,
+    dst_fourcc: u32,
+) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BridgeError> {
+    let library = mtl_device
+        .newLibraryWithSource_options_error(&NSString::from_str(BGRA_TO_420_METAL), None)
+        .map_err(|e| BridgeError::Metal(format!("compile bgra_to_420.metal: {}", ns_error(&e))))?;
+    let function_name = NSString::from_str(bgra_to_420_function(dst_fourcc)?);
+    let function = library
+        .newFunctionWithName(&function_name)
+        .ok_or_else(|| BridgeError::Metal(format!("missing Metal function {function_name}")))?;
+    mtl_device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|e| {
+            BridgeError::Metal(format!(
+                "create compute pipeline {function_name}: {}",
+                ns_error(&e)
+            ))
+        })
+}
+
+fn bgra_to_420_function(dst_fourcc: u32) -> Result<&'static str, BridgeError> {
+    use tether_codec::macos_interop::{
+        NV12_FULL_RANGE_FOURCC, NV12_VIDEO_RANGE_FOURCC, P010_FOURCC, X420_FOURCC, XF20_FOURCC,
+    };
+    match dst_fourcc {
+        NV12_VIDEO_RANGE_FOURCC | NV12_FULL_RANGE_FOURCC => Ok("bgra_to_420v"),
+        X420_FOURCC | XF20_FOURCC | P010_FOURCC => Ok("bgra_to_x420"),
+        _ => Err(BridgeError::UnknownFourcc { fourcc: dst_fourcc }),
+    }
+}
+
+fn ns_error(error: &objc2_foundation::NSError) -> String {
+    error.localizedDescription().to_string()
+}
+
 /// Per-plane Metal + wgpu format pair. Picked from the destination
 /// fourcc at bridge construction; kept identical for source and
 /// destination since the source IOSurface arrives in the same
@@ -884,6 +1313,334 @@ fn chroma_bit_depth_for_fourcc(
         X444_FOURCC | XF44_FOURCC | P410_FOURCC => Some((ChromaSubsampling::Yuv444, 10)),
         _ => None,
     }
+}
+
+struct BridgeFrameDump {
+    dir: PathBuf,
+    label: Option<String>,
+    saved: AtomicBool,
+}
+
+impl BridgeFrameDump {
+    fn from_env() -> Option<Arc<Self>> {
+        let dir = std::env::var_os(ENV_BGRA_BRIDGE_DUMP_DIR).map(PathBuf::from)?;
+        let label = std::env::var(ENV_BGRA_BRIDGE_DUMP_LABEL)
+            .ok()
+            .map(|s| sanitize_filename_part(&s))
+            .filter(|s| !s.is_empty());
+        Some(Arc::new(Self {
+            dir,
+            label,
+            saved: AtomicBool::new(false),
+        }))
+    }
+
+    fn maybe_dump(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        y_tex: &wgpu::Texture,
+        uv_tex: &wgpu::Texture,
+        dims: (u32, u32),
+        fourcc: u32,
+    ) {
+        if self.saved.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        match self.dump(device, queue, y_tex, uv_tex, dims, fourcc) {
+            Ok(path) => tracing::info!(path = %path.display(), "BGRA bridge output frame dumped"),
+            Err(e) => tracing::warn!(error = %e, "BGRA bridge output frame dump failed"),
+        }
+    }
+
+    fn dump(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        y_tex: &wgpu::Texture,
+        uv_tex: &wgpu::Texture,
+        dims: (u32, u32),
+        fourcc: u32,
+    ) -> std::result::Result<PathBuf, String> {
+        let (width, height) = dims;
+        let (_, bit_depth) =
+            chroma_bit_depth_for_fourcc(fourcc).ok_or("unsupported bridge dump fourcc")?;
+        let y_bpe = if bit_depth == 10 { 2 } else { 1 };
+        let uv_bpe = if bit_depth == 10 { 4 } else { 2 };
+        let chroma_w = width / 2;
+        let chroma_h = height / 2;
+        let y_tight_row = width
+            .checked_mul(y_bpe)
+            .ok_or("Y row byte count overflow")?;
+        let uv_tight_row = chroma_w
+            .checked_mul(uv_bpe)
+            .ok_or("UV row byte count overflow")?;
+        let y_padded_row = padded_copy_row(y_tight_row);
+        let uv_padded_row = padded_copy_row(uv_tight_row);
+
+        let y_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bgra bridge dump y readback"),
+            size: u64::from(y_padded_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let uv_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bgra bridge dump uv readback"),
+            size: u64::from(uv_padded_row) * u64::from(chroma_h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bgra bridge dump readback enc"),
+        });
+        copy_texture_to_buffer(
+            &mut encoder,
+            y_tex,
+            &y_readback,
+            width,
+            height,
+            y_padded_row,
+        );
+        copy_texture_to_buffer(
+            &mut encoder,
+            uv_tex,
+            &uv_readback,
+            chroma_w,
+            chroma_h,
+            uv_padded_row,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let y = read_tight_rows(device, &y_readback, y_tight_row, height, y_padded_row)?;
+        let uv = read_tight_rows(device, &uv_readback, uv_tight_row, chroma_h, uv_padded_row)?;
+        let rgba = yuv420_to_rgba(width, height, fourcc, &y, &uv)?;
+
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("create {}: {e}", self.dir.display()))?;
+        let label = self.label.as_deref().unwrap_or("frame");
+        let filename = format!(
+            "bgra-bridge-{}-{}x{}-{}-pid{}.png",
+            label,
+            width,
+            height,
+            fourcc_label(fourcc),
+            std::process::id()
+        );
+        let path = self.dir.join(filename);
+        write_rgba_png(&path, width, height, &rgba)?;
+        Ok(path)
+    }
+}
+
+fn copy_texture_to_buffer(
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    buffer: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_row: u32,
+) {
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+fn padded_copy_row(tight_row: u32) -> u32 {
+    const ALIGN: u32 = 256;
+    tight_row.div_ceil(ALIGN) * ALIGN
+}
+
+fn read_tight_rows(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    tight_row: u32,
+    rows: u32,
+    padded_row: u32,
+) -> std::result::Result<Vec<u8>, String> {
+    let slice = buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+
+    struct Unmapper<'a>(&'a wgpu::Buffer);
+    impl<'a> Drop for Unmapper<'a> {
+        fn drop(&mut self) {
+            self.0.unmap();
+        }
+    }
+    let _guard = Unmapper(buffer);
+
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| format!("poll: {e:?}"))?;
+    rx.recv()
+        .map_err(|_| "map_async callback never fired".to_string())?
+        .map_err(|e| format!("map: {e:?}"))?;
+
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|e| format!("get_mapped_range: {e:?}"))?;
+    let tight = usize::try_from(tight_row).map_err(|_| "tight row overflow")?;
+    let padded = usize::try_from(padded_row).map_err(|_| "padded row overflow")?;
+    let row_count = usize::try_from(rows).map_err(|_| "row count overflow")?;
+    let mut out = Vec::with_capacity(tight * row_count);
+    for row in 0..row_count {
+        let start = row * padded;
+        out.extend_from_slice(&mapped[start..start + tight]);
+    }
+    drop(mapped);
+    Ok(out)
+}
+
+fn yuv420_to_rgba(
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    y: &[u8],
+    uv: &[u8],
+) -> std::result::Result<Vec<u8>, String> {
+    let (_, bit_depth) =
+        chroma_bit_depth_for_fourcc(fourcc).ok_or("unsupported bridge dump fourcc")?;
+    let full_range = matches!(
+        fourcc,
+        tether_codec::macos_interop::NV12_FULL_RANGE_FOURCC
+            | tether_codec::macos_interop::XF20_FOURCC
+    );
+    let mut rgba = vec![0u8; usize::try_from(width * height * 4).map_err(|_| "RGBA overflow")?];
+    let width_us = usize::try_from(width).map_err(|_| "width overflow")?;
+    let height_us = usize::try_from(height).map_err(|_| "height overflow")?;
+    let chroma_w = usize::try_from(width / 2).map_err(|_| "chroma width overflow")?;
+    for py in 0..height_us {
+        for px in 0..width_us {
+            let (yy, cb, cr) = if bit_depth == 10 {
+                let y_idx = (py * width_us + px) * 2;
+                let uv_idx = ((py / 2) * chroma_w + (px / 2)) * 4;
+                (
+                    u32::from(read_le_u16(y, y_idx)? >> 6),
+                    u32::from(read_le_u16(uv, uv_idx)? >> 6),
+                    u32::from(read_le_u16(uv, uv_idx + 2)? >> 6),
+                )
+            } else {
+                let y_idx = py * width_us + px;
+                let uv_idx = ((py / 2) * chroma_w + (px / 2)) * 2;
+                (
+                    u32::from(*y.get(y_idx).ok_or("Y byte out of range")?),
+                    u32::from(*uv.get(uv_idx).ok_or("Cb byte out of range")?),
+                    u32::from(*uv.get(uv_idx + 1).ok_or("Cr byte out of range")?),
+                )
+            };
+            let [r, g, b] = yuv_bt709_to_rgb8(yy, cb, cr, bit_depth, full_range);
+            let dst = (py * width_us + px) * 4;
+            rgba[dst] = r;
+            rgba[dst + 1] = g;
+            rgba[dst + 2] = b;
+            rgba[dst + 3] = 255;
+        }
+    }
+    Ok(rgba)
+}
+
+fn read_le_u16(bytes: &[u8], offset: usize) -> std::result::Result<u16, String> {
+    let bytes = bytes
+        .get(offset..offset + 2)
+        .ok_or("16-bit sample out of range")?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn yuv_bt709_to_rgb8(y: u32, cb: u32, cr: u32, bit_depth: u8, full_range: bool) -> [u8; 3] {
+    let (y_norm, u_norm, v_norm) = if full_range {
+        let max = if bit_depth == 10 { 1023.0 } else { 255.0 };
+        let center = if bit_depth == 10 { 512.0 } else { 128.0 };
+        (
+            y as f32 / max,
+            (cb as f32 - center) / (max + 1.0),
+            (cr as f32 - center) / (max + 1.0),
+        )
+    } else if bit_depth == 10 {
+        (
+            (y as f32 - 64.0) / 876.0,
+            (cb as f32 - 512.0) / 896.0,
+            (cr as f32 - 512.0) / 896.0,
+        )
+    } else {
+        (
+            (y as f32 - 16.0) / 219.0,
+            (cb as f32 - 128.0) / 224.0,
+            (cr as f32 - 128.0) / 224.0,
+        )
+    };
+
+    let r = y_norm + 1.5748 * v_norm;
+    let g = y_norm - 0.1873 * u_norm - 0.4681 * v_norm;
+    let b = y_norm + 1.8556 * u_norm;
+    [float_to_u8(r), float_to_u8(g), float_to_u8(b)]
+}
+
+// Clamp and round before narrowing; this is the final PNG byte quantization.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn float_to_u8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn write_rgba_png(
+    path: &Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> std::result::Result<(), String> {
+    let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png = encoder
+        .write_header()
+        .map_err(|e| format!("png header {}: {e}", path.display()))?;
+    png.write_image_data(rgba)
+        .map_err(|e| format!("png write {}: {e}", path.display()))
+}
+
+fn fourcc_label(fourcc: u32) -> String {
+    let bytes = fourcc.to_be_bytes();
+    if bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        format!("0x{fourcc:08x}")
+    }
+}
+
+fn sanitize_filename_part(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                Some(c)
+            } else if c.is_ascii_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// RAII guard for one pool slot. The wrapped [`IOSurfaceFrame`] is
@@ -1114,14 +1871,10 @@ mod tests {
         );
     }
 
-    /// The 10-bit fourccs (`'x420'`, `'xf20'`) are valid in every
-    /// other layer's tables but the bridge's scaler currently only
-    /// has R8 / Rg8 plane pipelines. Verify the construction-time
-    /// guard rejects them with the dedicated
-    /// [`BridgeError::TenBitNotImplemented`] sentinel — without it
-    /// every 10-bit session that needs viewport scaling would build
-    /// the bridge successfully and then fail validation on the first
-    /// scale_to_iosurface call.
+    /// The 10-bit fourccs (`'x420'`, `'xf20'`) are valid in the
+    /// bridge's family table. Verify they report bit depth 10 so
+    /// construction can require `TEXTURE_FORMAT_16BIT_NORM` before
+    /// building R16/Rg16 plane textures.
     ///
     /// No wgpu device required: the guard fires before
     /// `Pipelines::build_with_plane_storage`. We can't actually

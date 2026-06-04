@@ -28,12 +28,14 @@ use tether_capture::macos::{
     probe_capture_pixel_formats, sck_pixel_format_for_profile, SckCaptureCapability,
 };
 use tether_codec::bitstream_sps::parse_sps_chroma_bit_depth;
-use tether_codec::macos_interop::{accepts_iosurface_fourcc, iosurface_fourcc_expected_label};
+use tether_codec::macos_interop::{
+    accepts_iosurface_fourcc, iosurface_fourcc_expected_label, NV12_VIDEO_RANGE_FOURCC, X420_FOURCC,
+};
 use tether_codec::videotoolbox::{
     expected_iosurface_fourccs, VideoToolboxDecoder, VideoToolboxEncoder,
 };
 use tether_codec::{Decoder, Encoder, Frame, GpuFrameSource};
-use tether_protocol::control::VideoProfile;
+use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
 use crate::profile_probe::{ProbeError, ProfileProbe, Result};
 use crate::PipelineStage;
@@ -80,21 +82,7 @@ fn sck_capability() -> &'static SckCaptureCapability {
 
 impl ProfileProbe for VideoToolboxProbe {
     fn probe_encode(profile: VideoProfile) -> Result<()> {
-        // Capture-stage gate: if SCK can't deliver the matching pixel
-        // format on this Mac, the host couldn't deliver real frames to
-        // the encoder regardless of whether VT itself accepts the
-        // profile. Folds in the SCK_CAPS_CACHE check that used to live
-        // in tether-host as a separate filter layer.
-        if !sck_pixel_format_for_profile(profile).is_deliverable(sck_capability()) {
-            return Err(ProbeError::new(
-                PipelineStage::Capture,
-                format!(
-                    "ScreenCaptureKit cannot deliver the pixel format for \
-                     {:?} {:?} {}-bit on this Mac",
-                    profile.codec, profile.chroma, profile.bit_depth
-                ),
-            ));
-        }
+        gate_capture_and_bridge(profile)?;
 
         let mut enc =
             VideoToolboxEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)
@@ -262,6 +250,70 @@ impl ProfileProbe for VideoToolboxProbe {
             )),
         }
     }
+}
+
+fn gate_capture_and_bridge(profile: VideoProfile) -> Result<()> {
+    let caps = sck_capability();
+    if profile.chroma == ChromaSubsampling::Yuv420 {
+        if !caps.bgra {
+            return Err(ProbeError::new(
+                PipelineStage::Capture,
+                format!(
+                    "ScreenCaptureKit cannot deliver BGRA for the macOS \
+                     host-side scaler path ({:?} {:?} {}-bit)",
+                    profile.codec, profile.chroma, profile.bit_depth
+                ),
+            ));
+        }
+        let dst_fourcc = match profile.bit_depth {
+            8 => NV12_VIDEO_RANGE_FOURCC,
+            10 => X420_FOURCC,
+            _ => {
+                return Err(ProbeError::new(
+                    PipelineStage::Capture,
+                    format!(
+                        "no BGRA IOSurface bridge output fourcc for {:?} {}-bit",
+                        profile.chroma, profile.bit_depth
+                    ),
+                ));
+            }
+        };
+        let (device, queue, _caps) = pollster::block_on(
+            tether_gpuconvert::nv12_iosurface::build_bridge_device(),
+        )
+        .map_err(|e| {
+            ProbeError::new(
+                PipelineStage::Capture,
+                format!("macOS BGRA IOSurface bridge device init failed: {e}"),
+            )
+        })?;
+        tether_gpuconvert::nv12_iosurface::BgraIOSurfaceBridge::new(
+            device,
+            queue,
+            (PROBE_DIM * 2, PROBE_DIM * 2),
+            (PROBE_DIM, PROBE_DIM),
+            dst_fourcc,
+        )
+        .map_err(|e| {
+            ProbeError::new(
+                PipelineStage::Capture,
+                format!("macOS BGRA IOSurface bridge construction failed: {e}"),
+            )
+        })?;
+        return Ok(());
+    }
+
+    if !sck_pixel_format_for_profile(profile).is_deliverable(caps) {
+        return Err(ProbeError::new(
+            PipelineStage::Capture,
+            format!(
+                "ScreenCaptureKit cannot deliver the pixel format for \
+                 {:?} {:?} {}-bit on this Mac",
+                profile.codec, profile.chroma, profile.bit_depth
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Produce a `PROBE_DIM × PROBE_DIM` BGRA buffer with high-frequency

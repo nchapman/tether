@@ -1466,7 +1466,7 @@ fn iosurface_host_scaler_sustained_rate() {
 /// Verify the bridge constructs successfully for 10-bit fourccs
 /// on a device that has both `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`
 /// and `TEXTURE_FORMAT_16BIT_NORM`, and falls back to
-/// `TenBitNotImplemented` on a device that has only the 8-bit
+/// `TenBitStorageUnsupported` on a device that has only the 8-bit
 /// feature opt-in. The R16/Rg16 plane pipelines (added in the
 /// follow-up that retired the original guard) only build on a
 /// 16BIT_NORM-equipped device.
@@ -1491,7 +1491,7 @@ fn iosurface_host_scaler_10bit_construction() {
     // x420 (limited-range 10-bit 4:2:0) is the fourcc the host actually
     // targets. Construction depends only on the 16BIT_NORM opt-in: it
     // builds the R16/Rg16 plane pipelines on a capable device and refuses
-    // with `TenBitNotImplemented` otherwise.
+    // with `TenBitStorageUnsupported` otherwise.
     let fcc = X420_FOURCC;
     let result = Nv12IOSurfaceBridge::new(
         device.clone(),
@@ -1508,10 +1508,10 @@ fn iosurface_host_scaler_10bit_construction() {
             );
             drop(bridge);
         }
-        (false, Err(BridgeError::TenBitNotImplemented { fourcc })) => {
+        (false, Err(BridgeError::TenBitStorageUnsupported { fourcc })) => {
             assert_eq!(
                 fourcc, fcc,
-                "TenBitNotImplemented error must carry the rejected fourcc"
+                "TenBitStorageUnsupported error must carry the rejected fourcc"
             );
             eprintln!(
                 "10-bit fourcc 0x{fcc:08x}: bridge correctly refused — adapter lacks 16BIT_NORM"
@@ -1526,12 +1526,12 @@ fn iosurface_host_scaler_10bit_construction() {
         (false, Ok(_)) => {
             panic!(
                 "10-bit fourcc 0x{fcc:08x}: device lacks 16BIT_NORM but bridge built \
-                 successfully — should have refused with TenBitNotImplemented"
+                 successfully — should have refused with TenBitStorageUnsupported"
             );
         }
         (false, Err(other)) => {
             panic!(
-                "10-bit fourcc 0x{fcc:08x}: expected TenBitNotImplemented on \
+                "10-bit fourcc 0x{fcc:08x}: expected TenBitStorageUnsupported on \
                  a non-16BIT_NORM device; got {other}"
             );
         }
@@ -1542,7 +1542,7 @@ fn iosurface_host_scaler_10bit_construction() {
     // host never targets a full-range output (see the table-consistency
     // test `nv12_fourccs_round_trip_across_tables`). The fourcc gate fires
     // before the 10-bit feature check, so this is `UnsupportedFourcc`, not
-    // `TenBitNotImplemented`.
+    // `TenBitStorageUnsupported`.
     let fcc = XF20_FOURCC;
     match Nv12IOSurfaceBridge::new(
         device.clone(),

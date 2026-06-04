@@ -30,6 +30,10 @@ use tether_codec::Encoder;
 use tether_codec::GpuEncoderFrame;
 #[cfg(target_os = "linux")]
 use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
+#[cfg(target_os = "macos")]
+use tether_gpuconvert::nv12_iosurface::{
+    BgraIOSurfaceBridge, BridgeError as IOSurfaceBridgeError, PooledIOSurface,
+};
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{
     Bgra2P010DmaBuf, Bgra2Xv30DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame,
@@ -97,12 +101,12 @@ const ENCODER_FPS: u32 = 60;
 
 /// VBR target bitrate. The encoder is allowed to overshoot for
 /// motion-heavy frames and undershoot on static content. Calibrated
-/// for 1080p60 H.264 ≈ 8 Mbps and roughly scales linearly with
+/// for 1080p60 H.264 ≈ 10 Mbps and roughly scales linearly with
 /// resolution × fps. HEVC sessions get a 0.7× multiplier inside the
 /// derivation step (~30% more efficient at the same visual quality;
 /// conservative estimate, refined when we benchmark). For now the
 /// constant is the H.264 1080p60 floor; multi-resolution scaling is W8.
-const ENCODER_BITRATE_KBPS: u32 = 8_000;
+const ENCODER_BITRATE_KBPS: u32 = 10_000;
 
 const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
@@ -596,6 +600,9 @@ async fn handle_client(
         stream_ready,
     } = session;
     let initial_viewport = client_hello.viewport.filter(|v| v.is_valid());
+    #[cfg(target_os = "macos")]
+    let macos_bgra_bridge_enabled =
+        !use_test_pattern && chosen_profile.chroma == ChromaSubsampling::Yuv420;
 
     // `use_test_pattern` from here on only switches the capture source;
     // the handshake-time profile floor it implied is already baked into
@@ -709,7 +716,7 @@ async fn handle_client(
     // from ClientHello; mutated by SetClientViewport.
     let latest_viewport: LatestViewport = Arc::new(StdMutex::new(ViewportState {
         #[cfg(target_os = "macos")]
-        viewport: if use_test_pattern {
+        viewport: if use_test_pattern || macos_bgra_bridge_enabled {
             initial_viewport
         } else {
             None
@@ -954,7 +961,7 @@ async fn handle_client(
                             "client viewport changed"
                         );
                         #[cfg(target_os = "macos")]
-                        if !use_test_pattern {
+                        if !use_test_pattern && !macos_bgra_bridge_enabled {
                             if let Some(handle) = &capture_viewport_for_ctl {
                                 let next = if v.is_valid() { Some(v) } else { None };
                                 handle.set_viewport(next);
@@ -1264,6 +1271,22 @@ struct EncoderSlot {
     /// through `ScalerPipelines::build` again.
     #[cfg(target_os = "linux")]
     scaler_pipelines: Option<Arc<ScalerPipelines>>,
+    /// macOS BGRA IOSurface -> optional Mitchell scale -> NV12/P010
+    /// IOSurface bridge. Unlike the older YUV-plane bridge, this keeps
+    /// SCK capture in BGRA until the final VideoToolbox input
+    /// conversion, matching the Linux/Windows visual-quality shape.
+    #[cfg(target_os = "macos")]
+    bgra_iosurface_bridge: Option<BgraIOSurfaceBridge>,
+    /// VideoToolbox-compatible destination IOSurface fourcc for the
+    /// negotiated 4:2:0 profile (`420v` or `x420`).
+    #[cfg(target_os = "macos")]
+    iosurface_encode_fourcc: u32,
+    /// The PooledIOSurface used by the previous macOS frame. Held
+    /// across one frame so VideoToolbox's async encode can drain the
+    /// CVPixelBuffer that wraps the IOSurface before the bridge recycles
+    /// the slot.
+    #[cfg(target_os = "macos")]
+    prev_pooled: Option<PooledIOSurface>,
 }
 
 /// Per-encoder adaptive bitrate state.
@@ -1312,7 +1335,7 @@ enum GpuConvertBridge {
 enum GpuEncodeOutcome {
     Packets(Vec<tether_codec::EncodedPacket>),
     DropFrame(anyhow::Error),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Fatal(anyhow::Error),
 }
 
@@ -1689,6 +1712,7 @@ fn encode_gpu_frame(
 #[cfg(target_os = "macos")]
 fn encode_iosurface_frame(
     slot: &mut EncoderSlot,
+    macos_gpu: &mut Option<MacosGpuState>,
     gpu: tether_capture::GpuCapturedFrame,
     pts: i64,
     force_keyframe: bool,
@@ -1700,12 +1724,138 @@ fn encode_iosurface_frame(
         width: iosurface.width,
         height: iosurface.height,
     };
+    if is_macos_bgra_fourcc(src_frame.pixel_format) {
+        if slot.iosurface_encode_fourcc == 0 {
+            return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                "BGRA IOSurface capture requires a 4:2:0 VideoToolbox destination fourcc"
+            ));
+        }
+        if macos_gpu.is_none() {
+            match MacosGpuState::new() {
+                Ok(state) => *macos_gpu = Some(state),
+                Err(e) => {
+                    return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                        "macOS BGRA IOSurface bridge device init failed: {e}"
+                    ));
+                }
+            }
+        }
+        let macos_gpu = macos_gpu.as_ref().expect("just initialised");
+        let rebuild_bridge = slot.bgra_iosurface_bridge.as_ref().is_none_or(|bridge| {
+            bridge.src_dims() != (slot.capture_width, slot.capture_height)
+                || bridge.dst_dims() != (slot.width, slot.height)
+        });
+        if rebuild_bridge {
+            let bridge = match macos_gpu.build_bgra_bridge(
+                (slot.capture_width, slot.capture_height),
+                (slot.width, slot.height),
+                slot.iosurface_encode_fourcc,
+            ) {
+                Ok(bridge) => bridge,
+                Err(e) => {
+                    return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                        "BGRA IOSurface bridge construction failed for {}x{} -> {}x{}: {e}",
+                        slot.capture_width,
+                        slot.capture_height,
+                        slot.width,
+                        slot.height,
+                    ));
+                }
+            };
+            info!(
+                capture_w = slot.capture_width,
+                capture_h = slot.capture_height,
+                encode_w = slot.width,
+                encode_h = slot.height,
+                dst_fourcc = format_args!("0x{:08x}", slot.iosurface_encode_fourcc),
+                "BGRA IOSurface bridge built for macOS host encode"
+            );
+            slot.bgra_iosurface_bridge = Some(bridge);
+        }
+
+        let bridge = slot.bgra_iosurface_bridge.as_ref().expect("just built");
+        let pooled = match bridge.convert_to_iosurface(&src_frame) {
+            Ok(pooled) => pooled,
+            Err(IOSurfaceBridgeError::PoolExhausted { depth }) => {
+                return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                    "BGRA IOSurface pool exhausted (depth {depth})"
+                ));
+            }
+            Err(e) => {
+                return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                    "BGRA IOSurface convert failed structurally: {e}"
+                ));
+            }
+        };
+        let packets = match slot.encoder.encode_gpu(
+            GpuEncoderFrame::IOSurface(&pooled.frame),
+            pts,
+            force_keyframe,
+        ) {
+            Ok(p) => p,
+            Err(e) => return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}")),
+        };
+        slot.prev_pooled = Some(pooled);
+        return GpuEncodeOutcome::Packets(packets);
+    }
+
+    slot.prev_pooled = None;
     match slot
         .encoder
         .encode_gpu(GpuEncoderFrame::IOSurface(&src_frame), pts, force_keyframe)
     {
         Ok(p) => GpuEncodeOutcome::Packets(p),
         Err(e) => GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_bgra_fourcc(fourcc: u32) -> bool {
+    fourcc == u32::from_be_bytes(*b"BGRA")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_iosurface_encode_fourcc(profile: VideoProfile) -> Option<u32> {
+    use tether_codec::macos_interop::{NV12_VIDEO_RANGE_FOURCC, X420_FOURCC};
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => Some(NV12_VIDEO_RANGE_FOURCC),
+        (ChromaSubsampling::Yuv420, 10) => Some(X420_FOURCC),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacosGpuState {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosGpuState {
+    fn new() -> anyhow::Result<Self> {
+        let (device, queue, caps) =
+            pollster::block_on(tether_gpuconvert::nv12_iosurface::build_bridge_device())?;
+        tracing::info!(
+            supports_10bit = caps.supports_10bit,
+            "macOS BGRA IOSurface bridge wgpu device built"
+        );
+        Ok(Self { device, queue })
+    }
+
+    fn build_bgra_bridge(
+        &self,
+        src_dims: (u32, u32),
+        dst_dims: (u32, u32),
+        dst_fourcc: u32,
+    ) -> anyhow::Result<BgraIOSurfaceBridge> {
+        BgraIOSurfaceBridge::new(
+            self.device.clone(),
+            self.queue.clone(),
+            src_dims,
+            dst_dims,
+            dst_fourcc,
+        )
+        .map_err(|e| anyhow::anyhow!("BgraIOSurfaceBridge::new: {e}"))
     }
 }
 
@@ -2281,18 +2431,17 @@ mod cursor_pump_tests {
     }
 }
 
-/// Encoder alignment in pixels. H.264 / HEVC both want even widths
-/// (chroma sampling); HEVC Main444 hardware encoders empirically
-/// reject widths that aren't a multiple of 16. Round to 16 to cover
-/// all cases — the worst-case waste is 15 pixels per side, which is
-/// invisible at any reasonable client window size.
-const ENCODER_ALIGN: u32 = 16;
+/// Visible stream dimensions are kept even for 4:2:0 luma/chroma
+/// geometry. Hardware paths that need coarser coded or pitch alignment
+/// should pad/crop internally instead of bending the displayed aspect
+/// ratio.
+const VISIBLE_DIM_ALIGN: u32 = 2;
 
 /// Compute the encoder-output dimensions for a given capture size
 /// and client viewport. The viewport bounds the longest edge; we
 /// preserve aspect ratio (letterbox at the client; never stretch)
-/// and clamp to [`ENCODER_ALIGN`]. `None` returns the capture dims
-/// (with the same alignment guarantee).
+/// and clamp viewport-driven outputs to [`VISIBLE_DIM_ALIGN`]. `None`
+/// returns the capture dims unchanged.
 // Scaled dimensions are non-negative (scale clamped to <= 1.0, dims positive)
 // and far below u32::MAX; the round-then-cast is intentional.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -2309,21 +2458,43 @@ fn encode_dims_for_viewport(
     let Some(v) = viewport.filter(|v| v.is_valid()) else {
         return (capture_w, capture_h);
     };
-    // Fit capture inside viewport at fixed aspect ratio: scale by the
-    // smaller of the two ratios. Never upscale — the client renderer
-    // can scale up for cheap; we're not paying the encoder cost to do
-    // it host-side.
+    // Fit capture inside viewport at fixed aspect ratio. Never upscale
+    // — the client renderer can scale up for cheap; we're not paying
+    // the encoder cost to do it host-side.
     let scale_w = f64::from(v.width) / f64::from(capture_w);
     let scale_h = f64::from(v.height) / f64::from(capture_h);
-    let scale = scale_w.min(scale_h).min(1.0);
-    let target_w = (f64::from(capture_w) * scale).round() as u32;
-    let target_h = (f64::from(capture_h) * scale).round() as u32;
-    // When viewport IS in play we floor to 16: the encoder rejects
-    // misaligned dims on HEVC Main444 hardware, and floor (not
-    // nearest) is what keeps us inside the viewport budget.
-    let aligned_w = (target_w / ENCODER_ALIGN) * ENCODER_ALIGN;
-    let aligned_h = (target_h / ENCODER_ALIGN) * ENCODER_ALIGN;
-    (aligned_w.max(ENCODER_ALIGN), aligned_h.max(ENCODER_ALIGN))
+    if scale_w >= 1.0 && scale_h >= 1.0 {
+        return (capture_w, capture_h);
+    }
+
+    if scale_w <= scale_h {
+        let aligned_w = align_floor(v.width.min(capture_w)).max(VISIBLE_DIM_ALIGN);
+        let exact_h = f64::from(aligned_w) * f64::from(capture_h) / f64::from(capture_w);
+        let aligned_h = align_nearest_within(exact_h, v.height.min(capture_h));
+        (aligned_w, aligned_h)
+    } else {
+        let aligned_h = align_floor(v.height.min(capture_h)).max(VISIBLE_DIM_ALIGN);
+        let exact_w = f64::from(aligned_h) * f64::from(capture_w) / f64::from(capture_h);
+        let aligned_w = align_nearest_within(exact_w, v.width.min(capture_w));
+        (aligned_w, aligned_h)
+    }
+}
+
+fn align_floor(value: u32) -> u32 {
+    (value / VISIBLE_DIM_ALIGN) * VISIBLE_DIM_ALIGN
+}
+
+// Alignment can make the exact aspect-preserving dimension impossible.
+// Pick the nearest aligned dimension that still fits the viewport/source cap.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn align_nearest_within(exact: f64, limit: u32) -> u32 {
+    let floor = align_floor(exact.floor() as u32);
+    let ceil = floor.saturating_add(VISIBLE_DIM_ALIGN);
+    if ceil <= limit && (f64::from(ceil) - exact).abs() < (exact - f64::from(floor)).abs() {
+        ceil.max(VISIBLE_DIM_ALIGN)
+    } else {
+        floor.max(VISIBLE_DIM_ALIGN)
+    }
 }
 
 /// Pure CPU bilinear BGRA resize. Used on the [`CapturedFrame::Cpu`]
@@ -2637,6 +2808,8 @@ fn run_capture_and_send(
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
     let mut slot: Option<EncoderSlot> = None;
+    #[cfg(target_os = "macos")]
+    let mut macos_gpu_state: Option<MacosGpuState> = None;
     let mut pts: i64 = 0;
     // Frame-change classifier. CPU frames get a strided hash; GPU
     // frames bypass it (zero-copy path mustn't read back). Resolution
@@ -2721,10 +2894,11 @@ fn run_capture_and_send(
         //   - Linux GPU dma-buf: `tether-scaler` (Mitchell-Netravali
         //     in linear-light) runs inside `encode_gpu_frame` between
         //     PipeWire's BGRA import and the chroma bridge.
-        //   - macOS GPU IOSurface: ScreenCaptureKit is configured and
-        //     live-reconfigured at the viewport target, so the SCK
-        //     IOSurface already matches the encoder dimensions and
-        //     feeds VideoToolbox directly.
+        //   - macOS GPU IOSurface: 4:2:0 sessions capture full-res
+        //     BGRA from SCK, then `BgraIOSurfaceBridge` runs the same
+        //     Mitchell scaler before converting into VT-ready NV12/P010
+        //     IOSurfaces. 4:4:4 sessions stay full-res SCK passthrough
+        //     until a matching BGRA->4:4:4 IOSurface bridge lands.
         let (encode_width, encode_height) =
             encode_dims_for_viewport(frame_width, frame_height, current_viewport);
         // viewport_seq isn't part of the rebuild check: only an actual
@@ -2848,6 +3022,9 @@ fn run_capture_and_send(
                              (encode dims too small for the configured floor)"
                         );
                     }
+                    #[cfg(target_os = "macos")]
+                    let iosurface_encode_fourcc =
+                        macos_iosurface_encode_fourcc(chosen_profile).unwrap_or(0);
                     Some(EncoderSlot {
                         encoder: e,
                         capture_width: frame_width,
@@ -2861,6 +3038,12 @@ fn run_capture_and_send(
                         scaler: None,
                         #[cfg(target_os = "linux")]
                         scaler_pipelines: None,
+                        #[cfg(target_os = "macos")]
+                        bgra_iosurface_bridge: None,
+                        #[cfg(target_os = "macos")]
+                        iosurface_encode_fourcc,
+                        #[cfg(target_os = "macos")]
+                        prev_pooled: None,
                     })
                 }
                 Err(e) => {
@@ -2964,13 +3147,29 @@ fn run_capture_and_send(
                 }
             },
             #[cfg(target_os = "macos")]
-            CapturedFrame::Gpu(gpu) => match encode_iosurface_frame(slot_mut, gpu, pts, force_kf) {
-                GpuEncodeOutcome::Packets(p) => p,
-                GpuEncodeOutcome::DropFrame(e) => {
-                    warn!(error = %e, "IOSurface encode failed; dropping frame");
-                    continue;
+            CapturedFrame::Gpu(gpu) => {
+                match encode_iosurface_frame(slot_mut, &mut macos_gpu_state, gpu, pts, force_kf) {
+                    GpuEncodeOutcome::Packets(p) => p,
+                    GpuEncodeOutcome::DropFrame(e) => {
+                        warn!(error = %e, "IOSurface encode failed; dropping frame");
+                        continue;
+                    }
+                    GpuEncodeOutcome::Fatal(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "IOSurface encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
+                        );
+                        let goodbye_conn = conn.clone();
+                        let reason = format!("host IOSurface encode bridge collapsed: {e}");
+                        let _ =
+                            runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
+                                reason,
+                                code: tether_protocol::control::GoodbyeCode::InternalError,
+                            }));
+                        return;
+                    }
                 }
-            },
+            }
             #[cfg(target_os = "windows")]
             CapturedFrame::Gpu(gpu) => {
                 use windows::core::Interface;
@@ -3313,24 +3512,29 @@ async fn real_capture(
     chosen_profile: VideoProfile,
     initial_viewport: Option<Viewport>,
 ) -> anyhow::Result<tether_capture::CaptureHandle> {
-    // Pick the SCK pixel format that matches the negotiated encoder
-    // profile. The encoder's `submit_iosurface` cross-checks the
-    // delivered IOSurface fourcc against this; a mismatch would refuse
-    // the zero-copy fast path. SCK's `start_capture` triggers the
-    // macOS ScreenRecording TCC prompt on first run; subsequent runs
-    // reuse the granted permission.
-    let pixel_format = match tether_capture::macos::sck_pixel_format_for_profile(chosen_profile) {
-        tether_capture::macos::SckCapabilityCheck::Supported(p) => p,
-        tether_capture::macos::SckCapabilityCheck::Unsupported => {
-            anyhow::bail!(
-                "no SCK pixel format models the negotiated profile {:?} — the \
-                 capture-bridge filter should have prevented this profile from \
-                 reaching negotiation",
-                chosen_profile
-            );
-        }
+    // For 4:2:0 sessions, capture BGRA so text/UI edges survive until
+    // our scaler runs; the host-side IOSurface bridge converts to the
+    // negotiated VideoToolbox YUV input format immediately before encode.
+    // 4:4:4 sessions still use direct SCK YUV IOSurfaces until we wire a
+    // matching BGRA->4:4:4 IOSurface conversion path.
+    let (pixel_format, capture_viewport) = if chosen_profile.chroma == ChromaSubsampling::Yuv420 {
+        (tether_capture::macos::sck_bgra_pixel_format(), None)
+    } else {
+        let pixel_format = match tether_capture::macos::sck_pixel_format_for_profile(chosen_profile)
+        {
+            tether_capture::macos::SckCapabilityCheck::Supported(p) => p,
+            tether_capture::macos::SckCapabilityCheck::Unsupported => {
+                anyhow::bail!(
+                    "no SCK pixel format models the negotiated profile {:?} — the \
+                         capture-bridge filter should have prevented this profile from \
+                         reaching negotiation",
+                    chosen_profile
+                );
+            }
+        };
+        (pixel_format, initial_viewport)
     };
-    tether_capture::macos::start(pixel_format, initial_viewport)
+    tether_capture::macos::start(pixel_format, capture_viewport)
         .await
         .map_err(anyhow::Error::from)
 }
@@ -3394,7 +3598,7 @@ fn init_tracing(ipc: bool) -> tracing_appender::non_blocking::WorkerGuard {
 }
 
 /// Default VBR target bitrate as a function of resolution, fps,
-/// codec, and chroma. Anchored at 1080p60 H.264 4:2:0 = 8 Mbps (the
+/// codec, and chroma. Anchored at 1080p60 H.264 4:2:0 = 10 Mbps (the
 /// [`ENCODER_BITRATE_KBPS`] floor); scales linearly with `pixels × fps`;
 /// HEVC gets a 0.7× codec multiplier (conservative ~30% efficiency
 /// gain over H.264 at the same visual quality); 4:4:4 gets a 1.4×
@@ -3504,8 +3708,7 @@ mod tests {
     #[test]
     fn encode_dims_viewport_smaller_letterboxes() {
         // 3840x2160 captured, client viewport 1280x720. Aspect
-        // matches (16:9), so we expect 1280x720 exactly (both
-        // 16-aligned).
+        // matches (16:9), so we expect 1280x720 exactly.
         assert_eq!(
             encode_dims_for_viewport(3840, 2160, Some(Viewport::new(1280, 720))),
             (1280, 720)
@@ -3549,15 +3752,37 @@ mod tests {
     }
 
     #[test]
-    fn encode_dims_rounds_down_to_alignment() {
-        // Off-aspect viewport that lands the output on non-16-aligned
-        // dims. We must round DOWN — the encoder rejects unaligned
-        // input on hardware Main444 backends, and overshooting would
-        // mean we ship more pixels than the client asked for.
+    fn encode_dims_viewport_scales_macos_hidpi_without_aspect_bend() {
+        // Regression for the macOS host blur investigation: the old
+        // 16x16 clamp turned this into 1728x1104, visibly changing
+        // the source aspect ratio.
+        assert_eq!(
+            encode_dims_for_viewport(3024, 1952, Some(Viewport::new(1920, 1116))),
+            (1728, 1116)
+        );
+    }
+
+    #[test]
+    fn encode_dims_rounds_to_even_chroma_safe_visible_grid() {
+        // Off-aspect viewport that lands the output on odd dimensions.
+        // The visible stream snaps only to a small chroma-safe grid;
+        // any coarser coded alignment belongs in backend padding/crop,
+        // not in the displayed aspect ratio.
         let (w, h) = encode_dims_for_viewport(1920, 1080, Some(Viewport::new(1000, 600)));
-        assert_eq!(w % 16, 0);
-        assert_eq!(h % 16, 0);
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
         assert!(w <= 1000 && h <= 600);
+    }
+
+    #[test]
+    fn encode_dims_five_k_two_k_viewport_uses_nearest_even_height() {
+        // 7680x3232 on a 1600-wide viewport lands at 673.33 px high.
+        // Even-only snapping chooses 674, avoiding the larger aspect
+        // bend introduced by a 4-pixel grid.
+        assert_eq!(
+            encode_dims_for_viewport(7680, 3232, Some(Viewport::new(1600, 900))),
+            (1600, 674)
+        );
     }
 
     #[test]

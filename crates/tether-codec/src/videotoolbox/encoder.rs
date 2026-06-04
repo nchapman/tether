@@ -124,7 +124,21 @@ impl VideoToolboxEncoder {
         encoder.set_pix_fmt(ffi::AV_PIX_FMT_VIDEOTOOLBOX);
         encoder.set_time_base(ra(1, fps_i32));
         encoder.set_framerate(ra(fps_i32, 1));
-        encoder.set_bit_rate(i64::from(bitrate_kbps) * 1000);
+        let bitrate_bps = i64::from(bitrate_kbps) * 1000;
+        encoder.set_bit_rate(bitrate_bps);
+        // Match Sunshine's baseline rate-control shape for low-latency
+        // streaming: set an explicit peak equal to the average bitrate
+        // and a one-frame VBV budget. Supplying only `bit_rate` leaves
+        // VideoToolbox's FFmpeg wrapper to infer buffering policy, which
+        // can smear detail on desktop content while still hitting the
+        // nominal average. This is a static construction-time baseline;
+        // live bitrate retune remains deliberately unwired here.
+        unsafe {
+            let raw = encoder.deref_mut();
+            raw.rc_max_rate = bitrate_bps;
+            raw.rc_buffer_size =
+                i32::try_from((bitrate_bps / i64::from(fps_i32)).max(1)).unwrap_or(i32::MAX);
+        }
         let gop_frames =
             fps_i32.saturating_mul(i32::try_from(GOP_SECONDS).expect("GOP_SECONDS fits in i32"));
         encoder.set_gop_size(gop_frames);
@@ -187,6 +201,12 @@ impl VideoToolboxEncoder {
         //     if the hardware path can't be opened. We hard-require
         //     hardware encode across the project; the probe layer
         //     surfaces a clean `NoHardwareCodec` error instead.
+        //
+        // Sunshine also sets `prio_speed=1` and HEVC `max_ref_frames=1`
+        // for its game-streaming profile. We leave both unset here while
+        // chasing macOS softness: `prio_speed` maps to VT's
+        // speed-over-quality bias, and this Apple Silicon device reports
+        // `max_ref_frames` unsupported anyway.
         //
         // Note: VideoToolbox doesn't expose an `idr_interval`-style
         // knob the way VAAPI does. We bound the IDR cadence via

@@ -70,12 +70,14 @@ the relevant crate (e.g. `tether-capture/src/macos.rs`).
 
 End-to-end for one frame, host on a Linux Wayland session, client on
 any Linux machine. The **macOS host** variant diverges only inside the
-capture→encoder hop: at 1:1 (capture_dims == encode_dims)
-ScreenCaptureKit hands NV12 IOSurfaces straight to VideoToolbox with
-no gpuconvert step; when the client viewport asks for a smaller
-encode, the `Nv12IOSurfaceBridge` runs the same Mitchell scaler
-pipelines as Linux on the Y and UV planes into a pooled destination
-IOSurface that's then fed to VideoToolbox. The rest of the pipeline
+capture→encoder hop: real sessions capture full-resolution BGRA
+IOSurfaces from ScreenCaptureKit, run MPS Lanczos on Metal when the
+client viewport asks for a smaller encode, then convert into the
+VideoToolbox input IOSurface family for the negotiated profile. Current
+VideoToolbox hardware encode preserves 4:2:0 8/10-bit only, so macOS
+hosts advertise Main/Main10 today; the BGRA bridge can already produce
+NV24/`x444` 4:4:4 IOSurfaces if a future VT encoder path starts
+preserving Main 4:4:4. The rest of the pipeline
 from `FrameFragmenter` onward is identical. See the dedicated
 **macOS host (shipping today)** subsection further down.
 
@@ -110,9 +112,8 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │       run tether-scaler (Mitchell-Netravali in linear-light)        │
 │       between PipeWire's BGRA dma-buf import and the chroma         │
 │       bridge; CPU paths bilinear-resize before encode_bgra.         │
-│       macOS GPU paths run the same Mitchell pipelines via the       │
-│       Nv12IOSurfaceBridge (gpuconvert) — see Mac host scaler        │
-│       below.                                                        │
+│       macOS GPU paths capture BGRA and run MPS Lanczos plus a       │
+│       Metal BGRA→YUV kernel before VT encode.                       │
 │     • ABR tick: drains the latest ClientStats + quinn path stats    │
 │       into tether_session::abr::AbrController; calls                │
 │       set_bitrate_kbps when the controller crosses a hysteresis     │
@@ -363,17 +364,24 @@ Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
 renderer a `GpuFrameGuard` (the shared `GpuResourceGuard` re-export) that
 holds the source `AVFrame` ref alive until the renderer drops it.
 
-**macOS host.** ScreenCaptureKit emits NV12
-`CMSampleBuffer`s; `tether-capture::macos` unwraps each to its
-`IOSurface` and forwards as `CapturedFrame::Gpu(GpuCapturedSource::IOSurface(...))`.
-`tether-codec::videotoolbox::VideoToolboxEncoder` wraps the IOSurface
-in a fresh `CVPixelBuffer` (`CVPixelBufferCreateWithIOSurface`) and
-feeds it to `h264_videotoolbox` / `hevc_videotoolbox` via the AVFrame
-`data[3]` slot — no NV12 conversion step is needed (SCK delivers
-NV12 video range natively), so the macOS host has no analogue of
-`tether-gpuconvert`, no `BridgeState`, and no chroma-aware dispatch
-(VideoToolbox is 4:2:0 only — see the per-platform capability gate
-in the negotiation section above). Input injection is via `enigo`'s
+**macOS host.** ScreenCaptureKit emits BGRA
+`CMSampleBuffer`s for real sessions; `tether-capture::macos` unwraps
+each to its `IOSurface` and forwards as
+`CapturedFrame::Gpu(GpuCapturedSource::IOSurface(...))`.
+`apps/tether-host::encode_iosurface_frame` routes that IOSurface
+through `tether-gpuconvert::nv12_iosurface::BgraIOSurfaceBridge`: MPS
+Lanczos resizes on Metal when the client viewport is smaller than the
+capture, then a Metal compute kernel converts BGRA into the
+VideoToolbox input family for the negotiated profile (NV12 for 4:2:0
+8-bit, `x420`/P010-family for 4:2:0 10-bit, NV24 for 4:4:4 8-bit,
+`x444`/P410-family for 4:4:4 10-bit). The VideoToolbox encoder wraps
+the bridged destination IOSurface in a fresh `CVPixelBuffer`
+(`CVPixelBufferCreateWithIOSurface`) and feeds it to
+`h264_videotoolbox` / `hevc_videotoolbox` via the AVFrame `data[3]`
+slot. The 4:4:4 bridge outputs are readiness coverage, not advertised
+macOS-host capability today: `videotoolbox_round_trip_chroma_matrix`
+and `iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix` show
+current VT encode silently downsampling or rejecting Main 4:4:4. Input injection is via `enigo`'s
 CGEvent backend (`inject::enigo_backend`, shared with the Windows
 SendInput backend). The Linux host injects through `/dev/uinput`
 (`inject::uinput`) instead — portal-free, so input needs no
@@ -579,10 +587,12 @@ real-round-trip probe — capture → bridge → encoder → decoder per
 profile) and picks the best mutual match against a fixed preference
 list:
 
-1. HEVC 4:4:4 8-bit (desktop-quality top rung — preserves text and UI
-   chroma detail that 4:2:0 visibly smears).
-2. HEVC 4:2:0 8-bit.
-3. H.264 4:2:0 8-bit (universal floor; H.264 4:4:4 is absent because
+1. HEVC 4:4:4 10-bit (desktop-quality top rung — preserves text and UI
+   chroma detail and adds precision).
+2. HEVC 4:4:4 8-bit.
+3. HEVC 4:2:0 10-bit (Main10).
+4. HEVC 4:2:0 8-bit.
+5. H.264 4:2:0 8-bit (universal floor; H.264 4:4:4 is absent because
    VAAPI has no encode profile for it).
 
 The chosen profile is echoed in `tether.cap.video.encode-profile`;
@@ -592,7 +602,7 @@ client extension is treated as the universal floor.
 
 Both the VAAPI encoder (`VaapiEncoder::new` takes `VideoProfile`,
 switches `sw_format` + the AVCodecContext `profile` field for
-`AV_PROFILE_HEVC_REXT` on 4:4:4 + BGRA→input swscale stage; color
+`AV_PROFILE_HEVC_REXT` on 4:4:4 where supported + BGRA→input swscale stage; color
 primaries / transfer / colorspace / range tagged explicitly on the
 context so the SPS VUI doesn't say "Unspecified") and the gpuconvert
 bridge branch on `(chroma, bit_depth)` at construction:

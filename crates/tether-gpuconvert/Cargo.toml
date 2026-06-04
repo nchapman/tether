@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Host-side GPU colour-space conversions (BGRA → NV12) for the zero-copy capture → encode path."
+description = "Host-side GPU colour-space conversions for the zero-copy capture → encode path."
 
 [dependencies]
 thiserror = { workspace = true }
@@ -43,11 +43,27 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std",
     "MTLAllocation",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
     "MTLDevice",
+    "MTLLibrary",
     "MTLPixelFormat",
     "MTLResource",
     "MTLTexture",
+    "MTLTypes",
     "objc2-io-surface",
+] }
+objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "alloc",
+    "MPSCore",
+    "MPSImage",
+    "MPSImageKernel",
+    "MPSImageResampling",
+    "MPSKernel",
 ] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef"] }
 core-foundation = "0.10"

@@ -23,9 +23,12 @@ pollster = "0.4"
 tether-gpuconvert = { workspace = true }
 
 # macOS probe folds in the SCK pixel-format capability check that
-# used to live in tether-host as a separate cache.
+# used to live in tether-host as a separate cache, and constructs the
+# host-side BGRA IOSurface bridge for the production 4:2:0 path.
 [target.'cfg(target_os = "macos")'.dependencies]
 tether-capture = { workspace = true }
+tether-gpuconvert = { workspace = true }
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "9d31bca9", features = ["metal"] }
 
 [lints]
 workspace = true

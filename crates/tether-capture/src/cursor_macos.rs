@@ -84,6 +84,10 @@ pub struct CaptureGeometry {
 
 /// Build the source and spawn the poll thread.
 pub fn start(geom: CaptureGeometry) -> Box<dyn CursorSource> {
+    start_with_shared_geometry(Arc::new(Mutex::new(geom)))
+}
+
+fn start_with_shared_geometry(geom: Arc<Mutex<CaptureGeometry>>) -> Box<dyn CursorSource> {
     let (shape_tx, shape_rx) = unbounded::<CursorEvent>();
     let position_state = Arc::new(Mutex::new(None::<CursorPosition>));
     let stop = Arc::new(AtomicBool::new(false));
@@ -93,20 +97,26 @@ pub fn start(geom: CaptureGeometry) -> Box<dyn CursorSource> {
 
     let seed_fn = unsafe { lookup_cursor_seed() };
     let initial_seed = seed_fn.map(|f| unsafe { f() });
+    let initial_geom = geom.lock().map(|g| *g).unwrap_or(CaptureGeometry {
+        logical_point_w: 1.0,
+        logical_point_h: 1.0,
+        capture_pixel_w: 1,
+        capture_pixel_h: 1,
+    });
     match initial_seed {
         Some(s) => tracing::info!(
             initial_seed = s,
-            logical_w = geom.logical_point_w,
-            logical_h = geom.logical_point_h,
-            pixel_w = geom.capture_pixel_w,
-            pixel_h = geom.capture_pixel_h,
+            logical_w = initial_geom.logical_point_w,
+            logical_h = initial_geom.logical_point_h,
+            pixel_w = initial_geom.capture_pixel_w,
+            pixel_h = initial_geom.capture_pixel_h,
             "macOS cursor source: CGSCurrentCursorSeed available, starting poll thread"
         ),
         None => tracing::warn!(
-            logical_w = geom.logical_point_w,
-            logical_h = geom.logical_point_h,
-            pixel_w = geom.capture_pixel_w,
-            pixel_h = geom.capture_pixel_h,
+            logical_w = initial_geom.logical_point_w,
+            logical_h = initial_geom.logical_point_h,
+            pixel_w = initial_geom.capture_pixel_w,
+            pixel_h = initial_geom.capture_pixel_h,
             "macOS cursor source: CGSCurrentCursorSeed not found via dlsym; \
              cursor sprite will be re-fetched every 33 ms (slow path)"
         ),
@@ -132,7 +142,7 @@ pub fn start(geom: CaptureGeometry) -> Box<dyn CursorSource> {
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 fn run_poll_thread(
-    geom: CaptureGeometry,
+    geom: Arc<Mutex<CaptureGeometry>>,
     seed_fn: Option<unsafe extern "C" fn() -> i32>,
     shape_tx: Sender<CursorEvent>,
     position_state: Arc<Mutex<Option<CursorPosition>>>,
@@ -166,7 +176,14 @@ fn run_poll_thread(
         let tick_start = std::time::Instant::now();
 
         // Position: cheap, every tick.
-        if let Some(pos) = read_pointer_position(geom) {
+        let current_geom = geom.lock().map(|g| *g).unwrap_or(CaptureGeometry {
+            logical_point_w: 1.0,
+            logical_point_h: 1.0,
+            capture_pixel_w: 1,
+            capture_pixel_h: 1,
+        });
+
+        if let Some(pos) = read_pointer_position(current_geom) {
             if !logged_first_position {
                 tracing::info!(
                     x = pos.x,
@@ -213,7 +230,7 @@ fn run_poll_thread(
         };
         if should_fetch_sprite {
             sprite_attempts += 1;
-            match read_cursor_sprite(geom) {
+            match read_cursor_sprite(current_geom) {
                 Some(shape) => {
                     if !logged_first_sprite_ok {
                         tracing::info!(

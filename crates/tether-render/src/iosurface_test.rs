@@ -70,6 +70,20 @@ fn make_test_bgra(w: u32, h: u32) -> Vec<u8> {
     data
 }
 
+fn make_chroma_detail_bgra(width: u32, height: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for _y in 0..height {
+        for x in 0..width {
+            if x % 2 == 0 {
+                data.extend_from_slice(&[0, 0, 255, 255]);
+            } else {
+                data.extend_from_slice(&[0, 255, 0, 255]);
+            }
+        }
+    }
+    data
+}
+
 fn region_average_rgb(rgba: &[u8], w: u32, x0: u32, y0: u32, rw: u32, rh: u32) -> (u8, u8, u8) {
     let mut sum = [0u64; 3];
     let mut count = 0u64;
@@ -793,12 +807,371 @@ fn iosurface_zero_copy_roundtrip_hevc_main_444_10bit_1920x1200() {
     assert_colorbars("4:4:4 10-bit 1920×1200", &rgba, w, h, ChannelOrder::Rgba);
 }
 
+#[cfg(target_os = "macos")]
+fn bgra_bridge_fourcc_for_profile(profile: VideoProfile) -> u32 {
+    use tether_codec::macos_interop::{
+        NV12_VIDEO_RANGE_FOURCC, NV24_VIDEO_RANGE_FOURCC, X420_FOURCC, X444_FOURCC,
+    };
+
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => NV12_VIDEO_RANGE_FOURCC,
+        (ChromaSubsampling::Yuv420, 10) => X420_FOURCC,
+        (ChromaSubsampling::Yuv444, 8) => NV24_VIDEO_RANGE_FOURCC,
+        (ChromaSubsampling::Yuv444, 10) => X444_FOURCC,
+        _ => panic!("unsupported test profile: {profile:?}"),
+    }
+}
+
+/// Production macOS host replacement path: BGRA IOSurface capture →
+/// `BgraIOSurfaceBridge` Metal resize/convert → YUV IOSurface import
+/// → renderer shader → readback. This specifically covers the new
+/// host path; the older host-scaler tests below still exercise
+/// `Nv12IOSurfaceBridge`, and the zero-copy cells above exercise
+/// decode-side IOSurface import.
+#[cfg(target_os = "macos")]
+fn run_bgra_bridge_roundtrip(
+    profile: VideoProfile,
+    src_dims: (u32, u32),
+    dst_dims: (u32, u32),
+) -> Option<(Vec<u8>, u32, u32)> {
+    use tether_gpuconvert::nv12_iosurface::{
+        build_bridge_device, create_bgra_iosurface_fixture, BgraIOSurfaceBridge,
+    };
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (device, queue, caps) = match pollster::block_on(build_bridge_device()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("SKIPPED: build_bridge_device failed: {e}");
+            return None;
+        }
+    };
+    if profile.bit_depth == 10 && !caps.supports_10bit {
+        eprintln!(
+            "SKIPPED: 10-bit BGRA bridge profile needs TEXTURE_FORMAT_16BIT_NORM and the \
+             adapter does not advertise it"
+        );
+        return None;
+    }
+
+    let input_bgra = crate::color_fixture::colorbars_bgra(src_dims);
+    let fixture =
+        create_bgra_iosurface_fixture(src_dims.0, src_dims.1, &input_bgra).expect("BGRA fixture");
+    let (src_frame, src_guard) = fixture.into_frame_parts();
+    let dst_fourcc = bgra_bridge_fourcc_for_profile(profile);
+    eprintln!(
+        "[{profile:?}] BGRA bridge roundtrip {}x{} -> {}x{} dst fourcc 0x{dst_fourcc:08x}",
+        src_dims.0, src_dims.1, dst_dims.0, dst_dims.1
+    );
+
+    let bridge = BgraIOSurfaceBridge::new(
+        device.clone(),
+        queue.clone(),
+        src_dims,
+        dst_dims,
+        dst_fourcc,
+    )
+    .expect("BgraIOSurfaceBridge::new");
+    let pooled = bridge
+        .convert_to_iosurface(&src_frame)
+        .expect("convert_to_iosurface");
+    drop(src_guard);
+
+    let target_format = wgpu::TextureFormat::Rgba8Unorm;
+    let pipeline = build_test_pipeline(&device, &queue, target_format, profile.bit_depth);
+    let textures = gpu::import_iosurface_textures(
+        &device,
+        &pipeline.yuv_bgl,
+        &pipeline.sampler,
+        profile.chroma,
+        profile.bit_depth,
+        &pooled.frame,
+        tether_codec::GpuFrameGuard::new(()),
+    )
+    .expect("import_iosurface_textures (BGRA bridge dst)");
+
+    let (dw, dh) = dst_dims;
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen target (BGRA bridge)"),
+        size: wgpu::Extent3d {
+            width: dw,
+            height: dh,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: target_format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let unpadded_bpr = u64::from(dw * 4);
+    let padded_bpr = unpadded_bpr.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback (BGRA bridge)"),
+        size: padded_bpr * u64::from(dh),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("BGRA bridge render encoder"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("BGRA bridge render pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_bind_group(0, &textures.bind_group, &[]);
+        pass.set_bind_group(1, &pipeline.scale_bind_group, &[]);
+        pass.set_bind_group(2, &pipeline.color_params_bind_group, &[]);
+        pass.draw(0..6, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bpr as u32),
+                rows_per_image: Some(dh),
+            },
+        },
+        wgpu::Extent3d {
+            width: dw,
+            height: dh,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let (tx, rx) = mpsc::channel();
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("send"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("device poll");
+    rx.recv().expect("map callback").expect("map ok");
+    let mapped = readback.slice(..).get_mapped_range().expect("range");
+    let mut rgba = Vec::with_capacity((dw * dh * 4) as usize);
+    for row in 0..dh as usize {
+        let start = row * padded_bpr as usize;
+        let end = start + unpadded_bpr as usize;
+        rgba.extend_from_slice(&mapped[start..end]);
+    }
+    drop(mapped);
+    readback.unmap();
+    drop(textures);
+    drop(pooled);
+    drop(bridge);
+
+    Some((rgba, dw, dh))
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA IOSurface bridge; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge"]
+fn iosurface_bgra_bridge_roundtrip_hevc_main_8bit() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 8,
+    };
+    let Some((rgba, w, h)) = run_bgra_bridge_roundtrip(profile, (320, 240), (320, 240)) else {
+        return;
+    };
+    assert_colorbars("BGRA bridge 4:2:0 8-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA IOSurface bridge + 16-bit storage; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge"]
+fn iosurface_bgra_bridge_roundtrip_hevc_main10() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv420,
+        bit_depth: 10,
+    };
+    let Some((rgba, w, h)) = run_bgra_bridge_roundtrip(profile, (320, 240), (320, 240)) else {
+        return;
+    };
+    assert_colorbars("BGRA bridge 4:2:0 10-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA IOSurface bridge; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge"]
+fn iosurface_bgra_bridge_roundtrip_hevc_main_444_8bit() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv444,
+        bit_depth: 8,
+    };
+    let Some((rgba, w, h)) = run_bgra_bridge_roundtrip(profile, (320, 240), (320, 240)) else {
+        return;
+    };
+    assert_colorbars("BGRA bridge 4:4:4 8-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA IOSurface bridge + 16-bit storage; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge"]
+fn iosurface_bgra_bridge_roundtrip_hevc_main_444_10bit() {
+    let profile = VideoProfile {
+        codec: tether_protocol::control::CodecKind::Hevc,
+        chroma: ChromaSubsampling::Yuv444,
+        bit_depth: 10,
+    };
+    let Some((rgba, w, h)) = run_bgra_bridge_roundtrip(profile, (320, 240), (320, 240)) else {
+        return;
+    };
+    assert_colorbars("BGRA bridge 4:4:4 10-bit", &rgba, w, h, ChannelOrder::Rgba);
+}
+
+#[cfg(target_os = "macos")]
+fn try_bgra_bridge_vt_encode_roundtrip(profile: VideoProfile) -> std::result::Result<u32, String> {
+    use tether_gpuconvert::nv12_iosurface::{
+        build_bridge_device, create_bgra_iosurface_fixture, BgraIOSurfaceBridge,
+    };
+
+    let src_dims = (128, 128);
+    let dst_dims = src_dims;
+    let (device, queue, caps) =
+        pollster::block_on(build_bridge_device()).map_err(|e| format!("bridge device: {e}"))?;
+    if profile.bit_depth == 10 && !caps.supports_10bit {
+        return Err("bridge device lacks TEXTURE_FORMAT_16BIT_NORM".into());
+    }
+
+    let input_bgra = make_chroma_detail_bgra(src_dims.0, src_dims.1);
+    let fixture = create_bgra_iosurface_fixture(src_dims.0, src_dims.1, &input_bgra)
+        .map_err(|e| format!("BGRA IOSurface fixture {}x{}: {e}", src_dims.0, src_dims.1))?;
+    let (src_frame, src_guard) = fixture.into_frame_parts();
+    let dst_fourcc = bgra_bridge_fourcc_for_profile(profile);
+    let bridge = BgraIOSurfaceBridge::new(device, queue, src_dims, dst_dims, dst_fourcc)
+        .map_err(|e| format!("BgraIOSurfaceBridge::new dst_fourcc=0x{dst_fourcc:08x}: {e}"))?;
+    let pooled = bridge
+        .convert_to_iosurface(&src_frame)
+        .map_err(|e| format!("BGRA bridge convert_to_iosurface: {e}"))?;
+
+    let mut enc = VideoToolboxEncoder::new(profile, dst_dims.0, dst_dims.1, 30, 2_000)
+        .map_err(|e| format!("encoder construction: {e:?}"))?;
+    let mut packets = enc
+        .submit_iosurface(&pooled.frame, 0, true)
+        .map_err(|e| format!("submit_iosurface: {e:?}"))?;
+    if packets.is_empty() {
+        packets = enc.flush().map_err(|e| format!("flush: {e:?}"))?;
+    }
+    drop(pooled);
+    drop(src_guard);
+    drop(bridge);
+    if packets.is_empty() {
+        return Err("no packets produced".into());
+    }
+
+    let mut dec = VideoToolboxDecoder::new(profile.codec)
+        .map_err(|e| format!("decoder construction: {e:?}"))?;
+    for p in &packets {
+        dec.submit(&p.data)
+            .map_err(|e| format!("decoder submit: {e:?}"))?;
+    }
+    dec.signal_eof()
+        .map_err(|e| format!("decoder signal_eof: {e:?}"))?;
+    match dec
+        .next_frame()
+        .map_err(|e| format!("decoder next_frame: {e:?}"))?
+    {
+        Some(CodecFrame::Gpu(g)) => {
+            let GpuFrameSource::IOSurface(io) = g.source;
+            let expected = tether_codec::videotoolbox::expected_iosurface_fourccs(profile);
+            if !expected.contains(&io.pixel_format) {
+                return Err(format!(
+                    "decoded IOSurface fourcc 0x{:08x} not in expected family {:?}",
+                    io.pixel_format,
+                    expected
+                        .iter()
+                        .map(|f| format!("0x{f:08x}"))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            Ok(io.pixel_format)
+        }
+        Some(CodecFrame::Cpu(_)) => Err("decoder produced Cpu frame".into()),
+        None => Err("decoder produced no frame after EOF".into()),
+    }
+}
+
+#[test]
+#[ignore = "requires macOS + Metal BGRA bridge + VideoToolbox; run with: cargo test -p tether-render --release -- --ignored iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix"]
+fn iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix() {
+    let profiles = [
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        },
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 8,
+        },
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Hevc,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: 10,
+        },
+    ];
+
+    for profile in profiles {
+        match try_bgra_bridge_vt_encode_roundtrip(profile) {
+            Ok(fourcc) => {
+                eprintln!(
+                    "BGRA bridge → VT encode matrix: {profile:?} OK (IOSurface 0x{fourcc:08x})"
+                );
+                assert_ne!(
+                    profile.chroma,
+                    ChromaSubsampling::Yuv444,
+                    "{profile:?} unexpectedly encodes 4:4:4 on this host; update probe/docs if this is a real hardware capability"
+                );
+            }
+            Err(reason) => {
+                eprintln!("BGRA bridge → VT encode matrix: {profile:?} unsupported ({reason})");
+                assert_eq!(
+                    profile.chroma,
+                    ChromaSubsampling::Yuv444,
+                    "{profile:?} should encode through the BGRA bridge"
+                );
+            }
+        }
+    }
+}
+
 /// Which input fixture to feed the host-scaler round-trip. Matches the
 /// Linux harness's `Fixture` enum in spirit — solid colours for
 /// photometric region checks, coord-encoded for geometric residual.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // `SolidSplit` is API-surface; the existing region cells call `make_test_bgra` directly via the `_rgba` helper.
 enum HostScalerFixture {
     /// Solid red-left + blue-right BGRA split. Survives lossy
     /// encode well; targeted by region-average / seam-region tests.
@@ -821,11 +1194,8 @@ fn host_scaler_input_bgra(w: u32, h: u32, fixture: HostScalerFixture) -> Vec<u8>
 }
 
 /// Artifacts produced by [`run_host_scaler_roundtrip_artifacts`]:
-/// the rendered downscaled output (BGRA at dst_dims) alongside a
-/// CPU reference for the same scaling (also BGRA at dst_dims).
-/// Mirrors the Linux harness's reference-vs-actual structure so
-/// metric helpers ([`assert_host_scaler_metrics`]) can run the
-/// same SSIM / Y-PSNR / geometric residual computations.
+/// the rendered downscaled output (BGRA at dst_dims) and its
+/// dimensions, used for structural assertions on the rendered output.
 #[cfg(target_os = "macos")]
 struct HostScalerArtifacts {
     /// Rendered output at `dst_dims`, packed BGRA (B, G, R, A). The
@@ -834,16 +1204,7 @@ struct HostScalerArtifacts {
     /// (`ssim_rgb` is symmetric in channel order but `psnr_db_y_bgra`
     /// reads B from byte 0; both buffers must use the same layout).
     bgra_dst: Vec<u8>,
-    /// CPU reference: `cpu_mitchell_resize_bgra(input, src, dst)`.
-    /// Skips chroma roundtrip for the same reason the Linux harness
-    /// does — see `test_harness::build_reference`'s comment for
-    /// the swscale-limited-range vs textbook-full-range gap.
-    reference_bgra: Vec<u8>,
     dst_dims: (u32, u32),
-    /// Echo of the input for any cell that wants to e.g. compare
-    /// geometric residual at the source resolution.
-    #[allow(dead_code)]
-    input_bgra: Vec<u8>,
 }
 
 /// Wide-region averages (left half + right half, sampled away from
@@ -1123,7 +1484,7 @@ fn run_host_scaler_roundtrip_rgba(
     src_dims: (u32, u32),
     dst_dims: (u32, u32),
 ) -> Option<Vec<u8>> {
-    let input_bgra = make_test_bgra(src_dims.0, src_dims.1);
+    let input_bgra = host_scaler_input_bgra(src_dims.0, src_dims.1, HostScalerFixture::SolidSplit);
     run_host_scaler_roundtrip_with_input(profile, src_dims, dst_dims, &input_bgra)
 }
 
@@ -1140,17 +1501,8 @@ fn run_host_scaler_roundtrip(
 }
 
 /// Artifact-returning wrapper: runs the full chain with the chosen
-/// fixture and returns both the rendered output (BGRA at dst_dims)
-/// and a CPU reference (Mitchell-downscaled input at dst_dims, also
-/// BGRA). Caller drives SSIM / Y-PSNR / geometric-residual
-/// assertions on top via [`assert_host_scaler_metrics`].
-///
-/// The CPU reference mirrors `tether-render::test_harness::build_reference`
-/// — skipping the chroma roundtrip step for the same reason
-/// (swscale limited-range vs textbook full-range divergence inflates
-/// the floor without catching real bugs). The coord-encoded fixture's
-/// constant B-channel makes the omission invisible; a future PNG
-/// fixture with high-frequency chroma would need the step re-enabled.
+/// fixture and returns the rendered output (BGRA at dst_dims). The
+/// coord-encoded smoke cell consumes this for structural range checks.
 #[cfg(target_os = "macos")]
 fn run_host_scaler_roundtrip_artifacts(
     profile: VideoProfile,
@@ -1158,8 +1510,6 @@ fn run_host_scaler_roundtrip_artifacts(
     dst_dims: (u32, u32),
     fixture: HostScalerFixture,
 ) -> Option<HostScalerArtifacts> {
-    use tether_scaler::test_util::cpu_mitchell_resize_bgra;
-
     let input_bgra = host_scaler_input_bgra(src_dims.0, src_dims.1, fixture);
     let rgba_dst = run_host_scaler_roundtrip_with_input(profile, src_dims, dst_dims, &input_bgra)?;
 
@@ -1171,59 +1521,7 @@ fn run_host_scaler_roundtrip_artifacts(
         chunk.swap(0, 2);
     }
 
-    // CPU reference: Mitchell-resize the input to dst_dims. No
-    // letterbox padding because every cell here has surface_dims
-    // == dst_dims (the renderer's identity-scale uniform is set
-    // accordingly).
-    let reference_bgra = if src_dims == dst_dims {
-        input_bgra.clone()
-    } else {
-        cpu_mitchell_resize_bgra(&input_bgra, src_dims, dst_dims)
-    };
-
-    Some(HostScalerArtifacts {
-        bgra_dst,
-        reference_bgra,
-        dst_dims,
-        input_bgra,
-    })
-}
-
-/// SSIM + Y-PSNR floor assertion against the artifacts' CPU
-/// reference. Computes both metrics and asserts they meet the given
-/// floors; prints both numbers (with the floor for context) on the
-/// eprintln channel before panicking so CI logs are useful for
-/// triage even without PNG diagnostic dumps.
-///
-/// Currently unused — the macOS coord-encoded smoke cell ships with
-/// a range-based assertion instead. Kept as ready-to-use
-/// infrastructure for a future calibrated pass that lands a
-/// macOS-tuned `cpu_chroma_roundtrip_bgra` reference (see the smoke
-/// cell's doc-comment for why floors are deferred).
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-fn assert_host_scaler_metrics(
-    label: &str,
-    artifacts: &HostScalerArtifacts,
-    ssim_floor: f64,
-    psnr_y_floor_db: f64,
-) {
-    use tether_scaler::test_util::{psnr_db_y_bgra, ssim_rgb};
-    let (dw, dh) = artifacts.dst_dims;
-    let ssim = ssim_rgb(&artifacts.bgra_dst, &artifacts.reference_bgra, dw, dh);
-    let psnr_y = psnr_db_y_bgra(&artifacts.bgra_dst, &artifacts.reference_bgra);
-    eprintln!(
-        "[{label}] {dw}×{dh}: SSIM {ssim:.4} (floor {ssim_floor:.4}), \
-         Y-PSNR {psnr_y:.2} dB (floor {psnr_y_floor_db:.2} dB)"
-    );
-    assert!(
-        ssim >= ssim_floor,
-        "{label}: SSIM {ssim:.4} below floor {ssim_floor:.4}"
-    );
-    assert!(
-        psnr_y >= psnr_y_floor_db,
-        "{label}: Y-PSNR {psnr_y:.2} dB below floor {psnr_y_floor_db:.2} dB"
-    );
+    Some(HostScalerArtifacts { bgra_dst, dst_dims })
 }
 
 /// HEVC 4:2:0 8-bit, host-scaler round-trip 640×480 → 320×240. The
@@ -1466,7 +1764,7 @@ fn iosurface_host_scaler_sustained_rate() {
 /// Verify the bridge constructs successfully for 10-bit fourccs
 /// on a device that has both `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`
 /// and `TEXTURE_FORMAT_16BIT_NORM`, and falls back to
-/// `TenBitNotImplemented` on a device that has only the 8-bit
+/// `TenBitStorageUnsupported` on a device that has only the 8-bit
 /// feature opt-in. The R16/Rg16 plane pipelines (added in the
 /// follow-up that retired the original guard) only build on a
 /// 16BIT_NORM-equipped device.
@@ -1491,7 +1789,7 @@ fn iosurface_host_scaler_10bit_construction() {
     // x420 (limited-range 10-bit 4:2:0) is the fourcc the host actually
     // targets. Construction depends only on the 16BIT_NORM opt-in: it
     // builds the R16/Rg16 plane pipelines on a capable device and refuses
-    // with `TenBitNotImplemented` otherwise.
+    // with `TenBitStorageUnsupported` otherwise.
     let fcc = X420_FOURCC;
     let result = Nv12IOSurfaceBridge::new(
         device.clone(),
@@ -1508,10 +1806,10 @@ fn iosurface_host_scaler_10bit_construction() {
             );
             drop(bridge);
         }
-        (false, Err(BridgeError::TenBitNotImplemented { fourcc })) => {
+        (false, Err(BridgeError::TenBitStorageUnsupported { fourcc })) => {
             assert_eq!(
                 fourcc, fcc,
-                "TenBitNotImplemented error must carry the rejected fourcc"
+                "TenBitStorageUnsupported error must carry the rejected fourcc"
             );
             eprintln!(
                 "10-bit fourcc 0x{fcc:08x}: bridge correctly refused — adapter lacks 16BIT_NORM"
@@ -1526,12 +1824,12 @@ fn iosurface_host_scaler_10bit_construction() {
         (false, Ok(_)) => {
             panic!(
                 "10-bit fourcc 0x{fcc:08x}: device lacks 16BIT_NORM but bridge built \
-                 successfully — should have refused with TenBitNotImplemented"
+                 successfully — should have refused with TenBitStorageUnsupported"
             );
         }
         (false, Err(other)) => {
             panic!(
-                "10-bit fourcc 0x{fcc:08x}: expected TenBitNotImplemented on \
+                "10-bit fourcc 0x{fcc:08x}: expected TenBitStorageUnsupported on \
                  a non-16BIT_NORM device; got {other}"
             );
         }
@@ -1542,7 +1840,7 @@ fn iosurface_host_scaler_10bit_construction() {
     // host never targets a full-range output (see the table-consistency
     // test `nv12_fourccs_round_trip_across_tables`). The fourcc gate fires
     // before the 10-bit feature check, so this is `UnsupportedFourcc`, not
-    // `TenBitNotImplemented`.
+    // `TenBitStorageUnsupported`.
     let fcc = XF20_FOURCC;
     match Nv12IOSurfaceBridge::new(
         device.clone(),

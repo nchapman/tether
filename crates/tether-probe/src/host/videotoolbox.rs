@@ -17,23 +17,24 @@
 //! routing through a native SW decoder for unsupported profiles) and
 //! genuine hardware-decoder absence.
 //!
-//! Step 2 of the migration: this is a verbatim move from
-//! `tether-codec::videotoolbox::probe`. Step 3 folds in the SCK
-//! capture capability check (today done at the host layer as a
-//! separate cache).
+//! The probe owns the macOS host capability answer end to end, including
+//! SCK BGRA availability, Metal bridge construction, VideoToolbox encode,
+//! VideoToolbox decode, and renderer IOSurface acceptance.
 
 use std::sync::OnceLock;
 
-use tether_capture::macos::{
-    probe_capture_pixel_formats, sck_pixel_format_for_profile, SckCaptureCapability,
-};
+use tether_capture::macos::{probe_capture_pixel_formats, SckCaptureCapability};
 use tether_codec::bitstream_sps::parse_sps_chroma_bit_depth;
-use tether_codec::macos_interop::{accepts_iosurface_fourcc, iosurface_fourcc_expected_label};
+use tether_codec::macos_interop::{
+    accepts_iosurface_fourcc, iosurface_fourcc_expected_label, NV12_VIDEO_RANGE_FOURCC,
+    NV24_VIDEO_RANGE_FOURCC, X420_FOURCC, X444_FOURCC,
+};
 use tether_codec::videotoolbox::{
     expected_iosurface_fourccs, VideoToolboxDecoder, VideoToolboxEncoder,
 };
 use tether_codec::{Decoder, Encoder, Frame, GpuFrameSource};
-use tether_protocol::control::VideoProfile;
+use tether_gpuconvert::nv12_iosurface::BridgeDeviceCapabilities;
+use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
 use crate::profile_probe::{ProbeError, ProfileProbe, Result};
 use crate::PipelineStage;
@@ -54,12 +55,6 @@ const PROBE_BITRATE_KBPS: u32 = 1_000;
 /// a Mac with a broken SCK setup still negotiates H.264/HEVC 4:2:0
 /// 8-bit (the universal floor) rather than refusing all profiles.
 ///
-/// TODO(probe-migration step 5): the tether-host `SCK_CAPS_CACHE` and
-/// `warm_sck_capture_capability_cache` are still alive during the
-/// migration window. After step 5 cuts the host over to call
-/// `tether_probe::host_supported_profiles()` directly, those become
-/// dead code and get deleted; this OnceLock is then the only cache
-/// of the SCK probe result.
 fn sck_capability() -> &'static SckCaptureCapability {
     static CACHED: OnceLock<SckCaptureCapability> = OnceLock::new();
     CACHED.get_or_init(|| match pollster::block_on(probe_capture_pixel_formats()) {
@@ -78,23 +73,25 @@ fn sck_capability() -> &'static SckCaptureCapability {
     })
 }
 
+fn bridge_device() -> Result<(wgpu::Device, wgpu::Queue, BridgeDeviceCapabilities)> {
+    static CACHED: OnceLock<
+        std::result::Result<(wgpu::Device, wgpu::Queue, BridgeDeviceCapabilities), String>,
+    > = OnceLock::new();
+    match CACHED.get_or_init(|| {
+        pollster::block_on(tether_gpuconvert::nv12_iosurface::build_bridge_device())
+            .map_err(|e| e.to_string())
+    }) {
+        Ok((device, queue, caps)) => Ok((device.clone(), queue.clone(), *caps)),
+        Err(e) => Err(ProbeError::new(
+            PipelineStage::Capture,
+            format!("macOS BGRA IOSurface bridge device init failed: {e}"),
+        )),
+    }
+}
+
 impl ProfileProbe for VideoToolboxProbe {
     fn probe_encode(profile: VideoProfile) -> Result<()> {
-        // Capture-stage gate: if SCK can't deliver the matching pixel
-        // format on this Mac, the host couldn't deliver real frames to
-        // the encoder regardless of whether VT itself accepts the
-        // profile. Folds in the SCK_CAPS_CACHE check that used to live
-        // in tether-host as a separate filter layer.
-        if !sck_pixel_format_for_profile(profile).is_deliverable(sck_capability()) {
-            return Err(ProbeError::new(
-                PipelineStage::Capture,
-                format!(
-                    "ScreenCaptureKit cannot deliver the pixel format for \
-                     {:?} {:?} {}-bit on this Mac",
-                    profile.codec, profile.chroma, profile.bit_depth
-                ),
-            ));
-        }
+        gate_capture_and_bridge(profile)?;
 
         let mut enc =
             VideoToolboxEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)
@@ -262,6 +259,50 @@ impl ProfileProbe for VideoToolboxProbe {
             )),
         }
     }
+}
+
+fn gate_capture_and_bridge(profile: VideoProfile) -> Result<()> {
+    let caps = sck_capability();
+    if !caps.bgra {
+        return Err(ProbeError::new(
+            PipelineStage::Capture,
+            format!(
+                "ScreenCaptureKit cannot deliver BGRA for the macOS \
+                 host-side Metal bridge ({:?} {:?} {}-bit)",
+                profile.codec, profile.chroma, profile.bit_depth
+            ),
+        ));
+    }
+    let dst_fourcc = match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => NV12_VIDEO_RANGE_FOURCC,
+        (ChromaSubsampling::Yuv420, 10) => X420_FOURCC,
+        (ChromaSubsampling::Yuv444, 8) => NV24_VIDEO_RANGE_FOURCC,
+        (ChromaSubsampling::Yuv444, 10) => X444_FOURCC,
+        _ => {
+            return Err(ProbeError::new(
+                PipelineStage::Capture,
+                format!(
+                    "no BGRA IOSurface bridge output fourcc for {:?} {}-bit",
+                    profile.chroma, profile.bit_depth
+                ),
+            ));
+        }
+    };
+    let (device, queue, _caps) = bridge_device()?;
+    tether_gpuconvert::nv12_iosurface::BgraIOSurfaceBridge::new(
+        device,
+        queue,
+        (PROBE_DIM * 2, PROBE_DIM * 2),
+        (PROBE_DIM, PROBE_DIM),
+        dst_fourcc,
+    )
+    .map_err(|e| {
+        ProbeError::new(
+            PipelineStage::Capture,
+            format!("macOS BGRA IOSurface bridge construction failed: {e}"),
+        )
+    })?;
+    Ok(())
 }
 
 /// Produce a `PROBE_DIM × PROBE_DIM` BGRA buffer with high-frequency

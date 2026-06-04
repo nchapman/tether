@@ -8,13 +8,14 @@
 //! - `build_yuv444_pipeline` — BGRA→XYUV packed (4:4:4 8-bit), via
 //!   `crate::Yuv444DmaBuf`. **Linux only.**
 //! - `build_p010_pipeline` — BGRA→P010 biplanar (4:2:0 10-bit), via
-//!   `crate::Bgra2P010DmaBuf`. **Linux only.**
+//!   `crate::Bgra2P010DmaBuf` on Linux and the macOS BGRA IOSurface
+//!   bridge.
 //! - `build_xv30_pipeline` — BGRA→XV30 packed (4:4:4 10-bit), via
 //!   `crate::Bgra2Xv30DmaBuf`. **Linux only.**
 //!
-//! macOS reaches all four encoder inputs without these builders —
-//! SCK delivers `420v` / `x420` / `444v` / `xf44` IOSurfaces straight
-//! to VideoToolbox.
+//! macOS reaches 4:4:4 encoder inputs without these builders, but the
+//! host-side BGRA capture path uses the 4:2:0 builders to preserve the
+//! desktop in BGRA until the final VideoToolbox input conversion.
 //!
 //! Per-pipeline bind-group layouts live alongside their builder so a
 //! binding-order change in a WGSL file only needs one matching Rust
@@ -170,9 +171,8 @@ pub(crate) fn build_yuv444_pipeline(
 /// on the chosen `VkFormat`. Some drivers expose 16-bit unorm as
 /// sampleable but not as storage-writable; on those, this pipeline
 /// would fail at `create_compute_pipeline`. The
-/// [`crate::storable_dmabuf_modifiers`] probe is the gate — callers
-/// invoke it before constructing the bridge (see
-/// [`crate::Bgra2P010DmaBuf::new`] for the live wiring).
+/// Linux DMA-BUF callers gate this via [`crate::storable_dmabuf_modifiers`]
+/// before constructing the bridge.
 #[cfg(target_os = "linux")]
 pub(crate) fn build_p010_pipeline(
     device: &wgpu::Device,

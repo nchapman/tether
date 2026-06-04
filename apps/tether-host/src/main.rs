@@ -32,7 +32,7 @@ use tether_codec::GpuEncoderFrame;
 use tether_codec::{DmaBufFrame, DmaBufLayer, DmaBufObject};
 #[cfg(target_os = "macos")]
 use tether_gpuconvert::nv12_iosurface::{
-    BridgeError as IOSurfaceBridgeError, Nv12IOSurfaceBridge, PooledIOSurface,
+    BgraIOSurfaceBridge, BridgeError as IOSurfaceBridgeError, PooledIOSurface,
 };
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{
@@ -101,12 +101,12 @@ const ENCODER_FPS: u32 = 60;
 
 /// VBR target bitrate. The encoder is allowed to overshoot for
 /// motion-heavy frames and undershoot on static content. Calibrated
-/// for 1080p60 H.264 ≈ 8 Mbps and roughly scales linearly with
+/// for 1080p60 H.264 ≈ 10 Mbps and roughly scales linearly with
 /// resolution × fps. HEVC sessions get a 0.7× multiplier inside the
 /// derivation step (~30% more efficient at the same visual quality;
 /// conservative estimate, refined when we benchmark). For now the
 /// constant is the H.264 1080p60 floor; multi-resolution scaling is W8.
-const ENCODER_BITRATE_KBPS: u32 = 8_000;
+const ENCODER_BITRATE_KBPS: u32 = 10_000;
 
 const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
@@ -272,27 +272,12 @@ async fn main() -> anyhow::Result<()> {
         println!("cert dir:        {} (rm to rotate)", cert_dir.display());
     }
 
-    // Warm the SCK capture-capability cache *before* the first client
-    // connects. The probe runs eight short `SCStream::start_capture`
-    // cycles (~300–900 ms total wall time) and triggers the macOS
-    // ScreenRecording TCC prompt on first run. Running it lazily on
-    // first-connection inside `handle_client` straddles the
-    // application-layer clock-probe RTT measurement, biasing the
-    // negotiated `clock_offset` by ~half the probe duration and
-    // producing phantom hundred-millisecond `latency_ms` values for
-    // every frame stat that session. Running it here moves the
-    // probe out of the handshake's critical path entirely; the TCC
-    // prompt also fires on host launch (better UX than on first
-    // remote connect).
-    //
     // Warm the unified capability probe. `tether_probe::host_supported_profiles`
     // round-trips every `PROFILE_PREFERENCE` entry through the full
     // production chain (capture → bridge → encoder → decoder) and
-    // OnceLock-caches the result for process lifetime. This is one
-    // call that replaces what used to be three caches:
-    //   - tether-codec's supported_profiles
-    //   - tether-host's SCK_CAPS_CACHE (macOS)
-    //   - tether-host's LINUX_P010_DELIVERABLE_CACHE
+    // OnceLock-caches the result for process lifetime. This replaces
+    // the older per-backend cache warmers with one host-authoritative
+    // answer.
     // Running it here keeps the probe off the handshake's critical
     // path — see the historical comment about clock-sync offset bias.
     //
@@ -649,7 +634,8 @@ async fn handle_client(
     // per-backend follow-up work). Re-grab the Arc clone via
     // `capture_handle.fps_handle()` when the first backend wires
     // through. See `tether_capture::CaptureHandle` docs.
-    let mut capture_handle = pick_capture_source(use_test_pattern, chosen_profile).await?;
+    let mut capture_handle =
+        pick_capture_source(use_test_pattern, chosen_profile, initial_viewport).await?;
     // Take the per-backend cursor source out before we drop the
     // handle. Wayland/PipeWire fills this with a `SPA_META_Cursor`
     // parser; the test-pattern and macOS-stub backends leave it
@@ -949,16 +935,10 @@ async fn handle_client(
                         );
                         // Latch the new viewport. The send thread
                         // notices the seq bump on its next iteration
-                        // and rebuilds the encoder ONLY if encode
-                        // dims actually change — on a GPU session the
-                        // dims stay at capture and the rebuild is
-                        // skipped (no GPU scaler yet). We force an
-                        // IDR regardless so the client sees a clean
-                        // cut on whatever the new dimensions turn
-                        // out to be. On a GPU session that means the
-                        // IDR fires mid-GOP with no epoch bump —
-                        // harmless to the client (a normal IDR), but
-                        // worth a debug breadcrumb in traces.
+                        // and rebuilds the encoder only if encode dims
+                        // actually change. We force an IDR regardless
+                        // so the client sees a clean cut on whatever
+                        // dimensions the backend chooses.
                         let next = if v.is_valid() { Some(v) } else { None };
                         let mut guard = latest_viewport_for_ctl.lock().unwrap();
                         guard.viewport = next;
@@ -968,8 +948,7 @@ async fn handle_client(
                             width = v.width,
                             height = v.height,
                             "SetClientViewport: forcing IDR; encoder rebuild fires only if \
-                             encode dims change (GPU sessions stay at capture dims until a \
-                             GPU-path scaler lands)"
+                             encode dims change"
                         );
                         force_idr_for_viewport.raise();
                     }
@@ -1251,20 +1230,20 @@ struct EncoderSlot {
     /// through `ScalerPipelines::build` again.
     #[cfg(target_os = "linux")]
     scaler_pipelines: Option<Arc<ScalerPipelines>>,
-    /// macOS NV12 IOSurface scaler bridge. Lazily built on the first
-    /// GPU frame after a slot rebuild when capture_dims != encode_dims
-    /// (i.e. the client viewport asks for a smaller encode than SCK
-    /// captures). `None` for 1:1 pass-through, where the SCK IOSurface
-    /// goes directly to the encoder. Built per resolution; rebuilt
-    /// when the slot is recreated.
+    /// macOS BGRA IOSurface -> optional Mitchell scale -> NV12/P010
+    /// IOSurface bridge. Unlike the older YUV-plane bridge, this keeps
+    /// SCK capture in BGRA until the final VideoToolbox input
+    /// conversion, matching the Linux/Windows visual-quality shape.
     #[cfg(target_os = "macos")]
-    iosurface_bridge: Option<Nv12IOSurfaceBridge>,
-    /// The PooledIOSurface used by the *previous* macOS frame. Held
+    bgra_iosurface_bridge: Option<BgraIOSurfaceBridge>,
+    /// VideoToolbox-compatible destination IOSurface fourcc for the
+    /// negotiated 4:2:0 profile (`420v` or `x420`).
+    #[cfg(target_os = "macos")]
+    iosurface_encode_fourcc: u32,
+    /// The PooledIOSurface used by the previous macOS frame. Held
     /// across one frame so VideoToolbox's async encode can drain the
-    /// CVPixelBuffer that wraps the IOSurface before the bridge
-    /// recycles the slot. With a pool depth of 4 and one slot
-    /// retired per frame, two slots stay free for the next acquire —
-    /// plenty of headroom even at sustained high frame rates.
+    /// CVPixelBuffer that wraps the IOSurface before the bridge recycles
+    /// the slot.
     #[cfg(target_os = "macos")]
     prev_pooled: Option<PooledIOSurface>,
 }
@@ -1315,6 +1294,7 @@ enum GpuConvertBridge {
 enum GpuEncodeOutcome {
     Packets(Vec<tether_codec::EncodedPacket>),
     DropFrame(anyhow::Error),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Fatal(anyhow::Error),
 }
 
@@ -1688,41 +1668,10 @@ fn encode_gpu_frame(
 /// `submit_iosurface` performs a fresh CFRetain on the wrapping
 /// CVPixelBuffer so the surface stays valid for the encoder's
 /// async work after we return.
-/// 1:1 pass-through path for macOS GPU frames where capture dims
-/// match encode dims. Bypasses the NV12 IOSurface bridge entirely;
-/// the SCK IOSurface goes straight to the encoder. Lives in its own
-/// function so the send loop can call it without needing a
-/// [`MacosGpuState`] handle for the no-scaling case.
-#[cfg(target_os = "macos")]
-fn encode_iosurface_frame_no_bridge(
-    slot: &mut EncoderSlot,
-    gpu: tether_capture::GpuCapturedFrame,
-    pts: i64,
-    force_keyframe: bool,
-) -> GpuEncodeOutcome {
-    let tether_capture::GpuCapturedSource::IOSurface(iosurface) = gpu.source;
-    let src_frame = tether_codec::IOSurfaceFrame {
-        surface: iosurface.surface,
-        pixel_format: iosurface.pixel_format,
-        width: iosurface.width,
-        height: iosurface.height,
-    };
-    // Drop any retained pooled slot from a prior downscaled session
-    // — we don't need it anymore.
-    slot.prev_pooled = None;
-    match slot
-        .encoder
-        .encode_gpu(GpuEncoderFrame::IOSurface(&src_frame), pts, force_keyframe)
-    {
-        Ok(p) => GpuEncodeOutcome::Packets(p),
-        Err(e) => GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}")),
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn encode_iosurface_frame(
     slot: &mut EncoderSlot,
-    macos_gpu: &mut MacosGpuState,
+    macos_gpu: &mut Option<MacosGpuState>,
     gpu: tether_capture::GpuCapturedFrame,
     pts: i64,
     force_keyframe: bool,
@@ -1734,40 +1683,37 @@ fn encode_iosurface_frame(
         width: iosurface.width,
         height: iosurface.height,
     };
-
-    // Two paths through the macOS GPU encode:
-    //   - capture_dims == encode_dims: feed the SCK IOSurface
-    //     straight to the encoder. No bridge, no scaler.
-    //   - capture_dims != encode_dims: build (or reuse) the
-    //     `Nv12IOSurfaceBridge`, scale into a pooled destination
-    //     IOSurface, feed *that* to the encoder.
-    let needs_bridge = (slot.capture_width, slot.capture_height) != (slot.width, slot.height);
-
-    if needs_bridge {
-        // Lazy-build the bridge. The slot is rebuilt on any dim
-        // change (see the recreate path in the send loop), so a
-        // None here means this is the first GPU frame for this slot.
-        // The bridge borrows the host's shared wgpu device + queue;
-        // creating a fresh Metal device per resolution change would
-        // waste a kernel object and contend for scheduler slots with
-        // the capture and renderer paths.
-        if slot.iosurface_bridge.is_none() {
-            // `submit_iosurface` validates the destination fourcc
-            // matches its `sw_format` family, so the destination
-            // here must come from the encoder's own table — not the
-            // source surface's fourcc. For NV12 sessions today the
-            // two families coincide, but a future range mismatch
-            // (e.g. capture 'f' / encode 'v') would silently allocate
-            // the wrong pool without this derivation.
-            let bridge = match macos_gpu.build_bridge(
-                (slot.capture_width, slot.capture_height),
-                (slot.width, slot.height),
-                src_frame.pixel_format,
-            ) {
-                Ok(b) => b,
+    if is_macos_bgra_fourcc(src_frame.pixel_format) {
+        if slot.iosurface_encode_fourcc == 0 {
+            return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                "BGRA IOSurface capture requires a 4:2:0 VideoToolbox destination fourcc"
+            ));
+        }
+        if macos_gpu.is_none() {
+            match MacosGpuState::new() {
+                Ok(state) => *macos_gpu = Some(state),
                 Err(e) => {
                     return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
-                        "nv12_iosurface bridge construction failed for {}x{} -> {}x{}: {e}",
+                        "macOS BGRA IOSurface bridge device init failed: {e}"
+                    ));
+                }
+            }
+        }
+        let macos_gpu = macos_gpu.as_ref().expect("just initialised");
+        let rebuild_bridge = slot.bgra_iosurface_bridge.as_ref().is_none_or(|bridge| {
+            bridge.src_dims() != (slot.capture_width, slot.capture_height)
+                || bridge.dst_dims() != (slot.width, slot.height)
+        });
+        if rebuild_bridge {
+            let bridge = match macos_gpu.build_bgra_bridge(
+                (slot.capture_width, slot.capture_height),
+                (slot.width, slot.height),
+                slot.iosurface_encode_fourcc,
+            ) {
+                Ok(bridge) => bridge,
+                Err(e) => {
+                    return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                        "BGRA IOSurface bridge construction failed for {}x{} -> {}x{}: {e}",
                         slot.capture_width,
                         slot.capture_height,
                         slot.width,
@@ -1780,95 +1726,67 @@ fn encode_iosurface_frame(
                 capture_h = slot.capture_height,
                 encode_w = slot.width,
                 encode_h = slot.height,
-                fourcc = format_args!("0x{:08x}", src_frame.pixel_format),
-                "NV12 IOSurface bridge built for macOS host downscale"
+                dst_fourcc = format_args!("0x{:08x}", slot.iosurface_encode_fourcc),
+                "BGRA IOSurface bridge built for macOS host encode"
             );
-            slot.iosurface_bridge = Some(bridge);
+            slot.bgra_iosurface_bridge = Some(bridge);
         }
 
-        let bridge = slot.iosurface_bridge.as_ref().expect("just built");
-        let pooled = match bridge.scale_to_iosurface(&src_frame) {
-            Ok(p) => p,
+        let bridge = slot.bgra_iosurface_bridge.as_ref().expect("just built");
+        let pooled = match bridge.convert_to_iosurface(&src_frame) {
+            Ok(pooled) => pooled,
             Err(IOSurfaceBridgeError::PoolExhausted { depth }) => {
-                // Genuine per-frame transient: VT briefly held the
-                // encoder back and N PooledIOSurfaces are in flight.
-                // Drop this frame and let the next one acquire.
                 return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
-                    "nv12_iosurface pool exhausted (depth {depth})"
+                    "BGRA IOSurface pool exhausted (depth {depth})"
                 ));
             }
             Err(e) => {
-                // Any other bridge error from the per-frame path is
-                // structural — NotMetalBacked / MtlImportReturnedNil /
-                // MissingPlanePipelines etc. will recur on every
-                // frame. Treat as fatal so the host emits
-                // Goodbye(InternalError) instead of silently dropping
-                // every frame for the rest of the session.
                 return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
-                    "nv12_iosurface scale failed structurally: {e}"
+                    "BGRA IOSurface convert failed structurally: {e}"
                 ));
             }
         };
-
-        // The bridge has run the scaler against the pool slot's
-        // destination textures. Feed the pool slot's IOSurface to
-        // the encoder; `submit_iosurface` will CF-retain the wrapping
-        // CVPixelBuffer.
         let packets = match slot.encoder.encode_gpu(
             GpuEncoderFrame::IOSurface(&pooled.frame),
             pts,
             force_keyframe,
         ) {
             Ok(p) => p,
-            Err(e) => {
-                return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}"));
-            }
-        };
-
-        // Retire the *previous* frame's PooledIOSurface here (after
-        // VT has had a chance to drain it via this frame's
-        // encode_gpu), keeping the current one alive for one more
-        // frame. With pool depth 4 and the encoder in low-latency
-        // mode (`MaxFrameDelayCount` defaults to 0), this gives 3
-        // slots in rotation — enough for the typical single-frame
-        // VT latency. A future change that bumps `MaxFrameDelayCount`
-        // must also bump `pool_depth` to match.
-        slot.prev_pooled = Some(pooled);
-        GpuEncodeOutcome::Packets(packets)
-    } else {
-        // Capture dims match encode dims: no scaler, no bridge. The
-        // SCK IOSurface goes straight to the encoder. `gpu`'s
-        // `release_guard` keeps the CMSampleBuffer-wrapped IOSurface
-        // alive across the encode call; `submit_iosurface` takes a
-        // fresh CF retain on the wrapping CVPixelBuffer so the surface
-        // outlives this scope as the encoder needs.
-        let packets = match slot.encoder.encode_gpu(
-            GpuEncoderFrame::IOSurface(&src_frame),
-            pts,
-            force_keyframe,
-        ) {
-            Ok(p) => p,
             Err(e) => return GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}")),
         };
-        // If we were previously using the bridge (different viewport)
-        // and now hit a 1:1 frame, the prev_pooled from then is
-        // still pinned here — drop it explicitly. The bridge itself
-        // stays cached (cheap to keep; will be reused if the
-        // viewport changes back).
-        slot.prev_pooled = None;
-        GpuEncodeOutcome::Packets(packets)
+        slot.prev_pooled = Some(pooled);
+        return GpuEncodeOutcome::Packets(packets);
+    }
+
+    slot.prev_pooled = None;
+    match slot
+        .encoder
+        .encode_gpu(GpuEncoderFrame::IOSurface(&src_frame), pts, force_keyframe)
+    {
+        Ok(p) => GpuEncodeOutcome::Packets(p),
+        Err(e) => GpuEncodeOutcome::DropFrame(anyhow::anyhow!("encode_gpu: {e}")),
     }
 }
 
-/// macOS host-side GPU state: one wgpu Metal device + queue, shared
-/// across the lifetime of the session. The NV12 IOSurface scaler
-/// bridge borrows handles from here on each (re)build, instead of
-/// constructing a fresh Metal device per viewport change (which would
-/// waste a kernel object and prevent cross-bridge IOSurface sharing).
-///
-/// Lazily initialised on the first downscaled GPU frame — a session
-/// that never asks for a viewport smaller than the capture pays
-/// nothing for the device handle.
+#[cfg(target_os = "macos")]
+fn is_macos_bgra_fourcc(fourcc: u32) -> bool {
+    fourcc == u32::from_be_bytes(*b"BGRA")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_iosurface_encode_fourcc(profile: VideoProfile) -> Option<u32> {
+    use tether_codec::macos_interop::{
+        NV12_VIDEO_RANGE_FOURCC, NV24_VIDEO_RANGE_FOURCC, X420_FOURCC, X444_FOURCC,
+    };
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => Some(NV12_VIDEO_RANGE_FOURCC),
+        (ChromaSubsampling::Yuv420, 10) => Some(X420_FOURCC),
+        (ChromaSubsampling::Yuv444, 8) => Some(NV24_VIDEO_RANGE_FOURCC),
+        (ChromaSubsampling::Yuv444, 10) => Some(X444_FOURCC),
+        _ => None,
+    }
+}
+
 #[cfg(target_os = "macos")]
 struct MacosGpuState {
     device: wgpu::Device,
@@ -1877,46 +1795,30 @@ struct MacosGpuState {
 
 #[cfg(target_os = "macos")]
 impl MacosGpuState {
-    /// Construct the shared wgpu Metal device + queue. Called at
-    /// most once per session; the result lives until the send loop
-    /// exits. Hard-fails on any adapter problem so a bridge attempt
-    /// in `encode_iosurface_frame` can rely on `MacosGpuState`
-    /// already being valid (or the host has already exited via
-    /// `Goodbye(InternalError)` at slot construction).
     fn new() -> anyhow::Result<Self> {
-        // Delegate to the shared helper in tether-gpuconvert so the
-        // device-features contract has exactly one source of truth.
-        // The iosurface_test hardware suite uses the same helper, so
-        // production and test paths can't drift.
         let (device, queue, caps) =
             pollster::block_on(tether_gpuconvert::nv12_iosurface::build_bridge_device())?;
         tracing::info!(
             supports_10bit = caps.supports_10bit,
-            "macOS NV12 IOSurface bridge wgpu device built"
+            "macOS BGRA IOSurface bridge wgpu device built"
         );
         Ok(Self { device, queue })
     }
 
-    fn build_bridge(
+    fn build_bgra_bridge(
         &self,
         src_dims: (u32, u32),
         dst_dims: (u32, u32),
-        fourcc: u32,
-    ) -> anyhow::Result<Nv12IOSurfaceBridge> {
-        Nv12IOSurfaceBridge::new(
+        dst_fourcc: u32,
+    ) -> anyhow::Result<BgraIOSurfaceBridge> {
+        BgraIOSurfaceBridge::new(
             self.device.clone(),
             self.queue.clone(),
             src_dims,
             dst_dims,
-            fourcc,
+            dst_fourcc,
         )
-        .map_err(|e| match e {
-            IOSurfaceBridgeError::NoScaleNeeded { dims } => anyhow::anyhow!(
-                "bridge construction got NoScaleNeeded for dims {dims:?} — caller \
-                     should have skipped the bridge path"
-            ),
-            other => anyhow::anyhow!("Nv12IOSurfaceBridge::new: {other}"),
-        })
+        .map_err(|e| anyhow::anyhow!("BgraIOSurfaceBridge::new: {e}"))
     }
 }
 
@@ -2492,18 +2394,17 @@ mod cursor_pump_tests {
     }
 }
 
-/// Encoder alignment in pixels. H.264 / HEVC both want even widths
-/// (chroma sampling); HEVC Main444 hardware encoders empirically
-/// reject widths that aren't a multiple of 16. Round to 16 to cover
-/// all cases — the worst-case waste is 15 pixels per side, which is
-/// invisible at any reasonable client window size.
-const ENCODER_ALIGN: u32 = 16;
+/// Visible stream dimensions are kept even for 4:2:0 luma/chroma
+/// geometry. Hardware paths that need coarser coded or pitch alignment
+/// should pad/crop internally instead of bending the displayed aspect
+/// ratio.
+const VISIBLE_DIM_ALIGN: u32 = 2;
 
 /// Compute the encoder-output dimensions for a given capture size
 /// and client viewport. The viewport bounds the longest edge; we
 /// preserve aspect ratio (letterbox at the client; never stretch)
-/// and clamp to [`ENCODER_ALIGN`]. `None` returns the capture dims
-/// (with the same alignment guarantee).
+/// and clamp viewport-driven outputs to [`VISIBLE_DIM_ALIGN`]. `None`
+/// returns the capture dims unchanged.
 // Scaled dimensions are non-negative (scale clamped to <= 1.0, dims positive)
 // and far below u32::MAX; the round-then-cast is intentional.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -2520,21 +2421,43 @@ fn encode_dims_for_viewport(
     let Some(v) = viewport.filter(|v| v.is_valid()) else {
         return (capture_w, capture_h);
     };
-    // Fit capture inside viewport at fixed aspect ratio: scale by the
-    // smaller of the two ratios. Never upscale — the client renderer
-    // can scale up for cheap; we're not paying the encoder cost to do
-    // it host-side.
+    // Fit capture inside viewport at fixed aspect ratio. Never upscale
+    // — the client renderer can scale up for cheap; we're not paying
+    // the encoder cost to do it host-side.
     let scale_w = f64::from(v.width) / f64::from(capture_w);
     let scale_h = f64::from(v.height) / f64::from(capture_h);
-    let scale = scale_w.min(scale_h).min(1.0);
-    let target_w = (f64::from(capture_w) * scale).round() as u32;
-    let target_h = (f64::from(capture_h) * scale).round() as u32;
-    // When viewport IS in play we floor to 16: the encoder rejects
-    // misaligned dims on HEVC Main444 hardware, and floor (not
-    // nearest) is what keeps us inside the viewport budget.
-    let aligned_w = (target_w / ENCODER_ALIGN) * ENCODER_ALIGN;
-    let aligned_h = (target_h / ENCODER_ALIGN) * ENCODER_ALIGN;
-    (aligned_w.max(ENCODER_ALIGN), aligned_h.max(ENCODER_ALIGN))
+    if scale_w >= 1.0 && scale_h >= 1.0 {
+        return (capture_w, capture_h);
+    }
+
+    if scale_w <= scale_h {
+        let aligned_w = align_floor(v.width.min(capture_w)).max(VISIBLE_DIM_ALIGN);
+        let exact_h = f64::from(aligned_w) * f64::from(capture_h) / f64::from(capture_w);
+        let aligned_h = align_nearest_within(exact_h, v.height.min(capture_h));
+        (aligned_w, aligned_h)
+    } else {
+        let aligned_h = align_floor(v.height.min(capture_h)).max(VISIBLE_DIM_ALIGN);
+        let exact_w = f64::from(aligned_h) * f64::from(capture_w) / f64::from(capture_h);
+        let aligned_w = align_nearest_within(exact_w, v.width.min(capture_w));
+        (aligned_w, aligned_h)
+    }
+}
+
+fn align_floor(value: u32) -> u32 {
+    (value / VISIBLE_DIM_ALIGN) * VISIBLE_DIM_ALIGN
+}
+
+// Alignment can make the exact aspect-preserving dimension impossible.
+// Pick the nearest aligned dimension that still fits the viewport/source cap.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn align_nearest_within(exact: f64, limit: u32) -> u32 {
+    let floor = align_floor(exact.floor() as u32);
+    let ceil = floor.saturating_add(VISIBLE_DIM_ALIGN);
+    if ceil <= limit && (f64::from(ceil) - exact).abs() < (exact - f64::from(floor)).abs() {
+        ceil.max(VISIBLE_DIM_ALIGN)
+    } else {
+        floor.max(VISIBLE_DIM_ALIGN)
+    }
 }
 
 /// Pure CPU bilinear BGRA resize. Used on the [`CapturedFrame::Cpu`]
@@ -2848,13 +2771,8 @@ fn run_capture_and_send(
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
     let mut slot: Option<EncoderSlot> = None;
-    // macOS-only host GPU state: shared wgpu Metal device + queue for
-    // the NV12 IOSurface scaler bridge. Lazily initialised on the
-    // first downscaled GPU frame; a session that never asks for a
-    // viewport smaller than the capture stays at `None` and pays
-    // nothing for the Metal device.
     #[cfg(target_os = "macos")]
-    let mut macos_gpu: Option<MacosGpuState> = None;
+    let mut macos_gpu_state: Option<MacosGpuState> = None;
     let mut pts: i64 = 0;
     // Frame-change classifier. CPU frames get a strided hash; GPU
     // frames bypass it (zero-copy path mustn't read back). Resolution
@@ -2939,10 +2857,10 @@ fn run_capture_and_send(
         //   - Linux GPU dma-buf: `tether-scaler` (Mitchell-Netravali
         //     in linear-light) runs inside `encode_gpu_frame` between
         //     PipeWire's BGRA import and the chroma bridge.
-        //   - macOS GPU IOSurface: `tether-gpuconvert::nv12_iosurface`
-        //     (Mitchell-Netravali in YUV space with cosited UV
-        //     siting) runs inside `encode_iosurface_frame` between
-        //     SCK's NV12 IOSurface and `submit_iosurface`.
+        //   - macOS GPU IOSurface: capture full-res BGRA from SCK,
+        //     then `BgraIOSurfaceBridge` runs MPS Lanczos before
+        //     converting into VT-ready NV12/P010/NV24/P410-family
+        //     IOSurfaces for the negotiated profile.
         let (encode_width, encode_height) =
             encode_dims_for_viewport(frame_width, frame_height, current_viewport);
         // viewport_seq isn't part of the rebuild check: only an actual
@@ -3066,6 +2984,9 @@ fn run_capture_and_send(
                              (encode dims too small for the configured floor)"
                         );
                     }
+                    #[cfg(target_os = "macos")]
+                    let iosurface_encode_fourcc =
+                        macos_iosurface_encode_fourcc(chosen_profile).unwrap_or(0);
                     Some(EncoderSlot {
                         encoder: e,
                         capture_width: frame_width,
@@ -3080,7 +3001,9 @@ fn run_capture_and_send(
                         #[cfg(target_os = "linux")]
                         scaler_pipelines: None,
                         #[cfg(target_os = "macos")]
-                        iosurface_bridge: None,
+                        bgra_iosurface_bridge: None,
+                        #[cfg(target_os = "macos")]
+                        iosurface_encode_fourcc,
                         #[cfg(target_os = "macos")]
                         prev_pooled: None,
                     })
@@ -3187,47 +3110,7 @@ fn run_capture_and_send(
             },
             #[cfg(target_os = "macos")]
             CapturedFrame::Gpu(gpu) => {
-                // Lazy-init the host-shared wgpu Metal device on the
-                // first downscaled GPU frame. A startup-time
-                // construction would force the cost on sessions that
-                // never need scaling; this defers it until we know
-                // the bridge will actually be built.
-                if macos_gpu.is_none()
-                    && (slot_mut.capture_width, slot_mut.capture_height)
-                        != (slot_mut.width, slot_mut.height)
-                {
-                    match MacosGpuState::new() {
-                        Ok(s) => {
-                            info!("macOS GPU state initialised for NV12 IOSurface bridge");
-                            macos_gpu = Some(s);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "macOS GPU state init failed; sending Goodbye(InternalError) and exiting send loop"
-                            );
-                            let goodbye_conn = conn.clone();
-                            let reason = format!("host macOS GPU state init failed: {e}");
-                            let _ = runtime.block_on(goodbye_conn.send_control(
-                                &ControlMessage::Goodbye {
-                                    reason,
-                                    code: tether_protocol::control::GoodbyeCode::InternalError,
-                                },
-                            ));
-                            return;
-                        }
-                    }
-                }
-                let outcome = if let Some(state) = macos_gpu.as_mut() {
-                    encode_iosurface_frame(slot_mut, state, gpu, pts, force_kf)
-                } else {
-                    // 1:1 pass-through path doesn't need MacosGpuState.
-                    // encode_iosurface_frame takes &mut MacosGpuState
-                    // unconditionally, so route through a synthetic
-                    // path that bypasses the bridge entirely.
-                    encode_iosurface_frame_no_bridge(slot_mut, gpu, pts, force_kf)
-                };
-                match outcome {
+                match encode_iosurface_frame(slot_mut, &mut macos_gpu_state, gpu, pts, force_kf) {
                     GpuEncodeOutcome::Packets(p) => p,
                     GpuEncodeOutcome::DropFrame(e) => {
                         warn!(error = %e, "IOSurface encode failed; dropping frame");
@@ -3236,10 +3119,10 @@ fn run_capture_and_send(
                     GpuEncodeOutcome::Fatal(e) => {
                         tracing::error!(
                             error = %e,
-                            "macOS GPU encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
+                            "IOSurface encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
                         );
                         let goodbye_conn = conn.clone();
-                        let reason = format!("host macOS GPU encode bridge collapsed: {e}");
+                        let reason = format!("host IOSurface encode bridge collapsed: {e}");
                         let _ =
                             runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
                                 reason,
@@ -3528,6 +3411,7 @@ fn spawn_stdin_command_watcher(
 async fn pick_capture_source(
     force_test_pattern: bool,
     chosen_profile: VideoProfile,
+    initial_viewport: Option<Viewport>,
 ) -> anyhow::Result<tether_capture::CaptureHandle> {
     if force_test_pattern {
         info!(
@@ -3542,12 +3426,13 @@ async fn pick_capture_source(
             TEST_PATTERN_FPS,
         ));
     }
-    real_capture(chosen_profile).await
+    real_capture(chosen_profile, initial_viewport).await
 }
 
 #[cfg(target_os = "linux")]
 async fn real_capture(
     _chosen_profile: VideoProfile,
+    _initial_viewport: Option<Viewport>,
 ) -> anyhow::Result<tether_capture::CaptureHandle> {
     info!("capture source: linux (PipeWire + xdg-desktop-portal)");
     // Query which DRM modifiers our wgpu/Vulkan importer can consume for
@@ -3586,26 +3471,14 @@ async fn real_capture(
 
 #[cfg(target_os = "macos")]
 async fn real_capture(
-    chosen_profile: VideoProfile,
+    _chosen_profile: VideoProfile,
+    _initial_viewport: Option<Viewport>,
 ) -> anyhow::Result<tether_capture::CaptureHandle> {
-    // Pick the SCK pixel format that matches the negotiated encoder
-    // profile. The encoder's `submit_iosurface` cross-checks the
-    // delivered IOSurface fourcc against this; a mismatch would refuse
-    // the zero-copy fast path. SCK's `start_capture` triggers the
-    // macOS ScreenRecording TCC prompt on first run; subsequent runs
-    // reuse the granted permission.
-    let pixel_format = match tether_capture::macos::sck_pixel_format_for_profile(chosen_profile) {
-        tether_capture::macos::SckCapabilityCheck::Supported(p) => p,
-        tether_capture::macos::SckCapabilityCheck::Unsupported => {
-            anyhow::bail!(
-                "no SCK pixel format models the negotiated profile {:?} — the \
-                 capture-bridge filter should have prevented this profile from \
-                 reaching negotiation",
-                chosen_profile
-            );
-        }
-    };
-    tether_capture::macos::start(pixel_format)
+    // Capture BGRA for every macOS host profile. The Metal bridge is
+    // the single live conversion path: MPS Lanczos handles viewport
+    // downscale, then the compute kernel writes the VideoToolbox input
+    // fourcc for the negotiated chroma/bit-depth.
+    tether_capture::macos::start(tether_capture::macos::sck_bgra_pixel_format())
         .await
         .map_err(anyhow::Error::from)
 }
@@ -3621,6 +3494,7 @@ static PRECREATED_CAPTURE: std::sync::Mutex<Option<tether_capture::windows::PreC
 #[cfg(target_os = "windows")]
 async fn real_capture(
     _chosen_profile: VideoProfile,
+    _initial_viewport: Option<Viewport>,
 ) -> anyhow::Result<tether_capture::CaptureHandle> {
     info!("capture source: windows (DXGI Desktop Duplication)");
     let pre = PRECREATED_CAPTURE.lock().unwrap().take();
@@ -3638,6 +3512,7 @@ async fn real_capture(
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn real_capture(
     _chosen_profile: VideoProfile,
+    _initial_viewport: Option<Viewport>,
 ) -> anyhow::Result<tether_capture::CaptureHandle> {
     warn!("no real capture backend on this platform yet; falling back to test-pattern");
     Ok(tether_capture::test_pattern::start(
@@ -3667,7 +3542,7 @@ fn init_tracing(ipc: bool) -> tracing_appender::non_blocking::WorkerGuard {
 }
 
 /// Default VBR target bitrate as a function of resolution, fps,
-/// codec, and chroma. Anchored at 1080p60 H.264 4:2:0 = 8 Mbps (the
+/// codec, and chroma. Anchored at 1080p60 H.264 4:2:0 = 10 Mbps (the
 /// [`ENCODER_BITRATE_KBPS`] floor); scales linearly with `pixels × fps`;
 /// HEVC gets a 0.7× codec multiplier (conservative ~30% efficiency
 /// gain over H.264 at the same visual quality); 4:4:4 gets a 1.4×
@@ -3777,8 +3652,7 @@ mod tests {
     #[test]
     fn encode_dims_viewport_smaller_letterboxes() {
         // 3840x2160 captured, client viewport 1280x720. Aspect
-        // matches (16:9), so we expect 1280x720 exactly (both
-        // 16-aligned).
+        // matches (16:9), so we expect 1280x720 exactly.
         assert_eq!(
             encode_dims_for_viewport(3840, 2160, Some(Viewport::new(1280, 720))),
             (1280, 720)
@@ -3822,15 +3696,37 @@ mod tests {
     }
 
     #[test]
-    fn encode_dims_rounds_down_to_alignment() {
-        // Off-aspect viewport that lands the output on non-16-aligned
-        // dims. We must round DOWN — the encoder rejects unaligned
-        // input on hardware Main444 backends, and overshooting would
-        // mean we ship more pixels than the client asked for.
+    fn encode_dims_viewport_scales_macos_hidpi_without_aspect_bend() {
+        // Regression for the macOS host blur investigation: the old
+        // 16x16 clamp turned this into 1728x1104, visibly changing
+        // the source aspect ratio.
+        assert_eq!(
+            encode_dims_for_viewport(3024, 1952, Some(Viewport::new(1920, 1116))),
+            (1728, 1116)
+        );
+    }
+
+    #[test]
+    fn encode_dims_rounds_to_even_chroma_safe_visible_grid() {
+        // Off-aspect viewport that lands the output on odd dimensions.
+        // The visible stream snaps only to a small chroma-safe grid;
+        // any coarser coded alignment belongs in backend padding/crop,
+        // not in the displayed aspect ratio.
         let (w, h) = encode_dims_for_viewport(1920, 1080, Some(Viewport::new(1000, 600)));
-        assert_eq!(w % 16, 0);
-        assert_eq!(h % 16, 0);
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
         assert!(w <= 1000 && h <= 600);
+    }
+
+    #[test]
+    fn encode_dims_five_k_two_k_viewport_uses_nearest_even_height() {
+        // 7680x3232 on a 1600-wide viewport lands at 673.33 px high.
+        // Even-only snapping chooses 674, avoiding the larger aspect
+        // bend introduced by a 4-pixel grid.
+        assert_eq!(
+            encode_dims_for_viewport(7680, 3232, Some(Viewport::new(1600, 900))),
+            (1600, 674)
+        );
     }
 
     #[test]
@@ -3936,8 +3832,8 @@ mod tests {
     /// path. Four crates each carry a `(chroma, bit_depth) → fourcc`
     /// table:
     ///
-    ///   * `tether_capture::macos::sck_pixel_format_for_profile` — the
-    ///     fourcc SCK will deliver for a chosen `VideoProfile`.
+    ///   * `macos_iosurface_encode_fourcc` — the fourcc the macOS
+    ///     Metal bridge will deliver for a chosen `VideoProfile`.
     ///   * `tether_codec::videotoolbox::encoder::iosurface_fourcc_matches`
     ///     — the fourccs the VT encoder accepts as zero-copy input.
     ///   * `tether_codec::videotoolbox::probe::expected_iosurface_fourccs`
@@ -3947,12 +3843,12 @@ mod tests {
     ///   * `tether_render::accepts_iosurface_fourcc` — the fourccs the
     ///     renderer's IOSurface import path accepts.
     ///
-    /// The full pipeline is `SCK → encoder → decoder → renderer`. For
+    /// The full pipeline is `SCK BGRA → Metal bridge → encoder → decoder → renderer`. For
     /// each profile we negotiate, the per-link invariants are:
     ///
-    ///   * **SCK output ⊆ encoder accept** — the encoder must accept
-    ///     whatever the capture layer delivers. A miss here crashes
-    ///     the first frame after handshake.
+    ///   * **Bridge output ⊆ encoder accept** — the encoder must accept
+    ///     whatever the Metal bridge produces. A miss here crashes
+    ///     the first bridged frame after handshake.
     ///   * **Decoder output (probe expected) ⊆ renderer accept** —
     ///     the renderer must accept anything the VT decoder might
     ///     emit. A miss here silently drops every frame after
@@ -3968,7 +3864,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_iosurface_fourcc_tables_agree_across_crates() {
-        use tether_capture::macos::sck_pixel_format_for_profile;
         use tether_codec::videotoolbox::encoder::iosurface_fourcc_matches;
         use tether_codec::videotoolbox::expected_iosurface_fourccs;
         use tether_probe::PROFILE_PREFERENCE;
@@ -3979,16 +3874,20 @@ mod tests {
             let chroma = profile.chroma;
             let bd = profile.bit_depth;
 
-            // (1) SCK output ⊆ encoder accept.
-            // If SCK has a mapping for this profile, whatever it
-            // would deliver must be in the encoder's accept set.
-            if let Some(fourcc) = sck_pixel_format_for_profile(*profile).fourcc() {
-                assert!(
-                    iosurface_fourcc_matches(chroma, bd, fourcc),
-                    "SCK delivers 0x{fourcc:08x} for profile {profile:?} but the VT encoder \
-                     does not accept it via submit_iosurface. This would crash at first frame."
-                );
-            }
+            // (1) Metal bridge output ⊆ encoder + renderer accept.
+            let Some(fourcc) = macos_iosurface_encode_fourcc(*profile) else {
+                continue;
+            };
+            assert!(
+                iosurface_fourcc_matches(chroma, bd, fourcc),
+                "Metal bridge produces 0x{fourcc:08x} for profile {profile:?} but the VT encoder \
+                 does not accept it via submit_iosurface. This would crash at first bridged frame."
+            );
+            assert!(
+                accepts_iosurface_fourcc(chroma, bd, fourcc),
+                "Metal bridge produces 0x{fourcc:08x} for profile {profile:?} but the renderer \
+                 rejects that IOSurface family. The encode/decode loopback would not be displayable."
+            );
 
             // (2) Probe expected ⊆ renderer accept.
             // Every fourcc the VT decoder might emit for a confirmed

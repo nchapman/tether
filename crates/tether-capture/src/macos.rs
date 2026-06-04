@@ -1,11 +1,12 @@
 //! macOS screen capture via ScreenCaptureKit.
 //!
 //! Calling [`start`] discovers the primary display via `SCShareableContent`,
-//! builds an NV12 (`YCbCr_420v`) stream, and spawns a delegate that emits
-//! one [`CapturedFrame::Gpu`] per `CMSampleBuffer` carrying a live
-//! `IOSurface`. The sample-buffer dispatch queue is owned by SCK; we
-//! retain each `CMSampleBuffer` in the per-frame `release_guard` so the
-//! underlying IOSurface stays valid until the consumer drops the frame.
+//! builds a stream for the requested pixel format (BGRA in the live macOS
+//! host path), and spawns a delegate that emits one [`CapturedFrame::Gpu`]
+//! per `CMSampleBuffer` carrying a live `IOSurface`. The sample-buffer
+//! dispatch queue is owned by SCK; we retain each `CMSampleBuffer` in the
+//! per-frame `release_guard` so the underlying IOSurface stays valid until
+//! the consumer drops the frame.
 //!
 //! Permission model: the first `start_capture` call triggers the macOS
 //! ScreenRecording TCC prompt. There's no synchronous preflight that
@@ -33,6 +34,7 @@ use screencapturekit::prelude::{
     CMSampleBuffer, PixelFormat, SCContentFilter, SCShareableContent, SCStream,
     SCStreamConfiguration, SCStreamOutputTrait, SCStreamOutputType,
 };
+use screencapturekit::stream::configuration::SCCaptureResolutionType;
 use screencapturekit::FourCharCode;
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 use tether_protocol::MonoNanos;
@@ -52,6 +54,8 @@ const CAPTURE_CHANNEL_DEPTH: usize = 2;
 /// as a producer cap, so they don't need to be the same call site —
 /// just the same value.
 const CAPTURE_FPS: u32 = 60;
+
+const ENV_SCK_CAPTURE_SIZE: &str = "TETHER_SCK_CAPTURE_SIZE";
 
 /// Start ScreenCaptureKit on the primary display with the requested
 /// pixel format.
@@ -100,17 +104,19 @@ pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
     }
 
     let (tx, rx) = bounded::<CapturedFrame>(CAPTURE_CHANNEL_DEPTH);
-    let (ready_tx, ready_rx) = bounded::<Result<CaptureGeometry>>(1);
+    let (ready_tx, ready_rx) = bounded::<Result<CaptureReady>>(1);
     let stop = Arc::new(AtomicBool::new(false));
 
     let stop_thread = Arc::clone(&stop);
     std::thread::Builder::new()
         .name("tether-capture-sck".into())
-        .spawn(move || run_capture_thread(tx, ready_tx, stop_thread, pixel_format))?;
+        .spawn(move || {
+            run_capture_thread(tx, ready_tx, stop_thread, pixel_format);
+        })?;
 
     // Block on the readiness signal from the capture thread without
     // tying up the async runtime.
-    let geom = tokio::task::spawn_blocking(move || ready_rx.recv())
+    let ready = tokio::task::spawn_blocking(move || ready_rx.recv())
         .await
         .map_err(|e| CaptureError::Sck(format!("capture thread join: {e}")))?
         .map_err(|_| CaptureError::Sck("capture thread exited before signaling ready".into()))??;
@@ -126,24 +132,15 @@ pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
     // observable via `CaptureHandle::target_fps` but don't change
     // the actual SCK cadence — see `CaptureHandle` docs.
     let target_fps = Arc::new(AtomicU32::new(CAPTURE_FPS));
-    let cursor_source = crate::cursor_macos::start(crate::cursor_macos::CaptureGeometry {
-        logical_point_w: geom.logical_point_w,
-        logical_point_h: geom.logical_point_h,
-        capture_pixel_w: geom.capture_pixel_w,
-        capture_pixel_h: geom.capture_pixel_h,
-    });
+    let cursor_source = crate::cursor_macos::start(ready.cursor_geom);
     Ok(CaptureHandle::from_parts(rx, target_fps).with_cursor_source(cursor_source))
 }
 
 /// Geometry of the live capture stream, plumbed from the capture
 /// thread back to `start` so it can hand the cursor source the
 /// point-to-pixel scale.
-#[derive(Clone, Copy, Debug)]
-struct CaptureGeometry {
-    logical_point_w: f64,
-    logical_point_h: f64,
-    capture_pixel_w: u32,
-    capture_pixel_h: u32,
+struct CaptureReady {
+    cursor_geom: crate::cursor_macos::CaptureGeometry,
 }
 
 /// Drive the SCStream lifecycle on a dedicated thread.
@@ -156,19 +153,19 @@ struct CaptureGeometry {
 /// 4. Stops the stream and lets it drop.
 fn run_capture_thread(
     tx: Sender<CapturedFrame>,
-    ready_tx: Sender<Result<CaptureGeometry>>,
+    ready_tx: Sender<Result<CaptureReady>>,
     stop: Arc<AtomicBool>,
     pixel_format: PixelFormat,
 ) {
     let stop_handler = Arc::clone(&stop);
-    let (stream, geom) = match build_and_start_stream(tx, stop_handler, pixel_format) {
+    let (stream, cursor_geom) = match build_and_start_stream(tx, stop_handler, pixel_format) {
         Ok(s) => s,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
-    let _ = ready_tx.send(Ok(geom));
+    let _ = ready_tx.send(Ok(CaptureReady { cursor_geom }));
 
     // Park until the frame handler signals shutdown. SCK delivers
     // samples on its own dispatch queue, so this thread has nothing to
@@ -187,7 +184,7 @@ fn build_and_start_stream(
     tx: Sender<CapturedFrame>,
     stop: Arc<AtomicBool>,
     pixel_format: PixelFormat,
-) -> Result<(SCStream, CaptureGeometry)> {
+) -> Result<(SCStream, crate::cursor_macos::CaptureGeometry)> {
     let content = SCShareableContent::get()?;
     let primary =
         content.displays().into_iter().next().ok_or_else(|| {
@@ -243,22 +240,8 @@ fn build_and_start_stream(
         );
         (logical_w, logical_h)
     };
-    // Align capture dims down to the encoder's 16-pixel block grid.
-    // Without this, the host's encode_dims_for_viewport floor-to-16
-    // would shrink encode dims below capture dims by a few pixels
-    // (e.g. 1512 → 1504), forcing the NV12 IOSurface bridge to
-    // engage for what's really a block-alignment trim, not a real
-    // viewport downscale. That spurious engagement crashes 10-bit
-    // sessions (the bridge's 10-bit pipelines aren't wired yet) and
-    // wastes Mitchell scaler work in 8-bit sessions for an 8-pixel
-    // crop the encoder could have done on its own. Captures already
-    // discard cropped content via SPS/PPS crop offsets at the
-    // decoder, so the visual loss is bounded to ≤15px on each axis.
-    const CAPTURE_ALIGN: u32 = 16;
-    let width = (raw_w / CAPTURE_ALIGN) * CAPTURE_ALIGN;
-    let height = (raw_h / CAPTURE_ALIGN) * CAPTURE_ALIGN;
-    let width = width.max(CAPTURE_ALIGN);
-    let height = height.max(CAPTURE_ALIGN);
+    let dims = sck_configured_capture_dims(raw_w, raw_h);
+    let (width, height) = (dims.width, dims.height);
     tracing::info!(
         display_id,
         logical_w,
@@ -269,6 +252,8 @@ fn build_and_start_stream(
         capture_h = height,
         fps = CAPTURE_FPS,
         pixel_format = %pixel_format,
+        capture_resolution = %SCCaptureResolutionType::Best,
+        capture_size_override = dims.override_label.as_deref(),
         "capture source: macOS (ScreenCaptureKit, primary display)"
     );
 
@@ -276,17 +261,40 @@ fn build_and_start_stream(
         .with_display(&primary)
         .with_excluding_windows(&[])
         .build();
-    // Configure SCK at the display's *backing pixel* grid, aligned
-    // to the encoder block size. The host's NV12 IOSurface bridge
-    // downscales to the client's viewport only when it's a real
-    // downscale, not a block-alignment trim. Capturing at the
-    // logical-point grid here would lock the wire stream to that
-    // resolution and force the client's renderer to upscale —
-    // producing the blurry output observed on Retina hosts.
-    let config = SCStreamConfiguration::new()
+    // Configure SCK at the display's backing-pixel grid, aligned to the
+    // encoder block size. Viewport sizing happens downstream in the host
+    // encode path; `TETHER_SCK_CAPTURE_SIZE` remains as an explicit
+    // diagnostic override for comparing Apple's native downscale.
+    let config = stream_config(pixel_format, width, height);
+
+    let mut stream = SCStream::new(&filter, &config);
+    let thread_handle = std::thread::current();
+    let cursor_geom = crate::cursor_macos::CaptureGeometry {
+        logical_point_w: f64::from(logical_w),
+        logical_point_h: f64::from(logical_h),
+        capture_pixel_w: width,
+        capture_pixel_h: height,
+    };
+    let handler = FrameHandler {
+        tx,
+        stop,
+        wake: thread_handle,
+    };
+    stream.add_output_handler(handler, SCStreamOutputType::Screen);
+    stream.start_capture()?;
+    Ok((stream, cursor_geom))
+}
+
+fn stream_config(pixel_format: PixelFormat, width: u32, height: u32) -> SCStreamConfiguration {
+    SCStreamConfiguration::new()
         .with_pixel_format(pixel_format)
         .with_width(width)
         .with_height(height)
+        // Default `Automatic` may trade source fidelity for bandwidth.
+        // We do our own explicit viewport sizing and bitrate control, so
+        // ask SCK to sample the source at the best available resolution
+        // before delivering our configured output dimensions.
+        .with_capture_resolution_type(SCCaptureResolutionType::Best)
         .with_fps(CAPTURE_FPS)
         // Low queue depth keeps capture-side latency tight; the wire
         // path already absorbs jitter via the fragmenter. Previously
@@ -300,26 +308,54 @@ fn build_and_start_stream(
         // Cursor is extracted out-of-band by `cursor_macos` and
         // overlay-rendered on the client at sub-frame latency. Leaving
         // SCK's in-frame cursor on would double-draw it.
-        .with_shows_cursor(false);
+        .with_shows_cursor(false)
+}
 
-    let mut stream = SCStream::new(&filter, &config);
-    let thread_handle = std::thread::current();
-    let handler = FrameHandler {
-        tx,
-        stop,
-        wake: thread_handle,
+#[derive(Debug)]
+struct SckCaptureDims {
+    width: u32,
+    height: u32,
+    override_label: Option<String>,
+}
+
+fn sck_configured_capture_dims(raw_w: u32, raw_h: u32) -> SckCaptureDims {
+    let (native_w, native_h) = sck_native_capture_dims(raw_w, raw_h);
+    let Some(requested) = std::env::var(ENV_SCK_CAPTURE_SIZE)
+        .ok()
+        .and_then(|v| parse_capture_size(&v))
+    else {
+        return SckCaptureDims {
+            width: native_w,
+            height: native_h,
+            override_label: None,
+        };
+    };
+
+    let (width, height) = align_capture_dims(requested.0, requested.1);
+    if (width, height) != requested {
+        tracing::warn!(
+            requested_w = requested.0,
+            requested_h = requested.1,
+            capture_w = width,
+            capture_h = height,
+            "TETHER_SCK_CAPTURE_SIZE floored to encoder alignment"
+        );
+    }
+    SckCaptureDims {
         width,
         height,
-    };
-    stream.add_output_handler(handler, SCStreamOutputType::Screen);
-    stream.start_capture()?;
-    let geom = CaptureGeometry {
-        logical_point_w: f64::from(logical_w),
-        logical_point_h: f64::from(logical_h),
-        capture_pixel_w: width,
-        capture_pixel_h: height,
-    };
-    Ok((stream, geom))
+        override_label: Some(format!("{}x{}", width, height)),
+    }
+}
+
+fn parse_capture_size(value: &str) -> Option<(u32, u32)> {
+    let (w, h) = value
+        .trim()
+        .split_once('x')
+        .or_else(|| value.trim().split_once('X'))?;
+    let w = w.trim().parse::<u32>().ok()?;
+    let h = h.trim().parse::<u32>().ok()?;
+    (w > 0 && h > 0).then_some((w, h))
 }
 
 struct FrameHandler {
@@ -331,8 +367,6 @@ struct FrameHandler {
     /// `park_timeout` immediately on disconnect rather than waiting for
     /// the next 100 ms tick.
     wake: std::thread::Thread,
-    width: u32,
-    height: u32,
 }
 
 impl SCStreamOutputTrait for FrameHandler {
@@ -344,7 +378,7 @@ impl SCStreamOutputTrait for FrameHandler {
             return;
         }
         let t_capture_userspace = MonoNanos::now();
-        let Some(frame) = build_frame(&sample, self.width, self.height, t_capture_userspace) else {
+        let Some(frame) = build_frame(&sample, t_capture_userspace) else {
             return;
         };
         match self.tx.try_send(frame) {
@@ -366,15 +400,12 @@ impl SCStreamOutputTrait for FrameHandler {
     }
 }
 
-fn build_frame(
-    sample: &CMSampleBuffer,
-    width: u32,
-    height: u32,
-    t_capture_userspace: MonoNanos,
-) -> Option<CapturedFrame> {
+fn build_frame(sample: &CMSampleBuffer, t_capture_userspace: MonoNanos) -> Option<CapturedFrame> {
     let pixel_buffer: CVPixelBuffer = sample.image_buffer()?;
     let iosurface = pixel_buffer.io_surface()?;
     let pixel_format = pixel_buffer.pixel_format();
+    let width = u32::try_from(pixel_buffer.width()).ok()?;
+    let height = u32::try_from(pixel_buffer.height()).ok()?;
     let surface_ptr = iosurface.as_ptr();
 
     // SCK's `CMSampleBuffer::presentation_timestamp` rides a CMClock
@@ -441,6 +472,27 @@ fn native_damage_for_frame_status(status: SCFrameStatus) -> NativeDamage {
     }
 }
 
+/// Diagnostic capture-size override alignment in pixels. Native SCK
+/// capture preserves the display's backing-pixel dimensions so capture
+/// aspect ratio and cursor point→pixel mapping stay exact; the host
+/// encode path handles viewport sizing downstream. The override is an
+/// explicit test knob for asking SCK to resize, so we floor only that
+/// requested size to the encoder-friendly grid.
+const SCK_CAPTURE_ALIGN: u32 = 16;
+
+fn sck_native_capture_dims(raw_w: u32, raw_h: u32) -> (u32, u32) {
+    (raw_w.max(1), raw_h.max(1))
+}
+
+fn align_capture_dims(width: u32, height: u32) -> (u32, u32) {
+    let aligned_w = (width / SCK_CAPTURE_ALIGN) * SCK_CAPTURE_ALIGN;
+    let aligned_h = (height / SCK_CAPTURE_ALIGN) * SCK_CAPTURE_ALIGN;
+    (
+        aligned_w.max(SCK_CAPTURE_ALIGN),
+        aligned_h.max(SCK_CAPTURE_ALIGN),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +516,38 @@ mod tests {
                 "{s:?} should map to idle"
             );
         }
+    }
+
+    #[test]
+    fn sck_native_dims_preserve_backing_pixels() {
+        assert_eq!(sck_native_capture_dims(3024, 1964), (3024, 1964));
+    }
+
+    #[test]
+    fn sck_native_dims_never_use_viewport_size() {
+        assert_eq!(sck_native_capture_dims(3840, 2160), (3840, 2160));
+        assert_eq!(sck_native_capture_dims(1280, 720), (1280, 720));
+    }
+
+    #[test]
+    fn diagnostic_override_floors_to_alignment() {
+        let (w, h) = sck_native_capture_dims(1920, 1080);
+        assert_eq!((w, h), (1920, 1080));
+        assert_eq!(align_capture_dims(w, h), (1920, 1072));
+    }
+
+    #[test]
+    fn parses_diagnostic_capture_size_override() {
+        assert_eq!(parse_capture_size("1712x1104"), Some((1712, 1104)));
+        assert_eq!(parse_capture_size(" 1600 X 900 "), Some((1600, 900)));
+        assert_eq!(parse_capture_size("0x900"), None);
+        assert_eq!(parse_capture_size("nope"), None);
+    }
+
+    #[test]
+    fn diagnostic_capture_size_override_aligns_like_native_dims() {
+        assert_eq!(align_capture_dims(1600, 900), (1600, 896));
+        assert_eq!(align_capture_dims(1712, 1104), (1712, 1104));
     }
 }
 
@@ -493,6 +577,13 @@ pub fn sck_pixel_format_for_profile(profile: VideoProfile) -> SckCapabilityCheck
         (ChromaSubsampling::Yuv444, 10) => Supported(PixelFormat::xf44),
         _ => Unsupported,
     }
+}
+
+/// SCK's packed BGRA capture format. Exposed so the host can request
+/// BGRA without depending directly on the ScreenCaptureKit crate.
+#[must_use]
+pub fn sck_bgra_pixel_format() -> PixelFormat {
+    PixelFormat::BGRA
 }
 
 /// Outcome of mapping a `VideoProfile` to an SCK `PixelFormat`. Two

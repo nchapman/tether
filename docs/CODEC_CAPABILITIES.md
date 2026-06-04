@@ -95,7 +95,7 @@ accepted pixel formats:
 | ------ | ---------- | --------- | ---------------------------------- |
 | `BGRA` | 4:4:4 RGB  | 8         | Default until macOS 26 on Apple Silicon |
 | `l10r` | 4:4:4 RGB  | 10        | ARGB2101010 packed                 |
-| `420v` | 4:2:0 YCbCr| 8         | Biplanar, video range — what we use today |
+| `420v` | 4:2:0 YCbCr| 8         | Biplanar, video range — probed; live host captures BGRA |
 | `420f` | 4:2:0 YCbCr| 8         | Biplanar, full range               |
 | `xf44` | 4:4:4 YCbCr| 10        | Biplanar full-range — Apple's documented 10-bit YCbCr capture format |
 | `RGhA` | 4:4:4 RGB  | half-float| 64-bit HDR                         |
@@ -145,9 +145,10 @@ candidate, and (for `PixelFormat::Unknown(FourCharCode)`
 variants — the SCK escape hatch) waits briefly for the first
 sample and verifies its delivered fourcc matches the requested
 one. Acceptance signals are stored in `SckCaptureCapability` and
-logged; the live stream still uses `420v` regardless until the
-renderer wires up the higher-chroma / 10-bit IOSurface import
-paths.
+logged. The live macOS host now captures `BGRA` for every real
+session and uses the Metal BGRA bridge for conversion, so these
+SCK YUV findings are capture-layer evidence only — not an
+encode-capability claim.
 
 Empirical results on M4 Max (macOS 26, SCK v6.0.1):
 
@@ -166,12 +167,11 @@ Two consequential findings:
    being undocumented in Apple's `SCStreamConfiguration.pixelFormat`
    list. The frame-arrival check rules out the "SCK accepts the
    FourCharCode but silently downgrades" failure mode for these
-   two specifically. Combined with VT's confirmed Main 4:4:4
-   encode acceptance (see the encode section above), macOS host
-   → anything HEVC Main 4:4:4 8-bit is reachable end-to-end.
+   two specifically. This means capture is not the blocker for
+   macOS 4:4:4; current VideoToolbox encode is.
 2. **`xf44` is reachable** — the documented 10-bit 4:4:4 capture
-   format. The renderer-side 10-bit IOSurface import is the
-   remaining gate.
+   format. The renderer-side 10-bit IOSurface import now works;
+   encode remains the remaining gate for macOS-host 4:4:4.
 
 ---
 
@@ -227,6 +227,16 @@ have plumbed it. Conversely, the wrapper listing a profile like
   high / constrained_high / extended` (all 4:2:0 8-bit). There's
   no path to drive a 4:4:4 H.264 encode on Apple Silicon through
   any public API. Source: `ffmpeg -h encoder=h264_videotoolbox`.
+- **HEVC Main 4:4:4 encode through public VideoToolbox/FFmpeg**:
+  Apple's documented HEVC `kVTCompressionPropertyKey_ProfileLevel`
+  constants include Main, Main10, Main42210, and monochrome variants,
+  but no Main444 key. FFmpeg 8.0/8.1's `hevc_videotoolbox` options
+  mirror that: `main`, `main10`, and `rext` / `main42210`, where RExt
+  maps to `kVTProfileLevel_HEVC_Main42210_AutoLevel`, not Main444.
+  Forcing `profile=rext` in our encoder changed the observed failure
+  from 4:2:0 to `x422`, confirming it is not a hidden Main444 knob.
+  Sources: Apple `kVTCompressionPropertyKey_ProfileLevel`; FFmpeg
+  `libavcodec/videotoolboxenc.c`.
 
 ### What's probed
 
@@ -251,8 +261,8 @@ Empirical results on M4 Max (Homebrew ffmpeg, VideoToolbox):
 | ------------------------ | :----: | :----: | ----------------------------------- |
 | HEVC 4:2:0 8-bit (Main)  | ✅     | ✅     | `'420v'`                            |
 | HEVC 4:2:0 10-bit (Main10)| ✅    | ✅     | `'x420'`                            |
-| HEVC 4:4:4 8-bit (Rext)  | ❌ (silent downsample) | ✅ | encoder produces `'420v'` |
-| HEVC 4:4:4 10-bit (Rext) | ❌ (silent downsample) | ✅ | encoder produces `'x420'` |
+| HEVC 4:4:4 8-bit (Rext/Main444)  | ❌ (silent downsample or VT-decode-rejected bitstream) | ✅ | BGRA upload path decodes as `'420v'`; zero-copy bridge path produces a bitstream VT decode rejects on this host |
+| HEVC 4:4:4 10-bit (Rext/Main444) | ❌ (silent downsample) | ✅ | encoder produces `'x420'` |
 | H.264 4:2:0 8-bit        | ✅     | ✅     | `'420v'`                            |
 
 Per-row reading: an `encode=❌` here means the VT encoder accepts
@@ -264,12 +274,26 @@ asked for — the silent-downsample case. The named hardware test
 and a disagreement panics; that's the regression guard against the
 probe ever silently slipping past a future downsample.
 
+The renderer suite adds
+`iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix`, which runs
+the live zero-copy path (BGRA IOSurface → Metal bridge →
+`submit_iosurface` → VT encode → VT decode). That test proves the
+bridge output itself is not the blocker: 4:2:0 8/10-bit succeeds,
+while 4:4:4 8-bit is rejected by VT decode and 4:4:4 10-bit decodes
+as `x420`.
+
 ### What's open
 
 - **Per-generation results (M1 / M2 / M3 / M4).** Probe matrix
   above is M4 Max only. Pre-M3 silicon may be more limited for
   4:2:2 specifically and may also accept-then-silently-downsample
   for the 4:4:4 cases the probe correctly rejects on M4 Max.
+- **Future Main444 VT encode support.** The macOS host-side capture,
+  Metal bridge, encoder input fourcc table, decoder, and renderer all
+  carry the `444v` / `x444` IOSurface families. If Apple adds a public
+  Main444 HEVC profile key or FFmpeg wires a real Main444 VT path, the
+  existing encode probe should promote macOS hosts automatically after
+  the round-trip starts decoding to the expected 4:4:4 IOSurface family.
 - **HEVC Main422 8/10-bit encode.** Not exercised — would
   require `ChromaSubsampling::Yuv422` on the wire. The 4:2:2
   fixtures are checked in (`hevc_yuv422_*bit.idr`) ready for
@@ -291,25 +315,27 @@ As of commit `513f4c7` the producer side is wired:
 - SCK probes the eight pixel formats it might accept and caches
   the result for the process lifetime
   (`tether_capture::macos::probe_capture_pixel_formats`).
-- `tether_capture::macos::sck_pixel_format_for_profile(profile)`
-  maps each negotiated `VideoProfile` to the SCK fourcc the
-  capture should configure, mirroring `vt_sw_format` on the
-  encoder side so the IOSurface fourcc and the encoder's
+- Live host sessions capture BGRA from SCK for every negotiated
+  profile. `BgraIOSurfaceBridge` maps each negotiated `VideoProfile`
+  to the VideoToolbox input fourcc it produces (`420v`, `x420`,
+  `444v`, or `x444`), so the bridge output and the encoder's
   `sw_format` agree by construction.
 - `VideoToolboxEncoder::submit_iosurface` accepts the matching
   fourcc families per `(chroma, bit_depth)` and refuses
   cross-bucket submissions, replacing the previous hard NV12-only
   guard. The encoder's `vt_sw_format` already supports `P010LE`
-  (10-bit 4:2:0), `NV24` / `P410LE` (4:4:4 8 / 10-bit).
-- The host's `capture_filtered_encode_profiles` (macOS arm)
-  filters the encoder-probed profile list down to what the SCK
-  probe says this Mac can deliver. On M4 Max + macOS 26 that
-  intersects to HEVC 4:2:0 8-bit + 10-bit (Main10); the 4:4:4
-  rows are filtered out by the VT encode probe's silent-downsample
-  detection, not by the SCK side.
+  (10-bit 4:2:0), `NV24` / `P410LE` (4:4:4 8 / 10-bit). The 4:4:4
+  entries are readiness plumbing only today; the VT encode round-trip
+  probe still rejects them because the emitted bitstream does not
+  preserve Main 4:4:4.
+- The macOS host probe filters the encoder-probed profile list
+  through SCK BGRA availability plus real Metal bridge construction.
+  On M4 Max + macOS 26 that intersects to HEVC 4:2:0 8-bit + 10-bit
+  (Main10); the 4:4:4 rows are filtered out by the VT encode probe's
+  silent-downsample detection, not by the capture side.
 
-The Linux producer side is the remaining gap (see the next
-section).
+Linux producer capability is covered separately below; it is also
+probe-gated per driver.
 
 ---
 
@@ -672,19 +698,26 @@ software decoding of 12b ... contents."
 
 ### What's probed
 
-`tether-codec/src/videotoolbox/probe.rs::probe_decode` submits a
+`tether-probe/src/host/videotoolbox.rs::probe_decode` submits a
 checked-in fixture, calls `signal_eof()` to force VT's wrapper to
 drain (it buffers the first packet pending a second packet or
-EOF — discovered empirically), and asserts a `Frame::Gpu` result.
-We currently probe HEVC 4:2:0 8-bit and HEVC 4:4:4 8-bit. We
-should add:
+EOF — discovered empirically), and asserts a `Frame::Gpu` result
+whose IOSurface fourcc is accepted by the renderer. The renderer
+hardware suite separately exercises the decoded IOSurface through
+`iosurface_zero_copy_roundtrip_*`.
 
-- **HEVC Main10 4:2:0 10-bit** — output fourcc likely `'x420'`
-  (or biplanar 10-bit), to be confirmed by probe.
-- **HEVC Main422 8/10-bit** — output fourcc unknown.
-- **HEVC Main444 10-bit** — output fourcc almost certainly
-  `'xf44'` or `'P410'`; the difference matters for the renderer
-  (packed vs biplanar).
+Confirmed on M4 Max:
+
+| Decode profile | Output IOSurface family |
+| -------------- | ----------------------- |
+| HEVC Main 4:2:0 8-bit | `'420v'` |
+| HEVC Main10 4:2:0 10-bit | `'x420'` |
+| HEVC Main 4:4:4 8-bit | `'444v'` |
+| HEVC Main 4:4:4 10-bit | `'x444'` |
+
+Still open: **HEVC Main422 8/10-bit** decode output fourccs, which
+require adding `ChromaSubsampling::Yuv422` to the wire before they
+can be negotiated.
 
 ### What's hard-confirmed about platform asymmetry
 
@@ -815,8 +848,8 @@ previous three-cache scaffolding.
 
 | Host       | Client     | Expected pick (best mutual)      | Notes |
 | ---------- | ---------- | -------------------------------- | ----- |
-| Linux      | Linux      | HEVC 4:4:4 8-bit                 | 10-bit Linux encode wired through the host's warm-time probe but blocked at the driver layer on the hardware tested (Intel iHD + Mesa + FFmpeg 8.1 rejects P010 dma-buf via `av_hwframe_map`). Main10 advertises only on drivers that pass the live `submit_dmabuf` round-trip — see the "Linux 10-bit encode — empirical state" section above. |
-| macOS M-series | Linux  | HEVC 4:2:0 10-bit (Main10)       | SCK delivers `'x420'` → VT encodes P010 → client decodes via VAAPI |
+| Linux      | Linux      | Probe-dependent HEVC 4:4:4       | Preference order picks 4:4:4 10-bit first when the live XV30 round-trip passes, then 4:4:4 8-bit, then Main10/Main. Main10 is working post-`RG32` fourcc fix on tested Intel; every rung still advertises only after the live `submit_dmabuf` round-trip passes. |
+| macOS M-series | Linux  | HEVC 4:2:0 10-bit (Main10)       | SCK BGRA → Metal bridge emits `'x420'` → VT encodes P010 → client decodes via VAAPI |
 | macOS M-series | macOS  | HEVC 4:2:0 10-bit (Main10)       | Same encode side; client decodes back to `'x420'` IOSurface |
 | Linux      | macOS      | HEVC 4:4:4 8-bit                 | VT client decodes 4:4:4 via NV24 even though encode side is 4:2:0-only |
 | Windows    | Windows    | HEVC 4:2:0 (Main10 / Main)       | Vendor-selected encode (QSV/AMF/NVENC, MF fallback) → D3D11VA decode; loopback-verified. **4:2:0 only — 4:4:4 excluded** (no VP path). Encode profiles are advertised without a per-profile probe (AMF single-session limit), so a 10-bit pick relies on the live encoder, not a warm-time round-trip. |
@@ -853,9 +886,9 @@ When adding a new profile to `tether_probe::PROFILE_PREFERENCE`:
 3. **Does it require new layer-1 (capture) capability?** The Linux
    probe constructs the real gpuconvert bridge in
    `probe_10bit_submit` (extend the dispatch for new chromas); the
-   macOS probe consults `sck_pixel_format_for_profile`. If a new
-   capture path is needed, wire its capability into the relevant
-   `host/*.rs` capture-stage check.
+   macOS probe constructs the real BGRA IOSurface bridge for the
+   profile's destination fourcc. If a new capture path is needed, wire
+   its capability into the relevant `host/*.rs` capture-stage check.
 4. **Does it require new layer-6 (renderer) capability?** Add a
    matching `RenderLayout` variant if needed, then a startup
    import probe similar to `importable_dmabuf_modifiers()`.

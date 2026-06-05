@@ -36,6 +36,7 @@ The host replies with `ServerHandshake`:
 - `audio: Option<AudioConfig>`
 - `displays`
 - `accepted_features`
+- `video_streams` reserved for future active multi-display streaming
 
 Video negotiation is host-authoritative. The client advertises decode profiles;
 the host intersects that list with host encode capabilities and returns one
@@ -104,6 +105,17 @@ Optional features negotiate with:
 Unknown or unnegotiated extension messages are protocol errors. First-party
 behavior should move to typed control messages once committed.
 
+`ExtensionMessage.payload` is capped at 16 KiB. The extension lane is not a
+bulk-transfer lane; file transfer, large clipboard contents, and any other
+multi-frame payload must use a dedicated reliable QUIC bulk stream when that
+feature lands. Bulk data must not raise the control-frame limit or ride through
+`ExtensionMessage`.
+
+When an extension graduates to first-party typed control, peers must accept both
+the negotiated extension form and the new typed form for one feature/protocol
+version. A new client must not switch to a typed oneof message until the host's
+feature acceptance says that form is supported.
+
 ## Media Datagrams
 
 The proven media design is unchanged:
@@ -114,17 +126,27 @@ The proven media design is unchanged:
 - IDRs are self-decodable.
 - Cursor and audio use latest-wins/drop-oldest semantics.
 
+Media envelopes are intentionally compact and do not have protobuf-style
+unknown-field skipping. `VideoFrameMetaEnvelope` stays `V1` unless a future
+metadata version is negotiated in hello, either through `NegotiatedVideo` or an
+accepted video feature. A host must not emit a future metadata envelope variant
+to a client that only negotiated `V1`, because old decoders reject unknown
+bincode enum variants before they can use the shard payload or FEC parity.
+
 ## Future-Feature Checks
 
 The v1 shape is intended to cover RustDesk-like feature growth without another
 wire reset:
 
 - Multi-display: typed `DisplayId`, `VideoStreamId`, display lists, active
-  display selection.
+  display selection, and the reserved `ServerHello.video_streams` list for
+  future per-stream descriptors.
 - Host resolution changes: `SetDisplayMode` request/result plus display
   capability flags.
-- Clipboard/file transfer: feature negotiation first, then typed messages when
-  the behavior is committed.
+- Clipboard: feature negotiation first, then typed messages when the behavior is
+  committed.
+- File transfer / large clipboard: a dedicated reliable QUIC bulk channel, not
+  control messages or extensions.
 - Gamepad/touch: input capability adverts and typed future input/control
   messages.
 - Virtual displays: display descriptors can report synthetic displays and

@@ -151,6 +151,10 @@ message ServerHello {
   AudioConfig audio = 3;
   repeated DisplayDescriptor displays = 4;
   repeated FeatureAccept accepted_features = 5;
+  // Reserved v1 shape for future multi-display streaming. Current hosts set
+  // `video` and leave this empty; future hosts can populate one descriptor per
+  // active stream without changing the reliable handshake envelope.
+  repeated NegotiatedVideo video_streams = 6;
 }
 
 message HandshakeFailure {

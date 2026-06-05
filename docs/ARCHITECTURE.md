@@ -474,7 +474,10 @@ its own QUIC primitive:
   (`StreamReady` / `StreamPause` / `StreamResume`), receiver
   telemetry (`ClientStats`), and the negotiated
   `Extension(ExtensionMessage)` lane for experimental or third-party
-  features.
+  features. Extension payloads are capped at 16 KiB and must never carry
+  file-transfer or large-clipboard bulk data; those features need an
+  independent reliable QUIC bulk stream so control messages cannot be
+  head-of-line blocked by multi-MB payloads.
 - **Video** (unreliable datagrams) — `VideoPacket::First { stream_id,
   stream_epoch, frame_seq, fragment_count, fec_pct, shard_size,
   total_body_len, meta: VideoFrameMetaEnvelope, payload }`,
@@ -495,9 +498,11 @@ its own QUIC primitive:
   block layout from `fragment_count` + `fec_pct`. `FrameReassembler`
   keys on `(stream_id, stream_epoch, frame_seq)`; `stream_epoch` is `u32`
   so encoder restarts can't wrap. `VideoFrameMetaEnvelope` is a
-  versioned wrap around `VideoFrameMeta` so future per-frame metadata
-  (HDR ROI QP) lands as additive variants instead of struct-field
-  appends.
+  versioned wrap around `VideoFrameMeta`, but media packets use compact
+  bincode rather than protobuf. A future metadata-envelope variant must
+  be negotiated in hello before a host emits it; otherwise an older
+  client rejects the whole packet before it can use the shard payload or
+  FEC parity.
 - **Audio** (unreliable datagrams, host → client) — `AudioPacket::Opus
   { stream_epoch, frame_seq, t_capture, payload, redundant }`. The full
   Opus capture → encode → decode → playback pipeline is implemented in
@@ -529,9 +534,13 @@ Forward-compat hooks every feature added later relies on:
   positional decode.
 - **Negotiated extension lane**: `FeatureAdvert` / `FeatureAccept`
   during hello, then `ControlMessage::Extension(ExtensionMessage)` for
-  accepted experimental or third-party features.
+  accepted experimental or third-party features. When an extension
+  graduates to first-party typed control, peers accept both forms for one
+  feature/protocol version and switch only after negotiation confirms the
+  typed form.
 - **`VideoFrameMetaEnvelope`** so per-frame metadata grows by enum
-  variant rather than struct field.
+  variant rather than struct field, with the envelope version negotiated
+  before any non-`V1` media packet appears on the datagram path.
 - **Typed protocol IDs** (`DisplayId`, `VideoStreamId`, `RequestId`) so
   display topology, multi-stream video, and request/reply control grow
   without overloading integers.
@@ -607,7 +616,9 @@ list:
    VAAPI has no encode profile for it).
 
 The chosen profile, pixel format, color spec, display id, and video
-stream id are returned in `ServerHello::video`.
+stream id are returned in `ServerHello::video`. `ServerHello` also
+reserves an additive `video_streams` list for future active multi-display
+sessions where each stream may need its own descriptor.
 
 Both the VAAPI encoder (`VaapiEncoder::new` takes `VideoProfile`,
 switches `sw_format` + the AVCodecContext `profile` field for

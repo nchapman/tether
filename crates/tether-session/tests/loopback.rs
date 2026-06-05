@@ -202,8 +202,8 @@ async fn double_send_server_hello_corrupts_the_stream() {
     let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
 
     // Client side: complete the handshake normally, then `recv_control`
-    // — that read should see the (corrupt) second ServerHello and
-    // bincode-fail.
+    // — that read should see the (corrupt) second ServerHello and fail
+    // protobuf/control conversion.
     let client_task = tokio::spawn(async move {
         let _ = client_chan
             .client_handshake(ClientHello {

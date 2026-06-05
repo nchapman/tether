@@ -433,6 +433,16 @@ pub struct ExtensionMessage {
     pub payload: Vec<u8>,
 }
 
+/// Extension messages are control-plane escape hatches, not a bulk-transfer
+/// lane. Large clipboard/file payloads must use an independent reliable QUIC
+/// bulk stream so they cannot head-of-line block core control messages.
+pub const MAX_EXTENSION_PAYLOAD_BYTES: usize = 16 * 1024;
+
+/// Cursor sprites ride reliable control, but should stay within the existing
+/// control-frame budget. Hosts already downsample large cursors before send;
+/// this guards hostile or malformed peers on direct decode paths.
+pub const MAX_CURSOR_SHAPE_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputCapabilities {
     pub keyboard: bool,
@@ -511,6 +521,10 @@ pub enum GoodbyeCode {
     /// peer may retry; a transient failure here doesn't preclude
     /// reconnect.
     InternalError,
+    /// Forward-compatible holder for a newer peer's machine-readable code.
+    /// Receivers can log the numeric value without failing the whole control
+    /// message.
+    Unknown(i32),
 }
 
 /// Cursor input model. Carried by
@@ -530,6 +544,9 @@ pub enum CursorMode {
     /// which routes through the OS's native delta API (the only
     /// path raw-input games can observe).
     Relative,
+    /// Forward-compatible holder for a newer cursor mode. Current apps treat
+    /// this as advisory and do not switch local cursor behavior on it.
+    Unknown(i32),
 }
 
 /// Messages exchanged on the reliable control stream after handshake.
@@ -571,11 +588,10 @@ pub enum ControlMessage {
         reason: String,
         code: GoodbyeCode,
     },
-    /// Escape hatch for features that don't yet warrant a typed
-    /// variant. Payload is opaque to the protocol — the convention
-    /// is reverse-DNS-style keys (`tether.clipboard`,
-    /// `tether.gamepad-rumble`) with a bincode-encoded body. Unknown
-    /// keys are logged + dropped. See the module-level doc.
+    /// Escape hatch for features that don't yet warrant a typed variant.
+    /// Payload is opaque to the core protocol; feature specs define their own
+    /// small, versioned payload bodies. Unknown keys are logged + dropped. See
+    /// the module-level doc.
     Extension(ExtensionMessage),
     /// Host → client. Cursor sprite (RGBA pixels). Routed on the
     /// reliable control stream rather than the cursor datagram channel
@@ -685,6 +701,7 @@ pub enum DisplayModeStatus {
     InvalidMode,
     PermissionDenied,
     Failed,
+    Unknown(i32),
 }
 
 /// Pixel dimensions of the client's rendering surface. Used to size
@@ -1033,6 +1050,10 @@ fn extension_to_pb(value: ExtensionMessage) -> pb::ExtensionMessage {
 }
 
 fn extension_from_pb(value: pb::ExtensionMessage) -> ExtensionMessage {
+    debug_assert!(
+        value.payload.len() <= MAX_EXTENSION_PAYLOAD_BYTES,
+        "extension payload cap should be checked before conversion"
+    );
     ExtensionMessage {
         key: value.key,
         version: value.version,
@@ -1115,7 +1136,7 @@ fn handshake_failure_to_pb(value: HandshakeFailure) -> pb::HandshakeFailure {
 
 fn handshake_failure_from_pb(value: pb::HandshakeFailure) -> Result<HandshakeFailure, CodecError> {
     Ok(HandshakeFailure {
-        code: goodbye_from_pb(value.code)?,
+        code: goodbye_from_pb(value.code),
         reason: value.reason,
     })
 }
@@ -1127,17 +1148,18 @@ fn status_to_pb(value: DisplayModeStatus) -> i32 {
         DisplayModeStatus::InvalidMode => 3,
         DisplayModeStatus::PermissionDenied => 4,
         DisplayModeStatus::Failed => 5,
+        DisplayModeStatus::Unknown(value) => value,
     }
 }
 
-fn status_from_pb(value: i32) -> Result<DisplayModeStatus, CodecError> {
+fn status_from_pb(value: i32) -> DisplayModeStatus {
     match value {
-        1 => Ok(DisplayModeStatus::Applied),
-        2 => Ok(DisplayModeStatus::Unsupported),
-        3 => Ok(DisplayModeStatus::InvalidMode),
-        4 => Ok(DisplayModeStatus::PermissionDenied),
-        5 => Ok(DisplayModeStatus::Failed),
-        _ => Err(CodecError::Wire("unknown DisplayModeStatus")),
+        1 => DisplayModeStatus::Applied,
+        2 => DisplayModeStatus::Unsupported,
+        3 => DisplayModeStatus::InvalidMode,
+        4 => DisplayModeStatus::PermissionDenied,
+        5 => DisplayModeStatus::Failed,
+        _ => DisplayModeStatus::Unknown(value),
     }
 }
 
@@ -1147,16 +1169,17 @@ fn goodbye_to_pb(value: GoodbyeCode) -> i32 {
         GoodbyeCode::ProtocolError => 2,
         GoodbyeCode::UnsupportedVersion => 3,
         GoodbyeCode::InternalError => 4,
+        GoodbyeCode::Unknown(value) => value,
     }
 }
 
-fn goodbye_from_pb(value: i32) -> Result<GoodbyeCode, CodecError> {
+fn goodbye_from_pb(value: i32) -> GoodbyeCode {
     match value {
-        1 => Ok(GoodbyeCode::Clean),
-        2 => Ok(GoodbyeCode::ProtocolError),
-        3 => Ok(GoodbyeCode::UnsupportedVersion),
-        4 => Ok(GoodbyeCode::InternalError),
-        _ => Err(CodecError::Wire("unknown GoodbyeCode")),
+        1 => GoodbyeCode::Clean,
+        2 => GoodbyeCode::ProtocolError,
+        3 => GoodbyeCode::UnsupportedVersion,
+        4 => GoodbyeCode::InternalError,
+        _ => GoodbyeCode::Unknown(value),
     }
 }
 
@@ -1164,14 +1187,15 @@ fn cursor_mode_to_pb(value: CursorMode) -> i32 {
     match value {
         CursorMode::Absolute => 1,
         CursorMode::Relative => 2,
+        CursorMode::Unknown(value) => value,
     }
 }
 
-fn cursor_mode_from_pb(value: i32) -> Result<CursorMode, CodecError> {
+fn cursor_mode_from_pb(value: i32) -> CursorMode {
     match value {
-        1 => Ok(CursorMode::Absolute),
-        2 => Ok(CursorMode::Relative),
-        _ => Err(CodecError::Wire("unknown CursorMode")),
+        1 => CursorMode::Absolute,
+        2 => CursorMode::Relative,
+        _ => CursorMode::Unknown(value),
     }
 }
 
@@ -1243,6 +1267,7 @@ impl ReliableMessage for ServerHello {
                 .cloned()
                 .map(feature_accept_to_pb)
                 .collect(),
+            video_streams: Vec::new(),
         }
         .encode_to_vec()
     }
@@ -1282,6 +1307,7 @@ impl ReliableMessage for ServerHandshake {
                         .into_iter()
                         .map(feature_accept_to_pb)
                         .collect(),
+                    video_streams: Vec::new(),
                 };
                 Kind::Accepted(pb)
             }
@@ -1450,22 +1476,42 @@ impl ReliableMessage for ControlMessage {
             })),
             Kind::Goodbye(v) => Ok(ControlMessage::Goodbye {
                 reason: v.reason,
-                code: goodbye_from_pb(v.code)?,
+                code: goodbye_from_pb(v.code),
             }),
-            Kind::Extension(v) => Ok(ControlMessage::Extension(extension_from_pb(v))),
-            Kind::CursorShape(v) => Ok(ControlMessage::CursorShape {
-                id: v.id,
-                hotspot: (
-                    u16::try_from(v.hotspot_x).map_err(|_| CodecError::Wire("hotspot_x > u16"))?,
-                    u16::try_from(v.hotspot_y).map_err(|_| CodecError::Wire("hotspot_y > u16"))?,
-                ),
-                width: u16::try_from(v.width)
-                    .map_err(|_| CodecError::Wire("cursor width > u16"))?,
-                height: u16::try_from(v.height)
-                    .map_err(|_| CodecError::Wire("cursor height > u16"))?,
-                format: cursor_pixel_from_pb(v.format)?,
-                pixels: v.pixels,
-            }),
+            Kind::Extension(v) => {
+                if v.payload.len() > MAX_EXTENSION_PAYLOAD_BYTES {
+                    return Err(CodecError::Wire("extension payload too large"));
+                }
+                Ok(ControlMessage::Extension(extension_from_pb(v)))
+            }
+            Kind::CursorShape(v) => {
+                if v.pixels.len() > MAX_CURSOR_SHAPE_BYTES {
+                    return Err(CodecError::Wire("cursor shape payload too large"));
+                }
+                let width =
+                    u16::try_from(v.width).map_err(|_| CodecError::Wire("cursor width > u16"))?;
+                let height =
+                    u16::try_from(v.height).map_err(|_| CodecError::Wire("cursor height > u16"))?;
+                let expected = usize::from(width)
+                    .saturating_mul(usize::from(height))
+                    .saturating_mul(4);
+                if v.pixels.len() != expected {
+                    return Err(CodecError::Wire("cursor shape payload length mismatch"));
+                }
+                Ok(ControlMessage::CursorShape {
+                    id: v.id,
+                    hotspot: (
+                        u16::try_from(v.hotspot_x)
+                            .map_err(|_| CodecError::Wire("hotspot_x > u16"))?,
+                        u16::try_from(v.hotspot_y)
+                            .map_err(|_| CodecError::Wire("hotspot_y > u16"))?,
+                    ),
+                    width,
+                    height,
+                    format: cursor_pixel_from_pb(v.format)?,
+                    pixels: v.pixels,
+                })
+            }
             Kind::CursorUseShape(v) => Ok(ControlMessage::CursorUseShape { id: v.id }),
             Kind::DisplayList(v) => Ok(ControlMessage::DisplayList {
                 displays: v
@@ -1495,7 +1541,7 @@ impl ReliableMessage for ControlMessage {
                 rtt_ewma_us: v.rtt_ewma_us,
             }),
             Kind::SetCursorMode(v) => Ok(ControlMessage::SetCursorMode {
-                mode: cursor_mode_from_pb(v.mode)?,
+                mode: cursor_mode_from_pb(v.mode),
             }),
             Kind::SetViewportHint(v) => Ok(ControlMessage::SetViewportHint {
                 stream_id: VideoStreamId(v.stream_id),
@@ -1513,7 +1559,7 @@ impl ReliableMessage for ControlMessage {
             Kind::DisplayModeResult(v) => Ok(ControlMessage::DisplayModeResult {
                 request_id: RequestId(v.request_id),
                 display_id: DisplayId(v.display_id),
-                status: status_from_pb(v.status)?,
+                status: status_from_pb(v.status),
                 actual_mode: v
                     .actual_mode
                     .map(|m| display_mode_from_pb(Some(m)))

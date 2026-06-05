@@ -547,7 +547,7 @@ impl App {
     fn toggle_cursor_mode(&mut self) {
         let new_mode = match self.cursor_mode {
             CursorMode::Absolute => CursorMode::Relative,
-            CursorMode::Relative => CursorMode::Absolute,
+            CursorMode::Relative | CursorMode::Unknown(_) => CursorMode::Absolute,
         };
         self.cursor_mode = new_mode;
         // Mirror into the renderer's cursor state: suppress overlay
@@ -565,7 +565,7 @@ impl App {
         if let Some(window) = &self.window {
             match new_mode {
                 CursorMode::Relative => self.apply_cursor_grab(window),
-                CursorMode::Absolute => {
+                CursorMode::Absolute | CursorMode::Unknown(_) => {
                     let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
                 }
             }
@@ -575,7 +575,7 @@ impl App {
             CursorMode::Relative => self.set_local_cursor_hidden(true),
             // Show the OS cursor now; the next `CursorMoved` re-hides it
             // if the pointer is over the video and the overlay draws.
-            CursorMode::Absolute => self.set_local_cursor_hidden(false),
+            CursorMode::Absolute | CursorMode::Unknown(_) => self.set_local_cursor_hidden(false),
         }
         self.emit(RenderEvent::CursorModeChanged(new_mode));
     }

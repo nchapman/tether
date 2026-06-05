@@ -124,12 +124,9 @@ pub enum CodecError {
     Wire(&'static str),
 }
 
-// bincode (over postcard / rkyv / prost) because: we control both endpoints
-// and ship them together, so schema evolution via protobuf-style tags isn't
-// worth the verbosity; varint encoding keeps the per-frame header compact;
-// and the serde adapter lets us keep #[derive(Serialize, Deserialize)] on
-// every protocol type so the same definitions can flow into telemetry JSON
-// or debug printing without a parallel set of derives.
+// Compact serde/bincode remains the codec for MTU-sensitive media datagrams and
+// the pre-session pairing stream. Reliable session control/input use prost via
+// `ReliableMessage`.
 fn bincode_config() -> impl bincode::config::Config {
     bincode::config::standard()
 }
@@ -177,23 +174,14 @@ pub fn decode_reliable<T: ReliableMessage>(bytes: &[u8]) -> Result<T, CodecError
     T::decode_reliable(bytes)
 }
 
-// Remaining untrusted-allocation surface after datagrams are bounded:
-// `ControlMessage::CursorShape::pixels` and `ControlMessage::Extension::payload`
-// decoded over the reliable control stream — both `Vec<u8>` with no length cap.
-// The control stream is framed by `MAX_FRAMED_MESSAGE` (64 KB), so worst-case is
-// bounded but larger than ideal; add per-field caps once sizes are measured.
 fn decode_with_config<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
     config: impl bincode::config::Config,
 ) -> Result<T, CodecError> {
     let (value, consumed) = bincode::serde::decode_from_slice(bytes, config)?;
-    // Strict-decode: every framed message must be fully consumed by its
-    // declared type. The forward-compat policy (see control.rs) says
-    // appending fields to a body is forbidden — only new enum variants
-    // are wire-additive. Catching trailing bytes here is what enforces
-    // that promise: a buggy future encoder that ignored the rule would
-    // trip this error in old receivers rather than having its extra
-    // bytes silently misattributed.
+    // Strict-decode compact messages: every datagram/pairing frame must be
+    // fully consumed by its declared type. The reliable session protocol gets
+    // field-level evolution from prost; bincode payloads do not.
     if consumed != bytes.len() {
         return Err(CodecError::Decode(bincode::error::DecodeError::Other(
             "decoded message had trailing bytes; sender may be using a \
@@ -215,6 +203,7 @@ mod tests {
         InputEchoBatch, VideoFrameMeta, VideoFrameMetaEnvelope, VideoPacket,
         DATAGRAM_WRAPPER_BYTES, FEC_MAX_PRIMARY_SHARDS,
     };
+    use prost::Message as _;
 
     /// The datagram decoder bounds allocation: a payload larger than
     /// `MAX_DATAGRAM_DECODE_BYTES` is rejected before allocation (where the
@@ -725,13 +714,9 @@ mod tests {
         assert_eq!(pf, pf2);
     }
 
-    /// Pin the 10-bit profile constants on the wire: the bincode shape
-    /// for `VideoProfile { codec, chroma, bit_depth }` must round-trip
-    /// 10 cleanly so a session that negotiates HEVC Main10 / Main 4:4:4
-    /// 10-bit doesn't get the bit_depth byte silently corrupted. Pinned
-    /// alongside the 8-bit cases (no shared body) so the bit_depth axis
-    /// gets independent coverage from the codec+chroma axes — a
-    /// future refactor that drops or reorders the field is caught here.
+    /// Pin the serde/bincode representation used by compact paths and debug
+    /// tooling: `VideoProfile { codec, chroma, bit_depth }` must round-trip 10
+    /// cleanly. Reliable hello negotiation uses protobuf and has its own tests.
     #[test]
     fn ten_bit_video_profile_round_trips() {
         use crate::control::VideoProfile;
@@ -743,13 +728,10 @@ mod tests {
         }
     }
 
-    /// Pin the AV1 profile constants on the wire: the bincode shape
-    /// must round-trip the new `CodecKind::Av1` variant at both 8- and
-    /// 10-bit depths cleanly. AV1 is a brand-new codec axis (no
-    /// `CodecKind::Av1` discriminant existed in shipped builds before
-    /// this), so the bincode enum tag is what older peers will treat
-    /// as "unknown" — the round-trip here is the contract that current
-    /// peers won't corrupt the new variant.
+    /// Pin the serde/bincode representation used by compact paths and debug
+    /// tooling: the new `CodecKind::Av1` variant must round-trip at both 8- and
+    /// 10-bit depths cleanly. Reliable hello negotiation uses protobuf and has
+    /// its own tests.
     #[test]
     fn av1_video_profile_round_trips() {
         use crate::control::{CodecKind, VideoProfile};
@@ -1056,6 +1038,114 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn oversized_extension_payload_fails_decode() {
+        let msg = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::Extension(
+                crate::pb::ExtensionMessage {
+                    key: "tether.exp.too-big".into(),
+                    version: 1,
+                    request_id: 1,
+                    reply_to: 0,
+                    payload: vec![0; MAX_EXTENSION_PAYLOAD_BYTES + 1],
+                },
+            )),
+        };
+        let bytes = msg.encode_to_vec();
+        let err = decode_reliable::<ControlMessage>(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::Wire("extension payload too large")
+        ));
+    }
+
+    #[test]
+    fn unknown_protobuf_control_enums_decode_to_unknown_variants() {
+        let goodbye = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::Goodbye(
+                crate::pb::Goodbye {
+                    reason: "future".into(),
+                    code: 99,
+                },
+            )),
+        };
+        match decode_reliable::<ControlMessage>(&goodbye.encode_to_vec()).unwrap() {
+            ControlMessage::Goodbye { code, .. } => assert_eq!(code, GoodbyeCode::Unknown(99)),
+            other => panic!("expected Goodbye, got {other:?}"),
+        }
+
+        let mode = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::SetCursorMode(
+                crate::pb::SetCursorMode { mode: 77 },
+            )),
+        };
+        match decode_reliable::<ControlMessage>(&mode.encode_to_vec()).unwrap() {
+            ControlMessage::SetCursorMode { mode } => assert_eq!(mode, CursorMode::Unknown(77)),
+            other => panic!("expected SetCursorMode, got {other:?}"),
+        }
+
+        let result = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::DisplayModeResult(
+                crate::pb::DisplayModeResult {
+                    request_id: 1,
+                    display_id: 2,
+                    status: 88,
+                    actual_mode: None,
+                },
+            )),
+        };
+        match decode_reliable::<ControlMessage>(&result.encode_to_vec()).unwrap() {
+            ControlMessage::DisplayModeResult { status, .. } => {
+                assert_eq!(status, DisplayModeStatus::Unknown(88));
+            }
+            other => panic!("expected DisplayModeResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cursor_shape_payload_must_match_rgba_dimensions() {
+        let msg = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::CursorShape(
+                crate::pb::CursorShape {
+                    id: 42,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                    width: 16,
+                    height: 16,
+                    format: 1,
+                    pixels: vec![0; (16 * 16 * 4) - 1],
+                },
+            )),
+        };
+        let err = decode_reliable::<ControlMessage>(&msg.encode_to_vec()).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::Wire("cursor shape payload length mismatch")
+        ));
+    }
+
+    #[test]
+    fn oversized_cursor_shape_payload_fails_decode() {
+        let msg = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::CursorShape(
+                crate::pb::CursorShape {
+                    id: 42,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                    width: 129,
+                    height: 128,
+                    format: 1,
+                    pixels: vec![0; (129 * 128 * 4) as usize],
+                },
+            )),
+        };
+        let err = decode_reliable::<ControlMessage>(&msg.encode_to_vec()).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::Wire("cursor shape payload too large")
+        ));
     }
 
     #[test]

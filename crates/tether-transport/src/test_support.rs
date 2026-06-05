@@ -25,8 +25,8 @@
 //! ## Channel-shape choices
 //!
 //! - [`ControlChannel`] and [`InputChannel`] are stream-shaped on the
-//!   wire (length-prefix + bincode over a QUIC reliable stream); they
-//!   ride `tokio::io::duplex` here with the same framing.
+//!   wire (length-prefix + prost over QUIC reliable streams); they ride
+//!   `tokio::io::duplex` here with the same framing.
 //! - [`VideoChannel`] carries all video — IDR keyframes included — as
 //!   message-framed datagrams (one `Datagram` per QUIC datagram); they ride
 //!   `tokio::sync::mpsc::channel<Datagram>` here — adding length-prefix
@@ -215,9 +215,9 @@ impl ControlChannel for DuplexControlChannel {
 // ---------------------------------------------------------------------
 
 /// One end of an in-memory input channel pair. The wire shape is the
-/// same length-prefix + bincode that the real `Connection`'s input
-/// stream uses, so a test that serializes 100 events through the fake
-/// will produce identical bytes to the production path.
+/// same length-prefixed protobuf encoding that the real `Connection`'s
+/// input stream uses, so a test that serializes 100 events through the
+/// fake will produce identical bytes to the production path.
 ///
 /// Like the real `Connection::InputStream`, each instance is logically
 /// uni-directional: the host side reads, the client side writes.

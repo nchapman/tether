@@ -90,3 +90,26 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
         "NVDEC decoder produced no frames after submit + eof + 4 polls",
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile_probe::fixture_for;
+
+    /// The bundled HEVC 8-bit 4:2:0 probe fixture must decode through the live
+    /// NVDEC probe. This is a regression guard for the fixture coded size:
+    /// NVDEC's HEVC decoder has a 144×144 minimum, so a fixture below that
+    /// (the original 128×128 set) fails `send_packet` with a bare `-1` and the
+    /// host silently drops HEVC to the H.264 floor. H.264's minimum is far
+    /// smaller, so its fixture is fine at any of these sizes — HEVC is the one
+    /// that breaks. `#[ignore]` — needs an NVIDIA GPU + an NVDEC FFmpeg.
+    #[test]
+    #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf"]
+    fn hevc_main_fixture_decodes_via_nvdec_probe() {
+        for profile in [VideoProfile::H264_8BIT_420, VideoProfile::HEVC_8BIT_420] {
+            let fixture = fixture_for(profile).expect("bundled probe fixture");
+            NvdecProbe::probe_decode(profile, fixture)
+                .unwrap_or_else(|e| panic!("{profile:?} should decode via NVDEC, got {e:?}"));
+        }
+    }
+}

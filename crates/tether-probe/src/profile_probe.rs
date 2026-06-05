@@ -105,7 +105,8 @@ pub(crate) trait ProfileProbe {
 /// `decode=false`).
 ///
 /// Fixtures are tiny single-IDR bitstreams generated offline at
-/// 128×128 grey. Regeneration commands live in `fixtures/probe/README.md`.
+/// 256×256 grey (above NVDEC's 144×144 HEVC minimum — see the README).
+/// Regeneration commands live in `fixtures/probe/README.md`.
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
     allow(dead_code)

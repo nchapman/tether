@@ -65,27 +65,44 @@ description = "Fast unit tests (no hardware required)"
 depends = ["ffmpeg"]
 run = "cargo test --workspace --lib"
 
-# Hardware-backed tests for the CURRENT platform. The per-platform encode/
-# decode/render modules are cfg-gated (vaapi=Linux, videotoolbox=macOS,
-# d3d11=Windows), so this one command runs exactly the present host's hardware
-# tests — VAAPI + dma-buf on Linux, VideoToolbox + IOSurface on macOS, D3D11 on
-# Windows — and is a fast no-op for the crates a platform doesn't use.
+# Every `#[ignore]` hardware test for the CURRENT platform, no matter which
+# crate it lives in. The per-platform backends are cfg-gated (vaapi=Linux,
+# videotoolbox=macOS, d3d11=Windows) and the cross-platform GPU tests
+# (tether-scaler, tether-probe) run everywhere, so `--workspace ... --ignored`
+# runs exactly the present host's hardware suite with no platform-shaped crate
+# list — codec + render + gpuconvert + scaler + probe alike. Run it on Linux,
+# macOS, or Windows and it covers that host's full backend; no platform is
+# privileged. (`--exclude tether-audio`: the audio round-trips need an audio
+# device with sound actively playing and hard-fail otherwise — they have their
+# own `test-audio` task. `--skip bench`: benchmarks live in `bench`.)
 # `--test-threads=1`: hardware tests share one GPU; serial avoids device
-# contention (the cause of the VAAPI bench serialization and the Windows
-# single-iGPU flakiness). `--skip bench` keeps the benchmark matrix in `bench`.
+# contention (the VAAPI bench serialization + Windows single-iGPU flakiness).
+# macOS adds `--release`: the IOSurface/Metal round-trips are too slow in debug
+# for their reference-comparison thresholds (their ignore messages document it);
+# Linux VAAPI + Windows D3D11 pass in debug, so only macOS pays the release build.
 [tasks.test-hw]
-description = "Hardware-backed tests for the current platform (codec + render + gpuconvert)"
+description = "All hardware tests for the current platform (codec + render + gpuconvert + scaler + probe)"
 depends = ["ffmpeg"]
-# macOS only: the IOSurface/Metal render round-trips are too slow in debug for
-# their reference-comparison thresholds (the test ignore messages document
-# `--release`). Linux VAAPI + Windows D3D11 hardware tests pass in debug, so
-# only macOS pays the release build.
-run = "cargo test -p tether-codec -p tether-render -p tether-gpuconvert --lib {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+run = "cargo test --workspace --exclude tether-audio --tests {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
 
-[tasks.bench]
-description = "Encoder benchmark matrix (VAAPI on Linux; no-op where a backend has no bench cells yet)"
+# System-audio capture → Opus → playback round-trip for the current platform
+# (PipeWire monitor on Linux, ScreenCaptureKit on macOS, WASAPI loopback on
+# Windows). Separate from `test-hw` because it needs an audio output device
+# with sound actively playing, not a GPU. Symmetric: one round-trip per OS,
+# cfg-selected. `--nocapture` surfaces the captured/played frame counts.
+[tasks.test-audio]
+description = "System-audio capture→encode→decode→playback round-trip (needs an audio device with sound playing)"
 depends = ["ffmpeg"]
-run = "cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1"
+run = "cargo test -p tether-audio --tests -- --ignored --test-threads=1 --nocapture"
+
+# Benchmark cells for the current platform, in release (benchmarks must be
+# optimized; the scaler microbench documents `--release`). VAAPI encode matrix
+# on Linux + the cross-platform scaler microbench everywhere; a no-op on a
+# backend with no bench cells yet. Same no-platform-privileged shape as test-hw.
+[tasks.bench]
+description = "Hardware benchmark cells for the current platform (release, serial)"
+depends = ["ffmpeg"]
+run = "cargo test --workspace --tests --release -- --ignored --test-threads=1 --nocapture bench"
 
 [tasks.probe]
 description = "Print the host codec capability matrix (encode/decode per profile)"

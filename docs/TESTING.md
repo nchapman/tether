@@ -141,14 +141,28 @@ behaviour we expect to work everywhere.
   backend-tested in a separate `shell-check` job.
 - Hardware tests (VAAPI/Vulkan/Metal/D3D11) are **not** run in CI — GitHub-hosted
   runners have no usable GPU. Run `mise run test-hw` locally on a hardware
-  runner; it auto-selects the current platform's backend (cfg-gating picks
-  VAAPI/VideoToolbox/D3D11), so the same command covers Linux, macOS, and
-  Windows. macOS builds with `--release` (the IOSurface/Metal round-trips are
+  runner. It is platform-symmetric by construction: `cargo test --workspace
+  --exclude tether-audio --tests -- --ignored` runs every `#[ignore]` hardware
+  test for the present host, no matter which crate it lives in. The per-platform
+  backends are cfg-gated (VAAPI/VideoToolbox/D3D11) and the cross-platform GPU
+  tests (`tether-scaler`, `tether-probe`) run everywhere, so the *same command*
+  covers Linux, macOS, and Windows with no platform privileged. Companions:
+  `mise run test-audio` (the per-platform system-audio round-trip; needs an
+  audio device with sound playing) and `mise run bench` (per-platform benchmark
+  cells in release — VAAPI matrix on Linux, the scaler microbench everywhere).
+  macOS builds `test-hw` with `--release` (the IOSurface/Metal round-trips are
   too slow in debug for their comparison thresholds); Linux/Windows run debug.
   Expect a non-zero ignored-test count per platform — a run that reports `0`
   hardware tests means a `#[cfg]`/`#[ignore]` gate is misconfigured, not that
   the suite is clean. A self-hosted GPU runner that wires it into CI is a
   documented follow-up.
+
+  Note the suites are symmetric in *infrastructure* (one command, every crate,
+  every platform) but not yet in *cell coverage*: the Linux VAAPI/dma-buf path
+  is the most mature (the 23-cell render harness, 4:4:4 + AV1 dma-buf, encoder-
+  knob SKIP tests), while the macOS VideoToolbox/IOSurface and Windows D3D11
+  render matrices are thinner. Bringing per-backend cell coverage to parity is
+  tracked separately; the runner no longer assumes Linux is the reference.
 - Releases: `.github/workflows/release.yml` on `v*` tags produces Tauri
   installers + a signed updater manifest (see `docs/RELEASING.md`).
 - Clippy is a blocking gate: `cargo clippy --workspace --all-targets -- -D

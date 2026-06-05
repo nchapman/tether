@@ -29,8 +29,9 @@ Key tasks:
 - `mise run ffmpeg` — download + stage the pinned static FFmpeg for this host (idempotent)
 - `mise run build` — `cargo build --workspace`
 - `mise run test` — `cargo test --workspace --lib` (no hardware)
-- `mise run test-hw` — the current platform's `#[ignore]` hardware tests across `tether-codec`, `tether-render`, `tether-gpuconvert` (cfg-gating selects VAAPI/VideoToolbox/D3D11 automatically); serial (`--test-threads=1`) to avoid GPU contention; skips bench
-- `mise run bench` — `cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1` (VAAPI matrix on Linux; no-op where a backend has no bench cells)
+- `mise run test-hw` — every `#[ignore]` hardware test for the current platform, workspace-wide (`--workspace --exclude tether-audio --tests`): codec + render + gpuconvert + scaler + probe. cfg-gating selects the backend (VAAPI/VideoToolbox/D3D11) and the cross-platform GPU tests (scaler, probe) run on all three — no platform-shaped crate list. Serial (`--test-threads=1`) to avoid GPU contention; macOS adds `--release` (IOSurface threshold timing); skips bench
+- `mise run test-audio` — the current platform's system-audio capture→Opus→playback round-trip (needs an audio device with sound playing)
+- `mise run bench` — the current platform's benchmark cells in release: VAAPI encode matrix (Linux) + the cross-platform scaler microbench (everywhere); no-op where a backend has no bench cells yet
 - `mise run probe` — print this host's codec capability matrix (encode/decode per profile)
 - `mise run clippy` — workspace + shell lint, warnings-as-errors (CI gate)
 - `mise run release` — host + client release build

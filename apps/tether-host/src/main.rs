@@ -42,8 +42,8 @@ use tether_gpuconvert::{
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
-    ChromaSubsampling, CodecKind, ControlMessage, DisplayDescriptor, DisplayId, DisplayMode,
-    DisplayModeStatus, VideoProfile, VideoStreamId, Viewport,
+    ChromaSubsampling, CodecKind, ControlMessage, DisplayDescriptor, DisplayModeStatus,
+    VideoProfile, VideoStreamId, Viewport,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
@@ -113,18 +113,24 @@ const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
 const TEST_PATTERN_FPS: u32 = 60;
 
-fn initial_display_descriptor() -> DisplayDescriptor {
-    let mode = DisplayMode::new(1280, 720, 60_000);
-    DisplayDescriptor {
-        id: DisplayId(0),
-        name: "primary".to_string(),
-        scale_num: 1,
-        scale_den: 1,
-        primary: true,
-        position: (0, 0),
-        current_mode: mode,
-        available_modes: vec![mode],
-        can_set_mode: false,
+fn initial_display_descriptors(use_test_pattern: bool) -> Vec<DisplayDescriptor> {
+    if use_test_pattern {
+        return vec![tether_capture::test_pattern_display(
+            TEST_PATTERN_WIDTH,
+            TEST_PATTERN_HEIGHT,
+            TEST_PATTERN_FPS.saturating_mul(1000),
+        )];
+    }
+
+    match tether_capture::display_list() {
+        Ok(displays) => displays,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "display topology enumeration failed; advertising synthetic primary display"
+            );
+            vec![tether_capture::test_pattern_display(1280, 720, 60_000)]
+        }
     }
 }
 
@@ -475,10 +481,12 @@ async fn main() -> anyhow::Result<()> {
         // ends use the fixed default Opus config (48 kHz stereo).
         let audio_config = (audio_enabled && tether_audio::capture::is_supported())
             .then(|| tether_audio::OpusConfig::default().wire_config());
+        let display_descriptors =
+            Arc::new(StdMutex::new(initial_display_descriptors(use_test_pattern)));
         let cfg = HostSessionConfig {
             server_name: "tether-host".to_string(),
             audio_config,
-            displays: vec![initial_display_descriptor()],
+            displays: display_descriptors.lock().unwrap().clone(),
         };
         // `HostSession::accept` takes the channel through the
         // `ControlChannel` trait object so it's mockable in tests.
@@ -542,7 +550,13 @@ async fn main() -> anyhow::Result<()> {
                 info!("shell stop received during session; shutting down");
                 break;
             }
-            res = handle_client(session, conn, use_test_pattern, audio_enabled) => {
+            res = handle_client(
+                session,
+                conn,
+                use_test_pattern,
+                audio_enabled,
+                display_descriptors,
+            ) => {
                 let reason = if revoked.load(Ordering::Relaxed) {
                     // The session ended because the operator revoked this peer
                     // (its connection was closed out from under handle_client).
@@ -594,9 +608,10 @@ async fn handle_client(
     conn: Arc<Connection>,
     use_test_pattern: bool,
     audio_enabled: bool,
+    display_descriptors: Arc<StdMutex<Vec<DisplayDescriptor>>>,
 ) -> anyhow::Result<()> {
-    // The handshake (decode-profile negotiation, pixel-format advert,
-    // Goodbye-on-no-match) ran in `HostSession::accept`. Unpack the
+    // The handshake (decode-profile negotiation, display topology advert,
+    // typed rejection on no-match) ran in `HostSession::accept`. Unpack the
     // per-connection state it produced.
     //
     // `session.channel` is dropped here: it's an `Arc<dyn ControlChannel>`
@@ -1063,6 +1078,8 @@ async fn handle_client(
     // or via tasks.shutdown() during disconnect.
     {
         let injector = injector.clone();
+        let conn = conn.clone();
+        let display_descriptors = display_descriptors.clone();
         let mut rx = display_dims_rx;
         tasks.spawn(async move {
             while rx.changed().await.is_ok() {
@@ -1072,6 +1089,33 @@ async fn handle_client(
                 let dims = *rx.borrow();
                 if let Some((w, h)) = dims {
                     injector.lock().await.set_display_size(w, h);
+                    let next = {
+                        let mut guard = display_descriptors.lock().unwrap();
+                        let next = tether_capture::display_list_with_primary_mode(
+                            guard.clone(),
+                            w,
+                            h,
+                            ENCODER_FPS.saturating_mul(1000),
+                        );
+                        if *guard == next {
+                            None
+                        } else {
+                            *guard = next.clone();
+                            Some(next)
+                        }
+                    };
+                    if let Some(displays) = next {
+                        if let Err(e) = conn
+                            .send_control(&ControlMessage::DisplayList { displays })
+                            .await
+                        {
+                            warn!(
+                                error = ?e,
+                                "display list update send failed; ending display follower"
+                            );
+                            return;
+                        }
+                    }
                 }
             }
         });

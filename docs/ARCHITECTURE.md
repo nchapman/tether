@@ -535,6 +535,9 @@ Forward-compat hooks every feature added later relies on:
 - **Typed protocol IDs** (`DisplayId`, `VideoStreamId`, `RequestId`) so
   display topology, multi-stream video, and request/reply control grow
   without overloading integers.
+- **Authoritative display topology** starts in `ServerHandshake` from
+  the host's display system, with a follow-up `DisplayList` when the
+  capture backend reports more exact primary capture dimensions.
 
 ### Session orchestration and the channel-trait abstraction
 

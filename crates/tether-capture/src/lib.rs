@@ -32,6 +32,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
+use tether_protocol::control::{DisplayDescriptor, DisplayId, DisplayMode};
 
 /// Capture-source handle returned by every backend's `start()`. Bundles
 /// the [`CapturedFrame`] receiver with a runtime-mutable target-FPS
@@ -211,6 +212,169 @@ pub enum PixelFormat {
     Nv12,
 }
 
+/// Best-effort host display topology for the protocol handshake.
+///
+/// Mode mutation is deliberately not advertised here. A backend should flip
+/// `can_set_mode` and expand `available_modes` only once it can apply and
+/// restore display modes end to end.
+pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
+    platform_display_list()
+}
+
+/// Synthetic display descriptor for the test-pattern capture source.
+#[must_use]
+pub fn test_pattern_display(width: u32, height: u32, refresh_millihz: u32) -> DisplayDescriptor {
+    let mode = DisplayMode::new(width, height, refresh_millihz);
+    DisplayDescriptor {
+        id: DisplayId(0),
+        name: "test-pattern".to_string(),
+        scale_num: 1,
+        scale_den: 1,
+        primary: true,
+        position: (0, 0),
+        current_mode: mode,
+        available_modes: vec![mode],
+        can_set_mode: false,
+    }
+}
+
+/// Update the primary display's current mode from the capture stream's actual
+/// frame dimensions. This corrects Linux portal/ScreenCaptureKit negotiation
+/// details that are only known after the capture stream starts.
+#[must_use]
+pub fn display_list_with_primary_mode(
+    mut displays: Vec<DisplayDescriptor>,
+    width: u32,
+    height: u32,
+    refresh_millihz: u32,
+) -> Vec<DisplayDescriptor> {
+    let idx = displays
+        .iter()
+        .position(|display| display.primary)
+        .unwrap_or(0);
+    let Some(display) = displays.get_mut(idx) else {
+        return vec![test_pattern_display(width, height, refresh_millihz)];
+    };
+
+    let mode = DisplayMode::new(width, height, refresh_millihz);
+    display.current_mode = mode;
+    if display.available_modes.is_empty() {
+        display.available_modes.push(mode);
+    } else {
+        display.available_modes[0] = mode;
+    }
+    displays
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn scale_to_ratio(scale: f64) -> (u16, u16) {
+    if !scale.is_finite() || scale <= 0.0 {
+        return (1, 1);
+    }
+
+    const DEN: u32 = 1000;
+    let num = f64_to_u32_clamped(scale * f64::from(DEN), 1, u32::from(u16::MAX));
+    let gcd = gcd_u32(num, DEN);
+    (
+        u16::try_from(num / gcd).unwrap_or(u16::MAX),
+        u16::try_from(DEN / gcd).unwrap_or(u16::MAX),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn f64_to_u32_clamped(value: f64, min: u32, max: u32) -> u32 {
+    if !value.is_finite() {
+        return min;
+    }
+    let clamped = value.round().clamp(f64::from(min), f64::from(max));
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        clamped as u32
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    if a == 0 {
+        1
+    } else {
+        a
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
+    use winit::event_loop::EventLoop;
+
+    let mut builder = EventLoop::builder();
+    winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
+    winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
+    let event_loop = builder
+        .build()
+        .map_err(|e| CaptureError::Display(format!("winit event loop: {e}")))?;
+    let primary_name = event_loop
+        .primary_monitor()
+        .and_then(|monitor| monitor.name());
+    let displays = event_loop
+        .available_monitors()
+        .enumerate()
+        .map(|(idx, monitor)| monitor_to_descriptor(idx, &monitor, primary_name.as_deref()))
+        .collect::<Vec<_>>();
+
+    if displays.is_empty() {
+        return Err(CaptureError::Display(
+            "no monitors reported by winit".into(),
+        ));
+    }
+    Ok(displays)
+}
+
+#[cfg(target_os = "linux")]
+fn monitor_to_descriptor(
+    idx: usize,
+    monitor: &winit::monitor::MonitorHandle,
+    primary_name: Option<&str>,
+) -> DisplayDescriptor {
+    let size = monitor.size();
+    let position = monitor.position();
+    let refresh_millihz = monitor.refresh_rate_millihertz().unwrap_or(60_000);
+    let mode = DisplayMode::new(size.width, size.height, refresh_millihz);
+    let name = monitor.name().unwrap_or_else(|| format!("display-{idx}"));
+    let (scale_num, scale_den) = scale_to_ratio(monitor.scale_factor());
+    DisplayDescriptor {
+        id: DisplayId(u32::try_from(idx).unwrap_or(u32::MAX)),
+        primary: primary_name.is_some_and(|primary| primary == name)
+            || (primary_name.is_none() && idx == 0),
+        name,
+        scale_num,
+        scale_den,
+        position: (position.x, position.y),
+        current_mode: mode,
+        available_modes: vec![mode],
+        can_set_mode: false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
+    macos::display_list()
+}
+
+#[cfg(target_os = "windows")]
+fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
+    windows::display_list()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
+    Err(CaptureError::Unsupported)
+}
+
 /// A single captured frame from the host's display.
 ///
 /// Two shapes: CPU-side owned bytes (the SHM fallback path), and a
@@ -377,6 +541,8 @@ pub enum CaptureError {
     Portal(String),
     #[error("pipewire: {0}")]
     PipeWire(String),
+    #[error("display topology: {0}")]
+    Display(String),
     /// ScreenCaptureKit (macOS) error — typically a permission denial
     /// (`NSScreenCaptureUsageDescription` missing or TCC denied),
     /// `SCShareableContent::get` failure, or `start_capture` rejection.
@@ -411,6 +577,49 @@ impl From<pipewire::Error> for CaptureError {
 impl From<screencapturekit::error::SCError> for CaptureError {
     fn from(e: screencapturekit::error::SCError) -> Self {
         Self::Sck(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn test_pattern_display_reports_current_mode() {
+        let display = test_pattern_display(320, 240, 60_000);
+        assert_eq!(display.id, DisplayId(0));
+        assert_eq!(display.current_mode, DisplayMode::new(320, 240, 60_000));
+        assert_eq!(display.available_modes, vec![display.current_mode]);
+        assert!(display.primary);
+        assert!(!display.can_set_mode);
+    }
+
+    #[test]
+    fn primary_mode_update_preserves_topology_metadata() {
+        let mut display = test_pattern_display(1280, 720, 60_000);
+        display.name = "DP-3".to_string();
+        display.position = (1920, 0);
+        display.scale_num = 3;
+        display.scale_den = 2;
+
+        let updated = display_list_with_primary_mode(vec![display], 2560, 1440, 144_000);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].name, "DP-3");
+        assert_eq!(updated[0].position, (1920, 0));
+        assert_eq!(updated[0].scale_num, 3);
+        assert_eq!(updated[0].scale_den, 2);
+        assert_eq!(
+            updated[0].current_mode,
+            DisplayMode::new(2560, 1440, 144_000)
+        );
+        assert_eq!(updated[0].available_modes, vec![updated[0].current_mode]);
+    }
+
+    #[test]
+    fn scale_factor_uses_reduced_rational() {
+        assert_eq!(scale_to_ratio(1.5), (3, 2));
+        assert_eq!(scale_to_ratio(2.0), (2, 1));
+        assert_eq!(scale_to_ratio(0.0), (1, 1));
     }
 }
 

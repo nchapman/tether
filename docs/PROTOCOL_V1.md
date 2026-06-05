@@ -73,6 +73,12 @@ displays/sources through `NegotiatedVideo` and future stream descriptors.
 
 `DisplayMode` is `{ width, height, refresh_millihz }`.
 
+The host sends the best topology it can observe in `ServerHandshake`.
+Production hosts enumerate the local display system; test-pattern/headless
+fallbacks advertise a synthetic primary display. If the capture backend later
+reveals a more exact primary capture mode, the host sends a fresh
+`DisplayList`.
+
 `SetViewportHint { stream_id, viewport }` is a best-effort encoder sizing hint.
 It does not change host resolution and does not require an acknowledgement.
 

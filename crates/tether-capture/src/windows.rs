@@ -22,6 +22,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use tether_protocol::control::{DisplayDescriptor, DisplayId, DisplayMode};
 use tether_protocol::MonoNanos;
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
@@ -60,6 +61,77 @@ const CAPTURE_FPS: u32 = 60;
 /// the encoder's Video Processor is still sampling (the cause of the
 /// progressive-corruption regression).
 const TEXTURE_POOL_SIZE: usize = 3;
+
+pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
+    let factory: IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1() }.map_err(|e| CaptureError::Io(hresult_io(e)))?;
+    let mut displays = Vec::new();
+    let mut adapter_idx = 0u32;
+
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_idx) } {
+        let mut output_idx = 0u32;
+        while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
+            if let Some(display) = dxgi_output_descriptor(displays.len(), &output) {
+                displays.push(display);
+            }
+            output_idx += 1;
+        }
+        adapter_idx += 1;
+    }
+
+    if displays.is_empty() {
+        return Err(CaptureError::Display(
+            "no attached DXGI outputs reported".into(),
+        ));
+    }
+    if !displays.iter().any(|display| display.primary) {
+        if let Some(first) = displays.first_mut() {
+            first.primary = true;
+        }
+    }
+    Ok(displays)
+}
+
+fn dxgi_output_descriptor(
+    idx: usize,
+    output: &windows::Win32::Graphics::Dxgi::IDXGIOutput,
+) -> Option<DisplayDescriptor> {
+    let desc = unsafe { output.GetDesc().ok()? };
+    if !desc.AttachedToDesktop.as_bool() {
+        return None;
+    }
+
+    let left = desc.DesktopCoordinates.left;
+    let top = desc.DesktopCoordinates.top;
+    let width = u32::try_from(desc.DesktopCoordinates.right.saturating_sub(left)).ok()?;
+    let height = u32::try_from(desc.DesktopCoordinates.bottom.saturating_sub(top)).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let mode = DisplayMode::new(width, height, 60_000);
+    Some(DisplayDescriptor {
+        id: DisplayId(u32::try_from(idx).unwrap_or(u32::MAX)),
+        name: utf16_name(&desc.DeviceName).unwrap_or_else(|| format!("display-{idx}")),
+        scale_num: 1,
+        scale_den: 1,
+        primary: left == 0 && top == 0,
+        position: (left, top),
+        current_mode: mode,
+        available_modes: vec![mode],
+        can_set_mode: false,
+    })
+}
+
+fn utf16_name(buf: &[u16]) -> Option<String> {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let name = String::from_utf16_lossy(&buf[..end]);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
 
 /// Shared D3D11 device handle. The capture thread creates it; the
 /// encoder receives a clone so both operate on the same device (no

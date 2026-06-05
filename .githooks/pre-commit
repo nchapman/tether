@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Tether pre-commit hook: the fast, no-compile checks CI enforces, run before
 # every commit so the tree never drifts out of format again. Install with
-# `make hooks` (sets core.hooksPath to .githooks).
+# `mise run hooks` (sets core.hooksPath to .githooks).
 #
 # Deliberately excludes the slow gates (build, test, clippy) — those run in CI
-# and via `make ci`. This hook is just rustfmt + the test-support gating check,
+# and via `mise run ci`. This hook is just rustfmt + the test-support gating check,
 # so it stays sub-second and never needs the FFmpeg toolchain.
 set -euo pipefail
 

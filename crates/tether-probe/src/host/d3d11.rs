@@ -6,7 +6,7 @@
 //! unsafe, so `probe_host` reports encode support statically and the
 //! trait drops the method on Windows.
 
-use tether_codec::d3d11::D3D11Decoder;
+use tether_codec::d3d11::{expected_decode_dxgi_format, D3D11Decoder};
 use tether_codec::Decoder;
 use tether_protocol::control::VideoProfile;
 
@@ -22,6 +22,24 @@ impl ProfileProbe for D3D11Probe {
 }
 
 fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
+    // Gate on a renderer-importable output format BEFORE the live decode. The
+    // D3D11VA codec can decode more than the native renderer can display — Arc
+    // hardware-decodes HEVC 4:4:4 to a 4:4:4 surface, but the renderer imports
+    // only NV12 / P010 (`expected_decode_dxgi_format`). Without this gate the
+    // probe would report 4:4:4 decode "Supported" (a frame came back), the
+    // client would advertise it, and a host that *can* encode HEVC 4:4:4 (top
+    // of PROFILE_PREFERENCE) would pick it — the client then decodes but can't
+    // render, breaking the session. Refusing here keeps advertised decode caps
+    // a subset of what the renderer accepts, which is the contract the
+    // `decoder_output_is_subset_of_renderer_accept` test assumes but can't
+    // enforce against a *live* probe.
+    if expected_decode_dxgi_format(profile).is_none() {
+        return Err(ProbeError::new(
+            PipelineStage::Decode,
+            "no renderer-importable surface format (D3D11 renderer is 4:2:0 NV12/P010 only)",
+        ));
+    }
+
     // Probe with `gpu_export = true` so it exercises the production export
     // path (`export_gpu_frame`), not the 8-bit-only CPU download. This is
     // load-bearing for 10-bit: a Main10 fixture decodes to a P010 surface,
@@ -39,16 +57,13 @@ fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
     // A decoded frame (now a shared-handle `Frame::Gpu`) means the codec +
     // export path work for this profile.
     //
-    // L2 render-acceptance gate (the check the Linux/macOS probes add) is
-    // intentionally ABSENT here. D3D11VA decode output is deterministic —
-    // `expected_decode_dxgi_format` (NV12 / P010, no driver-variable
-    // downsample) — and the pure-logic L1 test
-    // `decoder_output_is_subset_of_renderer_accept`
-    // (apps/tether-client) already proves that set ⊆ the renderer's
-    // `decode_plane_srv_formats`. The renderer predicate lives in
-    // `tether-render`, which `tether-probe` must not depend on (it's a
-    // client-only crate; the edge would be a cycle), so an L2 here could
-    // not consult it without contorting the graph to prove nothing new.
+    // Render-acceptance is enforced by the `expected_decode_dxgi_format` gate
+    // above (only NV12 / P010 reach this point) rather than by consulting the
+    // renderer directly: that predicate lives in `tether-render`, which
+    // `tether-probe` must not depend on (client-only crate; the edge would be
+    // a cycle). The pure-logic `decoder_output_is_subset_of_renderer_accept`
+    // test (apps/tether-client) proves `expected_decode_dxgi_format`'s set ⊆
+    // the renderer's `decode_plane_srv_formats`, so the gate is sound.
     for _ in 0..4 {
         match dec
             .next_frame()

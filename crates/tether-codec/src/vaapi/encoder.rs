@@ -55,9 +55,12 @@ pub struct VaapiEncoder {
     /// than getting stuck waiting for parameter sets that libavcodec
     /// only emitted in band on the encoder's first packet.
     ///
-    /// Empty if the encoder didn't populate `extradata` (shouldn't
-    /// happen for h264_vaapi/hevc_vaapi at Main profile — both write
-    /// Annex-B parameter sets to extradata at open()).
+    /// Empty for `av1_vaapi`: AV1 carries its sequence-header OBU in-band
+    /// on every keyframe, so no AV1 encoder populates `extradata`, and
+    /// `snapshot_extradata` accepts the empty snapshot for AV1 (see there).
+    /// For `h264_vaapi`/`hevc_vaapi` at Main this holds the Annex-B
+    /// parameter sets libavcodec writes to extradata at open(); an empty
+    /// snapshot there is fatal.
     extradata: Vec<u8>,
     // Keep the device context alive for the encoder's lifetime. The
     // encoder's `hw_frames_ctx` holds an internal ref-counted handle
@@ -543,7 +546,7 @@ impl VaapiEncoder {
         // h264_vaapi/hevc_vaapi at Main this is the Annex-B SPS/PPS
         // (HEVC also includes VPS). See `encoder_common` for why we
         // do this.
-        let extradata = snapshot_extradata(&encoder, vaapi_codec_name(kind), kind)?;
+        let extradata = snapshot_extradata(&encoder, vaapi_codec_name(kind), kind, false)?;
 
         Ok(Self {
             kind,

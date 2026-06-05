@@ -354,9 +354,10 @@ impl VideoToolboxEncoder {
 
         // Snapshot the parameter-set bundle libavcodec just wrote into
         // `extradata` so we can prepend it to every keyframe at drain
-        // time. See `encoder_common` for the contract — an empty
-        // extradata here is fatal (would break self-decodable IDRs).
-        let extradata = snapshot_extradata(&encoder, vt_codec_name(kind), kind)?;
+        // time. See `encoder_common` for the contract — VideoToolbox does
+        // not emit in-band parameter sets, so an empty extradata here is
+        // fatal (would break self-decodable IDRs).
+        let extradata = snapshot_extradata(&encoder, vt_codec_name(kind), kind, false)?;
 
         Ok(Self {
             kind,

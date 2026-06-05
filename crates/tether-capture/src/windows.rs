@@ -78,10 +78,7 @@ impl D3D11Device {
     /// shares the same D3D11 device as capture (zero-copy VP blit).
     pub fn device_ptrs(&self) -> (*mut std::ffi::c_void, *mut std::ffi::c_void) {
         use windows::core::Interface;
-        (
-            self.device.as_raw() as *mut std::ffi::c_void,
-            self.context.as_raw() as *mut std::ffi::c_void,
-        )
+        (self.device.as_raw(), self.context.as_raw())
     }
 }
 
@@ -196,7 +193,7 @@ pub fn start_with(pre: PreCreatedCapture) -> Result<(CaptureHandle, D3D11Device)
                 cursor_state,
             );
         })
-        .map_err(|e| CaptureError::Io(e))?;
+        .map_err(CaptureError::Io)?;
 
     Ok((handle, shared_device))
 }
@@ -488,6 +485,10 @@ fn acquire_slot<T>(free_rx: &Receiver<usize>, evict_rx: &Receiver<T>) -> Option<
     free_rx.try_recv().ok()
 }
 
+// Thread entry point wiring the capture loop's channels, device, and live
+// retune state together; grouping these into a struct would only add a
+// single-use type with no other callers.
+#[allow(clippy::too_many_arguments)]
 fn run_capture_thread(
     tx: Sender<CapturedFrame>,
     evict_rx: Receiver<CapturedFrame>,
@@ -678,6 +679,8 @@ fn create_texture_pool(
 /// Retries with exponential backoff up to [`RECONNECT_MAX_TOTAL`].
 /// First attempt is immediate (fast-user-switch recovers instantly);
 /// backoff sleep happens only after a failed attempt.
+// Elapsed reconnect time fits u64 ms trivially (bounded by RECONNECT_MAX_TOTAL).
+#[allow(clippy::cast_possible_truncation)]
 fn reconnect_duplication(device: &ID3D11Device) -> Option<(IDXGIOutputDuplication, u32, u32)> {
     let start = std::time::Instant::now();
     let mut attempt = 0usize;
@@ -706,6 +709,8 @@ fn reconnect_duplication(device: &ID3D11Device) -> Option<(IDXGIOutputDuplicatio
 }
 
 /// Query QPC frequency (ticks per second).
+// QueryPerformanceFrequency always reports a positive frequency.
+#[allow(clippy::cast_sign_loss)]
 fn qpc_frequency() -> u64 {
     let mut freq = 0i64;
     let _ = unsafe { QueryPerformanceFrequency(&mut freq) };
@@ -718,6 +723,9 @@ fn qpc_frequency() -> u64 {
 /// current QPC, then subtracting that delta from `MonoNanos::now()`.
 /// Returns `None` if the value is zero (DXGI sets it to 0 when
 /// unavailable).
+// elapsed_ticks is clamped to >= 0 before the u128 cast; the final nanos
+// value fits u64 for any realistic uptime (584 years at ns resolution).
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn qpc_to_mono_nanos(qpc: i64, freq: u64) -> Option<MonoNanos> {
     if qpc <= 0 || freq == 0 {
         return None;
@@ -725,14 +733,14 @@ fn qpc_to_mono_nanos(qpc: i64, freq: u64) -> Option<MonoNanos> {
     let mut now_qpc = 0i64;
     let _ = unsafe { QueryPerformanceCounter(&mut now_qpc) };
     let elapsed_ticks = now_qpc.saturating_sub(qpc).max(0) as u128;
-    let elapsed_nanos = (elapsed_ticks * 1_000_000_000) / freq as u128;
+    let elapsed_nanos = (elapsed_ticks * 1_000_000_000) / u128::from(freq);
     let now = MonoNanos::now();
     let kernel_nanos = now.0.saturating_sub(elapsed_nanos as u64);
     Some(MonoNanos(kernel_nanos))
 }
 
 fn hresult_io(e: windows::core::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }
 
 #[cfg(test)]

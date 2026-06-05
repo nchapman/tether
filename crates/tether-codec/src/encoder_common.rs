@@ -69,13 +69,24 @@ pub(crate) fn drain_encoder(
 
 /// Snapshot `AVCodecContext::extradata` into an owned `Vec<u8>`. Call
 /// this once immediately after `encoder.open()` has succeeded with
-/// `AV_CODEC_FLAG_GLOBAL_HEADER` set. Returns
-/// `Err(CodecError::NoHardwareCodec(..))` if libavcodec did not populate
-/// extradata — without it, keyframes won't carry SPS/PPS and any client
-/// that loses the first IDR or rebuilds its decoder mid-session is
-/// permanently stuck. That breaks Tether's self-decodable-IDR invariant,
-/// so we fail loudly at encoder construction rather than silently
-/// continuing.
+/// `AV_CODEC_FLAG_GLOBAL_HEADER` set.
+///
+/// Most hardware encoders (VAAPI, VideoToolbox, the vendor D3D11
+/// backends QSV/AMF/NVENC) populate `extradata` at `open()` and emit
+/// keyframe slices *without* in-band parameter sets; `drain_encoder`
+/// prepends this snapshot to every keyframe so each IDR is
+/// self-decodable. For those, an empty snapshot is fatal — without
+/// SPS/PPS any client that loses the first IDR or rebuilds its decoder
+/// mid-session is permanently stuck — so `inband_parameter_sets = false`
+/// fails loudly at construction.
+///
+/// FFmpeg's Media Foundation encoders (`*_mf`) are the exception: they
+/// never populate `extradata` but emit VPS/SPS/PPS (HEVC) or SPS/PPS
+/// (H.264) in-band on *every* keyframe, so each IDR is already
+/// self-decodable on its own. Callers pass `inband_parameter_sets = true`
+/// for those; an empty snapshot is then expected and `drain_encoder`
+/// correctly skips the prepend (prepending would duplicate the in-band
+/// sets). Verified by `d3d11_mf_keyframes_carry_inband_parameter_sets`.
 ///
 /// SAFETY: libavcodec populates `extradata` inside `open()` when
 /// `AV_CODEC_FLAG_GLOBAL_HEADER` is set, and does not mutate it
@@ -88,6 +99,7 @@ pub(crate) fn snapshot_extradata(
     encoder: &AVCodecContext,
     codec_name: &str,
     codec_kind: CodecKind,
+    inband_parameter_sets: bool,
 ) -> Result<Vec<u8>> {
     let extradata = unsafe {
         let raw = encoder.extradata;
@@ -99,6 +111,22 @@ pub(crate) fn snapshot_extradata(
         }
     };
     if extradata.is_empty() {
+        // AV1 has no out-of-band parameter-set record in our raw-OBU wire
+        // format: every keyframe carries its sequence-header OBU in-band, so
+        // *no* AV1 encoder (qsv/amf/nvenc/mf) populates extradata and an empty
+        // snapshot is always expected — independent of the per-backend flag.
+        // (Verified for av1_mf by `d3d11_mf_keyframes_carry_inband_parameter_sets`
+        // and end-to-end by the AV1 encode→decode round-trips.)
+        if inband_parameter_sets || codec_kind == CodecKind::Av1 {
+            // Also expected for Media Foundation H.264/HEVC: parameter sets
+            // ride in-band on every keyframe, so there is nothing to prepend.
+            tracing::debug!(
+                codec = codec_name,
+                "encoder leaves extradata empty; relying on in-band keyframe \
+                 parameter sets for self-decodable IDRs"
+            );
+            return Ok(Vec::new());
+        }
         return Err(CodecError::NoHardwareCodec(format!(
             "{codec_name}: encoder.extradata was empty after open() despite \
              AV_CODEC_FLAG_GLOBAL_HEADER. Keyframes would not carry SPS/PPS, \

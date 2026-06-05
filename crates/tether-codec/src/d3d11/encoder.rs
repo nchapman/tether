@@ -126,6 +126,13 @@ fn is_qsv_backend(name: &str) -> bool {
     name.contains("qsv")
 }
 
+/// Media Foundation backends (`hevc_mf` / `h264_mf` / `av1_mf`). Unlike the
+/// vendor encoders they never populate `extradata`; they emit parameter
+/// sets in-band on every keyframe instead (see `snapshot_extradata`).
+fn is_mf_backend(name: &str) -> bool {
+    name.contains("_mf")
+}
+
 pub struct D3D11Encoder {
     kind: CodecKind,
     encoder: AVCodecContext,
@@ -170,6 +177,10 @@ impl D3D11Encoder {
     ///
     /// `device_ptr` and `device_ctx_ptr` are raw COM pointers to the
     /// shared `ID3D11Device` / `ID3D11DeviceContext` from capture.
+    // Encoder construction inherently needs the full parameter set (profile,
+    // dims, fps, bitrate, shared device pair, vendor); a config struct would
+    // be single-use indirection.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         profile: VideoProfile,
         width: u32,
@@ -237,6 +248,8 @@ impl D3D11Encoder {
         Err(last_err)
     }
 
+    // Same parameter set as `new` plus the specific backend being attempted.
+    #[allow(clippy::too_many_arguments)]
     fn try_open(
         profile: VideoProfile,
         backend_name: &'static str,
@@ -483,7 +496,13 @@ impl D3D11Encoder {
         sw_frame.set_height(height_i32);
         sw_frame.alloc_buffer()?;
 
-        let extradata = snapshot_extradata(&encoder, backend_name, kind)?;
+        // Media Foundation encoders never populate `extradata`; they emit
+        // parameter sets in-band on every keyframe instead (verified by
+        // `d3d11_mf_keyframes_carry_inband_parameter_sets`). The vendor
+        // backends (QSV/AMF/NVENC) populate it and rely on the prepend, so
+        // an empty snapshot there is still fatal.
+        let extradata =
+            snapshot_extradata(&encoder, backend_name, kind, is_mf_backend(backend_name))?;
         let bgra_row_bytes = (width as usize) * 4;
 
         // Keep the D3D11VA device alive — for QSV the derived device
@@ -518,6 +537,9 @@ impl D3D11Encoder {
     /// the encoder was constructed with. Internally we use the D3D11
     /// Video Processor to convert BGRA→NV12 into an hw_frames pool
     /// surface, then submit that to the encoder.
+    // The D3D11VA array index in data[1] is a small pool-slot number that
+    // fits u32.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn submit_d3d11_texture(
         &mut self,
         frame: &D3D11TextureFrame,
@@ -593,7 +615,7 @@ impl D3D11Encoder {
                     ffi::av_hwframe_map(
                         mapped.as_mut_ptr(),
                         hw.as_ptr(),
-                        (ffi::AV_HWFRAME_MAP_WRITE | ffi::AV_HWFRAME_MAP_OVERWRITE) as i32,
+                        ffi::AV_HWFRAME_MAP_WRITE | ffi::AV_HWFRAME_MAP_OVERWRITE,
                     )
                 };
                 if rc < 0 {
@@ -671,6 +693,8 @@ impl D3D11Encoder {
 }
 
 impl Encoder for D3D11Encoder {
+    // The AVFrame luma linesize is a non-negative stride.
+    #[allow(clippy::cast_sign_loss)]
     fn encode_bgra(
         &mut self,
         bgra: &[u8],
@@ -824,7 +848,7 @@ fn create_d3d11va_hw_device(
         // lock_ctx must be non-null or FFmpeg falls back to its default.
         (*hwctx).lock = d3d11_no_op_lock as *mut std::ffi::c_void;
         (*hwctx).unlock = d3d11_no_op_lock as *mut std::ffi::c_void;
-        (*hwctx).lock_ctx = 1 as *mut std::ffi::c_void;
+        (*hwctx).lock_ctx = std::ptr::dangling_mut::<std::ffi::c_void>();
     }
     if let Err(e) = hw_device.init() {
         // init failed — FFmpeg won't release the injected refs, so we must.

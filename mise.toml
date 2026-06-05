@@ -9,3 +9,217 @@ rust = { version = "1.95.0", components = "rustfmt,clippy" }
 # toolchain across platforms.
 node = "22"
 pnpm = "10"
+
+[env]
+# Make Git's bundled Unix tools (sh/bash) resolvable for the few bash-script
+# tasks below, without the dev hand-editing PATH. Git ships sh.exe/bash.exe in
+# `<git-root>/bin`, and `git --exec-path` reports `<git-root>/mingw64/libexec/
+# git-core` on Windows — so swapping that suffix for `/bin` yields the dir with
+# the shell. (git is always on PATH; you can't clone without it.) On Linux the
+# exec-path is `/usr/lib/git-core`, which the second replace maps to the
+# already-present `/usr/bin` (a no-op). On macOS neither pattern matches, so the
+# git-core helper dir itself is prepended — harmless, since `sh` is already at
+# /bin/sh natively (the prepend only matters on Windows). This is the only
+# Windows-specific bit of the task layer.
+_.path = ["{{ exec(command='git --exec-path') | replace(from='/mingw64/libexec/git-core', to='/bin') | replace(from='/usr/lib/git-core', to='/usr/bin') }}"]
+
+# --- Dev tasks ------------------------------------------------------------
+# `mise tasks` lists every task; `mise run <name>` runs one. This replaces the
+# old Makefile so the same commands work on every platform without `make` or a
+# specific shell on PATH. Each task is the cost-of-truth for the cargo (or
+# script) invocation it wraps.
+#
+# Most tasks are pure `cargo`/`pnpm` and run under the platform default shell
+# (`cmd /c` on Windows) — no shell features, no extra dependency. Only the few
+# tasks that invoke a `scripts/*.sh` or a POSIX builtin (`rm -rf`) set
+# `shell = "sh -c"` so they run under git-bash on Windows (already a Windows
+# prerequisite — those scripts are bash); on Linux/macOS `sh` is the default
+# anyway, and `scripts/*.sh` run via their `#!/usr/bin/env bash` shebang.
+
+# tether-codec statically links the prebuilt LGPL FFmpeg from the
+# nchapman/tether-ffmpeg releases (pinned in scripts/ffmpeg-version). The fetch
+# is idempotent — a no-op once the matching artifact is staged — so every
+# compiling task depends on it.
+[tasks.ffmpeg]
+description = "Download + stage the pinned static FFmpeg for this host (idempotent)"
+shell = "sh -c"
+run = "scripts/fetch-ffmpeg.sh"
+
+[tasks.ffmpeg-clean]
+description = "Remove the staged FFmpeg so the next build re-fetches"
+shell = "sh -c"
+run = "rm -rf vendor/ffmpeg"
+
+[tasks.build]
+description = "Dev build of the full workspace"
+depends = ["ffmpeg"]
+run = "cargo build --workspace"
+
+[tasks.release]
+description = "Release build of the host + client binaries"
+depends = ["ffmpeg"]
+run = "cargo build --release -p tether-host -p tether-client"
+
+[tasks.test]
+description = "Fast unit tests (no hardware required)"
+depends = ["ffmpeg"]
+run = "cargo test --workspace --lib"
+
+# Every `#[ignore]` hardware test for the CURRENT platform, no matter which
+# crate it lives in. The per-platform backends are cfg-gated (vaapi=Linux,
+# videotoolbox=macOS, d3d11=Windows) and the cross-platform GPU tests
+# (tether-scaler, tether-probe) run everywhere, so `--workspace ... --ignored`
+# runs exactly the present host's hardware suite with no platform-shaped crate
+# list — codec + render + gpuconvert + scaler + probe alike. Run it on Linux,
+# macOS, or Windows and it covers that host's full backend; no platform is
+# privileged. (`--exclude tether-audio`: the audio round-trips need an audio
+# device with sound actively playing and hard-fail otherwise — they have their
+# own `test-audio` task. `--skip bench`: benchmarks live in `bench`.)
+# `--test-threads=1`: hardware tests share one GPU; serial avoids device
+# contention (the VAAPI bench serialization + Windows single-iGPU flakiness).
+# macOS adds `--release`: the IOSurface/Metal round-trips are too slow in debug
+# for their reference-comparison thresholds (their ignore messages document it);
+# Linux VAAPI + Windows D3D11 pass in debug, so only macOS pays the release build.
+# `--no-fail-fast`: this is a sweep — run every crate's hardware suite even if an
+# earlier one fails, so one broken crate can't mask the rest (cargo otherwise
+# stops at the first failing test binary, and the crates run in alphabetical
+# order).
+[tasks.test-hw]
+description = "All hardware tests for the current platform (codec + render + gpuconvert + scaler + probe)"
+depends = ["ffmpeg"]
+run = "cargo test --workspace --exclude tether-audio --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+# System-audio capture → Opus → playback round-trip for the current platform
+# (PipeWire monitor on Linux, ScreenCaptureKit on macOS, WASAPI loopback on
+# Windows). Separate from `test-hw` because it needs an audio output device
+# with sound actively playing, not a GPU. Symmetric: one round-trip per OS,
+# cfg-selected. `--nocapture` surfaces the captured/played frame counts.
+[tasks.test-audio]
+description = "System-audio capture→encode→decode→playback round-trip (needs an audio device with sound playing)"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-audio --tests -- --ignored --test-threads=1 --nocapture"
+
+# Benchmark cells for the current platform, in release (benchmarks must be
+# optimized; the scaler microbench documents `--release`). VAAPI encode matrix
+# on Linux + the cross-platform scaler microbench everywhere; a no-op on a
+# backend with no bench cells yet. Same no-platform-privileged shape as test-hw.
+[tasks.bench]
+description = "Hardware benchmark cells for the current platform (release, serial)"
+depends = ["ffmpeg"]
+run = "cargo test --workspace --tests --release -- --ignored --test-threads=1 --nocapture bench"
+
+[tasks.probe]
+description = "Print the host codec capability matrix (encode/decode per profile)"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-probe --lib print_host_supported_profiles -- --ignored --nocapture"
+
+[tasks.check]
+description = "Static workspace hygiene checks (no compile / no codegen)"
+shell = "sh -c"
+run = "scripts/check_test_support_gating.sh"
+
+[tasks.clippy]
+description = "Lint the workspace + shell, warnings-as-errors (CI gate)"
+depends = ["ffmpeg"]
+run = [
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy --manifest-path apps/tether-shell/src-tauri/Cargo.toml --all-targets -- -D warnings",
+]
+
+[tasks.fmt]
+description = "Format the workspace + the (excluded) Tauri shell"
+run = [
+  "cargo fmt --all",
+  "cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml",
+]
+
+# The no-hardware checks CI runs. RUSTFLAGS=-D warnings makes any new warning a
+# hard gate (matches CI); clippy + the excluded Tauri shell run at the end.
+[tasks.ci]
+description = "Run the no-hardware checks CI runs (fmt, gating, build, test, clippy, shell)"
+depends = ["ffmpeg"]
+env = { RUSTFLAGS = "-D warnings" }
+# `sh -c`: the run list includes the bash gating script.
+shell = "sh -c"
+run = [
+  "cargo fmt --all --check",
+  "cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check",
+  "scripts/check_test_support_gating.sh",
+  "cargo build --workspace --all-targets",
+  "cargo test --workspace",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy --manifest-path apps/tether-shell/src-tauri/Cargo.toml --all-targets -- -D warnings",
+  "pnpm --dir apps/tether-shell exec tsc --noEmit",
+  "cargo check --manifest-path apps/tether-shell/src-tauri/Cargo.toml",
+]
+
+[tasks.hooks]
+description = "Install the git pre-commit hook (fmt + gating, no compile)"
+shell = "sh -c"
+run = [
+  "git config core.hooksPath .githooks",
+  "echo 'pre-commit hook installed (.githooks)'",
+]
+
+[tasks.clean]
+description = "Cargo clean"
+run = "cargo clean"
+
+[tasks.install-udev]
+description = "(Linux) Install the /dev/uinput udev rule for portal-free input injection (needs sudo)"
+# `sh -c`: the trigger/modprobe steps use `||` fallbacks (Linux-only task).
+shell = "sh -c"
+run = [
+  "sudo install -m 0644 packaging/linux/udev/60-tether-uinput.rules /etc/udev/rules.d/60-tether-uinput.rules",
+  "sudo udevadm control --reload-rules",
+  "sudo udevadm trigger /dev/uinput || sudo udevadm trigger",
+  "sudo modprobe uinput || true",
+  "echo 'udev rule installed. tether-host can now inject input without a per-session prompt.'",
+]
+
+# --- Tauri shell (control-plane UI) ---------------------------------------
+# The shell is excluded from the cargo workspace and builds via pnpm + the
+# Tauri CLI. It spawns the host/client binaries from target/debug, so those
+# must be built first (the `engines` task does that).
+[tasks.engines]
+description = "Build the host + client binaries the shell spawns (target/debug)"
+depends = ["ffmpeg"]
+run = "cargo build -p tether-host -p tether-client"
+
+[tasks.shell-install]
+description = "Install the shell's frontend dependencies (run once, or after dep changes)"
+run = "pnpm --dir apps/tether-shell install"
+
+[tasks.shell]
+description = "Run the Tauri shell in dev mode (builds the engines first)"
+depends = ["engines"]
+# `sh -c`: stages the Windows runtime via a bash script before launching.
+shell = "sh -c"
+run = [
+  "scripts/stage-windows-runtime.sh",
+  "pnpm --dir apps/tether-shell tauri dev",
+]
+
+[tasks.shell-check]
+description = "Typecheck the shell without running it (TypeScript + src-tauri Rust)"
+run = [
+  "pnpm --dir apps/tether-shell exec tsc --noEmit",
+  "cargo check --manifest-path apps/tether-shell/src-tauri/Cargo.toml",
+]
+
+# --- Packaging (Tauri installers) -----------------------------------------
+# Builds release engines, stages them as sidecars, and runs the Tauri bundler.
+# Produces installers under apps/tether-shell/src-tauri/target/release/bundle/.
+# Keyless local smoke build: does NOT emit signed updater artifacts.
+[tasks.package]
+description = "Build a local Tauri installer bundle with the engines embedded"
+depends = ["ffmpeg"]
+# `sh -c`: stages engine sidecars + Windows runtime via bash scripts.
+shell = "sh -c"
+run = [
+  "cargo build --release -p tether-host -p tether-client",
+  "scripts/stage-engine-binaries.sh",
+  "scripts/stage-windows-runtime.sh",
+  "pnpm --dir apps/tether-shell install",
+  "pnpm --dir apps/tether-shell tauri build --config src-tauri/tauri.release.conf.json",
+]

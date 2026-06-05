@@ -1,7 +1,7 @@
 /target
 
 # Prebuilt static FFmpeg staged by scripts/fetch-ffmpeg.sh (downloaded per host
-# from the nchapman/tether-ffmpeg releases; never committed — `make ffmpeg`).
+# from the nchapman/tether-ffmpeg releases; never committed — `mise run ffmpeg`).
 /vendor/ffmpeg/
 
 # Engine sidecars staged for Tauri bundling by scripts/stage-engine-binaries.sh

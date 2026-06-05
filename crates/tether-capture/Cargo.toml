@@ -21,7 +21,7 @@ crossbeam-channel = { workspace = true }
 # by `tether-transport`.
 #
 # CI guards against this feature leaking into a non-`[dev-dependencies]`
-# slot — see `make check`.
+# slot — see `mise run check`.
 test-support = []
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -82,7 +82,7 @@ jobs:
           # Merge two release-only configs (paths relative to projectPath):
           #   - tauri.release.conf.json adds the engine sidecars (externalBin),
           #     kept out of the base config so `tauri dev` / CI / keyless
-          #     `make package` don't need staged engines.
+          #     `mise run package` don't need staged engines.
           #   - tauri.updater.conf.json enables createUpdaterArtifacts, which
           #     requires the signing key — only layered on here, where it's set.
           args: --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.updater.conf.json

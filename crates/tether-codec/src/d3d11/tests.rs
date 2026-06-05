@@ -3,7 +3,10 @@
 //! modern Intel/AMD/NVIDIA discrete or integrated GPU). Run with
 //! `cargo test -p tether-codec --lib d3d11::tests -- --ignored`.
 
+// Included from `d3d11/mod.rs` as `mod tests;`; the inner `mod tests` keeps
+// these hardware tests grouped under one named block.
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
@@ -18,6 +21,168 @@ mod tests {
     /// Intel PCI vendor ID — routes `D3D11Encoder::new` to the QSV
     /// backend (see `backends_for_vendor`).
     const VENDOR_INTEL: u32 = 0x8086;
+
+    /// Media Foundation encoders (`*_mf`, the unknown-vendor fallback)
+    /// never populate `AVCodecContext::extradata`, so `snapshot_extradata`
+    /// must NOT hard-fail construction for them (the bug that turned all 12
+    /// MF-path tests red on the static FFmpeg build). They keep the
+    /// self-decodable-IDR invariant a different way — parameter sets ride
+    /// in-band on *every* keyframe (including mid-stream forced IDRs), so
+    /// each IDR decodes standalone with no prepend:
+    ///   - HEVC: VPS (32) + SPS (33) + PPS (34) NAL units
+    ///   - H.264: SPS (7) + PPS (8) NAL units
+    ///   - AV1: a sequence-header OBU (type 1)
+    ///
+    /// This pins both facts for all three MF codecs: empty extradata at
+    /// open, and the in-band headers on each keyframe.
+    ///
+    /// Routes through vendor 0 → MF-only (`backends_for_vendor`), so it runs
+    /// on any D3D11 GPU regardless of which vendor it is.
+    #[test]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); exercises the Media Foundation fallback"]
+    fn d3d11_mf_keyframes_carry_inband_parameter_sets() {
+        // (label, profile, codec, required in-band header types). For HEVC
+        // and H.264 these are NAL unit types; for AV1, OBU types.
+        let cases: &[(&str, VideoProfile, CodecKind, &[u8])] = &[
+            ("hevc_mf", hevc_profile(), CodecKind::Hevc, &[32, 33, 34]),
+            ("h264_mf", h264_profile(), CodecKind::H264, &[7, 8]),
+            ("av1_mf", av1_profile(), CodecKind::Av1, &[1]),
+        ];
+
+        for &(label, profile, kind, want) in cases {
+            let mut enc = D3D11Encoder::new(
+                profile,
+                TEST_WIDTH,
+                TEST_HEIGHT,
+                TEST_FPS,
+                TEST_BITRATE_KBPS,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+            .unwrap_or_else(|e| panic!("{label}: construction must succeed, got {e:?}"));
+
+            // MF leaves extradata empty — that's expected, not a failure.
+            assert!(
+                enc.extradata().is_empty(),
+                "{label}: MF is expected to leave extradata empty (parameter \
+                 sets ride in-band); got {} bytes",
+                enc.extradata().len()
+            );
+
+            let bgra = vec![64u8; (TEST_WIDTH * TEST_HEIGHT * 4) as usize];
+            let mut keyframes = Vec::new();
+            for pts in 0..40i64 {
+                // Force an IDR at 0 and again mid-stream at 15 — both must be
+                // self-decodable, not just the first.
+                let force = pts == 0 || pts == 15;
+                let pkts = enc.encode_bgra(&bgra, pts, force).expect("encode_bgra");
+                keyframes.extend(pkts.into_iter().filter(|p| p.keyframe));
+                if keyframes.len() >= 2 {
+                    break;
+                }
+            }
+            assert!(
+                keyframes.len() >= 2,
+                "{label}: expected at least 2 keyframes (initial + forced), got {}",
+                keyframes.len()
+            );
+
+            for (i, kf) in keyframes.iter().enumerate() {
+                let found = match kind {
+                    CodecKind::Av1 => av1_obu_types(&kf.data),
+                    CodecKind::Hevc | CodecKind::H264 => {
+                        assert!(
+                            kf.data.starts_with(&[0, 0, 0, 1]) || kf.data.starts_with(&[0, 0, 1]),
+                            "{label}: keyframe #{i} must be Annex-B; starts {:02x?}",
+                            &kf.data[..kf.data.len().min(8)]
+                        );
+                        nalu_types(&kf.data, kind)
+                    }
+                };
+                for &ps in want {
+                    assert!(
+                        found.contains(&ps),
+                        "{label}: keyframe #{i} missing in-band header {ps} — \
+                         IDR is not self-decodable. Got {found:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scan an Annex-B bitstream and return the NAL unit type of each NALU.
+    /// Walks one byte at a time looking for 3- or 4-byte start codes; the
+    /// header byte immediately follows the start code.
+    fn nalu_types(data: &[u8], kind: CodecKind) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut i = 0;
+        while i + 3 < data.len() {
+            let sc4 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+            let sc3 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+            // A 4-byte start code needs a header byte at i+4; a 3-byte one at
+            // i+3 (guaranteed present by the loop condition).
+            if sc4 && i + 4 < data.len() {
+                let hdr = data[i + 4];
+                types.push(nal_unit_type(hdr, kind));
+                i += 4;
+            } else if sc3 {
+                let hdr = data[i + 3];
+                types.push(nal_unit_type(hdr, kind));
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        types
+    }
+
+    fn nal_unit_type(hdr: u8, kind: CodecKind) -> u8 {
+        match kind {
+            CodecKind::H264 => hdr & 0x1F,
+            CodecKind::Hevc => (hdr >> 1) & 0x3F,
+            CodecKind::Av1 => hdr,
+        }
+    }
+
+    /// Walk an AV1 low-overhead-format bitstream and return each OBU type.
+    /// OBU header: bit7 forbidden, bits6-3 type, bit2 extension, bit1
+    /// has_size, bit0 reserved; optional 1-byte extension; leb128 size.
+    fn av1_obu_types(data: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            let hdr = data[i];
+            let obu_type = (hdr >> 3) & 0x0F;
+            let ext = (hdr >> 2) & 1 == 1;
+            let has_size = (hdr >> 1) & 1 == 1;
+            types.push(obu_type);
+            let mut p = i + 1;
+            if ext {
+                p += 1;
+            }
+            if !has_size {
+                break; // can't advance without sizes; stop scanning
+            }
+            // leb128 size
+            let mut size: usize = 0;
+            let mut shift = 0;
+            loop {
+                if p >= data.len() {
+                    return types;
+                }
+                let b = data[p];
+                p += 1;
+                size |= ((b & 0x7F) as usize) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            i = p + size;
+        }
+        types
+    }
 
     fn h264_profile() -> VideoProfile {
         VideoProfile {
@@ -297,77 +462,31 @@ mod tests {
     fn d3d11_viewport_scale_encode_decode_roundtrip() {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
-        use windows::Win32::Foundation::HMODULE;
-        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-        use windows::Win32::Graphics::Direct3D11::{
-            D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-            D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-        };
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
         let capture_w = 1920u32;
         let capture_h = 1080u32;
         let encode_w = 960u32;
         let encode_h = 540u32;
 
-        // Create a D3D11 device for the test.
-        let mut device = None;
-        let mut context = None;
-        unsafe {
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-        }
-        .expect("D3D11CreateDevice");
-        let device = device.unwrap();
-        let context = context.unwrap();
+        // The Video Processor blit needs a VIDEO_SUPPORT device, and the
+        // encoder must share that same device or the VP can't write into
+        // its hw_frames pool (cross-device blit fails). `create_video_device`
+        // provides both; pass its pointers to the encoder.
+        let (device, context) = create_video_device();
+        let texture = make_bgra_texture(&device, capture_w, capture_h);
 
-        // Create a BGRA texture at capture dimensions.
-        let bgra_data = vec![128u8; (capture_w * capture_h * 4) as usize];
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: capture_w,
-            Height: capture_h,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: 0,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let init_data = D3D11_SUBRESOURCE_DATA {
-            pSysMem: bgra_data.as_ptr().cast(),
-            SysMemPitch: capture_w * 4,
-            SysMemSlicePitch: 0,
-        };
-        let mut texture = None;
-        unsafe { device.CreateTexture2D(&desc, Some(&init_data), Some(&mut texture)) }
-            .expect("CreateTexture2D");
-        let texture = texture.unwrap();
-
-        // Encoder at viewport (smaller) dimensions.
+        // Encoder at viewport (smaller) dimensions, on the shared device.
+        // vendor 0 → Media Foundation, the path an unknown-vendor host uses;
+        // this is also the only coverage of the MF zero-copy GPU submit.
         let mut enc = D3D11Encoder::new(
             h264_profile(),
             encode_w,
             encode_h,
             TEST_FPS,
             TEST_BITRATE_KBPS,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
             0,
         )
         .expect("encoder construction");
@@ -612,8 +731,10 @@ mod tests {
         }
         let kf = keyframe.expect("encoder produced no keyframe after 30 frames");
 
-        // Keyframe data must start with Annex-B start code (extradata was
-        // converted from hvcC if needed by snapshot_extradata).
+        // Keyframe data must start with an Annex-B start code. This routes
+        // through vendor 0 → Media Foundation, which carries VPS/SPS/PPS
+        // in-band on the keyframe (no extradata prepend — see
+        // `d3d11_mf_keyframes_carry_inband_parameter_sets`).
         assert!(
             kf.data.starts_with(&[0x00, 0x00, 0x00, 0x01])
                 || kf.data.starts_with(&[0x00, 0x00, 0x01]),
@@ -791,20 +912,39 @@ mod tests {
     }
 
     /// Verify the extradata stored in the encoder starts with VPS (type 32)
-    /// after the reordering fix. AMF emits SPS→PPS→VPS but we fix it to
-    /// VPS→SPS→PPS at snapshot time.
+    /// after the reordering fix (`snapshot_extradata` rewrites AMF's
+    /// SPS→PPS→VPS to VPS→SPS→PPS). Routes through the *present* GPU vendor
+    /// so it exercises a real vendor encoder's extradata (QSV/AMF/NVENC).
+    ///
+    /// SKIPs on unknown-vendor GPUs: those fall back to Media Foundation,
+    /// which never populates `extradata` (parameter sets ride in-band — see
+    /// `d3d11_mf_keyframes_carry_inband_parameter_sets`), so there is no
+    /// extradata ordering to check.
     #[test]
     #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows)"]
     fn d3d11_hevc_extradata_starts_with_vps() {
+        use windows::core::Interface;
+
+        let (device, context) = create_video_device();
+        let vendor_id = device_vendor_id(&device);
+        if !matches!(vendor_id, VENDOR_INTEL | VENDOR_AMD | VENDOR_NVIDIA) {
+            eprintln!(
+                "SKIP d3d11_hevc_extradata_starts_with_vps: unknown vendor \
+                 0x{vendor_id:04x} routes to MF, which carries parameter sets \
+                 in-band (no extradata to inspect)"
+            );
+            return;
+        }
+
         let enc = D3D11Encoder::new(
             hevc_profile(),
             TEST_WIDTH,
             TEST_HEIGHT,
             TEST_FPS,
             TEST_BITRATE_KBPS,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
+            device.as_raw() as *mut _,
+            context.as_raw() as *mut _,
+            vendor_id,
         )
         .expect("HEVC encoder construction");
 
@@ -1028,16 +1168,29 @@ mod tests {
             vendor_id,
         )
         .expect("encoder construction");
-        // We're on matching hardware (gated above), so the intended
-        // backend must open — a fall-through to `hevc_mf` means this
-        // FFmpeg build lacks the vendor encoder, which is a real failure.
-        assert_eq!(
-            enc.name(),
-            expected_backend,
-            "GPU is vendor 0x{vendor_id:04x} but {expected_backend} did not open (got {}); \
-             FFmpeg build is missing the {expected_backend} encoder",
-            enc.name()
-        );
+        // We're on matching hardware (gated above), so the intended backend
+        // must open — a fall-through to `*_mf` normally means this FFmpeg
+        // build lacks the vendor encoder, a real failure. EXCEPTION: AV1
+        // hardware encode needs a recent GPU (Intel Arc / AMD RDNA 3+ /
+        // NVIDIA Ada). On an older same-vendor GPU the vendor's AV1 encoder
+        // is genuinely absent and construction falls back to `av1_mf`, so
+        // SKIP rather than fail. HEVC/H.264 hardware encode is universal on
+        // these vendors, so a fallback there stays a hard failure.
+        if enc.name() != expected_backend {
+            if expected_backend.starts_with("av1") && enc.name().ends_with("_mf") {
+                eprintln!(
+                    "SKIP {expected_backend}: vendor 0x{vendor_id:04x} GPU lacks AV1 \
+                     hardware encode (opened {}); needs Intel Arc / AMD RDNA 3+ / NVIDIA Ada",
+                    enc.name()
+                );
+                return;
+            }
+            panic!(
+                "GPU is vendor 0x{vendor_id:04x} but {expected_backend} did not open (got {}); \
+                 FFmpeg build is missing the {expected_backend} encoder",
+                enc.name()
+            );
+        }
 
         let mut dec = D3D11Decoder::new(profile.codec, gpu_export).expect("decoder construction");
         let frame = D3D11TextureFrame {

@@ -22,7 +22,7 @@
 #     whatever pkg-config's first include path happens to be.
 #
 # If vendor/ffmpeg/prefix is missing, the build fails fast pointing at this
-# path — run `make ffmpeg` (or scripts/fetch-ffmpeg.sh) to populate it.
+# path — run `mise run ffmpeg` (or scripts/fetch-ffmpeg.sh) to populate it.
 [env]
 FFMPEG_PKG_CONFIG_PATH = { value = "vendor/ffmpeg/prefix/lib/pkgconfig", relative = true }
 FFMPEG_LIBS_DIR = { value = "vendor/ffmpeg/prefix/lib", relative = true }

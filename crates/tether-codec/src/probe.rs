@@ -128,7 +128,10 @@ pub fn build_encoder(
 /// device from the capture layer. When `device_ptr` is non-null, the
 /// encoder reuses the capture device (zero-copy texture sharing);
 /// when null, FFmpeg creates its own device (probe path, or fallback).
+// Forwards the full encoder-construction parameter set (profile, dims, fps,
+// bitrate, shared device pair, vendor) to D3D11Encoder::new verbatim.
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 pub fn build_encoder_d3d11(
     profile: VideoProfile,
     width: u32,

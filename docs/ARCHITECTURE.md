@@ -208,6 +208,10 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │       the encoder. NO_OUTPUT_WATCHDOG=1500ms triggers Idr on        │
 │       silent decoder stalls.                                        │
 │     • vaSyncSurface + vaExportSurfaceHandle → DRM_PRIME             │
+│     • NVIDIA clients: tether-codec::nvdec::NvdecDecoder instead     │
+│       (no VAAPI fallback); NVDEC → CUDA surface → EGLImage-import   │
+│       an NV12/P010 pool dma-buf → cuMemcpy2D planes in; same        │
+│       Frame::Gpu(DmaBuf) handoff (GH #16, Main + Main10)            │
 │         │   Frame::Gpu(GpuFrame { DmaBuf { fd, stride, modifier } })│
 │         ▼  (LatestFrame single-slot drop-oldest)                    │
 │   tether-render::gpu                                                │

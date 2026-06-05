@@ -34,7 +34,13 @@ pub(crate) struct NvencProbe;
 
 /// Probe canvas. 128×128 matches the VAAPI probe and the fixture dims, and
 /// satisfies HEVC's minimum-block constraint.
-const PROBE_DIM: u32 = 128;
+// 256, not the 128 the VAAPI probe uses: constructing a 128×128 HEVC Main10
+// (P010) NVENC encoder SIGSEGVs *inside the NVENC runtime* — Main10 has a
+// minimum encode dimension that 128px violates, and FFmpeg's wrapper faults
+// rather than erroring. 256 is the smallest dimension verified to construct
+// every advertised profile (the M3 P010 round-trip runs at 256). Real
+// sessions are always far larger; this is a probe-only floor.
+const PROBE_DIM: u32 = 256;
 const PROBE_FPS: u32 = 30;
 const PROBE_BITRATE_KBPS: u32 = 1_000;
 

@@ -16,6 +16,8 @@
 //! through VAAPI (nvidia-vaapi-driver's decode path).
 
 #[cfg(target_os = "linux")]
+pub(crate) mod nvdec;
+#[cfg(target_os = "linux")]
 pub(crate) mod nvenc;
 #[cfg(target_os = "linux")]
 pub(crate) mod vaapi;
@@ -69,5 +71,12 @@ pub(crate) fn probe_decode(
     fixture: &[u8],
 ) -> crate::profile_probe::Result<()> {
     use crate::profile_probe::ProfileProbe;
+    // Linux NVIDIA hosts decode through NVDEC, not VAAPI — the default VAAPI
+    // device there is the decode-only nvidia-vaapi-driver, whose VaapiDecoder
+    // SIGSEGVs. No VAAPI fallback (same reasoning as the encode side).
+    #[cfg(target_os = "linux")]
+    if tether_codec::nvenc::nvidia_gpu_present() {
+        return nvdec::NvdecProbe::probe_decode(profile, fixture);
+    }
     ActiveProbe::probe_decode(profile, fixture)
 }

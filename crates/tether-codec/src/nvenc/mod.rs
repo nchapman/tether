@@ -27,7 +27,10 @@
 pub use encoder::NvencEncoder;
 
 mod encoder;
-mod ffi;
+// `pub(crate)` so the NVDEC decoder (`crate::nvdec`) can reuse the same
+// EGL→CUDA importer for its reverse (CUDA → dma-buf) copy — the import
+// machinery is direction-agnostic, so there's one home for it.
+pub(crate) mod ffi;
 
 #[cfg(test)]
 mod tests;

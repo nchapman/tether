@@ -3860,6 +3860,7 @@ dependencies = [
 name = "tether-codec"
 version = "0.2.1"
 dependencies = [
+ "ash",
  "bytes",
  "crossbeam-channel",
  "libloading",

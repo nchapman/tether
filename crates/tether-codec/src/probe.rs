@@ -218,6 +218,32 @@ pub fn build_decoder(profile: VideoProfile, gpu_export: bool) -> Result<Box<dyn 
     let kind = profile.codec;
     #[cfg(target_os = "linux")]
     {
+        // On an NVIDIA host, NVDEC is the decode path — full stop, no VAAPI
+        // fallback. Symmetric with `build_encoder`'s NVENC-only dispatch and
+        // for the same load-bearing reason: the default VAAPI device on an
+        // NVIDIA box is the decode-only `nvidia-vaapi-driver`, whose VLD
+        // entrypoint SIGSEGVs through FFmpeg's VAAPI wrapper rather than
+        // failing cleanly. So a codec NVDEC can't serve is genuinely
+        // unavailable on this host, not a VAAPI candidate. `nvidia_gpu_present`
+        // is sysfs-only and shared with the host probe so the advertised set
+        // matches what this dispatch picks.
+        if crate::nvenc::nvidia_gpu_present() {
+            return match crate::nvdec::NvdecDecoder::new(kind) {
+                Ok(dec) => Ok(Box::new(dec)),
+                Err(e) => {
+                    tracing::error!(
+                        backend = "nvdec",
+                        codec = ?kind,
+                        chroma = ?profile.chroma,
+                        bit_depth = profile.bit_depth,
+                        error = %e,
+                        "NVDEC decoder construction failed"
+                    );
+                    Err(no_hw_decoder_nvdec(kind, e))
+                }
+            };
+        }
+        // Non-NVIDIA Linux: VAAPI (Intel/AMD) is the universal baseline.
         match crate::vaapi::VaapiDecoder::new(kind) {
             Ok(dec) => return Ok(Box::new(dec)),
             Err(e) => {
@@ -333,6 +359,20 @@ fn no_hw_decoder(kind: CodecKind, source: CodecError) -> CodecError {
          Check `vainfo` lists VAEntrypointVLD for the chosen codec, and that the \
          kernel + libva versions match (Mesa 24+ on a 6.x kernel is the verified \
          path). Tether requires GPU decode — there is no software fallback."
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn no_hw_decoder_nvdec(kind: CodecKind, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "NVDEC decoder unavailable for {kind:?} ({source}). \
+         This is an NVIDIA host (no VAAPI decode fallback — nvidia-vaapi-driver's \
+         VLD entrypoint SIGSEGVs through FFmpeg's VAAPI wrapper). Check that \
+         `nvidia-smi` works, that the FFmpeg build has NVDEC/cuvid support \
+         (`--enable-cuda --enable-cuvid --enable-nvdec`), that the runtime \
+         `libnvcuvid.so` / `libcuda.so` are present, and that a Vulkan device \
+         exposing VK_EXT_external_memory_dma_buf is available for the NV12 \
+         surface pool. Tether requires GPU decode — there is no software fallback."
     ))
 }
 

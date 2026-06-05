@@ -34,7 +34,7 @@ use crate::{DmaBufFrame, DmaBufLayer};
 // ---------------------------------------------------------------------------
 
 /// `CUcontext` — opaque handle to a CUDA context.
-pub(super) type CuContext = *mut c_void;
+pub(crate) type CuContext = *mut c_void;
 /// `CUgraphicsResource` — opaque handle to a registered graphics resource.
 type CuGraphicsResource = *mut c_void;
 /// `CUresult` — CUDA driver-API status code.
@@ -59,6 +59,10 @@ const CU_EGL_FRAME_TYPE_PITCH: u32 = 1;
 /// one or the other depending on `frame_type`.
 const CU_MEMORYTYPE_DEVICE: u32 = 2;
 const CU_MEMORYTYPE_ARRAY: u32 = 3;
+/// `CU_MEMORYTYPE_HOST` — a `CUDA_MEMCPY2D` operand in host memory
+/// (test-only readback; see `ImportedCudaFrame::copy_plane_to_host`).
+#[cfg(test)]
+const CU_MEMORYTYPE_HOST: u32 = 1;
 
 /// `CUDA_MEMCPY2D_v2` from `<cuda.h>`. Used to copy each EGL-imported plane
 /// (a standalone device allocation) into the contiguous NV12/P010 layout of
@@ -107,10 +111,10 @@ const _: () = {
 /// fields we touch, so reading `cuda_ctx` at offset 0 stays correct. The
 /// size assert below pins the prefix we depend on, not the whole struct.
 #[repr(C)]
-pub(super) struct AvCudaDeviceContext {
-    pub(super) cuda_ctx: CuContext,
-    pub(super) stream: *mut c_void,
-    pub(super) internal: *mut c_void,
+pub(crate) struct AvCudaDeviceContext {
+    pub(crate) cuda_ctx: CuContext,
+    pub(crate) stream: *mut c_void,
+    pub(crate) internal: *mut c_void,
 }
 
 /// `CUeglFrame` from `<cudaEGL.h>`. The leading union is the per-plane
@@ -365,7 +369,7 @@ impl EglFns {
 /// resident, the resolved CUDA + EGL entry points, and an `eglInitialize`d
 /// display bound to CUDA device 0 (the same physical GPU the default CUDA
 /// context — and therefore NVENC — runs on).
-pub(super) struct EglCudaImporter {
+pub(crate) struct EglCudaImporter {
     // The libraries are kept alive for the process lifetime so the raw
     // function pointers copied out of them stay valid. Never read directly.
     _libs: (Library, Library),
@@ -396,7 +400,7 @@ struct ImportedPlane {
 /// The result of [`EglCudaImporter::import`]: per-plane device pointers
 /// for an `AV_PIX_FMT_CUDA` AVFrame, plus a guard that frees the EGL
 /// images + CUDA graphics resources when dropped.
-pub(super) struct ImportedCudaFrame {
+pub(crate) struct ImportedCudaFrame {
     planes: Vec<ImportedPlane>,
     // Drop order is declaration order: planes (plain pointers, no
     // cleanup) before the guard, which unregisters/destroys the backing
@@ -407,7 +411,7 @@ pub(super) struct ImportedCudaFrame {
 
 impl ImportedCudaFrame {
     /// Number of imported planes (1 per dma-buf layer).
-    pub(super) fn plane_count(&self) -> usize {
+    pub(crate) fn plane_count(&self) -> usize {
         self.planes.len()
     }
 
@@ -416,7 +420,7 @@ impl ImportedCudaFrame {
     /// Device→device, on the import's CUDA context — no CPU bounce. NVENC
     /// registers one contiguous pool surface per input frame, so the caller
     /// uses this to assemble the planes into a pool frame's NV12/P010 layout.
-    pub(super) fn copy_plane_into(
+    pub(crate) fn copy_plane_into(
         &self,
         i: usize,
         dst_device_ptr: *mut u8,
@@ -464,6 +468,125 @@ impl ImportedCudaFrame {
             (self._guard.cuda.ctx_pop_current)(&mut popped);
             if rc != CUDA_SUCCESS {
                 return Err(format!("cuMemcpy2D(plane {i}) failed: {rc}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy a SOURCE device pointer (`src_device_ptr` with `src_pitch`) INTO
+    /// imported plane `i`, `width_bytes` × `height`. The exact reverse of
+    /// [`Self::copy_plane_into`]: device→device on the import's CUDA context,
+    /// no CPU bounce. The NVDEC decoder uses this to fill an EGL-imported
+    /// dma-buf surface plane from the NVDEC-decoded `AV_PIX_FMT_CUDA` frame's
+    /// device pointers, so the renderer can import the dma-buf zero-copy.
+    ///
+    /// The imported (destination) plane may be `PITCH` (a linear device
+    /// pointer + row pitch) or `ARRAY` (a `CUarray`) — exactly the dispatch
+    /// `copy_plane_into` does on the source side, mirrored here onto the dst.
+    pub(crate) fn copy_plane_from(
+        &self,
+        i: usize,
+        src_device_ptr: *mut u8,
+        src_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+    ) -> Result<(), String> {
+        let plane = &self.planes[i];
+        let dst_is_array = !plane.array.is_null();
+        let cpy = CudaMemcpy2D {
+            src_x_in_bytes: 0,
+            src_y: 0,
+            src_memory_type: CU_MEMORYTYPE_DEVICE,
+            src_host: std::ptr::null(),
+            src_device: src_device_ptr as u64,
+            src_array: std::ptr::null_mut(),
+            src_pitch,
+            dst_x_in_bytes: 0,
+            dst_y: 0,
+            dst_memory_type: if dst_is_array {
+                CU_MEMORYTYPE_ARRAY
+            } else {
+                CU_MEMORYTYPE_DEVICE
+            },
+            dst_host: std::ptr::null_mut(),
+            dst_device: plane.device_ptr as u64,
+            dst_array: plane.array,
+            // cuMemcpy2D ignores dstPitch for an ARRAY destination.
+            dst_pitch: plane.pitch,
+            width_in_bytes: width_bytes,
+            height,
+        };
+        // SAFETY: both operands are device allocations in `cuda_ctx` (the
+        // source is the NVDEC-decoded CUDA frame's plane, the destination is
+        // the EGL-imported dma-buf surface plane registered against the same
+        // FFmpeg CUDA context). We push that context for the copy and pop it
+        // after. cuMemcpy2D is synchronous on the default stream, so the data
+        // is in place when this returns.
+        unsafe {
+            let push_rc = (self._guard.cuda.ctx_push_current)(self._guard.cuda_ctx);
+            if push_rc != CUDA_SUCCESS {
+                return Err(format!("cuCtxPushCurrent (copy_from) failed: {push_rc}"));
+            }
+            let rc = (self._guard.cuda.memcpy_2d)(&cpy);
+            let mut popped: CuContext = std::ptr::null_mut();
+            (self._guard.cuda.ctx_pop_current)(&mut popped);
+            if rc != CUDA_SUCCESS {
+                return Err(format!("cuMemcpy2D(into plane {i}) failed: {rc}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy imported plane `i` (device or array) out to a host buffer with
+    /// `dst_pitch`, `width_bytes` × `height`. Test-only readback used to
+    /// verify a decoded surface holds the right pixels without a full GPU
+    /// import. `dst` must be at least `dst_pitch * height` bytes.
+    #[cfg(test)]
+    pub(crate) fn copy_plane_to_host(
+        &self,
+        i: usize,
+        dst: *mut u8,
+        dst_pitch: usize,
+        width_bytes: usize,
+        height: usize,
+    ) -> Result<(), String> {
+        let plane = &self.planes[i];
+        let src_is_array = !plane.array.is_null();
+        let cpy = CudaMemcpy2D {
+            src_x_in_bytes: 0,
+            src_y: 0,
+            src_memory_type: if src_is_array {
+                CU_MEMORYTYPE_ARRAY
+            } else {
+                CU_MEMORYTYPE_DEVICE
+            },
+            src_host: std::ptr::null(),
+            src_device: plane.device_ptr as u64,
+            src_array: plane.array,
+            src_pitch: plane.pitch,
+            dst_x_in_bytes: 0,
+            dst_y: 0,
+            dst_memory_type: CU_MEMORYTYPE_HOST,
+            dst_host: dst.cast::<c_void>(),
+            dst_device: 0,
+            dst_array: std::ptr::null_mut(),
+            dst_pitch,
+            width_in_bytes: width_bytes,
+            height,
+        };
+        // SAFETY: src is the imported surface plane in `cuda_ctx`; dst is a
+        // host buffer of at least dst_pitch*height bytes. Push/pop the context
+        // around the synchronous copy.
+        unsafe {
+            let push_rc = (self._guard.cuda.ctx_push_current)(self._guard.cuda_ctx);
+            if push_rc != CUDA_SUCCESS {
+                return Err(format!("cuCtxPushCurrent (to_host) failed: {push_rc}"));
+            }
+            let rc = (self._guard.cuda.memcpy_2d)(&cpy);
+            let mut popped: CuContext = std::ptr::null_mut();
+            (self._guard.cuda.ctx_pop_current)(&mut popped);
+            if rc != CUDA_SUCCESS {
+                return Err(format!("cuMemcpy2D(plane {i} → host) failed: {rc}"));
             }
         }
         Ok(())
@@ -562,7 +685,7 @@ impl EglCudaImporter {
     // 128 KiB), and AVFrame::linesize is i32-typed at the ffmpeg ABI. The
     // allow documents that the same-width u32→i32 reinterpret is intended.
     #[allow(clippy::cast_possible_wrap)]
-    pub(super) fn import(
+    pub(crate) fn import(
         &self,
         cuda_ctx: CuContext,
         frame: &DmaBufFrame,
@@ -890,7 +1013,7 @@ fn egl_display_for_cuda_device0(egl: &EglFns) -> Option<EglDisplay> {
 /// Process-global importer, lazily initialised on first call. `None` means
 /// the EGL/CUDA stack isn't usable on this host (no NVIDIA driver, missing
 /// EGL device extensions, etc.) and the encoder falls back to CPU upload.
-pub(super) fn importer() -> Option<&'static EglCudaImporter> {
+pub(crate) fn importer() -> Option<&'static EglCudaImporter> {
     static IMPORTER: OnceLock<Option<EglCudaImporter>> = OnceLock::new();
     IMPORTER.get_or_init(EglCudaImporter::init).as_ref()
 }

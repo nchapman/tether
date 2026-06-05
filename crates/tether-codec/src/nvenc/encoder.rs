@@ -103,6 +103,22 @@ impl NvencEncoder {
         let chroma = profile.chroma;
         let bit_depth = profile.bit_depth;
 
+        // AV1 NVENC is NOT probed. AV1 hardware encode needs Ada (RTX 40+);
+        // on a pre-Ada card (verified on an RTX 3090 Ti / Ampere) FFmpeg's
+        // `av1_nvenc` init SIGSEGVs *inside the NVENC runtime* rather than
+        // returning a clean error — the same "never speculatively construct a
+        // vendor encoder the GPU can't do" hazard the Windows D3D11 path warns
+        // about. We have no safe pre-construction capability query through the
+        // FFmpeg wrapper, so AV1 is excluded from the NVENC set entirely; it
+        // returns a clean `CodecNotFound` the probe/dispatch handle. Re-enable
+        // with a real NvEncGetEncodeCaps gate when AV1 NVENC is wanted.
+        if kind == CodecKind::Av1 {
+            return Err(CodecError::CodecNotFound(
+                "av1_nvenc (AV1 NVENC requires Ada+; not constructed — a pre-Ada \
+                 card faults inside the NVENC runtime instead of erroring)",
+            ));
+        }
+
         // 4:4:4 is deferred: NVENC's native 4:4:4 input is planar
         // (YUV444P / YUV444P16), not the packed VUYX/XV30 the VAAPI
         // DRM_PRIME path uses, so the zero-copy CUDA path needs a planar
@@ -121,7 +137,15 @@ impl NvencEncoder {
         // device strings only matter on multi-GPU systems, where the
         // producer (wgpu) and importer (CUDA) must agree on the physical
         // GPU — handled when a multi-GPU user needs it.
-        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, None, None, 0)?;
+        // `1` = AV_CUDA_USE_PRIMARY_CONTEXT (hwcontext_cuda.h `1 << 0`): share
+        // the GPU's primary CUDA context instead of creating a fresh one.
+        // FFmpeg's default (flags=0) does a new `cuCtxCreate` per device; the
+        // capability probe constructs an encoder + decoder for every profile in
+        // one process, and that many created+destroyed contexts corrupts CUDA
+        // state and SIGSEGVs (verified on an RTX 3090 Ti). The primary context
+        // is reference-counted and stable, so every NVENC/NVDEC instance and
+        // the EGL importer (also device 0) share one context.
+        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, None, None, 1)?;
 
         // Read FFmpeg's CUcontext out of the CUDA AVHWDeviceContext so the
         // zero-copy DMA-BUF import (`submit_dmabuf`) registers EGL images

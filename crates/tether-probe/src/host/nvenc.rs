@@ -9,15 +9,17 @@
 //!
 //! The probe is a real round trip against the live driver, not a
 //! construction-only check: `NvencEncoder::new` opening the codec is not
-//! sufficient evidence the CUDA upload + encode actually runs, so the 8-bit
-//! path encodes one frame. The 10-bit (and, later, 4:4:4) paths need the
-//! DMA-BUF → CUDA submit, which lands with that encoder method in a later
-//! milestone; until then they report unsupported here and the candidate
-//! dispatch falls back to VAAPI rather than advertising a half-probed profile.
+//! sufficient evidence the CUDA upload + encode actually runs. The 8-bit path
+//! encodes one CPU-uploaded frame; the 10-bit (Main10) path drives a real
+//! `Bgra2P010DmaBuf` → `submit_dmabuf` round trip through the production
+//! zero-copy import, the same way the VAAPI probe proves its P010 path. NVENC
+//! 4:4:4 is rejected at construction (no planar bridge yet), so it never
+//! reaches the bit-depth branch.
 
 use tether_codec::nvenc::NvencEncoder;
-use tether_codec::Encoder;
-use tether_protocol::control::VideoProfile;
+use tether_codec::{build_p010_dmabuf_frame, Encoder};
+use tether_gpuconvert::Bgra2P010DmaBuf;
+use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
 use crate::profile_probe::{ProbeError, Result};
 use crate::PipelineStage;
@@ -61,28 +63,60 @@ fn probe_encode_inner(profile: VideoProfile) -> Result<()> {
     let mut enc = NvencEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
 
-    match profile.bit_depth {
+    match (profile.chroma, profile.bit_depth) {
         // 8-bit: CPU BGRA upload (swscale → NV12 → host→CUDA transfer →
         // encode) exercises the full encode path, not just `open()`.
-        8 => {
+        (_, 8) => {
             let bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
             enc.encode_bgra(&bytes, 0, true)
                 .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
         }
-        // 10-bit 4:2:0 constructs fine (P010 pool) but proving it needs the
-        // DMA-BUF → CUDA `submit_dmabuf` round trip — construction alone is
-        // the half-credit answer the probe architecture rejects. That encoder
-        // method lands in a later milestone. Tag this `Construct` (not
-        // `Submit`): we never reach a submit, so a `Submit` tag would send an
-        // operator debugging DMA-BUF import for what is a not-yet-wired path.
-        // Reporting unsupported makes the candidate dispatch fall back to VAAPI.
-        _ => {
+        // 10-bit 4:2:0 (Main10): real submit_dmabuf round trip via the
+        // production `Bgra2P010DmaBuf` bridge — the encoder's only 10-bit input
+        // path (encode_bgra has no 10-bit branch). Proves NVENC accepts the
+        // P010 dma-buf through the EGL→CUDA import, not just that it opens.
+        (ChromaSubsampling::Yuv420, 10) => probe_p010_submit(&mut enc)?,
+        // 4:4:4 never reaches here (rejected at NvencEncoder::new); any other
+        // bit depth is unmapped.
+        (_, bd) => {
             return Err(ProbeError::new(
                 PipelineStage::Construct,
-                "NVENC 10-bit encode not yet probed (DMA-BUF → CUDA submit path \
-                 lands in a later milestone); falling back to VAAPI",
+                format!("unsupported bit depth {bd} for NVENC encode probe"),
             ));
         }
     }
+    Ok(())
+}
+
+/// Build a P010 dma-buf through the production `Bgra2P010DmaBuf` bridge and
+/// feed it to NVENC's `submit_dmabuf`. Mirrors the VAAPI probe's
+/// `probe_p010_submit`. Catches the three failure modes a construction-only
+/// check would miss: bridge construction (no R16/Rg16 LINEAR storage), bridge
+/// convert, and the EGL→CUDA import + NVENC P010 submit itself.
+fn probe_p010_submit(enc: &mut NvencEncoder) -> Result<()> {
+    let bridge = pollster::block_on(Bgra2P010DmaBuf::new(PROBE_DIM, PROBE_DIM)).map_err(|e| {
+        ProbeError::new(
+            PipelineStage::Capture,
+            format!(
+                "Bgra2P010DmaBuf::new failed — driver likely lacks R16/Rg16 \
+                 storage support on DRM_FORMAT_MOD_LINEAR: {e}"
+            ),
+        )
+    })?;
+    let probe_bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
+    let p010 = bridge.convert_bgra_bytes(&probe_bytes).map_err(|e| {
+        ProbeError::new(PipelineStage::Capture, format!("P010 bridge convert: {e}"))
+    })?;
+    let codec_frame = build_p010_dmabuf_frame(
+        p010.fd,
+        p010.size,
+        p010.modifier,
+        p010.y_offset,
+        p010.y_stride,
+        p010.uv_offset,
+        p010.uv_stride,
+    );
+    enc.submit_dmabuf(&codec_frame, 0, true)
+        .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
     Ok(())
 }

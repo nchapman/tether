@@ -47,16 +47,19 @@ separate process.
 
 ## Build
 
-First build on a fresh clone fetches the pinned static FFmpeg once:
+Dev tasks run through [mise](https://mise.jdx.dev/) (already required — it
+pins the Rust/Node toolchain), so the same commands work on Linux, macOS, and
+Windows. First build on a fresh clone fetches the pinned static FFmpeg once:
 
 ```
-make ffmpeg      # download + stage FFmpeg (idempotent; build targets call it)
-make build       # cargo build --workspace
-make test        # fast unit tests, no hardware
-make test-hw     # VAAPI + render + gpuconvert correctness + benchmarks
-make shell       # run the Tauri shell in dev mode
-make package     # build local installer bundles
-make help        # full target list
+mise run ffmpeg    # download + stage FFmpeg (idempotent; build tasks call it)
+mise run build     # cargo build --workspace
+mise run test      # fast unit tests, no hardware
+mise run test-hw   # this platform's hardware tests (codec + render + gpuconvert)
+mise run probe     # print this host's codec capability matrix
+mise run shell     # run the Tauri shell in dev mode
+mise run package   # build local installer bundles
+mise tasks         # full task list
 ```
 
 ## Linux host permissions

@@ -1,6 +1,6 @@
 //! Quality tests for the CPU reference Mitchell implementation.
 //!
-//! Runs without a GPU — `make test` default suite.
+//! Runs without a GPU — `mise run test` default suite.
 //!
 //! The point is to bound the reference's behaviour against an
 //! independent implementation (the `image` crate's CatmullRom filter)

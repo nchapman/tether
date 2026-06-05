@@ -13,7 +13,7 @@
 //!   center mapping, tap-count scaling, mip prefilter threshold) that
 //!   the shader silently relies on.
 //! - **CPU-side tests.** Quality tests in `tests/quality.rs` run
-//!   entirely on the CPU reference — no GPU required for `make test`.
+//!   entirely on the CPU reference — no GPU required for `mise run test`.
 //!
 //! All sample arrays in this module are RGBA8 (sRGB-encoded), row-
 //! major, 4 bytes per pixel, `stride = width * 4`. RGBA and not BGRA:

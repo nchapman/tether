@@ -457,7 +457,7 @@ mod tests {
 
     /// Diagnostic dump: run the full per-profile encode/decode probe on
     /// real hardware and print the verdict matrix. Not an assertion —
-    /// `make probe` runs this with `--nocapture` so an operator can see
+    /// `mise run probe` runs this with `--nocapture` so an operator can see
     /// which codecs this host can actually build + round-trip, and the
     /// `PipelineStage` reason for any it can't. Ignored by default
     /// because it constructs real encoders/decoders.

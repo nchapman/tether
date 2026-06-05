@@ -328,7 +328,7 @@ fn engine_file_name(role: &str) -> Result<String, String> {
 }
 
 /// Directories to search for an engine binary, in priority order:
-/// 1. `TETHER_ENGINE_DIR` — explicit override (dev / `make shell`).
+/// 1. `TETHER_ENGINE_DIR` — explicit override (dev / `mise run shell`).
 /// 2. The directory of the running shell binary — Tauri installs the
 ///    `externalBin` sidecars next to the app binary in a packaged build.
 /// 3. `../../../target/debug` relative to `tauri dev`'s working directory —

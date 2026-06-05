@@ -133,16 +133,22 @@ behaviour we expect to work everywhere.
 ## CI shape
 
 - Implemented in `.github/workflows/ci.yml` (push/PR) across Linux, macOS,
-  and Windows, with shared setup in `.github/actions/setup`. `make ci`
+  and Windows, with shared setup in `.github/actions/setup`. `mise run ci`
   reproduces the no-hardware checks locally.
 - Default: `cargo build --workspace --all-targets && cargo test --workspace`.
   The build runs with `RUSTFLAGS=-D warnings`, so any new warning is a hard
   gate. The Tauri shell (excluded from the workspace) is typechecked +
   backend-tested in a separate `shell-check` job.
-- Hardware tests (VAAPI/Vulkan/Metal) are **not** run in CI — GitHub-hosted
-  runners have no usable GPU. Run `make test-hw` locally on a hardware runner;
-  a self-hosted GPU runner that adds `cargo test --workspace -- --ignored` is
-  a documented follow-up.
+- Hardware tests (VAAPI/Vulkan/Metal/D3D11) are **not** run in CI — GitHub-hosted
+  runners have no usable GPU. Run `mise run test-hw` locally on a hardware
+  runner; it auto-selects the current platform's backend (cfg-gating picks
+  VAAPI/VideoToolbox/D3D11), so the same command covers Linux, macOS, and
+  Windows. macOS builds with `--release` (the IOSurface/Metal round-trips are
+  too slow in debug for their comparison thresholds); Linux/Windows run debug.
+  Expect a non-zero ignored-test count per platform — a run that reports `0`
+  hardware tests means a `#[cfg]`/`#[ignore]` gate is misconfigured, not that
+  the suite is clean. A self-hosted GPU runner that wires it into CI is a
+  documented follow-up.
 - Releases: `.github/workflows/release.yml` on `v*` tags produces Tauri
   installers + a signed updater manifest (see `docs/RELEASING.md`).
 - Clippy is a blocking gate: `cargo clippy --workspace --all-targets -- -D

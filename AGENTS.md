@@ -8,29 +8,35 @@ Tether is a low-latency open-source remote desktop in Rust. Two binaries (`tethe
 
 ## Common commands
 
-**First build / fresh clone:** run `make ffmpeg` once. `tether-codec` statically
+**First build / fresh clone:** run `mise run ffmpeg` once. `tether-codec` statically
 links our own LGPL FFmpeg 8.1 from the `nchapman/tether-ffmpeg` releases (pinned
 in `scripts/ffmpeg-version`); `scripts/fetch-ffmpeg.sh` downloads + checksum-verifies
 the host artifact into `vendor/ffmpeg/` (gitignored) and `.cargo/ffmpeg-env.toml`
-points rusty_ffmpeg at it. The `make` build/test targets fetch it automatically
+points rusty_ffmpeg at it. The `build`/`test` tasks fetch it automatically
 (idempotent); a raw `cargo build` on a fresh clone fails with a pkg-config path
-error until `make ffmpeg` has run. No system FFmpeg dev package is needed. There
+error until `mise run ffmpeg` has run. No system FFmpeg dev package is needed. There
 is no software encoder in the LGPL build — see `crates/tether-codec/src/h264.rs`.
 
-All wrapped by `make` (`make help`). Key targets:
+Dev tasks live in `mise.toml` `[tasks]` and run via `mise run <name>` (`mise tasks`
+lists them). mise is already required — it pins the toolchain — so the same tasks
+work on Linux, macOS, and Windows with no `make` dependency. Most tasks are pure
+`cargo`/`pnpm` and run under the platform default shell; only the few that invoke
+a `scripts/*.sh` or a POSIX builtin set `shell = "sh -c"`. On Windows that needs
+a POSIX shell, so `[env]` prepends Git's bundled `bin` (sh/bash) to PATH, derived
+from `git --exec-path` — no PATH setup required beyond having `git` (which you do).
+Key tasks:
 
-- `make ffmpeg` — download + stage the pinned static FFmpeg for this host (idempotent)
-- `make build` — `cargo build --workspace`
-- `make test` — `cargo test --workspace --lib` (no hardware)
-- `make test-hw` — `test-correctness` + `bench`; needs VAAPI + Vulkan
-- `make test-correctness` — the `#[ignore]` hardware tests in `tether-codec`, `tether-render`, `tether-gpuconvert`
-- `make bench` — `cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1` (serial: parallel cells contend for the VAAPI device)
-- `make probe` — VAAPI codec build availability
-- `make clippy` — advisory
-- `make release` — host + client release build
-- `make ci` — the no-hardware checks CI runs (fmt, gating, warning-free build, test)
-- `make package` — local Tauri installer bundle with the engines embedded as sidecars
-- `make hooks` — install the git pre-commit hook (fmt + gating; run once per clone)
+- `mise run ffmpeg` — download + stage the pinned static FFmpeg for this host (idempotent)
+- `mise run build` — `cargo build --workspace`
+- `mise run test` — `cargo test --workspace --lib` (no hardware)
+- `mise run test-hw` — the current platform's `#[ignore]` hardware tests across `tether-codec`, `tether-render`, `tether-gpuconvert` (cfg-gating selects VAAPI/VideoToolbox/D3D11 automatically); serial (`--test-threads=1`) to avoid GPU contention; skips bench
+- `mise run bench` — `cargo test -p tether-codec --lib bench -- --ignored --nocapture --test-threads=1` (VAAPI matrix on Linux; no-op where a backend has no bench cells)
+- `mise run probe` — print this host's codec capability matrix (encode/decode per profile)
+- `mise run clippy` — workspace + shell lint, warnings-as-errors (CI gate)
+- `mise run release` — host + client release build
+- `mise run ci` — the no-hardware checks CI runs (fmt, gating, warning-free build, test, clippy, shell)
+- `mise run package` — local Tauri installer bundle with the engines embedded as sidecars
+- `mise run hooks` — install the git pre-commit hook (fmt + gating; run once per clone)
 
 Single test: `cargo test -p <crate> <name>`. Hardware tests are `#[ignore = "requires …"]`; the message names the requirement.
 
@@ -64,4 +70,4 @@ Single test: `cargo test -p <crate> <name>`. Hardware tests are `#[ignore = "req
 
 ## Testing matrix
 
-See `docs/TESTING.md` for per-crate counts and infrastructure. Default CI is `cargo build --workspace --all-targets && cargo test --workspace`; the build must stay warning-free. Hardware runs add `-- --ignored`. Clippy is a blocking gate (`cargo clippy --workspace --all-targets -- -D warnings`, plus the excluded shell); intentional numeric casts are suppressed with scoped `#[allow]` + justification, not by disabling the workspace cast lints. CI/CD lives in `.github/workflows/` (`ci.yml` on push/PR across Linux/macOS/Windows; `release.yml` on `v*` tags → Tauri-bundled installers + signed updater manifest to GitHub Releases) with shared setup in `.github/actions/setup`; `make ci` reproduces the no-hardware checks locally. Release + packaging flow is documented in `docs/RELEASING.md`.
+See `docs/TESTING.md` for per-crate counts and infrastructure. Default CI is `cargo build --workspace --all-targets && cargo test --workspace`; the build must stay warning-free. Hardware runs add `-- --ignored`. Clippy is a blocking gate (`cargo clippy --workspace --all-targets -- -D warnings`, plus the excluded shell); intentional numeric casts are suppressed with scoped `#[allow]` + justification, not by disabling the workspace cast lints. CI/CD lives in `.github/workflows/` (`ci.yml` on push/PR across Linux/macOS/Windows; `release.yml` on `v*` tags → Tauri-bundled installers + signed updater manifest to GitHub Releases) with shared setup in `.github/actions/setup`; `mise run ci` reproduces the no-hardware checks locally. Release + packaging flow is documented in `docs/RELEASING.md`.

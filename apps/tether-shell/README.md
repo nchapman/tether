@@ -69,7 +69,7 @@ on the host to drop its access (and any live session) immediately.
 
 The shell lives in the system tray (`TrayIconBuilder` in `src-tauri/src/lib.rs`),
 so Tauri `dlopen`s the Ayatana app-indicator library at startup. If it's missing,
-`make shell` builds and launches but then panics with:
+`mise run shell` builds and launches but then panics with:
 
 ```
 Failed to load ayatana-appindicator3 or appindicator3 dynamic library

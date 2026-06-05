@@ -12,8 +12,9 @@ plugin against GitHub Releases.
   gating check, a warning-free workspace build, no-hardware unit tests, the
   shell typecheck + backend tests, and clippy (a blocking gate, `-D warnings`,
   workspace + the excluded shell). Runs on Linux, macOS,
-  and Windows. Hardware tests (VAAPI/Vulkan/Metal) are **not** run in CI — they
-  need a real GPU; run `make test-hw` locally.
+  and Windows. Hardware tests (VAAPI/Vulkan/Metal/D3D11) are **not** run in CI —
+  they need a real GPU; run `mise run test-hw` locally (it picks the current
+  platform's backend automatically).
 - **`.github/workflows/release.yml`** — on a `v*` tag: builds the engines,
   stages them as sidecars, and runs `tauri-action` to bundle, sign the updater
   manifest, and publish a **draft** GitHub Release with installers + `latest.json`.
@@ -26,9 +27,9 @@ plugin against GitHub Releases.
   platform so `latest.json` is already complete.
 - **`.github/actions/setup`** — shared setup (mise toolchains, Linux system
   deps, static FFmpeg fetch + cache, cargo cache).
-- **Local pre-commit hook** — `make hooks` installs `.githooks/pre-commit`,
+- **Local pre-commit hook** — `mise run hooks` installs `.githooks/pre-commit`,
   which runs rustfmt (workspace + shell) and the test-support gating check
-  before each commit so the tree can't drift out of format. Run `make ci` to
+  before each commit so the tree can't drift out of format. Run `mise run ci` to
   reproduce the full no-hardware gate locally.
 
 ## One-time setup (required before the first release)
@@ -97,7 +98,7 @@ are dynamic system libraries the installer does **not** ship:
 
 ## Local packaging
 
-`make package` builds the installers locally. It passes only
+`mise run package` builds the installers locally. It passes only
 `tauri.release.conf.json`, so it does **not** emit updater artifacts
 (`latest.json` + per-bundle `.sig`) — those need `tauri.updater.conf.json`
 plus the signing key, which only the tagged `release.yml` flow layers on.

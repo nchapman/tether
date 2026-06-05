@@ -823,7 +823,7 @@ fn vaapi_intra_refresh_round_trip() {
     // `set_var` / `remove_var` here *can* race with any concurrent
     // caller of `VaapiEncoder::new` that reads
     // `TETHER_INTRA_REFRESH_PERIOD`. Today every such caller in this
-    // file is `#[ignore]` and `make test-hw` invokes
+    // file is `#[ignore]` and `mise run test-hw` invokes
     // `--test-threads=1` for the bench cells. A sibling test,
     // `vaapi_min_qp_floor_reduces_bitstream`, now also drives the
     // env-var path (via `encode_with_env_and_measure`) for a

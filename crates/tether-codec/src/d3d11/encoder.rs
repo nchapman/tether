@@ -126,6 +126,13 @@ fn is_qsv_backend(name: &str) -> bool {
     name.contains("qsv")
 }
 
+/// Media Foundation backends (`hevc_mf` / `h264_mf` / `av1_mf`). Unlike the
+/// vendor encoders they never populate `extradata`; they emit parameter
+/// sets in-band on every keyframe instead (see `snapshot_extradata`).
+fn is_mf_backend(name: &str) -> bool {
+    name.contains("_mf")
+}
+
 pub struct D3D11Encoder {
     kind: CodecKind,
     encoder: AVCodecContext,
@@ -488,8 +495,8 @@ impl D3D11Encoder {
         // `d3d11_mf_keyframes_carry_inband_parameter_sets`). The vendor
         // backends (QSV/AMF/NVENC) populate it and rely on the prepend, so
         // an empty snapshot there is still fatal.
-        let inband_parameter_sets = backend_name.contains("_mf");
-        let extradata = snapshot_extradata(&encoder, backend_name, kind, inband_parameter_sets)?;
+        let extradata =
+            snapshot_extradata(&encoder, backend_name, kind, is_mf_backend(backend_name))?;
         let bgra_row_bytes = (width as usize) * 4;
 
         // Keep the D3D11VA device alive — for QSV the derived device

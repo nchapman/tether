@@ -23,24 +23,30 @@ mod tests {
     /// never populate `AVCodecContext::extradata`, so `snapshot_extradata`
     /// must NOT hard-fail construction for them (the bug that turned all 12
     /// MF-path tests red on the static FFmpeg build). They keep the
-    /// self-decodable-IDR invariant a different way: VPS/SPS/PPS (HEVC) or
-    /// SPS/PPS (H.264) ride in-band on *every* keyframe — including
-    /// mid-stream forced IDRs — so each IDR decodes standalone with no
-    /// prepend. This pins both facts: empty extradata at open, and in-band
-    /// parameter sets on each keyframe.
+    /// self-decodable-IDR invariant a different way — parameter sets ride
+    /// in-band on *every* keyframe (including mid-stream forced IDRs), so
+    /// each IDR decodes standalone with no prepend:
+    ///   - HEVC: VPS (32) + SPS (33) + PPS (34) NAL units
+    ///   - H.264: SPS (7) + PPS (8) NAL units
+    ///   - AV1: a sequence-header OBU (type 1)
+    ///
+    /// This pins both facts for all three MF codecs: empty extradata at
+    /// open, and the in-band headers on each keyframe.
     ///
     /// Routes through vendor 0 → MF-only (`backends_for_vendor`), so it runs
     /// on any D3D11 GPU regardless of which vendor it is.
     #[test]
     #[ignore = "requires D3D11VA-capable GPU (Windows); exercises the Media Foundation fallback"]
     fn d3d11_mf_keyframes_carry_inband_parameter_sets() {
-        // (label, profile, codec, required parameter-set NAL unit types)
-        let required: &[(&str, VideoProfile, CodecKind, &[u8])] = &[
+        // (label, profile, codec, required in-band header types). For HEVC
+        // and H.264 these are NAL unit types; for AV1, OBU types.
+        let cases: &[(&str, VideoProfile, CodecKind, &[u8])] = &[
             ("hevc_mf", hevc_profile(), CodecKind::Hevc, &[32, 33, 34]),
             ("h264_mf", h264_profile(), CodecKind::H264, &[7, 8]),
+            ("av1_mf", av1_profile(), CodecKind::Av1, &[1]),
         ];
 
-        for &(label, profile, kind, want) in required {
+        for &(label, profile, kind, want) in cases {
             let mut enc = D3D11Encoder::new(
                 profile,
                 TEST_WIDTH,
@@ -80,17 +86,22 @@ mod tests {
             );
 
             for (i, kf) in keyframes.iter().enumerate() {
-                assert!(
-                    kf.data.starts_with(&[0, 0, 0, 1]) || kf.data.starts_with(&[0, 0, 1]),
-                    "{label}: keyframe #{i} must be Annex-B; starts {:02x?}",
-                    &kf.data[..kf.data.len().min(8)]
-                );
-                let types = nalu_types(&kf.data, kind);
+                let found = match kind {
+                    CodecKind::Av1 => av1_obu_types(&kf.data),
+                    CodecKind::Hevc | CodecKind::H264 => {
+                        assert!(
+                            kf.data.starts_with(&[0, 0, 0, 1]) || kf.data.starts_with(&[0, 0, 1]),
+                            "{label}: keyframe #{i} must be Annex-B; starts {:02x?}",
+                            &kf.data[..kf.data.len().min(8)]
+                        );
+                        nalu_types(&kf.data, kind)
+                    }
+                };
                 for &ps in want {
                     assert!(
-                        types.contains(&ps),
-                        "{label}: keyframe #{i} missing in-band parameter set \
-                         NAL type {ps} — IDR is not self-decodable. Got {types:?}"
+                        found.contains(&ps),
+                        "{label}: keyframe #{i} missing in-band header {ps} — \
+                         IDR is not self-decodable. Got {found:?}"
                     );
                 }
             }
@@ -98,24 +109,74 @@ mod tests {
     }
 
     /// Scan an Annex-B bitstream and return the NAL unit type of each NALU.
+    /// Walks one byte at a time looking for 3- or 4-byte start codes; the
+    /// header byte immediately follows the start code.
     fn nalu_types(data: &[u8], kind: CodecKind) -> Vec<u8> {
         let mut types = Vec::new();
         let mut i = 0;
-        while i + 4 < data.len() {
-            let sc3 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+        while i + 3 < data.len() {
             let sc4 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
-            if sc3 || sc4 {
-                let hdr = if sc4 { data[i + 4] } else { data[i + 3] };
-                let nal_type = match kind {
-                    CodecKind::H264 => hdr & 0x1F,
-                    CodecKind::Hevc => (hdr >> 1) & 0x3F,
-                    CodecKind::Av1 => hdr,
-                };
-                types.push(nal_type);
-                i += if sc4 { 4 } else { 3 };
+            let sc3 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+            // A 4-byte start code needs a header byte at i+4; a 3-byte one at
+            // i+3 (guaranteed present by the loop condition).
+            if sc4 && i + 4 < data.len() {
+                let hdr = data[i + 4];
+                types.push(nal_unit_type(hdr, kind));
+                i += 4;
+            } else if sc3 {
+                let hdr = data[i + 3];
+                types.push(nal_unit_type(hdr, kind));
+                i += 3;
             } else {
                 i += 1;
             }
+        }
+        types
+    }
+
+    fn nal_unit_type(hdr: u8, kind: CodecKind) -> u8 {
+        match kind {
+            CodecKind::H264 => hdr & 0x1F,
+            CodecKind::Hevc => (hdr >> 1) & 0x3F,
+            CodecKind::Av1 => hdr,
+        }
+    }
+
+    /// Walk an AV1 low-overhead-format bitstream and return each OBU type.
+    /// OBU header: bit7 forbidden, bits6-3 type, bit2 extension, bit1
+    /// has_size, bit0 reserved; optional 1-byte extension; leb128 size.
+    fn av1_obu_types(data: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut i = 0;
+        while i < data.len() {
+            let hdr = data[i];
+            let obu_type = (hdr >> 3) & 0x0F;
+            let ext = (hdr >> 2) & 1 == 1;
+            let has_size = (hdr >> 1) & 1 == 1;
+            types.push(obu_type);
+            let mut p = i + 1;
+            if ext {
+                p += 1;
+            }
+            if !has_size {
+                break; // can't advance without sizes; stop scanning
+            }
+            // leb128 size
+            let mut size: usize = 0;
+            let mut shift = 0;
+            loop {
+                if p >= data.len() {
+                    return types;
+                }
+                let b = data[p];
+                p += 1;
+                size |= ((b & 0x7F) as usize) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            i = p + size;
         }
         types
     }
@@ -667,8 +728,10 @@ mod tests {
         }
         let kf = keyframe.expect("encoder produced no keyframe after 30 frames");
 
-        // Keyframe data must start with Annex-B start code (extradata was
-        // converted from hvcC if needed by snapshot_extradata).
+        // Keyframe data must start with an Annex-B start code. This routes
+        // through vendor 0 → Media Foundation, which carries VPS/SPS/PPS
+        // in-band on the keyframe (no extradata prepend — see
+        // `d3d11_mf_keyframes_carry_inband_parameter_sets`).
         assert!(
             kf.data.starts_with(&[0x00, 0x00, 0x00, 0x01])
                 || kf.data.starts_with(&[0x00, 0x00, 0x01]),

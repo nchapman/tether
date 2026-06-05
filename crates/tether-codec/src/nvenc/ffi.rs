@@ -229,6 +229,146 @@ impl CudaFns {
 }
 
 // ---------------------------------------------------------------------------
+// CUDA device enumeration (UUID correlation for multi-GPU pinning)
+// ---------------------------------------------------------------------------
+//
+// Picking which physical GPU NVENC, NVDEC, the EGL importer, and the
+// wgpu/Vulkan dma-buf producer all bind to happens once at host startup,
+// before any CUDA context exists. These device-management entry points need
+// only `libcuda.so.1` (no context, no EGL), so they get their own short-lived
+// loader rather than sharing the importer's lazily-initialised one.
+
+/// `CUdevice` — a CUDA device handle. The driver typedefs it to `int`.
+type CuDevice = i32;
+
+/// `CUuuid` from `<cuda.h>` — 16 raw bytes. On NVIDIA this equals the Vulkan
+/// `VkPhysicalDeviceIDProperties::deviceUUID` (and the GL UUID) for the same
+/// physical GPU, which is exactly what lets one 16-byte key pin the CUDA
+/// context, the EGL display, and the wgpu/Vulkan dma-buf producer to a single
+/// GPU on a multi-GPU host.
+#[repr(C)]
+struct CuUuid {
+    bytes: [u8; 16],
+}
+
+const _: () = assert!(std::mem::size_of::<CuUuid>() == 16);
+
+/// A physical-GPU identity shared across CUDA, Vulkan, and EGL: the 16-byte
+/// device UUID. The cross-API correlation key for device pinning (see
+/// [`cuda_ordinal_for_uuid`]).
+pub type GpuUuid = [u8; 16];
+
+// Device-management signatures. None take the `_v2` ABI suffix.
+type FnCuInit = unsafe extern "C" fn(u32) -> CuResult;
+type FnCuDeviceGetCount = unsafe extern "C" fn(*mut i32) -> CuResult;
+type FnCuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
+type FnCuDeviceGetUuid = unsafe extern "C" fn(*mut CuUuid, CuDevice) -> CuResult;
+
+/// Enumerate every CUDA device's `(ordinal, uuid)`.
+///
+/// Returns an empty vec when `libcuda.so.1` is absent, `cuInit` fails, or the
+/// host has no CUDA device — every such case means "no NVIDIA CUDA stack
+/// here", and the caller falls back to the driver-default device rather than
+/// failing. `cuInit(0)` is idempotent and safe to call before FFmpeg creates
+/// its own CUDA context; this reads device identities only, creating no
+/// context.
+#[must_use]
+pub fn cuda_device_uuids() -> Vec<(i32, GpuUuid)> {
+    // SAFETY: dlopen of libcuda.so.1 by soname. The resolved symbols are real
+    // CUDA driver entry points whose bound signatures match <cuda.h>. Each
+    // fn pointer is dereferenced and called while `lib` is still in scope
+    // (dropped at function end, after the final call), and we copy out only
+    // plain values.
+    let Ok(lib) = (unsafe { Library::new("libcuda.so.1") }) else {
+        return Vec::new();
+    };
+    unsafe {
+        let (Ok(cu_init), Ok(get_count), Ok(get_device), Ok(get_uuid)) = (
+            lib.get::<FnCuInit>(b"cuInit\0"),
+            lib.get::<FnCuDeviceGetCount>(b"cuDeviceGetCount\0"),
+            lib.get::<FnCuDeviceGet>(b"cuDeviceGet\0"),
+            lib.get::<FnCuDeviceGetUuid>(b"cuDeviceGetUuid\0"),
+        ) else {
+            return Vec::new();
+        };
+
+        if (*cu_init)(0) != CUDA_SUCCESS {
+            return Vec::new();
+        }
+        let mut count: i32 = 0;
+        if (*get_count)(&mut count) != CUDA_SUCCESS || count <= 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for ordinal in 0..count {
+            let mut dev: CuDevice = 0;
+            if (*get_device)(&mut dev, ordinal) != CUDA_SUCCESS {
+                continue;
+            }
+            let mut uuid = CuUuid { bytes: [0u8; 16] };
+            if (*get_uuid)(&mut uuid, dev) != CUDA_SUCCESS {
+                continue;
+            }
+            out.push((ordinal, uuid.bytes));
+        }
+        out
+    }
+}
+
+/// The CUDA device ordinal whose UUID matches `target`, or `None` if no CUDA
+/// device on this host carries that UUID.
+///
+/// The ordinal is what [`rsmpeg::avutil::AVHWDeviceContext::create`] takes as
+/// its decimal device string (pinning NVENC/NVDEC's CUDA context) and what the
+/// EGL display selection matches against `EGL_CUDA_DEVICE_NV` — so a single
+/// UUID, derived from the wgpu producer's chosen adapter, lines all three up
+/// on one physical GPU.
+#[must_use]
+pub fn cuda_ordinal_for_uuid(target: GpuUuid) -> Option<i32> {
+    match_uuid_ordinal(&cuda_device_uuids(), target)
+}
+
+/// Pure UUID→ordinal lookup, split out so the matching is unit-testable
+/// without a CUDA device.
+fn match_uuid_ordinal(devices: &[(i32, GpuUuid)], target: GpuUuid) -> Option<i32> {
+    devices
+        .iter()
+        .find(|(_, uuid)| *uuid == target)
+        .map(|&(ordinal, _)| ordinal)
+}
+
+#[cfg(test)]
+mod uuid_match_tests {
+    use super::match_uuid_ordinal;
+
+    #[test]
+    fn finds_target_ordinal_and_reports_misses() {
+        let a = [1u8; 16];
+        let b = [2u8; 16];
+        let devices = [(0i32, a), (1i32, b)];
+        assert_eq!(match_uuid_ordinal(&devices, a), Some(0));
+        assert_eq!(match_uuid_ordinal(&devices, b), Some(1));
+        // A UUID no device carries is a miss, not a wrong match.
+        assert_eq!(match_uuid_ordinal(&devices, [9u8; 16]), None);
+        // No CUDA devices → always a miss.
+        assert_eq!(match_uuid_ordinal(&[], a), None);
+    }
+
+    #[test]
+    fn matches_by_full_uuid_not_prefix() {
+        // Two UUIDs differing only in the last byte must not collide.
+        let mut x = [7u8; 16];
+        let mut y = [7u8; 16];
+        x[15] = 0;
+        y[15] = 1;
+        let devices = [(0i32, x), (1i32, y)];
+        assert_eq!(match_uuid_ordinal(&devices, y), Some(1));
+        assert_eq!(match_uuid_ordinal(&devices, x), Some(0));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EGL (libEGL.so.1)
 // ---------------------------------------------------------------------------
 

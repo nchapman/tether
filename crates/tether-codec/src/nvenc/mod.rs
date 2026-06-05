@@ -25,6 +25,10 @@
 //! `CodecError` when either is missing, so a non-NVIDIA host degrades to VAAPI.
 
 pub use encoder::NvencEncoder;
+// Multi-GPU device pinning: enumerate CUDA devices by UUID and map a target
+// UUID (derived from the wgpu dma-buf producer's chosen adapter) to the CUDA
+// ordinal NVENC/NVDEC/EGL must all bind to. See [`ffi::cuda_ordinal_for_uuid`].
+pub use ffi::{cuda_device_uuids, cuda_ordinal_for_uuid, GpuUuid};
 
 mod encoder;
 // `pub(crate)` so the NVDEC decoder (`crate::nvdec`) can reuse the same

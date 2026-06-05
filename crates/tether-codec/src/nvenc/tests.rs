@@ -536,3 +536,52 @@ fn nvenc_nv12_dmabuf_roundtrip_decodes_our_pixels() {
         frac * 100.0
     );
 }
+
+// --- multi-GPU device correlation ------------------------------------------
+
+/// The live CUDA device enumeration that backs multi-GPU pinning: every
+/// device must report a distinct, non-zero UUID, ordinals must be the dense
+/// `0..n` FFmpeg's device strings index, and each enumerated UUID must map
+/// back to its own ordinal. This is the keystone the wgpu/EGL/Vulkan-pool
+/// selection all key off; a driver that handed back zero or colliding UUIDs
+/// would silently pin the wrong GPU. On the dev box (2× RTX 3090 Ti + 1 AMD)
+/// CUDA sees the two NVIDIA GPUs.
+#[test]
+#[ignore = "requires NVIDIA GPU + libcuda (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_cuda_enumerates_distinct_nonzero_uuids() {
+    let devices = super::cuda_device_uuids();
+    assert!(
+        !devices.is_empty(),
+        "expected at least one CUDA device on an NVIDIA host"
+    );
+
+    for (i, (ordinal, uuid)) in devices.iter().enumerate() {
+        assert_eq!(
+            usize::try_from(*ordinal).unwrap(),
+            i,
+            "CUDA ordinals should be the dense 0..n FFmpeg indexes by device string"
+        );
+        assert_ne!(
+            *uuid,
+            [0u8; 16],
+            "CUDA device {ordinal} reported a zero UUID — cross-API correlation would be ambiguous"
+        );
+        // Every enumerated UUID must resolve back to exactly its own ordinal.
+        assert_eq!(super::cuda_ordinal_for_uuid(*uuid), Some(*ordinal));
+    }
+
+    // UUIDs are unique per physical GPU — two identical cards must not collide,
+    // or pinning could land NVENC and the producer on different GPUs.
+    for i in 0..devices.len() {
+        for j in (i + 1)..devices.len() {
+            assert_ne!(
+                devices[i].1, devices[j].1,
+                "CUDA devices {} and {} share a UUID",
+                devices[i].0, devices[j].0
+            );
+        }
+    }
+
+    // A UUID no device carries resolves to None (not a spurious ordinal 0).
+    assert_eq!(super::cuda_ordinal_for_uuid([0xABu8; 16]), None);
+}

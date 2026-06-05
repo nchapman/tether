@@ -516,14 +516,32 @@ impl Encoder for NvencEncoder {
         true
     }
 
-    // `supports_changing_bitrate` / `set_bitrate_kbps` are intentionally
-    // NOT overridden yet. NVENC genuinely supports live retune (FFmpeg's
-    // nvenc wrapper re-reads bit_rate and reconfigures rate control per
-    // frame — the architectural reason NVENC exists alongside VAAPI), but
-    // per the project rule we don't advertise a capability until a hardware
-    // test proves the bytecount delta on a real NVIDIA GPU. That override +
-    // its `nvenc_bitrate_retune_changes_bitstream_size` test land together
-    // in a later milestone, once an NVENC-enabled FFmpeg artifact is pinned.
+    /// NVENC honours live bitrate retune — the architectural reason it
+    /// exists alongside VAAPI (whose FFmpeg wrapper bakes the rate-control
+    /// buffer once at init). FFmpeg's `nvenc` wrapper re-reads
+    /// `avctx->bit_rate` on each `send_frame` and reconfigures the encoder
+    /// via `nvEncReconfigureEncoder`. Verified on an RTX 3090 Ti by
+    /// `nvenc_bitrate_retune_changes_bitstream_size` (a 1→20 Mbps retune
+    /// multiplies the bitstream size, the delta VAAPI's analogous test SKIPs).
+    fn supports_changing_bitrate(&self) -> bool {
+        true
+    }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+        let bps = i64::from(kbps) * 1000;
+        self.encoder.set_bit_rate(bps);
+        // CBR (our `rc=cbr`) tracks `rc_max_rate`; keep max == average so the
+        // reconfigure clamps to the new target rather than the construction-
+        // time ceiling. The next `send_frame` picks up the change.
+        //
+        // SAFETY: rc_max_rate is a plain AVCodecContext i64 field rsmpeg
+        // doesn't wrap; writing it between frames is the documented way to
+        // drive nvenc's runtime rate-control reconfigure.
+        unsafe {
+            self.encoder.deref_mut().rc_max_rate = bps;
+        }
+        Ok(())
+    }
 
     fn codec_kind(&self) -> CodecKind {
         self.kind

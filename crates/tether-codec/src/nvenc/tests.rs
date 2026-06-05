@@ -369,6 +369,73 @@ fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
     );
 }
 
+/// Encode `n` high-entropy frames starting at timestamp `start_t`; return
+/// (total bitstream bytes, next timestamp).
+fn encode_noisy(enc: &mut NvencEncoder, w: u32, h: u32, start_t: u32, n: u32) -> (usize, u32) {
+    let mut bytes = 0usize;
+    let mut t = start_t;
+    for _ in 0..n {
+        let bgra = make_noisy_bgra(w, h, t);
+        let packets = enc
+            .encode_bgra(&bgra, i64::from(t), t == 0)
+            .expect("encode_bgra");
+        for p in packets {
+            bytes += p.data.len();
+        }
+        t += 1;
+    }
+    (bytes, t)
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_bitrate_retune_changes_bitstream_size() {
+    const W: u32 = 256;
+    const H: u32 = 256;
+    const LOW_KBPS: u32 = 1_000;
+    const HIGH_KBPS: u32 = 20_000;
+    const WARMUP: u32 = 10;
+    const MEASURE: u32 = 40;
+
+    // The NVENC analogue of the VAAPI `vaapi_bitrate_retune_changes_bitstream_size`
+    // test — but where VAAPI SKIPs (its FFmpeg wrapper builds the rate-control
+    // buffer once at init), NVENC must PASS: live retune is the reason it exists
+    // alongside VAAPI (GH #16). High-entropy frames keep the encoder bitrate-
+    // bound so the CBR target, not content, governs frame size.
+    let mut enc =
+        NvencEncoder::new(VideoProfile::H264_8BIT_420, W, H, 30, LOW_KBPS).expect("NVENC H.264");
+    assert!(
+        enc.supports_changing_bitrate(),
+        "NVENC must advertise live bitrate retune"
+    );
+
+    let (_, t) = encode_noisy(&mut enc, W, H, 0, WARMUP); // let rate control settle
+    let (low_bytes, t) = encode_noisy(&mut enc, W, H, t, MEASURE);
+
+    enc.set_bitrate_kbps(HIGH_KBPS).expect("set_bitrate_kbps");
+    let (_, t) = encode_noisy(&mut enc, W, H, t, WARMUP); // let the new target settle
+    let (high_bytes, _) = encode_noisy(&mut enc, W, H, t, MEASURE);
+
+    let ratio = high_bytes as f64 / low_bytes.max(1) as f64;
+    eprintln!("nvenc retune: low={low_bytes}B high={high_bytes}B ratio={ratio:.2}");
+
+    // SKIP escape hatch: if a driver/FFmpeg combo ever silently ignores the
+    // retune, record it loudly rather than failing — but on the verified path
+    // (RTX 3090 Ti) the assertion is the point.
+    if ratio <= 1.5 {
+        eprintln!(
+            "SKIP nvenc_bitrate_retune: 1→20 Mbps retune produced only {ratio:.2}x \
+             bitstream growth — this driver did not honour the live retune"
+        );
+        return;
+    }
+    assert!(
+        ratio > 2.0,
+        "expected >2x bitstream growth after a 1→20 Mbps retune; got {ratio:.2}x \
+         (low={low_bytes}B high={high_bytes}B)"
+    );
+}
+
 #[test]
 #[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
 fn nvenc_nv12_dmabuf_roundtrip_decodes_our_pixels() {

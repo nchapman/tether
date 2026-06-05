@@ -53,12 +53,17 @@ pub const MAX_DATAGRAM_PAYLOAD: usize = 1200;
 ///   `tether_audio::MAX_PACKET_BYTES` (4000, libopus's recommended max) plus
 ///   ~20 bytes of enum/varint framing. A high-bitrate / long-frame config
 ///   (e.g. 510 kbps @ 60 ms) lands near that ceiling; the v1 default
-///   (~160 B/packet) is comfortably under.
+///   (~80 B/packet at 5 ms) is comfortably under, as is its RED tail.
 ///
-/// Set to clear `MAX_PACKET_BYTES + framing` so a non-default audio config is
+/// Set to clear `MAX_PACKET_BYTES` plus framing so a non-default audio config is
 /// not silently dropped, while still bounding a hostile allocation to ~4 KB.
-/// `tether-audio` carries a static assertion that this stays `>= MAX_PACKET_BYTES
-/// + framing`.
+/// `tether-audio` carries a static assertion that this stays at or above
+/// `MAX_PACKET_BYTES` plus framing.
+///
+/// Nested collections (e.g. `Vec<Bytes>` in `AudioPacket::Opus::redundant`) are
+/// equally bounded — the decoder counts bytes across the whole decoded
+/// structure, not per field, so a forged outer length claiming many inner copies
+/// can't drive a giant pre-allocation either.
 pub const MAX_DATAGRAM_DECODE_BYTES: usize = 4100;
 
 /// Wire-protocol version string. Bumped on any breaking change to the
@@ -123,8 +128,9 @@ fn bincode_config() -> impl bincode::config::Config {
 
 /// Like [`bincode_config`] but caps the total bytes a single decode may claim
 /// at [`MAX_DATAGRAM_DECODE_BYTES`]. Datagrams arrive from an untrusted peer, and
-/// a forged length prefix on a `Vec<u8>` field (e.g. `AudioPacket::Opus.payload`)
-/// would otherwise drive bincode to pre-allocate gigabytes. bincode claims a
+/// a forged length prefix on a byte-sequence field (e.g.
+/// `AudioPacket::Opus.payload`, a `Bytes`, or a nested `Vec<Bytes>` tail) would
+/// otherwise drive bincode to pre-allocate gigabytes. bincode claims a
 /// container's bytes against this limit *before* allocating, so an over-long
 /// field is rejected up front. The ceiling is [`MAX_DATAGRAM_DECODE_BYTES`], not
 /// the soft [`MAX_DATAGRAM_PAYLOAD`] target — a legitimate `First`/`Parity`
@@ -809,15 +815,29 @@ mod tests {
     #[test]
     fn round_trip_audio_packet_opus() {
         use crate::audio::{AudioConfig, AudioPacket, AUDIO_CONFIG_EXTENSION_KEY};
+        use bytes::Bytes;
         let p = AudioPacket::Opus {
             stream_epoch: 1,
             frame_seq: 1234,
             t_capture: MonoNanos(98765),
-            payload: vec![0xAB; 64],
+            payload: Bytes::from(vec![0xAB; 64]),
+            // RED tail: two previous frames, newest-first.
+            redundant: vec![Bytes::from(vec![0xCD; 48]), Bytes::from(vec![0xEF; 32])],
         };
         let bytes = encode(&p).unwrap();
         let p2: AudioPacket = decode(&bytes).unwrap();
         assert_eq!(p, p2);
+
+        // The empty-redundancy case (redundancy off / stream start) also
+        // round-trips — a client that never populates the tail is unaffected.
+        let p_no_red = AudioPacket::Opus {
+            stream_epoch: 1,
+            frame_seq: 1235,
+            t_capture: MonoNanos(98766),
+            payload: Bytes::from(vec![0x11; 16]),
+            redundant: vec![],
+        };
+        assert_eq!(p_no_red, decode(&encode(&p_no_red).unwrap()).unwrap());
 
         // Hello-extension config round-trips identically too.
         let cfg = AudioConfig {
@@ -841,17 +861,19 @@ mod tests {
     #[test]
     fn near_max_audio_datagram_decodes() {
         use crate::audio::AudioPacket;
+        use bytes::Bytes;
         // 4000-byte payload (tether_audio::MAX_PACKET_BYTES), above the prior
         // 2048 decode ceiling. The `Datagram::Audio` wrapper (in
         // tether-transport) adds ~1 byte; decode the AudioPacket directly here
-        // since the payload Vec is what the allocation guard bounds.
+        // since the payload is what the allocation guard bounds.
         let payload = vec![0x5Au8; 4000];
         assert!(payload.len() > 2048, "test must exceed the old ceiling");
         let packet = AudioPacket::Opus {
             stream_epoch: 7,
             frame_seq: 999,
             t_capture: MonoNanos(424242),
-            payload: payload.clone(),
+            payload: Bytes::from(payload.clone()),
+            redundant: vec![],
         };
         let bytes = encode(&packet).unwrap();
         assert!(
@@ -863,8 +885,76 @@ mod tests {
         let decoded: AudioPacket =
             decode_datagram(&bytes).expect("near-max audio datagram must decode");
         match decoded {
-            AudioPacket::Opus { payload: p, .. } => assert_eq!(p, payload),
+            AudioPacket::Opus { payload: p, .. } => assert_eq!(&p[..], &payload[..]),
         }
+    }
+
+    /// A realistically-sized primary payload plus a depth-1 RED tail (the
+    /// production shape) round-trips through the bounded datagram decoder. Pins
+    /// that a normal RED-carrying datagram stays under the ceiling, so a future
+    /// ceiling change that would silently drop RED packets trips this.
+    #[test]
+    fn typical_audio_datagram_with_red_decodes() {
+        use crate::audio::AudioPacket;
+        use bytes::Bytes;
+        // 160 B ~ a 10 ms / 128 kbps frame (the default 5 ms frame is ~80 B);
+        // depth-1 RED adds one prior copy. A larger-than-default vector here
+        // exercises the ceiling with margin.
+        let payload = vec![0x33u8; 160];
+        let packet = AudioPacket::Opus {
+            stream_epoch: 0,
+            frame_seq: 42,
+            t_capture: MonoNanos(1000),
+            payload: Bytes::from(payload.clone()),
+            redundant: vec![Bytes::from(vec![0x44u8; 160])],
+        };
+        let bytes = encode(&packet).unwrap();
+        assert!(
+            bytes.len() <= MAX_DATAGRAM_DECODE_BYTES,
+            "a typical primary + depth-1 RED datagram ({} B) must fit the ceiling {}",
+            bytes.len(),
+            MAX_DATAGRAM_DECODE_BYTES
+        );
+        let decoded: AudioPacket =
+            decode_datagram(&bytes).expect("typical RED datagram must decode");
+        match decoded {
+            AudioPacket::Opus {
+                payload: p,
+                redundant: r,
+                ..
+            } => {
+                assert_eq!(&p[..], &payload[..]);
+                assert_eq!(r, vec![Bytes::from(vec![0x44u8; 160])]);
+            }
+        }
+    }
+
+    /// The bounded datagram decoder caps total allocation across the whole
+    /// `AudioPacket` — including the RED tail — so a forged `redundant` vec of
+    /// many large payloads can't drive a huge pre-allocation. A datagram whose
+    /// combined payload + redundancy exceeds the ceiling is rejected, not
+    /// allocated.
+    #[test]
+    fn oversize_red_tail_is_rejected_by_the_decode_guard() {
+        use crate::audio::AudioPacket;
+        use bytes::Bytes;
+        // Several max-size payloads in the tail blow well past the ceiling.
+        let packet = AudioPacket::Opus {
+            stream_epoch: 0,
+            frame_seq: 0,
+            t_capture: MonoNanos(0),
+            payload: Bytes::from(vec![0u8; 2000]),
+            redundant: vec![Bytes::from(vec![0u8; 2000]), Bytes::from(vec![0u8; 2000])],
+        };
+        let bytes = encode(&packet).unwrap();
+        assert!(
+            bytes.len() > MAX_DATAGRAM_DECODE_BYTES,
+            "test must exceed the ceiling to exercise the guard"
+        );
+        assert!(
+            decode_datagram::<AudioPacket>(&bytes).is_err(),
+            "an over-ceiling RED datagram must be rejected before allocation"
+        );
     }
 
     #[test]

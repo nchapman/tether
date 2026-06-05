@@ -1,7 +1,7 @@
 //! Opus encode/decode bound directly to libopus (see [`crate::opus_sys`]).
 //!
 //! The encoder buffers interleaved f32 PCM and emits one Opus packet per whole
-//! `frame_size` (e.g. 480 samples/channel = 10 ms at 48 kHz), so callers can
+//! `frame_size` (e.g. 240 samples/channel = 5 ms at 48 kHz), so callers can
 //! push arbitrary capture chunk sizes. The decoder turns each packet back into
 //! interleaved f32 and exposes [`OpusDecoder::conceal`] for the jitter buffer's
 //! loss path.
@@ -30,15 +30,25 @@ const MAX_PACKET_BYTES: usize = 4000;
 
 /// Conservative wire framing around an `AudioPacket::Opus` payload inside a
 /// `Datagram::Audio` envelope: the two enum discriminants, `stream_epoch`,
-/// `frame_seq`, `t_capture`, and the payload length prefix. The real cost is
-/// ~20 bytes; this is rounded well up so the static assertion below has slack.
+/// `frame_seq`, `t_capture`, the payload length prefix, and the `redundant`
+/// RED-tail outer length prefix. The real cost is ~24 bytes; this is rounded
+/// well up so the static assertion below has slack.
 const AUDIO_DATAGRAM_FRAMING_BYTES: usize = 64;
 
-/// The shared datagram decode ceiling must clear the largest Opus packet a
-/// non-default config can emit plus its wire framing, or such a packet would
-/// be silently rejected by `tether_protocol::decode_datagram` — audio dropouts
-/// with no log. The v1 default (~160 B/packet) is far under, but a high-bitrate
-/// / long-frame config (e.g. 510 kbps @ 60 ms ≈ 3825 B) approaches it.
+/// The shared datagram decode ceiling must clear the largest legitimate audio
+/// datagram, or it would be silently rejected by
+/// `tether_protocol::decode_datagram` — audio dropouts with no log.
+///
+/// This bounds a *single primary* Opus packet plus framing. The RED tail
+/// (`redundant`) adds more payloads, but every datagram is also bounded by the
+/// path MTU on send (quinn rejects an over-MTU `send_datagram`), and the MTU
+/// (~1200 B) sits far below this ceiling — so any datagram small enough to send
+/// is small enough to decode, RED tail included. The default config
+/// (~80 B/packet at 5 ms, +~80 B per RED copy → ~240 B at depth 2) is
+/// comfortably under; a high-bitrate / long-frame config is capped by the MTU
+/// long before this ceiling. The ceiling's job is purely to bound a *hostile*
+/// allocation, which the bounded decoder enforces across the whole nested
+/// structure.
 const _: () = assert!(
     tether_protocol::MAX_DATAGRAM_DECODE_BYTES >= MAX_PACKET_BYTES + AUDIO_DATAGRAM_FRAMING_BYTES,
     "MAX_DATAGRAM_DECODE_BYTES must be >= MAX_PACKET_BYTES + audio datagram framing"
@@ -56,7 +66,9 @@ const VALID_FRAME_DURATIONS_TENTHS_MS: [u32; 6] = [25, 50, 100, 200, 400, 600];
 const EXPECTED_PACKET_LOSS_PERC: c_int = 5;
 
 /// Opus session parameters. The defaults are the v1 shipping config: 48 kHz
-/// stereo, 128 kbps CBR, 10 ms frames, restricted-lowdelay.
+/// stereo, 128 kbps CBR, 5 ms frames, restricted-lowdelay. 5 ms halves the
+/// packetisation latency of a 10 ms frame at negligible per-packet-overhead cost
+/// for ~128 kbps — the low-latency default (also what Moonlight ships).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpusConfig {
     pub sample_rate: u32,
@@ -71,13 +83,13 @@ impl Default for OpusConfig {
             sample_rate: crate::SAMPLE_RATE_HZ,
             channels: crate::CHANNELS,
             bitrate_bps: 128_000,
-            frame_duration_ms: 10,
+            frame_duration_ms: 5,
         }
     }
 }
 
 impl OpusConfig {
-    /// Samples per channel in one Opus frame (e.g. 480 at 48 kHz / 10 ms).
+    /// Samples per channel in one Opus frame (e.g. 240 at 48 kHz / 5 ms).
     #[must_use]
     pub fn frame_size(&self) -> usize {
         (self.sample_rate as usize * self.frame_duration_ms as usize) / 1000
@@ -544,7 +556,7 @@ mod tests {
         }
     }
 
-    /// The encoder and decoder agree on the configured 10 ms frame size (480
+    /// The encoder and decoder agree on the configured 5 ms frame size (240
     /// samples at 48 kHz), and concealment frames are that same length — so a
     /// concealed gap is exactly one frame on the playback clock.
     #[test]
@@ -552,7 +564,7 @@ mod tests {
         let cfg = OpusConfig::default();
         let enc = OpusEncoder::new(cfg).unwrap();
         let mut dec = OpusDecoder::new(cfg).unwrap();
-        assert_eq!(cfg.frame_size(), 480, "48 kHz / 10 ms");
+        assert_eq!(cfg.frame_size(), 240, "48 kHz / 5 ms");
         assert_eq!(enc.frame_size(), cfg.frame_size(), "encoder frame size");
         assert_eq!(
             dec.conceal().frames(),

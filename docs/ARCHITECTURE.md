@@ -499,12 +499,20 @@ its own QUIC primitive:
   (HDR ROI QP) lands as additive variants instead of struct-field
   appends.
 - **Audio** (unreliable datagrams, host → client) — `AudioPacket::Opus
-  { stream_epoch, frame_seq, t_capture, payload }`. The full Opus
-  capture → encode → decode → playback pipeline is implemented in
+  { stream_epoch, frame_seq, t_capture, payload, redundant }`. The full
+  Opus capture → encode → decode → playback pipeline is implemented in
   `tether-audio` (per-platform system-output capture, libopus codec
   with PLC, lock-free jitter ring + cap-and-drop playback policy),
   negotiated host-authoritatively via the `tether.audio` hello
-  extension.
+  extension. Audio has no transport-level FEC (unlike video's
+  `FrameFragmenter` Reed-Solomon), and Opus in-band FEC doesn't fit the
+  fullband-music config (LBRR is SILK-only; our CELT-only mode emits
+  none), so `redundant` carries an
+  RFC-2198-style RED tail — the previous Opus payload(s), newest-first —
+  letting the client recover an isolated lost frame from a later
+  datagram instead of concealing it. Loss/recovery is visible in the
+  client's `audio playback stats` log (`recovered_frames`,
+  `concealed_frames`, `dropout_frames`, `stale_packets`).
 - **Cursor** (unreliable datagrams, high priority) — pointer position
   only (`HostCursorPacket::Position`, `ClientCursorPacket`). Sprite
   payloads ride the reliable control stream (too large for a
@@ -831,7 +839,12 @@ Listed to set expectations; each is a real follow-up, not a "never":
   hello extension, but there is no user-facing control yet — audio is
   on whenever both peers support it (host `--no-audio` opts out). A
   per-session mute/volume toggle waits on the user-prefs work. No
-  microphone / client → host audio path; system output only.
+  microphone / client → host audio path; system output only. Network
+  loss is handled by RFC-2198 RED (depth-2, covering a short 2-frame
+  burst; see the `redundant` field above); the clock-drift adaptive
+  resampler (issue #35 item 1) is still deferred — the cap-and-drop
+  policy bounds latency instead (30 ms target / 50 ms ceiling), at a
+  bounded drop every minute or two on clock drift.
 - **Periodic safety-net IDR.** Sunshine deliberately omits this on
   the NVENC path; we follow suit. Worth adding if we ever see a
   "client went silent without observing decode failure" stall mode

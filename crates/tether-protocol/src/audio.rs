@@ -16,6 +16,23 @@
 //! frames at typical 60 ms-or-less packetisation fit well under the
 //! 1200-byte budget at any reasonable bitrate.
 //!
+//! ## Loss recovery (RED)
+//!
+//! Audio has no transport-level FEC (the video [`FrameFragmenter`] does),
+//! and Opus in-band FEC doesn't fit our config (LBRR is SILK-only; our
+//! CELT-only `RESTRICTED_LOWDELAY` mode — and even `OPUS_APPLICATION_AUDIO`
+//! at 128 kbps fullband music — emits little). So each datagram carries a
+//! small RFC-2198-style RED tail:
+//! the *previous* frames' Opus payloads in [`AudioPacket::Opus::redundant`].
+//! When a datagram is lost but a later one arrives, the client recovers the
+//! missing frame from the redundant copy and decodes it in order — no PLC
+//! click. The copies are tiny (~80 B/frame at the default 5 ms / 128 kbps),
+//! so even a couple stay far under the per-datagram MTU. `redundant` is empty when
+//! redundancy is disabled or at stream start; a client that ignores it
+//! still decodes the primary `payload` exactly as before.
+//!
+//! [`FrameFragmenter`]: crate::video::FrameFragmenter
+//!
 //! ## Format negotiation
 //!
 //! Sample rate, channel count, and Opus stream-config bytes are carried
@@ -24,8 +41,10 @@
 //! that wants a typed audio-config field on `ServerHelloV1` can promote
 //! the extension to a typed addition in `ServerHelloV2`.
 
-use crate::MonoNanos;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+
+use crate::MonoNanos;
 
 /// One host → client audio datagram.
 ///
@@ -42,8 +61,19 @@ pub enum AudioPacket {
         /// Opus-encoded payload. For multistream Opus (surround), this
         /// is the concatenated multistream packet — the
         /// `tether.audio` extension carries the stream/coupled count
-        /// the decoder needs.
-        payload: Vec<u8>,
+        /// the decoder needs. `Bytes` (refcounted) like the video wire,
+        /// so the encoder's output rides through to the datagram with no
+        /// copy. Serialized as a byte sequence (identical wire shape to
+        /// `Vec<u8>`).
+        payload: Bytes,
+        /// RED loss-recovery tail: the Opus payloads of the frames
+        /// immediately preceding this one, **newest-first** — so
+        /// `redundant[k]` is the payload for `frame_seq - (k + 1)`. Empty
+        /// when redundancy is off or at stream start. Lets the client
+        /// recover an isolated lost datagram from a later one without a
+        /// concealment click. Bounded by the datagram MTU on send and by
+        /// [`crate::MAX_DATAGRAM_DECODE_BYTES`] on receive.
+        redundant: Vec<Bytes>,
     },
 }
 

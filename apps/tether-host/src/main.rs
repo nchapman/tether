@@ -2648,6 +2648,19 @@ fn run_audio_capture_and_send(
         }
     };
 
+    // RFC-2198-style RED: attach the previous frames' Opus payloads to each
+    // datagram so the client can recover lost packets without a concealment
+    // click. Audio has no transport FEC, and Opus in-band FEC doesn't fit (LBRR
+    // is SILK-only; our CELT-only config emits none), so this is the loss lever
+    // that fits. Depth 2 covers a 2-frame burst — the common short Wi-Fi
+    // dropout — at zero added latency (RED recovers retroactively) for ~3× the
+    // tiny audio bitrate. (Comparable to Moonlight's 4+2 audio FEC.) Its history
+    // carries old payloads, so it must be reset alongside the encoder if a
+    // stream_epoch bump is ever wired (else the new epoch's first datagrams ship
+    // cross-epoch copies).
+    const AUDIO_REDUNDANCY_DEPTH: usize = 2;
+    let mut redundancy = tether_audio::RedundancyBuffer::new(AUDIO_REDUNDANCY_DEPTH);
+
     let mut frame_seq: u32 = 0;
     // Capture-side health, logged every interval: how many frames the backend
     // delivered and the peak |sample| among them. A peak of ~0 means the
@@ -2701,6 +2714,11 @@ fn run_audio_capture_and_send(
             }
         };
         for payload in packets {
+            // The RED tail must be built in send order (it records each payload
+            // for the following frames), so compute it before the move below.
+            // Both `payload` and the tail are `Bytes`, so they ride to the wire
+            // struct with no copy.
+            let redundant = redundancy.next_tail(&payload);
             let packet = AudioPacket::Opus {
                 // Audio runs a single encoder for the whole session (no
                 // mid-stream sample-rate/device switch today), so the epoch is
@@ -2710,7 +2728,8 @@ fn run_audio_capture_and_send(
                 stream_epoch: 0,
                 frame_seq,
                 t_capture: MonoNanos::now(),
-                payload: payload.to_vec(),
+                payload,
+                redundant,
             };
             frame_seq = frame_seq.wrapping_add(1);
             if let Err(e) = conn.send_datagram(&Datagram::Audio(packet)) {

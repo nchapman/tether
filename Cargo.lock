@@ -3862,6 +3862,7 @@ version = "0.2.1"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "libloading",
  "objc2 0.6.4",
  "objc2-io-surface",
  "objc2-metal 0.3.2",

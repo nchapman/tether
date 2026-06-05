@@ -37,6 +37,11 @@ rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a2002567
 # path. Linux-only because VAAPI itself is.
 [target.'cfg(target_os = "linux")'.dependencies]
 tether-vaapi = { workspace = true }
+# Runtime dlopen of libcuda.so.1 + libEGL.so.1 for the NVENC zero-copy
+# DMA-BUF → CUDA import (EGLImage interop, see `nvenc::ffi`). dlopen rather
+# than link-time so a non-NVIDIA host degrades gracefully (the loader
+# returns None and the encoder falls back to the CPU upload path).
+libloading = "0.8"
 
 # macOS-only IOSurface→MTLTexture→wgpu interop helpers. Shared by
 # `tether-render` (client decode-side import) and `tether-gpuconvert`

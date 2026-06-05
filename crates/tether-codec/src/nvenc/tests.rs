@@ -234,3 +234,198 @@ fn nvenc_detection_true_on_this_nvidia_host() {
         "nvidia_gpu_present() should be true on an NVIDIA host"
     );
 }
+
+/// Luma stats over a decoded frame, to verify a solid-color round trip
+/// without a full SSIM harness.
+struct DecodedYStats {
+    w: u32,
+    h: u32,
+    mean: f64,
+    stddev: f64,
+    /// Full-scale luma value: 255 (8-bit) or 1023 (10-bit).
+    max_scale: f64,
+}
+
+/// Decode an HEVC Annex-B bitstream (extradata-prefixed IDR) with FFmpeg's
+/// in-build native software decoder — no nvidia-vaapi-driver — and return
+/// luma stats for the first decoded frame. `None` if nothing decodes.
+fn sw_hevc_decode_y_stats(packets: &[crate::EncodedPacket]) -> Option<DecodedYStats> {
+    use rsmpeg::avcodec::{AVCodec, AVCodecContext};
+
+    let codec = AVCodec::find_decoder(ffi::AV_CODEC_ID_HEVC)?;
+    let mut dec = AVCodecContext::new(&codec);
+    dec.open(None).ok()?;
+    for p in packets {
+        let pkt = crate::h264::packet_from_bytes(&p.data).ok()?;
+        dec.send_packet(Some(&pkt)).ok()?;
+    }
+    // Flush: a lone IDR sits in the reorder DPB until EOF.
+    let _ = dec.send_packet(None);
+    let frame = dec.receive_frame().ok()?;
+    Some(y_stats(&frame))
+}
+
+// ffmpeg i32 width/height/linesize on an allocated frame are non-negative;
+// the u16 read is the 10-bit little-endian luma sample. Both casts are
+// deliberate, not lossy in practice.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn y_stats(frame: &rsmpeg::avutil::AVFrame) -> DecodedYStats {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let stride = frame.linesize[0] as usize;
+    let is_10bit = frame.format == ffi::AV_PIX_FMT_YUV420P10LE;
+    let max_scale = if is_10bit { 1023.0 } else { 255.0 };
+    let data = frame.data[0];
+    let (mut sum, mut sumsq, mut n) = (0f64, 0f64, 0f64);
+    // SAFETY: data points to at least `stride * h` readable bytes; we index
+    // within the visible w×h region (10-bit reads 2 bytes per sample).
+    unsafe {
+        for y in 0..h {
+            let row = data.add(y * stride);
+            for x in 0..w {
+                let v = if is_10bit {
+                    f64::from(row.add(x * 2).cast::<u16>().read_unaligned() & 0x03ff)
+                } else {
+                    f64::from(*row.add(x))
+                };
+                sum += v;
+                sumsq += v * v;
+                n += 1.0;
+            }
+        }
+    }
+    let mean = sum / n;
+    let var = (sumsq / n) - mean * mean;
+    DecodedYStats {
+        w: w as u32,
+        h: h as u32,
+        mean,
+        stddev: var.max(0.0).sqrt(),
+        max_scale,
+    }
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
+    use tether_gpuconvert::Bgra2P010DmaBuf;
+
+    const W: u32 = 256;
+    const H: u32 = 256;
+
+    let bridge = match pollster::block_on(Bgra2P010DmaBuf::new(W, H)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP nvenc_p010_dmabuf_roundtrip: Bgra2P010DmaBuf unavailable: {e}");
+            return;
+        }
+    };
+
+    // Solid mid-gray. A correct EGL→CUDA import decodes back to a uniform,
+    // mid-range frame; a wrong plane/stride/offset yields garbage (high
+    // variance) or zeroed memory (near-black).
+    let mut bgra = vec![0u8; (W * H * 4) as usize];
+    for px in bgra.chunks_exact_mut(4) {
+        px.copy_from_slice(&[128, 128, 128, 255]);
+    }
+    let p010 = bridge.convert_bgra_bytes(&bgra).expect("P010 convert");
+    let frame = crate::build_p010_dmabuf_frame(
+        p010.fd,
+        p010.size,
+        p010.modifier,
+        p010.y_offset,
+        p010.y_stride,
+        p010.uv_offset,
+        p010.uv_stride,
+    );
+
+    let mut enc =
+        NvencEncoder::new(VideoProfile::HEVC_10BIT_420, W, H, 30, 8_000).expect("NVENC HEVC Main10");
+    let packets = enc
+        .submit_dmabuf(&frame, 0, true)
+        .expect("submit_dmabuf (EGL→CUDA import + encode)");
+    assert!(
+        packets.iter().any(|p| p.keyframe),
+        "submit_dmabuf should produce an IDR"
+    );
+
+    let stats = sw_hevc_decode_y_stats(&packets)
+        .expect("software HEVC decode of the NVENC output produced no frame");
+    assert_eq!((stats.w, stats.h), (W, H), "decoded dims mismatch");
+    assert!(
+        stats.stddev < stats.max_scale * 0.05,
+        "decoded luma not uniform (stddev {:.1} of {:.0}) — the EGL→CUDA import likely \
+         delivered garbage instead of our solid frame",
+        stats.stddev,
+        stats.max_scale
+    );
+    let frac = stats.mean / stats.max_scale;
+    assert!(
+        (0.25..0.75).contains(&frac),
+        "decoded luma mean {:.1} ({:.0}% of full scale) is not mid-range — the import did \
+         not deliver the gray we encoded",
+        stats.mean,
+        frac * 100.0
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_nv12_dmabuf_roundtrip_decodes_our_pixels() {
+    use tether_gpuconvert::Nv12DmaBuf;
+
+    const W: u32 = 256;
+    const H: u32 = 256;
+
+    let bridge = match pollster::block_on(Nv12DmaBuf::new(W, H)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP nvenc_nv12_dmabuf_roundtrip: Nv12DmaBuf unavailable: {e}");
+            return;
+        }
+    };
+
+    // Solid mid-gray; same correctness logic as the P010 test, on the
+    // 8-bit NV12 path (HEVC Main).
+    let mut bgra = vec![0u8; (W * H * 4) as usize];
+    for px in bgra.chunks_exact_mut(4) {
+        px.copy_from_slice(&[128, 128, 128, 255]);
+    }
+    let nv12 = bridge.convert_bgra_bytes(&bgra).expect("NV12 convert");
+    let frame = crate::build_nv12_dmabuf_frame(
+        nv12.fd,
+        nv12.size,
+        nv12.modifier,
+        nv12.y_offset,
+        nv12.y_stride,
+        nv12.uv_offset,
+        nv12.uv_stride,
+    );
+
+    let mut enc =
+        NvencEncoder::new(VideoProfile::HEVC_8BIT_420, W, H, 30, 8_000).expect("NVENC HEVC Main");
+    let packets = enc
+        .submit_dmabuf(&frame, 0, true)
+        .expect("submit_dmabuf (EGL→CUDA import + encode)");
+    assert!(
+        packets.iter().any(|p| p.keyframe),
+        "submit_dmabuf should produce an IDR"
+    );
+
+    let stats = sw_hevc_decode_y_stats(&packets)
+        .expect("software HEVC decode of the NVENC output produced no frame");
+    assert_eq!((stats.w, stats.h), (W, H), "decoded dims mismatch");
+    assert!(
+        stats.stddev < stats.max_scale * 0.05,
+        "decoded luma not uniform (stddev {:.1} of {:.0}) — EGL→CUDA import likely garbage",
+        stats.stddev,
+        stats.max_scale
+    );
+    let frac = stats.mean / stats.max_scale;
+    assert!(
+        (0.25..0.75).contains(&frac),
+        "decoded luma mean {:.1} ({:.0}% of full scale) not mid-range — import wrong",
+        stats.mean,
+        frac * 100.0
+    );
+}

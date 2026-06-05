@@ -9,12 +9,16 @@
 //! nvidia-vaapi-driver shim, which still routes through that wrapper). The
 //! `*_nvenc` wrappers expose real per-frame plumbing — that's the whole point.
 //!
-//! Pipeline: capture DMA-BUF → import into CUDA zero-copy
-//! (`cuImportExternalMemory` on the object fd, see [`encoder::NvencEncoder::submit_dmabuf`])
-//! → `*_nvenc`. There is no `av_hwframe_map(DRM_PRIME → CUDA)` path in FFmpeg
-//! (that helper is registered only for VAAPI/Vulkan importers), so the import
-//! is done with the CUDA driver API directly against the same `CUcontext`
-//! FFmpeg's `AVCUDADeviceContext` holds.
+//! Pipeline: capture DMA-BUF → import into CUDA zero-copy via EGLImage
+//! interop (`eglCreateImage(EGL_LINUX_DMA_BUF_EXT)` →
+//! `cuGraphicsEGLRegisterImage`, see [`encoder::NvencEncoder::submit_dmabuf`]
+//! and [`ffi`]) → `*_nvenc`. There is no `av_hwframe_map(DRM_PRIME → CUDA)`
+//! path in FFmpeg (that helper is registered only for VAAPI/Vulkan
+//! importers), and `cuImportExternalMemory(OPAQUE_FD)` does **not** accept a
+//! Vulkan-exported dma-buf (it isn't a CUDA opaque-fd handle); the EGLImage
+//! path is what Sunshine uses. The import runs against the same `CUcontext`
+//! FFmpeg's `AVCUDADeviceContext` holds, so the device pointers it produces
+//! are dereferenceable by the encoder.
 //!
 //! Requires an FFmpeg built with `--enable-nvenc --enable-cuda` and the runtime
 //! `libnvidia-encode.so` / `libcuda.so` present. Construction returns a clean
@@ -23,6 +27,7 @@
 pub use encoder::NvencEncoder;
 
 mod encoder;
+mod ffi;
 
 #[cfg(test)]
 mod tests;

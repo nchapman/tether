@@ -529,6 +529,69 @@ pub fn build_p010_dmabuf_frame(
     }
 }
 
+/// Build a `DmaBufFrame` matching the NV12 (4:2:0 8-bit) descriptor shape:
+/// one DRM object, two layers — Y as `R8  ` and UV as `GR88` — both pointing
+/// at `object_index=0` with their offsets within the shared allocation. The
+/// 8-bit sibling of [`build_p010_dmabuf_frame`]; one source of truth shared by
+/// the host send loop (`nv12_dmabuf_to_codec_frame`) and the NVENC zero-copy
+/// probe/round-trip tests.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn build_nv12_dmabuf_frame(
+    fd: std::os::fd::OwnedFd,
+    size: u64,
+    modifier: u64,
+    y_offset: u64,
+    y_stride: u64,
+    uv_offset: u64,
+    uv_stride: u64,
+) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"NV12"),
+        objects: vec![DmaBufObject {
+            fd,
+            size,
+            drm_format_modifier: modifier,
+        }],
+        layers: vec![
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"R8  "),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(y_offset).expect("Y plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(y_stride).expect("Y plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+            },
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"GR88"),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(uv_offset).expect("UV plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(uv_stride).expect("UV plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+            },
+        ],
+    }
+}
+
 /// Build a `DmaBufFrame` matching the XV30 (HEVC Main 4:4:4 10-bit)
 /// descriptor shape FFmpeg's `vaapi_drm_format_map` expects: one DRM
 /// object, one layer (DRM_FORMAT_XV30, packed 10:10:10:2), one plane

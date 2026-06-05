@@ -9,9 +9,10 @@
 //!     `hwframe_transfer_data` host→CUDA). Used by the test pattern, the
 //!     bench harness, and the 8-bit encode probe.
 //!   * [`NvencEncoder::submit_dmabuf`] — the zero-copy production path
-//!     (capture DMA-BUF imported into CUDA). Wired in a later milestone;
-//!     until then `encode_gpu` reports `UnsupportedInputFormat` so the host
-//!     falls back to the CPU path rather than silently dropping frames.
+//!     (capture DMA-BUF imported into CUDA via EGLImage interop, see
+//!     [`super::ffi`]). `encode_gpu` routes `DmaBuf` frames here; if the
+//!     EGL/CUDA stack is unavailable it reports `NoHardwareCodec` so the
+//!     host falls back to the CPU path rather than dropping frames.
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{ra, AVDictionary, AVFrame, AVHWDeviceContext};
@@ -24,8 +25,9 @@ use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
 use crate::encoder_common::{drain_encoder, snapshot_extradata};
 use crate::h264::frame_plane_mut;
-use crate::{init_ffmpeg, CodecError, EncodedPacket, Encoder, Result, GOP_SECONDS};
+use crate::{init_ffmpeg, CodecError, DmaBufFrame, EncodedPacket, Encoder, Result, GOP_SECONDS};
 
+use super::ffi as nvffi;
 use super::NVENC_POOL_SIZE;
 
 pub struct NvencEncoder {
@@ -49,7 +51,20 @@ pub struct NvencEncoder {
     // down before `_hw_device` — surfaces freed before the device that
     // allocated them. Same contract as VaapiEncoder.
     _hw_device: AVHWDeviceContext,
+    /// Negotiated chroma subsampling. Pinned at construction; gates the
+    /// DMA-BUF fourcc the zero-copy path accepts (`expected_nvenc_dmabuf_fourcc`).
+    chroma: ChromaSubsampling,
+    width: u32,
     height: u32,
+    /// FFmpeg's `CUcontext` for this encoder, read once from the CUDA
+    /// `AVHWDeviceContext`. The EGL→CUDA import in `submit_dmabuf`
+    /// registers against this exact context so the device pointers it
+    /// hands NVENC are dereferenceable by the encoder.
+    ///
+    /// A raw pointer field; covered by the `unsafe impl Send` above (the
+    /// CUcontext is owned by `_hw_device`, which is dropped after the
+    /// encoder, and only touched under `&mut self`).
+    cuda_ctx: nvffi::CuContext,
     bgra_row_bytes: usize,
     /// AVOption keys `open()` left unconsumed. Empty when every requested
     /// option was accepted. Exposed via [`Self::unused_avoptions`] so tests
@@ -107,6 +122,23 @@ impl NvencEncoder {
         // producer (wgpu) and importer (CUDA) must agree on the physical
         // GPU — handled when a multi-GPU user needs it.
         let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, None, None, 0)?;
+
+        // Read FFmpeg's CUcontext out of the CUDA AVHWDeviceContext so the
+        // zero-copy DMA-BUF import (`submit_dmabuf`) registers EGL images
+        // against the exact context NVENC allocates surfaces in. The
+        // navigation mirrors the C cast in hwcontext_cuda users:
+        //   AVBufferRef::data → AVHWDeviceContext::hwctx → AVCUDADeviceContext::cuda_ctx
+        //
+        // SAFETY: `create` returned a valid CUDA device-context buffer.
+        // `data` points at an `AVHWDeviceContext`, whose `hwctx` points at
+        // an `AVCUDADeviceContext` (our `AvCudaDeviceContext`, prefix-ABI
+        // pinned by the const asserts in `nvffi`). We only read `cuda_ctx`.
+        let cuda_ctx: nvffi::CuContext = unsafe {
+            let buf_ref = hw_device.as_ptr();
+            let device_ctx = (*buf_ref).data as *const ffi::AVHWDeviceContext;
+            let cuda_device_ctx = (*device_ctx).hwctx as *const nvffi::AvCudaDeviceContext;
+            (*cuda_device_ctx).cuda_ctx
+        };
 
         let width_i32 = i32::try_from(width).expect("width fits in i32");
         let height_i32 = i32::try_from(height).expect("height fits in i32");
@@ -289,7 +321,10 @@ impl NvencEncoder {
             bgra_frame,
             extradata,
             _hw_device: hw_device,
+            chroma,
+            width,
             height,
+            cuda_ctx,
             bgra_row_bytes,
             unused_avoptions,
         })
@@ -300,6 +335,108 @@ impl NvencEncoder {
     #[must_use]
     pub fn unused_avoptions(&self) -> &[String] {
         &self.unused_avoptions
+    }
+
+    /// The zero-copy production path: import a capture DMA-BUF into CUDA
+    /// (EGLImage → `cuGraphicsEGLRegisterImage`) and feed the resulting
+    /// device pointers to `*_nvenc` as an `AV_PIX_FMT_CUDA` frame. The
+    /// NVENC twin of [`crate::vaapi::VaapiEncoder::submit_dmabuf`].
+    ///
+    /// `frame.fourcc` must match the negotiated chroma — `NV12` for 4:2:0
+    /// 8-bit, `P010` for 4:2:0 10-bit (see [`expected_nvenc_dmabuf_fourcc`]).
+    /// 4:4:4 is not accepted here: NVENC wants planar input the gpuconvert
+    /// bridge doesn't produce yet (same deferral as `nvenc_sw_format`).
+    /// Width/height are pinned to the encoder's construction values;
+    /// resolution changes go through a full encoder rebuild.
+    ///
+    /// Returns `NoHardwareCodec` when the EGL/CUDA stack is unavailable
+    /// (no NVIDIA driver / missing EGL device extensions) so the host's
+    /// send loop falls back to `encode_bgra` rather than dropping frames.
+    // AVFrame::linesize / packet.size are non-negative i32 ABI fields;
+    // same rationale as encode_bgra and the VAAPI sibling.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn submit_dmabuf(
+        &mut self,
+        frame: &DmaBufFrame,
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<Vec<EncodedPacket>> {
+        let expected_fourcc = expected_nvenc_dmabuf_fourcc(self.chroma, self.bit_depth)
+            .ok_or(CodecError::UnsupportedInputFormat)?;
+        if frame.fourcc != expected_fourcc {
+            // A fourcc mismatch means a stale dma-buf bridge built for one
+            // chroma was fed a frame from the other. Both numbers logged so
+            // the root cause is obvious without AV_LOG_DEBUG.
+            warn!(
+                actual = format_args!("0x{:08x}", frame.fourcc),
+                expected = format_args!("0x{:08x}", expected_fourcc),
+                chroma = ?self.chroma,
+                "imported dma-buf fourcc does not match the negotiated chroma (nvenc)"
+            );
+            return Err(CodecError::UnsupportedInputFormat);
+        }
+
+        // Lazily-initialised, process-global EGL/CUDA importer. `None`
+        // means this host can't do the interop at all.
+        let importer = nvffi::importer()
+            .ok_or_else(|| CodecError::NoHardwareCodec("EGL/CUDA import unavailable".to_string()))?;
+
+        // Import every plane into CUDA. `imported` owns the EGL images +
+        // CUDA graphics resources; it must outlive `send_frame` + `drain`
+        // so the device pointers stay mapped while NVENC reads them.
+        let imported = importer
+            .import(self.cuda_ctx, frame, self.width, self.height)
+            .map_err(CodecError::NoHardwareCodec)?;
+
+        // Allocate a destination frame from the encoder's own CUDA pool. It
+        // is a contiguous NV12/P010 surface with `buf[0]` set — what NVENC's
+        // input path requires. NVENC registers ONE pool surface per input
+        // frame (a single base pointer + pitch, UV at pitch*height); it can't
+        // consume the imported planes as separate external pointers, so we
+        // assemble them into this pool frame with device→device copies (the
+        // same hop Sunshine makes). A null `buf[0]` (the bare user-pointer
+        // frame we'd otherwise build) is exactly what made send_frame EINVAL.
+        let mut dst = AVFrame::new();
+        self.encoder
+            .hw_frames_ctx_mut()
+            .expect("hw_frames_ctx set in new")
+            .get_buffer(&mut dst)?;
+
+        // Copy each imported plane into the pool frame's matching plane.
+        // 4:2:0: plane 0 = full height, plane 1 (interleaved UV) = half
+        // height; both rows are `width * bytes_per_sample` bytes wide
+        // (NV12 UV packs w/2 CbCr pairs = w bytes; P010 = 2w bytes).
+        let bytes_per_sample = if self.bit_depth == 8 { 1 } else { 2 };
+        let width_bytes = self.width as usize * bytes_per_sample;
+        for i in 0..imported.plane_count() {
+            let plane_height = if i == 0 {
+                self.height as usize
+            } else {
+                (self.height as usize).div_ceil(2)
+            };
+            imported
+                .copy_plane_into(
+                    i,
+                    dst.data[i],
+                    dst.linesize[i].max(0) as usize,
+                    width_bytes,
+                    plane_height,
+                )
+                .map_err(CodecError::NoHardwareCodec)?;
+        }
+        // The pixels now live in the pool frame; the EGL/CUDA import
+        // resources can be released.
+        drop(imported);
+
+        dst.set_pts(pts);
+        dst.set_pict_type(if force_keyframe {
+            ffi::AV_PICTURE_TYPE_I
+        } else {
+            ffi::AV_PICTURE_TYPE_NONE
+        });
+
+        self.encoder.send_frame(Some(&dst))?;
+        drain_encoder(&mut self.encoder, &self.extradata)
     }
 }
 
@@ -399,15 +536,15 @@ impl Encoder for NvencEncoder {
     fn encode_gpu(
         &mut self,
         frame: crate::GpuEncoderFrame<'_>,
-        _pts: i64,
-        _force_keyframe: bool,
+        pts: i64,
+        force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
         match frame {
-            // The zero-copy DMA-BUF → CUDA import path lands in the next
-            // milestone (EGLImage interop). Until then report
-            // UnsupportedInputFormat so the host's send loop falls back to
-            // encode_bgra rather than silently dropping the frame.
-            crate::GpuEncoderFrame::DmaBuf(_) => Err(CodecError::UnsupportedInputFormat),
+            // Zero-copy DMA-BUF → CUDA import (EGLImage interop). Falls
+            // back via NoHardwareCodec / UnsupportedInputFormat so the
+            // host send loop drops to encode_bgra rather than dropping the
+            // frame when interop is unavailable or the chroma is 4:4:4.
+            crate::GpuEncoderFrame::DmaBuf(f) => self.submit_dmabuf(f, pts, force_keyframe),
             crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
         }
     }
@@ -440,6 +577,26 @@ fn nvenc_codec_display_name(kind: CodecKind) -> &'static str {
         CodecKind::Hevc => "hevc_nvenc (NVIDIA)",
         CodecKind::Av1 => "av1_nvenc (NVIDIA)",
     }
+}
+
+/// DRM fourcc the zero-copy DMA-BUF path expects for a negotiated
+/// `(chroma, bit_depth)` — the **surface-level** fourcc gpuconvert's
+/// NV12/P010 bridges stamp on the frame they hand the encoder.
+///
+/// 4:2:0 only, matching [`nvenc_sw_format`]: `NV12` (8-bit) / `P010`
+/// (10-bit). 4:4:4 returns `None` (deferred — no planar gpuconvert
+/// bridge yet), which `submit_dmabuf` maps to `UnsupportedInputFormat`.
+/// Same `(chroma, bit_depth) → fourcc` relation as the VAAPI sibling's
+/// [`crate::vaapi::expected_dmabuf_fourcc`] for the 4:2:0 rows.
+pub(super) fn expected_nvenc_dmabuf_fourcc(
+    chroma: ChromaSubsampling,
+    bit_depth: u8,
+) -> Option<u32> {
+    Some(match (chroma, bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => u32::from_le_bytes(*b"NV12"),
+        (ChromaSubsampling::Yuv420, 10) => u32::from_le_bytes(*b"P010"),
+        _ => return None,
+    })
 }
 
 /// FFmpeg CUDA `sw_format` (and matching BGRA→YUV swscale destination /

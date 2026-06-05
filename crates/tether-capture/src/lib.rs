@@ -309,7 +309,10 @@ const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
 
 #[cfg(target_os = "linux")]
 fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
-    use winit::event_loop::EventLoop;
+    use winit::application::ApplicationHandler;
+    use winit::event::WindowEvent;
+    use winit::event_loop::{ActiveEventLoop, EventLoop};
+    use winit::window::WindowId;
 
     let mut builder = EventLoop::builder();
     winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
@@ -317,21 +320,45 @@ fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
     let event_loop = builder
         .build()
         .map_err(|e| CaptureError::Display(format!("winit event loop: {e}")))?;
-    let primary_name = event_loop
-        .primary_monitor()
-        .and_then(|monitor| monitor.name());
-    let displays = event_loop
-        .available_monitors()
-        .enumerate()
-        .map(|(idx, monitor)| monitor_to_descriptor(idx, &monitor, primary_name.as_deref()))
-        .collect::<Vec<_>>();
 
-    if displays.is_empty() {
+    // winit 0.30 exposes monitor enumeration only through `ActiveEventLoop`, which
+    // is reachable from the `resumed` callback. Desktop platforms emit `resumed`
+    // once at startup, so we collect the monitor list there and exit immediately.
+    #[derive(Default)]
+    struct DisplayCollector {
+        displays: Vec<DisplayDescriptor>,
+    }
+
+    impl ApplicationHandler for DisplayCollector {
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            // Wayland has no primary-monitor concept, so `primary_monitor()`
+            // always returns `None` there; `monitor_to_descriptor` then falls
+            // back to flagging index 0. Only X11 (RandR) reports a real primary.
+            let primary_name = event_loop
+                .primary_monitor()
+                .and_then(|monitor| monitor.name());
+            self.displays = event_loop
+                .available_monitors()
+                .enumerate()
+                .map(|(idx, monitor)| monitor_to_descriptor(idx, &monitor, primary_name.as_deref()))
+                .collect();
+            event_loop.exit();
+        }
+
+        fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    }
+
+    let mut collector = DisplayCollector::default();
+    event_loop
+        .run_app(&mut collector)
+        .map_err(|e| CaptureError::Display(format!("winit run_app: {e}")))?;
+
+    if collector.displays.is_empty() {
         return Err(CaptureError::Display(
             "no monitors reported by winit".into(),
         ));
     }
-    Ok(displays)
+    Ok(collector.displays)
 }
 
 #[cfg(target_os = "linux")]

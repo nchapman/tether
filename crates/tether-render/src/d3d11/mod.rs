@@ -1179,7 +1179,7 @@ fn make_immutable_texture(
 #[allow(clippy::cast_sign_loss)]
 mod tests {
     use super::*;
-    use tether_protocol::control::VideoColorSpec;
+    use tether_protocol::control::{CodecKind, VideoColorSpec};
 
     /// Pins the renderer's decode-format → plane-SRV table against the
     /// real `DXGI_FORMAT` constants: NV12 (8-bit) samples through R8 luma
@@ -1333,13 +1333,36 @@ mod tests {
     #[test]
     #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
     fn d3d11_coord_fixture_decode_render_roundtrip_8bit() {
-        d3d11_roundtrip(8, false);
+        d3d11_roundtrip(CodecKind::Hevc, 8, false, None);
     }
 
     #[test]
     #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10)"]
     fn d3d11_coord_fixture_decode_render_roundtrip_10bit() {
-        d3d11_roundtrip(10, false);
+        d3d11_roundtrip(CodecKind::Hevc, 10, false, None);
+    }
+
+    /// Client upscale: decode at video dims (1280×720) and render into a
+    /// larger surface (1920×1080), so the renderer's Mitchell upscale +
+    /// letterbox stage runs — the one render-path stage the identity cells
+    /// above never exercise. Geometric residual (coord fixture) confirms the
+    /// scale/letterbox math, not just that pixels survive. Mirrors the Linux
+    /// `*_client_upscale` dma-buf cells.
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    fn d3d11_hevc_client_upscale_render_roundtrip_8bit() {
+        d3d11_roundtrip(CodecKind::Hevc, 8, false, Some((1920, 1080)));
+    }
+
+    /// Surface below video: decode at 1280×720 and render into a smaller
+    /// surface (960×540), so the renderer letterbox-fits by *downscaling* —
+    /// the blit pass's non-identity-but-shrinking branch, separate arithmetic
+    /// from the upscale path above. Mirrors the Linux
+    /// `h264_8bit_surface_below_video` cell.
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    fn d3d11_hevc_surface_below_video_render_roundtrip_8bit() {
+        d3d11_roundtrip(CodecKind::Hevc, 8, false, Some((960, 540)));
     }
 
     /// Colour-decode validation: red/green/blue/white bars through the
@@ -1350,19 +1373,44 @@ mod tests {
     #[test]
     #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
     fn d3d11_colorbars_decode_render_roundtrip_8bit() {
-        d3d11_roundtrip(8, true);
+        d3d11_roundtrip(CodecKind::Hevc, 8, true, None);
     }
 
     #[test]
     #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10)"]
     fn d3d11_colorbars_decode_render_roundtrip_10bit() {
-        d3d11_roundtrip(10, true);
+        d3d11_roundtrip(CodecKind::Hevc, 10, true, None);
     }
 
-    fn d3d11_roundtrip(bit_depth: u8, colorbars: bool) {
+    /// H.264 (the floor codec) through the full QSV encode → D3D11VA decode →
+    /// native D3D11 render path. HEVC has 8 + 10-bit cells above; H.264 ships
+    /// as Main 8-bit 4:2:0 only (NV12 → R8/R8G8), so it gets the same
+    /// coord-geometry + colour-bar pair at 8-bit. Guards the H.264 decode SRV
+    /// + shader branch end-to-end, not just the codec round-trip.
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    fn d3d11_h264_coord_fixture_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(CodecKind::H264, 8, false, None);
+    }
+
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    fn d3d11_h264_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(CodecKind::H264, 8, true, None);
+    }
+
+    /// `surface`: the render-target dims. `None` = identity (surface == video,
+    /// the encode/decode/render measurement is pure). `Some(dims)` larger than
+    /// the video drives the renderer's upscale + letterbox path.
+    fn d3d11_roundtrip(
+        codec: CodecKind,
+        bit_depth: u8,
+        colorbars: bool,
+        surface: Option<(u32, u32)>,
+    ) {
         use tether_codec::d3d11::{D3D11Decoder, D3D11Encoder};
         use tether_codec::{D3D11TextureFrame, Decoder, Encoder, Frame as CodecFrame};
-        use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+        use tether_protocol::control::{ChromaSubsampling, VideoProfile};
         use tether_scaler::test_util::{
             coord_fixture_fill, coord_fixture_residual_px_rms, LetterboxMap,
         };
@@ -1451,9 +1499,14 @@ mod tests {
         let src = src.unwrap();
 
         let profile = VideoProfile {
-            codec: CodecKind::Hevc,
+            codec,
             chroma: ChromaSubsampling::Yuv420,
             bit_depth,
+        };
+        let expected_backend = match codec {
+            CodecKind::H264 => "h264_qsv",
+            CodecKind::Hevc => "hevc_qsv",
+            CodecKind::Av1 => "av1_qsv",
         };
         let mut enc = D3D11Encoder::new(
             profile,
@@ -1468,12 +1521,12 @@ mod tests {
         .expect("QSV encoder");
         assert_eq!(
             enc.name(),
-            "hevc_qsv",
+            expected_backend,
             "QSV unavailable; got {}",
             enc.name()
         );
 
-        let mut dec = D3D11Decoder::new(CodecKind::Hevc, true).expect("decoder");
+        let mut dec = D3D11Decoder::new(codec, true).expect("decoder");
         let frame_desc = D3D11TextureFrame {
             texture: src.as_raw() as *mut _,
             device: device.as_raw() as *mut _,
@@ -1511,8 +1564,11 @@ mod tests {
 
         // Render through the production import/SRV/shader path on a fresh
         // device (cross-device, like the real client), read back, measure.
+        // `surface` defaults to the video dims (identity); a larger surface
+        // engages the renderer's upscale + letterbox stage.
+        let (sw, sh) = surface.unwrap_or((w, h));
         let mut state =
-            D3D11RenderState::new_headless(w, h, VideoColorSpec::sdr_desktop(), bit_depth)
+            D3D11RenderState::new_headless(sw, sh, VideoColorSpec::sdr_desktop(), bit_depth)
                 .expect("headless");
         state.apply_frame(render_frame).expect("apply_frame");
         state.render().expect("render");
@@ -1522,24 +1578,29 @@ mod tests {
             crate::color_fixture::assert_colorbars(
                 "d3d11 colorbars",
                 &bgra,
-                w,
-                h,
+                sw,
+                sh,
                 crate::color_fixture::ChannelOrder::Bgra,
             );
         } else {
-            let map = LetterboxMap::new((w, h), (w, h));
-            let residual = coord_fixture_residual_px_rms(&bgra, (w, h), &map);
-            let mid = (((h / 2) * w + (w / 2)) * 4) as usize;
+            let map = LetterboxMap::new((w, h), (sw, sh));
+            let residual = coord_fixture_residual_px_rms(&bgra, (sw, sh), &map);
+            let mid = (((sh / 2) * sw + (sw / 2)) * 4) as usize;
             eprintln!(
                 "coord-fixture residual = {residual:.1}px  center BGRA = ({}, {}, {})",
                 bgra[mid],
                 bgra[mid + 1],
                 bgra[mid + 2]
             );
+            // Upscale/letterbox adds interpolation spread on top of encoder
+            // quantisation, so allow more headroom when the surface differs
+            // from the video; identity stays tight.
+            let threshold = if surface.is_some() { 150.0 } else { 80.0 };
             assert!(
-                residual < 80.0,
-                "geometric residual {residual:.1}px too high — decode-export or render corruption \
-                 (uniform-green / scrambled chroma blows this metric past the quantisation floor)"
+                residual < threshold,
+                "geometric residual {residual:.1}px exceeds {threshold:.0}px — decode-export or \
+                 render corruption (uniform-green / scrambled chroma blows this metric past the \
+                 quantisation floor)"
             );
         }
     }

@@ -71,6 +71,9 @@ pub(crate) struct D3D11CursorOverlay {
 }
 
 impl D3D11CursorOverlay {
+    // The constant uniform-buffer size and the D3D11 bind/blend flag enum
+    // values are all small constants that fit their narrower targets.
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn new(device: &ID3D11Device) -> Result<Self> {
         const HLSL: &[u8] = include_bytes!("cursor.hlsl");
         let vs_blob = compile_shader(HLSL, s!("vs"), s!("vs_5_0"))?;

@@ -70,6 +70,9 @@ impl DxgiCursorState {
 
     /// Extract cursor state from this frame's info. Called after every
     /// successful `AcquireNextFrame`.
+    // DXGI cursor dimensions, hotspot coordinates, and the shape buffer size
+    // are all small, non-negative values that fit their narrower targets.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub(crate) fn update(
         &mut self,
         frame_info: &DXGI_OUTDUPL_FRAME_INFO,
@@ -167,6 +170,9 @@ impl DxgiCursorState {
 }
 
 /// Convert premultiplied BGRA to straight RGBA (un-premultiplies alpha).
+// Un-premultiplied channels are clamped to 255.0 and are non-negative
+// before the cast, so the u8 conversion is exact and saturating by design.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(bgra.len());
     for pixel in bgra.chunks_exact(4) {

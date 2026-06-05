@@ -3,7 +3,10 @@
 //! modern Intel/AMD/NVIDIA discrete or integrated GPU). Run with
 //! `cargo test -p tether-codec --lib d3d11::tests -- --ignored`.
 
+// Included from `d3d11/mod.rs` as `mod tests;`; the inner `mod tests` keeps
+// these hardware tests grouped under one named block.
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 

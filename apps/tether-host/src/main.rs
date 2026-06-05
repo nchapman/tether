@@ -3172,13 +3172,16 @@ fn run_capture_and_send(
             CapturedFrame::Gpu(gpu) => {
                 use windows::core::Interface;
                 let tether_capture::GpuCapturedSource::D3D11Texture(ref tex) = gpu.source;
+                // DXGI_FORMAT is a non-negative enum.
+                #[allow(clippy::cast_sign_loss)]
+                let format = tex.format.0 as u32;
                 let frame = tether_codec::D3D11TextureFrame {
-                    texture: tex.texture.as_raw() as *mut std::ffi::c_void,
-                    device: tex.device.device.as_raw() as *mut std::ffi::c_void,
-                    device_context: tex.device.context.as_raw() as *mut std::ffi::c_void,
+                    texture: tex.texture.as_raw(),
+                    device: tex.device.device.as_raw(),
+                    device_context: tex.device.context.as_raw(),
                     width: tex.width,
                     height: tex.height,
-                    format: tex.format.0 as u32,
+                    format,
                 };
                 match slot_mut.encoder.encode_gpu(
                     GpuEncoderFrame::D3D11Texture(&frame),

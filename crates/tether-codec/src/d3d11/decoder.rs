@@ -186,7 +186,7 @@ impl D3D11Decoder {
             };
             #[allow(clippy::cast_possible_wrap)]
             let supports_device_ctx =
-                config.methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0;
+                config.methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX != 0;
             if supports_device_ctx && config.device_type == ffi::AV_HWDEVICE_TYPE_D3D11VA {
                 d3d11va_supported = true;
                 break;
@@ -251,6 +251,9 @@ impl D3D11Decoder {
     /// handle. Copies both planes (Y and UV) from the decode pool slice
     /// into a MISC_SHARED biplanar staging texture (NV12 or P010, matching
     /// the decode format), entirely on the GPU.
+    // AVFrame dimensions and the DXGI format enum are non-negative; the
+    // D3D11VA array index in data[1] is a small slot number that fits u32.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn export_gpu_frame(&mut self, hw_frame: &AVFrame) -> Result<Frame> {
         let width = hw_frame.width as u32;
         let height = hw_frame.height as u32;
@@ -286,9 +289,11 @@ impl D3D11Decoder {
         // format only changes across a session/codec restart, but keying
         // on it keeps the staging in lock-step with the decode surface so
         // an 8↔10-bit reconfigure can't sample a stale NV12 staging.
-        if self.staging.as_ref().map_or(true, |s| {
-            s.width != width || s.height != height || s.format != src_format
-        }) {
+        if self
+            .staging
+            .as_ref()
+            .is_none_or(|s| s.width != width || s.height != height || s.format != src_format)
+        {
             self.staging = Some(Arc::new(Self::create_staging(
                 &self.device,
                 width,
@@ -341,7 +346,7 @@ impl D3D11Decoder {
             height,
             pts,
             GpuFrameSource::D3D11Texture(D3D11DecodedTexture {
-                handle: staging.handle.0 as *mut std::ffi::c_void,
+                handle: staging.handle.0,
                 width,
                 height,
                 format: staging.format.0 as u32,
@@ -453,8 +458,8 @@ impl D3D11Decoder {
 
         let w = width as usize;
         let h = height as usize;
-        let chroma_h = (h + 1) / 2;
-        let chroma_w = (w + 1) / 2;
+        let chroma_h = h.div_ceil(2);
+        let chroma_w = w.div_ceil(2);
 
         let mut y = Vec::with_capacity(w * h);
         for row in 0..h {

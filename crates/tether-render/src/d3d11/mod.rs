@@ -522,7 +522,7 @@ impl D3D11RenderState {
             &self.context,
             &imported.y_tex,
             &frame.y,
-            frame.width as usize * 1,
+            frame.width as usize,
             frame.height,
         )?;
         upload_rows(
@@ -1030,6 +1030,8 @@ fn upload_rows(
 
 /// Compile the embedded HLSL and build the shaders, sampler, and the
 /// per-frame constant buffer.
+// The shader-params struct size is a small constant that fits u32.
+#[allow(clippy::cast_possible_truncation)]
 fn build_pipeline(device: &ID3D11Device) -> Result<YuvPipeline> {
     const HLSL: &[u8] = include_bytes!("yuv.hlsl");
 
@@ -1250,7 +1252,7 @@ mod tests {
             r > 40 && g > 40 && b > 40,
             "render produced ~black for mid-luma input: ({b}, {g}, {r})"
         );
-        let (max, min) = (r.max(g).max(b) as i32, r.min(g).min(b) as i32);
+        let (max, min) = (i32::from(r.max(g).max(b)), i32::from(r.min(g).min(b)));
         assert!(
             max - min < 40,
             "neutral chroma should be near-gray: ({b}, {g}, {r})"
@@ -1309,7 +1311,7 @@ mod tests {
         let k = ((2 * w + 2) * 4) as usize;
         let (kb, kg, kr) = (bgra[k], bgra[k + 1], bgra[k + 2]);
         eprintln!("corner BGRA = ({kb}, {kg}, {kr})");
-        let (max, min) = (kr.max(kg).max(kb) as i32, kr.min(kg).min(kb) as i32);
+        let (max, min) = (i32::from(kr.max(kg).max(kb)), i32::from(kr.min(kg).min(kb)));
         assert!(
             kr > 40 && kg > 40 && kb > 40 && max - min < 40,
             "corner outside sprite should stay near-gray video, got ({kb}, {kg}, {kr})"

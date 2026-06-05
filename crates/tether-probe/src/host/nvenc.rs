@@ -1,11 +1,11 @@
 //! NVENC implementation of the host encode probe.
 //!
-//! Only the encode half lives here: an NVENC host *decodes* through the
-//! same VAAPI path as any other Linux client (there is no NVDEC backend),
-//! so the decode probe stays [`super::vaapi::VaapiProbe`]. `host::probe_encode`
-//! tries this first on an NVIDIA host and falls back to VAAPI, mirroring the
-//! live `build_encoder` dispatch so the advertised capability set matches
-//! what the session encoder will actually pick.
+//! Only the encode half lives here. Decode on an NVIDIA host goes through
+//! `NvdecDecoder`, probed by [`super::nvdec::NvdecProbe`] (see
+//! `host::probe_decode`) — NOT VAAPI, whose `nvidia-vaapi-driver` decoder
+//! SIGSEGVs. `host::probe_encode` tries this first on an NVIDIA host and falls
+//! back to VAAPI, mirroring the live `build_encoder` dispatch so the advertised
+//! capability set matches what the session encoder will actually pick.
 //!
 //! The probe is a real round trip against the live driver, not a
 //! construction-only check: `NvencEncoder::new` opening the codec is not
@@ -25,12 +25,11 @@ use crate::PipelineStage;
 pub(crate) struct NvencProbe;
 
 // NvencProbe deliberately does NOT implement the `ProfileProbe` trait (unlike
-// VaapiProbe): it has only an encode half. Decode for an NVENC host goes
-// through `host::probe_decode` → VAAPI (there is no NVDEC path), so a
-// trait-required `probe_decode` here would be a never-called delegating stub —
-// the kind of dead code the project avoids. `host::probe_encode` calls the
-// inherent method directly. If an NVDEC path is ever added, wire it through
-// `host::probe_decode`, not a trait impl here.
+// VaapiProbe): it has only an encode half. Decode on an NVIDIA host is probed
+// by `NvdecProbe` (wired through `host::probe_decode`), so a trait-required
+// `probe_decode` here would be a never-called delegating stub — the kind of
+// dead code the project avoids. `host::probe_encode` calls the inherent method
+// directly.
 
 /// Probe canvas. 128×128 matches the VAAPI probe and the fixture dims, and
 /// satisfies HEVC's minimum-block constraint.

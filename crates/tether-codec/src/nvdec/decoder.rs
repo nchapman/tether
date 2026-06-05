@@ -24,6 +24,12 @@ use crate::{
 
 use super::surface_pool::{NvdecSurfacePool, PooledSurface};
 
+/// Upper bound on a decoded frame's width/height. NVDEC's HEVC hardware max is
+/// 8192; this caps the pool allocation an attacker-influenced bitstream can
+/// drive and keeps the surface pool's alignment arithmetic well clear of
+/// `u32` overflow.
+const MAX_DECODE_DIM: u32 = 8192;
+
 /// NVDEC-accelerated video decoder. Uses FFmpeg's generic `h264` / `hevc` /
 /// `av1` decoder with NVDEC hwaccel selected via `get_format` returning
 /// `AV_PIX_FMT_CUDA`. D2: decoded CUDA surfaces are EGL-imported into an NV12
@@ -176,6 +182,16 @@ impl NvdecDecoder {
     fn export_cuda_frame(&mut self, frame: &AVFrame) -> Result<Frame> {
         let w = frame.width as u32;
         let h = frame.height as u32;
+        // The decoded dimensions come from an attacker-influenced bitstream and
+        // drive a 4-surface VRAM allocation on every change. Cap them well above
+        // any real display (NVDEC's own hardware max is 8192 for HEVC) so a
+        // crafted stream of escalating SPS resolutions can't exhaust VRAM or
+        // overflow the pool's alignment arithmetic.
+        if w == 0 || h == 0 || w > MAX_DECODE_DIM || h > MAX_DECODE_DIM {
+            return Err(CodecError::NoHardwareCodec(format!(
+                "NVDEC: decoded dimensions {w}x{h} out of range (1..={MAX_DECODE_DIM})"
+            )));
+        }
         let pts_out = if frame.pts == ffi::AV_NOPTS_VALUE {
             None
         } else {
@@ -265,8 +281,16 @@ impl NvdecDecoder {
             surface.uv_pitch,
         );
 
+        // read_only = false: this is the decode path — we write decoded planes
+        // INTO the imported surface, so it must register read-write.
         let imported = importer
-            .import(self.cuda_ctx, &surface_dmabuf, surface.width, surface.height)
+            .import(
+                self.cuda_ctx,
+                &surface_dmabuf,
+                surface.width,
+                surface.height,
+                false,
+            )
             .map_err(CodecError::NoHardwareCodec)?;
 
         // Copy each NVDEC plane INTO the imported surface plane. NV12 8-bit:
@@ -506,7 +530,7 @@ mod tests {
         };
         let importer = nvffi::importer().expect("EGL/CUDA importer");
         let imported = importer
-            .import(cuda_ctx, dmabuf, w, h)
+            .import(cuda_ctx, dmabuf, w, h, true)
             .expect("re-import output surface");
         let mut y = vec![0u8; y_stride * h as usize];
         imported

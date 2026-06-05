@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use rsmpeg::ffi;
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
 
-use super::encoder::{nvenc_codec_name as test_codec_name, nvenc_sw_format as test_sw_format};
+use super::encoder::{
+    expected_nvenc_dmabuf_fourcc as test_dmabuf_fourcc, nvenc_codec_name as test_codec_name,
+    nvenc_sw_format as test_sw_format,
+};
 use super::{nvidia_gpu_present_in, NvencEncoder};
 use crate::Encoder;
 
@@ -34,6 +37,43 @@ fn sw_format_maps_exactly_the_advertised_profiles() {
     );
     assert!(test_sw_format(ChromaSubsampling::Yuv444, 8).is_err());
     assert!(test_sw_format(ChromaSubsampling::Yuv444, 10).is_err());
+}
+
+#[test]
+fn sw_format_and_dmabuf_fourcc_agree_on_supported_set() {
+    // `nvenc_sw_format` (the CUDA staging format) and
+    // `expected_nvenc_dmabuf_fourcc` (the surface fourcc `submit_dmabuf`
+    // validates) encode the same `(chroma, bit_depth)` relation from two
+    // angles. If they drift — one gains a profile the other lacks —
+    // `submit_dmabuf` would reject a fourcc the encoder accepts (or vice
+    // versa), silently breaking the zero-copy path. Assert they agree across
+    // the full grid, and that the fourcc matches the staging format byte-for-
+    // byte on the supported rows.
+    for chroma in [ChromaSubsampling::Yuv420, ChromaSubsampling::Yuv444] {
+        for bit_depth in [8, 10] {
+            let sw = test_sw_format(chroma, bit_depth);
+            let fourcc = test_dmabuf_fourcc(chroma, bit_depth);
+            assert_eq!(
+                sw.is_ok(),
+                fourcc.is_some(),
+                "{chroma:?} {bit_depth}-bit: sw_format supported={} but dmabuf fourcc present={}",
+                sw.is_ok(),
+                fourcc.is_some()
+            );
+            if let (Ok(sw_fmt), Some(fcc)) = (sw, fourcc) {
+                let expected_fcc = match sw_fmt {
+                    ffi::AV_PIX_FMT_NV12 => u32::from_le_bytes(*b"NV12"),
+                    ffi::AV_PIX_FMT_P010LE => u32::from_le_bytes(*b"P010"),
+                    other => panic!("unexpected sw_format {other} for {chroma:?} {bit_depth}-bit"),
+                };
+                assert_eq!(
+                    fcc, expected_fcc,
+                    "{chroma:?} {bit_depth}-bit: dmabuf fourcc 0x{fcc:08x} disagrees with \
+                     sw_format-derived 0x{expected_fcc:08x}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

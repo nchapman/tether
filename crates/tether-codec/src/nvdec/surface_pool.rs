@@ -74,12 +74,18 @@ struct SurfaceExport {
     uv_pitch: u64,
 }
 
-/// One pool slot: the surface's dma-buf export plus a free flag. The export
-/// keeps the backing `VkImage`s / `VkDeviceMemory` alive (so the fd stays
-/// valid); `free` is `true` when the slot can be acquired.
+/// One pool slot: the surface's dma-buf export, a free flag, and the shared
+/// `Arc<SurfaceBacking>` that keeps the surface's `VkImage`s / `VkDeviceMemory`
+/// alive (so the fd stays valid). `free` is `true` when the slot can be
+/// acquired.
 struct Slot {
     export: SurfaceExport,
     free: Arc<AtomicBool>,
+    /// The slot's Vulkan images/memory. Shared (via `Arc`) with any
+    /// `PooledSurface` handed out from this slot so the backing — and the
+    /// exported dma-buf fd that aliases it — outlives a pool rebuild that drops
+    /// the old pool while the renderer still holds the surface.
+    backing: Arc<SurfaceBacking>,
 }
 
 /// A fixed pool of NV12 dma-buf surfaces for the zero-copy NVDEC decoder.
@@ -88,11 +94,10 @@ struct Slot {
 /// [`Self::acquire`] hands out a free surface; the returned [`PooledSurface`]
 /// releases the slot on drop.
 pub struct NvdecSurfacePool {
-    /// Owns the Vulkan device/instance and all surface images + memory. Drops
-    /// last (declaration order) so the images/memory free before the device.
-    vk: Arc<VulkanDevice>,
-    /// Per-slot `VkImage`s + `VkDeviceMemory`, freed on pool drop.
-    images: Vec<SurfaceImages>,
+    /// Each slot's `SurfaceBacking` holds an `Arc<VulkanDevice>` clone, so the
+    /// device stays alive as long as any slot exists — and, because a
+    /// handed-out surface holds the same `Arc`, also as long as any surface
+    /// outlives a pool rebuild. The pool needs no separate device handle.
     slots: Vec<Slot>,
     width: u32,
     height: u32,
@@ -117,7 +122,6 @@ impl NvdecSurfacePool {
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let vk = Arc::new(VulkanDevice::new_nvidia()?);
 
-        let mut images = Vec::with_capacity(POOL_SIZE);
         let mut slots = Vec::with_capacity(POOL_SIZE);
         for i in 0..POOL_SIZE {
             let (surface_images, export) = vk.export_nv12_surface(width, height).map_err(|e| {
@@ -125,16 +129,17 @@ impl NvdecSurfacePool {
                     "NVDEC surface pool: NV12 surface {i} allocation failed: {e}"
                 ))
             })?;
-            images.push(surface_images);
             slots.push(Slot {
                 export,
                 free: Arc::new(AtomicBool::new(true)),
+                backing: Arc::new(SurfaceBacking {
+                    vk: vk.clone(),
+                    images: surface_images,
+                }),
             });
         }
 
         Ok(Self {
-            vk,
-            images,
             slots,
             width,
             height,
@@ -187,6 +192,10 @@ impl NvdecSurfacePool {
                     height: self.height,
                     release: SlotGuard {
                         free: slot.free.clone(),
+                        // Hold a backing ref so the images/memory (and the
+                        // exported fd this surface dup'd) outlive a pool rebuild
+                        // that drops the pool while this surface is still out.
+                        _backing: slot.backing.clone(),
                     },
                 });
             }
@@ -195,24 +204,36 @@ impl NvdecSurfacePool {
     }
 }
 
-impl Drop for NvdecSurfacePool {
+// No explicit `Drop` for the pool: each slot's `Arc<SurfaceBacking>` frees its
+// own images/memory when the last reference (the slot or a handed-out surface)
+// drops, and the `Arc<VulkanDevice>` inside each backing keeps the device alive
+// until then.
+
+/// Per-surface Vulkan resources, shared via `Arc` between the pool's slot and
+/// any handed-out [`PooledSurface`]. Freeing is deferred to the last `Arc`
+/// drop, so a pool rebuilt mid-frame can't free memory (or invalidate the
+/// exported dma-buf fd) out from under a surface the renderer still holds.
+struct SurfaceBacking {
+    /// Keeps the device alive until this backing's images/memory are freed.
+    vk: Arc<VulkanDevice>,
+    images: SurfaceImages,
+}
+
+impl Drop for SurfaceBacking {
     fn drop(&mut self) {
-        // Free every surface's images + memory before the device drops (the
-        // `Arc<VulkanDevice>` Drop destroys instance/device last).
-        // SAFETY: each handle was created on `self.vk.device`, owned uniquely
-        // by this pool, and is destroyed exactly once here.
+        // SAFETY: each handle was created on `self.vk.device` and is owned
+        // uniquely by this backing (the `Arc` guarantees exactly one `Drop`),
+        // so it is destroyed exactly once, before the device.
         unsafe {
             let device = &self.vk.device;
-            for img in &self.images {
-                device.destroy_image(img.uv_image, None);
-                device.destroy_image(img.y_image, None);
-                device.free_memory(img.memory, None);
-            }
+            device.destroy_image(self.images.uv_image, None);
+            device.destroy_image(self.images.y_image, None);
+            device.free_memory(self.images.memory, None);
         }
     }
 }
 
-/// Per-surface Vulkan resources kept alive for the pool's lifetime.
+/// Per-surface Vulkan handle triple owned by a [`SurfaceBacking`].
 struct SurfaceImages {
     y_image: vk::Image,
     uv_image: vk::Image,
@@ -224,6 +245,11 @@ struct SurfaceImages {
 /// frame.
 pub struct SlotGuard {
     free: Arc<AtomicBool>,
+    /// Keeps the surface's Vulkan images/memory (and the exported dma-buf fd
+    /// aliasing them) alive while the renderer holds this surface, even if the
+    /// pool was rebuilt and dropped in the meantime. Never read — its `Drop`
+    /// (via the shared `Arc`) does the work.
+    _backing: Arc<SurfaceBacking>,
 }
 
 impl Drop for SlotGuard {
@@ -323,11 +349,28 @@ impl VulkanDevice {
             ash::ext::external_memory_dma_buf::NAME.as_ptr(),
             ash::ext::image_drm_format_modifier::NAME.as_ptr(),
         ];
-        // One queue (graphics/transfer family 0) — required to create a device,
-        // unused otherwise (the pool allocates memory, runs no commands).
+        // vkCreateDevice requires one queue, but the pool runs no commands (it
+        // only allocates + exports memory), so any valid family works. Pick the
+        // first non-empty one rather than assuming family 0 exists — on NVIDIA
+        // family 0 is the universal graphics/transfer family, but the spec
+        // doesn't guarantee its index.
+        // SAFETY: `physical_device` is from `instance`.
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let queue_family_index = queue_families
+            .iter()
+            .position(|f| f.queue_count > 0)
+            .and_then(|i| u32::try_from(i).ok())
+            .ok_or_else(|| {
+                // SAFETY: instance is live and otherwise unreferenced.
+                unsafe { instance.destroy_instance(None) };
+                CodecError::NoHardwareCodec(
+                    "NVDEC surface pool: NVIDIA Vulkan device exposes no queue families".to_string(),
+                )
+            })?;
         let queue_priorities = [1.0_f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(0)
+            .queue_family_index(queue_family_index)
             .queue_priorities(&queue_priorities)];
         let device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
@@ -492,14 +535,29 @@ impl VulkanDevice {
                 // SAFETY: raw_fd is a freshly-returned open fd we own.
                 let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
-                // Confirm the driver picked LINEAR (we asked via a 1-element list).
+                // Confirm the driver picked LINEAR (we asked via a 1-element
+                // list) for BOTH images. The single SurfaceExport modifier and
+                // the EGL import assume Y and UV share one modifier; a driver
+                // that diverged would otherwise fail later inside eglCreateImage
+                // with an opaque error.
                 let mut y_mod_props = vk::ImageDrmFormatModifierPropertiesEXT::default();
-                // SAFETY: y_image is a live DRM-modifier image on `device`.
+                let mut uv_mod_props = vk::ImageDrmFormatModifierPropertiesEXT::default();
+                // SAFETY: both are live DRM-modifier images on `device`.
                 unsafe {
                     self.modifier_ext
                         .get_image_drm_format_modifier_properties(y_image, &mut y_mod_props)
+                        .map_err(|e| format!("vkGetImageDrmFormatModifierPropertiesEXT (Y): {e}"))?;
+                    self.modifier_ext
+                        .get_image_drm_format_modifier_properties(uv_image, &mut uv_mod_props)
+                        .map_err(|e| format!("vkGetImageDrmFormatModifierPropertiesEXT (UV): {e}"))?;
                 }
-                .map_err(|e| format!("vkGetImageDrmFormatModifierPropertiesEXT (Y): {e}"))?;
+                if y_mod_props.drm_format_modifier != uv_mod_props.drm_format_modifier {
+                    return Err(format!(
+                        "NV12 surface Y/UV modifiers differ (Y 0x{:x}, UV 0x{:x}); \
+                         single-modifier EGL import would fail",
+                        y_mod_props.drm_format_modifier, uv_mod_props.drm_format_modifier
+                    ));
+                }
 
                 // Per-plane subresource layouts give the row pitches. For a
                 // LINEAR single-plane image plane-0 sits at offset 0 of its
@@ -558,10 +616,10 @@ impl VulkanDevice {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
-        // SAFETY: all surface images/memory are freed by the pool's Drop
-        // (which runs first — the pool owns the `Arc<VulkanDevice>` and drops
-        // its `images`/`slots` before this Arc's last ref). Destroy device then
-        // instance, each exactly once.
+        // SAFETY: every surface's images/memory live in a `SurfaceBacking` that
+        // holds its own `Arc<VulkanDevice>` clone, so this `Drop` (the last Arc
+        // ref) runs only after all backings have freed their images/memory.
+        // Destroy device then instance, each exactly once.
         unsafe {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -591,5 +649,68 @@ fn find_memory_type(
 /// `tether_gpuconvert::dmabuf_export::align_up`.
 fn align_up(value: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two(), "align must be power of two");
-    (value + align - 1) & !(align - 1)
+    // saturating, not `value + align - 1`: a driver-reported size/alignment near
+    // u64::MAX would otherwise wrap in release. Capped dimensions keep real
+    // inputs far from this, but the saturating add removes the foot-gun.
+    value.saturating_add(align - 1) & !(align - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn align_up_is_saturating_and_correct() {
+        assert_eq!(align_up(0, 64), 0);
+        assert_eq!(align_up(1, 64), 64);
+        assert_eq!(align_up(64, 64), 64);
+        assert_eq!(align_up(65, 64), 128);
+        // Near-u64::MAX inputs saturate instead of wrapping to a small value:
+        // u64::MAX rounded down to a 64-multiple (the low 6 bits cleared).
+        assert_eq!(align_up(u64::MAX, 64), 0xFFFF_FFFF_FFFF_FFC0);
+    }
+
+    /// Exercise the pool's free-list contract on real hardware: every slot is
+    /// handed out exactly once, exhaustion returns `None`, and releasing a
+    /// surface (drop) returns its slot for reuse. Also sanity-checks the NV12
+    /// surface descriptor (LINEAR modifier, plane pitches ≥ width). `#[ignore]`
+    /// — needs an NVIDIA GPU + a Vulkan dma-buf device.
+    #[test]
+    #[ignore = "requires NVIDIA GPU + Vulkan dma-buf"]
+    fn acquire_exhausts_then_release_reuses_slots() {
+        let (w, h) = (256u32, 256u32);
+        let pool = NvdecSurfacePool::new(w, h).expect("NV12 surface pool");
+        assert_eq!(pool.dims(), (w, h));
+
+        // Drain every slot; each surface must be a well-formed NV12 descriptor.
+        let mut held: Vec<PooledSurface> = Vec::new();
+        for _ in 0..POOL_SIZE {
+            let s = pool.acquire().expect("a free slot while the pool is not exhausted");
+            assert_eq!((s.width, s.height), (w, h));
+            assert!(s.size > 0, "surface allocation has non-zero size");
+            // We asked for a 1-element LINEAR modifier list, so the driver must
+            // have picked LINEAR (0); a non-LINEAR modifier means the export
+            // assumptions are broken.
+            assert_eq!(s.modifier, 0, "NV12 surface must be DRM_FORMAT_MOD_LINEAR");
+            // Y row spans w bytes; UV row spans w bytes (w/2 CbCr pairs × 2).
+            // Alignment may make either larger, never smaller.
+            assert!(s.y_pitch >= u64::from(w), "Y pitch {} < width {w}", s.y_pitch);
+            assert!(s.uv_pitch >= u64::from(w), "UV pitch {} < width {w}", s.uv_pitch);
+            assert!(s.uv_offset >= s.y_offset + s.y_pitch * u64::from(h));
+            held.push(s);
+        }
+
+        // Pool is now exhausted.
+        assert!(
+            pool.acquire().is_none(),
+            "acquire must return None when every slot is in use"
+        );
+
+        // Release one surface; its slot must become acquirable again.
+        held.pop();
+        assert!(
+            pool.acquire().is_some(),
+            "dropping a surface must return its slot to the free list"
+        );
+    }
 }

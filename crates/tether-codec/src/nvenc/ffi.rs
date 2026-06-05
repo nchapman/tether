@@ -43,6 +43,12 @@ type CuResult = i32;
 /// `CUDA_SUCCESS`.
 const CUDA_SUCCESS: CuResult = 0;
 
+/// `CU_GRAPHICS_REGISTER_FLAGS_NONE` — read-write registration. The NVDEC
+/// decoder writes decoded planes INTO the imported surface, so it must
+/// register read-write; registering its write target read-only is
+/// semantically wrong (current drivers ignore the flag, but don't rely on it).
+const CU_GRAPHICS_REGISTER_FLAGS_NONE: u32 = 0x00;
+
 /// `CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY` — NVENC only reads the input
 /// surface, so register read-only to let the driver skip write-back
 /// bookkeeping.
@@ -409,6 +415,22 @@ pub(crate) struct ImportedCudaFrame {
     _guard: ImportGuard,
 }
 
+/// Reject a `cuMemcpy2D` operand whose row pitch is smaller than the copied
+/// row width. CUDA requires `width_in_bytes <= pitch` for every pitched
+/// (non-array) operand; a shorter pitch makes the driver overlap rows and
+/// overrun the allocation. On the decode path the source pitch derives from an
+/// attacker-influenced bitstream, so this turns a silent OOB GPU copy into a
+/// hard error.
+fn guard_copy_pitch(i: usize, pitch: usize, width_bytes: usize, which: &str) -> Result<(), String> {
+    if pitch < width_bytes {
+        return Err(format!(
+            "cuMemcpy2D(plane {i}): {which} pitch {pitch} < copy width {width_bytes}; \
+             refusing out-of-bounds device copy"
+        ));
+    }
+    Ok(())
+}
+
 impl ImportedCudaFrame {
     /// Number of imported planes (1 per dma-buf layer).
     pub(crate) fn plane_count(&self) -> usize {
@@ -430,6 +452,15 @@ impl ImportedCudaFrame {
     ) -> Result<(), String> {
         let plane = &self.planes[i];
         let src_is_array = !plane.array.is_null();
+        // cuMemcpy2D requires width_in_bytes <= each non-array operand's pitch;
+        // a smaller pitch makes the driver stack rows at overlapping offsets and
+        // overrun the operand. The destination pitch is caller-supplied; the
+        // source pitch is the driver-reported EGL pitch — guard both rather than
+        // trust the driver (a 0/short pitch on a malformed surface → OOB copy).
+        guard_copy_pitch(i, dst_pitch, width_bytes, "dst")?;
+        if !src_is_array {
+            guard_copy_pitch(i, plane.pitch, width_bytes, "src")?;
+        }
         let cpy = CudaMemcpy2D {
             src_x_in_bytes: 0,
             src_y: 0,
@@ -465,7 +496,10 @@ impl ImportedCudaFrame {
             }
             let rc = (self._guard.cuda.memcpy_2d)(&cpy);
             let mut popped: CuContext = std::ptr::null_mut();
-            (self._guard.cuda.ctx_pop_current)(&mut popped);
+            let pop_rc = (self._guard.cuda.ctx_pop_current)(&mut popped);
+            if pop_rc != CUDA_SUCCESS {
+                tracing::warn!(pop_rc, "cuCtxPopCurrent after copy_plane_into failed; CUDA context stack may be inconsistent");
+            }
             if rc != CUDA_SUCCESS {
                 return Err(format!("cuMemcpy2D(plane {i}) failed: {rc}"));
             }
@@ -493,6 +527,14 @@ impl ImportedCudaFrame {
     ) -> Result<(), String> {
         let plane = &self.planes[i];
         let dst_is_array = !plane.array.is_null();
+        // Same bounds invariant as copy_plane_into, mirrored: the source pitch
+        // here is the NVDEC frame's linesize (derived from a decoded — and thus
+        // attacker-influenced — bitstream), the destination is the EGL surface
+        // pitch. width_in_bytes must not exceed either, or cuMemcpy2D overruns.
+        guard_copy_pitch(i, src_pitch, width_bytes, "src")?;
+        if !dst_is_array {
+            guard_copy_pitch(i, plane.pitch, width_bytes, "dst")?;
+        }
         let cpy = CudaMemcpy2D {
             src_x_in_bytes: 0,
             src_y: 0,
@@ -529,7 +571,10 @@ impl ImportedCudaFrame {
             }
             let rc = (self._guard.cuda.memcpy_2d)(&cpy);
             let mut popped: CuContext = std::ptr::null_mut();
-            (self._guard.cuda.ctx_pop_current)(&mut popped);
+            let pop_rc = (self._guard.cuda.ctx_pop_current)(&mut popped);
+            if pop_rc != CUDA_SUCCESS {
+                tracing::warn!(pop_rc, "cuCtxPopCurrent after copy_plane_from failed; CUDA context stack may be inconsistent");
+            }
             if rc != CUDA_SUCCESS {
                 return Err(format!("cuMemcpy2D(into plane {i}) failed: {rc}"));
             }
@@ -584,7 +629,10 @@ impl ImportedCudaFrame {
             }
             let rc = (self._guard.cuda.memcpy_2d)(&cpy);
             let mut popped: CuContext = std::ptr::null_mut();
-            (self._guard.cuda.ctx_pop_current)(&mut popped);
+            let pop_rc = (self._guard.cuda.ctx_pop_current)(&mut popped);
+            if pop_rc != CUDA_SUCCESS {
+                tracing::warn!(pop_rc, "cuCtxPopCurrent after copy_plane_to_host failed; CUDA context stack may be inconsistent");
+            }
             if rc != CUDA_SUCCESS {
                 return Err(format!("cuMemcpy2D(plane {i} → host) failed: {rc}"));
             }
@@ -671,11 +719,15 @@ impl EglCudaImporter {
         })
     }
 
-    /// Import a capture DMA-BUF into CUDA, returning per-plane device
-    /// pointers wrapped in a guard that frees the EGL/CUDA resources on
-    /// drop. `cuda_ctx` must be the FFmpeg encoder's CUDA context (read
+    /// Import a DMA-BUF into CUDA, returning per-plane device pointers
+    /// wrapped in a guard that frees the EGL/CUDA resources on drop.
+    /// `cuda_ctx` must be the FFmpeg encoder/decoder's CUDA context (read
     /// from its `AVCUDADeviceContext`); `width`/`height` are the full
     /// luma dimensions.
+    ///
+    /// `read_only` selects the CUDA graphics register flags: `true` for the
+    /// NVENC encode path (the surface is only read), `false` for the NVDEC
+    /// decode path (decoded planes are written INTO the imported surface).
     ///
     /// Returns `Err(String)` (a human-readable diagnostic the caller maps
     /// to `NoHardwareCodec`) on any EGL/CUDA failure.
@@ -691,6 +743,7 @@ impl EglCudaImporter {
         frame: &DmaBufFrame,
         width: u32,
         height: u32,
+        read_only: bool,
     ) -> Result<ImportedCudaFrame, String> {
         if frame.objects.len() != 1 {
             return Err(format!(
@@ -764,15 +817,17 @@ impl EglCudaImporter {
         }
 
         let mut resource: CuGraphicsResource = std::ptr::null_mut();
-        // SAFETY: `image` is a live EGLImage from eglCreateImage above;
-        // READ_ONLY matches NVENC's read-only access. On success the resource
-        // is stored in the guard for later unregistration.
+        // SAFETY: `image` is a live EGLImage from eglCreateImage above. The
+        // encode path registers READ_ONLY (NVENC only reads); the decode path
+        // registers read-write (NONE) since it writes decoded planes in. On
+        // success the resource is stored in the guard for later unregistration.
+        let register_flags = if read_only {
+            CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY
+        } else {
+            CU_GRAPHICS_REGISTER_FLAGS_NONE
+        };
         let reg_rc = unsafe {
-            (self.cuda.graphics_egl_register_image)(
-                &mut resource,
-                image,
-                CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY,
-            )
+            (self.cuda.graphics_egl_register_image)(&mut resource, image, register_flags)
         };
         if reg_rc != CUDA_SUCCESS {
             // SAFETY: image is live and not yet handed to CUDA; free it.
@@ -855,16 +910,20 @@ impl EglCudaImporter {
     }
 }
 
-/// Build the `eglCreateImage` attribute list for one dma-buf plane.
+/// Build the `eglCreateImage` attribute list for the whole multi-plane
+/// dma-buf surface (one EGLImage, not one per plane).
 ///
-/// Factored out (and kept verbose) because the per-plane geometry is the
-/// most likely thing to need a hardware tweak: `width`/`height` here are
-/// the **subsampled plane** dimensions (see [`plane_dimensions`]) and
-/// `fourcc` is the per-plane DRM format (`R8`/`GR88` for NV12, `R16`/`RG32`
-/// for P010), not the surface fourcc.
+/// Factored out (and kept verbose) because the geometry is the most likely
+/// thing to need a hardware tweak: `width`/`height` are the **full luma
+/// surface** dimensions and `fourcc` is the **surface-level** DRM format
+/// (`NV12` for 8-bit 4:2:0, `P010` for 10-bit 4:2:0) passed via
+/// `EGL_LINUX_DRM_FOURCC_EXT`. Each `layers[i]` contributes one
+/// `EGL_DMA_BUF_PLANE{i}_*` triple (offset/pitch), all sharing the single
+/// object's `fd`. CUDA rejects a standalone single-channel plane image, so the
+/// surface must be imported whole.
 ///
 /// Mirrors Sunshine's `surface_descriptor_to_egl_attribs`
-/// (`graphics.cpp`): width, height, fourcc, then plane-0 fd/offset/pitch,
+/// (`graphics.cpp`): width, height, fourcc, then per-plane fd/offset/pitch,
 /// then the modifier lo/hi pair only when an explicit modifier is present,
 /// terminated by `EGL_NONE`. Every value widens losslessly into the
 /// `EGLAttrib` (intptr) list.

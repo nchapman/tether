@@ -313,7 +313,18 @@ impl Nv12DmaBuf {
     /// P010/XV30 bridges' `convert_bgra_bytes`, for test + probe contexts
     /// that hold CPU-resident pixels and don't want their own wgpu device.
     pub fn convert_bgra_bytes(&self, bgra: &[u8]) -> Result<Nv12DmaBufFrame> {
-        let expected = (self.width * self.height * 4) as usize;
+        // Checked, not `(w * h * 4) as usize`: the u32 product overflows
+        // (silently, in release) past ~32K×32K, yielding a too-small `expected`
+        // that would wave through an undersized buffer into `write_texture`.
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(Nv12DmaBufError::ByteLenMismatch {
+                got: bgra.len(),
+                expected: usize::MAX,
+                w: self.width,
+                h: self.height,
+            })?;
         if bgra.len() != expected {
             return Err(Nv12DmaBufError::ByteLenMismatch {
                 got: bgra.len(),

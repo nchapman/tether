@@ -409,7 +409,7 @@ impl NvencEncoder {
         // CUDA graphics resources; it must outlive `send_frame` + `drain`
         // so the device pointers stay mapped while NVENC reads them.
         let imported = importer
-            .import(self.cuda_ctx, frame, self.width, self.height)
+            .import(self.cuda_ctx, frame, self.width, self.height, true)
             .map_err(CodecError::NoHardwareCodec)?;
 
         // Allocate a destination frame from the encoder's own CUDA pool. It

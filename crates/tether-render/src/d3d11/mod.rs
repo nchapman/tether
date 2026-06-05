@@ -1399,6 +1399,36 @@ mod tests {
         d3d11_roundtrip(CodecKind::H264, 8, true, None);
     }
 
+    /// AV1 through the full av1_qsv encode → D3D11VA AV1 decode → native render
+    /// path, at 8-bit (NV12) and 10-bit (P010). AV1 carries its sequence header
+    /// in-band (no extradata), so this also guards that the in-band path stays
+    /// self-decodable through render. Needs an AV1-encode GPU (Intel Arc /
+    /// Lunar Lake+, AMD RDNA 3+, NVIDIA Ada); skips via the encoder's vendor
+    /// fallback otherwise.
+    #[test]
+    #[ignore = "requires AV1-encode QSV (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
+    fn d3d11_av1_coord_fixture_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(CodecKind::Av1, 8, false, None);
+    }
+
+    #[test]
+    #[ignore = "requires AV1-encode QSV (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
+    fn d3d11_av1_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(CodecKind::Av1, 8, true, None);
+    }
+
+    #[test]
+    #[ignore = "requires AV1-encode QSV 10-bit (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
+    fn d3d11_av1_coord_fixture_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(CodecKind::Av1, 10, false, None);
+    }
+
+    #[test]
+    #[ignore = "requires AV1-encode QSV 10-bit (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
+    fn d3d11_av1_colorbars_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(CodecKind::Av1, 10, true, None);
+    }
+
     /// `surface`: the render-target dims. `None` = identity (surface == video,
     /// the encode/decode/render measurement is pure). `Some(dims)` larger than
     /// the video drives the renderer's upscale + letterbox path.

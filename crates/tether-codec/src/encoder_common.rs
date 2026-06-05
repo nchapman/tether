@@ -111,9 +111,15 @@ pub(crate) fn snapshot_extradata(
         }
     };
     if extradata.is_empty() {
-        if inband_parameter_sets {
-            // Expected for Media Foundation: parameter sets ride in-band on
-            // every keyframe, so there is nothing to prepend.
+        // AV1 has no out-of-band parameter-set record in our raw-OBU wire
+        // format: every keyframe carries its sequence-header OBU in-band, so
+        // *no* AV1 encoder (qsv/amf/nvenc/mf) populates extradata and an empty
+        // snapshot is always expected — independent of the per-backend flag.
+        // (Verified for av1_mf by `d3d11_mf_keyframes_carry_inband_parameter_sets`
+        // and end-to-end by the AV1 encode→decode round-trips.)
+        if inband_parameter_sets || codec_kind == CodecKind::Av1 {
+            // Also expected for Media Foundation H.264/HEVC: parameter sets
+            // ride in-band on every keyframe, so there is nothing to prepend.
             tracing::debug!(
                 codec = codec_name,
                 "encoder leaves extradata empty; relying on in-band keyframe \

@@ -32,6 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use crate::control::VideoStreamId;
 use crate::MonoNanos;
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -140,7 +141,7 @@ pub struct InputEchoBatch {
 ///
 /// **Wire-additive policy:** `VideoFrameMeta` is a closed struct — adding a
 /// field would be a wire break. New per-frame metadata (HDR mastering
-/// display info, ROI hints, encoder QP feedback, etc.) must land as a new
+/// stream_id info, ROI hints, encoder QP feedback, etc.) must land as a new
 /// variant of [`VideoFrameMetaEnvelope`], which is the type that actually
 /// rides on the wire in [`VideoPacket::First`]. The receive side unwraps
 /// to a `VideoFrameMeta` for downstream consumers; new variants update
@@ -182,13 +183,13 @@ impl VideoFrameMetaEnvelope {
 
 /// A single video datagram. Frames larger than the transport's max datagram
 /// size are sliced into multiple packets sharing
-/// `(display, stream_epoch, frame_seq)`.
+/// `(stream_id, stream_epoch, frame_seq)`.
 ///
-/// `display` identifies which host display the frame came from. The
-/// current host always uses `display = 0` (single-monitor capture), but
+/// `stream_id` identifies which host stream_id the frame came from. The
+/// current host always uses `stream_id = 0` (single-monitor capture), but
 /// the field is present so multi-monitor support can land later as a
 /// pure additive change.
-/// Each display gets its own encoder thread and therefore its own
+/// Each stream_id gets its own encoder thread and therefore its own
 /// `stream_epoch` + `frame_seq` counters (cribbed from RustDesk's
 /// `video_threads: HashMap<usize, _>` pattern).
 ///
@@ -207,7 +208,7 @@ impl VideoFrameMetaEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoPacket {
     First {
-        display: u8,
+        stream_id: VideoStreamId,
         stream_epoch: u32,
         frame_seq: u32,
         /// Total primary (data) shards across all FEC blocks for this frame.
@@ -233,7 +234,7 @@ pub enum VideoPacket {
         payload: Bytes,
     },
     Continuation {
-        display: u8,
+        stream_id: VideoStreamId,
         stream_epoch: u32,
         frame_seq: u32,
         /// Global primary shard index, `1..fragment_count`.
@@ -248,7 +249,7 @@ pub enum VideoPacket {
     /// is replicated here so a lost `First` doesn't make the frame
     /// unrecoverable. Each parity payload is exactly `shard_size` bytes.
     Parity {
-        display: u8,
+        stream_id: VideoStreamId,
         stream_epoch: u32,
         frame_seq: u32,
         fragment_count: u16,
@@ -285,30 +286,30 @@ impl VideoPacket {
         crate::encode(self).map(|b| b.len()).unwrap_or(0)
     }
 
-    /// `(display, stream_epoch, frame_seq)` accessor common to all
+    /// `(stream_id, stream_epoch, frame_seq)` accessor common to all
     /// variants. Used by the reassembler to route packets without
     /// repeating the match in five places.
     #[must_use]
-    pub fn route_key(&self) -> (u8, u32, u32) {
+    pub fn route_key(&self) -> (VideoStreamId, u32, u32) {
         match self {
             Self::First {
-                display,
+                stream_id,
                 stream_epoch,
                 frame_seq,
                 ..
             }
             | Self::Continuation {
-                display,
+                stream_id,
                 stream_epoch,
                 frame_seq,
                 ..
             }
             | Self::Parity {
-                display,
+                stream_id,
                 stream_epoch,
                 frame_seq,
                 ..
-            } => (*display, *stream_epoch, *frame_seq),
+            } => (*stream_id, *stream_epoch, *frame_seq),
         }
     }
 }
@@ -381,12 +382,12 @@ pub const MAX_FRAME_BODY_BYTES: usize = MAX_FRAGMENTS_PER_FRAME * crate::MAX_DAT
 /// [`FrameReassembler`] buffers. The per-stream `max_age` window and the
 /// `max_pending_age` wall-clock timeout bound steady-state memory but not the
 /// *instantaneous* entry count: a peer that sends one fragment each for a flood
-/// of distinct `(display, stream_epoch, frame_seq)` keys — never completing any
+/// of distinct `(stream_id, stream_epoch, frame_seq)` keys — never completing any
 /// — accumulates entries faster than the prune can evict them, and each new
 /// entry's descriptor can pre-allocate up to [`MAX_FRAGMENTS_PER_FRAME`] shard
 /// slots. This cap bounds that worst case: once reached, fragments for *new*
 /// keys are dropped (frames already pending still complete). The legitimate
-/// working set is a few frames per active display (the `max_age` window), so
+/// working set is a few frames per active stream_id (the `max_age` window), so
 /// 256 is generous headroom.
 pub const MAX_PENDING_FRAMES: usize = 256;
 
@@ -447,7 +448,7 @@ fn compute_parity_count(primary: usize, fec_percentage: u8) -> usize {
 /// counter; bump `stream_epoch` via [`Self::bump_epoch`] whenever the
 /// underlying encoder is restarted.
 pub struct FrameFragmenter {
-    display: u8,
+    stream_id: VideoStreamId,
     stream_epoch: u32,
     next_frame_seq: u32,
     /// Parity ratio as a percentage of primary shards per FEC block. `0`
@@ -456,16 +457,16 @@ pub struct FrameFragmenter {
 }
 
 impl FrameFragmenter {
-    pub fn new(display: u8) -> Self {
-        Self::new_with_fec(display, 0)
+    pub fn new(stream_id: impl Into<VideoStreamId>) -> Self {
+        Self::new_with_fec(stream_id, 0)
     }
 
     /// Construct a fragmenter with the given parity ratio. `0` disables FEC;
     /// positive values emit additional `VideoPacket::Parity` packets after the
     /// primaries of each `fragment()` call.
-    pub fn new_with_fec(display: u8, fec_percentage: u8) -> Self {
+    pub fn new_with_fec(stream_id: impl Into<VideoStreamId>, fec_percentage: u8) -> Self {
         Self {
-            display,
+            stream_id: stream_id.into(),
             stream_epoch: 0,
             next_frame_seq: 0,
             fec_percentage,
@@ -478,8 +479,8 @@ impl FrameFragmenter {
         self.fec_percentage
     }
 
-    pub fn display(&self) -> u8 {
-        self.display
+    pub fn stream_id(&self) -> VideoStreamId {
+        self.stream_id
     }
 
     pub fn stream_epoch(&self) -> u32 {
@@ -548,7 +549,7 @@ impl FrameFragmenter {
         // Primaries: First (shard 0, carries meta) + Continuations.
         let first_end = shard_size.min(body_len);
         packets.push(VideoPacket::First {
-            display: self.display,
+            stream_id: self.stream_id,
             stream_epoch: self.stream_epoch,
             frame_seq,
             fragment_count,
@@ -563,7 +564,7 @@ impl FrameFragmenter {
         while offset < body_len {
             let end = (offset + shard_size).min(body_len);
             packets.push(VideoPacket::Continuation {
-                display: self.display,
+                stream_id: self.stream_id,
                 stream_epoch: self.stream_epoch,
                 frame_seq,
                 fragment_index: idx,
@@ -596,7 +597,7 @@ impl FrameFragmenter {
                 };
                 for (parity_index, payload) in parity_payloads.into_iter().enumerate() {
                     packets.push(VideoPacket::Parity {
-                        display: self.display,
+                        stream_id: self.stream_id,
                         stream_epoch: self.stream_epoch,
                         frame_seq,
                         fragment_count,
@@ -624,7 +625,7 @@ impl FrameFragmenter {
 #[must_use]
 fn header_overhead(envelope: &VideoFrameMetaEnvelope) -> usize {
     let first = VideoPacket::First {
-        display: u8::MAX,
+        stream_id: VideoStreamId(u32::MAX),
         stream_epoch: u32::MAX,
         frame_seq: u32::MAX,
         fragment_count: u16::MAX,
@@ -635,7 +636,7 @@ fn header_overhead(envelope: &VideoFrameMetaEnvelope) -> usize {
         payload: Bytes::new(),
     };
     let parity = VideoPacket::Parity {
-        display: u8::MAX,
+        stream_id: VideoStreamId(u32::MAX),
         stream_epoch: u32::MAX,
         frame_seq: u32::MAX,
         fragment_count: u16::MAX,
@@ -737,14 +738,14 @@ fn encode_block_parity(
 /// thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReassembledFrame {
-    pub display: u8,
+    pub stream_id: VideoStreamId,
     pub stream_epoch: u32,
     pub frame_seq: u32,
     pub meta: VideoFrameMeta,
     pub body: Bytes,
 }
 
-/// Buffers in-flight fragments by `(display, stream_epoch, frame_seq)`
+/// Buffers in-flight fragments by `(stream_id, stream_epoch, frame_seq)`
 /// and emits a [`ReassembledFrame`] when all primaries for a key have
 /// arrived (directly or via per-block RS recovery). Drops fragments
 /// belonging to frames more than `max_age` frames behind the latest seen on
@@ -776,8 +777,8 @@ pub struct FrameReassembler {
     fragments_lost: u64,
 }
 
-type FrameKey = (u8, u32, u32);
-type StreamKey = (u8, u32);
+type FrameKey = (VideoStreamId, u32, u32);
+type StreamKey = (VideoStreamId, u32);
 
 struct Pending {
     /// Total primary shards (`K`). `0` until a `First`/`Parity` sets the
@@ -905,8 +906,8 @@ impl FrameReassembler {
             return None;
         }
 
-        let (display, stream_epoch, frame_seq) = packet.route_key();
-        let stream_key = (display, stream_epoch);
+        let (stream_id, stream_epoch, frame_seq) = packet.route_key();
+        let stream_key = (stream_id, stream_epoch);
         let latest = *self
             .latest_seq
             .entry(stream_key)
@@ -914,10 +915,9 @@ impl FrameReassembler {
             .or_insert(frame_seq);
 
         if latest.saturating_sub(frame_seq) > self.max_age {
-            let display_id = display;
             tracing::trace!(
-                "dropping stale fragment: display={} epoch={} seq={} latest={}",
-                display_id,
+                "dropping stale fragment: stream_id={} epoch={} seq={} latest={}",
+                stream_id,
                 stream_epoch,
                 frame_seq,
                 latest
@@ -928,7 +928,7 @@ impl FrameReassembler {
 
         self.prune_old();
 
-        let key = (display, stream_epoch, frame_seq);
+        let key = (stream_id, stream_epoch, frame_seq);
         // Drop packets for a frame that's already finalized AND no longer has a
         // pending entry — the FEC late-parity case. Without this gate, the
         // trailing parity packets resurrect a ghost entry that prunes-as-
@@ -936,9 +936,8 @@ impl FrameReassembler {
         if !self.pending.contains_key(&key) {
             if let Some(&final_seq) = self.finalized_seq.get(&stream_key) {
                 if frame_seq <= final_seq {
-                    let display_id = display;
                     tracing::trace!(
-                        display_id,
+                        stream_id = %stream_id,
                         stream_epoch,
                         frame_seq,
                         final_seq,
@@ -1038,7 +1037,7 @@ impl FrameReassembler {
             && entry.received_count == entry.fragment_count
             && entry.meta.is_some()
         {
-            return self.finalize(key, display, stream_epoch, frame_seq);
+            return self.finalize(key, stream_id, stream_epoch, frame_seq);
         }
 
         // Recovery path: try to rebuild missing primaries from parity, per
@@ -1048,7 +1047,7 @@ impl FrameReassembler {
             && entry.meta.is_some()
             && self.try_recover(key)
         {
-            return self.finalize(key, display, stream_epoch, frame_seq);
+            return self.finalize(key, stream_id, stream_epoch, frame_seq);
         }
 
         None
@@ -1117,7 +1116,7 @@ impl FrameReassembler {
     fn finalize(
         &mut self,
         key: FrameKey,
-        display: u8,
+        stream_id: VideoStreamId,
         stream_epoch: u32,
         frame_seq: u32,
     ) -> Option<ReassembledFrame> {
@@ -1145,9 +1144,9 @@ impl FrameReassembler {
             buf.extend_from_slice(&shard[..take]);
         }
 
-        self.mark_finalized(display, stream_epoch, frame_seq);
+        self.mark_finalized(stream_id, stream_epoch, frame_seq);
         Some(ReassembledFrame {
-            display,
+            stream_id,
             stream_epoch,
             frame_seq,
             meta,
@@ -1156,10 +1155,10 @@ impl FrameReassembler {
     }
 
     /// Record `frame_seq` as the latest finalized frame on this
-    /// `(display, stream_epoch)` stream. Idempotent + monotonic.
-    fn mark_finalized(&mut self, display: u8, stream_epoch: u32, frame_seq: u32) {
+    /// `(stream_id, stream_epoch)` stream. Idempotent + monotonic.
+    fn mark_finalized(&mut self, stream_id: VideoStreamId, stream_epoch: u32, frame_seq: u32) {
         self.finalized_seq
-            .entry((display, stream_epoch))
+            .entry((stream_id, stream_epoch))
             .and_modify(|s| *s = (*s).max(frame_seq))
             .or_insert(frame_seq);
     }
@@ -1182,9 +1181,9 @@ impl FrameReassembler {
         self.frames_dropped = self.frames_dropped.saturating_add(pruned as u64);
 
         // Bound the per-stream watermark maps. Both would otherwise grow one
-        // entry per (display, stream_epoch) ever seen — a peer spamming an
+        // entry per (stream_id, stream_epoch) ever seen — a peer spamming an
         // incrementing stream_epoch could leak memory without bound. Keep only
-        // the newest epoch per display (the live stream for a legitimately
+        // the newest epoch per stream_id (the live stream for a legitimately
         // monotonic sender) plus any stream with a frame still pending;
         // everything else is a dead epoch whose late packets we no longer need
         // to recognize. Bounds both maps to O(pending), itself capped by the
@@ -1198,13 +1197,13 @@ impl FrameReassembler {
     }
 }
 
-/// Retain only the newest `stream_epoch` per display plus any stream still
+/// Retain only the newest `stream_epoch` per stream_id plus any stream still
 /// referenced by a pending frame; drop superseded (dead-epoch) entries.
 fn retain_live_streams(map: &mut HashMap<StreamKey, u32>, pending: &HashSet<StreamKey>) {
     if map.len() <= 1 {
         return;
     }
-    let mut newest: HashMap<u8, u32> = HashMap::new();
+    let mut newest: HashMap<VideoStreamId, u32> = HashMap::new();
     for &(d, e) in map.keys() {
         newest
             .entry(d)
@@ -1378,7 +1377,7 @@ mod validation_tests {
     #[test]
     fn validate_rejects_oversized_first_fragment_count() {
         let packet = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: u16::MAX,
@@ -1394,7 +1393,7 @@ mod validation_tests {
     #[test]
     fn validate_rejects_zero_fragment_count() {
         let packet = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: 0,
@@ -1410,7 +1409,7 @@ mod validation_tests {
     #[test]
     fn validate_rejects_oversized_continuation_index() {
         let packet = VideoPacket::Continuation {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_index: u16::MAX,
@@ -1424,7 +1423,7 @@ mod validation_tests {
         // Shard 0 is always the `First`; a Continuation claiming index 0 is
         // malformed and must be rejected before it reaches the reassembler.
         let packet = VideoPacket::Continuation {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_index: 0,
@@ -1436,7 +1435,7 @@ mod validation_tests {
     #[test]
     fn validate_rejects_oversized_shard_size() {
         let packet = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: 1,
@@ -1452,7 +1451,7 @@ mod validation_tests {
     #[test]
     fn validate_rejects_oversized_total_body_len() {
         let packet = VideoPacket::Parity {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: 1,
@@ -1471,7 +1470,7 @@ mod validation_tests {
     fn validate_rejects_total_body_len_above_shard_capacity() {
         // 2 shards × 1100 = 2200 capacity; 3000 can't fit.
         let packet = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: 2,
@@ -1487,7 +1486,7 @@ mod validation_tests {
     #[test]
     fn validate_accepts_legitimate_packets() {
         let first = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: 10,
@@ -1499,7 +1498,7 @@ mod validation_tests {
         };
         assert!(validate_packet_sizing(&first).is_none());
         let parity = VideoPacket::Parity {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: 10,
@@ -1519,7 +1518,7 @@ mod validation_tests {
         let mut reassembler = FrameReassembler::new();
         let (_, before) = reassembler.loss_counters();
         let crafted = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: u16::MAX,
@@ -1543,7 +1542,7 @@ mod validation_tests {
         let mut reassembler = FrameReassembler::new();
         for epoch in 0..1000u32 {
             let packet = VideoPacket::First {
-                display: 0,
+                stream_id: VideoStreamId(0),
                 stream_epoch: epoch,
                 frame_seq: 0,
                 fragment_count: 1,
@@ -1581,7 +1580,7 @@ mod validation_tests {
         let flood = u32::try_from(MAX_PENDING_FRAMES * 4).unwrap();
         for epoch in 0..flood {
             let packet = VideoPacket::First {
-                display: 0,
+                stream_id: VideoStreamId(0),
                 stream_epoch: epoch,
                 frame_seq: 0,
                 // Multi-shard so the lone First never completes the frame.
@@ -1617,7 +1616,7 @@ mod validation_tests {
     /// count when the descriptor arrives so a legitimate frame still completes.
     #[test]
     fn out_of_range_continuation_does_not_wedge_finalization() {
-        let mut fragmenter = FrameFragmenter::new_with_fec(0, 0); // primaries only
+        let mut fragmenter = FrameFragmenter::new_with_fec(0u8, 0); // primaries only
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: false,
@@ -1635,7 +1634,7 @@ mod validation_tests {
         // Inject a bogus out-of-range continuation for the same key BEFORE the
         // descriptor (First) arrives — stored optimistically at a high index.
         let bogus = VideoPacket::Continuation {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_index: 99,
@@ -1661,7 +1660,7 @@ mod validation_tests {
     /// client's recovery loop).
     #[test]
     fn late_parity_after_finalize_does_not_create_ghost_entry() {
-        let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+        let mut fragmenter = FrameFragmenter::new_with_fec(0u8, 20);
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: false,
@@ -1716,7 +1715,7 @@ mod validation_tests {
     /// malformed half is covered by `handle_rejected_packet_bumps_fragments_lost`.
     #[test]
     fn incomplete_frame_pruned_past_max_age_bumps_frames_dropped() {
-        let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+        let mut fragmenter = FrameFragmenter::new_with_fec(0u8, 20);
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: false,

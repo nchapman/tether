@@ -1,0 +1,372 @@
+syntax = "proto3";
+
+package tether.v1;
+
+message MonoNanos {
+  uint64 value = 1;
+}
+
+enum CodecKind {
+  CODEC_KIND_UNSPECIFIED = 0;
+  CODEC_KIND_H264 = 1;
+  CODEC_KIND_HEVC = 2;
+  CODEC_KIND_AV1 = 3;
+}
+
+enum ChromaSubsampling {
+  CHROMA_SUBSAMPLING_UNSPECIFIED = 0;
+  CHROMA_SUBSAMPLING_YUV420 = 1;
+  CHROMA_SUBSAMPLING_YUV444 = 2;
+}
+
+message VideoProfile {
+  CodecKind codec = 1;
+  ChromaSubsampling chroma = 2;
+  uint32 bit_depth = 3;
+}
+
+enum ColorRange {
+  COLOR_RANGE_UNSPECIFIED = 0;
+  COLOR_RANGE_LIMITED = 1;
+  COLOR_RANGE_FULL = 2;
+}
+
+enum ColorMatrix {
+  COLOR_MATRIX_UNSPECIFIED = 0;
+  COLOR_MATRIX_BT709 = 1;
+  COLOR_MATRIX_BT2020_NCL = 2;
+  COLOR_MATRIX_IDENTITY = 3;
+}
+
+enum ColorTransfer {
+  COLOR_TRANSFER_UNSPECIFIED = 0;
+  COLOR_TRANSFER_BT709 = 1;
+  COLOR_TRANSFER_SRGB = 2;
+  COLOR_TRANSFER_PQ = 3;
+  COLOR_TRANSFER_HLG = 4;
+  COLOR_TRANSFER_LINEAR = 5;
+}
+
+enum ColorPrimaries {
+  COLOR_PRIMARIES_UNSPECIFIED = 0;
+  COLOR_PRIMARIES_BT709 = 1;
+  COLOR_PRIMARIES_BT2020 = 2;
+}
+
+message VideoColorSpec {
+  ColorMatrix matrix = 1;
+  ColorRange range = 2;
+  ColorTransfer transfer = 3;
+  ColorPrimaries primaries = 4;
+}
+
+enum PixelFormat {
+  PIXEL_FORMAT_UNSPECIFIED = 0;
+  PIXEL_FORMAT_BGRA8 = 1;
+  PIXEL_FORMAT_NV12 = 2;
+  PIXEL_FORMAT_P010 = 3;
+  PIXEL_FORMAT_YUV444P = 4;
+  PIXEL_FORMAT_P410 = 5;
+}
+
+message Viewport {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+message DisplayMode {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 refresh_millihz = 3;
+}
+
+message DisplayDescriptor {
+  uint32 id = 1;
+  string name = 2;
+  int32 position_x = 3;
+  int32 position_y = 4;
+  uint32 scale_num = 5;
+  uint32 scale_den = 6;
+  bool primary = 7;
+  DisplayMode current_mode = 8;
+  repeated DisplayMode available_modes = 9;
+  bool can_set_mode = 10;
+}
+
+message FeatureAdvert {
+  string key = 1;
+  uint32 min_version = 2;
+  uint32 max_version = 3;
+  bytes payload = 4;
+}
+
+message FeatureAccept {
+  string key = 1;
+  uint32 version = 2;
+  bytes payload = 3;
+}
+
+message ExtensionMessage {
+  string key = 1;
+  uint32 version = 2;
+  uint64 request_id = 3;
+  uint64 reply_to = 4;
+  bytes payload = 5;
+}
+
+message InputCapabilities {
+  bool keyboard = 1;
+  bool mouse = 2;
+  bool relative_mouse = 3;
+  bool text = 4;
+}
+
+message AudioConfig {
+  uint32 sample_rate_hz = 1;
+  uint32 channels = 2;
+  uint32 streams = 3;
+  uint32 coupled_streams = 4;
+  bytes channel_mapping = 5;
+}
+
+message NegotiatedVideo {
+  uint32 stream_id = 1;
+  uint32 display_id = 2;
+  VideoProfile profile = 3;
+  PixelFormat pixel_format = 4;
+  VideoColorSpec color_space = 5;
+}
+
+message ClientHello {
+  string client_name = 1;
+  repeated VideoProfile decode_profiles = 2;
+  Viewport initial_viewport = 3;
+  InputCapabilities input_capabilities = 4;
+  repeated FeatureAdvert requested_features = 5;
+}
+
+message ServerHello {
+  string server_name = 1;
+  NegotiatedVideo video = 2;
+  AudioConfig audio = 3;
+  repeated DisplayDescriptor displays = 4;
+  repeated FeatureAccept accepted_features = 5;
+}
+
+message HandshakeFailure {
+  GoodbyeCode code = 1;
+  string reason = 2;
+}
+
+message ServerHandshake {
+  oneof kind {
+    ServerHello accepted = 100;
+    HandshakeFailure rejected = 101;
+  }
+}
+
+enum GoodbyeCode {
+  GOODBYE_CODE_UNSPECIFIED = 0;
+  GOODBYE_CODE_CLEAN = 1;
+  GOODBYE_CODE_PROTOCOL_ERROR = 2;
+  GOODBYE_CODE_UNSUPPORTED_VERSION = 3;
+  GOODBYE_CODE_INTERNAL_ERROR = 4;
+}
+
+enum CursorMode {
+  CURSOR_MODE_UNSPECIFIED = 0;
+  CURSOR_MODE_ABSOLUTE = 1;
+  CURSOR_MODE_RELATIVE = 2;
+}
+
+enum CursorPixelFormat {
+  CURSOR_PIXEL_FORMAT_UNSPECIFIED = 0;
+  CURSOR_PIXEL_FORMAT_RGBA8 = 1;
+}
+
+message CursorShape {
+  uint64 id = 1;
+  uint32 hotspot_x = 2;
+  uint32 hotspot_y = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  CursorPixelFormat format = 6;
+  bytes pixels = 7;
+}
+
+message ClockProbe {
+  MonoNanos t0_sender = 1;
+  MonoNanos t1_receiver_recv = 2;
+  MonoNanos t2_receiver_send = 3;
+}
+
+message SetDisplayMode {
+  uint64 request_id = 1;
+  uint32 display_id = 2;
+  DisplayMode mode = 3;
+  bool restore_on_disconnect = 4;
+}
+
+enum DisplayModeStatus {
+  DISPLAY_MODE_STATUS_UNSPECIFIED = 0;
+  DISPLAY_MODE_STATUS_APPLIED = 1;
+  DISPLAY_MODE_STATUS_UNSUPPORTED = 2;
+  DISPLAY_MODE_STATUS_INVALID_MODE = 3;
+  DISPLAY_MODE_STATUS_PERMISSION_DENIED = 4;
+  DISPLAY_MODE_STATUS_FAILED = 5;
+}
+
+message DisplayModeResult {
+  uint64 request_id = 1;
+  uint32 display_id = 2;
+  DisplayModeStatus status = 3;
+  DisplayMode actual_mode = 4;
+}
+
+message ControlMessage {
+  oneof kind {
+    Empty force_idr = 1;
+    RequestRecovery request_recovery = 2;
+    ClockProbeRequest clock_probe_request = 3;
+    ClockProbe clock_probe_response = 4;
+    Goodbye goodbye = 5;
+    ExtensionMessage extension = 6;
+    CursorShape cursor_shape = 7;
+    CursorUseShape cursor_use_shape = 8;
+    DisplayList display_list = 9;
+    SetActiveDisplays set_active_displays = 10;
+    StreamReady stream_ready = 11;
+    StreamPause stream_pause = 12;
+    StreamResume stream_resume = 13;
+    ClientStats client_stats = 14;
+    SetCursorMode set_cursor_mode = 15;
+    SetViewportHint set_viewport_hint = 16;
+    SetDisplayMode set_display_mode = 17;
+    DisplayModeResult display_mode_result = 18;
+  }
+}
+
+message Empty {}
+
+message RequestRecovery {
+  uint32 last_reassembled_frame_id = 1;
+}
+
+message ClockProbeRequest {
+  MonoNanos t0_sender = 1;
+}
+
+message Goodbye {
+  string reason = 1;
+  GoodbyeCode code = 2;
+}
+
+message CursorUseShape {
+  uint64 id = 1;
+}
+
+message DisplayList {
+  repeated DisplayDescriptor displays = 1;
+}
+
+message SetActiveDisplays {
+  repeated uint32 displays = 1;
+}
+
+message StreamReady {
+  bool video = 1;
+  bool audio = 2;
+}
+
+message StreamPause {
+  uint32 stream_id = 1;
+}
+
+message StreamResume {
+  uint32 stream_id = 1;
+}
+
+message ClientStats {
+  uint32 interval_ms = 1;
+  uint32 frames_received = 2;
+  uint32 frames_dropped = 3;
+  uint32 fragments_lost = 4;
+  uint32 rtt_ewma_us = 5;
+}
+
+message SetCursorMode {
+  CursorMode mode = 1;
+}
+
+message SetViewportHint {
+  uint32 stream_id = 1;
+  Viewport viewport = 2;
+}
+
+message HidUsage {
+  uint32 value = 1;
+}
+
+message Modifiers {
+  bool shift = 1;
+  bool ctrl = 2;
+  bool alt = 3;
+  bool meta = 4;
+}
+
+enum MouseButton {
+  MOUSE_BUTTON_UNSPECIFIED = 0;
+  MOUSE_BUTTON_LEFT = 1;
+  MOUSE_BUTTON_RIGHT = 2;
+  MOUSE_BUTTON_MIDDLE = 3;
+  MOUSE_BUTTON_X1 = 4;
+  MOUSE_BUTTON_X2 = 5;
+}
+
+enum ScrollKind {
+  SCROLL_KIND_UNSPECIFIED = 0;
+  SCROLL_KIND_LINE = 1;
+  SCROLL_KIND_PIXEL = 2;
+}
+
+message InputEvent {
+  uint64 event_id = 1;
+  MonoNanos t_client = 2;
+  uint32 device_id = 3;
+  oneof kind {
+    KeyEvent key_down = 4;
+    KeyEvent key_up = 5;
+    TextInput text = 6;
+    MouseButtonEvent mouse_button = 7;
+    MouseScroll mouse_scroll = 8;
+    RelativeMouseMove relative_mouse_move = 9;
+  }
+}
+
+message KeyEvent {
+  HidUsage key = 1;
+  Modifiers modifiers = 2;
+}
+
+message TextInput {
+  string utf8 = 1;
+}
+
+message MouseButtonEvent {
+  MouseButton button = 1;
+  bool pressed = 2;
+  Modifiers modifiers = 3;
+}
+
+message MouseScroll {
+  float dx = 1;
+  float dy = 2;
+  ScrollKind kind = 3;
+  Modifiers modifiers = 4;
+}
+
+message RelativeMouseMove {
+  sint32 dx = 1;
+  sint32 dy = 2;
+  Modifiers modifiers = 3;
+}

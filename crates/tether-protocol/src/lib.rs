@@ -24,6 +24,10 @@ pub use guard::GpuResourceGuard;
 
 use serde::{Deserialize, Serialize};
 
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/tether.v1.rs"));
+}
+
 /// Conservative QUIC datagram budget — the upper bound on encoded
 /// [`video::VideoPacket`] size we target. The actual `max_datagram_size`
 /// reported by quinn at runtime may be larger; we slice frames to this size
@@ -114,6 +118,10 @@ pub enum CodecError {
     Encode(#[from] bincode::error::EncodeError),
     #[error("decode: {0}")]
     Decode(#[from] bincode::error::DecodeError),
+    #[error("prost decode: {0}")]
+    ProstDecode(#[from] prost::DecodeError),
+    #[error("wire: {0}")]
+    Wire(&'static str),
 }
 
 // bincode (over postcard / rkyv / prost) because: we control both endpoints
@@ -154,6 +162,19 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecErro
 /// datagram, so a forged length prefix can't trigger an out-of-memory abort.
 pub fn decode_datagram<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> {
     decode_with_config(bytes, datagram_config())
+}
+
+pub trait ReliableMessage: Sized {
+    fn encode_reliable(&self) -> Vec<u8>;
+    fn decode_reliable(bytes: &[u8]) -> Result<Self, CodecError>;
+}
+
+pub fn encode_reliable<T: ReliableMessage>(value: &T) -> Result<Vec<u8>, CodecError> {
+    Ok(value.encode_reliable())
+}
+
+pub fn decode_reliable<T: ReliableMessage>(bytes: &[u8]) -> Result<T, CodecError> {
+    T::decode_reliable(bytes)
 }
 
 // Remaining untrusted-allocation surface after datagrams are bounded:
@@ -236,7 +257,7 @@ mod tests {
     fn every_fragment_fits_the_datagram_budget_under_input_echo() {
         for budget in [1200usize, 1280, 1100] {
             for echo in [0usize, 8, 16, 64, 256] {
-                let mut frag = FrameFragmenter::new_with_fec(0, 20);
+                let mut frag = FrameFragmenter::new_with_fec(0u8, 20);
                 let meta = VideoFrameMeta {
                     timing: HostFrameTiming {
                         t_capture_kernel: MonoNanos(u64::MAX / 2),
@@ -398,116 +419,168 @@ mod tests {
 
     #[test]
     fn round_trip_client_hello() {
-        let body = ClientHelloV1 {
+        let hello = ClientHello {
             client_name: "tether-client/0.0.1".into(),
-            preferred_codecs: vec![CodecKind::H264, CodecKind::Hevc],
-            max_resolution: Some((3840, 2160)),
-            viewport: Some(crate::control::Viewport::new(1280, 720)),
-            clock_probe_t0: MonoNanos(123_456_789),
-            extensions: Default::default(),
-            resume_token: None,
+            decode_profiles: vec![VideoProfile::H264_8BIT_420, VideoProfile::HEVC_8BIT_420],
+            initial_viewport: Some(crate::control::Viewport::new(1280, 720)),
+            input_capabilities: InputCapabilities::default(),
+            requested_features: vec![],
         };
-        let h = ClientHello::V1(body.clone());
-        let bytes = encode(&h).unwrap();
-        let h2: ClientHello = decode(&bytes).unwrap();
-        let ClientHello::V1(body2) = h2;
-        assert_eq!(body.client_name, body2.client_name);
-        assert_eq!(body.preferred_codecs, body2.preferred_codecs);
-        assert_eq!(body.max_resolution, body2.max_resolution);
-        assert_eq!(body.viewport, body2.viewport);
-        assert_eq!(body.clock_probe_t0, body2.clock_probe_t0);
-        assert!(body2.extensions.is_empty());
-        assert!(body2.resume_token.is_none());
+        let bytes = encode_reliable(&hello).unwrap();
+        let decoded: ClientHello = decode_reliable(&bytes).unwrap();
+        assert_eq!(decoded, hello);
     }
 
     #[test]
-    fn client_hello_extensions_round_trip() {
-        // Extensions populated round-trip identically. This is the
-        // forward-compat probe: a future feature opt-in lands here.
-        let mut extensions = std::collections::BTreeMap::new();
-        extensions.insert("av1-preferred".to_string(), vec![1u8]);
-        extensions.insert("adaptive-bitrate-hint".to_string(), vec![0u8, 0, 64, 0]);
-        let body = ClientHelloV1 {
+    fn client_hello_feature_adverts_round_trip() {
+        let features = vec![
+            FeatureAdvert {
+                key: "tether.clipboard".to_string(),
+                min_version: 1,
+                max_version: 2,
+                payload: vec![1],
+            },
+            FeatureAdvert {
+                key: "tether.gamepad".to_string(),
+                min_version: 1,
+                max_version: 1,
+                payload: vec![0, 64],
+            },
+        ];
+        let hello = ClientHello {
             client_name: "x".into(),
-            preferred_codecs: vec![CodecKind::H264],
-            max_resolution: None,
-            viewport: None,
-            clock_probe_t0: MonoNanos(1),
-            extensions: extensions.clone(),
-            resume_token: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            decode_profiles: vec![VideoProfile::H264_8BIT_420],
+            initial_viewport: None,
+            input_capabilities: InputCapabilities::default(),
+            requested_features: features.clone(),
         };
-        let bytes = encode(&ClientHello::V1(body)).unwrap();
-        let ClientHello::V1(body2) = decode::<ClientHello>(&bytes).unwrap();
-        assert_eq!(body2.extensions, extensions);
-        assert_eq!(body2.resume_token, Some(vec![0xde, 0xad, 0xbe, 0xef]));
+        let decoded: ClientHello = decode_reliable(&encode_reliable(&hello).unwrap()).unwrap();
+        assert_eq!(decoded.requested_features, features);
     }
 
     #[test]
     fn round_trip_server_hello_hevc() {
-        // Codec negotiation lands HEVC: client advertised [Hevc, H264],
-        // host probed and picked Hevc, echoes back in chosen_codec.
-        // Round-tripping confirms the host's selection survives the wire.
-        use crate::control::{ChromaSubsampling, ServerHello, ServerHelloV1, VideoColorSpec};
-        let body = ServerHelloV1 {
+        use crate::control::{ServerHello, VideoColorSpec};
+        let mode = DisplayMode::new(1920, 1080, 60_000);
+        let hello = ServerHello {
             server_name: "tether-host".into(),
-            chosen_codec: CodecKind::Hevc,
-            chosen_chroma: ChromaSubsampling::Yuv420,
-            color_space: VideoColorSpec::sdr_desktop(),
-            resolution: (1920, 1080),
-            clock_probe_t0_echo: MonoNanos(42),
-            t1_server_recv: MonoNanos(43),
-            t2_server_send: MonoNanos(44),
-            extensions: Default::default(),
-            resume_token: None,
+            video: NegotiatedVideo {
+                stream_id: VideoStreamId(0),
+                display_id: DisplayId(0),
+                profile: VideoProfile::HEVC_8BIT_420,
+                pixel_format: PixelFormat::Nv12,
+                color_space: VideoColorSpec::sdr_desktop(),
+            },
+            audio: Some(crate::audio::AudioConfig {
+                sample_rate_hz: 48_000,
+                channels: 2,
+                streams: 1,
+                coupled_streams: 1,
+                channel_mapping: vec![0, 1],
+            }),
+            displays: vec![DisplayDescriptor {
+                id: DisplayId(0),
+                name: "DP-1".into(),
+                scale_num: 1,
+                scale_den: 1,
+                primary: true,
+                position: (0, 0),
+                current_mode: mode,
+                available_modes: vec![mode],
+                can_set_mode: true,
+            }],
+            accepted_features: vec![FeatureAccept {
+                key: "tether.clipboard".to_string(),
+                version: 1,
+                payload: vec![1],
+            }],
         };
-        let h = ServerHello::V1(body.clone());
-        let bytes = encode(&h).unwrap();
-        let h2: ServerHello = decode(&bytes).unwrap();
-        let ServerHello::V1(body2) = h2;
-        assert_eq!(body2.chosen_codec, CodecKind::Hevc);
-        assert_eq!(body2.server_name, body.server_name);
-        assert_eq!(body2.resolution, body.resolution);
+        let decoded: ServerHello = decode_reliable(&encode_reliable(&hello).unwrap()).unwrap();
+        assert_eq!(decoded, hello);
     }
 
     #[test]
-    fn trailing_bytes_fail_decode() {
-        // Strict-decode is the forcing function for the "no appended
-        // fields" forward-compat policy: a future encoder that appends
-        // a field to ClientHelloV1 (forbidden — see control.rs module
-        // doc) would produce a wire payload that decodes one extra
-        // byte past where this build's schema thinks the message ends.
-        // We surface that as a decode error rather than silently
-        // truncating.
-        let body = ClientHelloV1 {
+    fn round_trip_server_handshake_rejection() {
+        let rejection = ServerHandshake::Rejected(HandshakeFailure {
+            code: GoodbyeCode::InternalError,
+            reason: "no mutual profile".into(),
+        });
+        let decoded: ServerHandshake =
+            decode_reliable(&encode_reliable(&rejection).unwrap()).unwrap();
+        assert_eq!(decoded, rejection);
+    }
+
+    #[test]
+    fn prost_unknown_client_hello_field_is_skipped() {
+        let hello = ClientHello {
             client_name: "x".into(),
-            preferred_codecs: vec![CodecKind::H264],
-            max_resolution: None,
-            viewport: None,
-            clock_probe_t0: MonoNanos(0),
-            extensions: Default::default(),
-            resume_token: None,
+            decode_profiles: vec![VideoProfile::H264_8BIT_420],
+            initial_viewport: None,
+            input_capabilities: InputCapabilities::default(),
+            requested_features: vec![],
         };
-        let mut bytes = encode(&ClientHello::V1(body)).unwrap();
-        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
-        let result = decode::<ClientHello>(&bytes);
-        assert!(
-            result.is_err(),
-            "trailing bytes after a valid message must fail decode"
-        );
+        let mut bytes = encode_reliable(&hello).unwrap();
+        // field 99, wire type 2 (length-delimited), length 3, payload "new".
+        bytes.extend_from_slice(&[0x9A, 0x06, 0x03, b'n', b'e', b'w']);
+        let decoded: ClientHello = decode_reliable(&bytes).unwrap();
+        assert_eq!(decoded, hello);
     }
 
     #[test]
-    fn round_trip_set_client_viewport() {
+    fn client_hello_skips_unknown_advertised_profiles() {
+        use prost::Message as _;
+        let wire = pb::ClientHello {
+            client_name: "future-client".into(),
+            decode_profiles: vec![
+                pb::VideoProfile {
+                    codec: 99,
+                    chroma: 1,
+                    bit_depth: 8,
+                },
+                pb::VideoProfile {
+                    codec: 1,
+                    chroma: 77,
+                    bit_depth: 8,
+                },
+                pb::VideoProfile {
+                    codec: 2,
+                    chroma: 1,
+                    bit_depth: 10,
+                },
+            ],
+            initial_viewport: None,
+            input_capabilities: Some(pb::InputCapabilities {
+                keyboard: true,
+                mouse: true,
+                relative_mouse: true,
+                text: true,
+            }),
+            requested_features: vec![],
+        }
+        .encode_to_vec();
+        let decoded: ClientHello = decode_reliable(&wire).unwrap();
+        assert_eq!(decoded.decode_profiles, vec![VideoProfile::HEVC_10BIT_420]);
+    }
+
+    #[test]
+    fn round_trip_set_viewport_hint() {
         use crate::control::{ControlMessage, Viewport};
-        let msg = ControlMessage::SetClientViewport(Viewport::new(1280, 800));
-        let bytes = encode(&msg).unwrap();
-        let msg2: ControlMessage = decode(&bytes).unwrap();
+        let msg = ControlMessage::SetViewportHint {
+            stream_id: VideoStreamId(2),
+            viewport: Viewport::new(1280, 800),
+        };
+        let bytes = encode_reliable(&msg).unwrap();
+        let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
         match msg2 {
-            ControlMessage::SetClientViewport(v) => {
+            ControlMessage::SetViewportHint {
+                stream_id,
+                viewport: v,
+            } => {
+                assert_eq!(stream_id, VideoStreamId(2));
                 assert_eq!(v.width, 1280);
                 assert_eq!(v.height, 800);
             }
-            other => panic!("expected SetClientViewport, got {other:?}"),
+            other => panic!("expected SetViewportHint, got {other:?}"),
         }
     }
 
@@ -518,20 +591,6 @@ mod tests {
         assert!(!Viewport::new(0, 1).is_valid());
         assert!(!Viewport::new(1, 0).is_valid());
         assert!(!Viewport::new(0, 0).is_valid());
-    }
-
-    #[test]
-    fn unknown_client_hello_variant_fails_decode() {
-        // Hand-craft bytes for a hypothetical V2: discriminator byte
-        // claiming variant 1 (V1 is 0). This pins the forward-compat
-        // story: an older receiver decoding a newer variant must error
-        // cleanly, not silently misinterpret the body bytes.
-        let bytes = [1u8, 0, 0, 0, 0];
-        let result = decode::<ClientHello>(&bytes);
-        assert!(
-            result.is_err(),
-            "unknown ClientHello variant must fail decode, not silently succeed"
-        );
     }
 
     #[test]
@@ -546,8 +605,8 @@ mod tests {
             format: CursorPixelFormat::Rgba8,
             pixels: vec![0xABu8; 16 * 16 * 4],
         };
-        let bytes = encode(&msg).unwrap();
-        let msg2: ControlMessage = decode(&bytes).unwrap();
+        let bytes = encode_reliable(&msg).unwrap();
+        let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
         match msg2 {
             ControlMessage::CursorShape {
                 id,
@@ -571,8 +630,8 @@ mod tests {
     #[test]
     fn round_trip_cursor_use_shape_control() {
         let msg = ControlMessage::CursorUseShape { id: 7 };
-        let bytes = encode(&msg).unwrap();
-        let msg2: ControlMessage = decode(&bytes).unwrap();
+        let bytes = encode_reliable(&msg).unwrap();
+        let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
         match msg2 {
             ControlMessage::CursorUseShape { id } => assert_eq!(id, 7),
             _ => panic!("wrong variant"),
@@ -584,35 +643,37 @@ mod tests {
         // Multi-entry exercises the Vec<DisplayDescriptor> serde shape
         // even though the host today always emits a one-element list.
         use crate::control::DisplayDescriptor;
+        let primary_mode = DisplayMode::new(3840, 2160, 60_000);
+        let secondary_mode = DisplayMode::new(1920, 1080, 59_940);
         let displays = vec![
             DisplayDescriptor {
-                id: 0,
+                id: DisplayId(0),
                 name: "DP-1".into(),
-                width: 3840,
-                height: 2160,
-                refresh_mhz: 60_000,
                 scale_num: 2,
                 scale_den: 1,
                 primary: true,
                 position: (0, 0),
+                current_mode: primary_mode,
+                available_modes: vec![primary_mode],
+                can_set_mode: true,
             },
             DisplayDescriptor {
-                id: 1,
+                id: DisplayId(1),
                 name: "HDMI-A-2".into(),
-                width: 1920,
-                height: 1080,
-                refresh_mhz: 59_940,
                 scale_num: 1,
                 scale_den: 1,
                 primary: false,
                 position: (3840, 0),
+                current_mode: secondary_mode,
+                available_modes: vec![secondary_mode],
+                can_set_mode: false,
             },
         ];
         let msg = ControlMessage::DisplayList {
             displays: displays.clone(),
         };
-        let bytes = encode(&msg).unwrap();
-        let msg2: ControlMessage = decode(&bytes).unwrap();
+        let bytes = encode_reliable(&msg).unwrap();
+        let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
         match msg2 {
             ControlMessage::DisplayList { displays: d2 } => assert_eq!(d2, displays),
             _ => panic!("wrong variant"),
@@ -622,67 +683,46 @@ mod tests {
     #[test]
     fn round_trip_set_active_displays() {
         let msg = ControlMessage::SetActiveDisplays {
-            displays: vec![0, 2, 5],
+            displays: vec![DisplayId(0), DisplayId(2), DisplayId(5)],
         };
-        let bytes = encode(&msg).unwrap();
-        let msg2: ControlMessage = decode(&bytes).unwrap();
+        let bytes = encode_reliable(&msg).unwrap();
+        let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
         match msg2 {
             ControlMessage::SetActiveDisplays { displays } => {
-                assert_eq!(displays, vec![0, 2, 5]);
+                assert_eq!(displays, vec![DisplayId(0), DisplayId(2), DisplayId(5)]);
             }
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn pixel_format_extension_round_trips() {
-        use crate::control::{PixelFormat, PIXEL_FORMAT_EXTENSION_KEY};
+    fn round_trip_display_mode_request_and_result() {
+        let mode = DisplayMode::new(2560, 1440, 144_000);
+        let request = ControlMessage::SetDisplayMode {
+            request_id: RequestId(42),
+            display_id: DisplayId(7),
+            mode,
+            restore_on_disconnect: true,
+        };
+        let decoded: ControlMessage = decode_reliable(&encode_reliable(&request).unwrap()).unwrap();
+        assert_eq!(decoded, request);
+
+        let result = ControlMessage::DisplayModeResult {
+            request_id: RequestId(42),
+            display_id: DisplayId(7),
+            status: DisplayModeStatus::Unsupported,
+            actual_mode: None,
+        };
+        let decoded: ControlMessage = decode_reliable(&encode_reliable(&result).unwrap()).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn pixel_format_round_trips_as_typed_value() {
         let pf = PixelFormat::Nv12;
         let bytes = encode(&pf).unwrap();
         let pf2: PixelFormat = decode(&bytes).unwrap();
         assert_eq!(pf, pf2);
-
-        // Round-trip via a hello extension map to confirm the integration
-        // shape: server encodes into BTreeMap value, client decodes back.
-        let mut ext = std::collections::BTreeMap::<String, Vec<u8>>::new();
-        ext.insert(PIXEL_FORMAT_EXTENSION_KEY.to_string(), bytes);
-        let read = ext.get(PIXEL_FORMAT_EXTENSION_KEY).expect("present");
-        let decoded: PixelFormat = decode(read).unwrap();
-        assert_eq!(decoded, PixelFormat::Nv12);
-        assert_eq!(PIXEL_FORMAT_EXTENSION_KEY, "tether.pixel-format");
-    }
-
-    #[test]
-    fn video_profile_round_trips_via_extension() {
-        use crate::control::{
-            VideoProfile, CLIENT_DECODE_PROFILES_EXTENSION_KEY, SERVER_ENCODE_PROFILE_EXTENSION_KEY,
-        };
-        // Client packs its full decode set into one extension value.
-        let client_caps = vec![
-            VideoProfile::HEVC_8BIT_444,
-            VideoProfile::HEVC_8BIT_420,
-            VideoProfile::H264_8BIT_420,
-        ];
-        let payload = encode(&client_caps).unwrap();
-        let decoded: Vec<VideoProfile> = decode(&payload).unwrap();
-        assert_eq!(decoded, client_caps);
-
-        // Host echoes a single chosen profile.
-        let chosen = VideoProfile::HEVC_8BIT_444;
-        let payload = encode(&chosen).unwrap();
-        let decoded: VideoProfile = decode(&payload).unwrap();
-        assert_eq!(decoded, chosen);
-
-        // Key strings are part of the wire contract — pin them so a
-        // typo in a future refactor breaks the test, not the network.
-        assert_eq!(
-            CLIENT_DECODE_PROFILES_EXTENSION_KEY,
-            "tether.cap.video.decode-profiles"
-        );
-        assert_eq!(
-            SERVER_ENCODE_PROFILE_EXTENSION_KEY,
-            "tether.cap.video.encode-profile"
-        );
     }
 
     /// Pin the 10-bit profile constants on the wire: the bincode shape
@@ -814,7 +854,7 @@ mod tests {
 
     #[test]
     fn round_trip_audio_packet_opus() {
-        use crate::audio::{AudioConfig, AudioPacket, AUDIO_CONFIG_EXTENSION_KEY};
+        use crate::audio::{AudioConfig, AudioPacket};
         use bytes::Bytes;
         let p = AudioPacket::Opus {
             stream_epoch: 1,
@@ -839,7 +879,7 @@ mod tests {
         };
         assert_eq!(p_no_red, decode(&encode(&p_no_red).unwrap()).unwrap());
 
-        // Hello-extension config round-trips identically too.
+        // Typed hello audio config round-trips identically too.
         let cfg = AudioConfig {
             sample_rate_hz: 48_000,
             channels: 2,
@@ -850,7 +890,6 @@ mod tests {
         let cfg_bytes = encode(&cfg).unwrap();
         let cfg2: AudioConfig = decode(&cfg_bytes).unwrap();
         assert_eq!(cfg, cfg2);
-        assert_eq!(AUDIO_CONFIG_EXTENSION_KEY, "tether.audio");
     }
 
     /// A near-maximum Opus payload (a high-bitrate / long-frame config can
@@ -966,8 +1005,8 @@ mod tests {
             fragments_lost: 4,
             rtt_ewma_us: 9_500,
         };
-        let bytes = encode(&msg).unwrap();
-        let msg2: ControlMessage = decode(&bytes).unwrap();
+        let bytes = encode_reliable(&msg).unwrap();
+        let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
         assert_eq!(msg, msg2);
     }
 
@@ -980,11 +1019,15 @@ mod tests {
                 video: true,
                 audio: false,
             },
-            ControlMessage::StreamPause { display: 3 },
-            ControlMessage::StreamResume { display: 3 },
+            ControlMessage::StreamPause {
+                stream_id: VideoStreamId(3),
+            },
+            ControlMessage::StreamResume {
+                stream_id: VideoStreamId(3),
+            },
         ] {
-            let bytes = encode(&msg).unwrap();
-            let msg2: ControlMessage = decode(&bytes).unwrap();
+            let bytes = encode_reliable(&msg).unwrap();
+            let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
             assert_eq!(msg, msg2);
         }
     }
@@ -994,16 +1037,22 @@ mod tests {
         // The Extension escape unblocks future control features
         // without forcing a ClientHelloV2. Confirm it survives the
         // wire identically.
-        let msg = ControlMessage::Extension {
+        let msg = ControlMessage::Extension(ExtensionMessage {
             key: "tether.cap.test".into(),
+            version: 1,
+            request_id: RequestId(9),
+            reply_to: RequestId(0),
             payload: vec![1, 2, 3, 0xFF],
-        };
-        let bytes = encode(&msg).unwrap();
-        let msg2: ControlMessage = decode(&bytes).unwrap();
+        });
+        let bytes = encode_reliable(&msg).unwrap();
+        let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
         match msg2 {
-            ControlMessage::Extension { key, payload } => {
-                assert_eq!(key, "tether.cap.test");
-                assert_eq!(payload, vec![1, 2, 3, 0xFF]);
+            ControlMessage::Extension(msg) => {
+                assert_eq!(msg.key, "tether.cap.test");
+                assert_eq!(msg.version, 1);
+                assert_eq!(msg.request_id, RequestId(9));
+                assert_eq!(msg.reply_to, RequestId(0));
+                assert_eq!(msg.payload, vec![1, 2, 3, 0xFF]);
             }
             _ => panic!("wrong variant"),
         }
@@ -1015,8 +1064,8 @@ mod tests {
             reason: "user quit".into(),
             code: GoodbyeCode::Clean,
         };
-        let bytes = encode(&g).unwrap();
-        let g2: ControlMessage = decode(&bytes).unwrap();
+        let bytes = encode_reliable(&g).unwrap();
+        let g2: ControlMessage = decode_reliable(&bytes).unwrap();
         match g2 {
             ControlMessage::Goodbye { reason, code } => {
                 assert_eq!(reason, "user quit");
@@ -1029,7 +1078,7 @@ mod tests {
     #[test]
     fn round_trip_video_packet_first() {
         let p = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 42,
             fragment_count: 3,
@@ -1056,7 +1105,7 @@ mod tests {
         let p2: VideoPacket = decode(&bytes).unwrap();
         match p2 {
             VideoPacket::First {
-                display,
+                stream_id,
                 stream_epoch,
                 frame_seq,
                 fragment_count,
@@ -1066,7 +1115,7 @@ mod tests {
                 meta,
                 payload,
             } => {
-                assert_eq!(display, 0);
+                assert_eq!(stream_id, VideoStreamId(0));
                 assert_eq!(stream_epoch, 0);
                 assert_eq!(frame_seq, 42);
                 assert_eq!(fragment_count, 3);
@@ -1129,7 +1178,7 @@ mod tests {
         // BytesMut. Bincode positional encoding makes any field reordering a
         // silent data corruption — assert each value individually.
         let p = VideoPacket::Parity {
-            display: 3,
+            stream_id: VideoStreamId(3),
             stream_epoch: 42,
             frame_seq: 1001,
             fragment_count: 8,
@@ -1145,7 +1194,7 @@ mod tests {
         let p2: VideoPacket = decode(&bytes).unwrap();
         match p2 {
             VideoPacket::Parity {
-                display,
+                stream_id,
                 stream_epoch,
                 frame_seq,
                 fragment_count,
@@ -1157,7 +1206,7 @@ mod tests {
                 meta,
                 payload,
             } => {
-                assert_eq!(display, 3);
+                assert_eq!(stream_id, VideoStreamId(3));
                 assert_eq!(stream_epoch, 42);
                 assert_eq!(frame_seq, 1001);
                 assert_eq!(fragment_count, 8);
@@ -1215,7 +1264,7 @@ mod tests {
         // 70_000 is just past that ceiling.
         let epoch = 70_000u32;
         let p = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: epoch,
             frame_seq: 0,
             fragment_count: 1,
@@ -1296,7 +1345,7 @@ mod tests {
         // Stress test: max-valued numeric fields + a realistic input echo +
         // payload sized so the whole packet stays under the datagram budget.
         let p = VideoPacket::First {
-            display: u8::MAX,
+            stream_id: VideoStreamId(u32::from(u8::MAX)),
             stream_epoch: u32::MAX,
             frame_seq: u32::MAX,
             fragment_count: u16::MAX,
@@ -1333,8 +1382,8 @@ mod tests {
         // fec_percentage=0 emits no Parity packets; the two constructors are
         // equivalent, producing byte-identical primary fragmentation.
         let body: bytes::Bytes = vec![0xab; 5000].into();
-        let mut a = FrameFragmenter::new(0);
-        let mut b = FrameFragmenter::new_with_fec(0, 0);
+        let mut a = FrameFragmenter::new(0u8);
+        let mut b = FrameFragmenter::new_with_fec(0u8, 0);
         let pa = a.fragment(default_meta(), body.clone(), MAX_DATAGRAM_PAYLOAD);
         let pb = b.fragment(default_meta(), body, MAX_DATAGRAM_PAYLOAD);
         assert_eq!(pa.len(), pb.len());
@@ -1357,7 +1406,7 @@ mod tests {
     #[test]
     fn fragmenter_with_fec_emits_parity_proportional_to_percentage() {
         let body: bytes::Bytes = vec![0u8; 11_000].into();
-        let mut frag = FrameFragmenter::new_with_fec(0, 20);
+        let mut frag = FrameFragmenter::new_with_fec(0u8, 20);
         let pkts = frag.fragment(default_meta(), body, MAX_DATAGRAM_PAYLOAD);
         let primary = pkts
             .iter()
@@ -1388,7 +1437,7 @@ mod tests {
             .map(|i| (i & 0xff) as u8)
             .collect::<Vec<u8>>()
             .into();
-        let mut frag = FrameFragmenter::new_with_fec(0, 25); // 25% parity
+        let mut frag = FrameFragmenter::new_with_fec(0u8, 25); // 25% parity
         let pkts = frag.fragment(default_meta(), body.clone(), MAX_DATAGRAM_PAYLOAD);
         let parity_count = pkts
             .iter()
@@ -1420,7 +1469,7 @@ mod tests {
         // Losing more primaries than we have parity for must NOT
         // produce a reconstructed frame.
         let body: bytes::Bytes = vec![0xff; 5000].into();
-        let mut frag = FrameFragmenter::new_with_fec(0, 20); // 1 parity for 5 primaries
+        let mut frag = FrameFragmenter::new_with_fec(0u8, 20); // 1 parity for 5 primaries
         let pkts = frag.fragment(default_meta(), body, MAX_DATAGRAM_PAYLOAD);
         let parity_count = pkts
             .iter()
@@ -1449,7 +1498,7 @@ mod tests {
         // ceiling is split into multiple independent RS blocks and stays
         // loss-protected — no more no-FEC fallback for big IDRs.
         let body: bytes::Bytes = vec![0x5au8; 300_000].into();
-        let mut frag = FrameFragmenter::new_with_fec(0, 20);
+        let mut frag = FrameFragmenter::new_with_fec(0u8, 20);
         let pkts = frag.fragment(default_meta(), body, MAX_DATAGRAM_PAYLOAD);
         let primary = pkts
             .iter()
@@ -1491,7 +1540,7 @@ mod tests {
             .map(|i| (i & 0xff) as u8)
             .collect::<Vec<u8>>()
             .into();
-        let mut frag = FrameFragmenter::new_with_fec(0, 20);
+        let mut frag = FrameFragmenter::new_with_fec(0u8, 20);
         let pkts = frag.fragment(default_meta(), body.clone(), MAX_DATAGRAM_PAYLOAD);
         // Packets are ordered First, Continuations…, then Parity. Drop the
         // first 3 primaries (all in block 0); keep the rest + all parity.
@@ -1515,7 +1564,7 @@ mod tests {
     #[test]
     fn parity_packet_round_trips() {
         let p = VideoPacket::Parity {
-            display: 7,
+            stream_id: VideoStreamId(7),
             stream_epoch: 42,
             frame_seq: 100,
             fragment_count: 5,
@@ -1535,7 +1584,7 @@ mod tests {
         let p2: VideoPacket = decode(&bytes).unwrap();
         match p2 {
             VideoPacket::Parity {
-                display,
+                stream_id,
                 stream_epoch,
                 frame_seq,
                 fragment_count,
@@ -1547,7 +1596,7 @@ mod tests {
                 meta,
                 payload,
             } => {
-                assert_eq!(display, 7);
+                assert_eq!(stream_id, VideoStreamId(7));
                 assert_eq!(stream_epoch, 42);
                 assert_eq!(frame_seq, 100);
                 assert_eq!(fragment_count, 5);
@@ -1576,7 +1625,7 @@ mod tests {
             dimensions: (1920, 1080),
         };
         let body: bytes::Bytes = vec![0u8; 8 * 1024].into();
-        let mut frag = FrameFragmenter::new(0);
+        let mut frag = FrameFragmenter::new(0u8);
         let packets = frag.fragment(meta.clone(), body.clone(), MAX_DATAGRAM_PAYLOAD);
         for p in &packets {
             assert_eq!(
@@ -1589,7 +1638,7 @@ mod tests {
         // FEC path: include Parity in the coverage so a future
         // change to Parity's fields can't silently desync wire_size
         // from the actual encoded length.
-        let mut frag_fec = FrameFragmenter::new_with_fec(0, 20);
+        let mut frag_fec = FrameFragmenter::new_with_fec(0u8, 20);
         let packets_fec = frag_fec.fragment(meta, body, MAX_DATAGRAM_PAYLOAD);
         assert!(
             packets_fec
@@ -1616,7 +1665,7 @@ mod tests {
             dimensions: (320, 240),
         };
 
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let packets = fragmenter.fragment(
             meta.clone(),
             bytes::Bytes::from(body.clone()),
@@ -1639,7 +1688,7 @@ mod tests {
         let frame = got.expect("reassembled frame");
         assert_eq!(frame.body.as_ref(), body.as_slice());
         assert_eq!(frame.frame_seq, 0);
-        assert_eq!(frame.display, 0);
+        assert_eq!(frame.stream_id, VideoStreamId(0));
         assert!(frame.meta.keyframe);
     }
 
@@ -1652,7 +1701,7 @@ mod tests {
             input_echo: InputEchoBatch::default(),
             dimensions: (320, 240),
         };
-        let mut fragmenter = FrameFragmenter::new(2);
+        let mut fragmenter = FrameFragmenter::new(2u8);
         let mut packets =
             fragmenter.fragment(meta, bytes::Bytes::from(body.clone()), MAX_DATAGRAM_PAYLOAD);
         // Reverse the order — reassembler should still produce the frame.
@@ -1667,12 +1716,12 @@ mod tests {
         }
         let frame = got.expect("reassembled out-of-order frame");
         assert_eq!(frame.body.as_ref(), body.as_slice());
-        assert_eq!(frame.display, 2);
+        assert_eq!(frame.stream_id, VideoStreamId(2));
     }
 
     #[test]
     fn reassembler_drops_stale_fragments() {
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let mut reassembler = FrameReassembler::new().with_max_age(1);
 
         let meta = VideoFrameMeta {
@@ -1698,7 +1747,7 @@ mod tests {
         // 5 frames behind latest, max_age=1, so the reassembler should
         // drop it silently.
         let stale = VideoPacket::Continuation {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_index: 1,
@@ -1726,7 +1775,7 @@ mod tests {
         // Half-deliver frame 0 — First arrives but Continuation
         // doesn't.
         let first = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 0,
             fragment_count: 2,
@@ -1745,7 +1794,7 @@ mod tests {
         // Feeding any other fragment triggers prune_old. The stuck
         // frame_seq=0 entry should be evicted by the wall-clock check.
         let unrelated = VideoPacket::First {
-            display: 0,
+            stream_id: VideoStreamId(0),
             stream_epoch: 0,
             frame_seq: 1,
             fragment_count: 1,
@@ -1769,7 +1818,7 @@ mod tests {
         // expansion), a continuation packet must fit in the datagram budget.
         // ~15 bytes of header overhead in the worst case for this variant.
         let p = VideoPacket::Continuation {
-            display: u8::MAX,
+            stream_id: VideoStreamId(u32::from(u8::MAX)),
             stream_epoch: u32::MAX,
             frame_seq: u32::MAX,
             fragment_index: u16::MAX,
@@ -1865,7 +1914,7 @@ mod tests {
         let mut reassembler = FrameReassembler::new();
 
         // Deliver a complete frame under epoch 0.
-        let mut fragmenter_epoch0 = FrameFragmenter::new(0);
+        let mut fragmenter_epoch0 = FrameFragmenter::new(0u8);
         let packets_e0 = fragmenter_epoch0.fragment(
             meta.clone(),
             bytes::Bytes::from_static(&[1u8; 200]),
@@ -1887,7 +1936,7 @@ mod tests {
         // not `(display, epoch)`, so latest_seq for the old epoch
         // stays parked. A First arrives under the new epoch with the
         // same frame_seq=0 — must reassemble independently.
-        let mut fragmenter_epoch1 = FrameFragmenter::new(0);
+        let mut fragmenter_epoch1 = FrameFragmenter::new(0u8);
         fragmenter_epoch1.bump_epoch();
         assert_eq!(fragmenter_epoch1.stream_epoch(), 1);
         let packets_e1 = fragmenter_epoch1.fragment(
@@ -1915,7 +1964,7 @@ mod tests {
         // keyframe-sized body goes through the same fragment() + FEC datagram
         // path as every P-frame and reassembles to the exact body. Loss-free
         // delivery here is the happy path; FEC recovery is covered elsewhere.
-        let mut fragmenter = FrameFragmenter::new_with_fec(3, 20);
+        let mut fragmenter = FrameFragmenter::new_with_fec(3u8, 20);
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: true,
@@ -1950,7 +1999,7 @@ mod tests {
         }
         let frame = got.expect("keyframe must reassemble from its datagrams");
         assert_eq!(frame.body.as_ref(), body.as_slice());
-        assert_eq!(frame.display, 3);
+        assert_eq!(frame.stream_id, VideoStreamId(3));
         assert!(frame.meta.keyframe);
     }
 
@@ -1960,7 +2009,7 @@ mod tests {
         // either, but quinn does retransmit at the QUIC layer and a
         // future protocol bug could deliver the same fragment twice.
         // Reassembler must not double-count or corrupt the frame.
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: false,
@@ -1998,7 +2047,7 @@ mod tests {
         // A Continuation can legitimately arrive before its First on
         // the wire (UDP reorder). Reassembler should buffer the
         // Continuation, then complete the frame when First lands.
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let meta = VideoFrameMeta {
             timing: HostFrameTiming::default(),
             keyframe: false,

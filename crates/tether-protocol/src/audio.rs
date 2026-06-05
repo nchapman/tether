@@ -1,11 +1,7 @@
 //! Audio datagram format — host → client.
 //!
-//! Tether ships *the wire shape* for audio in V1 so adding the Opus
-//! pipeline later (capture, encode, decode, render) is a self-contained
-//! change with no protocol bump. The implementation deliberately stays
-//! out of scope here: no capture backend integration, no Opus codec
-//! wiring, no client-side audio output device. The pipeline is its own
-//! workstream once we want sound.
+//! System-output audio rides the same unreliable datagram transport as video
+//! and is negotiated through the typed `ServerHello::audio` field.
 //!
 //! ## Channel
 //!
@@ -35,11 +31,8 @@
 //!
 //! ## Format negotiation
 //!
-//! Sample rate, channel count, and Opus stream-config bytes are carried
-//! through the hello extensions map under key `tether.audio` —
-//! reverse-DNS-style same as every other extension. A future revision
-//! that wants a typed audio-config field on `ServerHelloV1` can promote
-//! the extension to a typed addition in `ServerHelloV2`.
+//! Sample rate, channel count, and Opus stream-config bytes are carried in
+//! `ServerHello::audio`. Absence means video-only.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -60,7 +53,7 @@ pub enum AudioPacket {
         t_capture: MonoNanos,
         /// Opus-encoded payload. For multistream Opus (surround), this
         /// is the concatenated multistream packet — the
-        /// `tether.audio` extension carries the stream/coupled count
+        /// `ServerHello::audio` carries the stream/coupled count
         /// the decoder needs. `Bytes` (refcounted) like the video wire,
         /// so the encoder's output rides through to the datagram with no
         /// copy. Serialized as a byte sequence (identical wire shape to
@@ -77,14 +70,8 @@ pub enum AudioPacket {
     },
 }
 
-/// Extension-map key for hello audio format negotiation. Value is a
-/// bincode-encoded [`AudioConfig`].
-pub const AUDIO_CONFIG_EXTENSION_KEY: &str = "tether.audio";
-
-/// Host-advertised audio configuration. Lives in the hello extensions
-/// map keyed by [`AUDIO_CONFIG_EXTENSION_KEY`] so it can be added today
-/// without a typed hello field — the client decodes it if present,
-/// ignores it if absent (no audio).
+/// Host-advertised audio configuration. The client decodes it if present in
+/// `ServerHello::audio` and runs video-only if absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// 48000 is the only Opus-native rate worth shipping; the field

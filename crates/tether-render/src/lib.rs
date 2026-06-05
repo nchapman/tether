@@ -229,7 +229,7 @@ pub enum RenderEvent {
     /// actually grab the pointer happens inside the renderer.
     CursorModeChanged(CursorMode),
     /// Window resized to `(width, height)` physical pixels. The client
-    /// binary forwards this to the host as `ControlMessage::SetClientViewport`
+    /// binary forwards this to the host as `ControlMessage::SetViewportHint`
     /// (after debouncing) so the host can re-encode at the new dims —
     /// without this hook, the host stays at the original capture
     /// resolution regardless of how small the client window is, wasting

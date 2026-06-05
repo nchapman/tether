@@ -42,7 +42,8 @@ use tether_gpuconvert::{
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
-    ChromaSubsampling, CodecKind, ControlMessage, VideoProfile, Viewport,
+    ChromaSubsampling, CodecKind, ControlMessage, DisplayDescriptor, DisplayId, DisplayMode,
+    DisplayModeStatus, VideoProfile, VideoStreamId, Viewport,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
@@ -112,6 +113,21 @@ const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
 const TEST_PATTERN_FPS: u32 = 60;
 
+fn initial_display_descriptor() -> DisplayDescriptor {
+    let mode = DisplayMode::new(1280, 720, 60_000);
+    DisplayDescriptor {
+        id: DisplayId(0),
+        name: "primary".to_string(),
+        scale_num: 1,
+        scale_den: 1,
+        primary: true,
+        position: (0, 0),
+        current_mode: mode,
+        available_modes: vec![mode],
+        can_set_mode: false,
+    }
+}
+
 /// Upper bound on the per-connection authorization exchange (allowlist resume
 /// or first-contact pairing). A peer that stalls mid-exchange is dropped so it
 /// can't wedge the accept loop indefinitely. The client connects only *after*
@@ -137,8 +153,8 @@ type LatestClientStats = Arc<StdMutex<Option<ClientStatsObservation>>>;
 
 /// Latest client viewport, with sequence counter so the send thread
 /// can tell whether anything changed without diffing the whole value.
-/// Set once from `ClientHelloV1::viewport` at session start, then
-/// overwritten by `ControlMessage::SetClientViewport` on each resize.
+/// Set once from `ClientHello::initial_viewport` at session start, then
+/// overwritten by `ControlMessage::SetViewportHint` on each resize.
 type LatestViewport = Arc<StdMutex<ViewportState>>;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -462,6 +478,7 @@ async fn main() -> anyhow::Result<()> {
         let cfg = HostSessionConfig {
             server_name: "tether-host".to_string(),
             audio_config,
+            displays: vec![initial_display_descriptor()],
         };
         // `HostSession::accept` takes the channel through the
         // `ControlChannel` trait object so it's mockable in tests.
@@ -596,12 +613,13 @@ async fn handle_client(
     let HostSession {
         channel: _,
         negotiated: chosen_profile,
+        negotiated_video: _negotiated_video,
         client_hello,
         client_decode_profiles: _client_decode_profiles,
         idr_signal: force_idr,
         stream_ready,
     } = session;
-    let initial_viewport = client_hello.viewport.filter(|v| v.is_valid());
+    let initial_viewport = client_hello.initial_viewport.filter(|v| v.is_valid());
 
     // `use_test_pattern` from here on only switches the capture source;
     // the handshake-time profile floor it implied is already baked into
@@ -611,34 +629,6 @@ async fn handle_client(
     // built) so it owns the cursor source for the lifetime of the
     // session — startup shape delivery, ongoing position datagrams,
     // and per-sprite-change shape forwarding are one loop.
-
-    // DisplayList: one entry, single-monitor placeholder. Real values
-    // (refresh rate from the PipeWire stream, scale + position from
-    // the compositor) get filled in when the capture backend grows a
-    // display-enumeration API. The send is here so the client gets
-    // the topology *before* any video arrives.
-    {
-        let display = tether_protocol::control::DisplayDescriptor {
-            id: 0,
-            name: String::new(),
-            // Resolution is not known until the first frame arrives;
-            // use 0 as "to be replaced." Future: defer DisplayList
-            // until the capture backend has reported its real dims.
-            width: 0,
-            height: 0,
-            refresh_mhz: 60_000,
-            scale_num: 1,
-            scale_den: 1,
-            primary: true,
-            position: (0, 0),
-        };
-        let msg = ControlMessage::DisplayList {
-            displays: vec![display],
-        };
-        if let Err(e) = conn.send_control(&msg).await {
-            warn!(error = ?e, "initial DisplayList send failed; continuing anyway");
-        }
-    }
 
     // Acquire a capture stream — either real platform capture or the
     // synthetic test pattern fallback. Real Linux capture is async (the
@@ -711,7 +701,7 @@ async fn handle_client(
     // encode-and-send thread on each loop iteration.
     let latest_client_stats: LatestClientStats = Arc::new(StdMutex::new(None));
     // Latest viewport-target the client has communicated. Seeded
-    // from ClientHello; mutated by SetClientViewport.
+    // from ClientHello; mutated by SetViewportHint.
     let latest_viewport: LatestViewport = Arc::new(StdMutex::new(ViewportState {
         viewport: initial_viewport,
         seq: if initial_viewport.is_some() { 1 } else { 0 },
@@ -907,13 +897,11 @@ async fn handle_client(
                         // captured frames until the client says it can play them.
                         audio_ready_ctl.store(audio, Ordering::Release);
                     }
-                    Ok(ControlMessage::StreamPause { display }) => {
-                        let display_id = display;
-                        info!(display_id, "client paused stream (no-op today)");
+                    Ok(ControlMessage::StreamPause { stream_id }) => {
+                        info!(%stream_id, "client paused stream (no-op today)");
                     }
-                    Ok(ControlMessage::StreamResume { display }) => {
-                        let display_id = display;
-                        info!(display_id, "client resumed stream (no-op today)");
+                    Ok(ControlMessage::StreamResume { stream_id }) => {
+                        info!(%stream_id, "client resumed stream (no-op today)");
                         // Force a fresh IDR so the client can latch
                         // onto the resumed stream without a partial GOP.
                         force_idr.raise();
@@ -944,8 +932,12 @@ async fn handle_client(
                                 fragments_lost,
                             });
                     }
-                    Ok(ControlMessage::SetClientViewport(v)) => {
+                    Ok(ControlMessage::SetViewportHint {
+                        stream_id,
+                        viewport: v,
+                    }) => {
                         info!(
+                            %stream_id,
                             width = v.width,
                             height = v.height,
                             "client viewport changed"
@@ -964,10 +956,34 @@ async fn handle_client(
                         tracing::debug!(
                             width = v.width,
                             height = v.height,
-                            "SetClientViewport: forcing IDR; encoder rebuild fires only if \
+                            "SetViewportHint: forcing IDR; encoder rebuild fires only if \
                              encode dims change"
                         );
                         force_idr_for_viewport.raise();
+                    }
+                    Ok(ControlMessage::SetDisplayMode {
+                        request_id,
+                        display_id,
+                        ..
+                    }) => {
+                        let response = ControlMessage::DisplayModeResult {
+                            request_id,
+                            display_id,
+                            status: DisplayModeStatus::Unsupported,
+                            actual_mode: None,
+                        };
+                        if let Err(e) = conn.send_control(&response).await {
+                            warn!(
+                                error = ?e,
+                                %request_id,
+                                %display_id,
+                                "display mode result send failed; ending control loop"
+                            );
+                            return;
+                        }
+                    }
+                    Ok(ControlMessage::DisplayModeResult { .. }) => {
+                        tracing::trace!("unsolicited display mode result; ignoring");
                     }
                     Ok(ControlMessage::ClockProbeRequest { t0_sender }) => {
                         let t1 = MonoNanos::now();
@@ -992,12 +1008,21 @@ async fn handle_client(
                         info!(%reason, ?code, "client said goodbye");
                         return;
                     }
-                    Ok(ControlMessage::Extension { key, payload }) => {
-                        tracing::debug!(
-                            key = %key,
-                            payload_len = payload.len(),
-                            "unknown control extension; ignoring"
+                    Ok(ControlMessage::Extension(msg)) => {
+                        warn!(
+                            key = %msg.key,
+                            version = msg.version,
+                            request_id = %msg.request_id,
+                            payload_len = msg.payload.len(),
+                            "unnegotiated control extension; closing session"
                         );
+                        let _ = conn
+                            .send_control(&ControlMessage::Goodbye {
+                                reason: format!("unnegotiated extension {}", msg.key),
+                                code: tether_protocol::control::GoodbyeCode::ProtocolError,
+                            })
+                            .await;
+                        return;
                     }
                     Ok(
                         ControlMessage::CursorShape { .. } | ControlMessage::CursorUseShape { .. },
@@ -2796,7 +2821,7 @@ fn run_capture_and_send(
     // a queue between encoder and sender. Re-adding wire pacing
     // would need that decoupling, not the in-line sleep we had.
     const FEC_PERCENTAGE: u8 = 20;
-    let mut fragmenter = FrameFragmenter::new_with_fec(0, FEC_PERCENTAGE);
+    let mut fragmenter = FrameFragmenter::new_with_fec(VideoStreamId(0), FEC_PERCENTAGE);
     let mut stats = tether_session::EncodeStatsWindow::new(std::time::Duration::from_secs(2));
     // Frames sacrificed because a datagram send failed transiently (the path
     // MTU shrank mid-frame). Reset each stats window and logged alongside the

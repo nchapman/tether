@@ -22,7 +22,7 @@ use tether_decode::{DecodeCompletion, DecodeJob};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
-use tether_protocol::control::{ControlMessage, GoodbyeCode, Viewport};
+use tether_protocol::control::{ControlMessage, GoodbyeCode, ServerHello, VideoStreamId, Viewport};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::LatestFrame;
@@ -266,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
             // shortly after the window is created (the WM sizes it to
             // the actual physical pixels for the display's scale
             // factor) and the viewport debouncer task below will follow
-            // up with a SetClientViewport reflecting the physical dims.
+            // up with a SetViewportHint reflecting the physical dims.
             // Sending an initial guess here means the first encoded
             // frame is already at roughly-the-right size instead of
             // wasting one frame at native capture dims.
@@ -279,8 +279,9 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             let err = match e {
                 ConnectError::ProfileNotAdvertised { .. }
-                | ConnectError::InvalidEncodeProfile { .. }
-                | ConnectError::UnknownBitDepth(_, _) => anyhow::anyhow!("{e}"),
+                | ConnectError::UnknownBitDepth(_, _)
+                | ConnectError::HandshakeRejected { .. }
+                | ConnectError::PeerGoodbyeDuringClockProbe { .. } => anyhow::anyhow!("{e}"),
                 ConnectError::Transport(t) => anyhow::Error::from(t),
             };
             reporter.emit(&EngineEvent::Error {
@@ -292,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
     let ClientSession {
         channel: _,
         negotiated: negotiated_profile,
+        negotiated_video: _negotiated_video,
         server_hello,
         clock_sync,
         client_decode_profiles: _,
@@ -364,12 +366,21 @@ async fn main() -> anyhow::Result<()> {
                         info!(%reason, ?code, "host said goodbye");
                         return;
                     }
-                    Ok(ControlMessage::Extension { key, payload }) => {
-                        tracing::debug!(
-                            key = %key,
-                            payload_len = payload.len(),
-                            "unknown control extension; ignoring"
+                    Ok(ControlMessage::Extension(msg)) => {
+                        warn!(
+                            key = %msg.key,
+                            version = msg.version,
+                            request_id = %msg.request_id,
+                            payload_len = msg.payload.len(),
+                            "unnegotiated control extension; closing session"
                         );
+                        let _ = conn
+                            .send_control(&ControlMessage::Goodbye {
+                                reason: format!("unnegotiated extension {}", msg.key),
+                                code: GoodbyeCode::ProtocolError,
+                            })
+                            .await;
+                        return;
                     }
                     Ok(ControlMessage::CursorShape {
                         id,
@@ -426,14 +437,15 @@ async fn main() -> anyhow::Result<()> {
                         info!(count = displays.len(), "host display topology");
                         for d in &displays {
                             info!(
-                                id = d.id,
+                                id = %d.id,
                                 name = %d.name,
-                                width = d.width,
-                                height = d.height,
-                                refresh_mhz = d.refresh_mhz,
+                                width = d.current_mode.width,
+                                height = d.current_mode.height,
+                                refresh_millihz = d.current_mode.refresh_millihz,
                                 scale = format!("{}/{}", d.scale_num, d.scale_den),
                                 primary = d.primary,
                                 position = ?d.position,
+                                can_set_mode = d.can_set_mode,
                                 "  display"
                             );
                         }
@@ -449,11 +461,26 @@ async fn main() -> anyhow::Result<()> {
                         | ControlMessage::StreamPause { .. }
                         | ControlMessage::StreamResume { .. }
                         | ControlMessage::ClientStats { .. }
-                        | ControlMessage::SetClientViewport(_),
+                        | ControlMessage::SetViewportHint { .. }
+                        | ControlMessage::SetDisplayMode { .. },
                     ) => {
                         // Client-originated; misrouted if seen on the client side.
                         tracing::debug!(
                             "unexpected client→host control message arrived on client; ignoring"
+                        );
+                    }
+                    Ok(ControlMessage::DisplayModeResult {
+                        request_id,
+                        display_id,
+                        status,
+                        actual_mode,
+                    }) => {
+                        tracing::debug!(
+                            %request_id,
+                            %display_id,
+                            ?status,
+                            ?actual_mode,
+                            "display mode result"
                         );
                     }
                     Err(e) => {
@@ -944,7 +971,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Viewport debouncer task. Drag-resizing fires
     // `WindowEvent::Resized` continuously (often >100 events/second);
-    // sending a `SetClientViewport` per event would have the host
+    // sending a `SetViewportHint` per event would have the host
     // rebuild its encoder on every pixel of drag — expensive on
     // Metal/DX12 where pipeline compile is hundreds of ms, and produces
     // a stream of one-frame DimMismatch drops in the scaler. Coalesce
@@ -977,7 +1004,10 @@ async fn main() -> anyhow::Result<()> {
                         let viewport = Viewport::new(w, h);
                         if viewport.is_valid() {
                             let _ = conn_viewport
-                                .send_control(&ControlMessage::SetClientViewport(viewport))
+                                .send_control(&ControlMessage::SetViewportHint {
+                                    stream_id: VideoStreamId(0),
+                                    viewport,
+                                })
                                 .await;
                         }
                     }
@@ -990,13 +1020,16 @@ async fn main() -> anyhow::Result<()> {
                             continue;
                         }
                         if let Err(e) = conn_viewport
-                            .send_control(&ControlMessage::SetClientViewport(viewport))
+                            .send_control(&ControlMessage::SetViewportHint {
+                                stream_id: VideoStreamId(0),
+                                viewport,
+                            })
                             .await
                         {
-                            warn!(error = ?e, "SetClientViewport send failed; viewport task exiting");
+                            warn!(error = ?e, "SetViewportHint send failed; viewport task exiting");
                             return;
                         }
-                        info!(width = w, height = h, "sent SetClientViewport to host");
+                        info!(width = w, height = h, "sent SetViewportHint to host");
                     }
                 }
             }
@@ -1068,7 +1101,7 @@ async fn main() -> anyhow::Result<()> {
     let render_result = tether_render::run(
         "tether-client",
         (INITIAL_WIDTH, INITIAL_HEIGHT),
-        server_hello.color_space,
+        server_hello.video.color_space,
         negotiated_profile.chroma,
         negotiated_profile.bit_depth,
         frames,
@@ -1293,17 +1326,13 @@ struct AudioFrameMsg {
 /// video-only. Never fatal — a missing output device just means no sound.
 fn setup_audio_playback(
     enabled: bool,
-    server_hello: &tether_protocol::control::ServerHelloV1,
+    server_hello: &ServerHello,
 ) -> (Option<crossbeam_channel::Sender<AudioFrameMsg>>, bool) {
     if !enabled {
         info!("audio disabled via --no-audio");
         return (None, false);
     }
-    let Some(audio_cfg) = server_hello
-        .extensions
-        .get(tether_protocol::audio::AUDIO_CONFIG_EXTENSION_KEY)
-        .and_then(|b| tether_protocol::decode::<tether_protocol::audio::AudioConfig>(b).ok())
-    else {
+    let Some(audio_cfg) = server_hello.audio.clone() else {
         info!("host advertised no audio; running video-only");
         return (None, false);
     };

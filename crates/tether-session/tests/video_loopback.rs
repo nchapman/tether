@@ -22,7 +22,7 @@ fn meta(keyframe: bool) -> VideoFrameMeta {
 #[tokio::test]
 async fn n_pframes_round_trip_through_duplex_video_channel() {
     let (host, client) = video_duplex_pair();
-    let mut fragmenter = FrameFragmenter::new(0);
+    let mut fragmenter = FrameFragmenter::new(0u8);
     let mut reassembler = FrameReassembler::new();
 
     let bodies: Vec<Bytes> = (0..16u8)
@@ -72,7 +72,7 @@ async fn idr_keyframe_round_trips_through_datagram_channel() {
     // sent as datagrams, reassembled. Asserts a multi-shard keyframe body
     // arrives intact over the lossless channel.
     let (host, client) = video_duplex_pair();
-    let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+    let mut fragmenter = FrameFragmenter::new_with_fec(0u8, 20);
     let mut reassembler = FrameReassembler::new();
 
     let body: Bytes = vec![0xa5u8; 16 * 1024].into();

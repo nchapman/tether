@@ -1,119 +1,66 @@
-//! Control stream: handshake, clock sync, IDR requests, shutdown.
+//! Control stream: handshake, clock probes, stream control, display topology,
+//! and negotiated extension traffic.
 //!
-//! # Versioning policy
+//! Reliable handshake/control/input messages are encoded as protobuf messages
+//! under the `tether.v1` schema. New optional fields may be added with fresh
+//! numeric tags; older peers skip fields they do not know. First-party behavior
+//! that is part of the supported protocol should use typed fields or typed
+//! [`ControlMessage`] variants, not opaque extension payloads.
 //!
-//! Both handshake messages ([`ClientHello`], [`ServerHello`]) are
-//! `enum`-shaped wire envelopes whose variants tag a body struct
-//! ([`ClientHelloV1`], [`ServerHelloV1`]). New protocol revisions land
-//! as additional variants (`V2(ClientHelloV2)` etc.). Bincode encodes
-//! enum variants with a varint discriminator, so a future V2 sent to
-//! a V1-only receiver fails decode cleanly (`DecodeError::UnexpectedVariant`)
-//! rather than silently misinterpreting the bytes. The transport
-//! surfaces that as a `Result::Err` to the caller, which then closes
-//! the connection — there's no in-band Goodbye round-trip on a
-//! decode failure (we'd have to know what the peer can parse, which
-//! is exactly what failed).
+//! Media datagrams intentionally stay on the compact serde/bincode path: video
+//! packets, cursor positions, and audio packets are hot-path bounded datagrams
+//! where the current envelope is already explicit and loss-tolerant.
 //!
-//! Inside a body struct, **only new variants are wire-additive — never
-//! appended fields**. Bincode is strictly positional within a struct
-//! with no length prefix, so a V1 encoder that grew a new field at the
-//! end would either leave trailing bytes attributed to the *next*
-//! framed message or hit EOF in an older decoder. Adding anything to
-//! `ClientHelloV1` after this point requires a `ClientHelloV2`.
-//! The `#[serde(default)]` attributes on `extensions` and `resume_token`
-//! are no-ops under bincode (positional, never sees a missing field) but
-//! stay correct under serde formats with field-name tagging, in case
-//! we ever export to JSON for telemetry.
+//! # Extension lane
 //!
-//! Forward-compatible *opt-in features* go through [`ClientHelloV1::extensions`]
-//! / [`ServerHelloV1::extensions`] instead. The map shape lets either
-//! side advertise a feature key (and its value payload) without a wire
-//! revision; unknown keys are ignored. **Key naming convention:**
-//! reverse-DNS-style `vendor.feature` (`tether.adaptive-bitrate`,
-//! `tether.av1-preferred`) so first-party and future third-party
-//! extensions don't collide.
-//!
-//! [`ControlMessage`] is closed: new variants on it are NOT
-//! wire-additive (the discriminator collides with future codepoints
-//! the peer might already understand differently). Adding a new
-//! `ControlMessage` variant requires landing a `ClientHelloV2`
-//! alongside it.
-//!
-//! # Reserved extension keys
-//!
-//! These keys have meanings the protocol has committed to but the
-//! payload formats aren't yet stabilised. First-party features should
-//! not collide; third-party builds that want to use them should pick
-//! a different reverse-DNS prefix.
-//!
-//! - `tether.audio` — host audio config; payload is bincode-encoded
-//!   [`crate::audio::AudioConfig`]. Advertised on `ServerHelloV1`.
-//! - `tether.pixel-format` — host video pixel format; payload is
-//!   bincode-encoded [`PixelFormat`]. Advertised on `ServerHelloV1`.
-//! - `tether.gamepad-rumble` — host → client rumble command; rides
-//!   [`ControlMessage::Extension`] until it earns a typed variant
-//!   in a future hello revision. Payload shape: TBD pending the
-//!   gamepad pipeline.
-//! - `tether.cap.*` — capability advertisement. See the next section.
-//! - `tether.cap.video.decode-profiles` — client → host. Bincode
-//!   `Vec<VideoProfile>`; the full set of video profiles the client can
-//!   decode. Absence is interpreted as legacy `[{H264, Yuv420, 8}]`.
-//! - `tether.cap.video.encode-profile` — host → client. Bincode
-//!   [`VideoProfile`]; the single profile the host picked from the
-//!   intersection of its encode capabilities and the client's decode
-//!   capabilities. Echoed in the [`ServerHelloV1`]; the inline
-//!   [`ServerHelloV1::chosen_codec`] / [`ServerHelloV1::chosen_chroma`]
-//!   fields carry the same information for legacy clients.
-//!
-//! # Capability advertisement (`tether.cap.*`)
-//!
-//! Any hello-extension key beginning with `tether.cap.` is a capability
-//! advertisement. The sender is offering the feature; the receiver, if
-//! it accepts the offer, MUST echo the key (with the negotiated payload
-//! it agrees to use) back in its own hello `extensions`. Receivers that
-//! recognise a `tether.cap.*` key but do not accept it MUST omit it
-//! from the echo; receivers that do not recognise it MUST omit it from
-//! the echo (the standard "unknown key, ignore" rule). Receivers MUST
-//! NOT silently *consume* a capability key without acknowledging —
-//! either echo or drop.
-//!
-//! That gives every future negotiated feature (FEC tuning, relay path,
-//! adaptive-bitrate handshake, bandwidth probe parameters,
-//! multi-stream session) a single shared idiom for "did the peer
-//! accept this?" — no per-feature ack message, no per-feature timeout
-//! dance. The presence of the key in the *other* side's hello
-//! `extensions` is the ack; absence is rejection.
-//!
-//! Example flow for a hypothetical FEC negotiation:
-//! - Client → `tether.cap.fec = encode(FecCapability { reed_solomon: true, .. })`.
-//! - Host accepts: echoes `tether.cap.fec = encode(FecCapability { reed_solomon: true, .. })`
-//!   with the parameters it agrees to (likely a subset / tightened
-//!   variant of what the client offered).
-//! - Host declines: omits the key. Client sees no echo and falls back.
-//!
-//! # The `Extension` escape
-//!
-//! [`ControlMessage::Extension`] exists so that future features which
-//! need a new control message *do not* force a `ClientHelloV2`. A
-//! sender publishes a reverse-DNS-keyed payload; receivers that
-//! don't recognise the key log and drop it without erroring. Typical
-//! lifecycle of a new control feature:
-//!
-//! 1. Ship the feature as `ControlMessage::Extension { key:
-//!    "tether.feature-x", payload: <bincode-encoded body> }`.
-//! 2. Soak it until the shape stabilises across deployments.
-//! 3. When promoting to a typed variant becomes worthwhile (compile-
-//!    time field checking, no String overhead per message), land it
-//!    as part of the next `ClientHelloV{N+1}` bump.
-//!
-//! Receivers MUST log unknown extension keys at `debug` so an
-//! operator can see "peer is speaking a feature this build doesn't
-//! support yet."
+//! Experimental or third-party features negotiate through
+//! [`FeatureAdvert`] / [`FeatureAccept`] in hello. After a feature is accepted,
+//! peers may send [`ControlMessage::Extension`] with the accepted key/version.
+//! Unknown or unnegotiated extension messages are protocol errors at the session
+//! layer; first-party committed features should graduate to typed messages.
 
-use std::collections::BTreeMap;
-
-use crate::MonoNanos;
+use crate::{pb, CodecError, MonoNanos, ReliableMessage};
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DisplayId(pub u32);
+
+impl std::fmt::Display for DisplayId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VideoStreamId(pub u32);
+
+impl std::fmt::Display for VideoStreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<u8> for VideoStreamId {
+    fn from(value: u8) -> Self {
+        Self(u32::from(value))
+    }
+}
+
+impl From<u32> for VideoStreamId {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestId(pub u64);
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodecKind {
@@ -130,12 +77,9 @@ pub enum ChromaSubsampling {
 
 /// Negotiation unit for video codec capabilities.
 ///
-/// One end advertises the set it can decode; the other intersects with
-/// the set it can encode and picks the best mutual profile against a
-/// fixed preference order. Carried in hello extensions
-/// ([`CLIENT_DECODE_PROFILES_EXTENSION_KEY`] / [`SERVER_ENCODE_PROFILE_EXTENSION_KEY`])
-/// rather than inline fields so adding a new axis (10-bit, future
-/// HDR-specific profile) doesn't require a [`ClientHelloV1`] bump.
+/// The client advertises the set it can decode in [`ClientHello`]; the host
+/// intersects with its encode capabilities and returns the selected profile in
+/// [`ServerHello::video`].
 ///
 /// `bit_depth` is `u8` rather than an enum so the wire form stays
 /// stable as new depths land — 8, 10, and (hypothetically) 12 all
@@ -169,9 +113,7 @@ pub fn is_known_bit_depth(depth: u8) -> bool {
 
 impl VideoProfile {
     /// The universal floor: H.264 Main 4:2:0 8-bit. Every host backend
-    /// we ship supports it, every client backend can decode it. This
-    /// is what a legacy peer (no `tether.cap.video.*` extension) is
-    /// assumed to support.
+    /// we ship supports it, every client backend can decode it.
     pub const H264_8BIT_420: Self = Self {
         codec: CodecKind::H264,
         chroma: ChromaSubsampling::Yuv420,
@@ -245,18 +187,8 @@ impl VideoProfile {
     };
 }
 
-/// Hello extension key. Client → host. Payload: bincode
-/// `Vec<VideoProfile>`. Absence is legacy `[VideoProfile::H264_8BIT_420]`.
-pub const CLIENT_DECODE_PROFILES_EXTENSION_KEY: &str = "tether.cap.video.decode-profiles";
-
-/// Hello extension key. Host → client. Payload: bincode [`VideoProfile`].
-/// The single profile the host picked. Absence means the host built
-/// against an older protocol revision — the inline [`ServerHelloV1::chosen_codec`]
-/// and [`ServerHelloV1::chosen_chroma`] fields are then the source of truth.
-pub const SERVER_ENCODE_PROFILE_EXTENSION_KEY: &str = "tether.cap.video.encode-profile";
-
 // =============================================================
-// Four-axis color spec. Carried first-class on `ServerHelloV1`.
+// Four-axis color spec. Carried first-class on `ServerHello::video`.
 // =============================================================
 //
 // A video stream's color identity is four orthogonal things, each
@@ -345,7 +277,7 @@ pub enum ColorPrimaries {
 }
 
 /// The four-axis tuple. Carried first-class on
-/// [`ServerHelloV1::color_space`].
+/// [`NegotiatedVideo::color_space`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoColorSpec {
     pub matrix: ColorMatrix,
@@ -398,8 +330,7 @@ impl Default for VideoColorSpec {
 /// Pixel/bit-depth format the host's video stream uses. The hardware
 /// decoder pipeline (VAAPI, VideoToolbox, Media Foundation) needs this
 /// up front — before parsing the SPS — to pick the right import path.
-/// Advertised via [`ServerHelloV1::extensions`] under
-/// [`PIXEL_FORMAT_EXTENSION_KEY`]; absence implies `Nv12`.
+/// Advertised as part of [`NegotiatedVideo`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PixelFormat {
     /// 8-bit packed BGRA (capture-side default; never on the wire in
@@ -413,8 +344,7 @@ pub enum PixelFormat {
     /// convention.
     P010,
     /// 8-bit 4:4:4 planar (Y/U/V each at full resolution). The path
-    /// HEVC Main444 emits; selected when [`ServerHelloV1::chosen_chroma`]
-    /// is [`ChromaSubsampling::Yuv444`].
+    /// HEVC Main444 emits for 8-bit 4:4:4 streams.
     Yuv444p,
     /// 10-bit 4:4:4 biplanar — the path HEVC Main 4:4:4 10-bit rides
     /// on macOS (matching VT's `'P410'` / `'xf44'` IOSurfaces) and
@@ -423,31 +353,35 @@ pub enum PixelFormat {
     P410,
 }
 
-/// Hello extension key for [`PixelFormat`] advertisement. Reverse-DNS
-/// per the [`ClientHelloV1::extensions`] convention.
-pub const PIXEL_FORMAT_EXTENSION_KEY: &str = "tether.pixel-format";
+/// One concrete display mode the host can report or apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+}
 
-/// Describes one host display, carried in
-/// [`ControlMessage::DisplayList`]. Today the host always sends a
-/// one-element list (single-monitor); the field shape is here so adding
-/// multi-monitor support later is purely additive — no new
-/// `ControlMessage` variant, no V2 hello bump. `refresh_mhz` and the
-/// `scale_*` pair also cover what would otherwise need their own
-/// extension keys (display geometry / HiDPI hints).
+impl DisplayMode {
+    #[must_use]
+    pub const fn new(width: u32, height: u32, refresh_millihz: u32) -> Self {
+        Self {
+            width,
+            height,
+            refresh_millihz,
+        }
+    }
+}
+
+/// Describes one host display. `DisplayList` is authoritative: clients replace
+/// their local topology view with each message rather than merging.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayDescriptor {
-    /// Host-assigned display id. Stable for the lifetime of a session;
-    /// matches the `display: u8` on `VideoPacket` / cursor packets.
-    pub id: u8,
+    /// Host-assigned display id. Stable for the lifetime of a session.
+    pub id: DisplayId,
     /// Human-readable name as the host's compositor reports it
     /// (`HDMI-A-1`, `DP-3`, `Built-in Retina Display`, etc.). May be
     /// empty if the host's capture backend doesn't expose names.
     pub name: String,
-    pub width: u32,
-    pub height: u32,
-    /// Refresh rate in millihertz so 60 Hz = 60_000 and 59.94 Hz =
-    /// 59_940 round-trip without floating point.
-    pub refresh_mhz: u32,
     /// Logical-to-physical scale as a rational `num / den`. `(1, 1)`
     /// for a 1× display, `(2, 1)` for a Retina-style 2×, `(3, 2)` for
     /// 150% Windows scaling. Rational so common factors round-trip
@@ -460,6 +394,9 @@ pub struct DisplayDescriptor {
     /// pixels. Lets the client place multi-display windows correctly
     /// without re-deriving the topology.
     pub position: (i32, i32),
+    pub current_mode: DisplayMode,
+    pub available_modes: Vec<DisplayMode>,
+    pub can_set_mode: bool,
 }
 
 /// NTP-style three-way clock probe. The receiver records `t3` locally on
@@ -472,84 +409,86 @@ pub struct ClockProbe {
     pub t2_receiver_send: MonoNanos,
 }
 
-// --- Versioned handshake envelopes --------------------------------------
-
-/// Wire envelope for the client's opening message.
-///
-/// New protocol revisions add additional variants alongside `V1`. See
-/// the module-level docs for the full versioning policy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClientHello {
-    V1(ClientHelloV1),
+pub struct FeatureAdvert {
+    pub key: String,
+    pub min_version: u32,
+    pub max_version: u32,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientHelloV1 {
-    pub client_name: String,
-    /// Codecs the client can decode, ordered by preference.
-    pub preferred_codecs: Vec<CodecKind>,
-    /// Client's maximum displayable resolution (host decides actual).
-    pub max_resolution: Option<(u32, u32)>,
-    /// Client's current viewport — the pixel dimensions of the window
-    /// it will render the remote desktop into. The host uses this as
-    /// the encoder output size (clamped to encoder alignment), which
-    /// avoids paying for full-resolution encode + transport when the
-    /// client window is smaller than the host display. `None` lets
-    /// the host pick native dimensions. Mid-session resizes ride
-    /// [`ControlMessage::SetClientViewport`].
-    pub viewport: Option<Viewport>,
-    /// First leg of the handshake clock probe — client's monotonic time at
-    /// the moment of send.
-    pub clock_probe_t0: MonoNanos,
-    /// Opt-in extension envelope for forward-compatible feature flags
-    /// (AV1 advertise, adaptive bitrate hint, future channels). Both
-    /// sides ignore keys they don't recognise — adding a feature here
-    /// does not require a protocol revision.
-    #[serde(default)]
-    pub extensions: BTreeMap<String, Vec<u8>>,
-    /// If the client is attempting to resume a previous session, the
-    /// token the host issued in that session's [`ServerHelloV1::resume_token`].
-    /// `None` on a fresh session. The host may accept (preserving
-    /// `stream_epoch` so the renderer can continue without a black
-    /// frame) or reject (issue a fresh epoch); semantics are TBD. The
-    /// protocol shape is here now so adding the implementation later
-    /// doesn't require a wire bump.
-    #[serde(default)]
-    pub resume_token: Option<Vec<u8>>,
+pub struct FeatureAccept {
+    pub key: String,
+    pub version: u32,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ServerHello {
-    V1(ServerHelloV1),
+pub struct ExtensionMessage {
+    pub key: String,
+    pub version: u32,
+    pub request_id: RequestId,
+    pub reply_to: RequestId,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputCapabilities {
+    pub keyboard: bool,
+    pub mouse: bool,
+    pub relative_mouse: bool,
+    pub text: bool,
+}
+
+impl Default for InputCapabilities {
+    fn default() -> Self {
+        Self {
+            keyboard: true,
+            mouse: true,
+            relative_mouse: true,
+            text: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerHelloV1 {
-    pub server_name: String,
-    pub chosen_codec: CodecKind,
-    pub chosen_chroma: ChromaSubsampling,
-    /// Color identity of the encoded stream — matrix, range,
-    /// transfer, primaries. Negotiated end-to-end so the renderer
-    /// can dispatch the right shader path (EOTF + matrix) without
-    /// guessing.
+pub struct NegotiatedVideo {
+    pub stream_id: VideoStreamId,
+    pub display_id: DisplayId,
+    pub profile: VideoProfile,
+    pub pixel_format: PixelFormat,
     pub color_space: VideoColorSpec,
-    pub resolution: (u32, u32),
-    /// Echo of the client's `clock_probe_t0` so the client can match
-    /// the response to the request it sent.
-    pub clock_probe_t0_echo: MonoNanos,
-    /// Server-monotonic time when `ClientHello` was received.
-    pub t1_server_recv: MonoNanos,
-    /// Server-monotonic time when this message is sent.
-    pub t2_server_send: MonoNanos,
-    /// Opt-in extension envelope — same purpose as
-    /// [`ClientHelloV1::extensions`].
-    #[serde(default)]
-    pub extensions: BTreeMap<String, Vec<u8>>,
-    /// Opaque token the client can stash and present in a future
-    /// [`ClientHelloV1::resume_token`] to attempt session resume.
-    /// `None` if the host doesn't (yet) implement resume.
-    #[serde(default)]
-    pub resume_token: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHello {
+    pub client_name: String,
+    pub decode_profiles: Vec<VideoProfile>,
+    pub initial_viewport: Option<Viewport>,
+    pub input_capabilities: InputCapabilities,
+    pub requested_features: Vec<FeatureAdvert>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerHello {
+    pub server_name: String,
+    pub video: NegotiatedVideo,
+    pub audio: Option<crate::audio::AudioConfig>,
+    pub displays: Vec<DisplayDescriptor>,
+    pub accepted_features: Vec<FeatureAccept>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandshakeFailure {
+    pub code: GoodbyeCode,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerHandshake {
+    Accepted(ServerHello),
+    Rejected(HandshakeFailure),
 }
 
 // --- Goodbye ------------------------------------------------------------
@@ -637,10 +576,7 @@ pub enum ControlMessage {
     /// is reverse-DNS-style keys (`tether.clipboard`,
     /// `tether.gamepad-rumble`) with a bincode-encoded body. Unknown
     /// keys are logged + dropped. See the module-level doc.
-    Extension {
-        key: String,
-        payload: Vec<u8>,
-    },
+    Extension(ExtensionMessage),
     /// Host → client. Cursor sprite (RGBA pixels). Routed on the
     /// reliable control stream rather than the cursor datagram channel
     /// because a 64×64 RGBA sprite exceeds the 1200-byte datagram
@@ -673,7 +609,7 @@ pub enum ControlMessage {
     /// client's user-driven display switch; host stops emitting video
     /// for displays not in the set.
     SetActiveDisplays {
-        displays: Vec<u8>,
+        displays: Vec<DisplayId>,
     },
     /// Client → host. Sent once after the client has finished building
     /// its decoders, so the host doesn't start blasting video before
@@ -688,14 +624,14 @@ pub enum ControlMessage {
     /// window minimised). Host is free to stop encoding entirely for
     /// that display to save power.
     StreamPause {
-        display: u8,
+        stream_id: VideoStreamId,
     },
     /// Client → host. Resume emission for the given display. Pairs
     /// with [`Self::StreamPause`]; host emits a fresh IDR before any
     /// subsequent P-frames so the client doesn't render a half-decoded
     /// stream.
     StreamResume {
-        display: u8,
+        stream_id: VideoStreamId,
     },
     /// Client → host. Periodic receive-side telemetry (1 Hz typical).
     /// Feeds future adaptive-bitrate / FEC / codec-downshift policy on
@@ -718,15 +654,37 @@ pub enum ControlMessage {
     SetCursorMode {
         mode: CursorMode,
     },
-    /// Client → host. The client's viewport changed (window resize,
-    /// monitor switch, fullscreen toggle). The host treats this as a
-    /// request to re-target the encoder at the new dimensions; the
-    /// rebuild reuses the same `stream_epoch` bump path as a
-    /// resolution change on the capture side. Hosts MAY debounce
-    /// rapid sequences (e.g. drag-resize) by latching the latest
-    /// viewport and rebuilding on the next frame rather than on each
-    /// message.
-    SetClientViewport(Viewport),
+    /// Client → host. Best-effort request to retarget one encoded stream at
+    /// the client's current viewport dimensions. This does not change the
+    /// host display mode and does not require an ack.
+    SetViewportHint {
+        stream_id: VideoStreamId,
+        viewport: Viewport,
+    },
+    /// Client → host. Request a real host display mode change. The host must
+    /// reply with [`Self::DisplayModeResult`].
+    SetDisplayMode {
+        request_id: RequestId,
+        display_id: DisplayId,
+        mode: DisplayMode,
+        restore_on_disconnect: bool,
+    },
+    /// Host → client. Result of a [`Self::SetDisplayMode`] request.
+    DisplayModeResult {
+        request_id: RequestId,
+        display_id: DisplayId,
+        status: DisplayModeStatus,
+        actual_mode: Option<DisplayMode>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayModeStatus {
+    Applied,
+    Unsupported,
+    InvalidMode,
+    PermissionDenied,
+    Failed,
 }
 
 /// Pixel dimensions of the client's rendering surface. Used to size
@@ -815,6 +773,753 @@ impl ClockSync {
     pub fn remote_to_local(&self, remote: MonoNanos) -> MonoNanos {
         let v = i128::from(remote.0) - i128::from(self.offset_nanos);
         MonoNanos(u64::try_from(v.clamp(0, i128::from(u64::MAX))).expect("clamped to u64 range"))
+    }
+}
+
+fn mono_to_pb(value: MonoNanos) -> pb::MonoNanos {
+    pb::MonoNanos { value: value.0 }
+}
+
+fn mono_from_pb(value: Option<pb::MonoNanos>) -> Result<MonoNanos, CodecError> {
+    Ok(MonoNanos(
+        value.ok_or(CodecError::Wire("missing MonoNanos"))?.value,
+    ))
+}
+
+fn codec_to_pb(value: CodecKind) -> i32 {
+    match value {
+        CodecKind::H264 => 1,
+        CodecKind::Hevc => 2,
+        CodecKind::Av1 => 3,
+    }
+}
+
+fn codec_from_pb(value: i32) -> Result<CodecKind, CodecError> {
+    match value {
+        1 => Ok(CodecKind::H264),
+        2 => Ok(CodecKind::Hevc),
+        3 => Ok(CodecKind::Av1),
+        _ => Err(CodecError::Wire("unknown CodecKind")),
+    }
+}
+
+fn chroma_to_pb(value: ChromaSubsampling) -> i32 {
+    match value {
+        ChromaSubsampling::Yuv420 => 1,
+        ChromaSubsampling::Yuv444 => 2,
+    }
+}
+
+fn chroma_from_pb(value: i32) -> Result<ChromaSubsampling, CodecError> {
+    match value {
+        1 => Ok(ChromaSubsampling::Yuv420),
+        2 => Ok(ChromaSubsampling::Yuv444),
+        _ => Err(CodecError::Wire("unknown ChromaSubsampling")),
+    }
+}
+
+fn profile_to_pb(value: VideoProfile) -> pb::VideoProfile {
+    pb::VideoProfile {
+        codec: codec_to_pb(value.codec),
+        chroma: chroma_to_pb(value.chroma),
+        bit_depth: u32::from(value.bit_depth),
+    }
+}
+
+fn profile_from_pb(value: pb::VideoProfile) -> Result<VideoProfile, CodecError> {
+    Ok(VideoProfile {
+        codec: codec_from_pb(value.codec)?,
+        chroma: chroma_from_pb(value.chroma)?,
+        bit_depth: u8::try_from(value.bit_depth).map_err(|_| CodecError::Wire("bit depth > u8"))?,
+    })
+}
+
+fn advertised_profile_from_pb(value: pb::VideoProfile) -> Option<VideoProfile> {
+    let codec = codec_from_pb(value.codec).ok()?;
+    let chroma = chroma_from_pb(value.chroma).ok()?;
+    let bit_depth = u8::try_from(value.bit_depth).ok()?;
+    Some(VideoProfile {
+        codec,
+        chroma,
+        bit_depth,
+    })
+}
+
+fn color_to_pb(value: VideoColorSpec) -> pb::VideoColorSpec {
+    pb::VideoColorSpec {
+        matrix: match value.matrix {
+            ColorMatrix::Bt709 => 1,
+            ColorMatrix::Bt2020Ncl => 2,
+            ColorMatrix::Identity => 3,
+        },
+        range: match value.range {
+            ColorRange::Limited => 1,
+            ColorRange::Full => 2,
+        },
+        transfer: match value.transfer {
+            ColorTransfer::Bt709 => 1,
+            ColorTransfer::Srgb => 2,
+            ColorTransfer::Pq => 3,
+            ColorTransfer::Hlg => 4,
+            ColorTransfer::Linear => 5,
+        },
+        primaries: match value.primaries {
+            ColorPrimaries::Bt709 => 1,
+            ColorPrimaries::Bt2020 => 2,
+        },
+    }
+}
+
+fn color_from_pb(value: Option<pb::VideoColorSpec>) -> Result<VideoColorSpec, CodecError> {
+    let value = value.ok_or(CodecError::Wire("missing VideoColorSpec"))?;
+    Ok(VideoColorSpec {
+        matrix: match value.matrix {
+            1 => ColorMatrix::Bt709,
+            2 => ColorMatrix::Bt2020Ncl,
+            3 => ColorMatrix::Identity,
+            _ => return Err(CodecError::Wire("unknown ColorMatrix")),
+        },
+        range: match value.range {
+            1 => ColorRange::Limited,
+            2 => ColorRange::Full,
+            _ => return Err(CodecError::Wire("unknown ColorRange")),
+        },
+        transfer: match value.transfer {
+            1 => ColorTransfer::Bt709,
+            2 => ColorTransfer::Srgb,
+            3 => ColorTransfer::Pq,
+            4 => ColorTransfer::Hlg,
+            5 => ColorTransfer::Linear,
+            _ => return Err(CodecError::Wire("unknown ColorTransfer")),
+        },
+        primaries: match value.primaries {
+            1 => ColorPrimaries::Bt709,
+            2 => ColorPrimaries::Bt2020,
+            _ => return Err(CodecError::Wire("unknown ColorPrimaries")),
+        },
+    })
+}
+
+fn pixel_to_pb(value: PixelFormat) -> i32 {
+    match value {
+        PixelFormat::Bgra8 => 1,
+        PixelFormat::Nv12 => 2,
+        PixelFormat::P010 => 3,
+        PixelFormat::Yuv444p => 4,
+        PixelFormat::P410 => 5,
+    }
+}
+
+fn pixel_from_pb(value: i32) -> Result<PixelFormat, CodecError> {
+    match value {
+        1 => Ok(PixelFormat::Bgra8),
+        2 => Ok(PixelFormat::Nv12),
+        3 => Ok(PixelFormat::P010),
+        4 => Ok(PixelFormat::Yuv444p),
+        5 => Ok(PixelFormat::P410),
+        _ => Err(CodecError::Wire("unknown PixelFormat")),
+    }
+}
+
+fn viewport_to_pb(value: Viewport) -> pb::Viewport {
+    pb::Viewport {
+        width: value.width,
+        height: value.height,
+    }
+}
+
+fn viewport_from_pb(value: pb::Viewport) -> Viewport {
+    Viewport::new(value.width, value.height)
+}
+
+fn display_mode_to_pb(value: DisplayMode) -> pb::DisplayMode {
+    pb::DisplayMode {
+        width: value.width,
+        height: value.height,
+        refresh_millihz: value.refresh_millihz,
+    }
+}
+
+fn display_mode_from_pb(value: Option<pb::DisplayMode>) -> Result<DisplayMode, CodecError> {
+    let value = value.ok_or(CodecError::Wire("missing DisplayMode"))?;
+    Ok(DisplayMode {
+        width: value.width,
+        height: value.height,
+        refresh_millihz: value.refresh_millihz,
+    })
+}
+
+fn display_to_pb(value: DisplayDescriptor) -> pb::DisplayDescriptor {
+    pb::DisplayDescriptor {
+        id: value.id.0,
+        name: value.name,
+        position_x: value.position.0,
+        position_y: value.position.1,
+        scale_num: u32::from(value.scale_num),
+        scale_den: u32::from(value.scale_den),
+        primary: value.primary,
+        current_mode: Some(display_mode_to_pb(value.current_mode)),
+        available_modes: value
+            .available_modes
+            .into_iter()
+            .map(display_mode_to_pb)
+            .collect(),
+        can_set_mode: value.can_set_mode,
+    }
+}
+
+fn display_from_pb(value: pb::DisplayDescriptor) -> Result<DisplayDescriptor, CodecError> {
+    Ok(DisplayDescriptor {
+        id: DisplayId(value.id),
+        name: value.name,
+        scale_num: u16::try_from(value.scale_num)
+            .map_err(|_| CodecError::Wire("display scale numerator > u16"))?,
+        scale_den: u16::try_from(value.scale_den)
+            .map_err(|_| CodecError::Wire("display scale denominator > u16"))?,
+        primary: value.primary,
+        position: (value.position_x, value.position_y),
+        current_mode: display_mode_from_pb(value.current_mode)?,
+        available_modes: value
+            .available_modes
+            .into_iter()
+            .map(|m| display_mode_from_pb(Some(m)))
+            .collect::<Result<_, _>>()?,
+        can_set_mode: value.can_set_mode,
+    })
+}
+
+fn feature_advert_to_pb(value: FeatureAdvert) -> pb::FeatureAdvert {
+    pb::FeatureAdvert {
+        key: value.key,
+        min_version: value.min_version,
+        max_version: value.max_version,
+        payload: value.payload,
+    }
+}
+
+fn feature_advert_from_pb(value: pb::FeatureAdvert) -> FeatureAdvert {
+    FeatureAdvert {
+        key: value.key,
+        min_version: value.min_version,
+        max_version: value.max_version,
+        payload: value.payload,
+    }
+}
+
+fn feature_accept_to_pb(value: FeatureAccept) -> pb::FeatureAccept {
+    pb::FeatureAccept {
+        key: value.key,
+        version: value.version,
+        payload: value.payload,
+    }
+}
+
+fn feature_accept_from_pb(value: pb::FeatureAccept) -> FeatureAccept {
+    FeatureAccept {
+        key: value.key,
+        version: value.version,
+        payload: value.payload,
+    }
+}
+
+fn extension_to_pb(value: ExtensionMessage) -> pb::ExtensionMessage {
+    pb::ExtensionMessage {
+        key: value.key,
+        version: value.version,
+        request_id: value.request_id.0,
+        reply_to: value.reply_to.0,
+        payload: value.payload,
+    }
+}
+
+fn extension_from_pb(value: pb::ExtensionMessage) -> ExtensionMessage {
+    ExtensionMessage {
+        key: value.key,
+        version: value.version,
+        request_id: RequestId(value.request_id),
+        reply_to: RequestId(value.reply_to),
+        payload: value.payload,
+    }
+}
+
+fn input_caps_to_pb(value: InputCapabilities) -> pb::InputCapabilities {
+    pb::InputCapabilities {
+        keyboard: value.keyboard,
+        mouse: value.mouse,
+        relative_mouse: value.relative_mouse,
+        text: value.text,
+    }
+}
+
+fn input_caps_from_pb(value: Option<pb::InputCapabilities>) -> InputCapabilities {
+    value.map_or_else(InputCapabilities::default, |v| InputCapabilities {
+        keyboard: v.keyboard,
+        mouse: v.mouse,
+        relative_mouse: v.relative_mouse,
+        text: v.text,
+    })
+}
+
+fn audio_to_pb(value: crate::audio::AudioConfig) -> pb::AudioConfig {
+    pb::AudioConfig {
+        sample_rate_hz: value.sample_rate_hz,
+        channels: u32::from(value.channels),
+        streams: u32::from(value.streams),
+        coupled_streams: u32::from(value.coupled_streams),
+        channel_mapping: value.channel_mapping,
+    }
+}
+
+fn audio_from_pb(value: pb::AudioConfig) -> Result<crate::audio::AudioConfig, CodecError> {
+    Ok(crate::audio::AudioConfig {
+        sample_rate_hz: value.sample_rate_hz,
+        channels: u8::try_from(value.channels).map_err(|_| CodecError::Wire("channels > u8"))?,
+        streams: u8::try_from(value.streams).map_err(|_| CodecError::Wire("streams > u8"))?,
+        coupled_streams: u8::try_from(value.coupled_streams)
+            .map_err(|_| CodecError::Wire("coupled_streams > u8"))?,
+        channel_mapping: value.channel_mapping,
+    })
+}
+
+fn video_to_pb(value: NegotiatedVideo) -> pb::NegotiatedVideo {
+    pb::NegotiatedVideo {
+        stream_id: value.stream_id.0,
+        display_id: value.display_id.0,
+        profile: Some(profile_to_pb(value.profile)),
+        pixel_format: pixel_to_pb(value.pixel_format),
+        color_space: Some(color_to_pb(value.color_space)),
+    }
+}
+
+fn video_from_pb(value: Option<pb::NegotiatedVideo>) -> Result<NegotiatedVideo, CodecError> {
+    let value = value.ok_or(CodecError::Wire("missing NegotiatedVideo"))?;
+    Ok(NegotiatedVideo {
+        stream_id: VideoStreamId(value.stream_id),
+        display_id: DisplayId(value.display_id),
+        profile: profile_from_pb(
+            value
+                .profile
+                .ok_or(CodecError::Wire("missing VideoProfile"))?,
+        )?,
+        pixel_format: pixel_from_pb(value.pixel_format)?,
+        color_space: color_from_pb(value.color_space)?,
+    })
+}
+
+fn handshake_failure_to_pb(value: HandshakeFailure) -> pb::HandshakeFailure {
+    pb::HandshakeFailure {
+        code: goodbye_to_pb(value.code),
+        reason: value.reason,
+    }
+}
+
+fn handshake_failure_from_pb(value: pb::HandshakeFailure) -> Result<HandshakeFailure, CodecError> {
+    Ok(HandshakeFailure {
+        code: goodbye_from_pb(value.code)?,
+        reason: value.reason,
+    })
+}
+
+fn status_to_pb(value: DisplayModeStatus) -> i32 {
+    match value {
+        DisplayModeStatus::Applied => 1,
+        DisplayModeStatus::Unsupported => 2,
+        DisplayModeStatus::InvalidMode => 3,
+        DisplayModeStatus::PermissionDenied => 4,
+        DisplayModeStatus::Failed => 5,
+    }
+}
+
+fn status_from_pb(value: i32) -> Result<DisplayModeStatus, CodecError> {
+    match value {
+        1 => Ok(DisplayModeStatus::Applied),
+        2 => Ok(DisplayModeStatus::Unsupported),
+        3 => Ok(DisplayModeStatus::InvalidMode),
+        4 => Ok(DisplayModeStatus::PermissionDenied),
+        5 => Ok(DisplayModeStatus::Failed),
+        _ => Err(CodecError::Wire("unknown DisplayModeStatus")),
+    }
+}
+
+fn goodbye_to_pb(value: GoodbyeCode) -> i32 {
+    match value {
+        GoodbyeCode::Clean => 1,
+        GoodbyeCode::ProtocolError => 2,
+        GoodbyeCode::UnsupportedVersion => 3,
+        GoodbyeCode::InternalError => 4,
+    }
+}
+
+fn goodbye_from_pb(value: i32) -> Result<GoodbyeCode, CodecError> {
+    match value {
+        1 => Ok(GoodbyeCode::Clean),
+        2 => Ok(GoodbyeCode::ProtocolError),
+        3 => Ok(GoodbyeCode::UnsupportedVersion),
+        4 => Ok(GoodbyeCode::InternalError),
+        _ => Err(CodecError::Wire("unknown GoodbyeCode")),
+    }
+}
+
+fn cursor_mode_to_pb(value: CursorMode) -> i32 {
+    match value {
+        CursorMode::Absolute => 1,
+        CursorMode::Relative => 2,
+    }
+}
+
+fn cursor_mode_from_pb(value: i32) -> Result<CursorMode, CodecError> {
+    match value {
+        1 => Ok(CursorMode::Absolute),
+        2 => Ok(CursorMode::Relative),
+        _ => Err(CodecError::Wire("unknown CursorMode")),
+    }
+}
+
+fn cursor_pixel_to_pb(value: crate::cursor::CursorPixelFormat) -> i32 {
+    match value {
+        crate::cursor::CursorPixelFormat::Rgba8 => 1,
+    }
+}
+
+fn cursor_pixel_from_pb(value: i32) -> Result<crate::cursor::CursorPixelFormat, CodecError> {
+    match value {
+        1 => Ok(crate::cursor::CursorPixelFormat::Rgba8),
+        _ => Err(CodecError::Wire("unknown CursorPixelFormat")),
+    }
+}
+
+impl ReliableMessage for ClientHello {
+    fn encode_reliable(&self) -> Vec<u8> {
+        pb::ClientHello {
+            client_name: self.client_name.clone(),
+            decode_profiles: self
+                .decode_profiles
+                .iter()
+                .copied()
+                .map(profile_to_pb)
+                .collect(),
+            initial_viewport: self.initial_viewport.map(viewport_to_pb),
+            input_capabilities: Some(input_caps_to_pb(self.input_capabilities)),
+            requested_features: self
+                .requested_features
+                .iter()
+                .cloned()
+                .map(feature_advert_to_pb)
+                .collect(),
+        }
+        .encode_to_vec()
+    }
+
+    fn decode_reliable(bytes: &[u8]) -> Result<Self, CodecError> {
+        let hello = pb::ClientHello::decode(bytes)?;
+        Ok(Self {
+            client_name: hello.client_name,
+            decode_profiles: hello
+                .decode_profiles
+                .into_iter()
+                .filter_map(advertised_profile_from_pb)
+                .collect(),
+            initial_viewport: hello.initial_viewport.map(viewport_from_pb),
+            input_capabilities: input_caps_from_pb(hello.input_capabilities),
+            requested_features: hello
+                .requested_features
+                .into_iter()
+                .map(feature_advert_from_pb)
+                .collect(),
+        })
+    }
+}
+
+impl ReliableMessage for ServerHello {
+    fn encode_reliable(&self) -> Vec<u8> {
+        pb::ServerHello {
+            server_name: self.server_name.clone(),
+            video: Some(video_to_pb(self.video.clone())),
+            audio: self.audio.clone().map(audio_to_pb),
+            displays: self.displays.iter().cloned().map(display_to_pb).collect(),
+            accepted_features: self
+                .accepted_features
+                .iter()
+                .cloned()
+                .map(feature_accept_to_pb)
+                .collect(),
+        }
+        .encode_to_vec()
+    }
+
+    fn decode_reliable(bytes: &[u8]) -> Result<Self, CodecError> {
+        let hello = pb::ServerHello::decode(bytes)?;
+        Ok(Self {
+            server_name: hello.server_name,
+            video: video_from_pb(hello.video)?,
+            audio: hello.audio.map(audio_from_pb).transpose()?,
+            displays: hello
+                .displays
+                .into_iter()
+                .map(display_from_pb)
+                .collect::<Result<_, _>>()?,
+            accepted_features: hello
+                .accepted_features
+                .into_iter()
+                .map(feature_accept_from_pb)
+                .collect(),
+        })
+    }
+}
+
+impl ReliableMessage for ServerHandshake {
+    fn encode_reliable(&self) -> Vec<u8> {
+        use pb::server_handshake::Kind;
+        let kind = match self.clone() {
+            ServerHandshake::Accepted(server) => {
+                let pb = pb::ServerHello {
+                    server_name: server.server_name,
+                    video: Some(video_to_pb(server.video)),
+                    audio: server.audio.map(audio_to_pb),
+                    displays: server.displays.into_iter().map(display_to_pb).collect(),
+                    accepted_features: server
+                        .accepted_features
+                        .into_iter()
+                        .map(feature_accept_to_pb)
+                        .collect(),
+                };
+                Kind::Accepted(pb)
+            }
+            ServerHandshake::Rejected(failure) => Kind::Rejected(handshake_failure_to_pb(failure)),
+        };
+        pb::ServerHandshake { kind: Some(kind) }.encode_to_vec()
+    }
+
+    fn decode_reliable(bytes: &[u8]) -> Result<Self, CodecError> {
+        use pb::server_handshake::Kind;
+        let handshake = pb::ServerHandshake::decode(bytes)?;
+        match handshake
+            .kind
+            .ok_or(CodecError::Wire("missing ServerHandshake kind"))?
+        {
+            Kind::Accepted(server) => Ok(ServerHandshake::Accepted(ServerHello {
+                server_name: server.server_name,
+                video: video_from_pb(server.video)?,
+                audio: server.audio.map(audio_from_pb).transpose()?,
+                displays: server
+                    .displays
+                    .into_iter()
+                    .map(display_from_pb)
+                    .collect::<Result<_, _>>()?,
+                accepted_features: server
+                    .accepted_features
+                    .into_iter()
+                    .map(feature_accept_from_pb)
+                    .collect(),
+            })),
+            Kind::Rejected(failure) => Ok(ServerHandshake::Rejected(handshake_failure_from_pb(
+                failure,
+            )?)),
+        }
+    }
+}
+
+impl ReliableMessage for ControlMessage {
+    fn encode_reliable(&self) -> Vec<u8> {
+        use pb::control_message::Kind;
+        let kind = match self.clone() {
+            ControlMessage::ForceIdr => Kind::ForceIdr(pb::Empty {}),
+            ControlMessage::RequestRecovery {
+                last_reassembled_frame_id,
+            } => Kind::RequestRecovery(pb::RequestRecovery {
+                last_reassembled_frame_id,
+            }),
+            ControlMessage::ClockProbeRequest { t0_sender } => {
+                Kind::ClockProbeRequest(pb::ClockProbeRequest {
+                    t0_sender: Some(mono_to_pb(t0_sender)),
+                })
+            }
+            ControlMessage::ClockProbeResponse(probe) => Kind::ClockProbeResponse(pb::ClockProbe {
+                t0_sender: Some(mono_to_pb(probe.t0_sender)),
+                t1_receiver_recv: Some(mono_to_pb(probe.t1_receiver_recv)),
+                t2_receiver_send: Some(mono_to_pb(probe.t2_receiver_send)),
+            }),
+            ControlMessage::Goodbye { reason, code } => Kind::Goodbye(pb::Goodbye {
+                reason,
+                code: goodbye_to_pb(code),
+            }),
+            ControlMessage::Extension(msg) => Kind::Extension(extension_to_pb(msg)),
+            ControlMessage::CursorShape {
+                id,
+                hotspot,
+                width,
+                height,
+                format,
+                pixels,
+            } => Kind::CursorShape(pb::CursorShape {
+                id,
+                hotspot_x: u32::from(hotspot.0),
+                hotspot_y: u32::from(hotspot.1),
+                width: u32::from(width),
+                height: u32::from(height),
+                format: cursor_pixel_to_pb(format),
+                pixels,
+            }),
+            ControlMessage::CursorUseShape { id } => {
+                Kind::CursorUseShape(pb::CursorUseShape { id })
+            }
+            ControlMessage::DisplayList { displays } => Kind::DisplayList(pb::DisplayList {
+                displays: displays.into_iter().map(display_to_pb).collect(),
+            }),
+            ControlMessage::SetActiveDisplays { displays } => {
+                Kind::SetActiveDisplays(pb::SetActiveDisplays {
+                    displays: displays.into_iter().map(|d| d.0).collect(),
+                })
+            }
+            ControlMessage::StreamReady { video, audio } => {
+                Kind::StreamReady(pb::StreamReady { video, audio })
+            }
+            ControlMessage::StreamPause { stream_id } => Kind::StreamPause(pb::StreamPause {
+                stream_id: stream_id.0,
+            }),
+            ControlMessage::StreamResume { stream_id } => Kind::StreamResume(pb::StreamResume {
+                stream_id: stream_id.0,
+            }),
+            ControlMessage::ClientStats {
+                interval_ms,
+                frames_received,
+                frames_dropped,
+                fragments_lost,
+                rtt_ewma_us,
+            } => Kind::ClientStats(pb::ClientStats {
+                interval_ms,
+                frames_received,
+                frames_dropped,
+                fragments_lost,
+                rtt_ewma_us,
+            }),
+            ControlMessage::SetCursorMode { mode } => Kind::SetCursorMode(pb::SetCursorMode {
+                mode: cursor_mode_to_pb(mode),
+            }),
+            ControlMessage::SetViewportHint {
+                stream_id,
+                viewport,
+            } => Kind::SetViewportHint(pb::SetViewportHint {
+                stream_id: stream_id.0,
+                viewport: Some(viewport_to_pb(viewport)),
+            }),
+            ControlMessage::SetDisplayMode {
+                request_id,
+                display_id,
+                mode,
+                restore_on_disconnect,
+            } => Kind::SetDisplayMode(pb::SetDisplayMode {
+                request_id: request_id.0,
+                display_id: display_id.0,
+                mode: Some(display_mode_to_pb(mode)),
+                restore_on_disconnect,
+            }),
+            ControlMessage::DisplayModeResult {
+                request_id,
+                display_id,
+                status,
+                actual_mode,
+            } => Kind::DisplayModeResult(pb::DisplayModeResult {
+                request_id: request_id.0,
+                display_id: display_id.0,
+                status: status_to_pb(status),
+                actual_mode: actual_mode.map(display_mode_to_pb),
+            }),
+        };
+        pb::ControlMessage { kind: Some(kind) }.encode_to_vec()
+    }
+
+    fn decode_reliable(bytes: &[u8]) -> Result<Self, CodecError> {
+        use pb::control_message::Kind;
+        let msg = pb::ControlMessage::decode(bytes)?;
+        let kind = msg
+            .kind
+            .ok_or(CodecError::Wire("missing ControlMessage kind"))?;
+        match kind {
+            Kind::ForceIdr(_) => Ok(ControlMessage::ForceIdr),
+            Kind::RequestRecovery(v) => Ok(ControlMessage::RequestRecovery {
+                last_reassembled_frame_id: v.last_reassembled_frame_id,
+            }),
+            Kind::ClockProbeRequest(v) => Ok(ControlMessage::ClockProbeRequest {
+                t0_sender: mono_from_pb(v.t0_sender)?,
+            }),
+            Kind::ClockProbeResponse(v) => Ok(ControlMessage::ClockProbeResponse(ClockProbe {
+                t0_sender: mono_from_pb(v.t0_sender)?,
+                t1_receiver_recv: mono_from_pb(v.t1_receiver_recv)?,
+                t2_receiver_send: mono_from_pb(v.t2_receiver_send)?,
+            })),
+            Kind::Goodbye(v) => Ok(ControlMessage::Goodbye {
+                reason: v.reason,
+                code: goodbye_from_pb(v.code)?,
+            }),
+            Kind::Extension(v) => Ok(ControlMessage::Extension(extension_from_pb(v))),
+            Kind::CursorShape(v) => Ok(ControlMessage::CursorShape {
+                id: v.id,
+                hotspot: (
+                    u16::try_from(v.hotspot_x).map_err(|_| CodecError::Wire("hotspot_x > u16"))?,
+                    u16::try_from(v.hotspot_y).map_err(|_| CodecError::Wire("hotspot_y > u16"))?,
+                ),
+                width: u16::try_from(v.width)
+                    .map_err(|_| CodecError::Wire("cursor width > u16"))?,
+                height: u16::try_from(v.height)
+                    .map_err(|_| CodecError::Wire("cursor height > u16"))?,
+                format: cursor_pixel_from_pb(v.format)?,
+                pixels: v.pixels,
+            }),
+            Kind::CursorUseShape(v) => Ok(ControlMessage::CursorUseShape { id: v.id }),
+            Kind::DisplayList(v) => Ok(ControlMessage::DisplayList {
+                displays: v
+                    .displays
+                    .into_iter()
+                    .map(display_from_pb)
+                    .collect::<Result<_, _>>()?,
+            }),
+            Kind::SetActiveDisplays(v) => Ok(ControlMessage::SetActiveDisplays {
+                displays: v.displays.into_iter().map(DisplayId).collect(),
+            }),
+            Kind::StreamReady(v) => Ok(ControlMessage::StreamReady {
+                video: v.video,
+                audio: v.audio,
+            }),
+            Kind::StreamPause(v) => Ok(ControlMessage::StreamPause {
+                stream_id: VideoStreamId(v.stream_id),
+            }),
+            Kind::StreamResume(v) => Ok(ControlMessage::StreamResume {
+                stream_id: VideoStreamId(v.stream_id),
+            }),
+            Kind::ClientStats(v) => Ok(ControlMessage::ClientStats {
+                interval_ms: v.interval_ms,
+                frames_received: v.frames_received,
+                frames_dropped: v.frames_dropped,
+                fragments_lost: v.fragments_lost,
+                rtt_ewma_us: v.rtt_ewma_us,
+            }),
+            Kind::SetCursorMode(v) => Ok(ControlMessage::SetCursorMode {
+                mode: cursor_mode_from_pb(v.mode)?,
+            }),
+            Kind::SetViewportHint(v) => Ok(ControlMessage::SetViewportHint {
+                stream_id: VideoStreamId(v.stream_id),
+                viewport: viewport_from_pb(
+                    v.viewport
+                        .ok_or(CodecError::Wire("missing viewport hint"))?,
+                ),
+            }),
+            Kind::SetDisplayMode(v) => Ok(ControlMessage::SetDisplayMode {
+                request_id: RequestId(v.request_id),
+                display_id: DisplayId(v.display_id),
+                mode: display_mode_from_pb(v.mode)?,
+                restore_on_disconnect: v.restore_on_disconnect,
+            }),
+            Kind::DisplayModeResult(v) => Ok(ControlMessage::DisplayModeResult {
+                request_id: RequestId(v.request_id),
+                display_id: DisplayId(v.display_id),
+                status: status_from_pb(v.status)?,
+                actual_mode: v
+                    .actual_mode
+                    .map(|m| display_mode_from_pb(Some(m)))
+                    .transpose()?,
+            }),
+        }
     }
 }
 

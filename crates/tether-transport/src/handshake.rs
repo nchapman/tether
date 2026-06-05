@@ -5,8 +5,7 @@
 //! [`send_server_hello`] carry an unenforced ordering invariant: `recv`
 //! must be called exactly once before `send` is called exactly once. A
 //! double-`send` corrupts the wire (the client decodes the second
-//! `ServerHello` body as the next `ControlMessage`); a `send` without a
-//! prior `recv` sends stamps based on uninitialized `MonoNanos` values.
+//! `ServerHello` body as the next `ControlMessage`).
 //!
 //! [`HostHandshake`] and [`ClientHelloReceived`] enforce that ordering
 //! at the type level. Each state owns the `Arc<dyn ControlChannel>` by
@@ -29,10 +28,8 @@
 
 use std::sync::Arc;
 
-use tether_protocol::control::{ClientHello, ServerHello};
-use tether_protocol::MonoNanos;
-
 use crate::{ControlChannel, Result};
+use tether_protocol::control::{ClientHello, HandshakeFailure, ServerHello};
 
 /// Initial state. Holds the channel; the only operation is to receive
 /// the [`ClientHello`].
@@ -40,10 +37,7 @@ pub struct HostHandshake {
     channel: Arc<dyn ControlChannel>,
 }
 
-/// Post-`recv` state. Carries the two clock-sync stamps captured
-/// during `recv` (`client_t0` echoed from the wire, `t1_server_recv`
-/// from the local clock at recv-return). The only operation is to
-/// send the [`ServerHello`].
+/// Post-`recv` state. The only operation is to send the [`ServerHello`].
 ///
 /// The parsed [`ClientHello`] is returned separately from
 /// [`HostHandshake::recv_client_hello`] so orchestration code can move
@@ -51,8 +45,6 @@ pub struct HostHandshake {
 /// session state) without having to clone it out of the typestate.
 pub struct ClientHelloReceived {
     channel: Arc<dyn ControlChannel>,
-    client_t0: MonoNanos,
-    t1_server_recv: MonoNanos,
 }
 
 impl HostHandshake {
@@ -60,39 +52,34 @@ impl HostHandshake {
         Self { channel }
     }
 
-    /// Awaits the [`ClientHello`] and captures `t1_server_recv`. The
-    /// returned [`ClientHelloReceived`] is the only path forward —
-    /// there is no way to call `send_server_hello` on the trait without
-    /// going through it.
-    ///
-    /// **Performance contract**: keep work between this returning and
-    /// the follow-up [`ClientHelloReceived::send_server_hello`] under
-    /// 1 ms. The duration biases the NTP-style clock-sync offset
-    /// estimator by half its wall-clock length. See
-    /// [`crate::ControlChannel::recv_client_hello`] for the detailed
-    /// bound.
+    /// Awaits the [`ClientHello`]. The returned [`ClientHelloReceived`] is the
+    /// only path forward — there is no way to call `send_server_hello` on the
+    /// trait without going through it.
     pub async fn recv_client_hello(self) -> Result<(ClientHello, ClientHelloReceived)> {
-        let (client_hello, t1_server_recv) = self.channel.recv_client_hello().await?;
-        let client_t0 = match &client_hello {
-            ClientHello::V1(body) => body.clock_probe_t0,
-        };
+        let client_hello = self.channel.recv_client_hello().await?;
         let pending = ClientHelloReceived {
             channel: self.channel,
-            client_t0,
-            t1_server_recv,
         };
         Ok((client_hello, pending))
     }
 }
 
 impl ClientHelloReceived {
-    /// Stamps the supplied [`ServerHello`] with `t0_echo` /
-    /// `t1_server_recv` / `t2_server_send` and writes it. Returns the
-    /// channel so the caller can resume post-handshake control-message
-    /// exchange.
+    /// Sends the supplied [`ServerHello`]. Returns the channel so the caller
+    /// can resume post-handshake control-message exchange.
     pub async fn send_server_hello(self, server: ServerHello) -> Result<Arc<dyn ControlChannel>> {
+        self.channel.send_server_hello(server).await?;
+        Ok(self.channel)
+    }
+
+    /// Sends a typed handshake rejection. Returns the channel so callers can
+    /// close or drain deliberately if needed.
+    pub async fn send_rejection(
+        self,
+        failure: HandshakeFailure,
+    ) -> Result<Arc<dyn ControlChannel>> {
         self.channel
-            .send_server_hello(server, self.client_t0, self.t1_server_recv)
+            .send_server_handshake_rejection(failure)
             .await?;
         Ok(self.channel)
     }
@@ -102,36 +89,46 @@ impl ClientHelloReceived {
 mod tests {
     use super::*;
     use crate::test_support::duplex_pair;
-    use std::collections::BTreeMap;
     use tether_protocol::control::{
-        ChromaSubsampling, ClientHelloV1, CodecKind, ServerHelloV1, VideoColorSpec,
+        DisplayDescriptor, DisplayId, DisplayMode, InputCapabilities, NegotiatedVideo, PixelFormat,
+        VideoColorSpec, VideoProfile, VideoStreamId,
     };
 
     fn hello() -> ClientHello {
-        ClientHello::V1(ClientHelloV1 {
+        ClientHello {
             client_name: "t".into(),
-            preferred_codecs: vec![CodecKind::H264],
-            max_resolution: None,
-            viewport: None,
-            clock_probe_t0: MonoNanos::now(),
-            extensions: BTreeMap::new(),
-            resume_token: None,
-        })
+            decode_profiles: vec![VideoProfile::H264_8BIT_420],
+            initial_viewport: None,
+            input_capabilities: InputCapabilities::default(),
+            requested_features: Vec::new(),
+        }
     }
 
     fn server() -> ServerHello {
-        ServerHello::V1(ServerHelloV1 {
+        let mode = DisplayMode::new(1280, 720, 60_000);
+        ServerHello {
             server_name: "s".into(),
-            chosen_codec: CodecKind::H264,
-            chosen_chroma: ChromaSubsampling::Yuv420,
-            color_space: VideoColorSpec::sdr_desktop(),
-            resolution: (0, 0),
-            clock_probe_t0_echo: MonoNanos::ZERO,
-            t1_server_recv: MonoNanos::ZERO,
-            t2_server_send: MonoNanos::ZERO,
-            extensions: BTreeMap::new(),
-            resume_token: None,
-        })
+            video: NegotiatedVideo {
+                stream_id: VideoStreamId(0),
+                display_id: DisplayId(0),
+                profile: VideoProfile::H264_8BIT_420,
+                pixel_format: PixelFormat::Nv12,
+                color_space: VideoColorSpec::sdr_desktop(),
+            },
+            audio: None,
+            displays: vec![DisplayDescriptor {
+                id: DisplayId(0),
+                name: "test".into(),
+                scale_num: 1,
+                scale_den: 1,
+                primary: true,
+                position: (0, 0),
+                current_mode: mode,
+                available_modes: vec![mode],
+                can_set_mode: false,
+            }],
+            accepted_features: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -147,7 +144,7 @@ mod tests {
             drop(channel);
         };
         let client_fut = async move {
-            let (_server, _sync) = client.client_handshake(hello()).await.unwrap();
+            let _server = client.client_handshake(hello()).await.unwrap();
         };
         tokio::join!(host_fut, client_fut);
     }

@@ -3698,6 +3698,7 @@ name = "tether-client"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "crossbeam-channel",
  "tether-audio",
  "tether-codec",

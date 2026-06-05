@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use crossbeam_channel::bounded;
 use tether_decode::{DecodeCompletion, DecodeJob};
 use tether_input::{WinitTranslator, WireEvent};
@@ -675,12 +676,21 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 Ok(Datagram::Audio(AudioPacket::Opus {
-                    frame_seq, payload, ..
+                    stream_epoch,
+                    frame_seq,
+                    payload,
+                    redundant,
+                    ..
                 })) => {
                     // Forward to the audio decode thread; drop on a full channel
                     // (decoder behind) — audio is loss-tolerant.
                     if let Some(tx) = &audio_tx {
-                        let _ = tx.try_send((frame_seq, payload));
+                        let _ = tx.try_send(AudioFrameMsg {
+                            stream_epoch,
+                            seq: frame_seq,
+                            payload,
+                            redundant,
+                        });
                     }
                     continue;
                 }
@@ -1266,9 +1276,16 @@ fn take_flag_value<'a>(
     }
 }
 
-/// `(frame_seq, opus_payload)` handed from the datagram recv loop to the audio
-/// playback thread; the sequence number drives gap-detected concealment.
-type AudioFrameMsg = (u32, Vec<u8>);
+/// One audio datagram handed from the recv loop to the playback thread. The
+/// sequence number drives gap-detected concealment; `redundant` is the RED tail
+/// (previous payloads, newest-first) used to recover a lost frame without a
+/// concealment click.
+struct AudioFrameMsg {
+    stream_epoch: u32,
+    seq: u32,
+    payload: Bytes,
+    redundant: Vec<Bytes>,
+}
 
 /// If audio is enabled and the host advertised an `AudioConfig`, spawn the
 /// playback thread and return a sender the recv loop feeds Opus frames to,
@@ -1339,10 +1356,11 @@ fn setup_audio_playback(
     }
 }
 
-/// Audio playback thread: decode incoming Opus frames, conceal sequence gaps,
-/// and push PCM into the playback ring feeding the cpal output stream. Owns the
-/// `AudioPlayer` (and thus the cpal stream) for its lifetime; returns when the
-/// channel closes (session ending), dropping the player to stop playback.
+/// Audio playback thread: decode incoming Opus frames, recover/conceal sequence
+/// gaps (via [`tether_audio::LossRecovery`]), and push PCM into the playback
+/// ring feeding the cpal output stream. Owns the `AudioPlayer` (and thus the
+/// cpal stream) for its lifetime; returns when the channel closes (session
+/// ending), dropping the player to stop playback.
 fn run_audio_playback(
     cfg: tether_audio::OpusConfig,
     rx: crossbeam_channel::Receiver<AudioFrameMsg>,
@@ -1354,72 +1372,104 @@ fn run_audio_playback(
             return;
         }
     };
-    let mut decoder = match tether_audio::OpusDecoder::new(cfg) {
+    let decoder = match tether_audio::OpusDecoder::new(cfg) {
         Ok(d) => d,
         Err(e) => {
             warn!(error = %e, "opus decoder init failed; no playback");
             return;
         }
     };
+    // Owns the decoder + sequence state; turns each datagram into PCM frames,
+    // healing losses from the RED tail before falling back to PLC. The loss
+    // counters it accumulates (recovered/concealed/dropout/stale) are surfaced
+    // in the stats log below — on a clean LAN all stay ~0; recovered_frames
+    // climbing while concealed/dropout stay low means RED is doing its job.
+    let mut recovery = tether_audio::LossRecovery::new(decoder);
 
-    // Cap concealment per packet so a crafted/huge sequence jump can't insert a
-    // long silence or spin. ~80 ms at 10 ms frames.
-    const MAX_CONCEAL: u32 = 8;
-    let mut last_seq: Option<u32> = None;
+    // The host runs one encoder for the whole session, so stream_epoch is a
+    // constant 0. We don't handle an audio encoder restart (decoder reset +
+    // sequence rebase) yet; guard against silently decoding cross-epoch state
+    // with stale decoder/RED context if that path is ever half-wired on the
+    // host — fail loud (warn once) and drop the foreign-epoch packets.
+    let mut audio_epoch: Option<u32> = None;
+    let mut epoch_mismatch_logged = false;
 
     // Periodic playback-health snapshot. The ring's drift/underrun behaviour is
     // otherwise invisible: cap-and-drop silently absorbs overflow and silence
     // fills underruns, so without this a multi-minute session shows nothing.
-    // Frame-driven (audio arrives ~every 10 ms), like the host's send-stats —
+    // Frame-driven (audio arrives ~every 5 ms), like the host's send-stats —
     // when audio stops, so does the log. 2 s matches the video stats cadence.
+    // Counters are logged as per-interval deltas (matching the video stats
+    // line), so a transient loss spike stands out instead of being buried in a
+    // climbing session total — hence the `prev_*` snapshots below.
     const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
     let mut last_stats_log = std::time::Instant::now();
+    let mut prev_underruns: u64 = 0;
+    let mut prev_dropped_samples: u64 = 0;
+    let mut prev_recovery = tether_audio::RecoveryStats::default();
     // Peak |sample| of decoded audio since the last log. ~0 means the frames
     // arriving are silent (the silence is upstream — capture/encode), which
     // distinguishes that from a local output-routing problem where non-zero
     // audio is played but not heard.
     let mut peak: f32 = 0.0;
 
-    while let Ok((seq, payload)) = rx.recv() {
-        if let Some(prev) = last_seq {
-            // Forward distance from the last delivered frame. A small positive
-            // gap is real loss → conceal the missing frames. A gap of 1 is the
-            // in-order case (nothing missing); 0 (duplicate) or a large value
-            // (reordered late packet, or a future epoch reset) is *not* treated
-            // as loss, so a backward/late packet can't trigger spurious silence.
-            let gap = seq.wrapping_sub(prev);
-            if (2..=MAX_CONCEAL + 1).contains(&gap) {
-                for _ in 0..gap - 1 {
-                    sink.submit(&decoder.conceal());
+    while let Ok(AudioFrameMsg {
+        stream_epoch,
+        seq,
+        payload,
+        redundant,
+    }) = rx.recv()
+    {
+        match audio_epoch {
+            None => audio_epoch = Some(stream_epoch),
+            Some(expected) if stream_epoch != expected => {
+                if !epoch_mismatch_logged {
+                    epoch_mismatch_logged = true;
+                    warn!(
+                        expected,
+                        got = stream_epoch,
+                        "audio stream_epoch changed mid-session; decoder/RED reset is \
+                         not wired — dropping foreign-epoch packets"
+                    );
                 }
+                continue;
             }
+            Some(_) => {}
         }
-        match decoder.decode(&payload) {
-            Ok(pcm) => {
-                for &s in &pcm.samples {
-                    peak = peak.max(s.abs());
-                }
-                sink.submit(&pcm);
+
+        recovery.accept(seq, &payload, &redundant, |pcm| {
+            for &s in &pcm.samples {
+                peak = peak.max(s.abs());
             }
-            Err(e) => warn!(error = %e, "opus decode failed; dropping audio frame"),
-        }
-        last_seq = Some(seq);
+            sink.submit(pcm);
+        });
 
         if last_stats_log.elapsed() >= STATS_INTERVAL {
             let (underruns, dropped_samples, buffered) = sink.stats();
-            // `buffered` is interleaved samples; convert to wall-clock so drift
-            // toward an underrun (→ 0 ms) or the latency cap is legible at a
-            // glance. Cumulative counters climbing across snapshots flags a
-            // clock-drift problem the cap-and-drop policy is papering over.
+            let s = recovery.stats();
+            // `buffered` is interleaved samples → wall-clock so drift toward an
+            // underrun (→ 0 ms) or the latency cap is legible at a glance. The
+            // counters are deltas over this interval (totals climb forever and
+            // bury a transient spike); buffered_ms / peak are instantaneous /
+            // per-interval already.
             let frames_buffered = buffered / usize::from(cfg.channels).max(1);
             let buffered_ms = frames_buffered * 1000 / (cfg.sample_rate as usize).max(1);
             info!(
-                underruns,
-                dropped_samples,
+                underruns = underruns - prev_underruns,
+                dropped_samples = dropped_samples - prev_dropped_samples,
                 buffered_ms,
+                recovered_frames = s.recovered_frames - prev_recovery.recovered_frames,
+                concealed_frames = s.concealed_frames - prev_recovery.concealed_frames,
+                dropout_frames = s.dropout_frames - prev_recovery.dropout_frames,
+                dropouts = s.dropouts - prev_recovery.dropouts,
+                stale_packets = s.stale_packets - prev_recovery.stale_packets,
+                decode_errors = s.decode_errors - prev_recovery.decode_errors,
                 peak = format!("{peak:.4}"),
                 "audio playback stats"
             );
+            prev_underruns = underruns;
+            prev_dropped_samples = dropped_samples;
+            prev_recovery = s;
             last_stats_log = std::time::Instant::now();
             peak = 0.0;
         }

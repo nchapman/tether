@@ -21,11 +21,15 @@ pub mod capture;
 pub mod codec;
 mod opus_sys;
 pub mod playback;
+pub mod recovery;
+pub mod redundancy;
 pub mod test_pattern;
 
 pub use capture::{AudioCaptureHandle, CaptureError};
 pub use codec::{OpusConfig, OpusDecoder, OpusEncoder};
 pub use playback::{AudioPlayer, AudioSink, PlaybackError};
+pub use recovery::{LossRecovery, RecoveryStats};
+pub use redundancy::RedundancyBuffer;
 
 /// Session audio constants. 48 kHz stereo is the only configuration we ship
 /// in v1; the protocol's `AudioConfig` keeps the door open for surround.

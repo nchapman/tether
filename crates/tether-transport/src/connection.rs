@@ -452,7 +452,8 @@ mod tests {
             stream_epoch: 7,
             frame_seq: 4321,
             t_capture: MonoNanos(123_456),
-            payload: vec![0xCD; 80],
+            payload: bytes::Bytes::from(vec![0xCD; 80]),
+            redundant: vec![bytes::Bytes::from(vec![0xAB; 60])],
         });
         let bytes = encode(&dgram).unwrap();
         assert!(bytes.len() <= MAX_DATAGRAM_PAYLOAD);
@@ -463,11 +464,13 @@ mod tests {
                 frame_seq,
                 t_capture,
                 payload,
+                redundant,
             }) => {
                 assert_eq!(stream_epoch, 7);
                 assert_eq!(frame_seq, 4321);
                 assert_eq!(t_capture, MonoNanos(123_456));
-                assert_eq!(payload, vec![0xCD; 80]);
+                assert_eq!(payload, bytes::Bytes::from(vec![0xCD; 80]));
+                assert_eq!(redundant, vec![bytes::Bytes::from(vec![0xAB; 60])]);
             }
             other => panic!("expected Datagram::Audio, got {other:?}"),
         }
@@ -483,7 +486,8 @@ mod tests {
             stream_epoch: 0,
             frame_seq: 0,
             t_capture: MonoNanos(0),
-            payload: Vec::new(),
+            payload: bytes::Bytes::new(),
+            redundant: Vec::new(),
         }))
         .unwrap();
         assert_eq!(bytes[0], 3, "Audio must be the 4th Datagram variant");

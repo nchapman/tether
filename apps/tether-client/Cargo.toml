@@ -13,6 +13,7 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 tokio.workspace = true
 crossbeam-channel.workspace = true
+bytes.workspace = true
 
 tether-protocol = { workspace = true }
 tether-transport = { workspace = true }

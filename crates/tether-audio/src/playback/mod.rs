@@ -21,12 +21,16 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{AudioFrame, OpusConfig};
 use policy::{PlaybackPolicy, PlaybackStats};
 
-/// Default jitter cushion before playback starts. ~40 ms keeps a LAN stream
-/// smooth without much added latency (Moonlight's level-2 buffer is in this
-/// range).
-pub const DEFAULT_TARGET_MS: u32 = 40;
-/// Default latency ceiling; beyond this the oldest audio is dropped.
-pub const DEFAULT_MAX_MS: u32 = 120;
+/// Default jitter cushion before playback starts. 30 ms is a tight cushion that
+/// keeps the steady-state latency this primes to low; with RED now covering
+/// loss, we don't need a fatter buffer for resilience. (Same operating point as
+/// Moonlight's SDL renderer, which gates feeding at ~30 ms of queued audio.)
+pub const DEFAULT_TARGET_MS: u32 = 30;
+/// Default latency ceiling; beyond this the oldest audio is dropped back to the
+/// target. 50 ms keeps the absolute latency floor low under clock drift — far
+/// tighter than the old 120 ms, so drops are smaller. (Comparable to Moonlight's
+/// ~50 ms SDL queue cap.)
+pub const DEFAULT_MAX_MS: u32 = 50;
 
 /// Errors bringing up audio output.
 #[derive(Debug, thiserror::Error)]

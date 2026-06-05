@@ -8,8 +8,11 @@
 //!   * **Live encoder ctl** — `opus_encoder_ctl` sets bitrate/CBR after open;
 //!     avcodec freezes rate-control at `init()`.
 //!
-//! (In-band FEC/LBRR is intentionally *not* used: it's a SILK feature, and our
-//! `RESTRICTED_LOWDELAY` mode runs CELT-only, where it's a silent no-op.)
+//! (In-band FEC/LBRR is intentionally *not* used. LBRR is a SILK feature, and
+//! our `RESTRICTED_LOWDELAY` mode forces CELT-only, where it's a silent no-op.
+//! Even in `OPUS_APPLICATION_AUDIO` our 128 kbps / 10 ms fullband-music config
+//! would stay in CELT, so LBRR would still emit little — loss resilience comes
+//! from RED redundancy instead. See `crate::redundancy`.)
 //!
 //! FFmpeg's `libavcodec.a` already carries *undefined* `opus_*` references that
 //! resolve from this same `libopus.a` at final link, so calling it ourselves

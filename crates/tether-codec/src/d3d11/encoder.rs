@@ -483,7 +483,13 @@ impl D3D11Encoder {
         sw_frame.set_height(height_i32);
         sw_frame.alloc_buffer()?;
 
-        let extradata = snapshot_extradata(&encoder, backend_name, kind)?;
+        // Media Foundation encoders never populate `extradata`; they emit
+        // parameter sets in-band on every keyframe instead (verified by
+        // `d3d11_mf_keyframes_carry_inband_parameter_sets`). The vendor
+        // backends (QSV/AMF/NVENC) populate it and rely on the prepend, so
+        // an empty snapshot there is still fatal.
+        let inband_parameter_sets = backend_name.contains("_mf");
+        let extradata = snapshot_extradata(&encoder, backend_name, kind, inband_parameter_sets)?;
         let bgra_row_bytes = (width as usize) * 4;
 
         // Keep the D3D11VA device alive — for QSV the derived device

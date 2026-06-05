@@ -42,6 +42,10 @@
 pub mod bgra_to_p010_dmabuf;
 #[cfg(target_os = "linux")]
 pub mod dmabuf_export;
+/// GPU device identity for multi-GPU pinning: read a producer device's
+/// Vulkan `deviceUUID` so the codec side binds CUDA/EGL to the same GPU.
+#[cfg(target_os = "linux")]
+pub mod gpu_select;
 #[cfg(target_os = "linux")]
 pub mod modifier_query;
 #[cfg(target_os = "linux")]

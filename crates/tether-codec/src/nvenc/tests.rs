@@ -585,3 +585,32 @@ fn nvenc_cuda_enumerates_distinct_nonzero_uuids() {
     // A UUID no device carries resolves to None (not a spurious ordinal 0).
     assert_eq!(super::cuda_ordinal_for_uuid([0xABu8; 16]), None);
 }
+
+/// End-to-end proof of the cross-API correlation key: the Vulkan `deviceUUID`
+/// of the wgpu dma-buf *producer* must equal one of the CUDA devices'
+/// `cuDeviceGetUuid` values and resolve to a concrete CUDA ordinal. This is
+/// the whole premise of multi-GPU pinning — wgpu leads, the codec side follows
+/// the producer's UUID onto the same physical GPU. If NVIDIA's Vulkan and CUDA
+/// UUIDs ever diverged, or either query read the wrong bytes, pinning would
+/// silently target the wrong GPU; only real hardware catches that.
+#[test]
+#[ignore = "requires NVIDIA GPU + Vulkan + libcuda (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_producer_uuid_resolves_to_a_cuda_ordinal() {
+    use tether_gpuconvert::Nv12DmaBuf;
+
+    let bridge =
+        pollster::block_on(Nv12DmaBuf::new(256, 256)).expect("construct BGRA→NV12 producer bridge");
+    let producer_uuid = tether_gpuconvert::gpu_select::device_uuid(bridge.device())
+        .expect("producer device is Vulkan-backed");
+
+    let cuda = super::cuda_device_uuids();
+    assert!(
+        cuda.iter().any(|(_, uuid)| *uuid == producer_uuid),
+        "wgpu producer UUID {producer_uuid:02x?} is not among the CUDA devices {cuda:02x?} — \
+         Vulkan deviceUUID and CUDA UUID disagree; the cross-API pinning key is invalid"
+    );
+    assert!(
+        super::cuda_ordinal_for_uuid(producer_uuid).is_some(),
+        "producer UUID {producer_uuid:02x?} did not resolve to a CUDA ordinal"
+    );
+}

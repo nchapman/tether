@@ -29,16 +29,16 @@ impl NvdecProbe {
 }
 
 fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
-    // The NVDEC zero-copy path exports NV12 (4:2:0 8-bit) surfaces only — the
-    // decoder rejects any other layout, so a 10-bit / 4:4:4 decode can never
-    // succeed here. Don't even attempt it: feeding NVDEC a 10-bit / 4:4:4
-    // bitstream to then reject is wasted work, and on some streams the NVDEC
-    // runtime faults inside `send_packet` rather than erroring cleanly. Report
-    // unsupported up front so negotiation drops these rungs to the NV12 floor.
-    if profile.chroma != ChromaSubsampling::Yuv420 || profile.bit_depth != 8 {
+    // The NVDEC zero-copy path exports 4:2:0 surfaces only — NV12 (8-bit) and
+    // P010 (10-bit). 4:4:4 has no surface-pool layout, so the decoder rejects
+    // it; don't even attempt it (feeding NVDEC a 4:4:4 bitstream to then reject
+    // is wasted work, and on some streams the NVDEC runtime faults inside
+    // `send_packet` rather than erroring cleanly). Report unsupported up front
+    // so negotiation drops 4:4:4 to a 4:2:0 rung.
+    if profile.chroma != ChromaSubsampling::Yuv420 {
         return Err(ProbeError::new(
             PipelineStage::Decode,
-            "NVDEC zero-copy decode is NV12 4:2:0 8-bit only (10-bit / 4:4:4 export not wired)",
+            "NVDEC zero-copy decode is 4:2:0 only (NV12 8-bit / P010 10-bit; 4:4:4 export not wired)",
         ));
     }
 

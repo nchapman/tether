@@ -18,11 +18,11 @@ use crate::h264::packet_from_bytes;
 use crate::nvenc::ffi as nvffi;
 use crate::vaapi::DECODE_EXTRA_HW_FRAMES;
 use crate::{
-    build_nv12_dmabuf_frame, init_ffmpeg, CodecError, Decoder, Frame, GpuFrame, GpuFrameSource,
+    init_ffmpeg, CodecError, Decoder, Frame, GpuFrame, GpuFrameSource,
     Result,
 };
 
-use super::surface_pool::{NvdecSurfacePool, PooledSurface};
+use super::surface_pool::{NvdecSurfaceFormat, NvdecSurfacePool, PooledSurface};
 
 /// Upper bound on a decoded frame's width/height. NVDEC's HEVC hardware max is
 /// 8192; this caps the pool allocation an attacker-influenced bitstream can
@@ -159,22 +159,21 @@ impl NvdecDecoder {
         Ok(())
     }
 
-    /// Export a decoded `AV_PIX_FMT_CUDA` frame as a zero-copy NV12 dma-buf.
+    /// Export a decoded `AV_PIX_FMT_CUDA` frame as a zero-copy 4:2:0 dma-buf —
+    /// NV12 (8-bit, Main) or P010 (10-bit, Main10), chosen from the frame's
+    /// `sw_format`.
     ///
-    /// Acquires a free pool surface, EGL-imports its dma-buf into CUDA, and
-    /// `cuMemcpy2D`s the NVDEC frame's Y and UV planes into the imported
-    /// surface (device→device, on the decoder's CUDA context). The decoded
-    /// pixels are then *in the surface*, so the NVDEC `AVFrame` and the
-    /// EGL/CUDA import resources are released immediately; only the pool slot
-    /// stays reserved (via the `GpuFrameGuard`) until the renderer drops the
-    /// frame. The renderer imports the resulting NV12 dma-buf exactly as it
-    /// does the VAAPI decoder's.
+    /// Acquires a free pool surface of the matching format, EGL-imports its
+    /// dma-buf into CUDA, and `cuMemcpy2D`s the NVDEC frame's Y and UV planes
+    /// into the imported surface (device→device, on the decoder's CUDA
+    /// context). The decoded pixels are then *in the surface*, so the NVDEC
+    /// `AVFrame` and the EGL/CUDA import resources are released immediately;
+    /// only the pool slot stays reserved (via the `GpuFrameGuard`) until the
+    /// renderer drops the frame. The renderer imports the resulting dma-buf
+    /// exactly as it does the VAAPI decoder's.
     ///
-    /// 10-bit (P010) is not yet wired here — the pool only allocates NV12
-    /// (8-bit) surfaces. A 10-bit decode would need a P010 surface pool +
-    /// `build_p010_dmabuf_frame`; deferred until the 10-bit NVDEC profile is
-    /// negotiated. For now non-NV12 sw_format reports `UnsupportedInputFormat`
-    /// rather than silently mis-copying.
+    /// 4:4:4 / 12-bit sw_formats report `UnsupportedInputFormat` rather than
+    /// silently mis-copying (the pool models only the two 4:2:0 layouts).
     // ffmpeg's i32 ABI fields (width, height, linesize) are non-negative on
     // allocated decoded frames; cast sites are at the FFI boundary and follow
     // that invariant. Same rationale as the VAAPI sibling.
@@ -198,17 +197,21 @@ impl NvdecDecoder {
             Some(frame.pts)
         };
 
-        // The CUDA hwframes sw_format tells us the on-device layout. Only NV12
-        // (8-bit) is wired on the pool; reject other layouts (P010 10-bit)
-        // loudly rather than copying NV12-shaped from a P010 surface.
-        if !self.frame_is_nv12(frame) {
-            return Err(CodecError::UnsupportedInputFormat);
-        }
+        // The CUDA hwframes sw_format tells us the on-device layout: NV12
+        // (8-bit) or P010 (10-bit) 4:2:0. Any other layout (4:4:4, 12-bit)
+        // is rejected loudly rather than copying a mismatched shape.
+        let format = self
+            .frame_surface_format(frame)
+            .ok_or(CodecError::UnsupportedInputFormat)?;
 
-        // (Re)build the pool when dims change or on first frame. The decoded
-        // frame's width/height are authoritative.
-        if self.pool.as_ref().map(NvdecSurfacePool::dims) != Some((w, h)) {
-            self.pool = Some(NvdecSurfacePool::new(w, h)?);
+        // (Re)build the pool when the dims OR the layout change (or on first
+        // frame). The decoded frame's width/height/sw_format are authoritative.
+        let pool_matches = self
+            .pool
+            .as_ref()
+            .is_some_and(|p| p.dims() == (w, h) && p.format() == format);
+        if !pool_matches {
+            self.pool = Some(NvdecSurfacePool::new(format, w, h)?);
         }
         let pool = self.pool.as_ref().expect("pool just set");
 
@@ -216,7 +219,7 @@ impl NvdecDecoder {
         // the renderer — fail cleanly (the parent may add back-pressure).
         let surface = pool.acquire().ok_or_else(|| {
             CodecError::NoHardwareCodec(
-                "NVDEC surface pool exhausted — every NV12 surface still held by the renderer"
+                "NVDEC surface pool exhausted — every surface still held by the renderer"
                     .to_string(),
             )
         })?;
@@ -228,15 +231,7 @@ impl NvdecDecoder {
         let out_fd = surface.fd.try_clone().map_err(|e| {
             CodecError::NoHardwareCodec(format!("NVDEC: dup surface fd for output frame: {e}"))
         })?;
-        let out = build_nv12_dmabuf_frame(
-            out_fd,
-            surface.size,
-            surface.modifier,
-            surface.y_offset,
-            surface.y_pitch,
-            surface.uv_offset,
-            surface.uv_pitch,
-        );
+        let out = surface.build_dmabuf_frame(out_fd);
 
         // The guard is the pool-slot release handle: dropping the GpuFrame
         // frees the slot back to the pool. The decoded pixels are already
@@ -271,15 +266,7 @@ impl NvdecDecoder {
         let import_fd = surface.fd.try_clone().map_err(|e| {
             CodecError::NoHardwareCodec(format!("NVDEC: dup surface fd for EGL import: {e}"))
         })?;
-        let surface_dmabuf = build_nv12_dmabuf_frame(
-            import_fd,
-            surface.size,
-            surface.modifier,
-            surface.y_offset,
-            surface.y_pitch,
-            surface.uv_offset,
-            surface.uv_pitch,
-        );
+        let surface_dmabuf = surface.build_dmabuf_frame(import_fd);
 
         // read_only = false: this is the decode path — we write decoded planes
         // INTO the imported surface, so it must register read-write.
@@ -293,12 +280,14 @@ impl NvdecDecoder {
             )
             .map_err(CodecError::NoHardwareCodec)?;
 
-        // Copy each NVDEC plane INTO the imported surface plane. NV12 8-bit:
-        // plane 0 = Y, full height, `w` bytes/row; plane 1 = interleaved UV,
-        // half height, `w` bytes/row (w/2 CbCr pairs × 2 bytes). The source is
-        // the NVDEC frame's device pointer + linesize; the destination is the
-        // EGL-imported surface plane (copy_plane_from handles PITCH vs ARRAY).
-        let width_bytes = surface.width as usize;
+        // Copy each NVDEC plane INTO the imported surface plane. Both planes
+        // span `w × bytes_per_sample` bytes/row: plane 0 = Y at full height;
+        // plane 1 = interleaved UV at half height (w/2 CbCr pairs × 2 components
+        // × bytes_per_sample = w × bytes_per_sample, equal to the Y row). NV12
+        // is 1 byte/sample, P010 is 2. The source is the NVDEC frame's device
+        // pointer + linesize; the destination is the EGL-imported surface plane
+        // (copy_plane_from handles PITCH vs ARRAY).
+        let width_bytes = surface.width as usize * surface.format.bytes_per_sample();
         for i in 0..imported.plane_count() {
             let plane_height = if i == 0 {
                 surface.height as usize
@@ -320,25 +309,30 @@ impl NvdecDecoder {
         Ok(())
     }
 
-    /// Whether the decoded CUDA frame's on-device layout is NV12 (the only
-    /// layout the surface pool supports). Reads the hwframes context's
-    /// `sw_format`. A null hwframes ctx would violate the libavutil hwaccel
-    /// contract for an `AV_PIX_FMT_CUDA` frame; treat that as "not NV12".
-    fn frame_is_nv12(&self, frame: &AVFrame) -> bool {
+    /// Map the decoded CUDA frame's on-device layout to a pool surface format,
+    /// or `None` for a layout the pool can't represent (4:4:4, 12-bit). Reads
+    /// the hwframes context's `sw_format`: NV12 → 8-bit, P010 → 10-bit, both
+    /// 4:2:0. A null hwframes ctx would violate the libavutil hwaccel contract
+    /// for an `AV_PIX_FMT_CUDA` frame; treat that as unsupported.
+    fn frame_surface_format(&self, frame: &AVFrame) -> Option<NvdecSurfaceFormat> {
         // SAFETY: for an AV_PIX_FMT_CUDA frame FFmpeg sets hw_frames_ctx to the
         // pool's buffer ref; `data` points at an AVHWFramesContext whose
         // `sw_format` is the on-device pixel layout. We only read scalar
-        // fields. A null ptr (contract violation) short-circuits to false.
+        // fields. A null ptr (contract violation) short-circuits to None.
         unsafe {
             let hwf_ref = frame.hw_frames_ctx;
             if hwf_ref.is_null() {
-                return false;
+                return None;
             }
             let hwf = (*hwf_ref).data as *const ffi::AVHWFramesContext;
             if hwf.is_null() {
-                return false;
+                return None;
             }
-            (*hwf).sw_format == ffi::AV_PIX_FMT_NV12
+            match (*hwf).sw_format {
+                ffi::AV_PIX_FMT_NV12 => Some(NvdecSurfaceFormat::Nv12),
+                ffi::AV_PIX_FMT_P010LE => Some(NvdecSurfaceFormat::P010),
+                _ => None,
+            }
         }
     }
 }
@@ -512,6 +506,146 @@ mod tests {
             "NVDEC zero-copy Y plane differs from the software decode (MAE {mae:.2}) — \
              the dma-buf surface does not hold the correctly-decoded image"
         );
+    }
+
+    /// Encode a solid-gray HEVC **Main10** IDR through our own NVENC (the only
+    /// in-crate source of a real 10-bit bitstream — there's no committed P010
+    /// fixture) and decode it through NVDEC, asserting a zero-copy **P010**
+    /// dma-buf of the right shape comes back and its Y plane holds a uniform,
+    /// mid-range image. Exercises the 10-bit decode path end-to-end: P010
+    /// surface-pool allocation (R16 + R16G16), P010 EGL import, the 2-byte
+    /// per-sample `cuMemcpy2D` widths, and the P010 output descriptor. A wrong
+    /// copy width or plane format would show up as non-uniform luma (garbage)
+    /// or wrong dims. `#[ignore]` — needs an NVIDIA GPU + NVENC/NVDEC FFmpeg +
+    /// Vulkan dma-buf.
+    #[test]
+    #[ignore = "requires NVIDIA GPU + NVENC/NVDEC FFmpeg + Vulkan dma-buf"]
+    fn decodes_our_hevc_main10_via_nvdec_p010() {
+        use crate::nvenc::NvencEncoder;
+        use tether_gpuconvert::Bgra2P010DmaBuf;
+        use tether_protocol::control::VideoProfile;
+
+        const W: u32 = 256;
+        const H: u32 = 256;
+
+        // Encode a solid mid-gray Main10 IDR via NVENC (P010 zero-copy in).
+        let bridge = match pollster::block_on(Bgra2P010DmaBuf::new(W, H)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("SKIP decodes_our_hevc_main10_via_nvdec_p010: P010 bridge: {e}");
+                return;
+            }
+        };
+        let bgra = vec![128u8; (W * H * 4) as usize];
+        let p010 = bridge.convert_bgra_bytes(&bgra).expect("P010 convert");
+        let enc_frame = crate::build_p010_dmabuf_frame(
+            p010.fd,
+            p010.size,
+            p010.modifier,
+            p010.y_offset,
+            p010.y_stride,
+            p010.uv_offset,
+            p010.uv_stride,
+        );
+        let mut enc = NvencEncoder::new(VideoProfile::HEVC_10BIT_420, W, H, 30, 8_000)
+            .expect("NVENC HEVC Main10");
+        let mut bitstream = Vec::new();
+        for pkt in enc
+            .submit_dmabuf(&enc_frame, 0, true)
+            .expect("submit_dmabuf encode")
+        {
+            bitstream.extend_from_slice(&pkt.data);
+        }
+
+        // Decode it via NVDEC.
+        let mut dec = NvdecDecoder::new(CodecKind::Hevc).expect("nvdec decoder");
+        dec.submit(&bitstream).expect("submit");
+        dec.signal_eof().expect("signal_eof");
+        let mut got = None;
+        while let Some(f) = dec.next_frame().expect("next_frame") {
+            got = Some(f);
+        }
+
+        let Frame::Gpu(gpu) = got.expect("decoder produced a frame") else {
+            panic!("Main10 NVDEC decode must export a zero-copy Gpu frame");
+        };
+        assert_eq!((gpu.width, gpu.height), (W, H));
+        let (_w, _h, _pts, source, _guard) = gpu.into_parts();
+        let GpuFrameSource::DmaBuf(dmabuf) = source;
+        // P010 surface descriptor: fourcc 'P010', one object, two layers
+        // (Y as R16, UV as RG32).
+        assert_eq!(dmabuf.fourcc, u32::from_le_bytes(*b"P010"));
+        assert_eq!(dmabuf.objects.len(), 1);
+        assert_eq!(dmabuf.layers.len(), 2);
+        // Each 10-bit plane row spans 2 bytes/sample, so the pitch must be at
+        // least 2×width.
+        assert!(
+            dmabuf.layers[0].pitch[0] >= 2 * W,
+            "Y pitch {} < 2×width {}",
+            dmabuf.layers[0].pitch[0],
+            2 * W
+        );
+
+        // Pixel sanity: read the 16-bit Y plane back off the GPU and confirm
+        // the decoded luma is uniform (we fed a solid frame) and mid-range. A
+        // wrong copy width / plane format yields high variance or near-zero.
+        let y_stride = dmabuf.layers[0].pitch[0] as usize;
+        let y16 = readback_surface_y16(&dmabuf, W, H, y_stride);
+        let (mean, stddev) = y10_mean_stddev(&y16, y_stride, W as usize, H as usize);
+        eprintln!("Main10 NVDEC Y10 mean={mean:.1} stddev={stddev:.1} (max 1023)");
+        assert!(
+            stddev < 1023.0 * 0.05,
+            "decoded Main10 luma not uniform (stddev {stddev:.1}) — P010 copy likely garbage"
+        );
+        let frac = mean / 1023.0;
+        assert!(
+            (0.2..0.8).contains(&frac),
+            "decoded Main10 luma {mean:.1}/1023 out of mid-range — wrong plane/format"
+        );
+    }
+
+    /// EGL-import the decoded P010 surface and copy its 16-bit Y plane to host
+    /// (`width × 2` bytes/row). Returns the strided byte buffer.
+    fn readback_surface_y16(dmabuf: &crate::DmaBufFrame, w: u32, h: u32, y_stride: usize) -> Vec<u8> {
+        let cuda_dev = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, None, None, 1)
+            .expect("CUDA device for readback");
+        // SAFETY: same navigation the decoder uses to read FFmpeg's CUcontext.
+        let cuda_ctx = unsafe {
+            let buf = cuda_dev.as_ptr();
+            let dctx = (*buf).data as *const ffi::AVHWDeviceContext;
+            let cdev = (*dctx).hwctx as *const nvffi::AvCudaDeviceContext;
+            (*cdev).cuda_ctx
+        };
+        let importer = nvffi::importer().expect("EGL/CUDA importer");
+        let imported = importer
+            .import(cuda_ctx, dmabuf, w, h, true)
+            .expect("re-import P010 surface");
+        let mut y = vec![0u8; y_stride * h as usize];
+        // 16-bit Y: width_bytes = w × 2.
+        imported
+            .copy_plane_to_host(0, y.as_mut_ptr(), y_stride, w as usize * 2, h as usize)
+            .expect("readback P010 Y plane");
+        drop(imported);
+        drop(cuda_dev);
+        y
+    }
+
+    /// Mean + population stddev of the 10-bit luma over the visible region,
+    /// reading P010's 16-bit little-endian samples (value in the top 10 bits).
+    fn y10_mean_stddev(y16: &[u8], y_stride: usize, w: usize, h: usize) -> (f64, f64) {
+        let mut vals = Vec::with_capacity(w * h);
+        for row in 0..h {
+            let base = row * y_stride;
+            for x in 0..w {
+                let lo = u16::from(y16[base + x * 2]);
+                let hi = u16::from(y16[base + x * 2 + 1]);
+                vals.push(f64::from((lo | (hi << 8)) >> 6)); // top 10 bits
+            }
+        }
+        let n = vals.len() as f64;
+        let mean = vals.iter().sum::<f64>() / n;
+        let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+        (mean, var.sqrt())
     }
 
     /// EGL-import the decoded surface into a fresh CUDA context (device 0,

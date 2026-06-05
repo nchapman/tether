@@ -59,6 +59,46 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const LUMA_STRIDE_ALIGN: u32 = 64;
 const HEIGHT_ALIGN: u32 = 16;
 
+/// On-device pixel layout of the pooled surfaces. NVDEC decodes 8-bit 4:2:0
+/// into NV12 and 10-bit 4:2:0 into P010; the pool allocates the matching
+/// two-plane dma-buf (same shared-allocation layout, different per-sample
+/// width) so the decoded planes copy in and the renderer imports zero-copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NvdecSurfaceFormat {
+    /// 8-bit 4:2:0 — Y as `R8`, UV as `R8G8` (fourcc `NV12`).
+    Nv12,
+    /// 10-bit 4:2:0 — Y as `R16`, UV as `R16G16` (fourcc `P010`).
+    P010,
+}
+
+impl NvdecSurfaceFormat {
+    /// Vulkan format for the Y (luma) plane image.
+    fn y_vk_format(self) -> vk::Format {
+        match self {
+            Self::Nv12 => vk::Format::R8_UNORM,
+            Self::P010 => vk::Format::R16_UNORM,
+        }
+    }
+
+    /// Vulkan format for the interleaved UV (chroma) plane image.
+    fn uv_vk_format(self) -> vk::Format {
+        match self {
+            Self::Nv12 => vk::Format::R8G8_UNORM,
+            Self::P010 => vk::Format::R16G16_UNORM,
+        }
+    }
+
+    /// Bytes per luma sample — the per-row byte multiplier for the device copy.
+    /// (UV rows span the same byte width: `w/2` CbCr pairs × 2 components ×
+    /// `bytes_per_sample` = `w × bytes_per_sample`, equal to the Y row.)
+    pub fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::Nv12 => 1,
+            Self::P010 => 2,
+        }
+    }
+}
+
 /// The dma-buf descriptor fields for one NV12 surface, as produced by the
 /// shared-allocation export. Mirrors `tether_gpuconvert::SharedNv12Export`'s
 /// descriptor fields (minus the wgpu textures, which the decoder doesn't need
@@ -99,6 +139,7 @@ pub struct NvdecSurfacePool {
     /// handed-out surface holds the same `Arc`, also as long as any surface
     /// outlives a pool rebuild. The pool needs no separate device handle.
     slots: Vec<Slot>,
+    format: NvdecSurfaceFormat,
     width: u32,
     height: u32,
 }
@@ -113,22 +154,23 @@ unsafe impl Sync for NvdecSurfacePool {}
 
 impl NvdecSurfacePool {
     /// Build the pool: create a Vulkan device on the NVIDIA GPU with the
-    /// dma-buf external-memory extensions and allocate `POOL_SIZE` NV12
-    /// surfaces sized `width`×`height`.
+    /// dma-buf external-memory extensions and allocate `POOL_SIZE` surfaces of
+    /// `format` sized `width`×`height`.
     ///
     /// Returns `NoHardwareCodec` if no NVIDIA Vulkan device with the required
     /// extensions exists or an allocation fails — the decoder maps that to a
     /// clean failure rather than silently corrupting frames.
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(format: NvdecSurfaceFormat, width: u32, height: u32) -> Result<Self> {
         let vk = Arc::new(VulkanDevice::new_nvidia()?);
 
         let mut slots = Vec::with_capacity(POOL_SIZE);
         for i in 0..POOL_SIZE {
-            let (surface_images, export) = vk.export_nv12_surface(width, height).map_err(|e| {
-                CodecError::NoHardwareCodec(format!(
-                    "NVDEC surface pool: NV12 surface {i} allocation failed: {e}"
-                ))
-            })?;
+            let (surface_images, export) =
+                vk.export_surface(format, width, height).map_err(|e| {
+                    CodecError::NoHardwareCodec(format!(
+                        "NVDEC surface pool: {format:?} surface {i} allocation failed: {e}"
+                    ))
+                })?;
             slots.push(Slot {
                 export,
                 free: Arc::new(AtomicBool::new(true)),
@@ -141,6 +183,7 @@ impl NvdecSurfacePool {
 
         Ok(Self {
             slots,
+            format,
             width,
             height,
         })
@@ -150,6 +193,12 @@ impl NvdecSurfacePool {
     /// rebuilds the pool when the decoded frame's dims change.
     pub fn dims(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// The pixel format the pool's surfaces were allocated for. The decoder
+    /// rebuilds the pool when the decoded frame's layout changes (8↔10-bit).
+    pub fn format(&self) -> NvdecSurfaceFormat {
+        self.format
     }
 
     /// Acquire a free surface, marking its slot in-use. Returns `None` when
@@ -182,6 +231,7 @@ impl NvdecSurfacePool {
                 };
                 return Some(PooledSurface {
                     fd,
+                    format: self.format,
                     size: export.size,
                     modifier: export.modifier,
                     y_offset: export.y_offset,
@@ -266,6 +316,9 @@ pub struct PooledSurface {
     /// A dup of the surface's dma-buf fd. The decoder uses it to import the
     /// surface into CUDA; the output frame gets its own fresh dup.
     pub fd: OwnedFd,
+    /// The surface's pixel layout (NV12 / P010) — selects the dma-buf fourcc
+    /// and the per-sample byte width of the device copy.
+    pub format: NvdecSurfaceFormat,
     pub size: u64,
     pub modifier: u64,
     pub y_offset: u64,
@@ -278,6 +331,35 @@ pub struct PooledSurface {
     /// decoder's `GpuFrameGuard` so the slot stays reserved while the renderer
     /// reads the surface.
     pub release: SlotGuard,
+}
+
+impl PooledSurface {
+    /// Build the `DmaBufFrame` describing this surface from a (dup'd) fd —
+    /// `NV12` or `P010` shaped per [`Self::format`]. One source of truth for
+    /// both the EGL import descriptor and the renderer output frame, so they
+    /// can't disagree on fourcc/plane formats.
+    pub fn build_dmabuf_frame(&self, fd: OwnedFd) -> crate::DmaBufFrame {
+        match self.format {
+            NvdecSurfaceFormat::Nv12 => crate::build_nv12_dmabuf_frame(
+                fd,
+                self.size,
+                self.modifier,
+                self.y_offset,
+                self.y_pitch,
+                self.uv_offset,
+                self.uv_pitch,
+            ),
+            NvdecSurfaceFormat::P010 => crate::build_p010_dmabuf_frame(
+                fd,
+                self.size,
+                self.modifier,
+                self.y_offset,
+                self.y_pitch,
+                self.uv_offset,
+                self.uv_pitch,
+            ),
+        }
+    }
 }
 
 /// Minimal Vulkan instance + device on the NVIDIA GPU, with the extensions
@@ -407,11 +489,12 @@ impl VulkanDevice {
         })
     }
 
-    /// Allocate one NV12 surface (Y as R8 + UV as R8G8) in a single shared
-    /// `VkDeviceMemory` and export it as one dma-buf fd. The Y and UV images
-    /// live at distinct offsets in the same allocation — the layout the
-    /// renderer's `build_nv12_dmabuf_frame` import and EGL→CUDA registration
-    /// both expect.
+    /// Allocate one 4:2:0 surface of `format` (NV12: Y `R8` + UV `R8G8`;
+    /// P010: Y `R16` + UV `R16G16`) in a single shared `VkDeviceMemory` and
+    /// export it as one dma-buf fd. The Y and UV images live at distinct
+    /// offsets in the same allocation — the layout the renderer's
+    /// `build_{nv12,p010}_dmabuf_frame` import and EGL→CUDA registration both
+    /// expect.
     ///
     /// Ported from `tether_gpuconvert::shared_nv12::export_nv12_shared_dmabuf`,
     /// keeping its load-bearing 64-byte luma-pitch / 16-row alignment. The
@@ -420,8 +503,9 @@ impl VulkanDevice {
     //
     // Vulkan image dims / offsets are u32/u64 at the ABI; the only casts are
     // the aligned-dimension `next_multiple_of` results, which fit by construction.
-    fn export_nv12_surface(
+    fn export_surface(
         &self,
+        format: NvdecSurfaceFormat,
         width: u32,
         height: u32,
     ) -> std::result::Result<(SurfaceImages, SurfaceExport), String> {
@@ -463,8 +547,8 @@ impl VulkanDevice {
                 .map_err(|e| format!("vkCreateImage (NV12 shared): {e}"))
         };
 
-        let y_image = create_image(vk::Format::R8_UNORM, aligned_w, aligned_h)?;
-        let uv_image = match create_image(vk::Format::R8G8_UNORM, chroma_w, chroma_h) {
+        let y_image = create_image(format.y_vk_format(), aligned_w, aligned_h)?;
+        let uv_image = match create_image(format.uv_vk_format(), chroma_w, chroma_h) {
             Ok(i) => i,
             Err(e) => {
                 // SAFETY: y_image is live, not yet exported; destroy it.
@@ -553,7 +637,7 @@ impl VulkanDevice {
                 }
                 if y_mod_props.drm_format_modifier != uv_mod_props.drm_format_modifier {
                     return Err(format!(
-                        "NV12 surface Y/UV modifiers differ (Y 0x{:x}, UV 0x{:x}); \
+                        "surface Y/UV modifiers differ (Y 0x{:x}, UV 0x{:x}); \
                          single-modifier EGL import would fail",
                         y_mod_props.drm_format_modifier, uv_mod_props.drm_format_modifier
                     ));
@@ -679,8 +763,10 @@ mod tests {
     #[ignore = "requires NVIDIA GPU + Vulkan dma-buf"]
     fn acquire_exhausts_then_release_reuses_slots() {
         let (w, h) = (256u32, 256u32);
-        let pool = NvdecSurfacePool::new(w, h).expect("NV12 surface pool");
+        let pool =
+            NvdecSurfacePool::new(NvdecSurfaceFormat::Nv12, w, h).expect("NV12 surface pool");
         assert_eq!(pool.dims(), (w, h));
+        assert_eq!(pool.format(), NvdecSurfaceFormat::Nv12);
 
         // Drain every slot; each surface must be a well-formed NV12 descriptor.
         let mut held: Vec<PooledSurface> = Vec::new();

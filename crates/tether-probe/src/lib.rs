@@ -218,9 +218,7 @@ fn probe_host() -> Vec<ProfileSupport> {
     // per-branch comments below), so it never touches the live probe
     // backend or fixtures.
     #[cfg(not(target_os = "windows"))]
-    use host::ActiveProbe;
-    #[cfg(not(target_os = "windows"))]
-    use profile_probe::{fixture_for, ProfileProbe};
+    use profile_probe::fixture_for;
 
     // On Windows/AMF, the encoder has a single-session limit and releases
     // asynchronously on drop. Probe H.264 first so the floor codec always
@@ -278,7 +276,7 @@ fn probe_host() -> Vec<ProfileSupport> {
                 SupportStatus::Supported
             };
             #[cfg(not(target_os = "windows"))]
-            let encode = match ActiveProbe::probe_encode(profile) {
+            let encode = match host::probe_encode(profile) {
                 Ok(()) => SupportStatus::Supported,
                 Err(e) => {
                     tracing::debug!(
@@ -312,7 +310,7 @@ fn probe_host() -> Vec<ProfileSupport> {
             };
             #[cfg(not(target_os = "windows"))]
             let decode = match fixture_for(profile) {
-                Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
+                Some(fixture) => match host::probe_decode(profile, fixture) {
                     Ok(()) => SupportStatus::Supported,
                     Err(e) => {
                         tracing::debug!(
@@ -372,15 +370,14 @@ fn probe_host() -> Vec<ProfileSupport> {
 /// asking the client about encode are asking the wrong question.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn probe_client() -> Vec<ProfileSupport> {
-    use host::ActiveProbe;
-    use profile_probe::{fixture_for, ProfileProbe};
+    use profile_probe::fixture_for;
 
     PROFILE_PREFERENCE
         .iter()
         .copied()
         .map(|profile| {
             let decode = match fixture_for(profile) {
-                Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
+                Some(fixture) => match host::probe_decode(profile, fixture) {
                     Ok(()) => SupportStatus::Supported,
                     Err(e) => {
                         tracing::debug!(

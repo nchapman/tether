@@ -23,6 +23,9 @@ mod encoder_common;
 #[cfg(target_os = "linux")]
 pub mod vaapi;
 
+#[cfg(target_os = "linux")]
+pub mod nvenc;
+
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
 

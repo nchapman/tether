@@ -63,6 +63,34 @@ pub fn build_encoder(
 ) -> Result<(VideoProfile, Box<dyn Encoder>)> {
     #[cfg(target_os = "linux")]
     {
+        // On an NVIDIA host, NVENC is the encode path — full stop, no VAAPI
+        // fallback. NVENC gives the live bitrate retune / LTR / intra-refresh
+        // that FFmpeg's vaapi wrapper architecturally can't (the reason GH #16
+        // exists), and — load-bearing — the default VAAPI device on an NVIDIA
+        // box is the decode-only `nvidia-vaapi-driver`, which exposes no encode
+        // entrypoint and whose `VaapiEncoder::new` partial-inits and SIGSEGVs
+        // instead of failing cleanly (verified on an RTX 3090 Ti). So a profile
+        // NVENC can't serve is genuinely unavailable on this host, not a VAAPI
+        // candidate. `nvidia_gpu_present` is sysfs-only and shared with the host
+        // probe so the advertised set matches what this dispatch picks.
+        if crate::nvenc::nvidia_gpu_present() {
+            return match crate::nvenc::NvencEncoder::new(profile, width, height, fps, bitrate_kbps)
+            {
+                Ok(enc) => Ok((profile, Box::new(enc))),
+                Err(e) => {
+                    tracing::warn!(
+                        backend = "nvenc",
+                        codec = ?profile.codec,
+                        chroma = ?profile.chroma,
+                        bit_depth = profile.bit_depth,
+                        error = %e,
+                        "NVENC encoder construction failed"
+                    );
+                    Err(no_hw_encoder_nvenc(profile, e))
+                }
+            };
+        }
+        // Non-NVIDIA Linux: VAAPI (Intel/AMD) is the universal baseline.
         match crate::vaapi::VaapiEncoder::new(profile, width, height, fps, bitrate_kbps) {
             Ok(enc) => Ok((profile, Box::new(enc))),
             Err(e) => {
@@ -247,6 +275,27 @@ pub fn build_decoder(profile: VideoProfile, gpu_export: bool) -> Result<Box<dyn 
         let _ = profile;
         Err(no_hw_decoder_for_platform())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn no_hw_encoder_nvenc(profile: VideoProfile, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "NVENC encoder unavailable for {:?} {:?} {}-bit ({source}). \
+         This is an NVIDIA host (no VAAPI encode fallback — nvidia-vaapi-driver \
+         is decode-only). Check that `nvidia-smi` works, that the FFmpeg build \
+         has {} (`--enable-nvenc --enable-cuda`), and that you haven't hit the \
+         driver's concurrent-NVENC-session limit. Note AV1 encode needs Ada \
+         (RTX 40+) and HEVC/H.264 4:4:4 is not yet wired on the NVENC path. \
+         Tether requires GPU encode — there is no software fallback.",
+        profile.codec,
+        profile.chroma,
+        profile.bit_depth,
+        match profile.codec {
+            CodecKind::H264 => "h264_nvenc",
+            CodecKind::Hevc => "hevc_nvenc",
+            CodecKind::Av1 => "av1_nvenc",
+        },
+    ))
 }
 
 #[cfg(target_os = "linux")]

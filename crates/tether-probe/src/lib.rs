@@ -293,13 +293,23 @@ fn probe_host() -> Vec<ProfileSupport> {
                     }
                 }
             };
-            // On Windows, skip the decode probe on the host side.
+            // On Windows, skip the *live* decode probe on the host side.
             // Creating multiple D3D11VA decoder contexts triggers
             // DXGI_ERROR_DEVICE_REMOVED on the pre-created capture
             // device (AMD RDNA 4 driver bug). The client runs its own
-            // decode probe independently.
+            // decode probe independently. We still gate the static verdict
+            // on a renderer-importable format (a pure, no-hardware check) so
+            // 4:4:4 — which the codec can decode but the D3D11 renderer can't
+            // display — never reports decode-Supported here either.
             #[cfg(target_os = "windows")]
-            let decode = SupportStatus::Supported;
+            let decode = if tether_codec::d3d11::expected_decode_dxgi_format(profile).is_some() {
+                SupportStatus::Supported
+            } else {
+                SupportStatus::Unsupported {
+                    stage: PipelineStage::Decode,
+                    reason: "D3D11 renderer imports only 4:2:0 NV12/P010".into(),
+                }
+            };
             #[cfg(not(target_os = "windows"))]
             let decode = match fixture_for(profile) {
                 Some(fixture) => match ActiveProbe::probe_decode(profile, fixture) {
@@ -428,6 +438,41 @@ fn probe_client() -> Vec<ProfileSupport> {
 mod tests {
     use super::*;
     use tether_protocol::control::{ChromaSubsampling, CodecKind};
+
+    /// Regression: the D3D11 renderer imports only 4:2:0 (NV12 / P010), so
+    /// the Windows probe must never report 4:4:4 *decode* as Supported. The
+    /// codec can hardware-decode HEVC 4:4:4 (a frame comes back), but the
+    /// renderer can't display it — so advertising it would let a 4:4:4-capable
+    /// host (Mac/Linux, where 4:4:4 tops PROFILE_PREFERENCE) negotiate it, and
+    /// the client would decode but fail to render. Guards both the host static
+    /// verdict and the client live-probe gate (which rejects on format before
+    /// constructing a decoder, so this needs no GPU).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_does_not_advertise_444_decode() {
+        use crate::host::d3d11::D3D11Probe;
+        use crate::profile_probe::ProfileProbe;
+        use tether_protocol::control::VideoProfile;
+
+        // Host static path (pure on Windows — no live decode probe).
+        for s in host_supported_profiles() {
+            if s.profile.chroma == ChromaSubsampling::Yuv444 {
+                assert!(
+                    !s.is_decode_supported(),
+                    "host probe must not advertise 4:4:4 decode: {:?}",
+                    s.profile
+                );
+            }
+        }
+
+        // Client live-probe building block: the format gate rejects 4:4:4
+        // before any decoder construction, so no hardware/fixture is needed.
+        for profile in [VideoProfile::HEVC_8BIT_444, VideoProfile::HEVC_10BIT_444] {
+            let err =
+                D3D11Probe::probe_decode(profile, &[]).expect_err("4:4:4 decode must be rejected");
+            assert_eq!(err.stage, PipelineStage::Decode);
+        }
+    }
 
     /// Pin the public surface: every variant of `PipelineStage` has a
     /// stable name. The match here will fail to compile if a new

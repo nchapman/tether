@@ -418,6 +418,51 @@ mark / use may require direct NVENC SDK calls rather than just
 AVOption + AVFrame side-data, to be verified against the installed
 FFmpeg version when that backend lands.
 
+## Layer 3 (Linux) — NVENC encode (NVIDIA)
+
+On an NVIDIA host (`/sys/class/drm/renderD*/device/vendor == 0x10de`,
+detected by `nvenc::nvidia_gpu_present`) the Linux encode path is
+**NVENC, not VAAPI** — `build_encoder` and the host probe both select it
+first and do **not** fall back to VAAPI, because the only VAAPI device on
+an NVIDIA box is the decode-only `nvidia-vaapi-driver` whose
+`VaapiEncoder::new` partial-inits and SIGSEGVs. NVENC exists alongside
+VAAPI for the per-frame rate-control plumbing VAAPI's FFmpeg wrappers
+can't expose (the verified-negative table above). Requires an FFmpeg
+built `--enable-nvenc --enable-cuda` (the `8.1.0-tether.5` artifact) plus
+the runtime `libnvidia-encode.so` / `libcuda.so` / `libEGL.so`.
+
+- **Codecs / profiles** (Ampere-verified set): H.264 4:2:0 8-bit (High),
+  HEVC 4:2:0 8-bit (Main) + 10-bit (Main10). AV1 is **not advertised** —
+  NVENC AV1 needs Ada (RTX 40+); a pre-Ada card fail-fasts at
+  construction and the probe degrades it. HEVC/H.264 4:4:4 is deferred
+  (NVENC wants planar `YUV444P`, not the packed VUYX/XV30 the gpuconvert
+  4:4:4 bridge produces).
+- **Zero-copy input**: NVENC's CUDA input can't consume a Vulkan-exported
+  dma-buf via `cuImportExternalMemory` (a dma-buf isn't a CUDA opaque-fd
+  handle). The bridge is EGLImage interop, like Sunshine: the gpuconvert
+  NV12/P010 dma-buf is wrapped in ONE multi-plane `EGLImage`
+  (`eglCreateImage(EGL_LINUX_DMA_BUF_EXT)`), registered with
+  `cuGraphicsEGLRegisterImage`, and each plane is `cuMemcpy2D`'d
+  (device→device, no CPU bounce) into a frame from the encoder's CUDA
+  pool — NVENC registers one contiguous pool surface per input frame and
+  can't take separate per-plane external pointers. A standalone R8 Y-plane
+  image is rejected by `cuGraphicsEGLRegisterImage`, which is why the
+  whole surface is imported as one semi-planar image. Source:
+  `nvenc/ffi.rs`, `nvenc/encoder.rs::submit_dmabuf`.
+- **EGL display** is pinned to CUDA device 0 (matched via
+  `EGL_CUDA_DEVICE_NV`) so the import lands on the encoder's GPU.
+  Multi-GPU device selection (the encoder's CUDA device + the gpuconvert
+  wgpu adapter + the EGL display must all be the same physical GPU) is a
+  deferred follow-up.
+- **Live rate-control is POSITIVE on NVENC**, the inverse of the VAAPI
+  table: `supports_changing_bitrate` is `true` and
+  `set_bitrate_kbps` (writing `bit_rate` + `rc_max_rate`) drives a real
+  reconfigure. `nvenc_bitrate_retune_changes_bitstream_size` verifies a
+  ~19× bitstream-size delta across a 1→20 Mbps retune on an RTX 3090 Ti,
+  so the host's ABR controller is active on NVENC hosts. LTR / intra-
+  refresh remain follow-ups (the protocol/host bookkeeping, not just the
+  encoder, is the bulk of that work — see #16's out-of-scope list).
+
 ### What's probed
 
 The probe at `tether-codec/src/vaapi/probe.rs` constructs an

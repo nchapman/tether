@@ -136,9 +136,14 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │       permanence rationale.                                         │
 │         │                                                           │
 │         ▼                                                           │
-│   tether-codec::vaapi::VaapiEncoder                                 │
+│   tether-codec::vaapi::VaapiEncoder  (Intel/AMD hosts)             │
 │     • av_hwframe_map(DRM_PRIME → VAAPI) on the single fd            │
 │     • h264_vaapi or hevc_vaapi encode → Annex-B NAL units           │
+│   tether-codec::nvenc::NvencEncoder  (NVIDIA hosts; GH #16)        │
+│     • dma-buf → EGLImage → cuGraphicsEGLRegisterImage →            │
+│       cuMemcpy2D into a CUDA pool frame → h264/hevc_nvenc           │
+│     • selected first on NVIDIA (no VAAPI encode fallback —          │
+│       nvidia-vaapi-driver is decode-only); honours live ABR         │
 │         │                                                           │
 │         ▼                                                           │
 │   tether-codec::drain_encoder                                       │

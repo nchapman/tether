@@ -23,7 +23,7 @@
 
 use std::sync::OnceLock;
 
-use tether_capture::macos::{probe_capture_pixel_formats, SckCaptureCapability};
+use tether_capture::macos::{probe_capture_pixel_formats_blocking, SckCaptureCapability};
 use tether_codec::bitstream_sps::parse_sps_chroma_bit_depth;
 use tether_codec::macos_interop::{
     accepts_iosurface_fourcc, iosurface_fourcc_expected_label, NV12_VIDEO_RANGE_FOURCC,
@@ -57,7 +57,10 @@ const PROBE_BITRATE_KBPS: u32 = 1_000;
 ///
 fn sck_capability() -> &'static SckCaptureCapability {
     static CACHED: OnceLock<SckCaptureCapability> = OnceLock::new();
-    CACHED.get_or_init(|| match pollster::block_on(probe_capture_pixel_formats()) {
+    // Drive the blocking probe core directly — no Tokio runtime required.
+    // (The async `probe_capture_pixel_formats` wrapper uses `spawn_blocking`,
+    // which panics without an ambient reactor; this sync probe has none.)
+    CACHED.get_or_init(|| match probe_capture_pixel_formats_blocking() {
         Ok(c) => {
             tracing::info!(?c, "SCK capture capability probed");
             c

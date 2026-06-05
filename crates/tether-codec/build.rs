@@ -12,9 +12,42 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_LIBS_DIR");
 
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS");
+
+    // macOS: rusty_ffmpeg's pkg-config link supplies `-lopus`, and a debug
+    // build links fine. But under the release profile (`lto = "thin"`,
+    // `codegen-units = 1`) the static `libopus.a` ends up scanned before
+    // `libavcodec.a` on the ld64 command line, so opus members aren't pulled
+    // and libavcodec's in-tree libopus wrapper (`--enable-libopus`) is left
+    // with undefined `_opus_*` symbols — the release *test* binaries for this
+    // crate and its dependents (tether-render) fail to link. The host/client
+    // *binaries* escape it because they also pull in tether-audio, whose
+    // build.rs links opus; the test binaries have no such second source.
+    // Re-emit opus from this crate (which depends on rusty_ffmpeg) so the
+    // archive is listed again, after libavcodec, resolving the references.
+    // Listing a static archive twice on the link line is a standard, harmless
+    // idiom — ld pulls each member once.
+    if target_os.as_deref() == Ok("macos") {
+        match std::env::var("FFMPEG_LIBS_DIR") {
+            Ok(libs_dir) => {
+                println!("cargo:rustc-link-search=native={libs_dir}");
+                println!("cargo:rustc-link-lib=static=opus");
+            }
+            // `.cargo/ffmpeg-env.toml` always sets FFMPEG_LIBS_DIR, so this is
+            // effectively unreachable — but warn rather than silently skip, since
+            // the failure it guards (undefined `_opus_*` in release test binaries)
+            // is silent and profile-dependent.
+            Err(_) => println!(
+                "cargo:warning=FFMPEG_LIBS_DIR unset; skipping macOS -lopus re-emit. \
+                 Run `mise run ffmpeg` if release test binaries fail to link."
+            ),
+        }
+        return;
+    }
+
     // Only relevant for the staged static-prefix link on Windows. On Unix the
     // pkg-config path supplies these; bail so we never perturb that link.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+    if target_os.as_deref() != Ok("windows") {
         return;
     }
     let Ok(libs_dir) = std::env::var("FFMPEG_LIBS_DIR") else {

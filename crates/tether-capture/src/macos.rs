@@ -826,6 +826,23 @@ enum ProbeOutcome {
 /// the alternative where the probe is the second attempt and the user
 /// sees a prompt for "tether host" twice.
 pub async fn probe_capture_pixel_formats() -> Result<SckCaptureCapability> {
+    // Probes are blocking SCK calls; run them on a blocking thread so an
+    // async caller's runtime isn't tied up waiting on SCK's dispatch queue.
+    tokio::task::spawn_blocking(probe_capture_pixel_formats_blocking)
+        .await
+        .map_err(|e| CaptureError::Sck(format!("probe task join: {e}")))?
+}
+
+/// Synchronous core of [`probe_capture_pixel_formats`]: query the shareable
+/// display, build a filter, and run each candidate format through
+/// `probe_one_format`. Blocks the calling thread on SCK's dispatch queue.
+///
+/// Unlike the async wrapper this needs **no** Tokio runtime, so sync callers
+/// (the host capability probe in `tether-probe`, which drives this from inside
+/// a sync `ProfileProbe` impl) can call it directly. Bridging the async fn with
+/// a non-Tokio executor like `pollster` panicked here — the wrapper's
+/// `spawn_blocking` needs an ambient reactor the probe didn't provide.
+pub fn probe_capture_pixel_formats_blocking() -> Result<SckCaptureCapability> {
     let content = SCShareableContent::get()?;
     let display =
         content.displays().into_iter().next().ok_or_else(|| {
@@ -841,36 +858,30 @@ pub async fn probe_capture_pixel_formats() -> Result<SckCaptureCapability> {
         .with_excluding_windows(&[])
         .build();
 
-    // Probes are blocking SCK calls; run them in spawn_blocking so the
-    // async runtime isn't tied up waiting on SCK's dispatch queue.
-    tokio::task::spawn_blocking(move || {
-        let mut caps = SckCaptureCapability::default();
-        for &probe in ProbeFormat::ALL {
-            match probe_one_format(&filter, probe, display_width, display_height) {
-                Ok(outcome) => {
-                    let accepted = matches!(outcome, ProbeOutcome::Accepted);
-                    tracing::debug!(format = probe.label(), accepted, "SCK probe result");
-                    probe.apply(&mut caps, accepted);
-                }
-                Err(e) => {
-                    // Fatal probe error (cleanup failure most likely).
-                    // Abort the loop so we don't leave zombie probe
-                    // streams running alongside subsequent probes and
-                    // the live session — SCK allows concurrent streams,
-                    // but a partial cleanup compounds across iterations.
-                    tracing::warn!(
-                        format = probe.label(),
-                        error = %e,
-                        "SCK probe aborted; remaining formats reported as not-supported"
-                    );
-                    return Ok(caps);
-                }
+    let mut caps = SckCaptureCapability::default();
+    for &probe in ProbeFormat::ALL {
+        match probe_one_format(&filter, probe, display_width, display_height) {
+            Ok(outcome) => {
+                let accepted = matches!(outcome, ProbeOutcome::Accepted);
+                tracing::debug!(format = probe.label(), accepted, "SCK probe result");
+                probe.apply(&mut caps, accepted);
+            }
+            Err(e) => {
+                // Fatal probe error (cleanup failure most likely).
+                // Abort the loop so we don't leave zombie probe
+                // streams running alongside subsequent probes and
+                // the live session — SCK allows concurrent streams,
+                // but a partial cleanup compounds across iterations.
+                tracing::warn!(
+                    format = probe.label(),
+                    error = %e,
+                    "SCK probe aborted; remaining formats reported as not-supported"
+                );
+                return Ok(caps);
             }
         }
-        Ok(caps)
-    })
-    .await
-    .map_err(|e| CaptureError::Sck(format!("probe task join: {e}")))?
+    }
+    Ok(caps)
 }
 
 /// Configure + start + (briefly verify) + stop an SCStream for one

@@ -80,10 +80,14 @@ run = "cargo test --workspace --lib"
 # macOS adds `--release`: the IOSurface/Metal round-trips are too slow in debug
 # for their reference-comparison thresholds (their ignore messages document it);
 # Linux VAAPI + Windows D3D11 pass in debug, so only macOS pays the release build.
+# `--no-fail-fast`: this is a sweep — run every crate's hardware suite even if an
+# earlier one fails, so one broken crate can't mask the rest (cargo otherwise
+# stops at the first failing test binary, and the crates run in alphabetical
+# order).
 [tasks.test-hw]
 description = "All hardware tests for the current platform (codec + render + gpuconvert + scaler + probe)"
 depends = ["ffmpeg"]
-run = "cargo test --workspace --exclude tether-audio --tests {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+run = "cargo test --workspace --exclude tether-audio --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
 
 # System-audio capture → Opus → playback round-trip for the current platform
 # (PipeWire monitor on Linux, ScreenCaptureKit on macOS, WASAPI loopback on

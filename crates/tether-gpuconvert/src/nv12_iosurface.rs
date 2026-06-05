@@ -588,6 +588,24 @@ impl IOSurfacePool {
     }
 }
 
+// SAFETY: `IOSurfacePool` is auto-`!Send`/`!Sync` because each `PoolSlot`
+// holds `y_mtl`/`uv_mtl: Retained<ProtocolObject<dyn MTLTexture>>`, which objc2
+// treats as `!Send` (`MTLTexture` carries no `+ Send` supertrait) — not because
+// of the IOSurfaces, which already carry their own `unsafe impl Send/Sync`.
+// Marking the pool `Send + Sync` is sound on two grounds:
+//   1. Metal objects are atomically ref-counted (ARC), so `objc_retain` /
+//      `objc_release` across threads is safe per Apple's documented contract.
+//   2. The Metal textures are created, used in scale dispatch, and dropped
+//      only on the bridge's owning thread: `Nv12IOSurfaceBridge` is itself
+//      `!Send` (it holds `wgpu::Device`), so the pool can never be *moved* to
+//      another thread along with the textures. The only cross-thread use of a
+//      shared `Arc<IOSurfacePool>` is `PooledIOSurface::Drop` calling `release`
+//      — a `Mutex`-guarded bool flip that never touches `y_mtl`/`uv_mtl`.
+// This makes `Arc<IOSurfacePool>` genuinely `Send + Sync`, as
+// `PooledIOSurface`'s own `unsafe impl Send` already relies on.
+unsafe impl Send for IOSurfacePool {}
+unsafe impl Sync for IOSurfacePool {}
+
 /// Bridge handle. Holds the wgpu device + queue, the per-plane scalers
 /// (built once for the bridge's lifetime — one src→dst dim pair), the
 /// IOSurface pool, and the destination fourcc / chroma tagging.

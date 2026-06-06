@@ -1019,8 +1019,25 @@ mod tests {
     /// NVIDIA PCI vendor ID — routes `D3D11Encoder::new` to NVENC.
     const VENDOR_NVIDIA: u32 = 0x10de;
 
-    /// Create a video device on the DXGI adapter of `vendor_id`, if one is
-    /// physically present; otherwise return `None`.
+    /// Outcome of trying to bind a video device to a vendor's GPU. Distinguishes
+    /// "no such vendor in the box" from "vendor present but its device wouldn't
+    /// create" so callers can print an accurate SKIP diagnostic — the two read
+    /// very differently during triage.
+    enum VendorVideoDevice {
+        Ready(
+            (
+                windows::Win32::Graphics::Direct3D11::ID3D11Device,
+                windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+            ),
+        ),
+        /// No adapter of this vendor is physically present.
+        Absent,
+        /// At least one adapter of this vendor is present, but every
+        /// `D3D11CreateDevice` against it failed (carries the last error).
+        Unusable(windows::core::Error),
+    }
+
+    /// Create a video device on a DXGI adapter of `vendor_id`.
     ///
     /// Vendor-roundtrip tests must run on the matching GPU's *own* device:
     /// `D3D11Encoder::new(.., vendor_id)` on a foreign vendor's device faults
@@ -1032,15 +1049,14 @@ mod tests {
     /// iGPU driving the panel and an NVIDIA eGPU thus runs both the QSV and the
     /// NVENC round trips; a single-vendor box SKIPs the absent vendors.
     ///
+    /// Enumeration continues past a device-create failure: on a box with two
+    /// adapters of the same vendor, a later one may succeed where the first
+    /// didn't. `Unusable` is returned only when *every* matching adapter failed.
+    ///
     /// An explicit adapter requires `D3D_DRIVER_TYPE_UNKNOWN` (passing
     /// `HARDWARE` with a non-null adapter fails) — same as the production
     /// capture fallback in `tether-capture`.
-    fn video_device_for_vendor(
-        vendor_id: u32,
-    ) -> Option<(
-        windows::Win32::Graphics::Direct3D11::ID3D11Device,
-        windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-    )> {
+    fn video_device_for_vendor(vendor_id: u32) -> VendorVideoDevice {
         use windows::core::Interface;
         use windows::Win32::Foundation::HMODULE;
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -1052,6 +1068,10 @@ mod tests {
 
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("CreateDXGIFactory1");
         let mut adapter_idx = 0u32;
+        // Track whether we saw the vendor at all, and the last create error, so
+        // a box with several same-vendor adapters reports "unusable" only after
+        // every one has failed.
+        let mut last_create_err = None;
         while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_idx) } {
             adapter_idx += 1;
             // GetDesc1 on a just-enumerated adapter shouldn't fail; a failure is
@@ -1062,9 +1082,11 @@ mod tests {
                 continue;
             }
 
-            // Take the first adapter of this vendor. On a box with two
-            // same-vendor GPUs, index 0 is the display adapter — the one most
-            // likely to support encode and matching production's default pick.
+            // Try this adapter. On a box with two same-vendor GPUs, index 0 is
+            // the display adapter — the one most likely to support encode and
+            // matching production's default pick — but if it won't create a
+            // device we fall through to the next same-vendor adapter rather than
+            // giving up, since a later one may still work.
             let mut device = None;
             let mut context = None;
             // The vendor GPU is present but device creation can still fail (a
@@ -1084,20 +1106,20 @@ mod tests {
                     Some(&mut context),
                 )
             } {
-                eprintln!(
-                    "SKIP: GPU vendor 0x{vendor_id:04x} present but D3D11CreateDevice \
-                     (UNKNOWN driver, VIDEO_SUPPORT) failed: {e}"
-                );
-                return None;
+                last_create_err = Some(e);
+                continue;
             }
             let device = device.unwrap();
             let context = context.unwrap();
             if let Ok(mt) = device.cast::<ID3D11Multithread>() {
                 let _ = unsafe { mt.SetMultithreadProtected(true) };
             }
-            return Some((device, context));
+            return VendorVideoDevice::Ready((device, context));
         }
-        None
+        match last_create_err {
+            Some(e) => VendorVideoDevice::Unusable(e),
+            None => VendorVideoDevice::Absent,
+        }
     }
 
     /// Create a video device, returning it only if an AMD GPU is present;
@@ -1114,11 +1136,18 @@ mod tests {
         windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     )> {
         match video_device_for_vendor(VENDOR_AMD) {
-            Some(dev) => Some(dev),
-            None => {
+            VendorVideoDevice::Ready(dev) => Some(dev),
+            VendorVideoDevice::Absent => {
                 eprintln!(
                     "SKIP {test}: no AMD GPU (0x{VENDOR_AMD:04x}) present; \
                      run on an AMF-capable AMD GPU"
+                );
+                None
+            }
+            VendorVideoDevice::Unusable(e) => {
+                eprintln!(
+                    "SKIP {test}: AMD GPU (0x{VENDOR_AMD:04x}) present but \
+                     D3D11CreateDevice (UNKNOWN driver, VIDEO_SUPPORT) failed: {e}"
                 );
                 None
             }
@@ -1203,11 +1232,18 @@ mod tests {
         // dual-GPU box this exercises each vendor in turn; a single-vendor box
         // SKIPs the absent vendors. Run this test on a matching GPU.
         let (device, context) = match video_device_for_vendor(vendor_id) {
-            Some(dev) => dev,
-            None => {
+            VendorVideoDevice::Ready(dev) => dev,
+            VendorVideoDevice::Absent => {
                 eprintln!(
                     "SKIP {expected_backend}: no GPU of vendor 0x{vendor_id:04x} present; \
                      run on a {expected_backend}-capable GPU"
+                );
+                return;
+            }
+            VendorVideoDevice::Unusable(e) => {
+                eprintln!(
+                    "SKIP {expected_backend}: GPU of vendor 0x{vendor_id:04x} present but \
+                     D3D11CreateDevice (UNKNOWN driver, VIDEO_SUPPORT) failed: {e}"
                 );
                 return;
             }

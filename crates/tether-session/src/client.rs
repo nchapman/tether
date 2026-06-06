@@ -60,9 +60,10 @@ impl ClientSession {
             "advertising video decode capabilities to host"
         );
 
+        let advertised = cfg.client_decode_profiles.clone();
         let hello = ClientHello {
             client_name: cfg.client_name,
-            decode_profiles: cfg.client_decode_profiles.clone(),
+            decode_profiles: advertised.clone(),
             initial_viewport: cfg.viewport,
             input_capabilities: InputCapabilities::default(),
             requested_features: Vec::new(),
@@ -79,15 +80,29 @@ impl ClientSession {
         };
         let negotiated = server_hello.video.profile;
         if !is_known_bit_depth(negotiated.bit_depth) {
+            send_protocol_error_goodbye(
+                channel.as_ref(),
+                format!(
+                    "host chose profile with unknown bit_depth {}; expected one of {:?}",
+                    negotiated.bit_depth,
+                    tether_protocol::control::KNOWN_BIT_DEPTHS
+                ),
+            )
+            .await;
             return Err(ConnectError::UnknownBitDepth(
                 negotiated.bit_depth,
                 tether_protocol::control::KNOWN_BIT_DEPTHS,
             ));
         }
-        if !cfg.client_decode_profiles.contains(&negotiated) {
+        if !advertised.contains(&negotiated) {
+            send_protocol_error_goodbye(
+                channel.as_ref(),
+                format!("host chose unadvertised video profile {negotiated:?}"),
+            )
+            .await;
             return Err(ConnectError::ProfileNotAdvertised {
                 chosen: negotiated,
-                advertised: cfg.client_decode_profiles,
+                advertised,
             });
         }
 
@@ -112,8 +127,24 @@ impl ClientSession {
             negotiated_video: server_hello.video.clone(),
             server_hello,
             clock_sync,
-            client_decode_profiles: cfg.client_decode_profiles,
+            client_decode_profiles: advertised,
         })
+    }
+}
+
+async fn send_protocol_error_goodbye(channel: &dyn ControlChannel, reason: String) {
+    warn!(
+        %reason,
+        "host sent invalid handshake selection; sending Goodbye(ProtocolError)"
+    );
+    if let Err(e) = channel
+        .send_control(&ControlMessage::Goodbye {
+            reason,
+            code: GoodbyeCode::ProtocolError,
+        })
+        .await
+    {
+        warn!(error = ?e, "failed to send Goodbye after invalid handshake selection");
     }
 }
 

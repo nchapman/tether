@@ -518,7 +518,7 @@ async fn main() -> anyhow::Result<()> {
         // `ControlChannel` trait object so it's mockable in tests.
         // We keep the original `Arc<Connection>` in scope for the rest
         // of `handle_client`, which uses concrete-type methods
-        // (video keyframe streams, datagram send, input recv) that
+        // (datagram send/recv, input recv, connection stats) that
         // are outside the `ControlChannel` surface.
         let session = match HostSession::accept(
             conn.clone() as Arc<dyn tether_transport::ControlChannel>,
@@ -535,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(s) => s,
             Err(AcceptError::NoProfileIntersection { client }) => {
-                // HostSession has already sent Goodbye(InternalError).
+                // HostSession has already sent a typed handshake rejection.
                 // We log the host list ourselves — the error doesn't
                 // carry it because the selector (which closes over it)
                 // is the only thing that saw both sides.
@@ -644,7 +644,7 @@ async fn handle_client(
     // pointing to the same `Connection` that `conn` holds, just
     // type-erased for the session-level abstraction. The recv tasks
     // and send thread below need concrete-`Connection` methods
-    // (video keyframe streams, datagram send, input recv), so we use
+    // (datagram send/recv, input recv, connection stats), so we use
     // `conn` directly.
     //
     // Bind `_client_decode_profiles` and `_client_hello` because the
@@ -760,22 +760,11 @@ async fn handle_client(
     let stream_ready_for_thread = stream_ready.clone();
     let latest_client_stats_for_send = latest_client_stats.clone();
     let latest_viewport_for_send = latest_viewport.clone();
-    // Keyframes ride a reliable per-IDR QUIC unidirectional stream
-    // rather than the unreliable datagram path used for P-frames.
-    // The sync send thread is not a tokio worker, so it calls into
-    // the async send via `Handle::block_on`. We send keyframes
-    // synchronously (block the send thread until the IDR is queued
-    // into quinn) instead of routing them through an mpsc to a
-    // separate task, because:
-    //   1. Ordering: a P-frame's stream_epoch must agree with the
-    //      IDR's. The earlier mpsc design opened a window where
-    //      `bump_epoch()` could fire between IDR enqueue and IDR
-    //      wire-write, mis-attributing the IDR to the old epoch.
-    //   2. Cost: keyframes are request-driven and infrequent. The
-    //      blocking write is ~1 ms on LAN (open_uni + write_all +
-    //      finish into quinn's send buffer). That frame's latency
-    //      budget already absorbs an extra round trip for
-    //      reliability.
+    // The sync send thread is not a tokio worker, so it uses the
+    // runtime handle only for the few async control sends needed on
+    // fatal exits. Regular video output is synchronous datagram send:
+    // every frame, IDR and P alike, goes through FrameFragmenter and
+    // quinn's non-blocking datagram queue.
     let runtime_handle_for_send = tokio::runtime::Handle::current();
     let send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())

@@ -13,3 +13,6 @@
 
 # Machine-specific mise overrides (FFmpeg paths, etc.).
 mise.local.toml
+
+# Local Claude/Codex agent state.
+.claude/

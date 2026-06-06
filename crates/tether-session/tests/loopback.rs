@@ -274,6 +274,16 @@ async fn host_picks_unadvertised_profile_client_refuses() {
     let host_session = host_task.await.unwrap().unwrap();
     assert_eq!(host_session.negotiated, VideoProfile::HEVC_8BIT_420);
     client_task.await.unwrap();
+    match host_session.channel.recv_control().await.unwrap() {
+        ControlMessage::Goodbye { reason, code } => {
+            assert_eq!(code, tether_protocol::control::GoodbyeCode::ProtocolError);
+            assert!(
+                reason.contains("unadvertised video profile"),
+                "unexpected goodbye reason: {reason}"
+            );
+        }
+        other => panic!("expected client Goodbye after invalid profile, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -317,10 +327,21 @@ async fn client_filters_unknown_bit_depth_from_host_advert() {
         );
     });
 
-    // Host doesn't see the refusal (it succeeds on its side); the
-    // client is the gate for unknown depths.
-    let _host = host_task.await.unwrap().unwrap();
+    // HostSession itself succeeds because it sent a syntactically valid
+    // ServerHello, but the client reports the protocol error on the control
+    // stream before returning its local validation failure.
+    let host = host_task.await.unwrap().unwrap();
     client_task.await.unwrap();
+    match host.channel.recv_control().await.unwrap() {
+        ControlMessage::Goodbye { reason, code } => {
+            assert_eq!(code, tether_protocol::control::GoodbyeCode::ProtocolError);
+            assert!(
+                reason.contains("unknown bit_depth 12"),
+                "unexpected goodbye reason: {reason}"
+            );
+        }
+        other => panic!("expected client Goodbye after unknown bit_depth, got {other:?}"),
+    }
 }
 
 #[tokio::test]

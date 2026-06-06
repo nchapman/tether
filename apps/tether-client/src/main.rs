@@ -249,13 +249,14 @@ async fn main() -> anyhow::Result<()> {
     // Application-layer handshake: identify ourselves, advertise our
     // decode profiles, resolve + validate the host's pick, and prime
     // the host with a `ForceIdr` so the next frame is a keyframe.
-    // The clock-sync probe round-trip happens inside `client_handshake`
-    // so latency logs are wall-clock-accurate from the first frame.
+    // The clock-sync probe round-trip happens immediately after the
+    // typed handshake, so latency logs are wall-clock-accurate from
+    // the first frame.
     // ClientSession takes the channel through the `ControlChannel`
     // trait object so it's mockable in tests. The original
     // `Arc<Connection>` stays in `conn` for the rest of `main` — the
     // recv tasks below use concrete-`Connection` methods (datagram,
-    // keyframe-stream accept, input send) that aren't on the trait.
+    // input send, connection stats) that aren't on the trait.
     let session = ClientSession::connect(
         conn.clone() as Arc<dyn tether_transport::ControlChannel>,
         ClientSessionConfig {

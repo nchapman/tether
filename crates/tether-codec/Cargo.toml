@@ -92,6 +92,9 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
+    # Tests enumerate DXGI adapters (IDXGIFactory1::EnumAdapters1) to bind a
+    # device to a specific GPU vendor for the per-vendor roundtrip tests.
+    "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
 ] }
 

@@ -149,7 +149,10 @@ run = [
   "cargo test --workspace",
   "cargo clippy --workspace --all-targets -- -D warnings",
   "cargo clippy --manifest-path apps/tether-shell/src-tauri/Cargo.toml --all-targets -- -D warnings",
-  "pnpm --dir apps/tether-shell exec tsc --noEmit",
+  # `mise exec --`: under `sh -c`, git-bash mangles the PATH handed to native
+  # pnpm and drops node's dir, so the `tsc` shim's bare `node` fails on Windows.
+  # See the `shell` task for the full rationale.
+  "mise exec -- pnpm --dir apps/tether-shell exec tsc --noEmit",
   "cargo check --manifest-path apps/tether-shell/src-tauri/Cargo.toml",
 ]
 
@@ -194,10 +197,15 @@ run = "pnpm --dir apps/tether-shell install"
 description = "Run the Tauri shell in dev mode (builds the engines first)"
 depends = ["engines"]
 # `sh -c`: stages the Windows runtime via a bash script before launching.
+# `mise exec --` wraps the pnpm launch because git-bash's `sh` mangles the
+# tool PATH it hands to native `pnpm.exe`, dropping node's install dir — so the
+# `tauri.cmd`/`vite.cmd` shims' bare `node` call fails ("'node' is not
+# recognized"). `mise exec` rebuilds the native tool env for the whole subtree.
+# (Default-shell tasks like `shell-check` don't hit this; only `sh -c` does.)
 shell = "sh -c"
 run = [
   "scripts/stage-windows-runtime.sh",
-  "pnpm --dir apps/tether-shell tauri dev",
+  "mise exec -- pnpm --dir apps/tether-shell tauri dev",
 ]
 
 [tasks.shell-check]
@@ -220,6 +228,9 @@ run = [
   "cargo build --release -p tether-host -p tether-client",
   "scripts/stage-engine-binaries.sh",
   "scripts/stage-windows-runtime.sh",
-  "pnpm --dir apps/tether-shell install",
-  "pnpm --dir apps/tether-shell tauri build --config src-tauri/tauri.release.conf.json",
+  # `mise exec --`: under `sh -c`, git-bash mangles the PATH handed to native
+  # pnpm and drops node's dir, so the tauri/vite `.cmd` shims' bare `node`
+  # fails. See the `shell` task for the full rationale.
+  "mise exec -- pnpm --dir apps/tether-shell install",
+  "mise exec -- pnpm --dir apps/tether-shell tauri build --config src-tauri/tauri.release.conf.json",
 ]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tether_protocol::control::{
     is_known_bit_depth, ClientHello, ClockSync, ControlMessage, GoodbyeCode, InputCapabilities,
-    ServerHandshake, ServerHello, VideoProfile,
+    ServerHandshake, ServerHello, VideoProfile, CLOCK_SYNC_PROBE_SAMPLES,
 };
 use tether_protocol::MonoNanos;
 use tether_transport::{ControlChannel, TransportError};
@@ -169,24 +169,48 @@ async fn send_protocol_error_goodbye(channel: &dyn ControlChannel, reason: Strin
 }
 
 async fn run_clock_probe(channel: &dyn ControlChannel) -> Result<ClockSync, ConnectError> {
-    let t0 = MonoNanos::now();
-    channel
-        .send_control(&ControlMessage::ClockProbeRequest { t0_sender: t0 })
-        .await?;
+    let mut pending = Vec::with_capacity(CLOCK_SYNC_PROBE_SAMPLES);
+    for _ in 0..CLOCK_SYNC_PROBE_SAMPLES {
+        let t0 = MonoNanos::now();
+        channel
+            .send_control(&ControlMessage::ClockProbeRequest { t0_sender: t0 })
+            .await?;
+        pending.push(t0);
+    }
+
+    let mut samples = Vec::with_capacity(CLOCK_SYNC_PROBE_SAMPLES);
     loop {
         let msg = channel.recv_control().await?;
         let t3 = MonoNanos::now();
         match msg {
-            ControlMessage::ClockProbeResponse(probe) if probe.t0_sender == t0 => {
-                return Ok(ClockSync::from_probe(
+            ControlMessage::ClockProbeResponse(probe) => {
+                let Some(pos) = pending.iter().position(|t0| *t0 == probe.t0_sender) else {
+                    tracing::debug!("ignoring stale ClockProbeResponse during handshake probe");
+                    continue;
+                };
+                let t0 = pending.swap_remove(pos);
+                samples.push(ClockSync::from_probe(
                     t0,
                     probe.t1_receiver_recv,
                     probe.t2_receiver_send,
                     t3,
                 ));
-            }
-            ControlMessage::ClockProbeResponse(_) => {
-                tracing::debug!("ignoring stale ClockProbeResponse during handshake probe");
+                if samples.len() == CLOCK_SYNC_PROBE_SAMPLES {
+                    let min_rtt = samples.iter().map(|s| s.rtt_nanos).min().unwrap_or(0);
+                    let max_rtt = samples.iter().map(|s| s.rtt_nanos).max().unwrap_or(0);
+                    let selected = ClockSync::best_sample(samples)
+                        .expect("collected at least one clock-sync sample");
+                    info!(
+                        event = "clock_sync",
+                        samples = CLOCK_SYNC_PROBE_SAMPLES,
+                        selected_rtt_us = selected.rtt_nanos / 1_000,
+                        min_rtt_us = min_rtt / 1_000,
+                        max_rtt_us = max_rtt / 1_000,
+                        clock_offset_us = selected.offset_nanos / 1_000,
+                        "selected clock-sync sample"
+                    );
+                    return Ok(selected);
+                }
             }
             other => {
                 if let ControlMessage::Goodbye { reason, code, .. } = other {

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tether_protocol::control::{
     ChromaSubsampling, ClientHello, CodecKind, ControlMessage, DisplayDescriptor, DisplayId,
     DisplayMode, DisplayModeStatus, NegotiatedVideo, PixelFormat, RequestId, ServerHello,
-    VideoColorSpec, VideoProfile, VideoStreamId, Viewport,
+    VideoColorSpec, VideoProfile, VideoStreamId, Viewport, CLOCK_SYNC_PROBE_SAMPLES,
 };
 use tether_protocol::MonoNanos;
 use tether_session::{
@@ -72,20 +72,22 @@ fn test_server_hello(profile: VideoProfile) -> ServerHello {
 }
 
 async fn answer_clock_probe(channel: &dyn ControlChannel) {
-    match channel.recv_control().await.unwrap() {
-        ControlMessage::ClockProbeRequest { t0_sender } => {
-            channel
-                .send_control(&ControlMessage::ClockProbeResponse(
-                    tether_protocol::control::ClockProbe {
-                        t0_sender,
-                        t1_receiver_recv: MonoNanos::now(),
-                        t2_receiver_send: MonoNanos::now(),
-                    },
-                ))
-                .await
-                .unwrap();
+    for _ in 0..CLOCK_SYNC_PROBE_SAMPLES {
+        match channel.recv_control().await.unwrap() {
+            ControlMessage::ClockProbeRequest { t0_sender } => {
+                channel
+                    .send_control(&ControlMessage::ClockProbeResponse(
+                        tether_protocol::control::ClockProbe {
+                            t0_sender,
+                            t1_receiver_recv: MonoNanos::now(),
+                            t2_receiver_send: MonoNanos::now(),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+            }
+            other => panic!("expected ClockProbeRequest, got {other:?}"),
         }
-        other => panic!("expected ClockProbeRequest, got {other:?}"),
     }
 }
 
@@ -134,6 +136,74 @@ async fn happy_path_handshake_completes_with_negotiated_profile() {
         client.clock_sync.offset_nanos.unsigned_abs() < 10_000_000,
         "expected sub-10ms clock offset on loopback, got {} ns",
         client.clock_sync.offset_nanos
+    );
+}
+
+#[tokio::test]
+async fn clock_probe_burst_rejects_noisy_high_rtt_sample() {
+    let (host_chan, client_chan) = duplex_pair();
+    let client_cfg = ClientSessionConfig {
+        client_name: "test-client".to_string(),
+        client_decode_profiles: vec![VideoProfile::H264_8BIT_420],
+        viewport: None,
+    };
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        let _hello = host_chan_dyn.recv_client_hello().await.unwrap();
+        host_chan_dyn
+            .send_server_hello(test_server_hello(VideoProfile::H264_8BIT_420))
+            .await
+            .unwrap();
+
+        for sample_idx in 0..CLOCK_SYNC_PROBE_SAMPLES {
+            let t0_sender = match host_chan_dyn.recv_control().await.unwrap() {
+                ControlMessage::ClockProbeRequest { t0_sender } => t0_sender,
+                other => panic!("expected ClockProbeRequest, got {other:?}"),
+            };
+            let probe = if sample_idx == 0 {
+                // Simulate the exact failure shape from issue #58: one queued
+                // startup sample with an RTT-sized offset bias. The reducer
+                // should reject it once cleaner samples arrive.
+                tether_protocol::control::ClockProbe {
+                    t0_sender,
+                    t1_receiver_recv: MonoNanos(t0_sender.0.saturating_add(300_000_000)),
+                    t2_receiver_send: t0_sender,
+                }
+            } else {
+                // A near-zero-queue sample. In loopback, `t2` is effectively
+                // the client's `t3`, so the offset and RTT should both be tiny.
+                tether_protocol::control::ClockProbe {
+                    t0_sender,
+                    t1_receiver_recv: t0_sender,
+                    t2_receiver_send: MonoNanos::now(),
+                }
+            };
+            host_chan_dyn
+                .send_control(&ControlMessage::ClockProbeResponse(probe))
+                .await
+                .unwrap();
+        }
+    });
+
+    let client = ClientSession::connect(client_chan_dyn, client_cfg)
+        .await
+        .unwrap();
+    host_task.await.unwrap();
+
+    assert!(
+        client.clock_sync.offset_nanos.unsigned_abs() < 5_000_000,
+        "expected clean min-RTT sample, got offset={}ns rtt={}ns",
+        client.clock_sync.offset_nanos,
+        client.clock_sync.rtt_nanos
+    );
+    assert!(
+        client.clock_sync.rtt_nanos < 5_000_000,
+        "expected low-RTT sample, got offset={}ns rtt={}ns",
+        client.clock_sync.offset_nanos,
+        client.clock_sync.rtt_nanos
     );
 }
 

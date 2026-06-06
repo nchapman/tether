@@ -786,6 +786,16 @@ impl Viewport {
 
 // --- ClockSync ----------------------------------------------------------
 
+/// Number of timestamp probes the client sends as a burst after handshake.
+///
+/// Clock offset estimation is only as good as the least-queued sample. A
+/// single probe taken while the host/client are still spawning render and GPU
+/// resources can overestimate frame age by an RTT-sized queueing spike, which
+/// feeds directly into latency telemetry and present-policy frame skipping.
+/// A small min-RTT burst follows standard NTP/PTP practice without adding N
+/// full round trips to startup.
+pub const CLOCK_SYNC_PROBE_SAMPLES: usize = 8;
+
 /// Result of a successful three-way handshake probe. Computed from
 /// `t0_client_send`, `t1_server_recv`, `t2_server_send`, `t3_client_recv`
 /// using the standard NTP formula: `offset = ((t1 - t0) + (t2 - t3)) / 2`,
@@ -834,6 +844,14 @@ impl ClockSync {
                 .expect("clamped to u64 range"),
             sampled_at_local: t3_local_recv,
         }
+    }
+
+    /// Pick the least-queued probe sample. Min-RTT is the best available proxy
+    /// for path symmetry, so its offset is the least likely to include startup
+    /// queueing from process spawn, GPU probing, or a busy control loop.
+    #[must_use]
+    pub fn best_sample(samples: impl IntoIterator<Item = Self>) -> Option<Self> {
+        samples.into_iter().min_by_key(|sync| sync.rtt_nanos)
     }
 
     /// Translate a timestamp from the remote clock into the local clock.
@@ -1762,6 +1780,22 @@ mod tests {
         let sync = ClockSync::from_probe(t0, t1, t2, t3);
         assert_eq!(sync.offset_nanos, 400);
         assert_eq!(sync.rtt_nanos, 10);
+    }
+
+    #[test]
+    fn clock_sync_best_sample_keeps_min_rtt_offset() {
+        let noisy = ClockSync {
+            offset_nanos: 145_000_000,
+            rtt_nanos: 290_000_000,
+            sampled_at_local: MonoNanos(10),
+        };
+        let clean = ClockSync {
+            offset_nanos: 4_000,
+            rtt_nanos: 5_000_000,
+            sampled_at_local: MonoNanos(20),
+        };
+
+        assert_eq!(ClockSync::best_sample([noisy, clean]), Some(clean));
     }
 
     #[test]

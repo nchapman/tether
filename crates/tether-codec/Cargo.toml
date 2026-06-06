@@ -37,6 +37,25 @@ rsmpeg = { git = "https://github.com/Dryvnt/rsmpeg", rev = "4dcf6be81b87a2002567
 # path. Linux-only because VAAPI itself is.
 [target.'cfg(target_os = "linux")'.dependencies]
 tether-vaapi = { workspace = true }
+# Runtime dlopen of libcuda.so.1 + libEGL.so.1 for the NVENC zero-copy
+# DMA-BUF → CUDA import (EGLImage interop, see `nvenc::ffi`). dlopen rather
+# than link-time so a non-NVIDIA host degrades gracefully (the loader
+# returns None and the encoder falls back to the CPU upload path).
+libloading = "0.8"
+# NVDEC zero-copy decode (GH #16, D2): the decoder allocates a pool of NV12
+# dma-buf surfaces and fills them from NVDEC's CUDA frame, so the renderer
+# imports the dma-buf directly.
+#
+# We allocate the surfaces with raw Vulkan (`ash`) rather than reusing
+# `tether-gpuconvert::export_nv12_shared_dmabuf`, because tether-codec
+# depending on tether-gpuconvert would form a normal-dependency CYCLE:
+# tether-gpuconvert already depends on tether-codec in production on macOS
+# (IOSurface interop). resolver-2 evaluates the dependency graph cfg-merged,
+# so the cross-platform mutual prod dependency is rejected even though the two
+# edges never coexist on one target. A self-contained ash exporter in
+# `nvdec::surface_pool` keeps the dependency acyclic. (`ash` 0.38 matches the
+# version tether-gpuconvert pins.)
+ash = "0.38"
 
 # macOS-only IOSurface→MTLTexture→wgpu interop helpers. Shared by
 # `tether-render` (client decode-side import) and `tether-gpuconvert`
@@ -62,8 +81,10 @@ objc2-io-surface = { version = "0.3.2", default-features = false, features = ["s
 
 # Hardware-gated round-trip tests need a real gpuconvert bridge to
 # produce the dma-buf descriptor shape the encoder expects (XYUV for
-# 4:4:4, NV12 for 4:2:0). Test-only — production code paths don't
-# depend on gpuconvert from inside tether-codec.
+# 4:4:4, NV12 for 4:2:0). Test-only — and crucially a *dev*-dependency,
+# which lets cargo tolerate the tether-codec ↔ tether-gpuconvert cycle
+# here (production tether-codec uses raw `ash` for its NVDEC surface pool
+# instead; see the dependencies block above).
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tether-gpuconvert = { workspace = true }
 # wgpu pinned to the same trunk SHA used elsewhere in the workspace.

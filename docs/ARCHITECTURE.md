@@ -136,9 +136,14 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │       permanence rationale.                                         │
 │         │                                                           │
 │         ▼                                                           │
-│   tether-codec::vaapi::VaapiEncoder                                 │
+│   tether-codec::vaapi::VaapiEncoder  (Intel/AMD hosts)             │
 │     • av_hwframe_map(DRM_PRIME → VAAPI) on the single fd            │
 │     • h264_vaapi or hevc_vaapi encode → Annex-B NAL units           │
+│   tether-codec::nvenc::NvencEncoder  (NVIDIA hosts; GH #16)        │
+│     • dma-buf → EGLImage → cuGraphicsEGLRegisterImage →            │
+│       cuMemcpy2D into a CUDA pool frame → h264/hevc_nvenc           │
+│     • selected first on NVIDIA (no VAAPI encode fallback —          │
+│       nvidia-vaapi-driver is decode-only); honours live ABR         │
 │         │                                                           │
 │         ▼                                                           │
 │   tether-codec::drain_encoder                                       │
@@ -203,6 +208,10 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │       the encoder. NO_OUTPUT_WATCHDOG=1500ms triggers Idr on        │
 │       silent decoder stalls.                                        │
 │     • vaSyncSurface + vaExportSurfaceHandle → DRM_PRIME             │
+│     • NVIDIA clients: tether-codec::nvdec::NvdecDecoder instead     │
+│       (no VAAPI fallback); NVDEC → CUDA surface → EGLImage-import   │
+│       an NV12/P010 pool dma-buf → cuMemcpy2D planes in; same        │
+│       Frame::Gpu(DmaBuf) handoff (Main/Main10; 4:4:4 not advertised)│
 │         │   Frame::Gpu(GpuFrame { DmaBuf { fd, stride, modifier } })│
 │         ▼  (LatestFrame single-slot drop-oldest)                    │
 │   tether-render::gpu                                                │
@@ -347,16 +356,16 @@ backend is a variant plus a module, not a refactor.
 `VaapiEncoder`, a `#[cfg(target_os = "macos")]` arm constructs
 `VideoToolboxEncoder`, and a `#[cfg(target_os = "windows")]`
 `build_encoder_d3d11` arm constructs `D3D11Encoder` — all return
-`Box<dyn Encoder>` so the host send loop is backend-agnostic. On
-Windows the *vendor* selection happens one level down, in
-`D3D11Encoder::new` → `backends_for_vendor(codec, vendor_id)`: it tries
-the GPU's native encoder first (`hevc_qsv`/`hevc_amf`/`hevc_nvenc`) then
-`hevc_mf`. An unknown vendor falls back to Media Foundation **only** —
-speculatively constructing a foreign vendor's encoder faults inside that
-vendor's runtime. A second Linux backend (the tracked NVENC follow-up)
-lands as an inner `match` inside the Linux arm that prefers NVENC when
-the probe accepts it and falls through to VAAPI otherwise — no signature
-change at the call site.
+`Box<dyn Encoder>` so the host send loop is backend-agnostic. On Linux,
+the arm runtime-selects by GPU vendor: NVIDIA hosts construct NVENC and
+do not try VAAPI there (the NVIDIA VAAPI device is the decode-only
+`nvidia-vaapi-driver`); non-NVIDIA hosts use VAAPI. On Windows the
+*vendor* selection happens one level down, in `D3D11Encoder::new` →
+`backends_for_vendor(codec, vendor_id)`: it tries the GPU's native
+encoder first (`hevc_qsv`/`hevc_amf`/`hevc_nvenc`) then `hevc_mf`. An
+unknown vendor falls back to Media Foundation **only** — speculatively
+constructing a foreign vendor's encoder faults inside that vendor's
+runtime.
 
 **Decoder side** uses the same shape, mirrored: `Decoder::next_frame ->
 Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a
@@ -671,14 +680,14 @@ of 4:2:0; rate-control absorbs some of that but not all, so a chroma-
 blind budget produces visibly blocky chroma in the same numbers that
 were sized for subsampled video.
 
-**Renderer accepts both YUV444 dma-buf shapes.** `vaExportSurfaceHandle`
-with `SEPARATE_LAYERS` is a *hint* the libva spec lets drivers ignore.
-Intel media-driver and current mesa return three R8 layers (one plane
-each); older mesa and nvidia-vaapi-driver return one `YU24` layer
-carrying three plane offsets. The import path accepts either. The
-encoder-side `yuv444_dmabuf_to_codec_frame` produces the
-one-layer/three-plane form, which matches VAAPI's PRIME_2 *importer*
-expectation on Main444.
+**Renderer accepts the Linux YUV444 dma-buf families that pass probe.**
+VAAPI HEVC Main 4:4:4 decode exports packed `XYUV` (and 10-bit `Y410` on
+the Intel reference path). The NVIDIA planar `YU24` renderer/import path
+exists as diagnostic groundwork, but NVIDIA Linux does not advertise
+4:4:4 today because the tested EGL stack rejects planar 4:4:4 dma-buf
+imports. Both families are still gated through the shared
+`accepts_dmabuf_fourcc` table so probe and renderer import cannot drift if
+a driver starts accepting the planar path.
 
 Four non-negotiable invariants tracked end-to-end:
 

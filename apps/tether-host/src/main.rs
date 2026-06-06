@@ -37,7 +37,7 @@ use tether_gpuconvert::nv12_iosurface::{
 #[cfg(target_os = "linux")]
 use tether_gpuconvert::{
     Bgra2P010DmaBuf, Bgra2Xv30DmaBuf, Nv12DmaBuf, Nv12DmaBufFrame, P010DmaBufFrame,
-    Xv30DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame,
+    Xv30DmaBufFrame, Yuv444DmaBuf, Yuv444DmaBufFrame, Yuv444pDmaBuf, Yuv444pDmaBufFrame,
 };
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
@@ -336,6 +336,32 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => {
                 tracing::warn!(error = %e, "DXGI pre-create failed; capture will retry later");
             }
+        }
+    }
+
+    // On a Linux NVIDIA host, pin every NVIDIA codec subsystem (NVENC/NVDEC
+    // CUDA context, the EGL→CUDA importer, the NVDEC surface pool's Vulkan
+    // device) to the physical GPU the dma-buf producer will use. The producer
+    // leads: read the GPU its HighPerformance wgpu adapter picks and pin to it
+    // BEFORE the capability probe and any encoder/decoder construct, so the
+    // whole zero-copy path lands on one GPU on multi-GPU hosts. Unpinned
+    // (non-NVIDIA, or no Vulkan adapter) keeps FFmpeg's default device, i.e.
+    // the original single-GPU behavior.
+    #[cfg(target_os = "linux")]
+    if !use_test_pattern && tether_codec::nvenc::nvidia_gpu_present() {
+        match tether_gpuconvert::gpu_select::preferred_device_uuid().await {
+            Some(uuid) => tether_codec::nvenc::pin_gpu_uuid(uuid),
+            // NVIDIA present (sysfs) but no Vulkan adapter to read a UUID from —
+            // the producer and the CUDA/EGL side can't be aligned. On a
+            // single-GPU host the default device still works; on a multi-GPU
+            // host this is a latent producer/encoder GPU mismatch that faults on
+            // the first real encode, so log loudly rather than as a soft warning.
+            None => tracing::error!(
+                "NVIDIA host but no Vulkan adapter found to pin the GPU; the codec \
+                 path will use FFmpeg's default CUDA device — on a multi-GPU host \
+                 the dma-buf producer and encoder may land on different GPUs and \
+                 fault. Check the Vulkan driver/ICD installation."
+            ),
         }
     }
 
@@ -1365,6 +1391,7 @@ enum BridgeState {
 enum GpuConvertBridge {
     Nv12(Nv12DmaBuf),
     Yuv444(Yuv444DmaBuf),
+    Yuv444p(Yuv444pDmaBuf),
     P010(Bgra2P010DmaBuf),
     Xv30(Bgra2Xv30DmaBuf),
 }
@@ -1393,6 +1420,7 @@ fn bridge_device_queue(b: &GpuConvertBridge) -> (wgpu::Device, wgpu::Queue) {
     match b {
         GpuConvertBridge::Nv12(b) => (b.device().clone(), b.queue().clone()),
         GpuConvertBridge::Yuv444(b) => (b.device().clone(), b.queue().clone()),
+        GpuConvertBridge::Yuv444p(b) => (b.device().clone(), b.queue().clone()),
         GpuConvertBridge::P010(b) => (b.device().clone(), b.queue().clone()),
         GpuConvertBridge::Xv30(b) => (b.device().clone(), b.queue().clone()),
     }
@@ -1443,13 +1471,15 @@ fn scale_if_needed<'a>(
 }
 
 /// Encode one PipeWire-supplied DMA-BUF frame through the zero-copy
-/// pipeline: import BGRA into wgpu, compute BGRA→(NV12|YUV444) onto
+/// pipeline: import BGRA into wgpu, compute BGRA→NV12/P010/YUV444 onto
 /// exported DMA-BUF planes, hand them to the encoder's `encode_gpu`.
 ///
-/// The bridge variant matches the negotiated chroma — NV12 for 4:2:0,
-/// YUV444 for HEVC Main444. Chosen on lazy init and fixed for the
-/// encoder's lifetime (chroma switch needs a full encoder rebuild,
-/// same as resolution change).
+/// The bridge variant matches the negotiated chroma/depth. NVIDIA's planar
+/// YUV444P branch is currently only reached if the live probe proves the
+/// driver accepts `YU24` dma-buf import; tested NVIDIA EGL stacks reject it,
+/// so NVIDIA Linux does not advertise 4:4:4 today. Chosen on lazy init and
+/// fixed for the encoder's lifetime (chroma switch needs a full encoder
+/// rebuild, same as resolution change).
 #[cfg(target_os = "linux")]
 fn encode_gpu_frame(
     slot: &mut EncoderSlot,
@@ -1492,15 +1522,29 @@ fn encode_gpu_frame(
                     }
                 }
                 (ChromaSubsampling::Yuv444, 8) => {
-                    match pollster::block_on(Yuv444DmaBuf::new(slot.width, slot.height)) {
-                        Ok(b) => GpuConvertBridge::Yuv444(b),
-                        Err(e) => {
-                            return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
-                                "Yuv444 gpuconvert bridge init failed for {}x{} after \
-                                 startup probe succeeded — device loss or OOM: {e}",
-                                slot.width,
-                                slot.height,
-                            ));
+                    if tether_codec::nvenc::nvidia_gpu_present() {
+                        match pollster::block_on(Yuv444pDmaBuf::new(slot.width, slot.height)) {
+                            Ok(b) => GpuConvertBridge::Yuv444p(b),
+                            Err(e) => {
+                                return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                                    "Yuv444p gpuconvert bridge init failed for {}x{} after \
+                                     startup probe succeeded — device loss or OOM: {e}",
+                                    slot.width,
+                                    slot.height,
+                                ));
+                            }
+                        }
+                    } else {
+                        match pollster::block_on(Yuv444DmaBuf::new(slot.width, slot.height)) {
+                            Ok(b) => GpuConvertBridge::Yuv444(b),
+                            Err(e) => {
+                                return GpuEncodeOutcome::Fatal(anyhow::anyhow!(
+                                    "Yuv444 gpuconvert bridge init failed for {}x{} after \
+                                     startup probe succeeded — device loss or OOM: {e}",
+                                    slot.width,
+                                    slot.height,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1669,6 +1713,37 @@ fn encode_gpu_frame(
             };
             drop(imported);
             yuv444_dmabuf_to_codec_frame(yuv)
+        }
+        GpuConvertBridge::Yuv444p(b) => {
+            let imported = match b.import_bgra_dmabuf(
+                fd,
+                modifier,
+                stride,
+                offset,
+                slot.capture_width,
+                slot.capture_height,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "import_bgra_dmabuf (yuv444p bridge): {e}"
+                    ));
+                }
+            };
+            let bridge_input = match scale_if_needed(slot.scaler.as_ref(), &imported) {
+                Ok(t) => t,
+                Err(e) => return GpuEncodeOutcome::DropFrame(e),
+            };
+            let yuv = match b.convert(bridge_input) {
+                Ok(f) => f,
+                Err(e) => {
+                    return GpuEncodeOutcome::DropFrame(anyhow::anyhow!(
+                        "Yuv444pDmaBuf::convert: {e}"
+                    ));
+                }
+            };
+            drop(imported);
+            yuv444p_dmabuf_to_codec_frame(yuv)
         }
         GpuConvertBridge::P010(b) => {
             let imported = match b.import_bgra_dmabuf(
@@ -2018,6 +2093,25 @@ fn yuv444_dmabuf_to_codec_frame(out: Yuv444DmaBufFrame) -> DmaBufFrame {
             ],
         }],
     }
+}
+
+/// Build a `DmaBufFrame` for NVIDIA's diagnostic planar YUV444P path: one
+/// DRM object, one `YU24` layer with three full-resolution R8 planes. Thin
+/// adapter over `tether_codec::build_yuv444p_dmabuf_frame` so production and
+/// probe descriptors cannot drift if a driver starts accepting this import.
+#[cfg(target_os = "linux")]
+fn yuv444p_dmabuf_to_codec_frame(out: Yuv444pDmaBufFrame) -> DmaBufFrame {
+    tether_codec::build_yuv444p_dmabuf_frame(
+        out.fd,
+        out.size,
+        out.modifier,
+        out.y_offset,
+        out.y_stride,
+        out.u_offset,
+        out.u_stride,
+        out.v_offset,
+        out.v_stride,
+    )
 }
 
 /// Build a `DmaBufFrame` for the XV30 (HEVC Main 4:4:4 10-bit) path:

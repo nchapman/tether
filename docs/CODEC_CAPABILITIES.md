@@ -418,6 +418,102 @@ mark / use may require direct NVENC SDK calls rather than just
 AVOption + AVFrame side-data, to be verified against the installed
 FFmpeg version when that backend lands.
 
+## Layer 3 (Linux) — NVENC encode (NVIDIA)
+
+On an NVIDIA host (`/sys/class/drm/renderD*/device/vendor == 0x10de`,
+detected by `nvenc::nvidia_gpu_present`) the Linux encode path is
+**NVENC, not VAAPI** — `build_encoder` and the host probe both select it
+first and do **not** fall back to VAAPI, because the only VAAPI device on
+an NVIDIA box is the decode-only `nvidia-vaapi-driver` whose
+`VaapiEncoder::new` partial-inits and SIGSEGVs. NVENC exists alongside
+VAAPI for the per-frame rate-control plumbing VAAPI's FFmpeg wrappers
+can't expose (the verified-negative table above). Requires an FFmpeg
+built `--enable-nvenc --enable-cuda` (the `8.1.0-tether.5` artifact) plus
+the runtime `libnvidia-encode.so` / `libcuda.so` / `libEGL.so`.
+
+- **Codecs / profiles** (Ampere-verified set): H.264 4:2:0 8-bit (High),
+  HEVC 4:2:0 8-bit (Main), and HEVC 4:2:0 10-bit (Main10). AV1 is **not
+  advertised** — NVENC AV1 needs Ada (RTX 40+), and the FFmpeg/NVENC
+  runtime has faulted during pre-Ada construction in testing, so Tether
+  excludes it before constructing the encoder. HEVC Main 4:4:4 is **not
+  advertised on NVIDIA Linux** today. NVENC/NVDEC have native planar 4:4:4
+  formats (`YUV444P` / `YUV444P16`), and Linux DRM has three-plane 10-bit
+  candidates (`Q410` / `S410` / `S416`), but the tested NVIDIA EGL stack
+  does not advertise/import the planar 4:4:4 dma-buf formats (`YU24`,
+  `Q410`, `S410`, `S416`). The live submit probe therefore records 4:4:4
+  unsupported rather than advertising a profile that will fail at
+  `eglCreateImage`.
+- **Zero-copy input**: NVENC's CUDA input can't consume a Vulkan-exported
+  dma-buf via `cuImportExternalMemory` (a dma-buf isn't a CUDA opaque-fd
+  handle). The bridge is EGLImage interop, like Sunshine: the gpuconvert
+  NV12/P010 dma-buf is wrapped in ONE multi-plane `EGLImage`
+  (`eglCreateImage(EGL_LINUX_DMA_BUF_EXT)`), registered with
+  `cuGraphicsEGLRegisterImage`, and each plane is `cuMemcpy2D`'d
+  (device→device, no CPU bounce) into a frame from the encoder's CUDA
+  pool — NVENC registers one contiguous pool surface per input frame and
+  can't take separate per-plane external pointers. A standalone R8 Y-plane
+  image is rejected by `cuGraphicsEGLRegisterImage`, which is why the
+  whole surface is imported as one semi-planar image. Source:
+  `nvenc/ffi.rs`, `nvenc/encoder.rs::submit_dmabuf`.
+- **EGL display** is bound to the **pinned** CUDA device (matched via
+  `EGL_CUDA_DEVICE_NV`) so the import lands on the encoder's GPU — device 0
+  when unpinned. Multi-GPU alignment is **implemented**: the host reads the
+  GPU its dma-buf producer (the gpuconvert wgpu adapter) will use, by 16-byte
+  Vulkan `deviceUUID` (which equals CUDA's `cuDeviceGetUuid` on NVIDIA), and
+  pins NVENC/NVDEC's CUDA context, the EGL display, and the NVDEC surface
+  pool's Vulkan device to that same physical GPU (`nvenc::pin_gpu_uuid`,
+  wired in `tether-host` before the probe). The user-facing override to force
+  a *specific* GPU (vs. the producer's default pick) is the remaining
+  follow-up. Source: `nvenc/gpu_pin.rs`, `gpu_select::preferred_device_uuid`.
+- **Live rate-control is POSITIVE on NVENC**, the inverse of the VAAPI
+  table: `supports_changing_bitrate` is `true` and
+  `set_bitrate_kbps` (writing `bit_rate` + `rc_max_rate`) drives a real
+  reconfigure. `nvenc_bitrate_retune_changes_bitstream_size` verifies a
+  ~19× bitstream-size delta across a 1→20 Mbps retune on an RTX 3090 Ti,
+  so the host's ABR controller is active on NVENC hosts. LTR / intra-
+  refresh remain follow-ups (the protocol/host bookkeeping, not just the
+  encoder, is the bulk of that work — see #16's out-of-scope list).
+
+## Layer 3 (Linux) — NVDEC decode (NVIDIA)
+
+On an NVIDIA host the decode path is **NVDEC, not VAAPI** — same reason as
+encode: the only VAAPI device is the decode-only `nvidia-vaapi-driver`,
+whose `VaapiDecoder` SIGSEGVs. `build_decoder` and the decode probe both
+route to NVDEC when `nvenc::nvidia_gpu_present()` and do not fall back.
+Uses FFmpeg's generic `h264` / `hevc` / `av1` decoder with a CUDA
+`AVHWDeviceContext` + a `get_format` callback pinning `AV_PIX_FMT_CUDA`
+(no `*_cuvid` name needed). Source: `nvdec/decoder.rs`, `nvdec/surface_pool.rs`.
+
+- **Zero-copy output**: the exact reverse of the encoder's import. NVDEC
+  decodes into a CUDA surface; the decoder allocates a 4:2:0 dma-buf from a
+  small `ash`-Vulkan surface pool, wraps it in ONE multi-plane `EGLImage`,
+  registers it read-write with `cuGraphicsEGLRegisterImage`, and
+  `cuMemcpy2D`s the decoded planes in (device→device). The renderer imports
+  the resulting dma-buf exactly as it does the VAAPI decoder's — no
+  host-memory round-trip. The surface pool is raw `ash` (not gpuconvert's
+  exporter) because tether-codec can't depend on gpuconvert without a cargo
+  cycle; it mirrors `shared_nv12.rs`'s layout + 64-byte/16-row alignment.
+- **Profiles**: H.264 / HEVC Main (NV12), HEVC Main10 and AV1 10-bit
+  (P010). HEVC Main 4:4:4 is not advertised on NVIDIA Linux until the
+  planar dma-buf import/export leg is proven on NVIDIA EGL/CUDA. AV1 decode
+  works on Ampere (decode, unlike encode, isn't Ada-only).
+- **NVDEC HEVC has a 144×144 minimum coded size** (H.264's is far smaller).
+  Below it, `avcodec_send_packet` fails with a bare `-1`. This bit the
+  decode probe: the fixtures were 128×128, so HEVC silently dropped to the
+  H.264 floor on NVIDIA. Probe fixtures are now 256×256 (above every
+  hardware decoder's minimum). See `fixtures/probe/README.md`.
+- **Surface-pool lifetime**: each slot's Vulkan images/memory live in a
+  refcounted `SurfaceBacking` shared with any handed-out `PooledSurface`,
+  so a pool rebuilt on a resolution/layout change can't free memory (or
+  invalidate an exported fd) under a surface the renderer still holds.
+- **Verified** on RTX 3090 Ti: `decodes_committed_h264_fixture_via_nvdec`
+  (NV12, pixel-exact vs software decode) and
+  `decodes_our_hevc_main10_via_nvdec_p010` (P010 round trip from our own
+  NVENC Main10 output, uniform mid-range 10-bit luma readback). The
+  diagnostic `decodes_our_hevc_main444_via_nvdec_yuv444p` test currently
+  SKIPs on this driver because `eglCreateImage(YU24)` returns
+  `EGL_BAD_MATCH`.
+
 ### What's probed
 
 The probe at `tether-codec/src/vaapi/probe.rs` constructs an

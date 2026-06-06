@@ -1,11 +1,12 @@
 //! Linux DMA-BUF zero-copy round-trip test cells.
 //!
-//! Each `#[test]` here is a [`RoundtripCase`] struct literal plus an
-//! assertion block — the harness in `test_harness.rs` owns everything
-//! else (fixture loading, encode dispatch, decoder loop, production-
-//! renderer dispatch via `Gpu::new_headless`, CPU reference build, and
-//! metric computation). Adding a new cell means writing one struct
-//! literal; this file is the matrix.
+//! Most `#[test]` cells here are a [`RoundtripCase`] struct literal plus
+//! an assertion block — the harness in `test_harness.rs` owns fixture
+//! loading, encode dispatch, decoder loop, production-renderer dispatch
+//! via `Gpu::new_headless`, CPU reference build, and metric computation.
+//! A few renderer-only DMA-BUF colour cells sit next to the matrix because
+//! they isolate Linux import bugs from codec encode/decode while using the
+//! same shared colour fixture as the end-to-end cells.
 //!
 //! ## Matrix
 //!
@@ -66,13 +67,15 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
 
 use tether_codec::vaapi::VaapiEncoder;
-use tether_codec::Encoder;
+use tether_codec::{Encoder, GpuFrameGuard, GpuFrameSource};
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoColorSpec, VideoProfile};
 
+use crate::gpu::GpuState;
 use crate::test_harness::{
-    dump_failure_diagnostics, run_roundtrip, Capability, Fixture, Floors, RoundtripCase,
-    RoundtripOutcome, RoundtripResult,
+    dump_failure_diagnostics, readback_offscreen, run_roundtrip, try_init_wgpu_for_dmabuf,
+    Capability, Fixture, Floors, RoundtripCase, RoundtripOutcome, RoundtripResult,
 };
+use crate::{Frame, GpuFrame};
 
 // =====================================================================
 // Per-cell assertion helper
@@ -377,6 +380,173 @@ fn decode_reference_colorbars_hevc_main444_8bit() {
         dims.1,
         crate::color_fixture::ChannelOrder::Bgra,
     );
+}
+
+// =====================================================================
+// Renderer-only DMA-BUF colour cells
+//
+// These isolate the branch's Linux renderer import path from codec
+// encode/decode. The source is the production gpuconvert bridge
+// (BGRA → DMA-BUF NV12/P010), imported by a separate production
+// `GpuState::new_headless`, rendered, read back, and checked with the
+// same colour-bar assertion as the end-to-end cells above.
+// =====================================================================
+
+const SYNTHETIC_DMABUF_DIMS: (u32, u32) = (640, 360);
+
+#[test]
+#[ignore = "requires Vulkan DMA-BUF import + NV12 storage"]
+fn renderer_import_colorbars_nv12_dmabuf() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (width, height) = SYNTHETIC_DMABUF_DIMS;
+    let bridge = match pollster::block_on(tether_gpuconvert::Nv12DmaBuf::new(width, height)) {
+        Ok(bridge) => bridge,
+        Err(e) => {
+            eprintln!("SKIPPED renderer_import_colorbars_nv12_dmabuf: Nv12DmaBuf::new failed: {e}");
+            return;
+        }
+    };
+    let bgra = crate::color_fixture::colorbars_bgra(SYNTHETIC_DMABUF_DIMS);
+    let nv12 = match bridge.convert_bgra_bytes(&bgra) {
+        Ok(nv12) => nv12,
+        Err(e) => {
+            eprintln!(
+                "SKIPPED renderer_import_colorbars_nv12_dmabuf: BGRA→NV12 convert failed: {e}"
+            );
+            return;
+        }
+    };
+    let tether_gpuconvert::Nv12DmaBufFrame {
+        width,
+        height,
+        fd,
+        size,
+        modifier,
+        y_offset,
+        y_stride,
+        uv_offset,
+        uv_stride,
+    } = nv12;
+    let dmabuf = tether_codec::build_nv12_dmabuf_frame(
+        fd, size, modifier, y_offset, y_stride, uv_offset, uv_stride,
+    );
+    let Some(readback) = render_synthetic_dmabuf_colorbars(
+        "renderer_import_colorbars_nv12_dmabuf",
+        8,
+        GpuFrameSource::DmaBuf(dmabuf),
+        GpuFrameGuard::new(bridge),
+    ) else {
+        return;
+    };
+    crate::color_fixture::assert_colorbars(
+        "renderer NV12 DMA-BUF",
+        &readback,
+        width,
+        height,
+        crate::color_fixture::ChannelOrder::Bgra,
+    );
+}
+
+#[test]
+#[ignore = "requires Vulkan DMA-BUF import + storage R16/Rg16"]
+fn renderer_import_colorbars_p010_dmabuf() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (width, height) = SYNTHETIC_DMABUF_DIMS;
+    let bridge = match pollster::block_on(tether_gpuconvert::Bgra2P010DmaBuf::new(width, height)) {
+        Ok(bridge) => bridge,
+        Err(e) => {
+            eprintln!(
+                "SKIPPED renderer_import_colorbars_p010_dmabuf: Bgra2P010DmaBuf::new failed: {e}"
+            );
+            return;
+        }
+    };
+    let bgra = crate::color_fixture::colorbars_bgra(SYNTHETIC_DMABUF_DIMS);
+    let p010 = match bridge.convert_bgra_bytes(&bgra) {
+        Ok(p010) => p010,
+        Err(e) => {
+            eprintln!(
+                "SKIPPED renderer_import_colorbars_p010_dmabuf: BGRA→P010 convert failed: {e}"
+            );
+            return;
+        }
+    };
+    let tether_gpuconvert::P010DmaBufFrame {
+        width,
+        height,
+        fd,
+        size,
+        modifier,
+        y_offset,
+        y_stride,
+        uv_offset,
+        uv_stride,
+    } = p010;
+    let dmabuf = tether_codec::build_p010_dmabuf_frame(
+        fd, size, modifier, y_offset, y_stride, uv_offset, uv_stride,
+    );
+    let Some(readback) = render_synthetic_dmabuf_colorbars(
+        "renderer_import_colorbars_p010_dmabuf",
+        10,
+        GpuFrameSource::DmaBuf(dmabuf),
+        GpuFrameGuard::new(bridge),
+    ) else {
+        return;
+    };
+    crate::color_fixture::assert_colorbars(
+        "renderer P010 DMA-BUF",
+        &readback,
+        width,
+        height,
+        crate::color_fixture::ChannelOrder::Bgra,
+    );
+}
+
+fn render_synthetic_dmabuf_colorbars(
+    label: &str,
+    bit_depth: u8,
+    source: GpuFrameSource,
+    guard: GpuFrameGuard,
+) -> Option<Vec<u8>> {
+    let (device, queue) = match pollster::block_on(try_init_wgpu_for_dmabuf(bit_depth)) {
+        Some((device, queue, _adapter)) => (device, queue),
+        None => {
+            eprintln!(
+                "SKIPPED {label}: wgpu adapter lacks Vulkan DMA-BUF import{}",
+                if bit_depth == 10 {
+                    " or TEXTURE_FORMAT_16BIT_NORM"
+                } else {
+                    ""
+                }
+            );
+            return None;
+        }
+    };
+    let mut renderer = match GpuState::new_headless(
+        device.clone(),
+        queue,
+        SYNTHETIC_DMABUF_DIMS,
+        VideoColorSpec::sdr_desktop(),
+        ChromaSubsampling::Yuv420,
+        bit_depth,
+    ) {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln!("SKIPPED {label}: GpuState::new_headless failed: {e}");
+            return None;
+        }
+    };
+    renderer
+        .apply_frame(Frame::Gpu(GpuFrame {
+            width: SYNTHETIC_DMABUF_DIMS.0,
+            height: SYNTHETIC_DMABUF_DIMS.1,
+            t_capture_client_clock: None,
+            source,
+            guard,
+        }))
+        .expect("apply synthetic DMA-BUF frame");
+    renderer.render().expect("render synthetic DMA-BUF frame");
+    Some(readback_offscreen(&renderer, &device))
 }
 
 // =====================================================================
@@ -977,7 +1147,7 @@ fn bench_encode_by_resolution_h264() {
 
 #[cfg(test)]
 mod cross_table_consistency {
-    use tether_codec::vaapi::expected_dmabuf_fourcc;
+    use tether_codec::{nvenc, vaapi};
     use tether_protocol::control::ChromaSubsampling;
 
     use crate::gpu::{render_layout_for, RenderLayout};
@@ -989,43 +1159,61 @@ mod cross_table_consistency {
         (ChromaSubsampling::Yuv444, 10),
     ];
 
-    /// Maps each encoder-input fourcc to the renderer layout we expect
-    /// to use for the matching `(chroma, bit_depth)`. The keys are the
-    /// *encoder-input* fourccs (`expected_dmabuf_fourcc`); the values are
-    /// the renderer's *decode-output* layout. For 4:2:0 and 8-bit 4:4:4
-    /// the decoder emits the same fourcc family it consumes. For 4:4:4
-    /// 10-bit they differ: the encoder consumes XV30 but Intel's decoder
-    /// outputs Y410 (→ `PackedY410`) — same 10:10:10:2 packing, different
-    /// component order. Verified end-to-end by the
+    /// Maps each backend's encoder-input fourcc to the renderer layout we
+    /// expect to use for the matching `(chroma, bit_depth)`. The values are
+    /// the renderer's *decode-output* layout. VAAPI 4:4:4 8-bit uses packed
+    /// `XYUV`; NVIDIA uses planar `YU24`. For VAAPI 4:4:4 10-bit, the encoder
+    /// consumes XV30 but Intel's decoder outputs Y410 (→ `PackedY410`) — same
+    /// 10:10:10:2 packing, different component order. Verified end-to-end by the
     /// `roundtrip_hevc_main444_10bit_identity` cell on Intel media-driver.
     fn expected_layout_for_fourcc(fourcc: u32) -> RenderLayout {
         match &fourcc.to_le_bytes() {
             b"NV12" => RenderLayout::Biplanar8,
             b"P010" => RenderLayout::Biplanar16,
             b"XYUV" => RenderLayout::PackedXYUV,
+            b"YU24" => RenderLayout::Planar444,
             b"XV30" => RenderLayout::PackedY410,
             other => panic!("expected_layout_for_fourcc: unknown fourcc {other:?}"),
         }
     }
 
+    fn expected_encoder_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {
+        if nvenc::nvidia_gpu_present() {
+            nvenc::expected_dmabuf_fourcc(chroma, bit_depth)
+        } else {
+            vaapi::expected_dmabuf_fourcc(chroma, bit_depth)
+        }
+    }
+
+    fn any_linux_backend_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {
+        vaapi::expected_dmabuf_fourcc(chroma, bit_depth)
+            .or_else(|| nvenc::expected_dmabuf_fourcc(chroma, bit_depth))
+    }
+
     #[test]
     fn encoder_fourccs_are_well_formed() {
         for &(chroma, bit_depth) in MODELED {
-            let f = expected_dmabuf_fourcc(chroma, bit_depth)
-                .unwrap_or_else(|| panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})"));
-            let bytes = f.to_le_bytes();
-            assert!(
-                bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)),
-                "encoder fourcc for ({chroma:?}, {bit_depth}) = 0x{f:08x} is not printable",
-            );
+            for (backend, fourcc) in [
+                ("vaapi", vaapi::expected_dmabuf_fourcc(chroma, bit_depth)),
+                ("nvenc", nvenc::expected_dmabuf_fourcc(chroma, bit_depth)),
+            ] {
+                let Some(f) = fourcc else { continue };
+                let bytes = f.to_le_bytes();
+                assert!(
+                    bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)),
+                    "{backend} encoder fourcc for ({chroma:?}, {bit_depth}) = 0x{f:08x} \
+                     is not printable",
+                );
+            }
         }
     }
 
     #[test]
     fn renderer_layout_matches_encoder_fourcc() {
         for &(chroma, bit_depth) in MODELED {
-            let fourcc = expected_dmabuf_fourcc(chroma, bit_depth)
-                .unwrap_or_else(|| panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})"));
+            let Some(fourcc) = expected_encoder_fourcc(chroma, bit_depth) else {
+                continue;
+            };
             let renderer = render_layout_for(chroma, bit_depth);
             let expected = expected_layout_for_fourcc(fourcc);
             assert_eq!(
@@ -1044,7 +1232,7 @@ mod cross_table_consistency {
         // addition (AV1, future chroma) is automatically covered. A
         // hand-rolled list silently misses new entries.
         for p in tether_probe::PROFILE_PREFERENCE.iter().copied() {
-            let f = expected_dmabuf_fourcc(p.chroma, p.bit_depth);
+            let f = any_linux_backend_fourcc(p.chroma, p.bit_depth);
             assert!(f.is_some(), "no encoder fourcc for profile {p:?}");
         }
     }

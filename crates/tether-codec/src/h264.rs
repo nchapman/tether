@@ -90,8 +90,8 @@ pub(crate) fn frame_plane_mut(frame: &mut AVFrame, idx: usize, height: usize) ->
 }
 
 /// Borrow plane `idx` of an allocated `AVFrame` as a read-only slice.
-#[allow(clippy::cast_sign_loss)] // ffmpeg linesize is i32 but non-negative for allocated frames
 #[cfg(test)]
+#[allow(clippy::cast_sign_loss)] // ffmpeg linesize is i32 but non-negative for allocated frames
 pub(crate) fn frame_plane(frame: &AVFrame, idx: usize, height: usize) -> &[u8] {
     let stride = frame.linesize[idx] as usize;
     let ptr = frame.data[idx];

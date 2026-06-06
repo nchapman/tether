@@ -1,0 +1,92 @@
+//! Process-global physical-GPU pin for the NVIDIA path (GitHub issue #16).
+//!
+//! On a multi-GPU host every NVIDIA subsystem must land on one physical GPU:
+//! NVENC's and NVDEC's CUDA contexts, the EGL→CUDA dma-buf importer, and the
+//! NVDEC surface pool's Vulkan device. The dma-buf *producer* (a gpuconvert
+//! bridge) leads — the host reads the GPU its `HighPerformance` wgpu adapter
+//! will pick (`tether_gpuconvert::gpu_select::preferred_device_uuid`) and calls
+//! [`pin_gpu_uuid`] once at startup. Everything built afterward (the capability
+//! probe and the live session alike) reads this pin and binds to the same GPU.
+//!
+//! Why a process-global rather than a threaded parameter: the EGL importer is
+//! itself a lazily-initialised process-global (one `EGLDisplay` per process),
+//! so its device choice *must* come from shared state; routing the same pin
+//! through the encoder, decoder, and surface pool keeps all four in agreement
+//! from one source of truth. Unset (the default) means "driver-default device"
+//! — exactly the single-GPU behavior that shipped before pinning, so a host
+//! that never calls [`pin_gpu_uuid`] is unchanged.
+
+use std::ffi::CString;
+use std::sync::OnceLock;
+
+use super::ffi::{cuda_ordinal_for_uuid, GpuUuid};
+
+/// The pinned GPU and its resolved CUDA ordinal. The ordinal is computed once
+/// at [`pin_gpu_uuid`] time (one CUDA enumeration) and cached here so the
+/// per-encoder / per-decoder / EGL-importer reads below don't re-`dlopen`
+/// libcuda and re-enumerate on every construction.
+struct Pin {
+    uuid: GpuUuid,
+    cuda_ordinal: i32,
+}
+
+/// The pinned target. `None` until the host pins one; the first pin wins (a
+/// host pins exactly once at startup).
+static TARGET: OnceLock<Pin> = OnceLock::new();
+
+/// Pin every NVIDIA subsystem to the physical GPU with this 16-byte device
+/// UUID (the Vulkan `deviceUUID` of the dma-buf producer, which equals the
+/// CUDA UUID on NVIDIA). Call once at host startup, before constructing any
+/// encoder/decoder or running the capability probe, so they all bind here.
+///
+/// Idempotent in practice: the first pin wins. A second call with a *different*
+/// UUID is a host bug (two GPUs chosen) — it's logged and ignored rather than
+/// silently re-pointed, since the EGL importer may already be bound.
+pub fn pin_gpu_uuid(uuid: GpuUuid) {
+    let Some(cuda_ordinal) = cuda_ordinal_for_uuid(uuid) else {
+        tracing::error!(
+            uuid = ?uuid,
+            "refusing to pin NVIDIA subsystems to a GPU UUID without a CUDA device"
+        );
+        return;
+    };
+
+    // Resolve the CUDA ordinal once, here, rather than on every later read.
+    let pin = Pin { uuid, cuda_ordinal };
+    match TARGET.set(pin) {
+        Ok(()) => {
+            tracing::info!(uuid = ?uuid, "pinned NVIDIA subsystems to GPU");
+        }
+        Err(_) => {
+            let existing = pinned_uuid();
+            if existing != Some(uuid) {
+                tracing::warn!(
+                    requested = ?uuid,
+                    existing = ?existing,
+                    "GPU already pinned to a different UUID; ignoring re-pin"
+                );
+            }
+        }
+    }
+}
+
+/// The pinned target GPU UUID, or `None` when unpinned (driver default).
+pub(crate) fn pinned_uuid() -> Option<GpuUuid> {
+    TARGET.get().map(|p| p.uuid)
+}
+
+/// The CUDA device ordinal the pinned UUID maps to, or `None` when unpinned
+/// (use the driver default). Used by the EGL importer to pick the matching
+/// `EGL_CUDA_DEVICE_NV` display. Cached at pin time — no enumeration here.
+pub(crate) fn pinned_cuda_ordinal() -> Option<i32> {
+    TARGET.get().map(|p| p.cuda_ordinal)
+}
+
+/// The CUDA device string for [`rsmpeg::avutil::AVHWDeviceContext::create`]
+/// (FFmpeg takes the device as a decimal ordinal), or `None` to let FFmpeg use
+/// its default device. `None` whenever [`pinned_cuda_ordinal`] is `None`.
+pub(crate) fn cuda_device_cstring() -> Option<CString> {
+    // ordinal.to_string() is decimal digits — never contains an interior NUL,
+    // so CString::new can't fail; map to None defensively all the same.
+    CString::new(pinned_cuda_ordinal()?.to_string()).ok()
+}

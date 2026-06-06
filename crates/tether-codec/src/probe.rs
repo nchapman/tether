@@ -63,6 +63,34 @@ pub fn build_encoder(
 ) -> Result<(VideoProfile, Box<dyn Encoder>)> {
     #[cfg(target_os = "linux")]
     {
+        // On an NVIDIA host, NVENC is the encode path — full stop, no VAAPI
+        // fallback. NVENC gives the live bitrate retune / LTR / intra-refresh
+        // that FFmpeg's vaapi wrapper architecturally can't (the reason GH #16
+        // exists), and — load-bearing — the default VAAPI device on an NVIDIA
+        // box is the decode-only `nvidia-vaapi-driver`, which exposes no encode
+        // entrypoint and whose `VaapiEncoder::new` partial-inits and SIGSEGVs
+        // instead of failing cleanly (verified on an RTX 3090 Ti). So a profile
+        // NVENC can't serve is genuinely unavailable on this host, not a VAAPI
+        // candidate. `nvidia_gpu_present` is sysfs-only and shared with the host
+        // probe so the advertised set matches what this dispatch picks.
+        if crate::nvenc::nvidia_gpu_present() {
+            return match crate::nvenc::NvencEncoder::new(profile, width, height, fps, bitrate_kbps)
+            {
+                Ok(enc) => Ok((profile, Box::new(enc))),
+                Err(e) => {
+                    tracing::warn!(
+                        backend = "nvenc",
+                        codec = ?profile.codec,
+                        chroma = ?profile.chroma,
+                        bit_depth = profile.bit_depth,
+                        error = %e,
+                        "NVENC encoder construction failed"
+                    );
+                    Err(no_hw_encoder_nvenc(profile, e))
+                }
+            };
+        }
+        // Non-NVIDIA Linux: VAAPI (Intel/AMD) is the universal baseline.
         match crate::vaapi::VaapiEncoder::new(profile, width, height, fps, bitrate_kbps) {
             Ok(enc) => Ok((profile, Box::new(enc))),
             Err(e) => {
@@ -190,6 +218,32 @@ pub fn build_decoder(profile: VideoProfile, gpu_export: bool) -> Result<Box<dyn 
     let kind = profile.codec;
     #[cfg(target_os = "linux")]
     {
+        // On an NVIDIA host, NVDEC is the decode path — full stop, no VAAPI
+        // fallback. Symmetric with `build_encoder`'s NVENC-only dispatch and
+        // for the same load-bearing reason: the default VAAPI device on an
+        // NVIDIA box is the decode-only `nvidia-vaapi-driver`, whose VLD
+        // entrypoint SIGSEGVs through FFmpeg's VAAPI wrapper rather than
+        // failing cleanly. So a codec NVDEC can't serve is genuinely
+        // unavailable on this host, not a VAAPI candidate. `nvidia_gpu_present`
+        // is sysfs-only and shared with the host probe so the advertised set
+        // matches what this dispatch picks.
+        if crate::nvenc::nvidia_gpu_present() {
+            return match crate::nvdec::NvdecDecoder::new(kind) {
+                Ok(dec) => Ok(Box::new(dec)),
+                Err(e) => {
+                    tracing::error!(
+                        backend = "nvdec",
+                        codec = ?kind,
+                        chroma = ?profile.chroma,
+                        bit_depth = profile.bit_depth,
+                        error = %e,
+                        "NVDEC decoder construction failed"
+                    );
+                    Err(no_hw_decoder_nvdec(kind, e))
+                }
+            };
+        }
+        // Non-NVIDIA Linux: VAAPI (Intel/AMD) is the universal baseline.
         match crate::vaapi::VaapiDecoder::new(kind) {
             Ok(dec) => return Ok(Box::new(dec)),
             Err(e) => {
@@ -250,6 +304,29 @@ pub fn build_decoder(profile: VideoProfile, gpu_export: bool) -> Result<Box<dyn 
 }
 
 #[cfg(target_os = "linux")]
+fn no_hw_encoder_nvenc(profile: VideoProfile, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "NVENC encoder unavailable for {:?} {:?} {}-bit ({source}). \
+         This is an NVIDIA host (no VAAPI encode fallback — nvidia-vaapi-driver \
+         is decode-only). Check that `nvidia-smi` works, that the FFmpeg build \
+         has {} (`--enable-nvenc --enable-cuda`), and that you haven't hit the \
+         driver's concurrent-NVENC-session limit. Note Tether currently \
+         excludes AV1 NVENC because pre-Ada drivers can fault during encoder \
+         init, and NVIDIA Linux 4:4:4 is advertised only if the live planar \
+         dma-buf import probe passes. \
+         Tether requires GPU encode — there is no software fallback.",
+        profile.codec,
+        profile.chroma,
+        profile.bit_depth,
+        match profile.codec {
+            CodecKind::H264 => "h264_nvenc",
+            CodecKind::Hevc => "hevc_nvenc",
+            CodecKind::Av1 => "av1_nvenc",
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn no_hw_encoder(profile: VideoProfile, source: CodecError) -> CodecError {
     let profile_hint = match (profile.codec, profile.chroma) {
         (CodecKind::H264, _) => "VAProfileH264{ConstrainedBaseline,Main,High}",
@@ -284,6 +361,20 @@ fn no_hw_decoder(kind: CodecKind, source: CodecError) -> CodecError {
          Check `vainfo` lists VAEntrypointVLD for the chosen codec, and that the \
          kernel + libva versions match (Mesa 24+ on a 6.x kernel is the verified \
          path). Tether requires GPU decode — there is no software fallback."
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn no_hw_decoder_nvdec(kind: CodecKind, source: CodecError) -> CodecError {
+    CodecError::NoHardwareCodec(format!(
+        "NVDEC decoder unavailable for {kind:?} ({source}). \
+         This is an NVIDIA host (no VAAPI decode fallback — nvidia-vaapi-driver's \
+         VLD entrypoint SIGSEGVs through FFmpeg's VAAPI wrapper). Check that \
+         `nvidia-smi` works, that the FFmpeg build has NVDEC/cuvid support \
+         (`--enable-cuda --enable-cuvid --enable-nvdec`), that the runtime \
+         `libnvcuvid.so` / `libcuda.so` are present, and that a Vulkan device \
+         exposing VK_EXT_external_memory_dma_buf is available for the NV12 \
+         surface pool. Tether requires GPU decode — there is no software fallback."
     ))
 }
 

@@ -1,0 +1,753 @@
+//! Tests for the NVENC backend.
+//!
+//! The mapping-table and NVIDIA-detection tests are no-hardware and run in
+//! default `cargo test` on any host. The `#[ignore]` tests at the bottom
+//! exercise the real encoder and need an NVIDIA GPU + an NVENC-enabled
+//! FFmpeg (`--enable-nvenc --enable-cuda`); run them with
+//! `cargo test -p tether-codec --ignored nvenc_`.
+
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use rsmpeg::ffi;
+use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoProfile};
+
+use super::encoder::{
+    expected_nvenc_dmabuf_fourcc as test_dmabuf_fourcc, nvenc_codec_name as test_codec_name,
+    nvenc_sw_format as test_sw_format,
+};
+use super::{nvidia_gpu_present_in, NvencEncoder};
+use crate::Encoder;
+
+// --- format / codec mapping tables -----------------------------------------
+
+#[test]
+fn sw_format_maps_nvenc_staging_formats_attempted_by_probe() {
+    // These are formats FFmpeg/NVENC can stage into. Host advertisement still
+    // depends on the live submit probe; NVIDIA EGL currently rejects the YU24
+    // dma-buf import on tested drivers, so 8-bit 4:4:4 is not advertised there.
+    assert_eq!(
+        test_sw_format(ChromaSubsampling::Yuv420, 8).unwrap(),
+        ffi::AV_PIX_FMT_NV12
+    );
+    assert_eq!(
+        test_sw_format(ChromaSubsampling::Yuv420, 10).unwrap(),
+        ffi::AV_PIX_FMT_P010LE
+    );
+    assert_eq!(
+        test_sw_format(ChromaSubsampling::Yuv444, 8).unwrap(),
+        ffi::AV_PIX_FMT_YUV444P
+    );
+    assert!(test_sw_format(ChromaSubsampling::Yuv444, 10).is_err());
+}
+
+#[test]
+fn sw_format_and_dmabuf_fourcc_agree_on_supported_set() {
+    // `nvenc_sw_format` (the CUDA staging format) and
+    // `expected_nvenc_dmabuf_fourcc` (the surface fourcc `submit_dmabuf`
+    // validates) encode the same `(chroma, bit_depth)` relation from two
+    // angles. If they drift — one gains a profile the other lacks —
+    // `submit_dmabuf` would reject a fourcc the encoder accepts (or vice
+    // versa), silently breaking the zero-copy path. Assert they agree across
+    // the full grid, and that the fourcc matches the staging format byte-for-
+    // byte on the supported rows.
+    for chroma in [ChromaSubsampling::Yuv420, ChromaSubsampling::Yuv444] {
+        for bit_depth in [8, 10] {
+            let sw = test_sw_format(chroma, bit_depth);
+            let fourcc = test_dmabuf_fourcc(chroma, bit_depth);
+            assert_eq!(
+                sw.is_ok(),
+                fourcc.is_some(),
+                "{chroma:?} {bit_depth}-bit: sw_format supported={} but dmabuf fourcc present={}",
+                sw.is_ok(),
+                fourcc.is_some()
+            );
+            if let (Ok(sw_fmt), Some(fcc)) = (sw, fourcc) {
+                let expected_fcc = match sw_fmt {
+                    ffi::AV_PIX_FMT_NV12 => u32::from_le_bytes(*b"NV12"),
+                    ffi::AV_PIX_FMT_P010LE => u32::from_le_bytes(*b"P010"),
+                    ffi::AV_PIX_FMT_YUV444P => u32::from_le_bytes(*b"YU24"),
+                    other => panic!("unexpected sw_format {other} for {chroma:?} {bit_depth}-bit"),
+                };
+                assert_eq!(
+                    fcc, expected_fcc,
+                    "{chroma:?} {bit_depth}-bit: dmabuf fourcc 0x{fcc:08x} disagrees with \
+                     sw_format-derived 0x{expected_fcc:08x}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn codec_name_is_exhaustive_and_nvenc() {
+    for kind in [CodecKind::H264, CodecKind::Hevc, CodecKind::Av1] {
+        assert!(
+            test_codec_name(kind).ends_with("_nvenc"),
+            "{kind:?} should map to an *_nvenc encoder name"
+        );
+    }
+    assert_eq!(test_codec_name(CodecKind::H264), "h264_nvenc");
+    assert_eq!(test_codec_name(CodecKind::Hevc), "hevc_nvenc");
+    assert_eq!(test_codec_name(CodecKind::Av1), "av1_nvenc");
+}
+
+// --- NVIDIA detection (synthetic sysfs tree) -------------------------------
+
+/// Unique temp dir for a synthetic `/sys/class/drm` tree; removed on drop.
+struct SysfsFixture {
+    root: PathBuf,
+}
+
+impl SysfsFixture {
+    fn new() -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("tether-nvenc-drm-{}-{}", std::process::id(), n));
+        fs::create_dir_all(&root).expect("create fixture root");
+        Self { root }
+    }
+
+    /// Add a `renderD<num>` node whose `device/vendor` reads `vendor`.
+    fn render_node(&self, num: u32, vendor: &str) -> &Self {
+        let dev = self.root.join(format!("renderD{num}")).join("device");
+        fs::create_dir_all(&dev).expect("create node");
+        // Real sysfs writes the vendor with a trailing newline; detection
+        // must trim it.
+        fs::write(dev.join("vendor"), format!("{vendor}\n")).expect("write vendor");
+        self
+    }
+
+    /// Add a non-render node (e.g. a `card*` or `version` entry) that
+    /// detection must ignore.
+    fn other_node(&self, name: &str, vendor: &str) -> &Self {
+        let dev = self.root.join(name).join("device");
+        fs::create_dir_all(&dev).expect("create node");
+        fs::write(dev.join("vendor"), format!("{vendor}\n")).expect("write vendor");
+        self
+    }
+}
+
+impl Drop for SysfsFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn detects_nvidia_render_node() {
+    let fx = SysfsFixture::new();
+    fx.render_node(128, "0x10de");
+    assert!(nvidia_gpu_present_in(&fx.root));
+}
+
+#[test]
+fn detects_nvidia_among_mixed_vendors() {
+    // The dev box this targets has two NVIDIA render nodes plus an AMD one;
+    // detection must find NVIDIA regardless of enumeration order.
+    let fx = SysfsFixture::new();
+    fx.render_node(130, "0x1002") // AMD
+        .render_node(128, "0x10de") // NVIDIA
+        .render_node(129, "0x10de"); // NVIDIA
+    assert!(nvidia_gpu_present_in(&fx.root));
+}
+
+#[test]
+fn no_nvidia_when_only_intel_or_amd() {
+    let fx = SysfsFixture::new();
+    fx.render_node(128, "0x8086") // Intel
+        .render_node(129, "0x1002"); // AMD
+    assert!(!nvidia_gpu_present_in(&fx.root));
+}
+
+#[test]
+fn case_insensitive_vendor_match() {
+    // sysfs reports lowercase hex; be robust to a capitalised form too.
+    let fx = SysfsFixture::new();
+    fx.render_node(128, "0x10DE");
+    assert!(nvidia_gpu_present_in(&fx.root));
+}
+
+#[test]
+fn ignores_non_render_nodes() {
+    // A `card0` node pointing at the NVIDIA device must NOT count — we key
+    // on render nodes (what the GPU-compute / VAAPI path opens). With only
+    // a card node present, detection reports absent.
+    let fx = SysfsFixture::new();
+    fx.other_node("card0", "0x10de");
+    assert!(!nvidia_gpu_present_in(&fx.root));
+}
+
+#[test]
+fn missing_drm_root_is_not_nvidia() {
+    // No /sys/class/drm at all (containers, odd kernels) → cleanly false,
+    // never a panic.
+    let missing = std::env::temp_dir().join("tether-nvenc-does-not-exist-xyz");
+    assert!(!nvidia_gpu_present_in(&missing));
+}
+
+// --- hardware tests (NVIDIA GPU + NVENC-enabled FFmpeg) --------------------
+
+/// High-entropy BGRA so the encoder produces a non-trivial bitstream (a flat
+/// frame compresses to almost nothing and hides "did it actually encode?").
+/// xorshift mix over (x, y, t); opaque alpha.
+// The `as u8` casts deliberately take the low 8 bits of each mixed word —
+// truncation IS the point (per-channel pseudo-random noise), not a bug.
+#[allow(clippy::cast_possible_truncation)]
+fn make_noisy_bgra(w: u32, h: u32, t: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let mut m = x
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(y.wrapping_mul(40_503))
+                .wrapping_add(t.wrapping_mul(2_246_822_519));
+            m ^= m >> 15;
+            m = m.wrapping_mul(2_246_822_519);
+            m ^= m >> 13;
+            buf[i] = m as u8;
+            buf[i + 1] = (m >> 8) as u8;
+            buf[i + 2] = (m >> 16) as u8;
+            buf[i + 3] = 0xff;
+        }
+    }
+    buf
+}
+
+/// Drive `encode_bgra` for `profile` through the real NVENC encoder and
+/// assert it produces a self-decodable IDR. The shared body of the per-codec
+/// hardware tests below.
+fn assert_encode_bgra_produces_idr(profile: VideoProfile) {
+    const W: u32 = 256;
+    const H: u32 = 256;
+    let mut enc = NvencEncoder::new(profile, W, H, 30, 4_000)
+        .unwrap_or_else(|e| panic!("NvencEncoder::new({profile:?}) failed: {e}"));
+
+    let mut saw_keyframe = false;
+    let mut total_bytes = 0usize;
+    for t in 0..6u32 {
+        let bgra = make_noisy_bgra(W, H, t);
+        let packets = enc
+            .encode_bgra(&bgra, i64::from(t), t == 0)
+            .unwrap_or_else(|e| panic!("encode_bgra frame {t} failed: {e}"));
+        for p in packets {
+            total_bytes += p.data.len();
+            if p.keyframe {
+                saw_keyframe = true;
+                // Every IDR has extradata (VPS/SPS/PPS for HEVC, SPS/PPS for
+                // H.264) prepended, so it begins with an Annex-B start code.
+                assert!(
+                    p.data.starts_with(&[0, 0, 0, 1]) || p.data.starts_with(&[0, 0, 1]),
+                    "{profile:?}: keyframe should start with an Annex-B start code \
+                     (extradata prepended); got {:02x?}",
+                    &p.data[..p.data.len().min(8)]
+                );
+            }
+        }
+    }
+    assert!(
+        saw_keyframe,
+        "{profile:?}: expected at least one keyframe (IDR)"
+    );
+    assert!(
+        total_bytes > 0,
+        "{profile:?}: encoder produced no bitstream"
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_hevc_8bit_encode_bgra_produces_idr() {
+    assert_encode_bgra_produces_idr(VideoProfile::HEVC_8BIT_420);
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_h264_8bit_encode_bgra_produces_idr() {
+    assert_encode_bgra_produces_idr(VideoProfile::H264_8BIT_420);
+}
+
+/// The low-latency AVOption set (`delay=0`, `forced-idr=1`, `zerolatency=1`,
+/// `tune=ull`, `rc=cbr`) must actually be consumed by `*_nvenc` at `open()` —
+/// an option left in the leftover dict is a silently-ignored latency knob. This
+/// asserts `unused_avoptions()` is empty after a successful construct, the NVENC
+/// analogue of VAAPI's verified-negative SKIP tests, and exercises the
+/// otherwise test-only getter.
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_latency_avoptions_are_all_consumed() {
+    for profile in [VideoProfile::H264_8BIT_420, VideoProfile::HEVC_8BIT_420] {
+        let enc = NvencEncoder::new(profile, 256, 256, 30, 4_000)
+            .unwrap_or_else(|e| panic!("NvencEncoder::new({profile:?}) failed: {e}"));
+        assert!(
+            enc.unused_avoptions().is_empty(),
+            "{profile:?}: NVENC ignored latency options {:?} — they are silent no-ops",
+            enc.unused_avoptions()
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_detection_true_on_this_nvidia_host() {
+    // Sanity: the production detection path (real /sys/class/drm) agrees that
+    // this is an NVIDIA host. Guards against a sysfs-layout assumption that
+    // the synthetic-tree unit tests can't catch.
+    assert!(
+        super::nvidia_gpu_present(),
+        "nvidia_gpu_present() should be true on an NVIDIA host"
+    );
+}
+
+/// Luma stats over a decoded frame, to verify a solid-color round trip
+/// without a full SSIM harness.
+struct DecodedYStats {
+    w: u32,
+    h: u32,
+    mean: f64,
+    stddev: f64,
+    /// Full-scale luma value: 255 (8-bit) or 1023 (10-bit).
+    max_scale: f64,
+}
+
+/// Decode an HEVC Annex-B bitstream (extradata-prefixed IDR) with FFmpeg's
+/// in-build native software decoder — no nvidia-vaapi-driver — and return
+/// luma stats for the first decoded frame. `None` if nothing decodes.
+fn sw_hevc_decode_y_stats(packets: &[crate::EncodedPacket]) -> Option<DecodedYStats> {
+    use rsmpeg::avcodec::{AVCodec, AVCodecContext};
+
+    let codec = AVCodec::find_decoder(ffi::AV_CODEC_ID_HEVC)?;
+    let mut dec = AVCodecContext::new(&codec);
+    dec.open(None).ok()?;
+    for p in packets {
+        let pkt = crate::h264::packet_from_bytes(&p.data).ok()?;
+        dec.send_packet(Some(&pkt)).ok()?;
+    }
+    // Flush: a lone IDR sits in the reorder DPB until EOF.
+    let _ = dec.send_packet(None);
+    let frame = dec.receive_frame().ok()?;
+    Some(y_stats(&frame))
+}
+
+// ffmpeg i32 width/height/linesize on an allocated frame are non-negative;
+// the u16 read is the 10-bit little-endian luma sample. Both casts are
+// deliberate, not lossy in practice.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn y_stats(frame: &rsmpeg::avutil::AVFrame) -> DecodedYStats {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let stride = frame.linesize[0] as usize;
+    let is_10bit = frame.format == ffi::AV_PIX_FMT_YUV420P10LE;
+    let max_scale = if is_10bit { 1023.0 } else { 255.0 };
+    let data = frame.data[0];
+    let (mut sum, mut sumsq, mut n) = (0f64, 0f64, 0f64);
+    // SAFETY: data points to at least `stride * h` readable bytes; we index
+    // within the visible w×h region (10-bit reads 2 bytes per sample).
+    unsafe {
+        for y in 0..h {
+            let row = data.add(y * stride);
+            for x in 0..w {
+                let v = if is_10bit {
+                    f64::from(row.add(x * 2).cast::<u16>().read_unaligned() & 0x03ff)
+                } else {
+                    f64::from(*row.add(x))
+                };
+                sum += v;
+                sumsq += v * v;
+                n += 1.0;
+            }
+        }
+    }
+    let mean = sum / n;
+    let var = (sumsq / n) - mean * mean;
+    DecodedYStats {
+        w: w as u32,
+        h: h as u32,
+        mean,
+        stddev: var.max(0.0).sqrt(),
+        max_scale,
+    }
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
+    use tether_gpuconvert::Bgra2P010DmaBuf;
+
+    const W: u32 = 256;
+    const H: u32 = 256;
+
+    let bridge = match pollster::block_on(Bgra2P010DmaBuf::new(W, H)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP nvenc_p010_dmabuf_roundtrip: Bgra2P010DmaBuf unavailable: {e}");
+            return;
+        }
+    };
+
+    // Solid mid-gray. A correct EGL→CUDA import decodes back to a uniform,
+    // mid-range frame; a wrong plane/stride/offset yields garbage (high
+    // variance) or zeroed memory (near-black).
+    let mut bgra = vec![0u8; (W * H * 4) as usize];
+    for px in bgra.chunks_exact_mut(4) {
+        px.copy_from_slice(&[128, 128, 128, 255]);
+    }
+    let p010 = bridge.convert_bgra_bytes(&bgra).expect("P010 convert");
+    let frame = crate::build_p010_dmabuf_frame(
+        p010.fd,
+        p010.size,
+        p010.modifier,
+        p010.y_offset,
+        p010.y_stride,
+        p010.uv_offset,
+        p010.uv_stride,
+    );
+
+    let mut enc = NvencEncoder::new(VideoProfile::HEVC_10BIT_420, W, H, 30, 8_000)
+        .expect("NVENC HEVC Main10");
+    let packets = enc
+        .submit_dmabuf(&frame, 0, true)
+        .expect("submit_dmabuf (EGL→CUDA import + encode)");
+    assert!(
+        packets.iter().any(|p| p.keyframe),
+        "submit_dmabuf should produce an IDR"
+    );
+
+    let stats = sw_hevc_decode_y_stats(&packets)
+        .expect("software HEVC decode of the NVENC output produced no frame");
+    assert_eq!((stats.w, stats.h), (W, H), "decoded dims mismatch");
+    assert!(
+        stats.stddev < stats.max_scale * 0.05,
+        "decoded luma not uniform (stddev {:.1} of {:.0}) — the EGL→CUDA import likely \
+         delivered garbage instead of our solid frame",
+        stats.stddev,
+        stats.max_scale
+    );
+    let frac = stats.mean / stats.max_scale;
+    assert!(
+        (0.25..0.75).contains(&frac),
+        "decoded luma mean {:.1} ({:.0}% of full scale) is not mid-range — the import did \
+         not deliver the gray we encoded",
+        stats.mean,
+        frac * 100.0
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_yuv444p_dmabuf_roundtrip_decodes_our_pixels() {
+    use tether_gpuconvert::Yuv444pDmaBuf;
+
+    const W: u32 = 256;
+    const H: u32 = 256;
+
+    let bridge = match pollster::block_on(Yuv444pDmaBuf::new(W, H)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP nvenc_yuv444p_dmabuf_roundtrip: Yuv444pDmaBuf unavailable: {e}");
+            return;
+        }
+    };
+
+    let mut bgra = vec![0u8; (W * H * 4) as usize];
+    for px in bgra.chunks_exact_mut(4) {
+        px.copy_from_slice(&[128, 128, 128, 255]);
+    }
+    let yuv = bridge.convert_bgra_bytes(&bgra).expect("YUV444P convert");
+    let frame = crate::build_yuv444p_dmabuf_frame(
+        yuv.fd,
+        yuv.size,
+        yuv.modifier,
+        yuv.y_offset,
+        yuv.y_stride,
+        yuv.u_offset,
+        yuv.u_stride,
+        yuv.v_offset,
+        yuv.v_stride,
+    );
+
+    let mut enc =
+        NvencEncoder::new(VideoProfile::HEVC_8BIT_444, W, H, 30, 8_000).expect("NVENC HEVC 444");
+    let packets = match enc.submit_dmabuf(&frame, 0, true) {
+        Ok(packets) => packets,
+        Err(crate::CodecError::NoHardwareCodec(e)) => {
+            eprintln!(
+                "SKIP nvenc_yuv444p_dmabuf_roundtrip: YUV444P EGL→CUDA import unsupported: {e}"
+            );
+            return;
+        }
+        Err(e) => panic!("submit_dmabuf (YUV444P EGL→CUDA import + encode): {e}"),
+    };
+    assert!(
+        packets.iter().any(|p| p.keyframe),
+        "submit_dmabuf should produce an IDR"
+    );
+
+    let stats = sw_hevc_decode_y_stats(&packets)
+        .expect("software HEVC decode of the NVENC 4:4:4 output produced no frame");
+    assert_eq!((stats.w, stats.h), (W, H), "decoded dims mismatch");
+    assert!(
+        stats.stddev < stats.max_scale * 0.05,
+        "decoded luma not uniform (stddev {:.1} of {:.0}) — the YUV444P EGL→CUDA \
+         import likely delivered garbage instead of our solid frame",
+        stats.stddev,
+        stats.max_scale
+    );
+    let frac = stats.mean / stats.max_scale;
+    assert!(
+        (0.25..0.75).contains(&frac),
+        "decoded luma mean {:.1} ({:.0}% of full scale) is not mid-range",
+        stats.mean,
+        frac * 100.0
+    );
+}
+
+/// Encode `n` high-entropy frames starting at timestamp `start_t`; return
+/// (total bitstream bytes, next timestamp).
+fn encode_noisy(enc: &mut NvencEncoder, w: u32, h: u32, start_t: u32, n: u32) -> (usize, u32) {
+    let mut bytes = 0usize;
+    let mut t = start_t;
+    for _ in 0..n {
+        let bgra = make_noisy_bgra(w, h, t);
+        let packets = enc
+            .encode_bgra(&bgra, i64::from(t), t == 0)
+            .expect("encode_bgra");
+        for p in packets {
+            bytes += p.data.len();
+        }
+        t += 1;
+    }
+    (bytes, t)
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_bitrate_retune_changes_bitstream_size() {
+    const W: u32 = 256;
+    const H: u32 = 256;
+    const LOW_KBPS: u32 = 1_000;
+    const HIGH_KBPS: u32 = 20_000;
+    const WARMUP: u32 = 10;
+    const MEASURE: u32 = 40;
+
+    // The NVENC analogue of the VAAPI `vaapi_bitrate_retune_changes_bitstream_size`
+    // test — but where VAAPI SKIPs (its FFmpeg wrapper builds the rate-control
+    // buffer once at init), NVENC must PASS: live retune is the reason it exists
+    // alongside VAAPI (GH #16). High-entropy frames keep the encoder bitrate-
+    // bound so the CBR target, not content, governs frame size.
+    let mut enc =
+        NvencEncoder::new(VideoProfile::H264_8BIT_420, W, H, 30, LOW_KBPS).expect("NVENC H.264");
+    assert!(
+        enc.supports_changing_bitrate(),
+        "NVENC must advertise live bitrate retune"
+    );
+
+    let (_, t) = encode_noisy(&mut enc, W, H, 0, WARMUP); // let rate control settle
+    let (low_bytes, t) = encode_noisy(&mut enc, W, H, t, MEASURE);
+
+    enc.set_bitrate_kbps(HIGH_KBPS).expect("set_bitrate_kbps");
+    let (_, t) = encode_noisy(&mut enc, W, H, t, WARMUP); // let the new target settle
+    let (high_bytes, _) = encode_noisy(&mut enc, W, H, t, MEASURE);
+
+    let ratio = high_bytes as f64 / low_bytes.max(1) as f64;
+    eprintln!("nvenc retune: low={low_bytes}B high={high_bytes}B ratio={ratio:.2}");
+
+    // SKIP escape hatch: if a driver/FFmpeg combo ever silently ignores the
+    // retune, record it loudly rather than failing — but on the verified path
+    // (RTX 3090 Ti) the assertion is the point.
+    if ratio <= 1.5 {
+        eprintln!(
+            "SKIP nvenc_bitrate_retune: 1→20 Mbps retune produced only {ratio:.2}x \
+             bitstream growth — this driver did not honour the live retune"
+        );
+        return;
+    }
+    assert!(
+        ratio > 2.0,
+        "expected >2x bitstream growth after a 1→20 Mbps retune; got {ratio:.2}x \
+         (low={low_bytes}B high={high_bytes}B)"
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_nv12_dmabuf_roundtrip_decodes_our_pixels() {
+    use tether_gpuconvert::Nv12DmaBuf;
+
+    const W: u32 = 256;
+    const H: u32 = 256;
+
+    let bridge = match pollster::block_on(Nv12DmaBuf::new(W, H)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP nvenc_nv12_dmabuf_roundtrip: Nv12DmaBuf unavailable: {e}");
+            return;
+        }
+    };
+
+    // Solid mid-gray; same correctness logic as the P010 test, on the
+    // 8-bit NV12 path (HEVC Main).
+    let mut bgra = vec![0u8; (W * H * 4) as usize];
+    for px in bgra.chunks_exact_mut(4) {
+        px.copy_from_slice(&[128, 128, 128, 255]);
+    }
+    let nv12 = bridge.convert_bgra_bytes(&bgra).expect("NV12 convert");
+    let frame = crate::build_nv12_dmabuf_frame(
+        nv12.fd,
+        nv12.size,
+        nv12.modifier,
+        nv12.y_offset,
+        nv12.y_stride,
+        nv12.uv_offset,
+        nv12.uv_stride,
+    );
+
+    let mut enc =
+        NvencEncoder::new(VideoProfile::HEVC_8BIT_420, W, H, 30, 8_000).expect("NVENC HEVC Main");
+    let packets = enc
+        .submit_dmabuf(&frame, 0, true)
+        .expect("submit_dmabuf (EGL→CUDA import + encode)");
+    assert!(
+        packets.iter().any(|p| p.keyframe),
+        "submit_dmabuf should produce an IDR"
+    );
+
+    let stats = sw_hevc_decode_y_stats(&packets)
+        .expect("software HEVC decode of the NVENC output produced no frame");
+    assert_eq!((stats.w, stats.h), (W, H), "decoded dims mismatch");
+    assert!(
+        stats.stddev < stats.max_scale * 0.05,
+        "decoded luma not uniform (stddev {:.1} of {:.0}) — EGL→CUDA import likely garbage",
+        stats.stddev,
+        stats.max_scale
+    );
+    let frac = stats.mean / stats.max_scale;
+    assert!(
+        (0.25..0.75).contains(&frac),
+        "decoded luma mean {:.1} ({:.0}% of full scale) not mid-range — import wrong",
+        stats.mean,
+        frac * 100.0
+    );
+}
+
+// --- multi-GPU device correlation ------------------------------------------
+
+/// The live CUDA device enumeration that backs multi-GPU pinning: every
+/// device must report a distinct, non-zero UUID, ordinals must be the dense
+/// `0..n` FFmpeg's device strings index, and each enumerated UUID must map
+/// back to its own ordinal. This is the keystone the wgpu/EGL/Vulkan-pool
+/// selection all key off; a driver that handed back zero or colliding UUIDs
+/// would silently pin the wrong GPU. On the dev box (2× RTX 3090 Ti + 1 AMD)
+/// CUDA sees the two NVIDIA GPUs.
+#[test]
+#[ignore = "requires NVIDIA GPU + libcuda (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_cuda_enumerates_distinct_nonzero_uuids() {
+    let devices = super::cuda_device_uuids();
+    assert!(
+        !devices.is_empty(),
+        "expected at least one CUDA device on an NVIDIA host"
+    );
+
+    for (i, (ordinal, uuid)) in devices.iter().enumerate() {
+        assert_eq!(
+            usize::try_from(*ordinal).unwrap(),
+            i,
+            "CUDA ordinals should be the dense 0..n FFmpeg indexes by device string"
+        );
+        assert_ne!(
+            *uuid, [0u8; 16],
+            "CUDA device {ordinal} reported a zero UUID — cross-API correlation would be ambiguous"
+        );
+        // Every enumerated UUID must resolve back to exactly its own ordinal.
+        assert_eq!(super::cuda_ordinal_for_uuid(*uuid), Some(*ordinal));
+    }
+
+    // UUIDs are unique per physical GPU — two identical cards must not collide,
+    // or pinning could land NVENC and the producer on different GPUs.
+    for i in 0..devices.len() {
+        for j in (i + 1)..devices.len() {
+            assert_ne!(
+                devices[i].1, devices[j].1,
+                "CUDA devices {} and {} share a UUID",
+                devices[i].0, devices[j].0
+            );
+        }
+    }
+
+    // A UUID no device carries resolves to None (not a spurious ordinal 0).
+    assert_eq!(super::cuda_ordinal_for_uuid([0xABu8; 16]), None);
+}
+
+/// End-to-end proof of the cross-API correlation key: the Vulkan `deviceUUID`
+/// of the wgpu dma-buf *producer* must equal one of the CUDA devices'
+/// `cuDeviceGetUuid` values and resolve to a concrete CUDA ordinal. This is
+/// the whole premise of multi-GPU pinning — wgpu leads, the codec side follows
+/// the producer's UUID onto the same physical GPU. If NVIDIA's Vulkan and CUDA
+/// UUIDs ever diverged, or either query read the wrong bytes, pinning would
+/// silently target the wrong GPU; only real hardware catches that.
+#[test]
+#[ignore = "requires NVIDIA GPU + Vulkan + libcuda (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_producer_uuid_resolves_to_a_cuda_ordinal() {
+    use tether_gpuconvert::Nv12DmaBuf;
+
+    let bridge =
+        pollster::block_on(Nv12DmaBuf::new(256, 256)).expect("construct BGRA→NV12 producer bridge");
+    let producer_uuid = tether_gpuconvert::gpu_select::device_uuid(bridge.device())
+        .expect("producer device is Vulkan-backed");
+
+    // The host pins from `preferred_device_uuid` (a throwaway HighPerformance
+    // adapter) on the assumption it picks the SAME physical GPU the bridges
+    // pick. That rests on wgpu adapter selection being deterministic within a
+    // process — the design's thinnest assumption. Assert it directly here, so a
+    // multi-GPU host where the two diverge fails this test instead of silently
+    // mispinning the codec side onto the wrong GPU.
+    let preferred = pollster::block_on(tether_gpuconvert::gpu_select::preferred_device_uuid())
+        .expect("preferred adapter is Vulkan-backed");
+    assert_eq!(
+        preferred, producer_uuid,
+        "preferred_device_uuid {preferred:02x?} != actual bridge device {producer_uuid:02x?} — \
+         the host would pin a different GPU than the producer uses"
+    );
+
+    let cuda = super::cuda_device_uuids();
+    assert!(
+        cuda.iter().any(|(_, uuid)| *uuid == producer_uuid),
+        "wgpu producer UUID {producer_uuid:02x?} is not among the CUDA devices {cuda:02x?} — \
+         Vulkan deviceUUID and CUDA UUID disagree; the cross-API pinning key is invalid"
+    );
+    assert!(
+        super::cuda_ordinal_for_uuid(producer_uuid).is_some(),
+        "producer UUID {producer_uuid:02x?} did not resolve to a CUDA ordinal"
+    );
+}
+
+/// The EGL importer's device selection must honor an arbitrary CUDA ordinal,
+/// not just device 0 — that is the whole multi-GPU pinning mechanism on the EGL
+/// side (the importer binds its display to the pinned GPU). Every real CUDA
+/// ordinal must yield a display; an out-of-range ordinal must not. On the dev
+/// box (2 NVIDIA GPUs) this confirms ordinal 1 selects a display too, which the
+/// old hardcoded `== 0` path could never have done.
+#[test]
+#[ignore = "requires NVIDIA GPU + libEGL device extensions (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_egl_display_selects_per_cuda_ordinal() {
+    let devices = super::cuda_device_uuids();
+    assert!(!devices.is_empty(), "expected at least one CUDA device");
+
+    for (ordinal, _) in &devices {
+        assert!(
+            super::ffi::egl_display_available_for_ordinal(*ordinal),
+            "no EGL display bound to CUDA ordinal {ordinal} — EGL pinning would fail for that GPU"
+        );
+    }
+
+    // An ordinal past the last device must select nothing (not silently fall
+    // back to device 0, which would defeat pinning).
+    let out_of_range = i32::try_from(devices.len()).unwrap() + 16;
+    assert!(
+        !super::ffi::egl_display_available_for_ordinal(out_of_range),
+        "EGL selected a display for non-existent CUDA ordinal {out_of_range}"
+    );
+}

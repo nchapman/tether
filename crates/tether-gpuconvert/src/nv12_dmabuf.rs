@@ -92,6 +92,13 @@ pub enum Nv12DmaBufError {
     Poll(String),
     #[error("dup fd: {0}")]
     DupFd(std::io::Error),
+    #[error("bgra byte slice is {got} bytes, expected {expected} ({w}x{h} BGRA)")]
+    ByteLenMismatch {
+        got: usize,
+        expected: usize,
+        w: u32,
+        h: u32,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Nv12DmaBufError>;
@@ -299,6 +306,69 @@ impl Nv12DmaBuf {
     /// Blocks on GPU completion so VAAPI's subsequent read sees the
     /// finished compute write. See module-level comment for the
     /// rationale and the path to an explicit-fence-based version.
+    /// Convenience wrapper around [`Self::convert`] that takes a
+    /// tightly-packed BGRA byte slice (`width * height * 4` bytes):
+    /// allocate a transient source texture on the bridge's device, upload
+    /// the bytes, and run the compute pass. The byte-slice sibling of the
+    /// P010/XV30 bridges' `convert_bgra_bytes`, for test + probe contexts
+    /// that hold CPU-resident pixels and don't want their own wgpu device.
+    pub fn convert_bgra_bytes(&self, bgra: &[u8]) -> Result<Nv12DmaBufFrame> {
+        // Checked, not `(w * h * 4) as usize`: the u32 product overflows
+        // (silently, in release) past ~32K×32K, yielding a too-small `expected`
+        // that would wave through an undersized buffer into `write_texture`.
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(Nv12DmaBufError::ByteLenMismatch {
+                got: bgra.len(),
+                expected: usize::MAX,
+                w: self.width,
+                h: self.height,
+            })?;
+        if bgra.len() != expected {
+            return Err(Nv12DmaBufError::ByteLenMismatch {
+                got: bgra.len(),
+                expected,
+                w: self.width,
+                h: self.height,
+            });
+        }
+        let src = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nv12 bgra scratch"),
+            size: wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bgra,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.width * 4),
+                rows_per_image: Some(self.height),
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.convert(&src)
+    }
+
     pub fn convert(&self, src_bgra: &wgpu::Texture) -> Result<Nv12DmaBufFrame> {
         if !matches!(
             src_bgra.format(),

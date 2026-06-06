@@ -35,6 +35,10 @@ pub const P010_FOURCC: u32 = u32::from_le_bytes(*b"P010");
 /// `vaapi_drm_format_map`, so libavcodec returns this regardless of
 /// the driver's internal tiling.
 pub const XYUV_FOURCC: u32 = u32::from_le_bytes(*b"XYUV");
+/// `DRM_FORMAT_YUV444` — planar 4:4:4 8-bit, three full-resolution
+/// R8 planes. NVIDIA NVDEC exports this for HEVC Main 4:4:4 8-bit and
+/// the renderer imports it through the `Planar444` layout.
+pub const YU24_FOURCC: u32 = u32::from_le_bytes(*b"YU24");
 /// `DRM_FORMAT_Y410` — packed 4:4:4 10-bit, 10:10:10:2
 /// (A:Cr:Y:Cb little-endian). What the Intel media-driver decoder —
 /// our 4:4:4 reference — exports for HEVC Main 4:4:4 10-bit. A
@@ -65,7 +69,7 @@ pub fn accepts_dmabuf_fourcc(chroma: ChromaSubsampling, bit_depth: u8, fourcc: u
         (chroma, bit_depth, fourcc),
         (ChromaSubsampling::Yuv420, 8, NV12_FOURCC)
             | (ChromaSubsampling::Yuv420, 10, P010_FOURCC)
-            | (ChromaSubsampling::Yuv444, 8, XYUV_FOURCC)
+            | (ChromaSubsampling::Yuv444, 8, XYUV_FOURCC | YU24_FOURCC)
             | (ChromaSubsampling::Yuv444, 10, Y410_FOURCC)
     )
 }
@@ -78,7 +82,9 @@ pub fn dmabuf_fourcc_expected_label(chroma: ChromaSubsampling, bit_depth: u8) ->
     match (chroma, bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => "'NV12' (biplanar 4:2:0 8-bit)",
         (ChromaSubsampling::Yuv420, 10) => "'P010' (biplanar 4:2:0 10-bit)",
-        (ChromaSubsampling::Yuv444, 8) => "'XYUV' (packed 4:4:4 8-bit)",
+        (ChromaSubsampling::Yuv444, 8) => {
+            "'XYUV' (packed 4:4:4 8-bit) or 'YU24' (planar 4:4:4 8-bit)"
+        }
         (ChromaSubsampling::Yuv444, 10) => "'Y410' (packed 4:4:4 10-bit)",
         _ => "a DRM fourcc supported by this build (8/10-bit 4:2:0 or 4:4:4)",
     }
@@ -104,7 +110,7 @@ pub fn expected_dmabuf_decode_fourcc(profile: VideoProfile) -> &'static [u32] {
     match (profile.chroma, profile.bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => &[NV12_FOURCC],
         (ChromaSubsampling::Yuv420, 10) => &[P010_FOURCC],
-        (ChromaSubsampling::Yuv444, 8) => &[XYUV_FOURCC],
+        (ChromaSubsampling::Yuv444, 8) => &[XYUV_FOURCC, YU24_FOURCC],
         (ChromaSubsampling::Yuv444, 10) => &[Y410_FOURCC],
         _ => &[],
     }
@@ -125,6 +131,7 @@ mod tests {
             (ChromaSubsampling::Yuv420, 8, NV12_FOURCC),
             (ChromaSubsampling::Yuv420, 10, P010_FOURCC),
             (ChromaSubsampling::Yuv444, 8, XYUV_FOURCC),
+            (ChromaSubsampling::Yuv444, 8, YU24_FOURCC),
             (ChromaSubsampling::Yuv444, 10, Y410_FOURCC),
         ];
         for (chroma, bit_depth, fourcc) in cases {

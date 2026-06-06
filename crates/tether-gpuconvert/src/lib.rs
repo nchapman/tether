@@ -42,6 +42,10 @@
 pub mod bgra_to_p010_dmabuf;
 #[cfg(target_os = "linux")]
 pub mod dmabuf_export;
+/// GPU device identity for multi-GPU pinning: read a producer device's
+/// Vulkan `deviceUUID` so the codec side binds CUDA/EGL to the same GPU.
+#[cfg(target_os = "linux")]
+pub mod gpu_select;
 #[cfg(target_os = "linux")]
 pub mod modifier_query;
 #[cfg(target_os = "linux")]
@@ -50,6 +54,8 @@ pub mod nv12_dmabuf;
 pub mod xv30_dmabuf;
 #[cfg(target_os = "linux")]
 pub mod yuv444_dmabuf;
+#[cfg(target_os = "linux")]
+pub mod yuv444p_dmabuf;
 
 /// macOS NV12 IOSurface scaler bridge — the host-side equivalent of
 /// `nv12_dmabuf` (Linux DMA-BUF NV12 bridge), driving the
@@ -76,6 +82,8 @@ pub use nv12_dmabuf::{Nv12DmaBuf, Nv12DmaBufError, Nv12DmaBufFrame};
 pub use xv30_dmabuf::{Bgra2Xv30DmaBuf, Xv30DmaBufError, Xv30DmaBufFrame};
 #[cfg(target_os = "linux")]
 pub use yuv444_dmabuf::{Yuv444DmaBuf, Yuv444DmaBufError, Yuv444DmaBufFrame};
+#[cfg(target_os = "linux")]
+pub use yuv444p_dmabuf::{Yuv444pDmaBuf, Yuv444pDmaBufError, Yuv444pDmaBufFrame};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {

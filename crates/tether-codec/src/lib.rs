@@ -23,6 +23,12 @@ mod encoder_common;
 #[cfg(target_os = "linux")]
 pub mod vaapi;
 
+#[cfg(target_os = "linux")]
+pub mod nvenc;
+
+#[cfg(target_os = "linux")]
+pub mod nvdec;
+
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
 
@@ -526,6 +532,69 @@ pub fn build_p010_dmabuf_frame(
     }
 }
 
+/// Build a `DmaBufFrame` matching the NV12 (4:2:0 8-bit) descriptor shape:
+/// one DRM object, two layers — Y as `R8  ` and UV as `GR88` — both pointing
+/// at `object_index=0` with their offsets within the shared allocation. The
+/// 8-bit sibling of [`build_p010_dmabuf_frame`]; one source of truth shared by
+/// the host send loop (`nv12_dmabuf_to_codec_frame`) and the NVENC zero-copy
+/// probe/round-trip tests.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn build_nv12_dmabuf_frame(
+    fd: std::os::fd::OwnedFd,
+    size: u64,
+    modifier: u64,
+    y_offset: u64,
+    y_stride: u64,
+    uv_offset: u64,
+    uv_stride: u64,
+) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"NV12"),
+        objects: vec![DmaBufObject {
+            fd,
+            size,
+            drm_format_modifier: modifier,
+        }],
+        layers: vec![
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"R8  "),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(y_offset).expect("Y plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(y_stride).expect("Y plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+            },
+            DmaBufLayer {
+                drm_format: u32::from_le_bytes(*b"GR88"),
+                num_planes: 1,
+                object_index: [0, 0, 0, 0],
+                offset: [
+                    u32::try_from(uv_offset).expect("UV plane offset fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+                pitch: [
+                    u32::try_from(uv_stride).expect("UV plane stride fits in u32"),
+                    0,
+                    0,
+                    0,
+                ],
+            },
+        ],
+    }
+}
+
 /// Build a `DmaBufFrame` matching the XV30 (HEVC Main 4:4:4 10-bit)
 /// descriptor shape FFmpeg's `vaapi_drm_format_map` expects: one DRM
 /// object, one layer (DRM_FORMAT_XV30, packed 10:10:10:2), one plane
@@ -569,6 +638,115 @@ pub fn build_xv30_dmabuf_frame(
                 0,
             ],
         }],
+    }
+}
+
+/// Build a `DmaBufFrame` matching planar 8-bit 4:4:4 (`DRM_FORMAT_YUV444`,
+/// fourcc `YU24`): one DRM object, one layer carrying three full-resolution
+/// R8 planes at distinct offsets. This is the NVIDIA NVENC/NVDEC 4:4:4
+/// shape; the VAAPI path intentionally stays on packed `XYUV`.
+#[cfg(target_os = "linux")]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_yuv444p_dmabuf_frame(
+    fd: std::os::fd::OwnedFd,
+    size: u64,
+    modifier: u64,
+    y_offset: u64,
+    y_stride: u64,
+    u_offset: u64,
+    u_stride: u64,
+    v_offset: u64,
+    v_stride: u64,
+) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"YU24"),
+        objects: vec![DmaBufObject {
+            fd,
+            size,
+            drm_format_modifier: modifier,
+        }],
+        layers: vec![DmaBufLayer {
+            drm_format: u32::from_le_bytes(*b"YU24"),
+            num_planes: 3,
+            object_index: [0, 0, 0, 0],
+            offset: [
+                u32::try_from(y_offset).expect("Y plane offset fits in u32"),
+                u32::try_from(u_offset).expect("U plane offset fits in u32"),
+                u32::try_from(v_offset).expect("V plane offset fits in u32"),
+                0,
+            ],
+            pitch: [
+                u32::try_from(y_stride).expect("Y plane stride fits in u32"),
+                u32::try_from(u_stride).expect("U plane stride fits in u32"),
+                u32::try_from(v_stride).expect("V plane stride fits in u32"),
+                0,
+            ],
+        }],
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod dmabuf_frame_builder_tests {
+    use std::fs::File;
+    use std::os::fd::OwnedFd;
+
+    fn dev_null_fd() -> OwnedFd {
+        File::open("/dev/null").expect("open /dev/null").into()
+    }
+
+    #[test]
+    fn nv12_builder_pins_surface_and_layer_fourccs() {
+        let frame = super::build_nv12_dmabuf_frame(dev_null_fd(), 4096, 0, 64, 128, 2048, 128);
+
+        assert_eq!(frame.fourcc, u32::from_le_bytes(*b"NV12"));
+        assert_eq!(frame.objects.len(), 1);
+        assert_eq!(frame.layers.len(), 2);
+        assert_eq!(frame.layers[0].drm_format, u32::from_le_bytes(*b"R8  "));
+        assert_eq!(frame.layers[0].num_planes, 1);
+        assert_eq!(frame.layers[0].offset[0], 64);
+        assert_eq!(frame.layers[0].pitch[0], 128);
+        assert_eq!(frame.layers[1].drm_format, u32::from_le_bytes(*b"GR88"));
+        assert_eq!(frame.layers[1].num_planes, 1);
+        assert_eq!(frame.layers[1].offset[0], 2048);
+        assert_eq!(frame.layers[1].pitch[0], 128);
+    }
+
+    #[test]
+    fn p010_builder_uses_rg32_uv_layer_not_gr32() {
+        let frame = super::build_p010_dmabuf_frame(dev_null_fd(), 8192, 0, 128, 256, 4096, 256);
+
+        assert_eq!(frame.fourcc, u32::from_le_bytes(*b"P010"));
+        assert_eq!(frame.layers.len(), 2);
+        assert_eq!(frame.layers[0].drm_format, u32::from_le_bytes(*b"R16 "));
+        assert_eq!(frame.layers[1].drm_format, u32::from_le_bytes(*b"RG32"));
+        assert_eq!(frame.layers[1].offset[0], 4096);
+        assert_eq!(frame.layers[1].pitch[0], 256);
+    }
+
+    #[test]
+    fn yuv444p_builder_keeps_three_planes_in_one_layer() {
+        let frame = super::build_yuv444p_dmabuf_frame(
+            dev_null_fd(),
+            12_288,
+            0,
+            0,
+            128,
+            4096,
+            128,
+            8192,
+            128,
+        );
+
+        assert_eq!(frame.fourcc, u32::from_le_bytes(*b"YU24"));
+        assert_eq!(frame.objects.len(), 1);
+        assert_eq!(frame.layers.len(), 1);
+        let layer = frame.layers[0];
+        assert_eq!(layer.drm_format, u32::from_le_bytes(*b"YU24"));
+        assert_eq!(layer.num_planes, 3);
+        assert_eq!(layer.object_index[..3], [0, 0, 0]);
+        assert_eq!(layer.offset[..3], [0, 4096, 8192]);
+        assert_eq!(layer.pitch[..3], [128, 128, 128]);
     }
 }
 

@@ -141,7 +141,7 @@ pub struct InputEchoBatch {
 ///
 /// **Wire-additive policy:** `VideoFrameMeta` is a closed struct — adding a
 /// field would be a wire break. New per-frame metadata (HDR mastering
-/// stream_id info, ROI hints, encoder QP feedback, etc.) must land as a new
+/// info, ROI hints, encoder QP feedback, etc.) must land as a new
 /// variant of [`VideoFrameMetaEnvelope`], which is the type that actually
 /// rides on the wire in [`VideoPacket::First`]. The receive side unwraps
 /// to a `VideoFrameMeta` for downstream consumers; new variants update

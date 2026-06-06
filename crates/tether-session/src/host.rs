@@ -68,7 +68,13 @@ impl HostSession {
                 reason: "host and client video capabilities do not intersect".to_string(),
                 code: GoodbyeCode::InternalError,
             };
-            let _ = pending.send_rejection(failure).await?;
+            // Best-effort: the session is ending on NoProfileIntersection
+            // regardless of whether the peer is still around to hear the
+            // rejection. Propagating a send error here would mask the real
+            // cause with a nondeterministic Transport error.
+            if let Err(e) = pending.send_rejection(failure).await {
+                warn!(error = ?e, "failed to deliver handshake rejection; ending session anyway");
+            }
             return Err(AcceptError::NoProfileIntersection {
                 client: client_decode_profiles,
             });

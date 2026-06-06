@@ -327,23 +327,40 @@ async fn frame_fragmented_at_live_mtu_is_accepted_and_reassembles() -> anyhow::R
 
     let body = bytes::Bytes::from((0..64u8).cycle().take(64 * 1024).collect::<Vec<u8>>());
     let body_for_server = body.clone();
+    let (client_done_tx, mut client_done_rx) = tokio::sync::oneshot::channel();
 
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("server closed")?;
         let mut reassembler = FrameReassembler::new();
+        let mut completed = false;
+
         // Localhost is lossless: read datagrams until the frame completes.
+        // Keep the connection alive until the client finishes sending all
+        // primaries and trailing FEC parity shards; otherwise a fast server can
+        // reassemble from primaries, return, and close the connection while the
+        // client is still validating quinn acceptance for the remaining parity.
         loop {
-            match conn.recv_datagram().await? {
-                Datagram::Video(pkt) => {
-                    if let Some(frame) = reassembler.handle(pkt) {
-                        assert_eq!(
-                            frame.body, body_for_server,
-                            "reassembled body must be byte-equal to what was sent"
-                        );
-                        break;
+            tokio::select! {
+                done = &mut client_done_rx, if completed => {
+                    let _ = done;
+                    break;
+                }
+                datagram = conn.recv_datagram() => {
+                    match datagram? {
+                        Datagram::Video(pkt) => {
+                            if !completed {
+                                if let Some(frame) = reassembler.handle(pkt) {
+                                    assert_eq!(
+                                        frame.body, body_for_server,
+                                        "reassembled body must be byte-equal to what was sent"
+                                    );
+                                    completed = true;
+                                }
+                            }
+                        }
+                        other => panic!("expected Video datagram, got {other:?}"),
                     }
                 }
-                other => panic!("expected Video datagram, got {other:?}"),
             }
         }
         anyhow::Ok(())
@@ -379,6 +396,7 @@ async fn frame_fragmented_at_live_mtu_is_accepted_and_reassembles() -> anyhow::R
         conn.send_datagram(&Datagram::Video(pkt))
             .expect("every shard sized to the live budget must be accepted by quinn");
     }
+    let _ = client_done_tx.send(());
 
     server_task.await??;
     Ok(())

@@ -3,9 +3,9 @@
 //! Only the encode half lives here. Decode on an NVIDIA host goes through
 //! `NvdecDecoder`, probed by [`super::nvdec::NvdecProbe`] (see
 //! `host::probe_decode`) — NOT VAAPI, whose `nvidia-vaapi-driver` decoder
-//! SIGSEGVs. `host::probe_encode` tries this first on an NVIDIA host and falls
-//! back to VAAPI, mirroring the live `build_encoder` dispatch so the advertised
-//! capability set matches what the session encoder will actually pick.
+//! SIGSEGVs. `host::probe_encode` routes NVIDIA hosts here exclusively,
+//! mirroring the live `build_encoder` dispatch so the advertised capability
+//! set matches what the session encoder will actually pick.
 //!
 //! The probe is a real round trip against the live driver, not a
 //! construction-only check: `NvencEncoder::new` opening the codec is not
@@ -38,9 +38,7 @@ pub(crate) struct NvencProbe;
 // dead code the project avoids. `host::probe_encode` calls the inherent method
 // directly.
 
-/// Probe canvas. 128×128 matches the VAAPI probe and the fixture dims, and
-/// satisfies HEVC's minimum-block constraint.
-// 256, not the 128 the VAAPI probe uses: constructing a 128×128 HEVC Main10
+/// Probe canvas. 256, not the 128 the VAAPI probe uses: constructing a 128×128 HEVC Main10
 // (P010) NVENC encoder SIGSEGVs *inside the NVENC runtime* — Main10 has a
 // minimum encode dimension that 128px violates, and FFmpeg's wrapper faults
 // rather than erroring. 256 is the smallest dimension verified to construct
@@ -54,7 +52,8 @@ impl NvencProbe {
     /// Probe whether this NVIDIA host can encode `profile` through NVENC.
     /// `Ok(())` means a real frame went through the encoder; `Err` carries
     /// the [`PipelineStage`] that rejected it, and the caller
-    /// (`host::probe_encode`) falls back to VAAPI.
+    /// (`host::probe_encode`) records the profile unsupported for this
+    /// NVIDIA host.
     pub(crate) fn probe_encode(profile: VideoProfile) -> Result<()> {
         tether_codec::av_log::with_probe_suppression(|| probe_encode_inner(profile))
     }

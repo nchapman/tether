@@ -3,8 +3,8 @@
 //! decoder — each with a CUDA `hw_device_ctx` and a `get_format` callback
 //! pinning `AV_PIX_FMT_CUDA`, which is what engages NVDEC. Structurally a
 //! twin of [`crate::vaapi::VaapiDecoder`] with CUDA in place of VAAPI: D2
-//! exports the decoded surface as an NV12 dma-buf the renderer imports
-//! directly, rather than downloading to system memory.
+//! exports the decoded surface as a renderer-importable dma-buf (NV12/P010,
+//! plus diagnostic YUV444P), rather than downloading to system memory.
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext};
@@ -29,14 +29,14 @@ const MAX_DECODE_DIM: u32 = 8192;
 
 /// NVDEC-accelerated video decoder. Uses FFmpeg's generic `h264` / `hevc` /
 /// `av1` decoder with NVDEC hwaccel selected via `get_format` returning
-/// `AV_PIX_FMT_CUDA`. D2: decoded CUDA surfaces are EGL-imported into an NV12
-/// dma-buf and handed to the renderer as a zero-copy [`Frame::Gpu`].
+/// `AV_PIX_FMT_CUDA`. D2: decoded CUDA surfaces are EGL-imported into a
+/// pooled dma-buf and handed to the renderer as a zero-copy [`Frame::Gpu`].
 pub struct NvdecDecoder {
     kind: CodecKind,
     decoder: AVCodecContext,
     /// FFmpeg's `CUcontext` for this decoder, read once from the CUDA
     /// `AVHWDeviceContext`. The EGL→CUDA import in [`Self::export_cuda_frame`]
-    /// registers the NV12 surface dma-buf against this exact context so the
+    /// registers the pooled surface dma-buf against this exact context so the
     /// device→device copy from the NVDEC frame is on the same context the
     /// decoded surface lives in.
     ///
@@ -44,9 +44,10 @@ pub struct NvdecDecoder {
     /// CUcontext is owned by `_hw_device`, dropped after the decoder, and only
     /// touched under `&mut self`).
     cuda_ctx: nvffi::CuContext,
-    /// NV12 dma-buf surface pool, lazily created on the first decoded frame
-    /// once the real dimensions are known. `None` until then. Rebuilt if a
-    /// later frame's dims change (resolution switch / stream restart).
+    /// Pooled dma-buf surfaces, lazily created on the first decoded frame once
+    /// the real dimensions and decoded layout are known. `None` until then.
+    /// Rebuilt if a later frame's dims or layout change (resolution switch /
+    /// stream restart).
     pool: Option<NvdecSurfacePool>,
     // Decoder holds a cloned (ref-counted) handle to the device internally
     // via set_hw_device_ctx; keeping our own ref documents the lifetime
@@ -111,7 +112,7 @@ impl NvdecDecoder {
             AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, cuda_device.as_deref(), None, 1)?;
 
         // Read FFmpeg's CUcontext out of the CUDA AVHWDeviceContext so the
-        // zero-copy NV12 dma-buf export registers EGL images against the exact
+        // zero-copy dma-buf export registers EGL images against the exact
         // context NVDEC decoded into. Same navigation as NvencEncoder::new:
         //   AVBufferRef::data → AVHWDeviceContext::hwctx → AVCUDADeviceContext::cuda_ctx
         //

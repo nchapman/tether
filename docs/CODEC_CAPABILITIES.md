@@ -433,8 +433,9 @@ the runtime `libnvidia-encode.so` / `libcuda.so` / `libEGL.so`.
 
 - **Codecs / profiles** (Ampere-verified set): H.264 4:2:0 8-bit (High),
   HEVC 4:2:0 8-bit (Main), and HEVC 4:2:0 10-bit (Main10). AV1 is **not
-  advertised** — NVENC AV1 needs Ada (RTX 40+); a pre-Ada card fail-fasts
-  at construction and the probe degrades it. HEVC Main 4:4:4 is **not
+  advertised** — NVENC AV1 needs Ada (RTX 40+), and the FFmpeg/NVENC
+  runtime has faulted during pre-Ada construction in testing, so Tether
+  excludes it before constructing the encoder. HEVC Main 4:4:4 is **not
   advertised on NVIDIA Linux** today. NVENC/NVDEC have native planar 4:4:4
   formats (`YUV444P` / `YUV444P16`), and Linux DRM has three-plane 10-bit
   candidates (`Q410` / `S410` / `S416`), but the tested NVIDIA EGL stack

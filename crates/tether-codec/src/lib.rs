@@ -686,6 +686,70 @@ pub fn build_yuv444p_dmabuf_frame(
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod dmabuf_frame_builder_tests {
+    use std::fs::File;
+    use std::os::fd::OwnedFd;
+
+    fn dev_null_fd() -> OwnedFd {
+        File::open("/dev/null").expect("open /dev/null").into()
+    }
+
+    #[test]
+    fn nv12_builder_pins_surface_and_layer_fourccs() {
+        let frame = super::build_nv12_dmabuf_frame(dev_null_fd(), 4096, 0, 64, 128, 2048, 128);
+
+        assert_eq!(frame.fourcc, u32::from_le_bytes(*b"NV12"));
+        assert_eq!(frame.objects.len(), 1);
+        assert_eq!(frame.layers.len(), 2);
+        assert_eq!(frame.layers[0].drm_format, u32::from_le_bytes(*b"R8  "));
+        assert_eq!(frame.layers[0].num_planes, 1);
+        assert_eq!(frame.layers[0].offset[0], 64);
+        assert_eq!(frame.layers[0].pitch[0], 128);
+        assert_eq!(frame.layers[1].drm_format, u32::from_le_bytes(*b"GR88"));
+        assert_eq!(frame.layers[1].num_planes, 1);
+        assert_eq!(frame.layers[1].offset[0], 2048);
+        assert_eq!(frame.layers[1].pitch[0], 128);
+    }
+
+    #[test]
+    fn p010_builder_uses_rg32_uv_layer_not_gr32() {
+        let frame = super::build_p010_dmabuf_frame(dev_null_fd(), 8192, 0, 128, 256, 4096, 256);
+
+        assert_eq!(frame.fourcc, u32::from_le_bytes(*b"P010"));
+        assert_eq!(frame.layers.len(), 2);
+        assert_eq!(frame.layers[0].drm_format, u32::from_le_bytes(*b"R16 "));
+        assert_eq!(frame.layers[1].drm_format, u32::from_le_bytes(*b"RG32"));
+        assert_eq!(frame.layers[1].offset[0], 4096);
+        assert_eq!(frame.layers[1].pitch[0], 256);
+    }
+
+    #[test]
+    fn yuv444p_builder_keeps_three_planes_in_one_layer() {
+        let frame = super::build_yuv444p_dmabuf_frame(
+            dev_null_fd(),
+            12_288,
+            0,
+            0,
+            128,
+            4096,
+            128,
+            8192,
+            128,
+        );
+
+        assert_eq!(frame.fourcc, u32::from_le_bytes(*b"YU24"));
+        assert_eq!(frame.objects.len(), 1);
+        assert_eq!(frame.layers.len(), 1);
+        let layer = frame.layers[0];
+        assert_eq!(layer.drm_format, u32::from_le_bytes(*b"YU24"));
+        assert_eq!(layer.num_planes, 3);
+        assert_eq!(layer.object_index[..3], [0, 0, 0]);
+        assert_eq!(layer.offset[..3], [0, 4096, 8192]);
+        assert_eq!(layer.pitch[..3], [128, 128, 128]);
+    }
+}
+
 /// macOS IOSurface descriptor for a captured (encoder input) or
 /// decoded (renderer input) frame. Mirrors what
 /// `tether_capture::CapturedIOSurface` carries on the capture side;

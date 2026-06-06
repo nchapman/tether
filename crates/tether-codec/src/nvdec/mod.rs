@@ -9,11 +9,12 @@
 //! "regular decoder + hw_device_ctx" idiom in reverse.
 //!
 //! Milestone D2 (GitHub #16): zero-copy. NVDEC decodes to an
-//! `AV_PIX_FMT_CUDA` surface; the decoder then EGL-imports an NV12 dma-buf
-//! surface (from a small [`surface_pool`]) into CUDA and `cuMemcpy2D`s the
-//! decoded planes into it device→device — the exact reverse of the encoder's
-//! [`crate::nvenc`] DMA-BUF→CUDA copy, reusing the same EGL→CUDA importer
-//! ([`crate::nvenc::ffi`]). The renderer imports the resulting NV12 dma-buf
+//! `AV_PIX_FMT_CUDA` surface; the decoder then EGL-imports a pooled dma-buf
+//! surface (NV12 for 8-bit 4:2:0, P010 for 10-bit 4:2:0, diagnostic YUV444P
+//! for 8-bit 4:4:4) into CUDA and `cuMemcpy2D`s the decoded planes into it
+//! device→device — the exact reverse of the encoder's [`crate::nvenc`]
+//! DMA-BUF→CUDA copy, reusing the same EGL→CUDA importer
+//! ([`crate::nvenc::ffi`]). The renderer imports the resulting dma-buf
 //! directly ([`crate::GpuFrameSource::DmaBuf`]), the same handoff the VAAPI
 //! decoder uses — no host-memory round-trip. (D1 downloaded the CUDA surface
 //! to a [`crate::Frame::Cpu`]; that interim is gone.)
@@ -24,8 +25,7 @@
 //! `VK_EXT_image_drm_format_modifier` on the NVIDIA GPU to back the surface
 //! pool (allocated with raw `ash` — see [`surface_pool`] for why it can't
 //! reuse `tether-gpuconvert`'s exporter). Construction returns a clean
-//! [`crate::CodecError`] when any is missing so a non-NVIDIA host degrades to
-//! VAAPI.
+//! [`crate::CodecError`] when any is missing.
 
 pub use decoder::NvdecDecoder;
 

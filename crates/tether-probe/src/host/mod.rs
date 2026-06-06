@@ -45,9 +45,9 @@ pub(crate) use d3d11::D3D11Probe as ActiveProbe;
 ///
 /// macOS: the single VideoToolbox backend. Linux: NVENC exclusively on an
 /// NVIDIA host (matching `build_encoder`) — VAAPI is **not** tried there, so
-/// a profile NVENC can't serve (AV1 on pre-Ada, 4:4:4 not yet wired) reports
-/// unsupported rather than dispatching to the decode-only nvidia-vaapi-driver
-/// whose `VaapiEncoder::new` SIGSEGVs. Non-NVIDIA Linux uses VAAPI.
+/// a profile NVENC can't serve reports unsupported rather than dispatching to
+/// the decode-only nvidia-vaapi-driver whose `VaapiEncoder::new` SIGSEGVs.
+/// Non-NVIDIA Linux uses VAAPI.
 #[cfg(target_os = "macos")]
 pub(crate) fn probe_encode(
     profile: tether_protocol::control::VideoProfile,

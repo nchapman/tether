@@ -1,13 +1,14 @@
 //! NVENC hardware video encoder (Linux / NVIDIA).
 //!
 //! A native NVENC backend parallel to [`crate::vaapi`], selected first on
-//! NVIDIA hosts with VAAPI as the universal fallback (see
+//! NVIDIA hosts with no VAAPI fallback on that host class (see
 //! `crate::probe::build_encoder`). NVENC exists because FFmpeg's `*_vaapi`
 //! wrappers build the rate-control / picture-param misc buffers once at
 //! `init()` and never re-read them, so live bitrate retune, qmin, and
-//! intra-refresh are silent no-ops on VAAPI (including NVIDIA's
-//! nvidia-vaapi-driver shim, which still routes through that wrapper). The
-//! `*_nvenc` wrappers expose real per-frame plumbing — that's the whole point.
+//! intra-refresh are silent no-ops on VAAPI. On NVIDIA specifically, the VAAPI
+//! device is normally the decode-only `nvidia-vaapi-driver` shim, so trying it
+//! as an encode fallback is both misleading and unsafe. The `*_nvenc` wrappers
+//! expose real per-frame plumbing — that's the whole point.
 //!
 //! Pipeline: capture DMA-BUF → import into CUDA zero-copy via EGLImage
 //! interop (`eglCreateImage(EGL_LINUX_DMA_BUF_EXT)` →

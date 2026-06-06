@@ -5,8 +5,10 @@
 //! than linked, so a host with no NVIDIA stack — no `libcuda.so.1`, no
 //! `libEGL.so.1`, or the EGL device-enumeration extensions absent —
 //! degrades gracefully: [`importer`] returns `None` and `submit_dmabuf`
-//! reports `NoHardwareCodec` so the host falls back to the CPU upload
-//! path. There are no link-time dependencies on either library.
+//! reports `NoHardwareCodec`. The host probe excludes profiles whose
+//! production DMA-BUF import cannot run, so a live-session failure here is
+//! reported as an encode/decode path failure rather than hidden behind a CPU
+//! upload path. There are no link-time dependencies on either library.
 //!
 //! The bridge mirrors Sunshine's approach (`src/platform/linux/cuda.cpp`,
 //! `graphics.cpp`): a Vulkan-exported dma-buf is **not** a CUDA opaque-fd
@@ -859,7 +861,8 @@ impl Drop for ImportGuard {
 impl EglCudaImporter {
     /// Load the libraries, resolve the entry points, and bind an EGL display
     /// to the pinned CUDA device (device 0 when unpinned). Returns `None` on any
-    /// failure so a non-NVIDIA / partial host degrades to the CPU upload path.
+    /// failure so callers report a clean `NoHardwareCodec` instead of linking
+    /// directly against a partial NVIDIA runtime.
     fn init() -> Option<Self> {
         // SAFETY: dlopen of the system CUDA/EGL runtimes by soname. The
         // libraries are stored in `_libs` and never unloaded, so every
@@ -1347,7 +1350,7 @@ pub(crate) fn egl_display_available_for_ordinal(cuda_ordinal: i32) -> bool {
 
 /// Process-global importer, lazily initialised on first call. `None` means
 /// the EGL/CUDA stack isn't usable on this host (no NVIDIA driver, missing
-/// EGL device extensions, etc.) and the encoder falls back to CPU upload.
+/// EGL device extensions, etc.).
 pub(crate) fn importer() -> Option<&'static EglCudaImporter> {
     static IMPORTER: OnceLock<Option<EglCudaImporter>> = OnceLock::new();
     IMPORTER.get_or_init(EglCudaImporter::init).as_ref()

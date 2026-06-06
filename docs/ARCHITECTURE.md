@@ -356,16 +356,16 @@ backend is a variant plus a module, not a refactor.
 `VaapiEncoder`, a `#[cfg(target_os = "macos")]` arm constructs
 `VideoToolboxEncoder`, and a `#[cfg(target_os = "windows")]`
 `build_encoder_d3d11` arm constructs `D3D11Encoder` — all return
-`Box<dyn Encoder>` so the host send loop is backend-agnostic. On
-Windows the *vendor* selection happens one level down, in
-`D3D11Encoder::new` → `backends_for_vendor(codec, vendor_id)`: it tries
-the GPU's native encoder first (`hevc_qsv`/`hevc_amf`/`hevc_nvenc`) then
-`hevc_mf`. An unknown vendor falls back to Media Foundation **only** —
-speculatively constructing a foreign vendor's encoder faults inside that
-vendor's runtime. A second Linux backend (the tracked NVENC follow-up)
-lands as an inner `match` inside the Linux arm that prefers NVENC when
-the probe accepts it and falls through to VAAPI otherwise — no signature
-change at the call site.
+`Box<dyn Encoder>` so the host send loop is backend-agnostic. On Linux,
+the arm runtime-selects by GPU vendor: NVIDIA hosts construct NVENC and
+do not try VAAPI there (the NVIDIA VAAPI device is the decode-only
+`nvidia-vaapi-driver`); non-NVIDIA hosts use VAAPI. On Windows the
+*vendor* selection happens one level down, in `D3D11Encoder::new` →
+`backends_for_vendor(codec, vendor_id)`: it tries the GPU's native
+encoder first (`hevc_qsv`/`hevc_amf`/`hevc_nvenc`) then `hevc_mf`. An
+unknown vendor falls back to Media Foundation **only** — speculatively
+constructing a foreign vendor's encoder faults inside that vendor's
+runtime.
 
 **Decoder side** uses the same shape, mirrored: `Decoder::next_frame ->
 Frame::{Cpu(DecodedFrame), Gpu(GpuFrame)}` where `GpuFrame.source` is a

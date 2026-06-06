@@ -310,8 +310,10 @@ fn no_hw_encoder_nvenc(profile: VideoProfile, source: CodecError) -> CodecError 
          This is an NVIDIA host (no VAAPI encode fallback — nvidia-vaapi-driver \
          is decode-only). Check that `nvidia-smi` works, that the FFmpeg build \
          has {} (`--enable-nvenc --enable-cuda`), and that you haven't hit the \
-         driver's concurrent-NVENC-session limit. Note AV1 encode needs Ada \
-         (RTX 40+) and HEVC/H.264 4:4:4 is not yet wired on the NVENC path. \
+         driver's concurrent-NVENC-session limit. Note Tether currently \
+         excludes AV1 NVENC because pre-Ada drivers can fault during encoder \
+         init, and NVIDIA Linux 4:4:4 is advertised only if the live planar \
+         dma-buf import probe passes. \
          Tether requires GPU encode — there is no software fallback.",
         profile.codec,
         profile.chroma,

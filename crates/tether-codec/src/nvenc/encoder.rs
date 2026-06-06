@@ -11,8 +11,10 @@
 //!   * [`NvencEncoder::submit_dmabuf`] — the zero-copy production path
 //!     (capture DMA-BUF imported into CUDA via EGLImage interop, see
 //!     [`super::ffi`]). `encode_gpu` routes `DmaBuf` frames here; if the
-//!     EGL/CUDA stack is unavailable it reports `NoHardwareCodec` so the
-//!     host falls back to the CPU path rather than dropping frames.
+//!     EGL/CUDA stack is unavailable it reports `NoHardwareCodec`. The
+//!     host capability probe must have proven this path before advertising
+//!     the profile, so a later live-session failure is treated as device loss
+//!     / frame failure, not as a CPU-upload fallback.
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avutil::{ra, AVDictionary, AVFrame, AVHWDeviceContext};
@@ -89,7 +91,8 @@ impl NvencEncoder {
     /// device can't be created (no NVIDIA GPU / driver, `libcuda.so`
     /// absent) or the codec rejects the configuration (e.g. AV1 on a
     /// pre-Ada card). The probe walks every profile and records which
-    /// failed and why; `build_encoder` falls back to VAAPI.
+    /// failed and why; on NVIDIA hosts `build_encoder` reports the NVENC
+    /// failure directly rather than falling back to VAAPI.
     pub fn new(
         profile: VideoProfile,
         width: u32,
@@ -583,10 +586,10 @@ impl Encoder for NvencEncoder {
         force_keyframe: bool,
     ) -> Result<Vec<EncodedPacket>> {
         match frame {
-            // Zero-copy DMA-BUF → CUDA import (EGLImage interop). Falls
-            // back via NoHardwareCodec / UnsupportedInputFormat so the
-            // host send loop drops to encode_bgra rather than dropping the
-            // frame when interop is unavailable or the chroma is 4:4:4.
+            // Zero-copy DMA-BUF → CUDA import (EGLImage interop). The
+            // capability probe proves this path before negotiation; a live
+            // failure is returned to the host send loop as a hard encode
+            // error for this GPU frame.
             crate::GpuEncoderFrame::DmaBuf(f) => self.submit_dmabuf(f, pts, force_keyframe),
             crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
         }

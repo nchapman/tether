@@ -1,33 +1,31 @@
-//! Fixed pool of NV12 dma-buf surfaces the zero-copy NVDEC decoder fills
-//! and hands to the renderer (GH #16, D2).
+//! Fixed pool of dma-buf surfaces the zero-copy NVDEC decoder fills and hands
+//! to the renderer (GH #16, D2).
 //!
-//! NVDEC decodes into CUDA surfaces; the renderer imports an NV12 dma-buf
-//! (`GpuFrameSource::DmaBuf`, 2 layers R8 + GR88) directly into wgpu — the
-//! same shape the VAAPI decoder exports. So the decoder needs a dma-buf it
-//! can write the decoded pixels into. This pool allocates a small fixed set
-//! of NV12 surfaces and lends them out one at a time. A surface stays
-//! reserved (its slot marked in-use) until the renderer drops the frame, so
-//! the decoder can't overwrite a surface the renderer is still reading;
+//! NVDEC decodes into CUDA surfaces; the renderer imports a dma-buf
+//! (`GpuFrameSource::DmaBuf`) directly into wgpu — NV12 for 8-bit 4:2:0, P010
+//! for 10-bit 4:2:0, and diagnostic YUV444P for 8-bit 4:4:4. So the decoder
+//! needs a dma-buf it can write the decoded pixels into. This pool allocates a
+//! small fixed set of surfaces and lends them out one at a time. A surface
+//! stays reserved (its slot marked in-use) until the renderer drops the frame,
+//! so the decoder can't overwrite a surface the renderer is still reading;
 //! [`PooledSurface`]'s slot guard returns the slot on drop.
 //!
 //! **Why raw Vulkan (`ash`), not `tether-gpuconvert`'s exporter.** The
-//! obvious move is to reuse `tether_gpuconvert::export_nv12_shared_dmabuf`,
-//! but tether-codec depending on tether-gpuconvert in production forms a
+//! obvious move is to reuse tether-gpuconvert's shared dma-buf exporters, but
+//! tether-codec depending on tether-gpuconvert in production forms a
 //! normal-dependency cycle (tether-gpuconvert already depends on tether-codec
 //! on macOS for IOSurface interop; cargo's resolver-2 evaluates the graph
 //! cfg-merged and rejects the cross-platform mutual prod dependency). So this
-//! module reimplements the minimal NV12 two-plane shared-allocation export
-//! directly on `ash`. It mirrors `shared_nv12.rs`'s layout and — load-bearing
-//! — its 64-byte Y-row-pitch + 16-row-height alignment (Intel iHD's importer
-//! mis-reads non-aligned widths; harmless on NVIDIA/RADV but kept identical so
-//! the descriptor is universally importable; see the gpuconvert comment).
+//! module reimplements the minimal shared-allocation export directly on `ash`.
+//! It mirrors `shared_nv12.rs` / `shared_p010.rs` / `shared_yuv444p.rs` and —
+//! load-bearing — keeps the 64-byte Y-row-pitch + 16-row-height alignment
+//! (Intel iHD's importer mis-reads non-aligned widths; harmless on NVIDIA/RADV
+//! but kept identical so the descriptor is universally importable; see the
+//! gpuconvert comment).
 //!
-//! Single-GPU assumption (known follow-up, not solved here): the Vulkan
-//! physical device is the first NVIDIA (`0x10de`) device, which must be the
-//! same physical GPU as the decoder's CUDA context (device 0) for the EGL→CUDA
-//! import of the surface dma-buf to succeed. On the target box (RTX 3090 Ti)
-//! that's the only NVIDIA GPU. A multi-GPU host would need an explicit
-//! device-match (matched by PCI/UUID), deferred until a user needs it.
+//! Multi-GPU pinning: when the host has pinned a producer GPU, the pool matches
+//! that Vulkan `deviceUUID` before allocating surfaces. Unpinned keeps the old
+//! single-GPU/default-driver behavior by taking the first NVIDIA Vulkan device.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,9 +35,9 @@ use ash::vk;
 
 use crate::{CodecError, Result};
 
-/// Number of NV12 surfaces in the pool. NVDEC reorder depth plus a couple
-/// in flight to the renderer; matches the encoder's small-pool sizing
-/// rationale (a handful is plenty when the renderer consumes promptly).
+/// Number of surfaces in the pool. NVDEC reorder depth plus a couple in flight
+/// to the renderer; matches the encoder's small-pool sizing rationale (a
+/// handful is plenty when the renderer consumes promptly).
 const POOL_SIZE: usize = 4;
 
 /// NVIDIA PCI vendor id (matches `crate::nvenc`'s sysfs check). The Vulkan
@@ -117,8 +115,8 @@ impl NvdecSurfaceFormat {
     }
 }
 
-/// The dma-buf descriptor fields for one NV12 surface, as produced by the
-/// shared-allocation export. Mirrors `tether_gpuconvert::SharedNv12Export`'s
+/// The dma-buf descriptor fields for one pooled surface, as produced by the
+/// shared-allocation export. Mirrors tether-gpuconvert's shared-export
 /// descriptor fields (minus the wgpu textures, which the decoder doesn't need
 /// — it writes via CUDA, not wgpu).
 struct SurfaceExport {
@@ -148,7 +146,7 @@ struct Slot {
     backing: Arc<SurfaceBacking>,
 }
 
-/// A fixed pool of NV12 dma-buf surfaces for the zero-copy NVDEC decoder.
+/// A fixed pool of dma-buf surfaces for the zero-copy NVDEC decoder.
 ///
 /// Owns the Vulkan device + the `POOL_SIZE` surfaces' images/memory.
 /// [`Self::acquire`] hands out a free surface; the returned [`PooledSurface`]
@@ -351,8 +349,8 @@ pub struct PooledSurface {
     /// A dup of the surface's dma-buf fd. The decoder uses it to import the
     /// surface into CUDA; the output frame gets its own fresh dup.
     pub fd: OwnedFd,
-    /// The surface's pixel layout (NV12 / P010) — selects the dma-buf fourcc
-    /// and the per-sample byte width of the device copy.
+    /// The surface's pixel layout — selects the dma-buf fourcc and the
+    /// per-sample byte width of the device copy.
     pub format: NvdecSurfaceFormat,
     pub size: u64,
     pub modifier: u64,
@@ -371,10 +369,9 @@ pub struct PooledSurface {
 }
 
 impl PooledSurface {
-    /// Build the `DmaBufFrame` describing this surface from a (dup'd) fd —
-    /// `NV12` or `P010` shaped per [`Self::format`]. One source of truth for
-    /// both the EGL import descriptor and the renderer output frame, so they
-    /// can't disagree on fourcc/plane formats.
+    /// Build the `DmaBufFrame` describing this surface from a (dup'd) fd.
+    /// One source of truth for both the EGL import descriptor and the renderer
+    /// output frame, so they can't disagree on fourcc/plane formats.
     pub fn build_dmabuf_frame(&self, fd: OwnedFd) -> crate::DmaBufFrame {
         match self.format {
             NvdecSurfaceFormat::Nv12 => crate::build_nv12_dmabuf_frame(
@@ -411,7 +408,7 @@ impl PooledSurface {
 }
 
 /// Minimal Vulkan instance + device on the NVIDIA GPU, with the extensions
-/// the NV12 dma-buf export needs. Owns the `ash::Instance` / `ash::Device`
+/// the dma-buf export needs. Owns the `ash::Instance` / `ash::Device`
 /// and is dropped last so all surface resources free first.
 struct VulkanDevice {
     // `Entry` keeps the loaded Vulkan loader alive for the device's lifetime.
@@ -578,12 +575,11 @@ impl VulkanDevice {
         })
     }
 
-    /// Allocate one 4:2:0 surface of `format` (NV12: Y `R8` + UV `R8G8`;
-    /// P010: Y `R16` + UV `R16G16`) in a single shared `VkDeviceMemory` and
-    /// export it as one dma-buf fd. The Y and UV images live at distinct
-    /// offsets in the same allocation — the layout the renderer's
-    /// `build_{nv12,p010}_dmabuf_frame` import and EGL→CUDA registration both
-    /// expect.
+    /// Allocate one surface of `format` in a single shared `VkDeviceMemory`
+    /// and export it as one dma-buf fd. NV12/P010 use Y + interleaved UV
+    /// images; YUV444P adds a full-resolution V image. The images live at
+    /// distinct offsets in the same allocation — the layout the renderer's
+    /// `build_*_dmabuf_frame` import and EGL→CUDA registration both expect.
     ///
     /// Ported from `tether_gpuconvert::shared_nv12::export_nv12_shared_dmabuf`,
     /// keeping its load-bearing 64-byte luma-pitch / 16-row alignment. The
@@ -600,6 +596,11 @@ impl VulkanDevice {
     ) -> std::result::Result<(SurfaceImages, SurfaceExport), String> {
         let aligned_w = width.next_multiple_of(LUMA_STRIDE_ALIGN);
         let aligned_h = height.next_multiple_of(HEIGHT_ALIGN);
+        let surface_label = match format {
+            NvdecSurfaceFormat::Nv12 => "NV12",
+            NvdecSurfaceFormat::P010 => "P010",
+            NvdecSurfaceFormat::Yuv444p => "YUV444P",
+        };
         let (chroma_w, chroma_h) = match format {
             NvdecSurfaceFormat::Nv12 | NvdecSurfaceFormat::P010 => {
                 (aligned_w.div_ceil(2), aligned_h.div_ceil(2))
@@ -638,7 +639,7 @@ impl VulkanDevice {
                 // SAFETY: `info` is a well-formed external/modifier image descriptor;
                 // the returned image is destroyed by the caller on error / pool drop.
                 unsafe { device.create_image(&info, None) }
-                    .map_err(|e| format!("vkCreateImage (NV12 shared): {e}"))
+                    .map_err(|e| format!("vkCreateImage ({surface_label} shared): {e}"))
             };
 
         let y_image = create_image(format.y_vk_format(), aligned_w, aligned_h)?;
@@ -723,7 +724,7 @@ impl VulkanDevice {
                 .push_next(&mut export_alloc);
             // SAFETY: exportable allocation of `total_size`; freed by the caller.
             let memory = unsafe { device.allocate_memory(&alloc_info, None) }
-                .map_err(|e| format!("vkAllocateMemory (NV12 shared): {e}"))?;
+                .map_err(|e| format!("vkAllocateMemory ({surface_label} shared): {e}"))?;
 
             let finish = (|| -> std::result::Result<SurfaceExport, String> {
                 // SAFETY: both images + `memory` are live; offsets satisfy the
@@ -747,7 +748,7 @@ impl VulkanDevice {
                     .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
                 // SAFETY: `memory` was allocated exportable as DMA_BUF_EXT.
                 let raw_fd = unsafe { self.ext_mem_fd.get_memory_fd(&fd_info) }
-                    .map_err(|e| format!("vkGetMemoryFdKHR (NV12 shared): {e}"))?;
+                    .map_err(|e| format!("vkGetMemoryFdKHR ({surface_label} shared): {e}"))?;
                 // SAFETY: raw_fd is a freshly-returned open fd we own.
                 let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 

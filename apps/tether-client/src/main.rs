@@ -14,7 +14,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -23,7 +23,10 @@ use tether_decode::{DecodeCompletion, DecodeJob};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
-use tether_protocol::control::{ControlMessage, GoodbyeCode, ServerHello, VideoStreamId, Viewport};
+use tether_protocol::control::{
+    ClockSync, ControlMessage, GoodbyeCode, ServerHello, VideoStreamId, Viewport,
+    CLOCK_SYNC_PROBE_SAMPLES,
+};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::LatestFrame;
@@ -44,6 +47,13 @@ use client_pairing::HostAuth;
 // texture on dimension change.
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
+const CLOCK_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Default)]
+struct ClockResyncState {
+    pending: Vec<MonoNanos>,
+    samples: Vec<ClockSync>,
+}
 
 /// Whether a `FrameReassembler::handle()` loss-counter delta warrants a
 /// `RequestRecovery`. `before`/`after` are reassembler
@@ -327,6 +337,8 @@ async fn main() -> anyhow::Result<()> {
         false,
     ));
     let shutdown_notice_sent = Arc::new(AtomicBool::new(false));
+    let clock_sync_state = Arc::new(RwLock::new(clock_sync));
+    let clock_resync_state = Arc::new(Mutex::new(ClockResyncState::default()));
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -346,9 +358,61 @@ async fn main() -> anyhow::Result<()> {
     // arrive here, so the loop exists from V1 onward.
     {
         let conn = conn.clone();
+        let clock_resync_state = clock_resync_state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(CLOCK_RESYNC_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // Skip the immediate tick; handshake just sampled.
+            loop {
+                ticker.tick().await;
+                {
+                    let mut state = clock_resync_state
+                        .lock()
+                        .expect("clock resync lock poisoned");
+                    if !state.pending.is_empty() {
+                        warn!(
+                            pending = state.pending.len(),
+                            samples = state.samples.len(),
+                            "clock resync probe burst did not complete before next interval; restarting"
+                        );
+                        state.pending.clear();
+                        state.samples.clear();
+                    }
+                    state.pending.reserve(CLOCK_SYNC_PROBE_SAMPLES);
+                    state.samples.reserve(CLOCK_SYNC_PROBE_SAMPLES);
+                }
+
+                for _ in 0..CLOCK_SYNC_PROBE_SAMPLES {
+                    let t0 = MonoNanos::now();
+                    {
+                        let mut state = clock_resync_state
+                            .lock()
+                            .expect("clock resync lock poisoned");
+                        state.pending.push(t0);
+                    }
+                    if let Err(e) = conn
+                        .send_control(&ControlMessage::ClockProbeRequest { t0_sender: t0 })
+                        .await
+                    {
+                        let mut state = clock_resync_state
+                            .lock()
+                            .expect("clock resync lock poisoned");
+                        state.pending.clear();
+                        state.samples.clear();
+                        warn!(error = ?e, "clock resync probe send failed; ending resync task");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    {
+        let conn = conn.clone();
         let cursor_channel_ctrl = cursor_channel.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
+        let clock_sync_state = clock_sync_state.clone();
+        let clock_resync_state = clock_resync_state.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_control().await {
@@ -382,8 +446,59 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     }
-                    Ok(ControlMessage::ClockProbeResponse(_)) => {
-                        tracing::trace!("unsolicited clock probe response; ignoring");
+                    Ok(ControlMessage::ClockProbeResponse(probe)) => {
+                        let selected = {
+                            let mut state = clock_resync_state
+                                .lock()
+                                .expect("clock resync lock poisoned");
+                            let Some(pos) =
+                                state.pending.iter().position(|t0| *t0 == probe.t0_sender)
+                            else {
+                                tracing::trace!("unsolicited clock probe response; ignoring");
+                                continue;
+                            };
+                            let t0 = state.pending.swap_remove(pos);
+                            let t3 = MonoNanos::now();
+                            state.samples.push(ClockSync::from_probe(
+                                t0,
+                                probe.t1_receiver_recv,
+                                probe.t2_receiver_send,
+                                t3,
+                            ));
+                            if state.samples.len() == CLOCK_SYNC_PROBE_SAMPLES {
+                                let min_rtt =
+                                    state.samples.iter().map(|s| s.rtt_nanos).min().unwrap_or(0);
+                                let max_rtt =
+                                    state.samples.iter().map(|s| s.rtt_nanos).max().unwrap_or(0);
+                                let samples = std::mem::take(&mut state.samples);
+                                state.pending.clear();
+                                ClockSync::best_sample(samples).map(|sync| (sync, min_rtt, max_rtt))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((selected, min_rtt, max_rtt)) = selected {
+                            let previous =
+                                *clock_sync_state.read().expect("clock sync lock poisoned");
+                            *clock_sync_state.write().expect("clock sync lock poisoned") = selected;
+                            let offset_delta_us = ((i128::from(selected.offset_nanos)
+                                - i128::from(previous.offset_nanos))
+                                / 1_000)
+                                .clamp(i128::from(i64::MIN), i128::from(i64::MAX));
+                            let offset_delta_us =
+                                i64::try_from(offset_delta_us).expect("clamped to i64 range");
+                            info!(
+                                event = "clock_sync",
+                                phase = "resync",
+                                samples = CLOCK_SYNC_PROBE_SAMPLES,
+                                selected_rtt_us = selected.rtt_nanos / 1_000,
+                                min_rtt_us = min_rtt / 1_000,
+                                max_rtt_us = max_rtt / 1_000,
+                                clock_offset_us = selected.offset_nanos / 1_000,
+                                offset_delta_us,
+                                "refreshed clock-sync sample"
+                            );
+                        }
                     }
                     Ok(ControlMessage::Goodbye {
                         reason,
@@ -532,7 +647,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let conn_recv = conn.clone();
-    let recv_clock_sync = clock_sync;
+    let recv_clock_sync = clock_sync_state.clone();
     let decode_profile = negotiated_profile;
     let conn_ready = conn.clone();
     let cursor_channel_datagram = cursor_channel.clone();
@@ -876,9 +991,10 @@ async fn main() -> anyhow::Result<()> {
             // difference between them and `now` decomposes
             // total latency into capture-to-send (host
             // pipeline) and send-to-recv (network + reassembly).
+            let current_clock_sync = *recv_clock_sync.read().expect("clock sync lock poisoned");
             let host_in_client_clock =
-                recv_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
-            let send_in_client_clock = recv_clock_sync.remote_to_local(frame.meta.timing.t_send);
+                current_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
+            let send_in_client_clock = current_clock_sync.remote_to_local(frame.meta.timing.t_send);
             let age_ns = now.saturating_sub(host_in_client_clock);
             let network_ns = now.saturating_sub(send_in_client_clock);
             frame_count += 1;

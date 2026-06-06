@@ -144,13 +144,14 @@ pub struct NvdecSurfacePool {
     height: u32,
 }
 
-// SAFETY: the Vulkan handles are only ever touched under `&mut self` /
-// pool-internal serialisation (the decoder is single-threaded); the
-// `Arc<AtomicBool>` free flags are `Send + Sync`; `OwnedFd` is `Send + Sync`.
-// The explicit impls document the move-between-threads contract the decoder's
-// own `unsafe impl Send` relies on (ash handles are `!Send` by default).
+// SAFETY: the pool is owned by `NvdecDecoder` (itself only `Send`) and its
+// Vulkan handles are only ever touched under `&mut self` on the single decode
+// thread; the `Arc<AtomicBool>` free flags and `OwnedFd` are already `Send`.
+// Only `Send` is asserted — moving the pool between threads is the decoder's
+// contract (ash handles are `!Send` by default). `Sync` is deliberately NOT
+// implemented: nothing shares `&NvdecSurfacePool` across threads, so asserting
+// it would only widen the unsafe surface for no caller.
 unsafe impl Send for NvdecSurfacePool {}
-unsafe impl Sync for NvdecSurfacePool {}
 
 impl NvdecSurfacePool {
     /// Build the pool: create a Vulkan device on the NVIDIA GPU with the
@@ -638,7 +639,12 @@ impl VulkanDevice {
             // UV bind offset spans the Y image and satisfies both alignments.
             let uv_align = uv_req.alignment.max(y_req.alignment);
             let uv_bind_offset = align_up(y_req.size, uv_align);
-            let total_size = uv_bind_offset + uv_req.size;
+            // Saturating, consistent with `align_up`: a driver-reported size near
+            // u64::MAX must not wrap to a small `total_size`, which would
+            // under-allocate the memory and bind the UV plane past its end.
+            // (`MAX_DECODE_DIM` keeps real inputs far from this, but the
+            // arithmetic stays honest.)
+            let total_size = uv_bind_offset.saturating_add(uv_req.size);
 
             let mut export_alloc = vk::ExportMemoryAllocateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);

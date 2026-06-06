@@ -112,4 +112,19 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{profile:?} should decode via NVDEC, got {e:?}"));
         }
     }
+
+    /// AV1 decode is advertised on NVDEC (unlike AV1 *encode*, which is
+    /// Ada-only — NVDEC AV1 works on Ampere). The host advertises it, so per the
+    /// "probe-pass is half-credit" rule it gets a real round-trip too: both the
+    /// 8-bit (NV12) and 10-bit (P010) AV1 4:2:0 fixtures must decode through the
+    /// live NVDEC probe. `#[ignore]` — needs an NVIDIA GPU + an NVDEC FFmpeg.
+    #[test]
+    #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf"]
+    fn av1_fixtures_decode_via_nvdec_probe() {
+        for profile in [VideoProfile::AV1_8BIT_420, VideoProfile::AV1_10BIT_420] {
+            let fixture = fixture_for(profile).expect("bundled probe fixture");
+            NvdecProbe::probe_decode(profile, fixture)
+                .unwrap_or_else(|e| panic!("{profile:?} should decode via NVDEC, got {e:?}"));
+        }
+    }
 }

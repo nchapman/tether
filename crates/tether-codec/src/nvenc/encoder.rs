@@ -377,8 +377,14 @@ impl NvencEncoder {
     /// resolution changes go through a full encoder rebuild.
     ///
     /// Returns `NoHardwareCodec` when the EGL/CUDA stack is unavailable
-    /// (no NVIDIA driver / missing EGL device extensions) so the host's
-    /// send loop falls back to `encode_bgra` rather than dropping frames.
+    /// (no NVIDIA driver / missing EGL device extensions). This is the
+    /// production path for every 8-bit *and* 10-bit GPU capture frame — the
+    /// host has no CPU-upload fallback for GPU frames (it has no host-side BGRA
+    /// bytes to feed `encode_bgra`), so a failure here drops the frame. The
+    /// encode probe therefore proves *this* path, not `encode_bgra`, before a
+    /// profile is advertised (see `tether-probe`'s `probe_nv12_submit` /
+    /// `probe_p010_submit`), so a negotiated session only reaches here on a host
+    /// where the import already succeeded; a later failure means device loss.
     // AVFrame::linesize / packet.size are non-negative i32 ABI fields;
     // same rationale as encode_bgra and the VAAPI sibling.
     #[allow(clippy::cast_sign_loss)]

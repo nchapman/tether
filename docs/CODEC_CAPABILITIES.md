@@ -449,11 +449,16 @@ the runtime `libnvidia-encode.so` / `libcuda.so` / `libEGL.so`.
   image is rejected by `cuGraphicsEGLRegisterImage`, which is why the
   whole surface is imported as one semi-planar image. Source:
   `nvenc/ffi.rs`, `nvenc/encoder.rs::submit_dmabuf`.
-- **EGL display** is pinned to CUDA device 0 (matched via
-  `EGL_CUDA_DEVICE_NV`) so the import lands on the encoder's GPU.
-  Multi-GPU device selection (the encoder's CUDA device + the gpuconvert
-  wgpu adapter + the EGL display must all be the same physical GPU) is a
-  deferred follow-up.
+- **EGL display** is bound to the **pinned** CUDA device (matched via
+  `EGL_CUDA_DEVICE_NV`) so the import lands on the encoder's GPU — device 0
+  when unpinned. Multi-GPU alignment is **implemented**: the host reads the
+  GPU its dma-buf producer (the gpuconvert wgpu adapter) will use, by 16-byte
+  Vulkan `deviceUUID` (which equals CUDA's `cuDeviceGetUuid` on NVIDIA), and
+  pins NVENC/NVDEC's CUDA context, the EGL display, and the NVDEC surface
+  pool's Vulkan device to that same physical GPU (`nvenc::pin_gpu_uuid`,
+  wired in `tether-host` before the probe). The user-facing override to force
+  a *specific* GPU (vs. the producer's default pick) is the remaining
+  follow-up. Source: `nvenc/gpu_pin.rs`, `gpu_select::preferred_device_uuid`.
 - **Live rate-control is POSITIVE on NVENC**, the inverse of the VAAPI
   table: `supports_changing_bitrate` is `true` and
   `set_bitrate_kbps` (writing `bit_rate` + `rc_max_rate`) drives a real

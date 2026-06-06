@@ -263,6 +263,26 @@ fn nvenc_h264_8bit_encode_bgra_produces_idr() {
     assert_encode_bgra_produces_idr(VideoProfile::H264_8BIT_420);
 }
 
+/// The low-latency AVOption set (`delay=0`, `forced-idr=1`, `zerolatency=1`,
+/// `tune=ull`, `rc=cbr`) must actually be consumed by `*_nvenc` at `open()` —
+/// an option left in the leftover dict is a silently-ignored latency knob. This
+/// asserts `unused_avoptions()` is empty after a successful construct, the NVENC
+/// analogue of VAAPI's verified-negative SKIP tests, and exercises the
+/// otherwise test-only getter.
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_latency_avoptions_are_all_consumed() {
+    for profile in [VideoProfile::H264_8BIT_420, VideoProfile::HEVC_8BIT_420] {
+        let enc = NvencEncoder::new(profile, 256, 256, 30, 4_000)
+            .unwrap_or_else(|e| panic!("NvencEncoder::new({profile:?}) failed: {e}"));
+        assert!(
+            enc.unused_avoptions().is_empty(),
+            "{profile:?}: NVENC ignored latency options {:?} — they are silent no-ops",
+            enc.unused_avoptions()
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires NVIDIA GPU (cargo test -p tether-codec --ignored nvenc_)"]
 fn nvenc_detection_true_on_this_nvidia_host() {

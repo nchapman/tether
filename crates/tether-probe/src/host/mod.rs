@@ -11,9 +11,12 @@
 //! there is the decode-only nvidia-vaapi-driver, whose encoder construction
 //! SIGSEGVs), and a non-NVIDIA host uses VAAPI. Matching the live dispatch
 //! keeps the advertised capability set from disagreeing with what the session
-//! encoder actually picks. Decode is always the platform decoder backend
-//! ([`ActiveProbe`]) — an NVENC host decodes its own round-trip fixtures
-//! through VAAPI (nvidia-vaapi-driver's decode path).
+//! encoder actually picks. Decode is likewise runtime-selected on Linux: an
+//! NVIDIA host probes decode through **NVDEC** ([`nvdec::NvdecProbe`]), *not*
+//! VAAPI — the default VAAPI device there is the decode-only
+//! nvidia-vaapi-driver, whose `VaapiDecoder` SIGSEGVs, so there is no VAAPI
+//! decode fallback either. A non-NVIDIA host decodes through [`ActiveProbe`]
+//! (VAAPI). See [`probe_decode`].
 
 #[cfg(target_os = "linux")]
 pub(crate) mod nvdec;
@@ -62,10 +65,11 @@ pub(crate) fn probe_encode(
     vaapi::VaapiProbe::probe_encode(profile)
 }
 
-/// Run the host decode probe for `profile` against the platform decoder
-/// backend ([`ActiveProbe`]). Used by the host round-trip (encode → decode)
-/// and by the client decode advertisement. On Linux this is always VAAPI —
-/// including on an NVENC host, which has no NVDEC path.
+/// Run the host decode probe for `profile`. Used by the host round-trip
+/// (encode → decode) and by the client decode advertisement. Runtime-selected
+/// on Linux: an NVIDIA host probes through NVDEC ([`nvdec::NvdecProbe`]), every
+/// other host through the platform decoder backend ([`ActiveProbe`], i.e.
+/// VAAPI on Linux).
 pub(crate) fn probe_decode(
     profile: tether_protocol::control::VideoProfile,
     fixture: &[u8],

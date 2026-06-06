@@ -527,8 +527,10 @@ impl EglFns {
 
 /// Process-global EGL/CUDA importer. Holds the dlopen'd libraries
 /// resident, the resolved CUDA + EGL entry points, and an `eglInitialize`d
-/// display bound to CUDA device 0 (the same physical GPU the default CUDA
-/// context — and therefore NVENC — runs on).
+/// display bound to the **pinned** CUDA device — the GPU the host pinned via
+/// [`gpu_pin::pin_gpu_uuid`], or device 0 when unpinned (the single-GPU
+/// default). That is the same physical GPU NVENC/NVDEC's CUDA context runs on,
+/// so the imported device pointers are dereferenceable by the codec.
 pub(crate) struct EglCudaImporter {
     // The libraries are kept alive for the process lifetime so the raw
     // function pointers copied out of them stay valid. Never read directly.
@@ -837,6 +839,12 @@ impl Drop for ImportGuard {
                 );
                 return;
             }
+            // No `cuGraphicsUnmapResources` before unregister: unlike the
+            // OpenGL interop, the EGL path's `cuGraphicsResourceGetMappedEglFrame`
+            // does not pair with an explicit map/unmap (the mapping is implicit
+            // in the registered EGL image), so `cuGraphicsUnregisterResource` is
+            // called directly. This matches Sunshine's EGL→CUDA importer; do not
+            // "fix" it by adding an unmap call.
             for (image, resource) in self.resources.drain(..) {
                 (self.cuda.graphics_unregister_resource)(resource);
                 (self.egl.destroy_image)(self.display, image);
@@ -848,9 +856,9 @@ impl Drop for ImportGuard {
 }
 
 impl EglCudaImporter {
-    /// Load the libraries, resolve the entry points, and bind an EGL
-    /// display to CUDA device 0. Returns `None` on any failure so a
-    /// non-NVIDIA / partial host degrades to the CPU upload path.
+    /// Load the libraries, resolve the entry points, and bind an EGL display
+    /// to the pinned CUDA device (device 0 when unpinned). Returns `None` on any
+    /// failure so a non-NVIDIA / partial host degrades to the CPU upload path.
     fn init() -> Option<Self> {
         // SAFETY: dlopen of the system CUDA/EGL runtimes by soname. The
         // libraries are stored in `_libs` and never unloaded, so every
@@ -1011,22 +1019,28 @@ impl EglCudaImporter {
             ));
         }
 
-        // One ImportedPlane per CUeglFrame plane (2 for NV12/P010), tagged by
-        // frame type: PITCH hands back device pointers + a row pitch; ARRAY
-        // hands back CUarrays (the copy path handles both). Cap at the union's
-        // 3 slots and the surface's layer count.
-        let plane_count = (egl_frame.plane_count as usize).min(3).min(frame.layers.len());
-        if plane_count == 0 {
-            // A misbehaving driver / format CUDA doesn't model: with no planes
-            // the pool frame would ship to NVENC holding stale surface memory
-            // (silent corruption). Fail loudly instead.
+        // One ImportedPlane per CUeglFrame plane, tagged by frame type: PITCH
+        // hands back device pointers + a row pitch; ARRAY hands back CUarrays
+        // (the copy path handles both).
+        //
+        // The mapped plane count MUST equal the surface's dma-buf layer count
+        // (2 for NV12/P010; CUeglFrame holds at most 3). A driver that maps
+        // FEWER planes — e.g. losing the UV plane of a semi-planar image — would
+        // otherwise make us copy only Y and ship a surface to NVENC (or, on the
+        // decode side, export one) with stale / uninitialised chroma: silent
+        // corruption. Require an exact match and fail loudly on any mismatch.
+        let expected_planes = frame.layers.len();
+        let mapped_planes = usize::try_from(egl_frame.plane_count).unwrap_or(0);
+        if expected_planes == 0 || expected_planes > 3 || mapped_planes != expected_planes {
             self.pop_ctx();
             return Err(format!(
-                "cuGraphicsResourceGetMappedEglFrame reported plane_count=0 for fourcc \
-                 0x{:08x} (expected 2 for NV12/P010)",
+                "cuGraphicsResourceGetMappedEglFrame mapped {mapped_planes} plane(s) for fourcc \
+                 0x{:08x}, but the surface declares {expected_planes} (2 for NV12/P010); \
+                 refusing to import a partially-mapped surface",
                 frame.fourcc
             ));
         }
+        let plane_count = expected_planes;
         let pitch = usize::try_from(egl_frame.pitch).unwrap_or(0);
         for i in 0..plane_count {
             // SAFETY: the active union arm is selected by `frame_type`; both

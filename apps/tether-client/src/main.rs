@@ -366,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::trace!("unsolicited clock probe response; ignoring");
                     }
                     Ok(ControlMessage::Goodbye { reason, code }) => {
-                        info!(%reason, ?code, "host said goodbye");
+                        info!(event = "peer_goodbye", %reason, ?code, "host said goodbye");
                         return;
                     }
                     Ok(ControlMessage::Extension(msg)) => {
@@ -590,6 +590,13 @@ async fn main() -> anyhow::Result<()> {
             .await
         {
             warn!(error = ?e, "StreamReady send failed; host will not emit video");
+        } else {
+            info!(
+                event = "stream_ready",
+                video = true,
+                audio = audio_active,
+                "client signalled StreamReady"
+            );
         }
         let mut frame_count: u64 = 0;
         // Reassembler cumulative counters at the start of the current stats
@@ -1213,6 +1220,12 @@ async fn say_goodbye_with_code(
     if let Err(e) = conn.send_control(&msg).await {
         warn!(error = ?e, "send Goodbye failed; host will fall back to timeout");
     } else {
+        info!(
+            event = "session_teardown",
+            reason,
+            ?code,
+            "client sent Goodbye"
+        );
         let wait = (2 * conn.rtt()).clamp(Duration::from_millis(20), Duration::from_millis(200));
         tokio::time::sleep(wait).await;
     }

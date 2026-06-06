@@ -56,6 +56,14 @@ impl ClientSession {
         cfg: ClientSessionConfig,
     ) -> Result<Self, ConnectError> {
         info!(
+            event = "handshake_start",
+            role = "client",
+            client = %cfg.client_name,
+            "sending client hello"
+        );
+        info!(
+            event = "client_capabilities",
+            client = %cfg.client_name,
             client_decode_profiles = ?cfg.client_decode_profiles,
             "advertising video decode capabilities to host"
         );
@@ -72,6 +80,13 @@ impl ClientSession {
         let server_hello = match channel.client_handshake(hello).await? {
             ServerHandshake::Accepted(server_hello) => server_hello,
             ServerHandshake::Rejected(failure) => {
+                warn!(
+                    event = "handshake_rejected",
+                    role = "client",
+                    code = ?failure.code,
+                    reason = %failure.reason,
+                    "host rejected handshake"
+                );
                 return Err(ConnectError::HandshakeRejected {
                     code: failure.code,
                     reason: failure.reason,
@@ -108,6 +123,8 @@ impl ClientSession {
 
         let clock_sync = run_clock_probe(channel.as_ref()).await?;
         info!(
+            event = "handshake_accepted",
+            role = "client",
             server = %server_hello.server_name,
             negotiated_codec = ?negotiated.codec,
             negotiated_chroma = ?negotiated.chroma,
@@ -134,6 +151,8 @@ impl ClientSession {
 
 async fn send_protocol_error_goodbye(channel: &dyn ControlChannel, reason: String) {
     warn!(
+        event = "session_teardown",
+        code = ?GoodbyeCode::ProtocolError,
         %reason,
         "host sent invalid handshake selection; sending Goodbye(ProtocolError)"
     );

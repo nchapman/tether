@@ -918,8 +918,8 @@ async fn handle_client(
                     }
                     Ok(ControlMessage::StreamReady { video, audio }) => {
                         info!(
-                            video,
-                            audio, "client signalled StreamReady; opening the gate"
+                            event = "stream_ready",
+                            video, audio, "client signalled StreamReady; opening the gate"
                         );
                         stream_ready_ctl.store(true, Ordering::Release);
                         // Defensive IDR at gate-open. A fresh encoder's
@@ -1044,7 +1044,7 @@ async fn handle_client(
                     }
                     Ok(ControlMessage::Goodbye { reason, code }) => {
                         shutdown_notice_for_ctl.store(true, Ordering::Release);
-                        info!(%reason, ?code, "client said goodbye");
+                        info!(event = "peer_goodbye", %reason, ?code, "client said goodbye");
                         return;
                     }
                     Ok(ControlMessage::Extension(msg)) => {
@@ -1064,6 +1064,7 @@ async fn handle_client(
                             )
                             .await;
                             info!(
+                                event = "session_teardown",
                                 reason = reason.as_str(),
                                 code = ?GoodbyeCode::ProtocolError,
                                 sent,
@@ -1268,6 +1269,7 @@ async fn handle_client(
     if !shutdown_notice_sent_or_received.swap(true, Ordering::AcqRel) {
         let sent = send_goodbye_notice(&conn, teardown_reason, teardown_code).await;
         info!(
+            event = "session_teardown",
             reason = teardown_reason,
             code = ?teardown_code,
             sent,
@@ -1339,7 +1341,13 @@ fn send_goodbye_notice_blocking(
         return;
     }
     let sent = runtime.block_on(send_goodbye_notice(conn, reason, code));
-    info!(reason, ?code, sent, "host session shutdown notice");
+    info!(
+        event = "session_teardown",
+        reason,
+        ?code,
+        sent,
+        "host session shutdown notice"
+    );
 }
 
 /// Encoder paired with the input dimensions it was configured for, so we

@@ -133,10 +133,12 @@ impl NvencEncoder {
         let codec = AVCodec::find_encoder_by_name(codec_cname)
             .ok_or(CodecError::CodecNotFound(nvenc_codec_name(kind)))?;
 
-        // Default CUDA device (GPU 0). None lets FFmpeg pick; explicit
-        // device strings only matter on multi-GPU systems, where the
-        // producer (wgpu) and importer (CUDA) must agree on the physical
-        // GPU — handled when a multi-GPU user needs it.
+        // CUDA device selection. `None` lets FFmpeg pick its default (device
+        // 0); a host that pinned a GPU (`super::pin_gpu_uuid`) supplies the
+        // matching CUDA ordinal so NVENC's context lands on the same physical
+        // GPU as the dma-buf producer and the EGL importer. The `CString` is
+        // bound to a local so its `&CStr` stays valid across the create call.
+        let cuda_device = super::gpu_pin::cuda_device_cstring();
         // `1` = AV_CUDA_USE_PRIMARY_CONTEXT (hwcontext_cuda.h `1 << 0`): share
         // the GPU's primary CUDA context instead of creating a fresh one.
         // FFmpeg's default (flags=0) does a new `cuCtxCreate` per device; the
@@ -145,7 +147,8 @@ impl NvencEncoder {
         // state and SIGSEGVs (verified on an RTX 3090 Ti). The primary context
         // is reference-counted and stable, so every NVENC/NVDEC instance and
         // the EGL importer (also device 0) share one context.
-        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, None, None, 1)?;
+        let hw_device =
+            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, cuda_device.as_deref(), None, 1)?;
 
         // Read FFmpeg's CUcontext out of the CUDA AVHWDeviceContext so the
         // zero-copy DMA-BUF import (`submit_dmabuf`) registers EGL images

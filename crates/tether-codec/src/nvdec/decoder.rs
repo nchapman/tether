@@ -104,9 +104,14 @@ impl NvdecDecoder {
             return Err(CodecError::CodecNotFound(nvdec_name(kind)));
         }
 
-        // Default CUDA device (GPU 0). None lets FFmpeg pick; explicit device
-        // strings only matter on multi-GPU systems. Same call as NvencEncoder.
-        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, None, None, 1)?;
+        // CUDA device selection mirrors NvencEncoder: `None` is FFmpeg's
+        // default device; a pinned host (`nvenc::pin_gpu_uuid`) supplies the
+        // matching ordinal so the decoder's CUDA context, the EGL importer, and
+        // the surface pool's Vulkan device share one physical GPU. The local
+        // keeps the `&CStr` alive across the create call.
+        let cuda_device = crate::nvenc::gpu_pin::cuda_device_cstring();
+        let hw_device =
+            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, cuda_device.as_deref(), None, 1)?;
 
         // Read FFmpeg's CUcontext out of the CUDA AVHWDeviceContext so the
         // zero-copy NV12 dma-buf export registers EGL images against the exact

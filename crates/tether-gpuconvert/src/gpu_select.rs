@@ -36,6 +36,46 @@ pub fn device_uuid(device: &wgpu::Device) -> Option<[u8; 16]> {
     }
 }
 
+/// The Vulkan `deviceUUID` of a wgpu adapter — the [`device_uuid`] form for an
+/// [`wgpu::Adapter`] not yet turned into a device. Used by
+/// [`preferred_device_uuid`] to read the producer's GPU without building a full
+/// bridge.
+#[must_use]
+pub fn adapter_uuid(adapter: &wgpu::Adapter) -> Option<[u8; 16]> {
+    // SAFETY: hal escape hatch — the raw handles are valid for the
+    // `hal::Adapter` borrow and we only read properties through them.
+    unsafe {
+        let hal = adapter.as_hal::<Vulkan>()?;
+        let instance = hal.shared_instance().raw_instance();
+        let physical = hal.raw_physical_device();
+        Some(physical_device_uuid(instance, physical))
+    }
+}
+
+/// The `deviceUUID` of the GPU the producer bridges will pick: the
+/// `HighPerformance` adapter `request_adapter` returns. Every dma-buf bridge in
+/// this crate uses that same request, and the choice is deterministic within a
+/// process, so this answers "which physical GPU will the producers land on?"
+/// without constructing one.
+///
+/// The host queries this once at startup and pins the NVIDIA codec subsystems
+/// to it (`tether_codec::nvenc::pin_gpu_uuid`) so NVENC/NVDEC's CUDA context and
+/// the EGL importer follow the producer. `None` on a non-Vulkan host (no
+/// dma-buf path there) or when no adapter is available.
+pub async fn preferred_device_uuid() -> Option<[u8; 16]> {
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .ok()?;
+    adapter_uuid(&adapter)
+}
+
 /// Query `VkPhysicalDeviceIDProperties::deviceUUID` (core Vulkan 1.1, always
 /// present on the 1.1+ instances wgpu's Vulkan backend creates).
 ///

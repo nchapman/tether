@@ -614,3 +614,31 @@ fn nvenc_producer_uuid_resolves_to_a_cuda_ordinal() {
         "producer UUID {producer_uuid:02x?} did not resolve to a CUDA ordinal"
     );
 }
+
+/// The EGL importer's device selection must honor an arbitrary CUDA ordinal,
+/// not just device 0 — that is the whole multi-GPU pinning mechanism on the EGL
+/// side (the importer binds its display to the pinned GPU). Every real CUDA
+/// ordinal must yield a display; an out-of-range ordinal must not. On the dev
+/// box (2 NVIDIA GPUs) this confirms ordinal 1 selects a display too, which the
+/// old hardcoded `== 0` path could never have done.
+#[test]
+#[ignore = "requires NVIDIA GPU + libEGL device extensions (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_egl_display_selects_per_cuda_ordinal() {
+    let devices = super::cuda_device_uuids();
+    assert!(!devices.is_empty(), "expected at least one CUDA device");
+
+    for (ordinal, _) in &devices {
+        assert!(
+            super::ffi::egl_display_available_for_ordinal(*ordinal),
+            "no EGL display bound to CUDA ordinal {ordinal} — EGL pinning would fail for that GPU"
+        );
+    }
+
+    // An ordinal past the last device must select nothing (not silently fall
+    // back to device 0, which would defeat pinning).
+    let out_of_range = i32::try_from(devices.len()).unwrap() + 16;
+    assert!(
+        !super::ffi::egl_display_available_for_ordinal(out_of_range),
+        "EGL selected a display for non-existent CUDA ordinal {out_of_range}"
+    );
+}

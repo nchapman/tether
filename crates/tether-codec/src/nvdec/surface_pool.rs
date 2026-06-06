@@ -375,6 +375,25 @@ struct VulkanDevice {
     modifier_ext: ash::ext::image_drm_format_modifier::Device,
 }
 
+/// Read a physical device's `VkPhysicalDeviceIDProperties::deviceUUID` (core
+/// Vulkan 1.1). On NVIDIA this equals the CUDA `cuDeviceGetUuid` value and the
+/// wgpu producer's `deviceUUID` for the same GPU, so it correlates the surface
+/// pool's allocation device with the host's pinned GPU.
+///
+/// # Safety
+/// `instance` must be live and `physical` one of the devices it enumerated.
+unsafe fn physical_device_uuid(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+) -> [u8; 16] {
+    let mut id_props = vk::PhysicalDeviceIDProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id_props);
+    // SAFETY: `physical` belongs to `instance`; `props2` is a well-formed
+    // properties2 chain with the ID-properties struct linked via push_next.
+    unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
+    id_props.device_uuid
+}
+
 impl VulkanDevice {
     /// Create a headless Vulkan device on the first NVIDIA physical device
     /// that supports the dma-buf external-memory + DRM-format-modifier
@@ -395,7 +414,14 @@ impl VulkanDevice {
             CodecError::NoHardwareCodec(format!("NVDEC surface pool: vkCreateInstance: {e}"))
         })?;
 
-        // Pick the NVIDIA physical device. SAFETY: `instance` is live.
+        // Pick the NVIDIA physical device the decoder's CUDA context lives on.
+        // When the host pinned a GPU (`nvenc::pin_gpu_uuid`) we must allocate
+        // surfaces on that exact GPU by matching the Vulkan `deviceUUID` to the
+        // pin — the decoded planes are copied into this surface inside the
+        // decoder's CUDA context, then EGL-imported back, so a surface on the
+        // wrong GPU would fault. Unpinned: the first NVIDIA device (single-GPU
+        // behavior). SAFETY: `instance` is live.
+        let pinned = crate::nvenc::gpu_pin::pinned_uuid();
         let physical_device = unsafe {
             let devices = instance.enumerate_physical_devices().map_err(|e| {
                 instance.destroy_instance(None);
@@ -404,17 +430,28 @@ impl VulkanDevice {
                 ))
             })?;
             let chosen = devices.into_iter().find(|&pd| {
-                instance.get_physical_device_properties(pd).vendor_id == VENDOR_NVIDIA
+                if instance.get_physical_device_properties(pd).vendor_id != VENDOR_NVIDIA {
+                    return false;
+                }
+                match pinned {
+                    Some(target) => physical_device_uuid(&instance, pd) == target,
+                    None => true,
+                }
             });
             match chosen {
                 Some(pd) => pd,
                 None => {
                     instance.destroy_instance(None);
-                    return Err(CodecError::NoHardwareCodec(
-                        "NVDEC surface pool: no NVIDIA Vulkan physical device found \
-                         (the surface pool must allocate on the same GPU as CUDA device 0)"
-                            .to_string(),
-                    ));
+                    let detail = match pinned {
+                        Some(uuid) => format!(
+                            "no NVIDIA Vulkan device matches the pinned GPU UUID {uuid:02x?} \
+                             (the surface pool must allocate on the decoder's CUDA GPU)"
+                        ),
+                        None => "no NVIDIA Vulkan physical device found".to_string(),
+                    };
+                    return Err(CodecError::NoHardwareCodec(format!(
+                        "NVDEC surface pool: {detail}"
+                    )));
                 }
             }
         };

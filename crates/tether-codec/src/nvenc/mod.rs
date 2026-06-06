@@ -29,12 +29,18 @@ pub use encoder::NvencEncoder;
 // UUID (derived from the wgpu dma-buf producer's chosen adapter) to the CUDA
 // ordinal NVENC/NVDEC/EGL must all bind to. See [`ffi::cuda_ordinal_for_uuid`].
 pub use ffi::{cuda_device_uuids, cuda_ordinal_for_uuid, GpuUuid};
+// The host pins all NVIDIA subsystems to one physical GPU via `pin_gpu_uuid`;
+// the encoder, decoder, EGL importer, and NVDEC surface pool read the pin.
+pub use gpu_pin::pin_gpu_uuid;
 
 mod encoder;
 // `pub(crate)` so the NVDEC decoder (`crate::nvdec`) can reuse the same
 // EGL→CUDA importer for its reverse (CUDA → dma-buf) copy — the import
 // machinery is direction-agnostic, so there's one home for it.
 pub(crate) mod ffi;
+// `pub(crate)` so the NVDEC decoder + surface pool read the same GPU pin the
+// encoder does (the pin is shared across encode and decode subsystems).
+pub(crate) mod gpu_pin;
 
 #[cfg(test)]
 mod tests;

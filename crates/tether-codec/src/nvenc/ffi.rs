@@ -849,7 +849,13 @@ impl EglCudaImporter {
         let cuda = unsafe { CudaFns::load(&cuda_lib) }?;
         let egl = unsafe { EglFns::load(&egl_lib) }?;
 
-        let display = egl_display_for_cuda_device0(&egl)?;
+        // Bind the EGL display to the GPU the host pinned (the dma-buf
+        // producer's device); unpinned falls back to CUDA ordinal 0, FFmpeg's
+        // default device. This runs once (the importer is a process-global) and
+        // must agree with the ordinal the encoder/decoder passed to
+        // AVHWDeviceContext::create.
+        let cuda_ordinal = super::gpu_pin::pinned_cuda_ordinal().unwrap_or(0);
+        let display = egl_display_for_cuda_device(&egl, cuda_ordinal)?;
 
         Some(Self {
             _libs: (cuda_lib, egl_lib),
@@ -1146,15 +1152,17 @@ fn plane_attr_tokens(n: usize) -> (EglAttrib, EglAttrib, EglAttrib, EglAttrib, E
     }
 }
 
-/// Find the EGL device whose `EGL_CUDA_DEVICE_NV` attribute is CUDA
-/// device 0, open a platform display on it, and `eglInitialize` it.
+/// Find the EGL device whose `EGL_CUDA_DEVICE_NV` attribute is the given CUDA
+/// ordinal, open a platform display on it, and `eglInitialize` it.
 ///
-/// Picking device 0 keeps the EGL→CUDA import on the same physical GPU as
-/// the default CUDA context FFmpeg's nvenc wrapper creates. (Multi-GPU
-/// device selection is deferred — the encoder's `new()` also pins CUDA
-/// device 0; the two must agree.) Returns `None` if no CUDA-backed EGL
-/// device exists or initialisation fails.
-fn egl_display_for_cuda_device0(egl: &EglFns) -> Option<EglDisplay> {
+/// `cuda_ordinal` must be the same CUDA device the encoder/decoder bound their
+/// context to (see [`gpu_pin`]): the EGL→CUDA import maps the dma-buf into the
+/// display's GPU, so the display and the FFmpeg CUDA context have to be the
+/// same physical GPU or the imported pointers are undereferenceable. On an
+/// unpinned host that ordinal is 0 (FFmpeg's default device), preserving the
+/// original single-GPU behavior. Returns `None` if no EGL device reports that
+/// CUDA ordinal or initialisation fails.
+fn egl_display_for_cuda_device(egl: &EglFns, cuda_ordinal: i32) -> Option<EglDisplay> {
     // Enumerate up to a generous fixed cap of EGL devices.
     const MAX_DEVICES: EglInt = 32;
     let mut devices: [EglDeviceExt; MAX_DEVICES as usize] = [std::ptr::null_mut(); 32];
@@ -1172,6 +1180,9 @@ fn egl_display_for_cuda_device0(egl: &EglFns) -> Option<EglDisplay> {
     // num_devices > 0 per the guard above, so the conversion can't fail;
     // clamp to the buffer length defensively against a misbehaving driver.
     let count = usize::try_from(num_devices).unwrap_or(0).min(devices.len());
+    // A failed conversion → -1, which no real EGL_CUDA_DEVICE_NV (≥ 0) equals,
+    // so the loop simply finds no match (the importer then reports unavailable).
+    let target = EglAttrib::try_from(cuda_ordinal).unwrap_or(-1);
     for &device in &devices[..count] {
         let mut cuda_device: EglAttrib = -1;
         // SAFETY: device is a valid EGLDeviceEXT from query_devices; the
@@ -1180,7 +1191,7 @@ fn egl_display_for_cuda_device0(egl: &EglFns) -> Option<EglDisplay> {
         let ok = unsafe {
             (egl.query_device_attrib)(device, EGL_CUDA_DEVICE_NV, &mut cuda_device)
         };
-        if ok != EGL_TRUE || cuda_device != 0 {
+        if ok != EGL_TRUE || cuda_device != target {
             continue;
         }
 
@@ -1207,6 +1218,25 @@ fn egl_display_for_cuda_device0(egl: &EglFns) -> Option<EglDisplay> {
         }
     }
     None
+}
+
+/// Test hook: whether an EGL display can be bound to the given CUDA ordinal on
+/// this host. Loads libEGL fresh (independent of the process-global importer)
+/// and runs the same device selection the importer uses, so a hardware test can
+/// assert the EGL pinning honors an arbitrary ordinal (not just device 0) and
+/// rejects an out-of-range one. Returns `false` if libEGL / the device
+/// extensions are unavailable.
+#[cfg(test)]
+pub(crate) fn egl_display_available_for_ordinal(cuda_ordinal: i32) -> bool {
+    // SAFETY: dlopen of libEGL.so.1 by soname; EglFns::load matches the EGL ABI
+    // (see its doc). The library stays resident for the call's duration.
+    let Ok(egl_lib) = (unsafe { Library::new("libEGL.so.1") }) else {
+        return false;
+    };
+    let Some(egl) = (unsafe { EglFns::load(&egl_lib) }) else {
+        return false;
+    };
+    egl_display_for_cuda_device(&egl, cuda_ordinal).is_some()
 }
 
 /// Process-global importer, lazily initialised on first call. `None` means

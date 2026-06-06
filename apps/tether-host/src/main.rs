@@ -339,6 +339,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // On a Linux NVIDIA host, pin every NVIDIA codec subsystem (NVENC/NVDEC
+    // CUDA context, the EGL→CUDA importer, the NVDEC surface pool's Vulkan
+    // device) to the physical GPU the dma-buf producer will use. The producer
+    // leads: read the GPU its HighPerformance wgpu adapter picks and pin to it
+    // BEFORE the capability probe and any encoder/decoder construct, so the
+    // whole zero-copy path lands on one GPU on multi-GPU hosts. Unpinned
+    // (non-NVIDIA, or no Vulkan adapter) keeps FFmpeg's default device, i.e.
+    // the original single-GPU behavior.
+    #[cfg(target_os = "linux")]
+    if !use_test_pattern && tether_codec::nvenc::nvidia_gpu_present() {
+        match tether_gpuconvert::gpu_select::preferred_device_uuid().await {
+            Some(uuid) => tether_codec::nvenc::pin_gpu_uuid(uuid),
+            None => tracing::warn!(
+                "NVIDIA host but no Vulkan adapter to pin to; using FFmpeg's \
+                 default CUDA device (a multi-GPU host may mismatch producer/encoder)"
+            ),
+        }
+    }
+
     if !use_test_pattern {
         tokio::task::spawn_blocking(|| {
             let _ = tether_probe::host_supported_profiles();

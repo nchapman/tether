@@ -319,6 +319,16 @@ pub(crate) enum RenderLayout {
     PackedY410,
 }
 
+#[cfg(target_os = "linux")]
+fn linux_nvidia_planar444_active() -> bool {
+    tether_codec::nvenc::nvidia_gpu_present()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_nvidia_planar444_active() -> bool {
+    false
+}
+
 pub(crate) fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> RenderLayout {
     match (chroma, bit_depth) {
         // 8-bit: existing macOS-IOSurface / Linux-dma-buf split. macOS
@@ -328,7 +338,7 @@ pub(crate) fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> Ren
         (ChromaSubsampling::Yuv444, 8) => {
             if cfg!(target_os = "macos") {
                 RenderLayout::Biplanar8
-            } else if cfg!(target_os = "linux") && tether_codec::nvenc::nvidia_gpu_present() {
+            } else if linux_nvidia_planar444_active() {
                 RenderLayout::Planar444
             } else {
                 RenderLayout::PackedXYUV
@@ -2094,7 +2104,7 @@ mod tests {
         let yuv444_8bit = render_layout_for(ChromaSubsampling::Yuv444, 8);
         if cfg!(target_os = "macos") {
             assert_eq!(yuv444_8bit, RenderLayout::Biplanar8);
-        } else if cfg!(target_os = "linux") && tether_codec::nvenc::nvidia_gpu_present() {
+        } else if super::linux_nvidia_planar444_active() {
             assert_eq!(yuv444_8bit, RenderLayout::Planar444);
         } else {
             assert_eq!(yuv444_8bit, RenderLayout::PackedXYUV);

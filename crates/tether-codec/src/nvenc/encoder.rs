@@ -333,7 +333,7 @@ impl NvencEncoder {
 
         let bgra_row_bytes = (width as usize) * 4;
 
-        let extradata = snapshot_extradata(&encoder, nvenc_codec_name(kind), kind)?;
+        let extradata = snapshot_extradata(&encoder, nvenc_codec_name(kind), kind, false)?;
 
         Ok(Self {
             kind,

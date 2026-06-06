@@ -662,6 +662,13 @@ async fn handle_client(
         stream_ready,
     } = session;
     let initial_viewport = client_hello.initial_viewport.filter(|v| v.is_valid());
+    if let Some(v) = initial_viewport {
+        info!(
+            width = v.width,
+            height = v.height,
+            "client hello included an initial viewport; waiting for live viewport hint before streaming"
+        );
+    }
     let audio_active = audio_enabled && tether_audio::capture::is_supported();
     let session_summary = Arc::new(SessionSummaryState::new(
         "host",
@@ -689,8 +696,7 @@ async fn handle_client(
     // per-backend follow-up work). Re-grab the Arc clone via
     // `capture_handle.fps_handle()` when the first backend wires
     // through. See `tether_capture::CaptureHandle` docs.
-    let mut capture_handle =
-        pick_capture_source(use_test_pattern, chosen_profile, initial_viewport).await?;
+    let mut capture_handle = pick_capture_source(use_test_pattern, chosen_profile, None).await?;
     // Take the per-backend cursor source out before we drop the
     // handle. Wayland/PipeWire fills this with a `SPA_META_Cursor`
     // parser; the test-pattern and macOS-stub backends leave it
@@ -754,11 +760,13 @@ async fn handle_client(
     // window. Written by the control recv task, drained by the
     // encode-and-send thread on each loop iteration.
     let latest_client_stats: LatestClientStats = Arc::new(StdMutex::new(None));
-    // Latest viewport-target the client has communicated. Seeded
-    // from ClientHello; mutated by SetViewportHint.
+    // Latest viewport-target the client has communicated. Startup requires a
+    // live SetViewportHint from the renderer before the video gate opens; the
+    // older ClientHello hint is ignored because the app can only know the real
+    // physical viewport after the window exists.
     let latest_viewport: LatestViewport = Arc::new(StdMutex::new(ViewportState {
-        viewport: initial_viewport,
-        seq: if initial_viewport.is_some() { 1 } else { 0 },
+        viewport: None,
+        seq: 0,
     }));
     // `stream_ready`: gate at the head of the send loop. The client
     // signals it has built its decoders by sending
@@ -771,6 +779,7 @@ async fn handle_client(
     let force_idr_for_send = force_idr.clone();
     let send_shutdown_for_thread = send_shutdown.clone();
     let stream_ready_for_thread = stream_ready.clone();
+    let video_ready_requested = Arc::new(AtomicBool::new(false));
     let latest_client_stats_for_send = latest_client_stats.clone();
     let latest_viewport_for_send = latest_viewport.clone();
     let shutdown_notice_for_send = shutdown_notice_sent.clone();
@@ -857,6 +866,7 @@ async fn handle_client(
         let conn = conn.clone();
         let force_idr = force_idr.clone();
         let stream_ready_ctl = stream_ready.clone();
+        let video_ready_requested_ctl = video_ready_requested.clone();
         let audio_ready_ctl = audio_ready.clone();
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
@@ -936,18 +946,33 @@ async fn handle_client(
                     Ok(ControlMessage::StreamReady { video, audio }) => {
                         info!(
                             event = "stream_ready",
-                            video, audio, "client signalled StreamReady; opening the gate"
+                            video, audio, "client signalled StreamReady"
                         );
-                        stream_ready_ctl.store(true, Ordering::Release);
-                        // Defensive IDR at gate-open. A fresh encoder's
-                        // first frame is already an IDR, so this is usually
-                        // redundant — but if StreamReady lands before the
-                        // encoder lazy-inits, the pending flag guarantees
-                        // the first encoded frame is still forced to a
-                        // keyframe. Coalesces harmlessly via IdrSignal.
-                        // Matches Moonlight/Sunshine forcing an IDR at
-                        // stream start.
-                        force_idr.raise();
+                        if video {
+                            video_ready_requested_ctl.store(true, Ordering::Release);
+                            let has_viewport = latest_viewport_for_ctl
+                                .lock()
+                                .unwrap()
+                                .viewport
+                                .is_some();
+                            if has_viewport {
+                                stream_ready_ctl.store(true, Ordering::Release);
+                                // Defensive IDR at gate-open. A fresh encoder's
+                                // first frame is already an IDR, so this is usually
+                                // redundant — but if StreamReady lands before the
+                                // encoder lazy-inits, the pending flag guarantees
+                                // the first encoded frame is still forced to a
+                                // keyframe. Coalesces harmlessly via IdrSignal.
+                                // Matches Moonlight/Sunshine forcing an IDR at
+                                // stream start.
+                                force_idr.raise();
+                            } else {
+                                info!(
+                                    "video StreamReady received before viewport; waiting for \
+                                     SetViewportHint before opening video gate"
+                                );
+                            }
+                        }
                         // Open the audio gate too; the host audio thread drops
                         // captured frames until the client says it can play them.
                         audio_ready_ctl.store(audio, Ordering::Release);
@@ -1007,11 +1032,31 @@ async fn handle_client(
                         // actually change. We force an IDR regardless
                         // so the client sees a clean cut on whatever
                         // dimensions the backend chooses.
-                        let next = if v.is_valid() { Some(v) } else { None };
+                        let next = if v.is_valid() {
+                            Some(v)
+                        } else {
+                            warn!(
+                                width = v.width,
+                                height = v.height,
+                                "invalid viewport hint; video gate remains closed until a valid viewport arrives"
+                            );
+                            None
+                        };
                         let mut guard = latest_viewport_for_ctl.lock().unwrap();
                         guard.viewport = next;
                         guard.seq = guard.seq.wrapping_add(1);
                         drop(guard);
+                        if next.is_some()
+                            && video_ready_requested_ctl.load(Ordering::Acquire)
+                            && !stream_ready_ctl.load(Ordering::Acquire)
+                        {
+                            info!(
+                                width = v.width,
+                                height = v.height,
+                                "initial viewport received; opening video gate"
+                            );
+                            stream_ready_ctl.store(true, Ordering::Release);
+                        }
                         tracing::debug!(
                             width = v.width,
                             height = v.height,

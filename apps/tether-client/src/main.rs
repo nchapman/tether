@@ -35,7 +35,7 @@ use tether_session::{
     log_peer_session_summary, ClientSession, ClientSessionConfig, ConnectError, SessionSummaryState,
 };
 use tether_transport::{Client, Datagram, ServerAuth};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 mod client_pairing;
@@ -286,16 +286,11 @@ async fn main() -> anyhow::Result<()> {
         ClientSessionConfig {
             client_name: "tether-client".to_string(),
             client_decode_profiles: client_decode_profiles.clone(),
-            // Initial viewport = the window's logical size at connect
-            // time. The renderer's first WindowEvent::Resized will fire
-            // shortly after the window is created (the WM sizes it to
-            // the actual physical pixels for the display's scale
-            // factor) and the viewport debouncer task below will follow
-            // up with a SetViewportHint reflecting the physical dims.
-            // Sending an initial guess here means the first encoded
-            // frame is already at roughly-the-right size instead of
-            // wasting one frame at native capture dims.
-            viewport: Some(Viewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)),
+            // Startup video is gated on the first real renderer viewport.
+            // A guessed logical size here causes the host to build a doomed
+            // first encoder epoch on HiDPI clients, then immediately rebuild
+            // when the physical viewport arrives.
+            viewport: None,
         },
     )
     .await;
@@ -351,6 +346,12 @@ async fn main() -> anyhow::Result<()> {
     // position updates; the renderer's overlay pass reads each
     // frame. Cloned through to all three consumers (cheap `Arc`).
     let cursor_channel = tether_render::CursorChannel::new();
+
+    // Renderer resize events drive startup video readiness. The host must not
+    // begin streaming until it has the client's real physical viewport, so the
+    // viewport task sends SetViewportHint before StreamReady.
+    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
+    let (decoder_ready_for_startup_tx, decoder_ready_for_startup_rx) = watch::channel(false);
 
     // Receive-side control loop. Today the host doesn't initiate any
     // typed messages we need to act on, but the Extension escape and
@@ -736,25 +737,12 @@ async fn main() -> anyhow::Result<()> {
             .await;
             return;
         }
-        // Decoder is up; tell the host to start streaming. `audio` is true only
-        // when we built a playback path for the host's advertised AudioConfig —
-        // the host's audio gate keys off this.
-        if let Err(e) = conn_ready
-            .send_control(&ControlMessage::StreamReady {
-                video: true,
-                audio: audio_active,
-            })
-            .await
-        {
-            warn!(error = ?e, "StreamReady send failed; host will not emit video");
-        } else {
-            info!(
-                event = "stream_ready",
-                video = true,
-                audio = audio_active,
-                "client signalled StreamReady"
-            );
-        }
+        // Decoder is up, but video startup still waits for the renderer's real
+        // physical viewport. The viewport task sends SetViewportHint and then
+        // StreamReady on the same control stream so the host opens the gate only
+        // after it has the dimensions it will encode for.
+        let _ = decoder_ready_for_startup_tx.send(true);
+        info!("client decoder ready; waiting for first viewport before StreamReady");
         let mut frame_count: u64 = 0;
         // Reassembler cumulative counters at the start of the current stats
         // window. Diff against the live counters to compute per-window
@@ -1217,7 +1205,6 @@ async fn main() -> anyhow::Result<()> {
     // unreliable datagram channel; everything else on the reliable
     // input stream.
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<RenderEvent>();
-    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
     let conn_input = conn.clone();
     tokio::spawn(async move {
         let mut translator = WinitTranslator::new();
@@ -1275,6 +1262,8 @@ async fn main() -> anyhow::Result<()> {
         use std::time::Duration;
         let debounce = Duration::from_millis(150);
         let mut pending: Option<(u32, u32)> = None;
+        let mut startup_sent = false;
+        let mut decoder_ready_for_startup_rx = decoder_ready_for_startup_rx;
         loop {
             // Either receive a new size, or fire the pending one after
             // the debounce window elapses with no new event.
@@ -1284,20 +1273,74 @@ async fn main() -> anyhow::Result<()> {
             };
             match next {
                 Ok(Some(size)) => {
+                    let viewport = Viewport::new(size.0, size.1);
+                    if !viewport.is_valid() {
+                        continue;
+                    }
+                    if !startup_sent {
+                        while !*decoder_ready_for_startup_rx.borrow_and_update() {
+                            if decoder_ready_for_startup_rx.changed().await.is_err() {
+                                warn!(
+                                    "decoder readiness channel closed before initial viewport; \
+                                     viewport task exiting"
+                                );
+                                return;
+                            }
+                        }
+                        if let Err(e) = conn_viewport
+                            .send_control(&ControlMessage::SetViewportHint {
+                                stream_id: VideoStreamId(0),
+                                viewport,
+                            })
+                            .await
+                        {
+                            warn!(
+                                error = ?e,
+                                "initial SetViewportHint send failed; viewport task exiting"
+                            );
+                            return;
+                        }
+                        info!(
+                            width = viewport.width,
+                            height = viewport.height,
+                            "sent initial SetViewportHint to host"
+                        );
+                        if let Err(e) = conn_viewport
+                            .send_control(&ControlMessage::StreamReady {
+                                video: true,
+                                audio: audio_active,
+                            })
+                            .await
+                        {
+                            warn!(error = ?e, "StreamReady send failed; host will not emit video");
+                            return;
+                        }
+                        info!(
+                            event = "stream_ready",
+                            video = true,
+                            audio = audio_active,
+                            "client signalled StreamReady after initial viewport"
+                        );
+                        startup_sent = true;
+                        pending = None;
+                        continue;
+                    }
                     pending = Some(size);
                 }
                 Ok(None) => {
                     // Sender dropped. Fire any pending before exiting
                     // so the last resize event still makes it.
-                    if let Some((w, h)) = pending {
-                        let viewport = Viewport::new(w, h);
-                        if viewport.is_valid() {
-                            let _ = conn_viewport
-                                .send_control(&ControlMessage::SetViewportHint {
-                                    stream_id: VideoStreamId(0),
-                                    viewport,
-                                })
-                                .await;
+                    if startup_sent {
+                        if let Some((w, h)) = pending {
+                            let viewport = Viewport::new(w, h);
+                            if viewport.is_valid() {
+                                let _ = conn_viewport
+                                    .send_control(&ControlMessage::SetViewportHint {
+                                        stream_id: VideoStreamId(0),
+                                        viewport,
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     return;
@@ -1305,9 +1348,6 @@ async fn main() -> anyhow::Result<()> {
                 Err(_) => {
                     if let Some((w, h)) = pending.take() {
                         let viewport = Viewport::new(w, h);
-                        if !viewport.is_valid() {
-                            continue;
-                        }
                         if let Err(e) = conn_viewport
                             .send_control(&ControlMessage::SetViewportHint {
                                 stream_id: VideoStreamId(0),

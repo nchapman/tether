@@ -581,6 +581,8 @@ mod wgpu_overlay {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
+            let (pixels, bytes_per_row) =
+                pad_rgba_rows_for_wgpu(snap.pixels, snap.width, snap.height);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -588,10 +590,10 @@ mod wgpu_overlay {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                snap.pixels,
+                &pixels,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(snap.width * 4),
+                    bytes_per_row: Some(bytes_per_row),
                     rows_per_image: Some(snap.height),
                 },
                 wgpu::Extent3d {
@@ -693,6 +695,28 @@ mod wgpu_overlay {
             pass.draw(0..6, 0..1);
         }
     }
+
+    pub(super) fn pad_rgba_rows_for_wgpu(pixels: &[u8], width: u32, height: u32) -> (Vec<u8>, u32) {
+        let row_bytes = usize::try_from(width)
+            .expect("cursor width fits usize")
+            .saturating_mul(4);
+        let rows = usize::try_from(height).expect("cursor height fits usize");
+        let padded_row_bytes =
+            row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        let padded_row_bytes_u32 =
+            u32::try_from(padded_row_bytes).expect("cursor row pitch fits u32");
+        if row_bytes == padded_row_bytes {
+            return (pixels.to_vec(), padded_row_bytes_u32);
+        }
+
+        let mut padded = vec![0u8; padded_row_bytes.saturating_mul(rows)];
+        for row in 0..rows {
+            let src = row * row_bytes;
+            let dst = row * padded_row_bytes;
+            padded[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+        }
+        (padded, padded_row_bytes_u32)
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +732,34 @@ mod tests {
         s.set_host_visible(true);
         s.set_local_pointer(Some((10.0, 20.0)));
         assert!(s.snapshot().is_none());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn wgpu_cursor_upload_rows_are_copy_aligned() {
+        let width = 12u32;
+        let height = 17u32;
+        let row_bytes = width as usize * 4;
+        let rows = height as usize;
+        let pixels = (0..row_bytes * rows)
+            .map(|v| u8::try_from(v % 251).expect("test byte fits"))
+            .collect::<Vec<_>>();
+
+        let (padded, bytes_per_row) =
+            super::wgpu_overlay::pad_rgba_rows_for_wgpu(&pixels, width, height);
+
+        assert_eq!(bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
+        assert_eq!(bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        assert_eq!(padded.len(), bytes_per_row as usize * rows);
+
+        for row in 0..rows {
+            let src = row * row_bytes;
+            let dst = row * bytes_per_row as usize;
+            assert_eq!(&padded[dst..dst + row_bytes], &pixels[src..src + row_bytes]);
+            assert!(padded[dst + row_bytes..dst + bytes_per_row as usize]
+                .iter()
+                .all(|&b| b == 0));
+        }
     }
 
     #[test]

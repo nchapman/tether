@@ -83,6 +83,14 @@ mod tests {
     use super::*;
     use crate::profile_probe::fixture_for;
 
+    fn require_nvidia_gpu(test_name: &str) -> bool {
+        if tether_codec::nvenc::nvidia_gpu_present() {
+            return true;
+        }
+        eprintln!("SKIP {test_name}: no NVIDIA GPU present");
+        false
+    }
+
     /// The bundled HEVC 8-bit 4:2:0 probe fixture must decode through the live
     /// NVDEC probe. This is a regression guard for the fixture coded size:
     /// NVDEC's HEVC decoder has a 144×144 minimum, so a fixture below that
@@ -93,6 +101,10 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf"]
     fn hevc_main_fixture_decodes_via_nvdec_probe() {
+        if !require_nvidia_gpu("hevc_main_fixture_decodes_via_nvdec_probe") {
+            return;
+        }
+
         for profile in [VideoProfile::H264_8BIT_420, VideoProfile::HEVC_8BIT_420] {
             let fixture = fixture_for(profile).expect("bundled probe fixture");
             NvdecProbe::probe_decode(profile, fixture)
@@ -108,6 +120,10 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf"]
     fn av1_fixtures_decode_via_nvdec_probe() {
+        if !require_nvidia_gpu("av1_fixtures_decode_via_nvdec_probe") {
+            return;
+        }
+
         for profile in [VideoProfile::AV1_8BIT_420, VideoProfile::AV1_10BIT_420] {
             let fixture = fixture_for(profile).expect("bundled probe fixture");
             NvdecProbe::probe_decode(profile, fixture)

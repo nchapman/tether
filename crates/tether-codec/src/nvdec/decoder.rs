@@ -442,6 +442,14 @@ mod tests {
     use super::*;
     use crate::h264::{fixture_access_units, H264_320X240_INTRA};
 
+    fn require_nvidia_gpu(test_name: &str) -> bool {
+        if crate::nvenc::nvidia_gpu_present() {
+            return true;
+        }
+        eprintln!("SKIP {test_name}: no NVIDIA GPU present");
+        false
+    }
+
     /// Decode the committed 320×240 H.264 IDR fixture through a real NVDEC
     /// decoder and assert a zero-copy GPU NV12 dma-buf frame of the expected
     /// dims comes back with the right descriptor shape (1 object, 2 layers,
@@ -455,6 +463,10 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf"]
     fn decodes_committed_h264_fixture_via_nvdec() {
+        if !require_nvidia_gpu("decodes_committed_h264_fixture_via_nvdec") {
+            return;
+        }
+
         let w = 320u32;
         let h = 240u32;
         let mut dec = NvdecDecoder::new(CodecKind::H264).expect("nvdec decoder");
@@ -534,6 +546,10 @@ mod tests {
         use crate::nvenc::NvencEncoder;
         use tether_gpuconvert::Bgra2P010DmaBuf;
         use tether_protocol::control::VideoProfile;
+
+        if !require_nvidia_gpu("decodes_our_hevc_main10_via_nvdec_p010") {
+            return;
+        }
 
         const W: u32 = 256;
         const H: u32 = 256;
@@ -624,6 +640,10 @@ mod tests {
         use crate::nvenc::NvencEncoder;
         use tether_gpuconvert::Yuv444pDmaBuf;
         use tether_protocol::control::VideoProfile;
+
+        if !require_nvidia_gpu("decodes_our_hevc_main444_via_nvdec_yuv444p") {
+            return;
+        }
 
         const W: u32 = 256;
         const H: u32 = 256;

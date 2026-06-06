@@ -904,6 +904,14 @@ fn align_up(value: u64, align: u64) -> u64 {
 mod tests {
     use super::*;
 
+    fn require_nvidia_gpu(test_name: &str) -> bool {
+        if crate::nvenc::nvidia_gpu_present() {
+            return true;
+        }
+        eprintln!("SKIP {test_name}: no NVIDIA GPU present");
+        false
+    }
+
     #[test]
     fn align_up_is_saturating_and_correct() {
         assert_eq!(align_up(0, 64), 0);
@@ -923,6 +931,10 @@ mod tests {
     #[test]
     #[ignore = "requires NVIDIA GPU + Vulkan dma-buf"]
     fn acquire_exhausts_then_release_reuses_slots() {
+        if !require_nvidia_gpu("acquire_exhausts_then_release_reuses_slots") {
+            return;
+        }
+
         let (w, h) = (256u32, 256u32);
         let pool =
             NvdecSurfacePool::new(NvdecSurfaceFormat::Nv12, w, h).expect("NV12 surface pool");
@@ -980,6 +992,10 @@ mod tests {
     #[ignore = "requires NVIDIA GPU + Vulkan; sets the process GPU pin (run in isolation)"]
     fn surface_pool_allocates_on_the_pinned_gpu() {
         use crate::nvenc::gpu_pin;
+
+        if !require_nvidia_gpu("surface_pool_allocates_on_the_pinned_gpu") {
+            return;
+        }
 
         // Use whatever's already pinned (robust if a prior test pinned), else
         // pin to the first CUDA device so the test is self-contained.

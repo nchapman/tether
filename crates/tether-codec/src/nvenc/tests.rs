@@ -190,6 +190,14 @@ fn missing_drm_root_is_not_nvidia() {
 
 // --- hardware tests (NVIDIA GPU + NVENC-enabled FFmpeg) --------------------
 
+fn require_nvidia_gpu(test_name: &str) -> bool {
+    if super::nvidia_gpu_present() {
+        return true;
+    }
+    eprintln!("SKIP {test_name}: no NVIDIA GPU present");
+    false
+}
+
 /// High-entropy BGRA so the encoder produces a non-trivial bitstream (a flat
 /// frame compresses to almost nothing and hides "did it actually encode?").
 /// xorshift mix over (x, y, t); opaque alpha.
@@ -221,6 +229,10 @@ fn make_noisy_bgra(w: u32, h: u32, t: u32) -> Vec<u8> {
 /// assert it produces a self-decodable IDR. The shared body of the per-codec
 /// hardware tests below.
 fn assert_encode_bgra_produces_idr(profile: VideoProfile) {
+    if !require_nvidia_gpu(&format!("nvenc_encode_bgra_produces_idr {profile:?}")) {
+        return;
+    }
+
     const W: u32 = 256;
     const H: u32 = 256;
     let mut enc = NvencEncoder::new(profile, W, H, 30, 4_000)
@@ -279,6 +291,10 @@ fn nvenc_h264_8bit_encode_bgra_produces_idr() {
 #[test]
 #[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg (cargo test -p tether-codec --ignored nvenc_)"]
 fn nvenc_latency_avoptions_are_all_consumed() {
+    if !require_nvidia_gpu("nvenc_latency_avoptions_are_all_consumed") {
+        return;
+    }
+
     for profile in [VideoProfile::H264_8BIT_420, VideoProfile::HEVC_8BIT_420] {
         let enc = NvencEncoder::new(profile, 256, 256, 30, 4_000)
             .unwrap_or_else(|e| panic!("NvencEncoder::new({profile:?}) failed: {e}"));
@@ -296,10 +312,7 @@ fn nvenc_detection_true_on_this_nvidia_host() {
     // Sanity: the production detection path (real /sys/class/drm) agrees that
     // this is an NVIDIA host. Guards against a sysfs-layout assumption that
     // the synthetic-tree unit tests can't catch.
-    assert!(
-        super::nvidia_gpu_present(),
-        "nvidia_gpu_present() should be true on an NVIDIA host"
-    );
+    let _ = require_nvidia_gpu("nvenc_detection_true_on_this_nvidia_host");
 }
 
 /// Luma stats over a decoded frame, to verify a solid-color round trip
@@ -377,6 +390,10 @@ fn y_stats(frame: &rsmpeg::avutil::AVFrame) -> DecodedYStats {
 fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
     use tether_gpuconvert::Bgra2P010DmaBuf;
 
+    if !require_nvidia_gpu("nvenc_p010_dmabuf_roundtrip") {
+        return;
+    }
+
     const W: u32 = 256;
     const H: u32 = 256;
 
@@ -440,6 +457,10 @@ fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
 #[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
 fn nvenc_yuv444p_dmabuf_roundtrip_decodes_our_pixels() {
     use tether_gpuconvert::Yuv444pDmaBuf;
+
+    if !require_nvidia_gpu("nvenc_yuv444p_dmabuf_roundtrip") {
+        return;
+    }
 
     const W: u32 = 256;
     const H: u32 = 256;
@@ -526,6 +547,10 @@ fn encode_noisy(enc: &mut NvencEncoder, w: u32, h: u32, start_t: u32, n: u32) ->
 #[test]
 #[ignore = "requires NVIDIA GPU + NVENC (cargo test -p tether-codec --ignored nvenc_)"]
 fn nvenc_bitrate_retune_changes_bitstream_size() {
+    if !require_nvidia_gpu("nvenc_bitrate_retune_changes_bitstream_size") {
+        return;
+    }
+
     const W: u32 = 256;
     const H: u32 = 256;
     const LOW_KBPS: u32 = 1_000;
@@ -576,6 +601,10 @@ fn nvenc_bitrate_retune_changes_bitstream_size() {
 #[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
 fn nvenc_nv12_dmabuf_roundtrip_decodes_our_pixels() {
     use tether_gpuconvert::Nv12DmaBuf;
+
+    if !require_nvidia_gpu("nvenc_nv12_dmabuf_roundtrip") {
+        return;
+    }
 
     const W: u32 = 256;
     const H: u32 = 256;
@@ -645,6 +674,10 @@ fn nvenc_nv12_dmabuf_roundtrip_decodes_our_pixels() {
 #[test]
 #[ignore = "requires NVIDIA GPU + libcuda (cargo test -p tether-codec --ignored nvenc_)"]
 fn nvenc_cuda_enumerates_distinct_nonzero_uuids() {
+    if !require_nvidia_gpu("nvenc_cuda_enumerates_distinct_nonzero_uuids") {
+        return;
+    }
+
     let devices = super::cuda_device_uuids();
     assert!(
         !devices.is_empty(),
@@ -693,6 +726,10 @@ fn nvenc_cuda_enumerates_distinct_nonzero_uuids() {
 fn nvenc_producer_uuid_resolves_to_a_cuda_ordinal() {
     use tether_gpuconvert::Nv12DmaBuf;
 
+    if !require_nvidia_gpu("nvenc_producer_uuid_resolves_to_a_cuda_ordinal") {
+        return;
+    }
+
     let bridge =
         pollster::block_on(Nv12DmaBuf::new(256, 256)).expect("construct BGRA→NV12 producer bridge");
     let producer_uuid = tether_gpuconvert::gpu_select::device_uuid(bridge.device())
@@ -733,6 +770,10 @@ fn nvenc_producer_uuid_resolves_to_a_cuda_ordinal() {
 #[test]
 #[ignore = "requires NVIDIA GPU + libEGL device extensions (cargo test -p tether-codec --ignored nvenc_)"]
 fn nvenc_egl_display_selects_per_cuda_ordinal() {
+    if !require_nvidia_gpu("nvenc_egl_display_selects_per_cuda_ordinal") {
+        return;
+    }
+
     let devices = super::cuda_device_uuids();
     assert!(!devices.is_empty(), "expected at least one CUDA device");
 

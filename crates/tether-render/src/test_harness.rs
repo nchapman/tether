@@ -417,7 +417,7 @@ pub(crate) fn render_reference_bitstream(
 /// `TEXTURE_FORMAT_16BIT_NORM` for 10-bit profiles. Returns `None` if
 /// the adapter doesn't support the required feature set so the
 /// caller can SKIP loudly.
-async fn try_init_wgpu_for_dmabuf(
+pub(crate) async fn try_init_wgpu_for_dmabuf(
     bit_depth: u8,
 ) -> Option<(wgpu::Device, wgpu::Queue, wgpu::Adapter)> {
     let instance = wgpu::Instance::default();
@@ -1159,7 +1159,7 @@ fn capability_for_profile(profile: VideoProfile) -> Capability {
 // Render readback
 // =====================================================================
 
-fn readback_offscreen(renderer: &GpuState, device: &wgpu::Device) -> Vec<u8> {
+pub(crate) fn readback_offscreen(renderer: &GpuState, device: &wgpu::Device) -> Vec<u8> {
     let (w, h) = renderer.dimensions().1;
     let unpadded_bpr = u64::from(w * 4);
     let padded_bpr = unpadded_bpr.next_multiple_of(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));

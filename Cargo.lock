@@ -4011,8 +4011,10 @@ name = "tether-render"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "ash",
  "crossbeam-channel",
  "image",
+ "libc",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
  "objc2-io-surface",

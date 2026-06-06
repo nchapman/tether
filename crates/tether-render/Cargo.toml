@@ -73,6 +73,14 @@ windows = { version = "0.61", features = [
 # winit 0.30 implements); we build the swapchain against it.
 raw-window-handle = "0.6"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Raw Vulkan import is needed for DMA-BUF layers at non-zero offsets inside a
+# shared allocation. wgpu-hal's current helper allocates only the imported
+# image's memory requirement and binds it at offset 0; that works for Y but
+# imports the wrong bytes for UV when both planes share one DMA-BUF object.
+ash = "0.38"
+libc = "0.2"
+
 [dev-dependencies]
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }

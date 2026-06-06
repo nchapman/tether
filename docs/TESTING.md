@@ -212,3 +212,56 @@ behaviour we expect to work everywhere.
   Any new capture-backend FFI surface (a new SPA meta type, a new
   SCK attachment) follows the same shape: pure helper + pod-shape
   snapshot + manual verification note.
+
+## Live session checklist
+
+Use this when validating a real host↔client pair after protocol/session
+changes. Capture host and client logs for every run; `RUST_LOG=info` is the
+baseline, `RUST_LOG=debug` is appropriate when investigating recovery, cursor,
+or teardown behaviour.
+
+Minimum matrix before calling a protocol/session change live-ready:
+
+- Linux host → Linux client on LAN.
+- macOS host → Linux client.
+- Linux host → macOS client.
+- Windows host → Windows client loopback.
+- At least one cross-device Windows client or host run when D3D11 shared-handle
+  ownership changed.
+- One audio-enabled run per platform pair where both sides support audio, plus
+  one host `--no-audio` run to verify negotiation disables it cleanly.
+
+For each run, verify lifecycle events in order:
+
+1. `event="handshake_start"` appears on both peers.
+2. Either `event="handshake_accepted"` appears on both peers with the same
+   codec/chroma/bit-depth, or one side logs `event="handshake_rejected"` with a
+   typed reason.
+3. Client logs `event="stream_ready"` and the host logs matching
+   `event="stream_ready"` before host `send stats` begin.
+4. Normal close logs exactly one typed shutdown reason:
+   `event="session_teardown"` on the initiator and `event="peer_goodbye"` on the
+   peer. Fatal exits should use `GoodbyeCode::InternalError`; protocol
+   violations should use `GoodbyeCode::ProtocolError`.
+
+For steady-state video, collect at least 30 seconds of logs after stream-ready:
+
+- Host `send stats`: `frames`, `avg_capture_age_ms`, `avg_encode_ms`,
+  `avg_send_ms`, `kbps_out`, `keyframes_per_s`,
+  `transient_send_drop_frames`.
+- Client `frame stats`: `frames`, `fps`, `avg_latency_ms`, `avg_network_ms`,
+  `avg_decode_ms`, `kbps_in`, `decode_errors`, `render_drop_frames`,
+  `idr_requests`, `decode_queue_drop_frames`.
+- Host `client stats`: `window_ms`, `frames_received`, `incomplete_frames`,
+  `fragment_loss_events`, `rtt_us`.
+
+Red flags that should block sign-off until explained:
+
+- Missing `stream_ready` on either side.
+- `send stats` present but no client `frame stats`.
+- Sustained `incomplete_frames > 0` or `fragment_loss_events > 0` on a quiet LAN.
+- `decode_errors`, `decode_queue_drop_frames`, or `render_drop_frames` rising in
+  every window.
+- `kbps_out` and `kbps_in` diverging materially without matching loss counters.
+- More than one teardown reason for one session, or a generic clean teardown
+  after an earlier fatal/protocol error.

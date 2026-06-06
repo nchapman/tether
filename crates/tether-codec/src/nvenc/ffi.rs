@@ -282,13 +282,27 @@ pub fn cuda_device_uuids() -> Vec<(i32, GpuUuid)> {
     let Ok(lib) = (unsafe { Library::new("libcuda.so.1") }) else {
         return Vec::new();
     };
+    // `lib` must stay in scope until the last call below: the fn pointers are
+    // copied out of `Symbol`s borrowing `lib`, and are only valid to call while
+    // `lib` is loaded. It drops at function end, after the final call.
     unsafe {
-        let (Ok(cu_init), Ok(get_count), Ok(get_device), Ok(get_uuid)) = (
+        let (Ok(cu_init), Ok(get_count), Ok(get_device)) = (
             lib.get::<FnCuInit>(b"cuInit\0"),
             lib.get::<FnCuDeviceGetCount>(b"cuDeviceGetCount\0"),
             lib.get::<FnCuDeviceGet>(b"cuDeviceGet\0"),
-            lib.get::<FnCuDeviceGetUuid>(b"cuDeviceGetUuid\0"),
         ) else {
+            return Vec::new();
+        };
+        // Prefer the MIG-aware `_v2` symbol (and match the `_v2` convention the
+        // other CUDA symbols here already use); fall back to the legacy name on
+        // older drivers. Identical signature — both take `CUuuid* , CUdevice`.
+        // On a MIG host the `_v2` UUID is the one that equals Vulkan's
+        // `deviceUUID`, so resolving v1 there would never match and the host
+        // would silently fall back to the default device.
+        let Ok(get_uuid) = lib
+            .get::<FnCuDeviceGetUuid>(b"cuDeviceGetUuid_v2\0")
+            .or_else(|_| lib.get::<FnCuDeviceGetUuid>(b"cuDeviceGetUuid\0"))
+        else {
             return Vec::new();
         };
 
@@ -1180,8 +1194,10 @@ fn egl_display_for_cuda_device(egl: &EglFns, cuda_ordinal: i32) -> Option<EglDis
     // num_devices > 0 per the guard above, so the conversion can't fail;
     // clamp to the buffer length defensively against a misbehaving driver.
     let count = usize::try_from(num_devices).unwrap_or(0).min(devices.len());
-    // A failed conversion → -1, which no real EGL_CUDA_DEVICE_NV (≥ 0) equals,
-    // so the loop simply finds no match (the importer then reports unavailable).
+    // i32 → isize (EglAttrib) is lossless on every target we build for, so the
+    // -1 fallback is defensive only; it would mean "match nothing" since no real
+    // EGL_CUDA_DEVICE_NV (≥ 0) equals it. The caller only ever passes a
+    // non-negative ordinal.
     let target = EglAttrib::try_from(cuda_ordinal).unwrap_or(-1);
     for &device in &devices[..count] {
         let mut cuda_device: EglAttrib = -1;

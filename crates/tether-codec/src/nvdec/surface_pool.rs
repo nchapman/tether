@@ -201,6 +201,14 @@ impl NvdecSurfacePool {
         self.format
     }
 
+    /// Test-only: the GPU the pool allocated its surfaces on, by Vulkan
+    /// `deviceUUID`. All slots share one `VulkanDevice`, so any slot answers.
+    /// Used to assert pinning routed the pool to the pinned GPU.
+    #[cfg(test)]
+    pub(crate) fn vulkan_device_uuid(&self) -> [u8; 16] {
+        self.slots[0].backing.vk.device_uuid()
+    }
+
     /// Acquire a free surface, marking its slot in-use. Returns `None` when
     /// every surface is still held by the renderer — the caller reports a
     /// clean error rather than overwriting a surface in use.
@@ -395,6 +403,13 @@ unsafe fn physical_device_uuid(
 }
 
 impl VulkanDevice {
+    /// Test-only: the GPU this device was created on, by Vulkan `deviceUUID`.
+    #[cfg(test)]
+    fn device_uuid(&self) -> [u8; 16] {
+        // SAFETY: `instance` + `physical_device` are live for `self`'s lifetime.
+        unsafe { physical_device_uuid(&self.instance, self.physical_device) }
+    }
+
     /// Create a headless Vulkan device on the first NVIDIA physical device
     /// that supports the dma-buf external-memory + DRM-format-modifier
     /// extensions. No surface, no swapchain — the pool only allocates
@@ -834,6 +849,36 @@ mod tests {
         assert!(
             pool.acquire().is_some(),
             "dropping a surface must return its slot to the free list"
+        );
+    }
+
+    /// When the host pins a GPU, the surface pool must allocate on *that* GPU,
+    /// not just "the first NVIDIA device". Pin to a real GPU and assert the
+    /// pool's Vulkan device UUID matches. This is the decode-side twin of the
+    /// EGL/CUDA pinning proofs in `nvenc::tests`. Sets the process GPU pin, so
+    /// run it in isolation. `#[ignore]` — needs an NVIDIA GPU + Vulkan.
+    #[test]
+    #[ignore = "requires NVIDIA GPU + Vulkan; sets the process GPU pin (run in isolation)"]
+    fn surface_pool_allocates_on_the_pinned_gpu() {
+        use crate::nvenc::gpu_pin;
+
+        // Use whatever's already pinned (robust if a prior test pinned), else
+        // pin to the first CUDA device so the test is self-contained.
+        let target = gpu_pin::pinned_uuid().unwrap_or_else(|| {
+            let first = crate::nvenc::cuda_device_uuids()
+                .first()
+                .map(|&(_, uuid)| uuid)
+                .expect("at least one CUDA device on an NVIDIA host");
+            crate::nvenc::pin_gpu_uuid(first);
+            gpu_pin::pinned_uuid().expect("pin just set")
+        });
+
+        let pool = NvdecSurfacePool::new(NvdecSurfaceFormat::Nv12, 256, 256)
+            .expect("build NVDEC surface pool on the pinned GPU");
+        assert_eq!(
+            pool.vulkan_device_uuid(),
+            target,
+            "surface pool allocated on a different GPU than the pinned one"
         );
     }
 }

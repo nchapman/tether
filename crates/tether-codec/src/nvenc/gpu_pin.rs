@@ -21,9 +21,20 @@ use std::sync::OnceLock;
 
 use super::ffi::{cuda_ordinal_for_uuid, GpuUuid};
 
-/// The pinned target GPU UUID. `None` until the host pins one; the first pin
-/// wins (a host pins exactly once at startup).
-static TARGET_UUID: OnceLock<GpuUuid> = OnceLock::new();
+/// The pinned GPU and its resolved CUDA ordinal. The ordinal is computed once
+/// at [`pin_gpu_uuid`] time (one CUDA enumeration) and cached here so the
+/// per-encoder / per-decoder / EGL-importer reads below don't re-`dlopen`
+/// libcuda and re-enumerate on every construction.
+struct Pin {
+    uuid: GpuUuid,
+    /// CUDA ordinal for `uuid`, or `None` if the UUID has no live CUDA device
+    /// (shouldn't happen — the host pins the producer's GPU, which CUDA sees).
+    cuda_ordinal: Option<i32>,
+}
+
+/// The pinned target. `None` until the host pins one; the first pin wins (a
+/// host pins exactly once at startup).
+static TARGET: OnceLock<Pin> = OnceLock::new();
 
 /// Pin every NVIDIA subsystem to the physical GPU with this 16-byte device
 /// UUID (the Vulkan `deviceUUID` of the dma-buf producer, which equals the
@@ -34,12 +45,17 @@ static TARGET_UUID: OnceLock<GpuUuid> = OnceLock::new();
 /// UUID is a host bug (two GPUs chosen) — it's logged and ignored rather than
 /// silently re-pointed, since the EGL importer may already be bound.
 pub fn pin_gpu_uuid(uuid: GpuUuid) {
-    match TARGET_UUID.set(uuid) {
+    // Resolve the CUDA ordinal once, here, rather than on every later read.
+    let pin = Pin {
+        uuid,
+        cuda_ordinal: cuda_ordinal_for_uuid(uuid),
+    };
+    match TARGET.set(pin) {
         Ok(()) => {
             tracing::info!(uuid = ?uuid, "pinned NVIDIA subsystems to GPU");
         }
         Err(_) => {
-            let existing = TARGET_UUID.get().copied();
+            let existing = pinned_uuid();
             if existing != Some(uuid) {
                 tracing::warn!(
                     requested = ?uuid,
@@ -53,14 +69,15 @@ pub fn pin_gpu_uuid(uuid: GpuUuid) {
 
 /// The pinned target GPU UUID, or `None` when unpinned (driver default).
 pub(crate) fn pinned_uuid() -> Option<GpuUuid> {
-    TARGET_UUID.get().copied()
+    TARGET.get().map(|p| p.uuid)
 }
 
 /// The CUDA device ordinal the pinned UUID maps to, or `None` when unpinned
 /// (use the driver default) or the UUID has no live CUDA device. Used by the
-/// EGL importer to pick the matching `EGL_CUDA_DEVICE_NV` display.
+/// EGL importer to pick the matching `EGL_CUDA_DEVICE_NV` display. Cached at
+/// pin time — no enumeration here.
 pub(crate) fn pinned_cuda_ordinal() -> Option<i32> {
-    cuda_ordinal_for_uuid(pinned_uuid()?)
+    TARGET.get().and_then(|p| p.cuda_ordinal)
 }
 
 /// The CUDA device string for [`rsmpeg::avutil::AVHWDeviceContext::create`]

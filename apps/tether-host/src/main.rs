@@ -351,9 +351,16 @@ async fn main() -> anyhow::Result<()> {
     if !use_test_pattern && tether_codec::nvenc::nvidia_gpu_present() {
         match tether_gpuconvert::gpu_select::preferred_device_uuid().await {
             Some(uuid) => tether_codec::nvenc::pin_gpu_uuid(uuid),
-            None => tracing::warn!(
-                "NVIDIA host but no Vulkan adapter to pin to; using FFmpeg's \
-                 default CUDA device (a multi-GPU host may mismatch producer/encoder)"
+            // NVIDIA present (sysfs) but no Vulkan adapter to read a UUID from —
+            // the producer and the CUDA/EGL side can't be aligned. On a
+            // single-GPU host the default device still works; on a multi-GPU
+            // host this is a latent producer/encoder GPU mismatch that faults on
+            // the first real encode, so log loudly rather than as a soft warning.
+            None => tracing::error!(
+                "NVIDIA host but no Vulkan adapter found to pin the GPU; the codec \
+                 path will use FFmpeg's default CUDA device — on a multi-GPU host \
+                 the dma-buf producer and encoder may land on different GPUs and \
+                 fault. Check the Vulkan driver/ICD installation."
             ),
         }
     }

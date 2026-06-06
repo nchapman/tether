@@ -612,8 +612,14 @@ mod tests {
     /// EGL-import the decoded P010 surface and copy its 16-bit Y plane to host
     /// (`width × 2` bytes/row). Returns the strided byte buffer.
     fn readback_surface_y16(dmabuf: &crate::DmaBufFrame, w: u32, h: u32, y_stride: usize) -> Vec<u8> {
-        let cuda_dev = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, None, None, 1)
-            .expect("CUDA device for readback");
+        // Bind to the same GPU the decoder + EGL importer use: the importer's
+        // EGLDisplay is on the pinned GPU, so registering its EGL image into a
+        // CUDA context on the default device (when a different GPU is pinned)
+        // would cross devices and fault. `None` when unpinned.
+        let cuda_device = crate::nvenc::gpu_pin::cuda_device_cstring();
+        let cuda_dev =
+            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, cuda_device.as_deref(), None, 1)
+                .expect("CUDA device for readback");
         // SAFETY: same navigation the decoder uses to read FFmpeg's CUcontext.
         let cuda_ctx = unsafe {
             let buf = cuda_dev.as_ptr();
@@ -657,8 +663,14 @@ mod tests {
     /// the same GPU the surface lives on) and copy its Y plane to host.
     /// Returns the strided Y buffer (`y_stride * height` bytes).
     fn readback_surface_y(dmabuf: &crate::DmaBufFrame, w: u32, h: u32, y_stride: usize) -> Vec<u8> {
-        let cuda_dev = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, None, None, 1)
-            .expect("CUDA device for readback");
+        // Bind to the same GPU the decoder + EGL importer use: the importer's
+        // EGLDisplay is on the pinned GPU, so registering its EGL image into a
+        // CUDA context on the default device (when a different GPU is pinned)
+        // would cross devices and fault. `None` when unpinned.
+        let cuda_device = crate::nvenc::gpu_pin::cuda_device_cstring();
+        let cuda_dev =
+            AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_CUDA, cuda_device.as_deref(), None, 1)
+                .expect("CUDA device for readback");
         // SAFETY: same AVBufferRef::data → AVHWDeviceContext::hwctx →
         // AVCUDADeviceContext::cuda_ctx navigation the decoder uses.
         let cuda_ctx = unsafe {

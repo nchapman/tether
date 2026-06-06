@@ -603,6 +603,20 @@ fn nvenc_producer_uuid_resolves_to_a_cuda_ordinal() {
     let producer_uuid = tether_gpuconvert::gpu_select::device_uuid(bridge.device())
         .expect("producer device is Vulkan-backed");
 
+    // The host pins from `preferred_device_uuid` (a throwaway HighPerformance
+    // adapter) on the assumption it picks the SAME physical GPU the bridges
+    // pick. That rests on wgpu adapter selection being deterministic within a
+    // process — the design's thinnest assumption. Assert it directly here, so a
+    // multi-GPU host where the two diverge fails this test instead of silently
+    // mispinning the codec side onto the wrong GPU.
+    let preferred = pollster::block_on(tether_gpuconvert::gpu_select::preferred_device_uuid())
+        .expect("preferred adapter is Vulkan-backed");
+    assert_eq!(
+        preferred, producer_uuid,
+        "preferred_device_uuid {preferred:02x?} != actual bridge device {producer_uuid:02x?} — \
+         the host would pin a different GPU than the producer uses"
+    );
+
     let cuda = super::cuda_device_uuids();
     assert!(
         cuda.iter().any(|(_, uuid)| *uuid == producer_uuid),

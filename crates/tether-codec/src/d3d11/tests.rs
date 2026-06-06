@@ -1000,11 +1000,10 @@ mod tests {
         (device, context)
     }
 
-    /// PCI vendor ID of the GPU backing `device`. Used to gate vendor
-    /// roundtrip tests *before* constructing the encoder: attempting an
-    /// AMF/NVENC encoder on a machine without that GPU faults inside the
-    /// vendor's runtime (STATUS_ACCESS_VIOLATION), so we must skip rather
-    /// than try-and-fall-back.
+    /// PCI vendor ID of the GPU backing `device`. Used by tests that run on
+    /// the default adapter to gate on known-vendor hardware (skip the unknown
+    /// vendors that route to Media Foundation). The per-vendor roundtrip tests
+    /// instead bind to a chosen adapter up front via `video_device_for_vendor`.
     fn device_vendor_id(device: &windows::Win32::Graphics::Direct3D11::ID3D11Device) -> u32 {
         use windows::core::Interface;
         use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
@@ -1020,28 +1019,139 @@ mod tests {
     /// NVIDIA PCI vendor ID — routes `D3D11Encoder::new` to NVENC.
     const VENDOR_NVIDIA: u32 = 0x10de;
 
-    /// Create a video device, returning it only if the present GPU is AMD;
+    /// Outcome of trying to bind a video device to a vendor's GPU. Distinguishes
+    /// "no such vendor in the box" from "vendor present but its device wouldn't
+    /// create" so callers can print an accurate SKIP diagnostic — the two read
+    /// very differently during triage.
+    enum VendorVideoDevice {
+        Ready(
+            (
+                windows::Win32::Graphics::Direct3D11::ID3D11Device,
+                windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+            ),
+        ),
+        /// No adapter of this vendor is physically present.
+        Absent,
+        /// At least one adapter of this vendor is present, but every
+        /// `D3D11CreateDevice` against it failed (carries the last error).
+        Unusable(windows::core::Error),
+    }
+
+    /// Create a video device on a DXGI adapter of `vendor_id`.
+    ///
+    /// Vendor-roundtrip tests must run on the matching GPU's *own* device:
+    /// `D3D11Encoder::new(.., vendor_id)` on a foreign vendor's device faults
+    /// inside that vendor's runtime (STATUS_ACCESS_VIOLATION), not a catchable
+    /// error. The production rule is "use the GPU driving the display" (the
+    /// default adapter), but a hardware test should exercise *every* vendor
+    /// GPU in the box, not just the default one — so here we enumerate adapters
+    /// and bind to the requested vendor explicitly. A laptop with an Intel
+    /// iGPU driving the panel and an NVIDIA eGPU thus runs both the QSV and the
+    /// NVENC round trips; a single-vendor box SKIPs the absent vendors.
+    ///
+    /// Enumeration continues past a device-create failure: on a box with two
+    /// adapters of the same vendor, a later one may succeed where the first
+    /// didn't. `Unusable` is returned only when *every* matching adapter failed.
+    ///
+    /// An explicit adapter requires `D3D_DRIVER_TYPE_UNKNOWN` (passing
+    /// `HARDWARE` with a non-null adapter fails) — same as the production
+    /// capture fallback in `tether-capture`.
+    fn video_device_for_vendor(vendor_id: u32) -> VendorVideoDevice {
+        use windows::core::Interface;
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, ID3D11Multithread, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+        };
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("CreateDXGIFactory1");
+        let mut adapter_idx = 0u32;
+        // Track whether we saw the vendor at all, and the last create error, so
+        // a box with several same-vendor adapters reports "unusable" only after
+        // every one has failed.
+        let mut last_create_err = None;
+        while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_idx) } {
+            adapter_idx += 1;
+            // GetDesc1 on a just-enumerated adapter shouldn't fail; a failure is
+            // a driver/environment error, not "vendor absent" — surface it loudly
+            // rather than silently skipping (which would read as "GPU not present").
+            let desc = unsafe { adapter.GetDesc1() }.expect("IDXGIAdapter1::GetDesc1");
+            if desc.VendorId != vendor_id {
+                continue;
+            }
+
+            // Try this adapter. On a box with two same-vendor GPUs, index 0 is
+            // the display adapter — the one most likely to support encode and
+            // matching production's default pick — but if it won't create a
+            // device we fall through to the next same-vendor adapter rather than
+            // giving up, since a later one may still work.
+            let mut device = None;
+            let mut context = None;
+            // The vendor GPU is present but device creation can still fail (a
+            // corrupted driver, VIDEO_SUPPORT unavailable on this config). That's
+            // "present but not usable", which the harness treats as SKIP, not a
+            // hard failure — mirror the rest of the test infrastructure.
+            if let Err(e) = unsafe {
+                D3D11CreateDevice(
+                    &adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            } {
+                last_create_err = Some(e);
+                continue;
+            }
+            let device = device.unwrap();
+            let context = context.unwrap();
+            if let Ok(mt) = device.cast::<ID3D11Multithread>() {
+                let _ = unsafe { mt.SetMultithreadProtected(true) };
+            }
+            return VendorVideoDevice::Ready((device, context));
+        }
+        match last_create_err {
+            Some(e) => VendorVideoDevice::Unusable(e),
+            None => VendorVideoDevice::Absent,
+        }
+    }
+
+    /// Create a video device, returning it only if an AMD GPU is present;
     /// otherwise print a SKIP diagnostic and return `None`. AMF-specific
     /// tests must gate on the real vendor *before* constructing the encoder:
     /// `D3D11Encoder::new(.., VENDOR_AMD)` on non-AMD hardware faults inside
     /// a foreign vendor runtime (STATUS_ACCESS_VIOLATION), not a catchable
-    /// error. Run these on an AMF-capable AMD GPU.
+    /// error. Binds to the AMD adapter itself (see `video_device_for_vendor`)
+    /// so a box where AMD isn't the default adapter still runs these.
     fn amd_video_device_or_skip(
         test: &str,
     ) -> Option<(
         windows::Win32::Graphics::Direct3D11::ID3D11Device,
         windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     )> {
-        let (device, context) = create_video_device();
-        let present = device_vendor_id(&device);
-        if present != VENDOR_AMD {
-            eprintln!(
-                "SKIP {test}: GPU vendor 0x{present:04x} != AMD 0x{VENDOR_AMD:04x}; \
-                 run on an AMF-capable AMD GPU"
-            );
-            return None;
+        match video_device_for_vendor(VENDOR_AMD) {
+            VendorVideoDevice::Ready(dev) => Some(dev),
+            VendorVideoDevice::Absent => {
+                eprintln!(
+                    "SKIP {test}: no AMD GPU (0x{VENDOR_AMD:04x}) present; \
+                     run on an AMF-capable AMD GPU"
+                );
+                None
+            }
+            VendorVideoDevice::Unusable(e) => {
+                eprintln!(
+                    "SKIP {test}: AMD GPU (0x{VENDOR_AMD:04x}) present but \
+                     D3D11CreateDevice (UNKNOWN driver, VIDEO_SUPPORT) failed: {e}"
+                );
+                None
+            }
         }
-        Some((device, context))
     }
 
     /// Allocate a mid-grey BGRA `ID3D11Texture2D` to feed the zero-copy
@@ -1115,20 +1225,29 @@ mod tests {
         let encode_w = 1280u32;
         let encode_h = 720u32;
 
-        let (device, context) = create_video_device();
-
-        // SKIP-with-diagnostic when this machine's GPU isn't the target
-        // vendor. Constructing the wrong vendor's encoder faults inside
-        // that vendor's runtime, so gate on the present GPU *before*
-        // touching `D3D11Encoder::new`. Run this test on a matching GPU.
-        let present_vendor = device_vendor_id(&device);
-        if present_vendor != vendor_id {
-            eprintln!(
-                "SKIP {expected_backend}: GPU vendor 0x{present_vendor:04x} != target \
-                 0x{vendor_id:04x}; run on a {expected_backend}-capable GPU"
-            );
-            return;
-        }
+        // SKIP-with-diagnostic when this machine has no GPU of the target
+        // vendor. Constructing the wrong vendor's encoder faults inside that
+        // vendor's runtime, so we bind to the target vendor's *own* adapter
+        // (not the default one) *before* touching `D3D11Encoder::new`. On a
+        // dual-GPU box this exercises each vendor in turn; a single-vendor box
+        // SKIPs the absent vendors. Run this test on a matching GPU.
+        let (device, context) = match video_device_for_vendor(vendor_id) {
+            VendorVideoDevice::Ready(dev) => dev,
+            VendorVideoDevice::Absent => {
+                eprintln!(
+                    "SKIP {expected_backend}: no GPU of vendor 0x{vendor_id:04x} present; \
+                     run on a {expected_backend}-capable GPU"
+                );
+                return;
+            }
+            VendorVideoDevice::Unusable(e) => {
+                eprintln!(
+                    "SKIP {expected_backend}: GPU of vendor 0x{vendor_id:04x} present but \
+                     D3D11CreateDevice (UNKNOWN driver, VIDEO_SUPPORT) failed: {e}"
+                );
+                return;
+            }
+        };
 
         // BGRA source texture at capture dims.
         let bgra = vec![128u8; (capture_w * capture_h * 4) as usize];

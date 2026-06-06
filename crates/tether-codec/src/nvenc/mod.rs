@@ -25,7 +25,7 @@
 //! `libnvidia-encode.so` / `libcuda.so` present. Construction returns a clean
 //! `CodecError` when either is missing, so a non-NVIDIA host degrades to VAAPI.
 
-pub use encoder::NvencEncoder;
+pub use encoder::{expected_nvenc_dmabuf_fourcc as expected_dmabuf_fourcc, NvencEncoder};
 // Multi-GPU device pinning: enumerate CUDA devices by UUID and map a target
 // UUID (derived from the wgpu dma-buf producer's chosen adapter) to the CUDA
 // ordinal NVENC/NVDEC/EGL must all bind to. See [`ffi::cuda_ordinal_for_uuid`].

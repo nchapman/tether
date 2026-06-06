@@ -633,10 +633,7 @@ fn nvenc_codec_display_name(kind: CodecKind) -> &'static str {
 /// (planar 4:4:4 8-bit), matching [`nvenc_sw_format`].
 /// Same `(chroma, bit_depth) → fourcc` relation as the VAAPI sibling's
 /// [`crate::vaapi::expected_dmabuf_fourcc`] for the 4:2:0 rows.
-pub(super) fn expected_nvenc_dmabuf_fourcc(
-    chroma: ChromaSubsampling,
-    bit_depth: u8,
-) -> Option<u32> {
+pub fn expected_nvenc_dmabuf_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {
     Some(match (chroma, bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => u32::from_le_bytes(*b"NV12"),
         (ChromaSubsampling::Yuv420, 10) => u32::from_le_bytes(*b"P010"),

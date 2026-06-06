@@ -27,9 +27,7 @@ use super::ffi::{cuda_ordinal_for_uuid, GpuUuid};
 /// libcuda and re-enumerate on every construction.
 struct Pin {
     uuid: GpuUuid,
-    /// CUDA ordinal for `uuid`, or `None` if the UUID has no live CUDA device
-    /// (shouldn't happen — the host pins the producer's GPU, which CUDA sees).
-    cuda_ordinal: Option<i32>,
+    cuda_ordinal: i32,
 }
 
 /// The pinned target. `None` until the host pins one; the first pin wins (a
@@ -45,11 +43,16 @@ static TARGET: OnceLock<Pin> = OnceLock::new();
 /// UUID is a host bug (two GPUs chosen) — it's logged and ignored rather than
 /// silently re-pointed, since the EGL importer may already be bound.
 pub fn pin_gpu_uuid(uuid: GpuUuid) {
-    // Resolve the CUDA ordinal once, here, rather than on every later read.
-    let pin = Pin {
-        uuid,
-        cuda_ordinal: cuda_ordinal_for_uuid(uuid),
+    let Some(cuda_ordinal) = cuda_ordinal_for_uuid(uuid) else {
+        tracing::error!(
+            uuid = ?uuid,
+            "refusing to pin NVIDIA subsystems to a GPU UUID without a CUDA device"
+        );
+        return;
     };
+
+    // Resolve the CUDA ordinal once, here, rather than on every later read.
+    let pin = Pin { uuid, cuda_ordinal };
     match TARGET.set(pin) {
         Ok(()) => {
             tracing::info!(uuid = ?uuid, "pinned NVIDIA subsystems to GPU");
@@ -73,11 +76,10 @@ pub(crate) fn pinned_uuid() -> Option<GpuUuid> {
 }
 
 /// The CUDA device ordinal the pinned UUID maps to, or `None` when unpinned
-/// (use the driver default) or the UUID has no live CUDA device. Used by the
-/// EGL importer to pick the matching `EGL_CUDA_DEVICE_NV` display. Cached at
-/// pin time — no enumeration here.
+/// (use the driver default). Used by the EGL importer to pick the matching
+/// `EGL_CUDA_DEVICE_NV` display. Cached at pin time — no enumeration here.
 pub(crate) fn pinned_cuda_ordinal() -> Option<i32> {
-    TARGET.get().and_then(|p| p.cuda_ordinal)
+    TARGET.get().map(|p| p.cuda_ordinal)
 }
 
 /// The CUDA device string for [`rsmpeg::avutil::AVHWDeviceContext::create`]

@@ -977,7 +977,7 @@ fn bench_encode_by_resolution_h264() {
 
 #[cfg(test)]
 mod cross_table_consistency {
-    use tether_codec::vaapi::expected_dmabuf_fourcc;
+    use tether_codec::{nvenc, vaapi};
     use tether_protocol::control::ChromaSubsampling;
 
     use crate::gpu::{render_layout_for, RenderLayout};
@@ -989,49 +989,61 @@ mod cross_table_consistency {
         (ChromaSubsampling::Yuv444, 10),
     ];
 
-    /// Maps each encoder-input fourcc to the renderer layout we expect
-    /// to use for the matching `(chroma, bit_depth)`. The keys are the
-    /// *encoder-input* fourccs (`expected_dmabuf_fourcc`); the values are
-    /// the renderer's *decode-output* layout. For 4:2:0 and 8-bit 4:4:4
-    /// the decoder emits the same fourcc family it consumes. For 4:4:4
-    /// 10-bit they differ: the encoder consumes XV30 but Intel's decoder
-    /// outputs Y410 (→ `PackedY410`) — same 10:10:10:2 packing, different
-    /// component order. Verified end-to-end by the
+    /// Maps each backend's encoder-input fourcc to the renderer layout we
+    /// expect to use for the matching `(chroma, bit_depth)`. The values are
+    /// the renderer's *decode-output* layout. VAAPI 4:4:4 8-bit uses packed
+    /// `XYUV`; NVIDIA uses planar `YU24`. For VAAPI 4:4:4 10-bit, the encoder
+    /// consumes XV30 but Intel's decoder outputs Y410 (→ `PackedY410`) — same
+    /// 10:10:10:2 packing, different component order. Verified end-to-end by the
     /// `roundtrip_hevc_main444_10bit_identity` cell on Intel media-driver.
     fn expected_layout_for_fourcc(fourcc: u32) -> RenderLayout {
         match &fourcc.to_le_bytes() {
             b"NV12" => RenderLayout::Biplanar8,
             b"P010" => RenderLayout::Biplanar16,
-            b"XYUV" => {
-                if tether_codec::nvenc::nvidia_gpu_present() {
-                    RenderLayout::Planar444
-                } else {
-                    RenderLayout::PackedXYUV
-                }
-            }
+            b"XYUV" => RenderLayout::PackedXYUV,
+            b"YU24" => RenderLayout::Planar444,
             b"XV30" => RenderLayout::PackedY410,
             other => panic!("expected_layout_for_fourcc: unknown fourcc {other:?}"),
         }
     }
 
+    fn expected_encoder_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {
+        if nvenc::nvidia_gpu_present() {
+            nvenc::expected_dmabuf_fourcc(chroma, bit_depth)
+        } else {
+            vaapi::expected_dmabuf_fourcc(chroma, bit_depth)
+        }
+    }
+
+    fn any_linux_backend_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {
+        vaapi::expected_dmabuf_fourcc(chroma, bit_depth)
+            .or_else(|| nvenc::expected_dmabuf_fourcc(chroma, bit_depth))
+    }
+
     #[test]
     fn encoder_fourccs_are_well_formed() {
         for &(chroma, bit_depth) in MODELED {
-            let f = expected_dmabuf_fourcc(chroma, bit_depth)
-                .unwrap_or_else(|| panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})"));
-            let bytes = f.to_le_bytes();
-            assert!(
-                bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)),
-                "encoder fourcc for ({chroma:?}, {bit_depth}) = 0x{f:08x} is not printable",
-            );
+            for (backend, fourcc) in [
+                ("vaapi", vaapi::expected_dmabuf_fourcc(chroma, bit_depth)),
+                ("nvenc", nvenc::expected_dmabuf_fourcc(chroma, bit_depth)),
+            ] {
+                let Some(f) = fourcc else { continue };
+                let bytes = f.to_le_bytes();
+                assert!(
+                    bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)),
+                    "{backend} encoder fourcc for ({chroma:?}, {bit_depth}) = 0x{f:08x} \
+                     is not printable",
+                );
+            }
         }
     }
 
     #[test]
     fn renderer_layout_matches_encoder_fourcc() {
         for &(chroma, bit_depth) in MODELED {
-            let fourcc = expected_dmabuf_fourcc(chroma, bit_depth)
-                .unwrap_or_else(|| panic!("encoder has no fourcc for ({chroma:?}, {bit_depth})"));
+            let Some(fourcc) = expected_encoder_fourcc(chroma, bit_depth) else {
+                continue;
+            };
             let renderer = render_layout_for(chroma, bit_depth);
             let expected = expected_layout_for_fourcc(fourcc);
             assert_eq!(
@@ -1050,7 +1062,7 @@ mod cross_table_consistency {
         // addition (AV1, future chroma) is automatically covered. A
         // hand-rolled list silently misses new entries.
         for p in tether_probe::PROFILE_PREFERENCE.iter().copied() {
-            let f = expected_dmabuf_fourcc(p.chroma, p.bit_depth);
+            let f = any_linux_backend_fourcc(p.chroma, p.bit_depth);
             assert!(f.is_some(), "no encoder fourcc for profile {p:?}");
         }
     }

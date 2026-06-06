@@ -993,6 +993,32 @@ mod tests {
     }
 
     #[test]
+    fn client_stats_maps_named_fields_without_cross_wire_swap() {
+        use crate::pb::control_message::Kind;
+        use prost::Message as _;
+
+        let msg = ControlMessage::ClientStats {
+            window_ms: 1001,
+            frames_received: 62,
+            incomplete_frames: 3,
+            fragment_loss_events: 5,
+            rtt_us: 7000,
+        };
+        let bytes = encode_reliable(&msg).unwrap();
+        let wire = pb::ControlMessage::decode(bytes.as_slice()).unwrap();
+        match wire.kind.expect("kind") {
+            Kind::ClientStats(stats) => {
+                assert_eq!(stats.window_ms, 1001);
+                assert_eq!(stats.frames_received, 62);
+                assert_eq!(stats.incomplete_frames, 3);
+                assert_eq!(stats.fragment_loss_events, 5);
+                assert_eq!(stats.rtt_us, 7000);
+            }
+            other => panic!("expected ClientStats, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn round_trip_stream_lifecycle() {
         // The three lifecycle variants gate host frame emission. All
         // three need to survive the wire identically.

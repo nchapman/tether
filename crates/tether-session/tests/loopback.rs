@@ -608,6 +608,65 @@ async fn mid_session_set_viewport_round_trips_on_control_stream() {
 }
 
 #[tokio::test]
+async fn mid_session_client_stats_round_trips_on_control_stream() {
+    let (host_chan, client_chan) = duplex_pair();
+    let (host_cfg, client_cfg) = cfgs();
+
+    let host_chan_for_session: Arc<dyn ControlChannel> = host_chan.clone();
+    let client_chan_for_session: Arc<dyn ControlChannel> = client_chan.clone();
+    let host_chan_for_probe = host_chan_for_session.clone();
+
+    let host_task = tokio::spawn(async move {
+        let session = HostSession::accept(host_chan_for_session, host_cfg, |client_caps| {
+            client_caps.iter().copied().next()
+        })
+        .await
+        .unwrap();
+        answer_clock_probe(host_chan_for_probe.as_ref()).await;
+        session
+    });
+    let client_task = tokio::spawn(async move {
+        ClientSession::connect(client_chan_for_session, client_cfg)
+            .await
+            .unwrap()
+    });
+    let _host = host_task.await.unwrap();
+    let _client = client_task.await.unwrap();
+
+    client_chan
+        .send_control(&ControlMessage::ClientStats {
+            window_ms: 1001,
+            frames_received: 62,
+            incomplete_frames: 3,
+            fragment_loss_events: 5,
+            rtt_us: 7000,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match host_chan.recv_control().await.unwrap() {
+            ControlMessage::ForceIdr => continue,
+            ControlMessage::ClientStats {
+                window_ms,
+                frames_received,
+                incomplete_frames,
+                fragment_loss_events,
+                rtt_us,
+            } => {
+                assert_eq!(window_ms, 1001);
+                assert_eq!(frames_received, 62);
+                assert_eq!(incomplete_frames, 3);
+                assert_eq!(fragment_loss_events, 5);
+                assert_eq!(rtt_us, 7000);
+                break;
+            }
+            other => panic!("expected ClientStats, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn display_mode_request_returns_unsupported_until_platform_wired() {
     let (host_chan, client_chan) = duplex_pair();
     let (host_cfg, client_cfg) = cfgs();

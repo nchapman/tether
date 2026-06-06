@@ -291,11 +291,11 @@ message StreamResume {
 }
 
 message ClientStats {
-  uint32 interval_ms = 1;
+  uint32 window_ms = 1;
   uint32 frames_received = 2;
-  uint32 frames_dropped = 3;
-  uint32 fragments_lost = 4;
-  uint32 rtt_ewma_us = 5;
+  uint32 incomplete_frames = 3;
+  uint32 fragment_loss_events = 4;
+  uint32 rtt_us = 5;
 }
 
 message SetCursorMode {

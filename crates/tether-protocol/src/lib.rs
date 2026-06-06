@@ -981,11 +981,11 @@ mod tests {
     #[test]
     fn round_trip_client_stats() {
         let msg = ControlMessage::ClientStats {
-            interval_ms: 1000,
+            window_ms: 1000,
             frames_received: 60,
-            frames_dropped: 2,
-            fragments_lost: 4,
-            rtt_ewma_us: 9_500,
+            incomplete_frames: 2,
+            fragment_loss_events: 4,
+            rtt_us: 9_500,
         };
         let bytes = encode_reliable(&msg).unwrap();
         let msg2: ControlMessage = decode_reliable(&bytes).unwrap();

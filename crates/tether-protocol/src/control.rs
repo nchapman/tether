@@ -650,15 +650,15 @@ pub enum ControlMessage {
         stream_id: VideoStreamId,
     },
     /// Client → host. Periodic receive-side telemetry (1 Hz typical).
-    /// Feeds future adaptive-bitrate / FEC / codec-downshift policy on
-    /// the host. Counters are per the elapsed `interval_ms` window;
-    /// `rtt_ewma_us` is the EWMA over the connection's lifetime so far.
+    /// Feeds adaptive-bitrate / FEC / codec-downshift policy on the host.
+    /// Count fields are per the elapsed `window_ms`; `rtt_us` is the
+    /// client's current QUIC RTT estimate.
     ClientStats {
-        interval_ms: u32,
+        window_ms: u32,
         frames_received: u32,
-        frames_dropped: u32,
-        fragments_lost: u32,
-        rtt_ewma_us: u32,
+        incomplete_frames: u32,
+        fragment_loss_events: u32,
+        rtt_us: u32,
     },
     /// Either side → other. Switch the cursor input model. Toggles
     /// mid-session without renegotiating; the receiver echoes the
@@ -1407,17 +1407,17 @@ impl ReliableMessage for ControlMessage {
                 stream_id: stream_id.0,
             }),
             ControlMessage::ClientStats {
-                interval_ms,
+                window_ms,
                 frames_received,
-                frames_dropped,
-                fragments_lost,
-                rtt_ewma_us,
+                incomplete_frames,
+                fragment_loss_events,
+                rtt_us,
             } => Kind::ClientStats(pb::ClientStats {
-                interval_ms,
+                window_ms,
                 frames_received,
-                frames_dropped,
-                fragments_lost,
-                rtt_ewma_us,
+                incomplete_frames,
+                fragment_loss_events,
+                rtt_us,
             }),
             ControlMessage::SetCursorMode { mode } => Kind::SetCursorMode(pb::SetCursorMode {
                 mode: cursor_mode_to_pb(mode),
@@ -1534,11 +1534,11 @@ impl ReliableMessage for ControlMessage {
                 stream_id: VideoStreamId(v.stream_id),
             }),
             Kind::ClientStats(v) => Ok(ControlMessage::ClientStats {
-                interval_ms: v.interval_ms,
+                window_ms: v.window_ms,
                 frames_received: v.frames_received,
-                frames_dropped: v.frames_dropped,
-                fragments_lost: v.fragments_lost,
-                rtt_ewma_us: v.rtt_ewma_us,
+                incomplete_frames: v.incomplete_frames,
+                fragment_loss_events: v.fragment_loss_events,
+                rtt_us: v.rtt_us,
             }),
             Kind::SetCursorMode(v) => Ok(ControlMessage::SetCursorMode {
                 mode: cursor_mode_from_pb(v.mode),

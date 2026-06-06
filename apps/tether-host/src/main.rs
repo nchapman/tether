@@ -43,7 +43,7 @@ use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ControlMessage, DisplayDescriptor, DisplayModeStatus,
-    VideoProfile, VideoStreamId, Viewport,
+    GoodbyeCode, VideoProfile, VideoStreamId, Viewport,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
@@ -176,13 +176,13 @@ struct ViewportState {
 
 /// One window of client-side telemetry. Mirrors the fields in
 /// [`ControlMessage::ClientStats`] that the ABR controller actually
-/// consumes; `interval_ms` and `frames_received` are dropped at the
+/// consumes; `window_ms` and `frames_received` are dropped at the
 /// boundary because the controller takes wall-clock dt itself and
 /// doesn't need the success-count.
 #[derive(Debug, Clone, Copy)]
 struct ClientStatsObservation {
-    frames_dropped: u32,
-    fragments_lost: u32,
+    incomplete_frames: u32,
+    fragment_loss_events: u32,
 }
 
 #[tokio::main]
@@ -737,6 +737,11 @@ async fn handle_client(
     // no-op.
     let send_exited = Arc::new(tokio::sync::Notify::new());
     let send_exited_for_thread = send_exited.clone();
+    // Set once a typed shutdown reason has crossed the control stream in either
+    // direction. Prevents the final teardown from overwriting a specific peer
+    // Goodbye / protocol error / fatal send-loop Goodbye with a generic clean
+    // "session ended" notice.
+    let shutdown_notice_sent_or_received = Arc::new(AtomicBool::new(false));
     // Drop-oldest single-slot mailbox for the most recent `ClientStats`
     // window. Written by the control recv task, drained by the
     // encode-and-send thread on each loop iteration.
@@ -760,6 +765,7 @@ async fn handle_client(
     let stream_ready_for_thread = stream_ready.clone();
     let latest_client_stats_for_send = latest_client_stats.clone();
     let latest_viewport_for_send = latest_viewport.clone();
+    let shutdown_notice_for_send = shutdown_notice_sent_or_received.clone();
     // The sync send thread is not a tokio worker, so it uses the
     // runtime handle only for the few async control sends needed on
     // fatal exits. Regular video output is synchronous datagram send:
@@ -782,6 +788,7 @@ async fn handle_client(
                 latest_client_stats_for_send,
                 latest_viewport_for_send,
                 send_exited_for_thread,
+                shutdown_notice_for_send,
             )
         })?;
 
@@ -838,6 +845,7 @@ async fn handle_client(
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
         let force_idr_for_viewport = force_idr.clone();
+        let shutdown_notice_for_ctl = shutdown_notice_sent_or_received.clone();
         tasks.spawn(async move {
             // Per-message rate limit for IDR-triggering control messages.
             // A client flooding ForceIdr / RequestRecovery on the
@@ -937,18 +945,18 @@ async fn handle_client(
                         force_idr.raise();
                     }
                     Ok(ControlMessage::ClientStats {
-                        interval_ms,
+                        window_ms,
                         frames_received,
-                        frames_dropped,
-                        fragments_lost,
-                        rtt_ewma_us,
+                        incomplete_frames,
+                        fragment_loss_events,
+                        rtt_us,
                     }) => {
                         info!(
-                            interval_ms,
+                            window_ms,
                             frames_received,
-                            frames_dropped,
-                            fragments_lost,
-                            rtt_ewma_us,
+                            incomplete_frames,
+                            fragment_loss_events,
+                            rtt_us,
                             "client stats"
                         );
                         // Drop-oldest: the ABR controller only needs
@@ -958,8 +966,8 @@ async fn handle_client(
                         // on fresh telemetry than queue stale data.
                         *latest_client_stats_for_ctl.lock().unwrap() =
                             Some(ClientStatsObservation {
-                                frames_dropped,
-                                fragments_lost,
+                                incomplete_frames,
+                                fragment_loss_events,
                             });
                     }
                     Ok(ControlMessage::SetViewportHint {
@@ -1035,6 +1043,7 @@ async fn handle_client(
                         tracing::trace!("unsolicited clock probe response; ignoring");
                     }
                     Ok(ControlMessage::Goodbye { reason, code }) => {
+                        shutdown_notice_for_ctl.store(true, Ordering::Release);
                         info!(%reason, ?code, "client said goodbye");
                         return;
                     }
@@ -1046,12 +1055,21 @@ async fn handle_client(
                             payload_len = msg.payload.len(),
                             "unnegotiated control extension; closing session"
                         );
-                        let _ = conn
-                            .send_control(&ControlMessage::Goodbye {
-                                reason: format!("unnegotiated extension {}", msg.key),
-                                code: tether_protocol::control::GoodbyeCode::ProtocolError,
-                            })
+                        let reason = format!("unnegotiated extension {}", msg.key);
+                        if !shutdown_notice_for_ctl.swap(true, Ordering::AcqRel) {
+                            let sent = send_goodbye_notice(
+                                &conn,
+                                reason.as_str(),
+                                GoodbyeCode::ProtocolError,
+                            )
                             .await;
+                            info!(
+                                reason = reason.as_str(),
+                                code = ?GoodbyeCode::ProtocolError,
+                                sent,
+                                "host session shutdown notice"
+                            );
+                        }
                         return;
                     }
                     Ok(
@@ -1217,13 +1235,14 @@ async fn handle_client(
     //   - Ctrl-C: user wants out
     //   - any per-connection task exited: disconnect, Goodbye, or recv error
     // Whichever fires first, the cleanup path below runs.
-    tokio::select! {
+    let (teardown_reason, teardown_code) = tokio::select! {
         ctrl_c = tokio::signal::ctrl_c() => {
             if let Err(e) = ctrl_c {
                 warn!(error = %e, "ctrl-c handler failed; tearing down anyway");
             } else {
                 info!("ctrl-c received, ending session");
             }
+            ("host interrupted", GoodbyeCode::Clean)
         }
         res = tasks.join_next() => {
             match res {
@@ -1231,6 +1250,7 @@ async fn handle_client(
                 Some(Err(e)) => warn!(error = ?e, "per-connection task failed; tearing down"),
                 None => warn!("joined empty task set; tearing down"),
             }
+            ("host session task ended", GoodbyeCode::Clean)
         }
         () = send_exited.notified() => {
             // Send thread exited (fatal encoder init failure, GPU
@@ -1241,7 +1261,18 @@ async fn handle_client(
             // down immediately rather than waiting for the client to
             // ack-by-disconnect.
             info!("send thread exited; tearing down");
+            ("host send loop ended", GoodbyeCode::Clean)
         }
+    };
+
+    if !shutdown_notice_sent_or_received.swap(true, Ordering::AcqRel) {
+        let sent = send_goodbye_notice(&conn, teardown_reason, teardown_code).await;
+        info!(
+            reason = teardown_reason,
+            code = ?teardown_code,
+            sent,
+            "host session shutdown notice"
+        );
     }
 
     // Close the QUIC connection. This makes send_datagram error in the
@@ -1274,6 +1305,41 @@ async fn handle_client(
     }
 
     Ok(())
+}
+
+async fn send_goodbye_notice(conn: &Connection, reason: &str, code: GoodbyeCode) -> bool {
+    let msg = ControlMessage::Goodbye {
+        reason: reason.to_string(),
+        code,
+    };
+    match conn.send_control(&msg).await {
+        Ok(()) => {
+            let wait = (2 * conn.rtt()).clamp(
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(200),
+            );
+            tokio::time::sleep(wait).await;
+            true
+        }
+        Err(e) => {
+            warn!(error = ?e, reason, ?code, "send Goodbye failed");
+            false
+        }
+    }
+}
+
+fn send_goodbye_notice_blocking(
+    runtime: &tokio::runtime::Handle,
+    conn: &Connection,
+    sent_or_received: &AtomicBool,
+    reason: &str,
+    code: GoodbyeCode,
+) {
+    if sent_or_received.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let sent = runtime.block_on(send_goodbye_notice(conn, reason, code));
+    info!(reason, ?code, sent, "host session shutdown notice");
 }
 
 /// Encoder paired with the input dimensions it was configured for, so we
@@ -2705,8 +2771,8 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
         lost_packets_delta: quinn
             .lost_packets
             .saturating_sub(abr.last_quinn.lost_packets),
-        client_fragments_lost: stats.fragments_lost,
-        client_frames_dropped: stats.frames_dropped,
+        client_fragment_loss_events: stats.fragment_loss_events,
+        client_incomplete_frames: stats.incomplete_frames,
     };
     abr.last_quinn = quinn;
     abr.last_observed_at = now;
@@ -2720,8 +2786,8 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
                     rtt_ms = sample.rtt.as_millis() as u64,
                     congestion_events_delta = sample.congestion_events_delta,
                     lost_packets_delta = sample.lost_packets_delta,
-                    client_fragments_lost = sample.client_fragments_lost,
-                    client_frames_dropped = sample.client_frames_dropped,
+                    client_fragment_loss_events = sample.client_fragment_loss_events,
+                    client_incomplete_frames = sample.client_incomplete_frames,
                     "abr: bitrate retuned"
                 );
                 abr.last_applied_kbps = decision.target_kbps;
@@ -2845,7 +2911,7 @@ fn run_audio_capture_and_send(
         if last_stats_log.elapsed() >= AUDIO_STATS_INTERVAL {
             info!(
                 frames_captured,
-                peak = format!("{peak:.4}"),
+                peak,
                 gated = !audio_ready.load(Ordering::Acquire),
                 "audio capture stats"
             );
@@ -2918,6 +2984,7 @@ fn run_capture_and_send(
     latest_client_stats: LatestClientStats,
     latest_viewport: LatestViewport,
     send_exited: Arc<tokio::sync::Notify>,
+    shutdown_notice_sent_or_received: Arc<AtomicBool>,
 ) {
     // RAII: notify handle_client on *any* exit from this function —
     // including the six fatal-return sites below, a panic that's
@@ -3213,15 +3280,17 @@ fn run_capture_and_send(
                         encode_height,
                         "encoder init failed; sending Goodbye(InternalError) and exiting send loop"
                     );
-                    let goodbye_conn = conn.clone();
                     let reason = format!(
                         "host could not construct {:?} {:?} encoder for {}x{}: {}",
                         chosen_profile.codec, chosen_profile.chroma, encode_width, encode_height, e
                     );
-                    let _ = runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
-                        reason,
-                        code: tether_protocol::control::GoodbyeCode::InternalError,
-                    }));
+                    send_goodbye_notice_blocking(
+                        &runtime,
+                        &conn,
+                        &shutdown_notice_sent_or_received,
+                        reason.as_str(),
+                        GoodbyeCode::InternalError,
+                    );
                     return;
                 }
             };
@@ -3287,12 +3356,14 @@ fn run_capture_and_send(
                         error = %e,
                         "GPU encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
                     );
-                    let goodbye_conn = conn.clone();
                     let reason = format!("host GPU encode bridge collapsed: {e}");
-                    let _ = runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
-                        reason,
-                        code: tether_protocol::control::GoodbyeCode::InternalError,
-                    }));
+                    send_goodbye_notice_blocking(
+                        &runtime,
+                        &conn,
+                        &shutdown_notice_sent_or_received,
+                        reason.as_str(),
+                        GoodbyeCode::InternalError,
+                    );
                     return;
                 }
             },
@@ -3309,13 +3380,14 @@ fn run_capture_and_send(
                             error = %e,
                             "IOSurface encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
                         );
-                        let goodbye_conn = conn.clone();
                         let reason = format!("host IOSurface encode bridge collapsed: {e}");
-                        let _ =
-                            runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
-                                reason,
-                                code: tether_protocol::control::GoodbyeCode::InternalError,
-                            }));
+                        send_goodbye_notice_blocking(
+                            &runtime,
+                            &conn,
+                            &shutdown_notice_sent_or_received,
+                            reason.as_str(),
+                            GoodbyeCode::InternalError,
+                        );
                         return;
                     }
                 }
@@ -3447,18 +3519,13 @@ fn run_capture_and_send(
                 // fragment+wire. Their sum ≈ host-side end-to-end latency.
                 info!(
                     frames = snap.frame_count,
-                    capture_age_ms = format!(
-                        "{:.2}",
-                        StageLatency::avg_ms(stage_latency.capture_age_ns, stage_latency.frames)
-                    ),
-                    avg_encode_ms = format!("{:.2}", snap.avg_encode_ms),
-                    send_ms = format!(
-                        "{:.2}",
-                        StageLatency::avg_ms(stage_latency.send_ns, stage_latency.frames)
-                    ),
-                    kbps_out = format!("{:.0}", snap.kbps_out),
-                    kf_per_s = format!("{kf_per_s:.2}"),
-                    transient_send_drops,
+                    avg_capture_age_ms =
+                        StageLatency::avg_ms(stage_latency.capture_age_ns, stage_latency.frames),
+                    avg_encode_ms = snap.avg_encode_ms,
+                    avg_send_ms = StageLatency::avg_ms(stage_latency.send_ns, stage_latency.frames),
+                    kbps_out = snap.kbps_out,
+                    keyframes_per_s = kf_per_s,
+                    transient_send_drop_frames = transient_send_drops,
                     "send stats"
                 );
                 stage_latency = StageLatency::default();

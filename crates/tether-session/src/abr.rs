@@ -4,25 +4,18 @@
 //! 1 Hz `ClientStats` cadence) with a fresh [`AbrSample`] combining quinn
 //! path stats and the client's `ClientStats`. The controller folds the
 //! sample into a rolling 3-second window and returns an
-//! [`AbrDecision`] — a target bitrate (kbps) and target FPS — that the
-//! caller debounces against its current setting before pushing it into
-//! the encoder.
+//! [`AbrDecision`] — a target bitrate (kbps) that the caller debounces
+//! against its current setting before pushing it into the encoder.
 //!
-//! Two independent state machines drive the decision:
+//! One state machine drives the decision:
 //!
 //! - **Bitrate gear.** Reflects quality vs. congestion. Congestion is
 //!   inferred from RTT (high-water 150 ms, low-water 60 ms) plus
 //!   quinn-side loss (`congestion_events_delta`, `lost_packets_delta`)
-//!   and the client's `fragments_lost`. A burst of loss collapses
+//!   and the client's `fragment_loss_events`. A burst of loss collapses
 //!   immediately to the floor (no hysteresis on a fall — keep latency
 //!   playable); recovery is gated by N consecutive healthy samples so
 //!   we don't oscillate.
-//! - **FPS gear.** Reflects the encoder's ability to keep up. Climbs
-//!   when the network is healthy and the client isn't dropping frames;
-//!   falls when `frames_dropped` rises. Wired into the encoder is
-//!   future work; the controller exposes the value today so the
-//!   plumbing seam exists when the capture/encoder learn to take an
-//!   FPS hint.
 //!
 //! The controller is pure: no I/O, no clock reads. Callers supply the
 //! tick interval. Tests drive deterministic state transitions by
@@ -46,27 +39,26 @@ pub struct AbrSample {
     /// New packets quinn marked lost since the last sample
     /// (`PathStats::lost_packets` delta).
     pub lost_packets_delta: u64,
-    /// Fragments the client's defragmenter never assembled, per the
-    /// most recent `ClientStats::fragments_lost` window.
-    pub client_fragments_lost: u32,
-    /// Frames the client dropped (decode lag, render queue full), per
-    /// the most recent `ClientStats::frames_dropped` window.
-    pub client_frames_dropped: u32,
+    /// Fragment loss/reject events observed by the client reassembler, per
+    /// the most recent `ClientStats::fragment_loss_events` window.
+    pub client_fragment_loss_events: u32,
+    /// Frames the client reassembler pruned incomplete, per the most
+    /// recent `ClientStats::incomplete_frames` window.
+    pub client_incomplete_frames: u32,
 }
 
 impl AbrSample {
     /// `true` if any congestion or loss signal fired on this sample.
     ///
-    /// `client_frames_dropped` counts here too: the client only drops
-    /// decoded frames when its render queue can't keep up, which on a
-    /// pure-network bottleneck is downstream of the same loss/RTT
-    /// pressure quinn is reporting — treating it as a loss signal
-    /// resets the healthy streak and gates the bitrate step-up.
+    /// `client_incomplete_frames` counts here too: incomplete frame
+    /// assembly is downstream of the same loss/RTT pressure quinn is
+    /// reporting, so treating it as a loss signal resets the healthy
+    /// streak and gates the bitrate step-up.
     fn has_loss(&self) -> bool {
         self.congestion_events_delta > 0
             || self.lost_packets_delta > 0
-            || self.client_fragments_lost > 0
-            || self.client_frames_dropped > 0
+            || self.client_fragment_loss_events > 0
+            || self.client_incomplete_frames > 0
     }
 }
 
@@ -331,8 +323,8 @@ mod tests {
             rtt: Duration::from_millis(20),
             congestion_events_delta: 0,
             lost_packets_delta: 0,
-            client_fragments_lost: 0,
-            client_frames_dropped: 0,
+            client_fragment_loss_events: 0,
+            client_incomplete_frames: 0,
         }
     }
 
@@ -341,8 +333,8 @@ mod tests {
             rtt: Duration::from_millis(200),
             congestion_events_delta: 0,
             lost_packets_delta: 0,
-            client_fragments_lost: 0,
-            client_frames_dropped: 0,
+            client_fragment_loss_events: 0,
+            client_incomplete_frames: 0,
         }
     }
 
@@ -351,8 +343,8 @@ mod tests {
             rtt: Duration::from_millis(200),
             congestion_events_delta: 1,
             lost_packets_delta: 5,
-            client_fragments_lost: 2,
-            client_frames_dropped: 0,
+            client_fragment_loss_events: 2,
+            client_incomplete_frames: 0,
         }
     }
 
@@ -495,15 +487,15 @@ mod tests {
         s.lost_packets_delta = 1;
         assert!(s.has_loss());
         s = healthy();
-        s.client_fragments_lost = 1;
+        s.client_fragment_loss_events = 1;
         assert!(s.has_loss());
         s = healthy();
-        s.client_frames_dropped = 1;
+        s.client_incomplete_frames = 1;
         assert!(s.has_loss());
     }
 
     #[test]
-    fn client_frames_dropped_resets_healthy_streak() {
+    fn client_incomplete_frames_resets_healthy_streak() {
         let mut c = ctl();
         // Force a fall to leave headroom for a step-up.
         c.observe(Duration::from_secs(1), loss_burst());
@@ -511,15 +503,15 @@ mod tests {
         // Two healthy samples build the streak.
         c.observe(Duration::from_secs(4), healthy());
         c.observe(Duration::from_millis(500), healthy());
-        // A frames-dropped blip resets the streak; next would-be
+        // An incomplete-frame blip resets the streak; next would-be
         // step-up should NOT fire even though the cooldown has
         // elapsed and rtt is fine.
         let mut blip = healthy();
-        blip.client_frames_dropped = 3;
+        blip.client_incomplete_frames = 3;
         let after_blip = c.observe(Duration::from_millis(500), blip).target_kbps;
         assert_eq!(
             after_blip, 1_500,
-            "client_frames_dropped should suppress the step-up"
+            "client_incomplete_frames should suppress the step-up"
         );
     }
 }

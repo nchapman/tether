@@ -43,17 +43,19 @@ const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
 
 /// Whether a `FrameReassembler::handle()` loss-counter delta warrants a
-/// `RequestRecovery`. `before`/`after` are `(frames_dropped, fragments_lost)`
-/// snapshots taken around the `handle()` call.
+/// `RequestRecovery`. `before`/`after` are reassembler
+/// `(incomplete_frames, fragment_loss_events)` snapshots taken around the
+/// `handle()` call.
 ///
-/// Fires only on a `frames_dropped` increase — a frame started but pruned
+/// Fires only on an incomplete-frame increase — a frame started but pruned
 /// before completing, the genuine "this frame will never arrive" signal.
-/// Never fires on `fragments_lost` alone: that counts stale stragglers (a late
-/// fragment for an already-finalized or already-pruned frame) and malformed
-/// packets, neither of which is independently actionable. Triggering on them
-/// would emit spurious recovery IDRs that add bandwidth and worsen congestion
-/// on an already-lossy path; a frame that truly won't complete still bumps
-/// `frames_dropped` when it's pruned, so the real signal survives.
+/// Never fires on fragment-loss events alone: that counts stale stragglers
+/// (a late fragment for an already-finalized or already-pruned frame) and
+/// malformed packets, neither of which is independently actionable. Triggering
+/// on them would emit spurious recovery IDRs that add bandwidth and worsen
+/// congestion on an already-lossy path; a frame that truly won't complete
+/// still bumps the incomplete-frame counter when it's pruned, so the real
+/// signal survives.
 fn recovery_warranted(before: (u64, u64), after: (u64, u64)) -> bool {
     after.0 > before.0
 }
@@ -590,11 +592,11 @@ async fn main() -> anyhow::Result<()> {
             warn!(error = ?e, "StreamReady send failed; host will not emit video");
         }
         let mut frame_count: u64 = 0;
-        // Reassembler cumulative counters at the start of the current
-        // stats window. Diff against the live counters to compute the
-        // per-interval drop and fragment-loss rates for ClientStats.
-        let mut last_frames_dropped: u64 = 0;
-        let mut last_fragments_lost: u64 = 0;
+        // Reassembler cumulative counters at the start of the current stats
+        // window. Diff against the live counters to compute per-window
+        // incomplete-frame and fragment-loss-event counts for ClientStats.
+        let mut last_incomplete_frames: u64 = 0;
+        let mut last_fragment_loss_events: u64 = 0;
         // Most-recent frame_seq the reassembler *completed*. Quoted in
         // RequestRecovery when the reassembler observes a stale drop, and
         // doubles as the "have we received any frame yet" sentinel that gates
@@ -736,19 +738,19 @@ async fn main() -> anyhow::Result<()> {
 
             // Snapshot loss counters around the handle() so we can see if
             // this packet's processing caused the reassembler to give up on
-            // a frame. We gate recovery on `frames_dropped` only — the count
-            // of frames started but pruned incomplete. That is the genuine
-            // "a frame will never complete" signal worth a recovery IDR.
+            // a frame. We gate recovery on incomplete frames only — the count
+            // of frames started but pruned incomplete. That is the genuine "a
+            // frame will never complete" signal worth a recovery IDR.
             //
-            // We deliberately do NOT trigger on `fragments_lost`: that counter
-            // bumps when a *straggler* fragment arrives for a frame that was
-            // already finalized or pruned, or when a malformed packet is
-            // rejected. Neither is independently actionable — by the time a
+            // We deliberately do NOT trigger on fragment-loss events: that
+            // counter bumps when a *straggler* fragment arrives for a frame
+            // that was already finalized or pruned, or when a malformed packet
+            // is rejected. Neither is independently actionable — by the time a
             // late fragment shows up the frame is already gone (recovered or
             // abandoned), so firing on it just emits spurious recovery IDRs
             // that add bandwidth and worsen congestion exactly when the path
             // is already lossy. A frame that truly won't complete still bumps
-            // `frames_dropped` when `prune_old` evicts it, so the real signal
+            // incomplete frames when `prune_old` evicts it, so the real signal
             // is not lost — only the noise.
             let pre_loss = reassembler.loss_counters();
             let result = reassembler.handle(packet);
@@ -833,32 +835,30 @@ async fn main() -> anyhow::Result<()> {
                 let window_secs = last_log.elapsed().as_secs_f64();
                 // ClientStats — host uses this to drive future
                 // adaptive bitrate / FEC strength / codec
-                // downshift decisions. Counters are diffed
-                // against last window so the wire field is a
-                // per-interval rate; rtt_ewma_us is whole-
-                // session EWMA on the QUIC RTT.
-                let (frames_dropped_now, fragments_lost_now) = reassembler.loss_counters();
-                let frames_dropped_delta =
-                    u32::try_from(frames_dropped_now.saturating_sub(last_frames_dropped))
+                // downshift decisions. Counters are per-window; rtt_us is the
+                // current QUIC RTT estimate.
+                let (incomplete_frames_now, fragment_loss_events_now) = reassembler.loss_counters();
+                let incomplete_frames =
+                    u32::try_from(incomplete_frames_now.saturating_sub(last_incomplete_frames))
                         .unwrap_or(u32::MAX);
-                let fragments_lost_delta =
-                    u32::try_from(fragments_lost_now.saturating_sub(last_fragments_lost))
-                        .unwrap_or(u32::MAX);
-                last_frames_dropped = frames_dropped_now;
-                last_fragments_lost = fragments_lost_now;
+                let fragment_loss_events = u32::try_from(
+                    fragment_loss_events_now.saturating_sub(last_fragment_loss_events),
+                )
+                .unwrap_or(u32::MAX);
+                last_incomplete_frames = incomplete_frames_now;
+                last_fragment_loss_events = fragment_loss_events_now;
                 // window_secs is a small positive duration; round-to-i64 is intentional.
                 #[allow(clippy::cast_possible_truncation)]
-                let interval_ms =
+                let window_ms =
                     u32::try_from((window_secs * 1000.0).round() as i64).unwrap_or(u32::MAX);
-                let rtt_ewma_us =
-                    u32::try_from(conn_recv.rtt().as_micros().min(u128::from(u32::MAX)))
-                        .unwrap_or(u32::MAX);
+                let rtt_us = u32::try_from(conn_recv.rtt().as_micros().min(u128::from(u32::MAX)))
+                    .unwrap_or(u32::MAX);
                 let stats = ControlMessage::ClientStats {
-                    interval_ms,
+                    window_ms,
                     frames_received: u32::try_from(frame_count).unwrap_or(u32::MAX),
-                    frames_dropped: frames_dropped_delta,
-                    fragments_lost: fragments_lost_delta,
-                    rtt_ewma_us,
+                    incomplete_frames,
+                    fragment_loss_events,
+                    rtt_us,
                 };
                 let conn_stats = conn_recv.clone();
                 tokio::spawn(async move {
@@ -895,16 +895,23 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     0.0
                 };
+                #[allow(clippy::cast_precision_loss)]
+                let fps = if window_secs > 0.0 {
+                    frame_count as f64 / window_secs
+                } else {
+                    0.0
+                };
                 info!(
-                    frames_per_s = frame_count,
-                    latency_ms = format!("{avg_latency_ms:.2}"),
-                    network_ms = format!("{avg_network_ms:.2}"),
-                    avg_decode_ms = format!("{avg_decode_ms:.2}"),
-                    kbps_in = format!("{kbps_in:.0}"),
-                    decode_errs = decode_errors,
-                    render_drops = render_drops,
-                    idr_reqs = idr_requests,
-                    decode_queue_drops,
+                    frames = frame_count,
+                    fps,
+                    avg_latency_ms,
+                    avg_network_ms,
+                    avg_decode_ms,
+                    kbps_in,
+                    decode_errors,
+                    render_drop_frames = render_drops,
+                    idr_requests,
+                    decode_queue_drop_frames = decode_queue_drops,
                     "frame stats"
                 );
                 frame_count = 0;
@@ -1494,7 +1501,7 @@ fn run_audio_playback(
                 dropouts = s.dropouts - prev_recovery.dropouts,
                 stale_packets = s.stale_packets - prev_recovery.stale_packets,
                 decode_errors = s.decode_errors - prev_recovery.decode_errors,
-                peak = format!("{peak:.4}"),
+                peak,
                 "audio playback stats"
             );
             prev_underruns = underruns;
@@ -1660,11 +1667,11 @@ mod arg_tests {
 
     #[test]
     fn recovery_fires_only_on_a_pruned_frame_not_a_straggler() {
-        // (frames_dropped, fragments_lost)
-        // A frame pruned incomplete (frames_dropped++) → recover.
+        // (incomplete_frames, fragment_loss_events)
+        // A frame pruned incomplete (incomplete_frames++) → recover.
         assert!(recovery_warranted((0, 0), (1, 0)));
-        // A stale straggler / malformed packet (fragments_lost++ only) →
-        // do NOT recover; it's not independently actionable.
+        // A stale straggler / malformed packet (fragment_loss_events++ only)
+        // → do NOT recover; it's not independently actionable.
         assert!(!recovery_warranted((0, 0), (0, 1)));
         // Both moving still recovers — the dropped frame is the reason.
         assert!(recovery_warranted((0, 0), (1, 1)));

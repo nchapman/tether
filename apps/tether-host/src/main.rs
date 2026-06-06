@@ -744,11 +744,12 @@ async fn handle_client(
     // no-op.
     let send_exited = Arc::new(tokio::sync::Notify::new());
     let send_exited_for_thread = send_exited.clone();
-    // Set once a typed shutdown reason has crossed the control stream in either
-    // direction. Prevents the final teardown from overwriting a specific peer
-    // Goodbye / protocol error / fatal send-loop Goodbye with a generic clean
-    // "session ended" notice.
-    let shutdown_notice_sent_or_received = Arc::new(AtomicBool::new(false));
+    // Set once this side has sent a typed shutdown reason on the control
+    // stream. Prevents the final teardown from overwriting a specific protocol
+    // error / fatal send-loop Goodbye with a generic clean "session ended"
+    // notice, while still allowing a reciprocal stats-bearing Goodbye when the
+    // peer initiates shutdown.
+    let shutdown_notice_sent = Arc::new(AtomicBool::new(false));
     // Drop-oldest single-slot mailbox for the most recent `ClientStats`
     // window. Written by the control recv task, drained by the
     // encode-and-send thread on each loop iteration.
@@ -772,7 +773,7 @@ async fn handle_client(
     let stream_ready_for_thread = stream_ready.clone();
     let latest_client_stats_for_send = latest_client_stats.clone();
     let latest_viewport_for_send = latest_viewport.clone();
-    let shutdown_notice_for_send = shutdown_notice_sent_or_received.clone();
+    let shutdown_notice_for_send = shutdown_notice_sent.clone();
     let session_summary_for_send = session_summary.clone();
     // The sync send thread is not a tokio worker, so it uses the
     // runtime handle only for the few async control sends needed on
@@ -860,7 +861,7 @@ async fn handle_client(
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
         let force_idr_for_viewport = force_idr.clone();
-        let shutdown_notice_for_ctl = shutdown_notice_sent_or_received.clone();
+        let shutdown_notice_for_ctl = shutdown_notice_sent.clone();
         let session_summary_for_ctl = session_summary.clone();
         tasks.spawn(async move {
             // Per-message rate limit for IDR-triggering control messages.
@@ -886,10 +887,6 @@ async fn handle_client(
                         }
                         last_idr_request = Some(now);
                         tracing::debug!("client requested IDR");
-                        session_summary_for_ctl
-                            .video
-                            .idr_requests
-                            .fetch_add(1, Ordering::Relaxed);
                         force_idr.raise();
                     }
                     Ok(ControlMessage::SetCursorMode { mode }) => {
@@ -934,10 +931,6 @@ async fn handle_client(
                             last_reassembled_frame_id,
                             "client requested recovery; emitting forced IDR"
                         );
-                        session_summary_for_ctl
-                            .video
-                            .idr_requests
-                            .fetch_add(1, Ordering::Relaxed);
                         force_idr.raise();
                     }
                     Ok(ControlMessage::StreamReady { video, audio }) => {
@@ -987,26 +980,6 @@ async fn handle_client(
                             fec_recovered_fragments,
                             "client stats"
                         );
-                        session_summary_for_ctl
-                            .video
-                            .frames_received
-                            .fetch_add(u64::from(frames_received), Ordering::Relaxed);
-                        session_summary_for_ctl
-                            .video
-                            .incomplete_frames
-                            .fetch_add(u64::from(incomplete_frames), Ordering::Relaxed);
-                        session_summary_for_ctl
-                            .video
-                            .fragment_loss_events
-                            .fetch_add(u64::from(fragment_loss_events), Ordering::Relaxed);
-                        session_summary_for_ctl
-                            .video
-                            .fec_recovered_frames
-                            .fetch_add(u64::from(fec_recovered_frames), Ordering::Relaxed);
-                        session_summary_for_ctl
-                            .video
-                            .fec_recovered_fragments
-                            .fetch_add(u64::from(fec_recovered_fragments), Ordering::Relaxed);
                         // Drop-oldest: the ABR controller only needs
                         // the most recent window. If the send thread
                         // hasn't drained yet (slow encoder loop), the
@@ -1095,9 +1068,25 @@ async fn handle_client(
                         code,
                         final_stats,
                     }) => {
-                        shutdown_notice_for_ctl.store(true, Ordering::Release);
                         info!(event = "peer_goodbye", %reason, ?code, "client said goodbye");
                         log_peer_session_summary("client", final_stats.as_deref());
+                        if !shutdown_notice_for_ctl.swap(true, Ordering::AcqRel) {
+                            let ack_reason = "host acknowledged client goodbye";
+                            let sent = send_goodbye_notice(
+                                &conn,
+                                ack_reason,
+                                GoodbyeCode::Clean,
+                                &session_summary_for_ctl,
+                            )
+                            .await;
+                            info!(
+                                event = "session_teardown",
+                                reason = ack_reason,
+                                code = ?GoodbyeCode::Clean,
+                                sent,
+                                "host session shutdown notice"
+                            );
+                        }
                         return;
                     }
                     Ok(ControlMessage::Extension(msg)) => {
@@ -1320,7 +1309,7 @@ async fn handle_client(
         }
     };
 
-    if !shutdown_notice_sent_or_received.swap(true, Ordering::AcqRel) {
+    if !shutdown_notice_sent.swap(true, Ordering::AcqRel) {
         let sent =
             send_goodbye_notice(&conn, teardown_reason, teardown_code, &session_summary).await;
         info!(
@@ -1394,12 +1383,12 @@ async fn send_goodbye_notice(
 fn send_goodbye_notice_blocking(
     runtime: &tokio::runtime::Handle,
     conn: &Connection,
-    sent_or_received: &AtomicBool,
+    sent: &AtomicBool,
     reason: &str,
     code: GoodbyeCode,
     summary: &SessionSummaryState,
 ) {
-    if sent_or_received.swap(true, Ordering::AcqRel) {
+    if sent.swap(true, Ordering::AcqRel) {
         return;
     }
     let sent = runtime.block_on(send_goodbye_notice(conn, reason, code, summary));
@@ -3078,7 +3067,7 @@ fn run_capture_and_send(
     latest_client_stats: LatestClientStats,
     latest_viewport: LatestViewport,
     send_exited: Arc<tokio::sync::Notify>,
-    shutdown_notice_sent_or_received: Arc<AtomicBool>,
+    shutdown_notice_sent: Arc<AtomicBool>,
     summary: Arc<SessionSummaryState>,
 ) {
     // RAII: notify handle_client on *any* exit from this function —
@@ -3388,7 +3377,7 @@ fn run_capture_and_send(
                     send_goodbye_notice_blocking(
                         &runtime,
                         &conn,
-                        &shutdown_notice_sent_or_received,
+                        &shutdown_notice_sent,
                         reason.as_str(),
                         GoodbyeCode::InternalError,
                         &summary,
@@ -3462,7 +3451,7 @@ fn run_capture_and_send(
                     send_goodbye_notice_blocking(
                         &runtime,
                         &conn,
-                        &shutdown_notice_sent_or_received,
+                        &shutdown_notice_sent,
                         reason.as_str(),
                         GoodbyeCode::InternalError,
                         &summary,
@@ -3487,7 +3476,7 @@ fn run_capture_and_send(
                         send_goodbye_notice_blocking(
                             &runtime,
                             &conn,
-                            &shutdown_notice_sent_or_received,
+                            &shutdown_notice_sent,
                             reason.as_str(),
                             GoodbyeCode::InternalError,
                             &summary,
@@ -3542,7 +3531,17 @@ fn run_capture_and_send(
         // pre-sized `BytesMut`.
         let mut keyframe = false;
         let body: tether_codec::bytes::Bytes = match encoded.len() {
-            0 => continue,
+            0 => {
+                if force_kf {
+                    forced_idr_misses = forced_idr_misses.saturating_add(1);
+                    summary
+                        .video
+                        .forced_idr_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(pts, "encoder produced no packet for a forced-IDR request");
+                }
+                continue;
+            }
             1 => {
                 let pkt = encoded.into_iter().next().expect("len == 1");
                 keyframe = pkt.keyframe;
@@ -3561,6 +3560,17 @@ fn run_capture_and_send(
             }
         };
         if body.is_empty() {
+            if force_kf {
+                forced_idr_misses = forced_idr_misses.saturating_add(1);
+                summary
+                    .video
+                    .forced_idr_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    pts,
+                    "encoder produced an empty body for a forced-IDR request"
+                );
+            }
             continue;
         }
         let body_len = body.len() as u64;
@@ -3575,8 +3585,6 @@ fn run_capture_and_send(
                 body_len, "encoder did not emit a keyframe for a forced-IDR request"
             );
         }
-        stats.record_frame(encode_delta_ns, body_len, keyframe);
-
         let meta = VideoFrameMeta {
             timing: timing.finish(),
             keyframe,
@@ -3622,7 +3630,16 @@ fn run_capture_and_send(
                     sent_frame = false;
                     break;
                 }
-                warn!(error = ?e, "send_datagram failed (fatal), terminating send loop");
+                let reason = format!("host video datagram send failed: {e:?}");
+                warn!(error = ?e, "send_datagram failed (fatal), sending Goodbye(InternalError)");
+                send_goodbye_notice_blocking(
+                    &runtime,
+                    &conn,
+                    &shutdown_notice_sent,
+                    reason.as_str(),
+                    GoodbyeCode::InternalError,
+                    &summary,
+                );
                 return;
             }
             datagrams_sent = datagrams_sent.saturating_add(1);
@@ -3659,11 +3676,13 @@ fn run_capture_and_send(
                     .max_keyframe_bytes
                     .fetch_max(body_len, Ordering::Relaxed);
             }
+            stats.record_frame(encode_delta_ns, body_len, keyframe);
+            // Accumulated only for frames that complete encode + send;
+            // damage-skipped, rebuild-failed, and transient-send-dropped frames
+            // are excluded, so this is the handoff age of frames that actually
+            // reach the wire.
+            stage_latency.record(capture_age_ns, send_t0.elapsed().as_nanos() as u64);
         }
-        // Accumulated only for frames that complete encode + send;
-        // damage-skipped and rebuild-failed frames are excluded, so this
-        // is the handoff age of frames that actually reach the wire.
-        stage_latency.record(capture_age_ns, send_t0.elapsed().as_nanos() as u64);
 
         if stats.should_emit() {
             if let Some(snap) = stats.snapshot_and_reset() {

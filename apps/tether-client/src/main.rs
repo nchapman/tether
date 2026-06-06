@@ -13,7 +13,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -326,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
         negotiated_profile,
         false,
     ));
+    let shutdown_notice_sent = Arc::new(AtomicBool::new(false));
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -347,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         let conn = conn.clone();
         let cursor_channel_ctrl = cursor_channel.clone();
         let session_summary = session_summary.clone();
+        let shutdown_notice_sent = shutdown_notice_sent.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_control().await {
@@ -390,6 +392,14 @@ async fn main() -> anyhow::Result<()> {
                     }) => {
                         info!(event = "peer_goodbye", %reason, ?code, "host said goodbye");
                         log_peer_session_summary("host", final_stats.as_deref());
+                        say_goodbye_once(
+                            &conn,
+                            "client acknowledged host goodbye",
+                            GoodbyeCode::Clean,
+                            &session_summary,
+                            &shutdown_notice_sent,
+                        )
+                        .await;
                         return;
                     }
                     Ok(ControlMessage::Extension(msg)) => {
@@ -400,13 +410,15 @@ async fn main() -> anyhow::Result<()> {
                             payload_len = msg.payload.len(),
                             "unnegotiated control extension; closing session"
                         );
-                        let _ = conn
-                            .send_control(&ControlMessage::Goodbye {
-                                reason: format!("unnegotiated extension {}", msg.key),
-                                code: GoodbyeCode::ProtocolError,
-                                final_stats: Some(Box::new(session_summary.snapshot())),
-                            })
-                            .await;
+                        let reason = format!("unnegotiated extension {}", msg.key);
+                        say_goodbye_once(
+                            &conn,
+                            reason.as_str(),
+                            GoodbyeCode::ProtocolError,
+                            &session_summary,
+                            &shutdown_notice_sent,
+                        )
+                        .await;
                         return;
                     }
                     Ok(ControlMessage::CursorShape {
@@ -584,6 +596,7 @@ async fn main() -> anyhow::Result<()> {
 
     let conn_for_recovery_send = conn.clone();
     let session_summary_for_recv = session_summary.clone();
+    let shutdown_notice_for_recv = shutdown_notice_sent.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
         if decoder_ready_rx.await.is_err() {
@@ -593,16 +606,17 @@ async fn main() -> anyhow::Result<()> {
             // Goodbye(InternalError) before exiting — otherwise the
             // host keeps encoding into a black hole until idle
             // timeout, and the user sees a frozen window with no
-            // explanation. `say_goodbye_with_code` closes the
+            // explanation. `say_goodbye_once` closes the
             // connection as part of its shutdown.
             error!(
                 "decode thread failed to initialise; sending Goodbye(InternalError) and exiting"
             );
-            say_goodbye_with_code(
+            say_goodbye_once(
                 &conn_ready,
                 "client decoder failed to initialise",
                 GoodbyeCode::InternalError,
                 &session_summary_for_recv,
+                &shutdown_notice_for_recv,
             )
             .await;
             return;
@@ -800,8 +814,32 @@ async fn main() -> anyhow::Result<()> {
             // incomplete frames when `prune_old` evicts it, so the real signal
             // is not lost — only the noise.
             let pre_loss = reassembler.loss_counters();
+            let pre_recovery = reassembler.recovery_counters();
             let result = reassembler.handle(packet);
             let post_loss = reassembler.loss_counters();
+            let post_recovery = reassembler.recovery_counters();
+            session_summary_for_recv
+                .video
+                .incomplete_frames
+                .fetch_add(post_loss.0.saturating_sub(pre_loss.0), Ordering::Relaxed);
+            session_summary_for_recv
+                .video
+                .fragment_loss_events
+                .fetch_add(post_loss.1.saturating_sub(pre_loss.1), Ordering::Relaxed);
+            session_summary_for_recv
+                .video
+                .fec_recovered_frames
+                .fetch_add(
+                    post_recovery.0.saturating_sub(pre_recovery.0),
+                    Ordering::Relaxed,
+                );
+            session_summary_for_recv
+                .video
+                .fec_recovered_fragments
+                .fetch_add(
+                    post_recovery.1.saturating_sub(pre_recovery.1),
+                    Ordering::Relaxed,
+                );
             if recovery_warranted(pre_loss, post_loss) {
                 if let Some(last_reassembled) = last_reassembled_frame_seq {
                     let now = MonoNanos::now();
@@ -952,22 +990,6 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(u32::MAX);
                 last_fec_recovered_frames = fec_recovered_frames_now;
                 last_fec_recovered_fragments = fec_recovered_fragments_now;
-                session_summary_for_recv
-                    .video
-                    .incomplete_frames
-                    .fetch_add(u64::from(incomplete_frames), Ordering::Relaxed);
-                session_summary_for_recv
-                    .video
-                    .fragment_loss_events
-                    .fetch_add(u64::from(fragment_loss_events), Ordering::Relaxed);
-                session_summary_for_recv
-                    .video
-                    .fec_recovered_frames
-                    .fetch_add(u64::from(fec_recovered_frames), Ordering::Relaxed);
-                session_summary_for_recv
-                    .video
-                    .fec_recovered_fragments
-                    .fetch_add(u64::from(fec_recovered_fragments), Ordering::Relaxed);
                 // window_secs is a small positive duration; round-to-i64 is intentional.
                 #[allow(clippy::cast_possible_truncation)]
                 let window_ms =
@@ -1213,6 +1235,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let conn = conn.clone();
         let session_summary = session_summary.clone();
+        let shutdown_notice_sent = shutdown_notice_sent.clone();
         tokio::spawn(async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
                 warn!(error = %e, "ctrl-c handler failed; exiting anyway");
@@ -1222,7 +1245,13 @@ async fn main() -> anyhow::Result<()> {
             reporter.emit(&EngineEvent::Disconnected {
                 reason: "interrupted".to_string(),
             });
-            say_goodbye(&conn, "client interrupted", &session_summary).await;
+            say_goodbye(
+                &conn,
+                "client interrupted",
+                &session_summary,
+                &shutdown_notice_sent,
+            )
+            .await;
             std::process::exit(0);
         });
     }
@@ -1235,13 +1264,20 @@ async fn main() -> anyhow::Result<()> {
     if reporter.is_json() {
         let conn = conn.clone();
         let session_summary = session_summary.clone();
+        let shutdown_notice_sent = shutdown_notice_sent.clone();
         tokio::spawn(async move {
             wait_for_stdin_stop().await;
             info!("shell stop received; sending Goodbye and exiting");
             reporter.emit(&EngineEvent::Disconnected {
                 reason: "stopped by shell".to_string(),
             });
-            say_goodbye(&conn, "client stopped", &session_summary).await;
+            say_goodbye(
+                &conn,
+                "client stopped",
+                &session_summary,
+                &shutdown_notice_sent,
+            )
+            .await;
             std::process::exit(0);
         });
     }
@@ -1270,7 +1306,13 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => format!("render error: {e}"),
     };
     reporter.emit(&EngineEvent::Disconnected { reason });
-    say_goodbye(&conn, "client closing", &session_summary).await;
+    say_goodbye(
+        &conn,
+        "client closing",
+        &session_summary,
+        &shutdown_notice_sent,
+    )
+    .await;
 
     // In `--ipc` mode the stdin stop-watcher parks a `tokio::io::stdin()`
     // blocking read that can't be cancelled, so letting `main` return would
@@ -1341,8 +1383,25 @@ async fn say_goodbye(
     conn: &tether_transport::Connection,
     reason: &str,
     summary: &SessionSummaryState,
+    sent: &AtomicBool,
 ) {
-    say_goodbye_with_code(conn, reason, GoodbyeCode::Clean, summary).await;
+    say_goodbye_once(conn, reason, GoodbyeCode::Clean, summary, sent).await;
+}
+
+/// Send local final stats once and close the connection. The `sent` guard
+/// prevents a reciprocal Goodbye from echoing forever when both peers exchange
+/// shutdown summaries.
+async fn say_goodbye_once(
+    conn: &tether_transport::Connection,
+    reason: &str,
+    code: GoodbyeCode,
+    summary: &SessionSummaryState,
+    sent: &AtomicBool,
+) {
+    if sent.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    say_goodbye_with_code(conn, reason, code, summary).await;
 }
 
 /// Variant that lets the caller signal *why* the session ended.
@@ -1603,6 +1662,9 @@ fn run_audio_playback(
     let mut prev_underruns: u64 = 0;
     let mut prev_dropped_samples: u64 = 0;
     let mut prev_recovery = tether_audio::RecoveryStats::default();
+    let mut summary_prev_underruns: u64 = 0;
+    let mut summary_prev_dropped_samples: u64 = 0;
+    let mut summary_prev_recovery = tether_audio::RecoveryStats::default();
     // Peak |sample| of decoded audio since the last log. ~0 means the frames
     // arriving are silent (the silence is upstream — capture/encode), which
     // distinguishes that from a local output-routing problem where non-zero
@@ -1639,19 +1701,24 @@ fn run_audio_playback(
             }
             sink.submit(pcm);
         });
+        let (summary_underruns, summary_dropped_samples, _) = sink.stats();
+        let summary_recovery = recovery.stats();
+        record_audio_playback_summary_delta(
+            &summary,
+            summary_underruns,
+            summary_prev_underruns,
+            summary_dropped_samples,
+            summary_prev_dropped_samples,
+            summary_recovery,
+            summary_prev_recovery,
+        );
+        summary_prev_underruns = summary_underruns;
+        summary_prev_dropped_samples = summary_dropped_samples;
+        summary_prev_recovery = summary_recovery;
 
         if last_stats_log.elapsed() >= STATS_INTERVAL {
             let (underruns, dropped_samples, buffered) = sink.stats();
             let s = recovery.stats();
-            record_audio_playback_summary_delta(
-                &summary,
-                underruns,
-                prev_underruns,
-                dropped_samples,
-                prev_dropped_samples,
-                s,
-                prev_recovery,
-            );
             // `buffered` is interleaved samples → wall-clock so drift toward an
             // underrun (→ 0 ms) or the latency cap is legible at a glance. The
             // counters are deltas over this interval (totals climb forever and
@@ -1685,11 +1752,11 @@ fn run_audio_playback(
     record_audio_playback_summary_delta(
         &summary,
         underruns,
-        prev_underruns,
+        summary_prev_underruns,
         dropped_samples,
-        prev_dropped_samples,
+        summary_prev_dropped_samples,
         s,
-        prev_recovery,
+        summary_prev_recovery,
     );
 
     // Channel closed: drop the player to stop the output stream.

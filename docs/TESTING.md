@@ -231,6 +231,12 @@ Minimum matrix before calling a protocol/session change live-ready:
 - One audio-enabled run per platform pair where both sides support audio, plus
   one host `--no-audio` run to verify negotiation disables it cleanly.
 
+Before each cross-device run, capture a basic network sanity baseline on the
+same path: sustained throughput, packet loss, jitter, and the effective MTU. A
+quiet LAN should show no sustained loss and low jitter; if those are bad, keep
+that result attached to the session logs so protocol symptoms are not diagnosed
+in isolation.
+
 For each run, verify lifecycle events in order:
 
 1. `event="handshake_start"` appears on both peers.
@@ -249,22 +255,35 @@ For each run, verify lifecycle events in order:
 
 For steady-state video, collect at least 30 seconds of logs after stream-ready:
 
-- Host `send stats`: `frames`, `avg_capture_age_ms`, `avg_encode_ms`,
-  `avg_send_ms`, `kbps_out`, `keyframes_per_s`,
-  `transient_send_drop_frames`.
-- Client `frame stats`: `frames`, `fps`, `avg_latency_ms`, `avg_network_ms`,
-  `avg_decode_ms`, `kbps_in`, `decode_errors`, `render_drop_frames`,
-  `idr_requests`, `decode_queue_drop_frames`.
+- Host `send stats`: `frames`, `avg_capture_age_ms`,
+  `min_capture_age_ms`, `max_capture_age_ms`, `avg_encode_ms`,
+  `min_encode_ms`, `max_encode_ms`, `avg_send_ms`, `min_send_ms`,
+  `max_send_ms`, `kbps_out`, `keyframes_per_s`, `datagrams_sent`,
+  `parity_datagrams_sent`, `max_datagrams_per_frame`, `max_frame_bytes`,
+  `max_keyframe_bytes`, `forced_idr_misses`, `transient_send_drop_frames`.
+- Client `frame stats`: `frames`, `fps`, `avg_latency_ms`,
+  `min_latency_ms`, `max_latency_ms`, `avg_network_ms`, `min_network_ms`,
+  `max_network_ms`, `avg_decode_ms`, `min_decode_ms`, `max_decode_ms`,
+  `kbps_in`, `decode_errors`, `render_drop_frames`, `idr_requests`,
+  `decode_queue_drop_frames`, `fec_recovered_frames`,
+  `fec_recovered_fragments`.
 - Host `client stats`: `window_ms`, `frames_received`, `incomplete_frames`,
-  `fragment_loss_events`, `rtt_us`.
+  `fragment_loss_events`, `rtt_us`, `fec_recovered_frames`,
+  `fec_recovered_fragments`.
 
 Red flags that should block sign-off until explained:
 
 - Missing `stream_ready` on either side.
 - `send stats` present but no client `frame stats`.
 - Sustained `incomplete_frames > 0` or `fragment_loss_events > 0` on a quiet LAN.
+- Sustained FEC recovery on a quiet LAN, or `fec_recovered_frames` rising
+  immediately before `incomplete_frames`; this means FEC is masking real loss
+  until bursts exceed parity.
 - `decode_errors`, `decode_queue_drop_frames`, or `render_drop_frames` rising in
   every window.
+- `forced_idr_misses > 0`; a hardware encoder ignored a recovery request.
+- Large jumps in `max_datagrams_per_frame`, `max_frame_bytes`, or
+  `max_keyframe_bytes` that coincide with RTT/loss spikes.
 - `kbps_out` and `kbps_in` diverging materially without matching loss counters.
 - More than one teardown reason for one session, or a generic clean teardown
   after an earlier fatal/protocol error.

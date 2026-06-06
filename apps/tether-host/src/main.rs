@@ -46,7 +46,7 @@ use tether_protocol::control::{
     GoodbyeCode, VideoProfile, VideoStreamId, Viewport,
 };
 use tether_protocol::video::{
-    FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
+    FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta, VideoPacket,
 };
 use tether_protocol::MonoNanos;
 #[cfg(target_os = "linux")]
@@ -974,6 +974,8 @@ async fn handle_client(
                         incomplete_frames,
                         fragment_loss_events,
                         rtt_us,
+                        fec_recovered_frames,
+                        fec_recovered_fragments,
                     }) => {
                         info!(
                             window_ms,
@@ -981,6 +983,8 @@ async fn handle_client(
                             incomplete_frames,
                             fragment_loss_events,
                             rtt_us,
+                            fec_recovered_frames,
+                            fec_recovered_fragments,
                             "client stats"
                         );
                         session_summary_for_ctl
@@ -995,6 +999,14 @@ async fn handle_client(
                             .video
                             .fragment_loss_events
                             .fetch_add(u64::from(fragment_loss_events), Ordering::Relaxed);
+                        session_summary_for_ctl
+                            .video
+                            .fec_recovered_frames
+                            .fetch_add(u64::from(fec_recovered_frames), Ordering::Relaxed);
+                        session_summary_for_ctl
+                            .video
+                            .fec_recovered_fragments
+                            .fetch_add(u64::from(fec_recovered_fragments), Ordering::Relaxed);
                         // Drop-oldest: the ABR controller only needs
                         // the most recent window. If the send thread
                         // hasn't drained yet (slow encoder loop), the
@@ -2879,13 +2891,26 @@ struct StageLatency {
     frames: u64,
     capture_age_ns: u64,
     send_ns: u64,
+    min_capture_age_ns: u64,
+    max_capture_age_ns: u64,
+    min_send_ns: u64,
+    max_send_ns: u64,
 }
 
 impl StageLatency {
     fn record(&mut self, capture_age_ns: u64, send_ns: u64) {
+        if self.frames == 0 {
+            self.min_capture_age_ns = capture_age_ns;
+            self.min_send_ns = send_ns;
+        } else {
+            self.min_capture_age_ns = self.min_capture_age_ns.min(capture_age_ns);
+            self.min_send_ns = self.min_send_ns.min(send_ns);
+        }
         self.frames += 1;
         self.capture_age_ns += capture_age_ns;
         self.send_ns += send_ns;
+        self.max_capture_age_ns = self.max_capture_age_ns.max(capture_age_ns);
+        self.max_send_ns = self.max_send_ns.max(send_ns);
     }
 
     /// Mean of `sum_ns` over recorded frames, in milliseconds.
@@ -2894,6 +2919,14 @@ impl StageLatency {
             0.0
         } else {
             sum_ns as f64 / frames as f64 / 1_000_000.0
+        }
+    }
+
+    fn ns_to_ms(ns: u64, frames: u64) -> f64 {
+        if frames == 0 {
+            0.0
+        } else {
+            ns as f64 / 1_000_000.0
         }
     }
 }
@@ -3084,6 +3117,12 @@ fn run_capture_and_send(
     // per-window rates, so a flapping path shows up as recent drops rather than
     // a silent monotonic total.
     let mut transient_send_drops: u64 = 0;
+    let mut datagrams_sent: u64 = 0;
+    let mut parity_datagrams_sent: u64 = 0;
+    let mut max_datagrams_per_frame: u64 = 0;
+    let mut max_frame_bytes: u64 = 0;
+    let mut max_keyframe_bytes: u64 = 0;
+    let mut forced_idr_misses: u64 = 0;
     // Per-stage latency (handoff + send), averaged over the same window
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
@@ -3525,6 +3564,17 @@ fn run_capture_and_send(
             continue;
         }
         let body_len = body.len() as u64;
+        if force_kf && !keyframe {
+            forced_idr_misses = forced_idr_misses.saturating_add(1);
+            summary
+                .video
+                .forced_idr_misses
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                pts,
+                body_len, "encoder did not emit a keyframe for a forced-IDR request"
+            );
+        }
         stats.record_frame(encode_delta_ns, body_len, keyframe);
 
         let meta = VideoFrameMeta {
@@ -3549,7 +3599,10 @@ fn run_capture_and_send(
                 m.min(tether_protocol::MAX_DATAGRAM_PAYLOAD)
             });
         let mut sent_frame = true;
-        for packet in fragmenter.fragment(meta, body, budget) {
+        let packets = fragmenter.fragment(meta, body, budget);
+        let planned_frame_datagrams = u64::try_from(packets.len()).unwrap_or(u64::MAX);
+        for packet in packets {
+            let is_parity = matches!(&packet, VideoPacket::Parity { .. });
             if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
                 if e.is_transient_send() {
                     // MTU shrank mid-frame (PLPMTUD black-hole / path change),
@@ -3572,15 +3625,39 @@ fn run_capture_and_send(
                 warn!(error = ?e, "send_datagram failed (fatal), terminating send loop");
                 return;
             }
+            datagrams_sent = datagrams_sent.saturating_add(1);
+            summary.video.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+            if is_parity {
+                parity_datagrams_sent = parity_datagrams_sent.saturating_add(1);
+                summary
+                    .video
+                    .parity_datagrams_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         if sent_frame {
+            max_datagrams_per_frame = max_datagrams_per_frame.max(planned_frame_datagrams);
+            max_frame_bytes = max_frame_bytes.max(body_len);
             summary.video.frames_sent.fetch_add(1, Ordering::Relaxed);
             summary
                 .video
                 .bytes_sent
                 .fetch_add(body_len, Ordering::Relaxed);
+            summary
+                .video
+                .max_datagrams_per_frame
+                .fetch_max(planned_frame_datagrams, Ordering::Relaxed);
+            summary
+                .video
+                .max_frame_bytes
+                .fetch_max(body_len, Ordering::Relaxed);
             if keyframe {
                 summary.video.keyframes.fetch_add(1, Ordering::Relaxed);
+                max_keyframe_bytes = max_keyframe_bytes.max(body_len);
+                summary
+                    .video
+                    .max_keyframe_bytes
+                    .fetch_max(body_len, Ordering::Relaxed);
             }
         }
         // Accumulated only for frames that complete encode + send;
@@ -3603,17 +3680,43 @@ fn run_capture_and_send(
                     frames = snap.frame_count,
                     avg_capture_age_ms =
                         StageLatency::avg_ms(stage_latency.capture_age_ns, stage_latency.frames),
+                    min_capture_age_ms = StageLatency::ns_to_ms(
+                        stage_latency.min_capture_age_ns,
+                        stage_latency.frames
+                    ),
+                    max_capture_age_ms = StageLatency::ns_to_ms(
+                        stage_latency.max_capture_age_ns,
+                        stage_latency.frames
+                    ),
                     avg_encode_ms = snap.avg_encode_ms,
+                    min_encode_ms = snap.min_encode_ms,
+                    max_encode_ms = snap.max_encode_ms,
                     avg_send_ms = StageLatency::avg_ms(stage_latency.send_ns, stage_latency.frames),
+                    min_send_ms =
+                        StageLatency::ns_to_ms(stage_latency.min_send_ns, stage_latency.frames),
+                    max_send_ms =
+                        StageLatency::ns_to_ms(stage_latency.max_send_ns, stage_latency.frames),
                     kbps_out = snap.kbps_out,
                     keyframes_per_s = kf_per_s,
                     transient_send_drop_frames = transient_send_drops,
+                    datagrams_sent,
+                    parity_datagrams_sent,
+                    max_datagrams_per_frame,
+                    max_frame_bytes = max_frame_bytes.max(snap.max_frame_bytes),
+                    max_keyframe_bytes,
+                    forced_idr_misses,
                     "send stats"
                 );
                 stage_latency = StageLatency::default();
                 // Per-window like the rates above: zero so the next log shows
                 // drops in that window, not a monotonic lifetime total.
                 transient_send_drops = 0;
+                datagrams_sent = 0;
+                parity_datagrams_sent = 0;
+                max_datagrams_per_frame = 0;
+                max_frame_bytes = 0;
+                max_keyframe_bytes = 0;
+                forced_idr_misses = 0;
             }
         }
     }
@@ -3974,6 +4077,10 @@ mod tests {
         assert_eq!(s.frames, 2);
         assert!((StageLatency::avg_ms(s.capture_age_ns, s.frames) - 2.0).abs() < 1e-9);
         assert!((StageLatency::avg_ms(s.send_ns, s.frames) - 3.0).abs() < 1e-9);
+        assert!((StageLatency::ns_to_ms(s.min_capture_age_ns, s.frames) - 1.0).abs() < 1e-9);
+        assert!((StageLatency::ns_to_ms(s.max_capture_age_ns, s.frames) - 3.0).abs() < 1e-9);
+        assert!((StageLatency::ns_to_ms(s.min_send_ns, s.frames) - 2.0).abs() < 1e-9);
+        assert!((StageLatency::ns_to_ms(s.max_send_ns, s.frames) - 4.0).abs() < 1e-9);
     }
     use std::sync::Arc;
     use tokio::task::JoinSet;

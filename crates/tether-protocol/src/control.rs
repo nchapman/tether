@@ -552,6 +552,14 @@ pub struct VideoSessionStats {
     pub idr_requests: u64,
     pub decode_queue_drop_frames: u64,
     pub transient_send_drop_frames: u64,
+    pub fec_recovered_frames: u64,
+    pub fec_recovered_fragments: u64,
+    pub datagrams_sent: u64,
+    pub parity_datagrams_sent: u64,
+    pub max_datagrams_per_frame: u64,
+    pub max_frame_bytes: u64,
+    pub max_keyframe_bytes: u64,
+    pub forced_idr_misses: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -695,13 +703,16 @@ pub enum ControlMessage {
     /// Client → host. Periodic receive-side telemetry (1 Hz typical).
     /// Feeds adaptive-bitrate / FEC / codec-downshift policy on the host.
     /// Count fields are per the elapsed `window_ms`; `rtt_us` is the
-    /// client's current QUIC RTT estimate.
+    /// client's current QUIC RTT estimate. FEC recovery counts are successful
+    /// repairs only; failed incomplete frames are reported separately.
     ClientStats {
         window_ms: u32,
         frames_received: u32,
         incomplete_frames: u32,
         fragment_loss_events: u32,
         rtt_us: u32,
+        fec_recovered_frames: u32,
+        fec_recovered_fragments: u32,
     },
     /// Either side → other. Switch the cursor input model. Toggles
     /// mid-session without renegotiating; the receiver echoes the
@@ -1267,6 +1278,14 @@ fn video_session_stats_to_pb(value: VideoSessionStats) -> pb::VideoSessionStats 
         idr_requests: value.idr_requests,
         decode_queue_drop_frames: value.decode_queue_drop_frames,
         transient_send_drop_frames: value.transient_send_drop_frames,
+        fec_recovered_frames: value.fec_recovered_frames,
+        fec_recovered_fragments: value.fec_recovered_fragments,
+        datagrams_sent: value.datagrams_sent,
+        parity_datagrams_sent: value.parity_datagrams_sent,
+        max_datagrams_per_frame: value.max_datagrams_per_frame,
+        max_frame_bytes: value.max_frame_bytes,
+        max_keyframe_bytes: value.max_keyframe_bytes,
+        forced_idr_misses: value.forced_idr_misses,
     }
 }
 
@@ -1284,6 +1303,14 @@ fn video_session_stats_from_pb(value: pb::VideoSessionStats) -> VideoSessionStat
         idr_requests: value.idr_requests,
         decode_queue_drop_frames: value.decode_queue_drop_frames,
         transient_send_drop_frames: value.transient_send_drop_frames,
+        fec_recovered_frames: value.fec_recovered_frames,
+        fec_recovered_fragments: value.fec_recovered_fragments,
+        datagrams_sent: value.datagrams_sent,
+        parity_datagrams_sent: value.parity_datagrams_sent,
+        max_datagrams_per_frame: value.max_datagrams_per_frame,
+        max_frame_bytes: value.max_frame_bytes,
+        max_keyframe_bytes: value.max_keyframe_bytes,
+        forced_idr_misses: value.forced_idr_misses,
     }
 }
 
@@ -1553,12 +1580,16 @@ impl ReliableMessage for ControlMessage {
                 incomplete_frames,
                 fragment_loss_events,
                 rtt_us,
+                fec_recovered_frames,
+                fec_recovered_fragments,
             } => Kind::ClientStats(pb::ClientStats {
                 window_ms,
                 frames_received,
                 incomplete_frames,
                 fragment_loss_events,
                 rtt_us,
+                fec_recovered_frames,
+                fec_recovered_fragments,
             }),
             ControlMessage::SetCursorMode { mode } => Kind::SetCursorMode(pb::SetCursorMode {
                 mode: cursor_mode_to_pb(mode),
@@ -1684,6 +1715,8 @@ impl ReliableMessage for ControlMessage {
                 incomplete_frames: v.incomplete_frames,
                 fragment_loss_events: v.fragment_loss_events,
                 rtt_us: v.rtt_us,
+                fec_recovered_frames: v.fec_recovered_frames,
+                fec_recovered_fragments: v.fec_recovered_fragments,
             }),
             Kind::SetCursorMode(v) => Ok(ControlMessage::SetCursorMode {
                 mode: cursor_mode_from_pb(v.mode),

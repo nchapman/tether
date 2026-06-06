@@ -986,6 +986,8 @@ mod tests {
             incomplete_frames: 2,
             fragment_loss_events: 4,
             rtt_us: 9_500,
+            fec_recovered_frames: 1,
+            fec_recovered_fragments: 3,
         };
         let bytes = encode_reliable(&msg).unwrap();
         let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
@@ -1003,6 +1005,8 @@ mod tests {
             incomplete_frames: 3,
             fragment_loss_events: 5,
             rtt_us: 7000,
+            fec_recovered_frames: 7,
+            fec_recovered_fragments: 11,
         };
         let bytes = encode_reliable(&msg).unwrap();
         let wire = pb::ControlMessage::decode(bytes.as_slice()).unwrap();
@@ -1013,6 +1017,8 @@ mod tests {
                 assert_eq!(stats.incomplete_frames, 3);
                 assert_eq!(stats.fragment_loss_events, 5);
                 assert_eq!(stats.rtt_us, 7000);
+                assert_eq!(stats.fec_recovered_frames, 7);
+                assert_eq!(stats.fec_recovered_fragments, 11);
             }
             other => panic!("expected ClientStats, got {other:?}"),
         }
@@ -1219,6 +1225,14 @@ mod tests {
                 idr_requests: 6,
                 decode_queue_drop_frames: 7,
                 transient_send_drop_frames: 0,
+                fec_recovered_frames: 8,
+                fec_recovered_fragments: 9,
+                datagrams_sent: 10,
+                parity_datagrams_sent: 11,
+                max_datagrams_per_frame: 12,
+                max_frame_bytes: 13,
+                max_keyframe_bytes: 14,
+                forced_idr_misses: 15,
             },
             audio: Some(AudioSessionStats {
                 packets_sent: 0,
@@ -1636,6 +1650,7 @@ mod tests {
             .map(|(_, p)| p)
             .collect();
         let mut r = FrameReassembler::new();
+        let recovery_before = r.recovery_counters();
         let mut got = None;
         for p in kept {
             if let Some(f) = r.handle(p) {
@@ -1644,6 +1659,12 @@ mod tests {
         }
         let f = got.expect("reassembled via FEC");
         assert_eq!(f.body.as_ref(), body.as_ref());
+        let recovery_after = r.recovery_counters();
+        assert_eq!(recovery_after.0, recovery_before.0 + 1);
+        assert_eq!(
+            recovery_after.1,
+            recovery_before.1 + u64::try_from(parity_count).unwrap()
+        );
     }
 
     #[test]
@@ -1672,6 +1693,11 @@ mod tests {
             }
         }
         assert!(got.is_none(), "loss above parity must not reconstruct");
+        assert_eq!(
+            r.recovery_counters(),
+            (0, 0),
+            "failed partial recovery must not count as useful repair"
+        );
     }
 
     #[test]

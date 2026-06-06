@@ -63,6 +63,15 @@ fn recovery_warranted(before: (u64, u64), after: (u64, u64)) -> bool {
     after.0 > before.0
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn ns_to_ms(ns: u64, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        ns as f64 / 1_000_000.0
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     // Parse args first so `--ipc` routes tracing off stdout (reserved for
@@ -623,6 +632,8 @@ async fn main() -> anyhow::Result<()> {
         // incomplete-frame and fragment-loss-event counts for ClientStats.
         let mut last_incomplete_frames: u64 = 0;
         let mut last_fragment_loss_events: u64 = 0;
+        let mut last_fec_recovered_frames: u64 = 0;
+        let mut last_fec_recovered_fragments: u64 = 0;
         // Most-recent frame_seq the reassembler *completed*. Quoted in
         // RequestRecovery when the reassembler observes a stale drop, and
         // doubles as the "have we received any frame yet" sentinel that gates
@@ -645,17 +656,23 @@ async fn main() -> anyhow::Result<()> {
         // metric so the two together show where pipeline time is
         // going.
         let mut decode_latency_sum_ns: u64 = 0;
+        let mut decode_latency_min_ns: u64 = 0;
+        let mut decode_latency_max_ns: u64 = 0;
         // Sum of capture-to-recv ages over the window. The previous
         // implementation logged the last frame's age which is
         // misleading when the metric is supposed to summarise a
         // second of behaviour; averaging across frames gives an
         // actually-meaningful number.
         let mut latency_sum_ns: u64 = 0;
+        let mut latency_min_ns: u64 = 0;
+        let mut latency_max_ns: u64 = 0;
         // Sum of t_send (host clock, translated via clock_sync) to
         // local recv times. Isolates the network leg from compute
         // — pair with avg_encode_ms / avg_decode_ms to attribute
         // any latency budget movement to the right component.
         let mut network_latency_sum_ns: u64 = 0;
+        let mut network_latency_min_ns: u64 = 0;
+        let mut network_latency_max_ns: u64 = 0;
         // Bytes off the wire (encoded H.264 payloads after
         // reassembly). With matching host kbps_out, a divergence
         // means packets are being dropped between host and client.
@@ -829,6 +846,15 @@ async fn main() -> anyhow::Result<()> {
             frame_count += 1;
             latency_sum_ns = latency_sum_ns.saturating_add(age_ns);
             network_latency_sum_ns = network_latency_sum_ns.saturating_add(network_ns);
+            if frame_count == 1 {
+                latency_min_ns = age_ns;
+                network_latency_min_ns = network_ns;
+            } else {
+                latency_min_ns = latency_min_ns.min(age_ns);
+                network_latency_min_ns = network_latency_min_ns.min(network_ns);
+            }
+            latency_max_ns = latency_max_ns.max(age_ns);
+            network_latency_max_ns = network_latency_max_ns.max(network_ns);
             let frame_body_len = frame.body.len() as u64;
             bytes_received = bytes_received.saturating_add(frame_body_len);
             session_summary_for_recv
@@ -871,6 +897,12 @@ async fn main() -> anyhow::Result<()> {
             while let Ok(c) = decode_completion_rx.try_recv() {
                 decode_completion_count = decode_completion_count.saturating_add(1);
                 decode_latency_sum_ns = decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
+                if decode_completion_count == 1 {
+                    decode_latency_min_ns = c.decode_duration_ns;
+                } else {
+                    decode_latency_min_ns = decode_latency_min_ns.min(c.decode_duration_ns);
+                }
+                decode_latency_max_ns = decode_latency_max_ns.max(c.decode_duration_ns);
                 if c.decode_err || c.soft_failure {
                     decode_errors = decode_errors.saturating_add(1);
                     session_summary_for_recv
@@ -908,6 +940,18 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(u32::MAX);
                 last_incomplete_frames = incomplete_frames_now;
                 last_fragment_loss_events = fragment_loss_events_now;
+                let (fec_recovered_frames_now, fec_recovered_fragments_now) =
+                    reassembler.recovery_counters();
+                let fec_recovered_frames = u32::try_from(
+                    fec_recovered_frames_now.saturating_sub(last_fec_recovered_frames),
+                )
+                .unwrap_or(u32::MAX);
+                let fec_recovered_fragments = u32::try_from(
+                    fec_recovered_fragments_now.saturating_sub(last_fec_recovered_fragments),
+                )
+                .unwrap_or(u32::MAX);
+                last_fec_recovered_frames = fec_recovered_frames_now;
+                last_fec_recovered_fragments = fec_recovered_fragments_now;
                 session_summary_for_recv
                     .video
                     .incomplete_frames
@@ -916,6 +960,14 @@ async fn main() -> anyhow::Result<()> {
                     .video
                     .fragment_loss_events
                     .fetch_add(u64::from(fragment_loss_events), Ordering::Relaxed);
+                session_summary_for_recv
+                    .video
+                    .fec_recovered_frames
+                    .fetch_add(u64::from(fec_recovered_frames), Ordering::Relaxed);
+                session_summary_for_recv
+                    .video
+                    .fec_recovered_fragments
+                    .fetch_add(u64::from(fec_recovered_fragments), Ordering::Relaxed);
                 // window_secs is a small positive duration; round-to-i64 is intentional.
                 #[allow(clippy::cast_possible_truncation)]
                 let window_ms =
@@ -928,6 +980,8 @@ async fn main() -> anyhow::Result<()> {
                     incomplete_frames,
                     fragment_loss_events,
                     rtt_us,
+                    fec_recovered_frames,
+                    fec_recovered_fragments,
                 };
                 let conn_stats = conn_recv.clone();
                 tokio::spawn(async move {
@@ -946,18 +1000,24 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     0.0
                 };
+                let min_decode_ms = ns_to_ms(decode_latency_min_ns, decode_completion_count);
+                let max_decode_ms = ns_to_ms(decode_latency_max_ns, decode_completion_count);
                 #[allow(clippy::cast_precision_loss)]
                 let avg_latency_ms = if frame_count > 0 {
                     (latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
                 } else {
                     0.0
                 };
+                let min_latency_ms = ns_to_ms(latency_min_ns, frame_count);
+                let max_latency_ms = ns_to_ms(latency_max_ns, frame_count);
                 #[allow(clippy::cast_precision_loss)]
                 let avg_network_ms = if frame_count > 0 {
                     (network_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
                 } else {
                     0.0
                 };
+                let min_network_ms = ns_to_ms(network_latency_min_ns, frame_count);
+                let max_network_ms = ns_to_ms(network_latency_max_ns, frame_count);
                 #[allow(clippy::cast_precision_loss)]
                 let kbps_in = if window_secs > 0.0 {
                     (bytes_received as f64 * 8.0 / 1000.0) / window_secs
@@ -974,19 +1034,33 @@ async fn main() -> anyhow::Result<()> {
                     frames = frame_count,
                     fps,
                     avg_latency_ms,
+                    min_latency_ms,
+                    max_latency_ms,
                     avg_network_ms,
+                    min_network_ms,
+                    max_network_ms,
                     avg_decode_ms,
+                    min_decode_ms,
+                    max_decode_ms,
                     kbps_in,
                     decode_errors,
                     render_drop_frames = render_drops,
                     idr_requests,
                     decode_queue_drop_frames = decode_queue_drops,
+                    fec_recovered_frames,
+                    fec_recovered_fragments,
                     "frame stats"
                 );
                 frame_count = 0;
                 decode_latency_sum_ns = 0;
+                decode_latency_min_ns = 0;
+                decode_latency_max_ns = 0;
                 latency_sum_ns = 0;
+                latency_min_ns = 0;
+                latency_max_ns = 0;
                 network_latency_sum_ns = 0;
+                network_latency_min_ns = 0;
+                network_latency_max_ns = 0;
                 bytes_received = 0;
                 decode_errors = 0;
                 render_drops = 0;

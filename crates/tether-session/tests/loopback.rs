@@ -641,6 +641,8 @@ async fn mid_session_client_stats_round_trips_on_control_stream() {
             incomplete_frames: 3,
             fragment_loss_events: 5,
             rtt_us: 7000,
+            fec_recovered_frames: 7,
+            fec_recovered_fragments: 11,
         })
         .await
         .unwrap();
@@ -654,12 +656,16 @@ async fn mid_session_client_stats_round_trips_on_control_stream() {
                 incomplete_frames,
                 fragment_loss_events,
                 rtt_us,
+                fec_recovered_frames,
+                fec_recovered_fragments,
             } => {
                 assert_eq!(window_ms, 1001);
                 assert_eq!(frames_received, 62);
                 assert_eq!(incomplete_frames, 3);
                 assert_eq!(fragment_loss_events, 5);
                 assert_eq!(rtt_us, 7000);
+                assert_eq!(fec_recovered_frames, 7);
+                assert_eq!(fec_recovered_fragments, 11);
                 break;
             }
             other => panic!("expected ClientStats, got {other:?}"),

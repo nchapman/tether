@@ -775,6 +775,12 @@ pub struct FrameReassembler {
     /// `max_age` behind the latest seq seen on their stream) or
     /// malformed (wire-validation rejection).
     fragments_lost: u64,
+    /// Cumulative count of frames that finalized only after FEC rebuilt at
+    /// least one missing primary shard.
+    fec_recovered_frames: u64,
+    /// Cumulative count of primary shards rebuilt by FEC in frames that
+    /// finalized successfully.
+    fec_recovered_fragments: u64,
 }
 
 type FrameKey = (VideoStreamId, u32, u32);
@@ -803,6 +809,9 @@ struct Pending {
     /// Latches per block once RS recovery has been attempted, so a failed
     /// reconstruct (unreachable over QUIC) isn't retried on every packet.
     block_recovery_attempted: Vec<bool>,
+    /// Primary shards filled by FEC recovery. Counted only if the whole frame
+    /// finalizes, so failed partial recovery doesn't look like useful repair.
+    recovered_primary_count: u16,
 }
 
 impl Pending {
@@ -819,6 +828,7 @@ impl Pending {
             descriptor_known: false,
             parity: Vec::new(),
             block_recovery_attempted: Vec::new(),
+            recovered_primary_count: 0,
         }
     }
 
@@ -869,6 +879,8 @@ impl FrameReassembler {
             max_pending_age: Duration::from_millis(500),
             frames_dropped: 0,
             fragments_lost: 0,
+            fec_recovered_frames: 0,
+            fec_recovered_fragments: 0,
         }
     }
 
@@ -893,6 +905,14 @@ impl FrameReassembler {
     #[must_use]
     pub fn loss_counters(&self) -> (u64, u64) {
         (self.frames_dropped, self.fragments_lost)
+    }
+
+    /// Returns `(fec_recovered_frames, fec_recovered_fragments)`. Counters are
+    /// cumulative over the reassembler's lifetime; callers diff successive
+    /// reads to compute per-window rates.
+    #[must_use]
+    pub fn recovery_counters(&self) -> (u64, u64) {
+        (self.fec_recovered_frames, self.fec_recovered_fragments)
     }
 
     pub fn handle(&mut self, packet: VideoPacket) -> Option<ReassembledFrame> {
@@ -1105,6 +1125,8 @@ impl FrameReassembler {
                     if entry.fragments[g].is_none() {
                         entry.fragments[g] = Some(shard);
                         entry.received_count += 1;
+                        entry.recovered_primary_count =
+                            entry.recovered_primary_count.saturating_add(1);
                     }
                 }
             }
@@ -1125,6 +1147,7 @@ impl FrameReassembler {
         let k = pending.fragment_count as usize;
         let shard_size = pending.shard_size as usize;
         let total = pending.total_body_len? as usize;
+        let recovered_primary_count = pending.recovered_primary_count;
 
         let mut buf = BytesMut::with_capacity(total);
         for i in 0..k {
@@ -1145,6 +1168,12 @@ impl FrameReassembler {
         }
 
         self.mark_finalized(stream_id, stream_epoch, frame_seq);
+        if recovered_primary_count > 0 {
+            self.fec_recovered_frames = self.fec_recovered_frames.saturating_add(1);
+            self.fec_recovered_fragments = self
+                .fec_recovered_fragments
+                .saturating_add(u64::from(recovered_primary_count));
+        }
         Some(ReassembledFrame {
             stream_id,
             stream_epoch,

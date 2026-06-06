@@ -289,6 +289,14 @@ message VideoSessionStats {
   uint64 idr_requests = 10;
   uint64 decode_queue_drop_frames = 11;
   uint64 transient_send_drop_frames = 12;
+  uint64 fec_recovered_frames = 13;
+  uint64 fec_recovered_fragments = 14;
+  uint64 datagrams_sent = 15;
+  uint64 parity_datagrams_sent = 16;
+  uint64 max_datagrams_per_frame = 17;
+  uint64 max_frame_bytes = 18;
+  uint64 max_keyframe_bytes = 19;
+  uint64 forced_idr_misses = 20;
 }
 
 message AudioSessionStats {
@@ -336,6 +344,8 @@ message ClientStats {
   uint32 incomplete_frames = 3;
   uint32 fragment_loss_events = 4;
   uint32 rtt_us = 5;
+  uint32 fec_recovered_frames = 6;
+  uint32 fec_recovered_fragments = 7;
 }
 
 message SetCursorMode {

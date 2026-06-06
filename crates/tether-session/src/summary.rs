@@ -66,6 +66,14 @@ pub struct VideoSummaryCounters {
     pub idr_requests: AtomicU64,
     pub decode_queue_drop_frames: AtomicU64,
     pub transient_send_drop_frames: AtomicU64,
+    pub fec_recovered_frames: AtomicU64,
+    pub fec_recovered_fragments: AtomicU64,
+    pub datagrams_sent: AtomicU64,
+    pub parity_datagrams_sent: AtomicU64,
+    pub max_datagrams_per_frame: AtomicU64,
+    pub max_frame_bytes: AtomicU64,
+    pub max_keyframe_bytes: AtomicU64,
+    pub forced_idr_misses: AtomicU64,
 }
 
 impl VideoSummaryCounters {
@@ -83,6 +91,14 @@ impl VideoSummaryCounters {
             idr_requests: self.idr_requests.load(Ordering::Relaxed),
             decode_queue_drop_frames: self.decode_queue_drop_frames.load(Ordering::Relaxed),
             transient_send_drop_frames: self.transient_send_drop_frames.load(Ordering::Relaxed),
+            fec_recovered_frames: self.fec_recovered_frames.load(Ordering::Relaxed),
+            fec_recovered_fragments: self.fec_recovered_fragments.load(Ordering::Relaxed),
+            datagrams_sent: self.datagrams_sent.load(Ordering::Relaxed),
+            parity_datagrams_sent: self.parity_datagrams_sent.load(Ordering::Relaxed),
+            max_datagrams_per_frame: self.max_datagrams_per_frame.load(Ordering::Relaxed),
+            max_frame_bytes: self.max_frame_bytes.load(Ordering::Relaxed),
+            max_keyframe_bytes: self.max_keyframe_bytes.load(Ordering::Relaxed),
+            forced_idr_misses: self.forced_idr_misses.load(Ordering::Relaxed),
         }
     }
 }
@@ -143,6 +159,14 @@ pub fn log_peer_session_summary(peer: &str, summary: Option<&SessionSummary>) {
         video_idr_requests = summary.video.idr_requests,
         video_decode_queue_drop_frames = summary.video.decode_queue_drop_frames,
         video_transient_send_drop_frames = summary.video.transient_send_drop_frames,
+        video_fec_recovered_frames = summary.video.fec_recovered_frames,
+        video_fec_recovered_fragments = summary.video.fec_recovered_fragments,
+        video_datagrams_sent = summary.video.datagrams_sent,
+        video_parity_datagrams_sent = summary.video.parity_datagrams_sent,
+        video_max_datagrams_per_frame = summary.video.max_datagrams_per_frame,
+        video_max_frame_bytes = summary.video.max_frame_bytes,
+        video_max_keyframe_bytes = summary.video.max_keyframe_bytes,
+        video_forced_idr_misses = summary.video.forced_idr_misses,
         audio_packets_sent = audio.map_or(0, |s| s.packets_sent),
         audio_packets_received = audio.map_or(0, |s| s.packets_received),
         audio_capture_frames = audio.map_or(0, |s| s.capture_frames),

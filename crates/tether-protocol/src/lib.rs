@@ -1094,6 +1094,7 @@ mod tests {
                 crate::pb::Goodbye {
                     reason: "future".into(),
                     code: 99,
+                    final_stats: None,
                 },
             )),
         };
@@ -1179,15 +1180,80 @@ mod tests {
         let g = ControlMessage::Goodbye {
             reason: "user quit".into(),
             code: GoodbyeCode::Clean,
+            final_stats: None,
         };
         let bytes = encode_reliable(&g).unwrap();
         let g2: ControlMessage = decode_reliable(&bytes).unwrap();
         match g2 {
-            ControlMessage::Goodbye { reason, code } => {
+            ControlMessage::Goodbye {
+                reason,
+                code,
+                final_stats,
+            } => {
                 assert_eq!(reason, "user quit");
                 assert_eq!(code, GoodbyeCode::Clean);
+                assert!(final_stats.is_none());
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn goodbye_carries_final_session_summary() {
+        let summary = SessionSummary {
+            role: "client".into(),
+            duration_ms: 1_234,
+            codec: "Hevc".into(),
+            chroma: "Yuv420".into(),
+            bit_depth: 10,
+            video: VideoSessionStats {
+                frames_sent: 0,
+                frames_received: 99,
+                keyframes: 2,
+                bytes_sent: 0,
+                bytes_received: 4_096,
+                incomplete_frames: 1,
+                fragment_loss_events: 3,
+                decode_errors: 4,
+                render_drop_frames: 5,
+                idr_requests: 6,
+                decode_queue_drop_frames: 7,
+                transient_send_drop_frames: 0,
+            },
+            audio: Some(AudioSessionStats {
+                packets_sent: 0,
+                packets_received: 88,
+                capture_frames: 0,
+                underruns: 1,
+                dropped_samples: 2,
+                recovered_frames: 3,
+                concealed_frames: 4,
+                dropout_frames: 5,
+                dropouts: 6,
+                stale_packets: 7,
+                decode_errors: 8,
+            }),
+        };
+        let msg = ControlMessage::Goodbye {
+            reason: "done".into(),
+            code: GoodbyeCode::Clean,
+            final_stats: Some(Box::new(summary.clone())),
+        };
+
+        let bytes = encode_reliable(&msg).unwrap();
+        let decoded: ControlMessage = decode_reliable(&bytes).unwrap();
+
+        match decoded {
+            ControlMessage::Goodbye {
+                reason,
+                code,
+                final_stats,
+            } => {
+                assert_eq!(reason, "done");
+                assert_eq!(code, GoodbyeCode::Clean);
+                assert_eq!(final_stats.as_deref(), Some(&summary));
+            }
+            other => panic!("expected Goodbye, got {other:?}"),
         }
     }
 

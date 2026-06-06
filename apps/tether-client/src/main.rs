@@ -13,6 +13,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -27,7 +28,9 @@ use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::LatestFrame;
 use tether_render::RenderEvent;
-use tether_session::{ClientSession, ClientSessionConfig, ConnectError};
+use tether_session::{
+    log_peer_session_summary, ClientSession, ClientSessionConfig, ConnectError, SessionSummaryState,
+};
 use tether_transport::{Client, Datagram, ServerAuth};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -309,6 +312,11 @@ async fn main() -> anyhow::Result<()> {
             negotiated_profile.codec, negotiated_profile.chroma, negotiated_profile.bit_depth
         ),
     });
+    let session_summary = Arc::new(SessionSummaryState::new(
+        "client",
+        negotiated_profile,
+        false,
+    ));
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -329,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let conn = conn.clone();
         let cursor_channel_ctrl = cursor_channel.clone();
+        let session_summary = session_summary.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_control().await {
@@ -365,8 +374,13 @@ async fn main() -> anyhow::Result<()> {
                     Ok(ControlMessage::ClockProbeResponse(_)) => {
                         tracing::trace!("unsolicited clock probe response; ignoring");
                     }
-                    Ok(ControlMessage::Goodbye { reason, code }) => {
+                    Ok(ControlMessage::Goodbye {
+                        reason,
+                        code,
+                        final_stats,
+                    }) => {
                         info!(event = "peer_goodbye", %reason, ?code, "host said goodbye");
+                        log_peer_session_summary("host", final_stats.as_deref());
                         return;
                     }
                     Ok(ControlMessage::Extension(msg)) => {
@@ -381,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
                             .send_control(&ControlMessage::Goodbye {
                                 reason: format!("unnegotiated extension {}", msg.key),
                                 code: GoodbyeCode::ProtocolError,
+                                final_stats: Some(Box::new(session_summary.snapshot())),
                             })
                             .await;
                         return;
@@ -554,9 +569,12 @@ async fn main() -> anyhow::Result<()> {
     // decode → jitter buffer → cpal playback path on its own thread.
     // `audio_tx` feeds it from the datagram recv loop below; `audio_active`
     // gates `StreamReady.audio`. Both are moved into the recv task.
-    let (audio_tx, audio_active) = setup_audio_playback(audio_enabled, &server_hello);
+    let (audio_tx, audio_active) =
+        setup_audio_playback(audio_enabled, &server_hello, session_summary.clone());
+    session_summary.set_audio_active(audio_active);
 
     let conn_for_recovery_send = conn.clone();
+    let session_summary_for_recv = session_summary.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
         if decoder_ready_rx.await.is_err() {
@@ -575,6 +593,7 @@ async fn main() -> anyhow::Result<()> {
                 &conn_ready,
                 "client decoder failed to initialise",
                 GoodbyeCode::InternalError,
+                &session_summary_for_recv,
             )
             .await;
             return;
@@ -729,6 +748,10 @@ async fn main() -> anyhow::Result<()> {
                             redundant,
                         });
                     }
+                    session_summary_for_recv
+                        .audio
+                        .packets_received
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 Err(e) => {
@@ -806,7 +829,22 @@ async fn main() -> anyhow::Result<()> {
             frame_count += 1;
             latency_sum_ns = latency_sum_ns.saturating_add(age_ns);
             network_latency_sum_ns = network_latency_sum_ns.saturating_add(network_ns);
-            bytes_received = bytes_received.saturating_add(frame.body.len() as u64);
+            let frame_body_len = frame.body.len() as u64;
+            bytes_received = bytes_received.saturating_add(frame_body_len);
+            session_summary_for_recv
+                .video
+                .frames_received
+                .fetch_add(1, Ordering::Relaxed);
+            session_summary_for_recv
+                .video
+                .bytes_received
+                .fetch_add(frame_body_len, Ordering::Relaxed);
+            if frame.meta.keyframe {
+                session_summary_for_recv
+                    .video
+                    .keyframes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
             // Hand the reassembled frame to the decode thread.
             // Bounded channel + try_send means a stalled decoder
@@ -819,6 +857,10 @@ async fn main() -> anyhow::Result<()> {
             };
             if decode_job_tx.try_send(job).is_err() {
                 decode_queue_drops = decode_queue_drops.saturating_add(1);
+                session_summary_for_recv
+                    .video
+                    .decode_queue_drop_frames
+                    .fetch_add(1, Ordering::Relaxed);
             }
 
             // Drain decode completions that arrived since the last
@@ -831,10 +873,22 @@ async fn main() -> anyhow::Result<()> {
                 decode_latency_sum_ns = decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
                 if c.decode_err || c.soft_failure {
                     decode_errors = decode_errors.saturating_add(1);
+                    session_summary_for_recv
+                        .video
+                        .decode_errors
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 render_drops = render_drops.saturating_add(c.render_drops);
+                session_summary_for_recv
+                    .video
+                    .render_drop_frames
+                    .fetch_add(u64::from(c.render_drops), Ordering::Relaxed);
                 if c.idr_request_fired {
                     idr_requests = idr_requests.saturating_add(1);
+                    session_summary_for_recv
+                        .video
+                        .idr_requests
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -854,6 +908,14 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(u32::MAX);
                 last_incomplete_frames = incomplete_frames_now;
                 last_fragment_loss_events = fragment_loss_events_now;
+                session_summary_for_recv
+                    .video
+                    .incomplete_frames
+                    .fetch_add(u64::from(incomplete_frames), Ordering::Relaxed);
+                session_summary_for_recv
+                    .video
+                    .fragment_loss_events
+                    .fetch_add(u64::from(fragment_loss_events), Ordering::Relaxed);
                 // window_secs is a small positive duration; round-to-i64 is intentional.
                 #[allow(clippy::cast_possible_truncation)]
                 let window_ms =
@@ -1076,6 +1138,7 @@ async fn main() -> anyhow::Result<()> {
     // before adding anything in those categories.
     {
         let conn = conn.clone();
+        let session_summary = session_summary.clone();
         tokio::spawn(async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
                 warn!(error = %e, "ctrl-c handler failed; exiting anyway");
@@ -1085,7 +1148,7 @@ async fn main() -> anyhow::Result<()> {
             reporter.emit(&EngineEvent::Disconnected {
                 reason: "interrupted".to_string(),
             });
-            say_goodbye(&conn, "client interrupted").await;
+            say_goodbye(&conn, "client interrupted", &session_summary).await;
             std::process::exit(0);
         });
     }
@@ -1097,13 +1160,14 @@ async fn main() -> anyhow::Result<()> {
     // through winit.
     if reporter.is_json() {
         let conn = conn.clone();
+        let session_summary = session_summary.clone();
         tokio::spawn(async move {
             wait_for_stdin_stop().await;
             info!("shell stop received; sending Goodbye and exiting");
             reporter.emit(&EngineEvent::Disconnected {
                 reason: "stopped by shell".to_string(),
             });
-            say_goodbye(&conn, "client stopped").await;
+            say_goodbye(&conn, "client stopped", &session_summary).await;
             std::process::exit(0);
         });
     }
@@ -1132,7 +1196,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => format!("render error: {e}"),
     };
     reporter.emit(&EngineEvent::Disconnected { reason });
-    say_goodbye(&conn, "client closing").await;
+    say_goodbye(&conn, "client closing", &session_summary).await;
 
     // In `--ipc` mode the stdin stop-watcher parks a `tokio::io::stdin()`
     // blocking read that can't be cancelled, so letting `main` return would
@@ -1199,8 +1263,12 @@ async fn wait_for_stdin_stop() {
 /// any sane link. The floor handles loopback (RTT in the microseconds)
 /// and the cap bounds shutdown latency on a high-RTT link where the
 /// peer may already be unreachable anyway.
-async fn say_goodbye(conn: &tether_transport::Connection, reason: &str) {
-    say_goodbye_with_code(conn, reason, GoodbyeCode::Clean).await;
+async fn say_goodbye(
+    conn: &tether_transport::Connection,
+    reason: &str,
+    summary: &SessionSummaryState,
+) {
+    say_goodbye_with_code(conn, reason, GoodbyeCode::Clean, summary).await;
 }
 
 /// Variant that lets the caller signal *why* the session ended.
@@ -1211,11 +1279,13 @@ async fn say_goodbye_with_code(
     conn: &tether_transport::Connection,
     reason: &str,
     code: GoodbyeCode,
+    summary: &SessionSummaryState,
 ) {
     use std::time::Duration;
     let msg = ControlMessage::Goodbye {
         reason: reason.to_string(),
         code,
+        final_stats: Some(Box::new(summary.snapshot())),
     };
     if let Err(e) = conn.send_control(&msg).await {
         warn!(error = ?e, "send Goodbye failed; host will fall back to timeout");
@@ -1348,6 +1418,7 @@ struct AudioFrameMsg {
 fn setup_audio_playback(
     enabled: bool,
     server_hello: &ServerHello,
+    summary: Arc<SessionSummaryState>,
 ) -> (Option<crossbeam_channel::Sender<AudioFrameMsg>>, bool) {
     if !enabled {
         info!("audio disabled via --no-audio");
@@ -1389,7 +1460,7 @@ fn setup_audio_playback(
     let (tx, rx) = crossbeam_channel::bounded::<AudioFrameMsg>(64);
     match std::thread::Builder::new()
         .name("tether-client-audio".into())
-        .spawn(move || run_audio_playback(opus_cfg, rx))
+        .spawn(move || run_audio_playback(opus_cfg, rx, summary))
     {
         Ok(_) => {
             info!(
@@ -1414,6 +1485,7 @@ fn setup_audio_playback(
 fn run_audio_playback(
     cfg: tether_audio::OpusConfig,
     rx: crossbeam_channel::Receiver<AudioFrameMsg>,
+    summary: Arc<SessionSummaryState>,
 ) {
     let (player, sink) = match tether_audio::AudioPlayer::with_defaults(cfg) {
         Ok(pair) => pair,
@@ -1497,6 +1569,15 @@ fn run_audio_playback(
         if last_stats_log.elapsed() >= STATS_INTERVAL {
             let (underruns, dropped_samples, buffered) = sink.stats();
             let s = recovery.stats();
+            record_audio_playback_summary_delta(
+                &summary,
+                underruns,
+                prev_underruns,
+                dropped_samples,
+                prev_dropped_samples,
+                s,
+                prev_recovery,
+            );
             // `buffered` is interleaved samples → wall-clock so drift toward an
             // underrun (→ 0 ms) or the latency cap is legible at a glance. The
             // counters are deltas over this interval (totals climb forever and
@@ -1525,8 +1606,73 @@ fn run_audio_playback(
         }
     }
 
+    let (underruns, dropped_samples, _) = sink.stats();
+    let s = recovery.stats();
+    record_audio_playback_summary_delta(
+        &summary,
+        underruns,
+        prev_underruns,
+        dropped_samples,
+        prev_dropped_samples,
+        s,
+        prev_recovery,
+    );
+
     // Channel closed: drop the player to stop the output stream.
     drop(player);
+}
+
+fn record_audio_playback_summary_delta(
+    summary: &SessionSummaryState,
+    underruns: u64,
+    prev_underruns: u64,
+    dropped_samples: u64,
+    prev_dropped_samples: u64,
+    recovery: tether_audio::RecoveryStats,
+    prev_recovery: tether_audio::RecoveryStats,
+) {
+    summary
+        .audio
+        .underruns
+        .fetch_add(underruns.saturating_sub(prev_underruns), Ordering::Relaxed);
+    summary.audio.dropped_samples.fetch_add(
+        dropped_samples.saturating_sub(prev_dropped_samples),
+        Ordering::Relaxed,
+    );
+    summary.audio.recovered_frames.fetch_add(
+        recovery
+            .recovered_frames
+            .saturating_sub(prev_recovery.recovered_frames),
+        Ordering::Relaxed,
+    );
+    summary.audio.concealed_frames.fetch_add(
+        recovery
+            .concealed_frames
+            .saturating_sub(prev_recovery.concealed_frames),
+        Ordering::Relaxed,
+    );
+    summary.audio.dropout_frames.fetch_add(
+        recovery
+            .dropout_frames
+            .saturating_sub(prev_recovery.dropout_frames),
+        Ordering::Relaxed,
+    );
+    summary.audio.dropouts.fetch_add(
+        recovery.dropouts.saturating_sub(prev_recovery.dropouts),
+        Ordering::Relaxed,
+    );
+    summary.audio.stale_packets.fetch_add(
+        recovery
+            .stale_packets
+            .saturating_sub(prev_recovery.stale_packets),
+        Ordering::Relaxed,
+    );
+    summary.audio.decode_errors.fetch_add(
+        recovery
+            .decode_errors
+            .saturating_sub(prev_recovery.decode_errors),
+        Ordering::Relaxed,
+    );
 }
 
 /// Directory the client caches its identity (`client_cert.der`/`client_key.der`)

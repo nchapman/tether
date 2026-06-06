@@ -52,7 +52,8 @@ use tether_protocol::MonoNanos;
 #[cfg(target_os = "linux")]
 use tether_scaler::{Pipelines as ScalerPipelines, Scaler, ScalerError};
 use tether_session::{
-    AbrConfig, AbrController, AbrSample, AcceptError, HostSession, HostSessionConfig,
+    log_peer_session_summary, AbrConfig, AbrController, AbrSample, AcceptError, HostSession,
+    HostSessionConfig, SessionSummaryState,
 };
 use tether_transport::{AbrSnapshot, Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
@@ -661,6 +662,12 @@ async fn handle_client(
         stream_ready,
     } = session;
     let initial_viewport = client_hello.initial_viewport.filter(|v| v.is_valid());
+    let audio_active = audio_enabled && tether_audio::capture::is_supported();
+    let session_summary = Arc::new(SessionSummaryState::new(
+        "host",
+        chosen_profile,
+        audio_active,
+    ));
 
     // `use_test_pattern` from here on only switches the capture source;
     // the handshake-time profile floor it implied is already baked into
@@ -766,6 +773,7 @@ async fn handle_client(
     let latest_client_stats_for_send = latest_client_stats.clone();
     let latest_viewport_for_send = latest_viewport.clone();
     let shutdown_notice_for_send = shutdown_notice_sent_or_received.clone();
+    let session_summary_for_send = session_summary.clone();
     // The sync send thread is not a tokio worker, so it uses the
     // runtime handle only for the few async control sends needed on
     // fatal exits. Regular video output is synchronous datagram send:
@@ -789,6 +797,7 @@ async fn handle_client(
                 latest_viewport_for_send,
                 send_exited_for_thread,
                 shutdown_notice_for_send,
+                session_summary_for_send,
             )
         })?;
 
@@ -799,15 +808,21 @@ async fn handle_client(
     // tear down with the session. Skipped (and left silent) when audio is off
     // or the platform has no capture backend.
     let audio_ready = Arc::new(AtomicBool::new(false));
-    let audio_handle = if audio_enabled && tether_audio::capture::is_supported() {
+    let audio_handle = if audio_active {
         let conn_audio = conn.clone();
         let audio_shutdown = send_shutdown.clone();
         let audio_ready_thread = audio_ready.clone();
+        let session_summary_for_audio = session_summary.clone();
         Some(
             std::thread::Builder::new()
                 .name("tether-host-audio".into())
                 .spawn(move || {
-                    run_audio_capture_and_send(conn_audio, audio_shutdown, audio_ready_thread);
+                    run_audio_capture_and_send(
+                        conn_audio,
+                        audio_shutdown,
+                        audio_ready_thread,
+                        session_summary_for_audio,
+                    );
                 })?,
         )
     } else {
@@ -846,6 +861,7 @@ async fn handle_client(
         let latest_viewport_for_ctl = latest_viewport.clone();
         let force_idr_for_viewport = force_idr.clone();
         let shutdown_notice_for_ctl = shutdown_notice_sent_or_received.clone();
+        let session_summary_for_ctl = session_summary.clone();
         tasks.spawn(async move {
             // Per-message rate limit for IDR-triggering control messages.
             // A client flooding ForceIdr / RequestRecovery on the
@@ -870,6 +886,10 @@ async fn handle_client(
                         }
                         last_idr_request = Some(now);
                         tracing::debug!("client requested IDR");
+                        session_summary_for_ctl
+                            .video
+                            .idr_requests
+                            .fetch_add(1, Ordering::Relaxed);
                         force_idr.raise();
                     }
                     Ok(ControlMessage::SetCursorMode { mode }) => {
@@ -914,6 +934,10 @@ async fn handle_client(
                             last_reassembled_frame_id,
                             "client requested recovery; emitting forced IDR"
                         );
+                        session_summary_for_ctl
+                            .video
+                            .idr_requests
+                            .fetch_add(1, Ordering::Relaxed);
                         force_idr.raise();
                     }
                     Ok(ControlMessage::StreamReady { video, audio }) => {
@@ -959,6 +983,18 @@ async fn handle_client(
                             rtt_us,
                             "client stats"
                         );
+                        session_summary_for_ctl
+                            .video
+                            .frames_received
+                            .fetch_add(u64::from(frames_received), Ordering::Relaxed);
+                        session_summary_for_ctl
+                            .video
+                            .incomplete_frames
+                            .fetch_add(u64::from(incomplete_frames), Ordering::Relaxed);
+                        session_summary_for_ctl
+                            .video
+                            .fragment_loss_events
+                            .fetch_add(u64::from(fragment_loss_events), Ordering::Relaxed);
                         // Drop-oldest: the ABR controller only needs
                         // the most recent window. If the send thread
                         // hasn't drained yet (slow encoder loop), the
@@ -1042,9 +1078,14 @@ async fn handle_client(
                         // we ever do, the matching response handler goes here.
                         tracing::trace!("unsolicited clock probe response; ignoring");
                     }
-                    Ok(ControlMessage::Goodbye { reason, code }) => {
+                    Ok(ControlMessage::Goodbye {
+                        reason,
+                        code,
+                        final_stats,
+                    }) => {
                         shutdown_notice_for_ctl.store(true, Ordering::Release);
                         info!(event = "peer_goodbye", %reason, ?code, "client said goodbye");
+                        log_peer_session_summary("client", final_stats.as_deref());
                         return;
                     }
                     Ok(ControlMessage::Extension(msg)) => {
@@ -1061,6 +1102,7 @@ async fn handle_client(
                                 &conn,
                                 reason.as_str(),
                                 GoodbyeCode::ProtocolError,
+                                &session_summary_for_ctl,
                             )
                             .await;
                             info!(
@@ -1267,7 +1309,8 @@ async fn handle_client(
     };
 
     if !shutdown_notice_sent_or_received.swap(true, Ordering::AcqRel) {
-        let sent = send_goodbye_notice(&conn, teardown_reason, teardown_code).await;
+        let sent =
+            send_goodbye_notice(&conn, teardown_reason, teardown_code, &session_summary).await;
         info!(
             event = "session_teardown",
             reason = teardown_reason,
@@ -1309,10 +1352,16 @@ async fn handle_client(
     Ok(())
 }
 
-async fn send_goodbye_notice(conn: &Connection, reason: &str, code: GoodbyeCode) -> bool {
+async fn send_goodbye_notice(
+    conn: &Connection,
+    reason: &str,
+    code: GoodbyeCode,
+    summary: &SessionSummaryState,
+) -> bool {
     let msg = ControlMessage::Goodbye {
         reason: reason.to_string(),
         code,
+        final_stats: Some(Box::new(summary.snapshot())),
     };
     match conn.send_control(&msg).await {
         Ok(()) => {
@@ -1336,11 +1385,12 @@ fn send_goodbye_notice_blocking(
     sent_or_received: &AtomicBool,
     reason: &str,
     code: GoodbyeCode,
+    summary: &SessionSummaryState,
 ) {
     if sent_or_received.swap(true, Ordering::AcqRel) {
         return;
     }
-    let sent = runtime.block_on(send_goodbye_notice(conn, reason, code));
+    let sent = runtime.block_on(send_goodbye_notice(conn, reason, code, summary));
     info!(
         event = "session_teardown",
         reason,
@@ -2857,6 +2907,7 @@ fn run_audio_capture_and_send(
     conn: Arc<Connection>,
     shutdown: Arc<AtomicBool>,
     audio_ready: Arc<AtomicBool>,
+    summary: Arc<SessionSummaryState>,
 ) {
     let opus_cfg = tether_audio::OpusConfig::default();
     let capture = match tether_audio::capture::start(opus_cfg) {
@@ -2913,6 +2964,7 @@ fn run_audio_capture_and_send(
             }
         };
         frames_captured += 1;
+        summary.audio.capture_frames.fetch_add(1, Ordering::Relaxed);
         for &s in &frame.samples {
             peak = peak.max(s.abs());
         }
@@ -2970,6 +3022,7 @@ fn run_audio_capture_and_send(
                 warn!(error = ?e, "audio datagram send failed; ending audio sender");
                 return;
             }
+            summary.audio.packets_sent.fetch_add(1, Ordering::Relaxed);
         }
     }
     capture.stop();
@@ -2993,6 +3046,7 @@ fn run_capture_and_send(
     latest_viewport: LatestViewport,
     send_exited: Arc<tokio::sync::Notify>,
     shutdown_notice_sent_or_received: Arc<AtomicBool>,
+    summary: Arc<SessionSummaryState>,
 ) {
     // RAII: notify handle_client on *any* exit from this function —
     // including the six fatal-return sites below, a panic that's
@@ -3298,6 +3352,7 @@ fn run_capture_and_send(
                         &shutdown_notice_sent_or_received,
                         reason.as_str(),
                         GoodbyeCode::InternalError,
+                        &summary,
                     );
                     return;
                 }
@@ -3371,6 +3426,7 @@ fn run_capture_and_send(
                         &shutdown_notice_sent_or_received,
                         reason.as_str(),
                         GoodbyeCode::InternalError,
+                        &summary,
                     );
                     return;
                 }
@@ -3395,6 +3451,7 @@ fn run_capture_and_send(
                             &shutdown_notice_sent_or_received,
                             reason.as_str(),
                             GoodbyeCode::InternalError,
+                            &summary,
                         );
                         return;
                     }
@@ -3467,7 +3524,8 @@ fn run_capture_and_send(
         if body.is_empty() {
             continue;
         }
-        stats.record_frame(encode_delta_ns, body.len() as u64, keyframe);
+        let body_len = body.len() as u64;
+        stats.record_frame(encode_delta_ns, body_len, keyframe);
 
         let meta = VideoFrameMeta {
             timing: timing.finish(),
@@ -3490,6 +3548,7 @@ fn run_capture_and_send(
             .map_or(tether_protocol::MAX_DATAGRAM_PAYLOAD, |m| {
                 m.min(tether_protocol::MAX_DATAGRAM_PAYLOAD)
             });
+        let mut sent_frame = true;
         for packet in fragmenter.fragment(meta, body, budget) {
             if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
                 if e.is_transient_send() {
@@ -3502,11 +3561,26 @@ fn run_capture_and_send(
                     // sacrificed, but a single dropped frame is recoverable and
                     // a torn-down session is not.
                     transient_send_drops += 1;
+                    summary
+                        .video
+                        .transient_send_drop_frames
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(error = ?e, "dropping frame on transient datagram send error");
+                    sent_frame = false;
                     break;
                 }
                 warn!(error = ?e, "send_datagram failed (fatal), terminating send loop");
                 return;
+            }
+        }
+        if sent_frame {
+            summary.video.frames_sent.fetch_add(1, Ordering::Relaxed);
+            summary
+                .video
+                .bytes_sent
+                .fetch_add(body_len, Ordering::Relaxed);
+            if keyframe {
+                summary.video.keyframes.fetch_add(1, Ordering::Relaxed);
             }
         }
         // Accumulated only for frames that complete encode + send;

@@ -275,7 +275,7 @@ async fn host_picks_unadvertised_profile_client_refuses() {
     assert_eq!(host_session.negotiated, VideoProfile::HEVC_8BIT_420);
     client_task.await.unwrap();
     match host_session.channel.recv_control().await.unwrap() {
-        ControlMessage::Goodbye { reason, code } => {
+        ControlMessage::Goodbye { reason, code, .. } => {
             assert_eq!(code, tether_protocol::control::GoodbyeCode::ProtocolError);
             assert!(
                 reason.contains("unadvertised video profile"),
@@ -333,7 +333,7 @@ async fn client_filters_unknown_bit_depth_from_host_advert() {
     let host = host_task.await.unwrap().unwrap();
     client_task.await.unwrap();
     match host.channel.recv_control().await.unwrap() {
-        ControlMessage::Goodbye { reason, code } => {
+        ControlMessage::Goodbye { reason, code, .. } => {
             assert_eq!(code, tether_protocol::control::GoodbyeCode::ProtocolError);
             assert!(
                 reason.contains("unknown bit_depth 12"),
@@ -454,6 +454,7 @@ async fn goodbye_during_clock_probe_aborts_connect() {
                     .send_control(&ControlMessage::Goodbye {
                         reason: "probe denied".into(),
                         code: tether_protocol::control::GoodbyeCode::ProtocolError,
+                        final_stats: None,
                     })
                     .await
                     .unwrap();

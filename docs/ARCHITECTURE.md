@@ -477,7 +477,8 @@ its own QUIC primitive:
 - **Control** (reliable, bidirectional) — length-prefixed protobuf
   messages under the `tether.v1` schema. Handshake (`ClientHello` /
   `ServerHandshake`), `Goodbye` (with machine-readable
-  `GoodbyeCode`), `ForceIdr`, `ClockProbe*`, cursor shapes
+  `GoodbyeCode` and final session stats summary), `ForceIdr`,
+  `ClockProbe*`, cursor shapes
   (`CursorShape` / `CursorUseShape`), display topology
   (`DisplayList` / `SetActiveDisplays`), stream lifecycle
   (`StreamReady` / `StreamPause` / `StreamResume`), receiver

@@ -160,6 +160,7 @@ async fn send_protocol_error_goodbye(channel: &dyn ControlChannel, reason: Strin
         .send_control(&ControlMessage::Goodbye {
             reason,
             code: GoodbyeCode::ProtocolError,
+            final_stats: None,
         })
         .await
     {
@@ -188,7 +189,7 @@ async fn run_clock_probe(channel: &dyn ControlChannel) -> Result<ClockSync, Conn
                 tracing::debug!("ignoring stale ClockProbeResponse during handshake probe");
             }
             other => {
-                if let ControlMessage::Goodbye { reason, code } = other {
+                if let ControlMessage::Goodbye { reason, code, .. } = other {
                     tracing::warn!(%reason, ?code, "peer ended session during clock probe");
                     return Err(ConnectError::PeerGoodbyeDuringClockProbe { reason, code });
                 }

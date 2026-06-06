@@ -620,6 +620,7 @@ mod tests {
                 .send_control(&ControlMessage::Goodbye {
                     reason: "test".into(),
                     code: GoodbyeCode::Clean,
+                    final_stats: None,
                 })
                 .await
                 .unwrap();

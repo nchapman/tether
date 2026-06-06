@@ -527,6 +527,48 @@ pub enum GoodbyeCode {
     Unknown(i32),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub role: String,
+    pub duration_ms: u64,
+    pub codec: String,
+    pub chroma: String,
+    pub bit_depth: u32,
+    pub video: VideoSessionStats,
+    pub audio: Option<AudioSessionStats>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoSessionStats {
+    pub frames_sent: u64,
+    pub frames_received: u64,
+    pub keyframes: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub incomplete_frames: u64,
+    pub fragment_loss_events: u64,
+    pub decode_errors: u64,
+    pub render_drop_frames: u64,
+    pub idr_requests: u64,
+    pub decode_queue_drop_frames: u64,
+    pub transient_send_drop_frames: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioSessionStats {
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub capture_frames: u64,
+    pub underruns: u64,
+    pub dropped_samples: u64,
+    pub recovered_frames: u64,
+    pub concealed_frames: u64,
+    pub dropout_frames: u64,
+    pub dropouts: u64,
+    pub stale_packets: u64,
+    pub decode_errors: u64,
+}
+
 /// Cursor input model. Carried by
 /// [`ControlMessage::SetCursorMode`]; default is `Absolute`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -587,6 +629,7 @@ pub enum ControlMessage {
     Goodbye {
         reason: String,
         code: GoodbyeCode,
+        final_stats: Option<Box<SessionSummary>>,
     },
     /// Escape hatch for features that don't yet warrant a typed variant.
     /// Payload is opaque to the core protocol; feature specs define their own
@@ -1183,6 +1226,99 @@ fn goodbye_from_pb(value: i32) -> GoodbyeCode {
     }
 }
 
+fn session_summary_to_pb(value: SessionSummary) -> pb::SessionSummary {
+    pb::SessionSummary {
+        role: value.role,
+        duration_ms: value.duration_ms,
+        codec: value.codec,
+        chroma: value.chroma,
+        bit_depth: value.bit_depth,
+        video: Some(video_session_stats_to_pb(value.video)),
+        audio: value.audio.map(audio_session_stats_to_pb),
+    }
+}
+
+fn session_summary_from_pb(value: pb::SessionSummary) -> Result<SessionSummary, CodecError> {
+    Ok(SessionSummary {
+        role: value.role,
+        duration_ms: value.duration_ms,
+        codec: value.codec,
+        chroma: value.chroma,
+        bit_depth: value.bit_depth,
+        video: value
+            .video
+            .map(video_session_stats_from_pb)
+            .unwrap_or_default(),
+        audio: value.audio.map(audio_session_stats_from_pb),
+    })
+}
+
+fn video_session_stats_to_pb(value: VideoSessionStats) -> pb::VideoSessionStats {
+    pb::VideoSessionStats {
+        frames_sent: value.frames_sent,
+        frames_received: value.frames_received,
+        keyframes: value.keyframes,
+        bytes_sent: value.bytes_sent,
+        bytes_received: value.bytes_received,
+        incomplete_frames: value.incomplete_frames,
+        fragment_loss_events: value.fragment_loss_events,
+        decode_errors: value.decode_errors,
+        render_drop_frames: value.render_drop_frames,
+        idr_requests: value.idr_requests,
+        decode_queue_drop_frames: value.decode_queue_drop_frames,
+        transient_send_drop_frames: value.transient_send_drop_frames,
+    }
+}
+
+fn video_session_stats_from_pb(value: pb::VideoSessionStats) -> VideoSessionStats {
+    VideoSessionStats {
+        frames_sent: value.frames_sent,
+        frames_received: value.frames_received,
+        keyframes: value.keyframes,
+        bytes_sent: value.bytes_sent,
+        bytes_received: value.bytes_received,
+        incomplete_frames: value.incomplete_frames,
+        fragment_loss_events: value.fragment_loss_events,
+        decode_errors: value.decode_errors,
+        render_drop_frames: value.render_drop_frames,
+        idr_requests: value.idr_requests,
+        decode_queue_drop_frames: value.decode_queue_drop_frames,
+        transient_send_drop_frames: value.transient_send_drop_frames,
+    }
+}
+
+fn audio_session_stats_to_pb(value: AudioSessionStats) -> pb::AudioSessionStats {
+    pb::AudioSessionStats {
+        packets_sent: value.packets_sent,
+        packets_received: value.packets_received,
+        capture_frames: value.capture_frames,
+        underruns: value.underruns,
+        dropped_samples: value.dropped_samples,
+        recovered_frames: value.recovered_frames,
+        concealed_frames: value.concealed_frames,
+        dropout_frames: value.dropout_frames,
+        dropouts: value.dropouts,
+        stale_packets: value.stale_packets,
+        decode_errors: value.decode_errors,
+    }
+}
+
+fn audio_session_stats_from_pb(value: pb::AudioSessionStats) -> AudioSessionStats {
+    AudioSessionStats {
+        packets_sent: value.packets_sent,
+        packets_received: value.packets_received,
+        capture_frames: value.capture_frames,
+        underruns: value.underruns,
+        dropped_samples: value.dropped_samples,
+        recovered_frames: value.recovered_frames,
+        concealed_frames: value.concealed_frames,
+        dropout_frames: value.dropout_frames,
+        dropouts: value.dropouts,
+        stale_packets: value.stale_packets,
+        decode_errors: value.decode_errors,
+    }
+}
+
 fn cursor_mode_to_pb(value: CursorMode) -> i32 {
     match value {
         CursorMode::Absolute => 1,
@@ -1365,9 +1501,14 @@ impl ReliableMessage for ControlMessage {
                 t1_receiver_recv: Some(mono_to_pb(probe.t1_receiver_recv)),
                 t2_receiver_send: Some(mono_to_pb(probe.t2_receiver_send)),
             }),
-            ControlMessage::Goodbye { reason, code } => Kind::Goodbye(pb::Goodbye {
+            ControlMessage::Goodbye {
+                reason,
+                code,
+                final_stats,
+            } => Kind::Goodbye(pb::Goodbye {
                 reason,
                 code: goodbye_to_pb(code),
+                final_stats: final_stats.map(|summary| Box::new(session_summary_to_pb(*summary))),
             }),
             ControlMessage::Extension(msg) => Kind::Extension(extension_to_pb(msg)),
             ControlMessage::CursorShape {
@@ -1477,6 +1618,10 @@ impl ReliableMessage for ControlMessage {
             Kind::Goodbye(v) => Ok(ControlMessage::Goodbye {
                 reason: v.reason,
                 code: goodbye_from_pb(v.code),
+                final_stats: v
+                    .final_stats
+                    .map(|summary| session_summary_from_pb(*summary).map(Box::new))
+                    .transpose()?,
             }),
             Kind::Extension(v) => {
                 if v.payload.len() > MAX_EXTENSION_PAYLOAD_BYTES {

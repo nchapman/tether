@@ -78,6 +78,14 @@ pub(crate) enum YuvPlanes {
     /// The variant holds one texture either way; the `RenderLayout`
     /// (`PackedXYUV` vs `PackedY410`) picks the matching shader.
     Yuv444Packed { packed: wgpu::Texture },
+    /// Planar 8-bit 4:4:4: full-resolution R8 Y, U, and V planes.
+    /// NVIDIA NVDEC exports HEVC Main 4:4:4 this way (`DRM_FORMAT_YUV444` /
+    /// `YU24`), unlike VAAPI's packed XYUV output.
+    Yuv444Planar {
+        y: wgpu::Texture,
+        u: wgpu::Texture,
+        v: wgpu::Texture,
+    },
 }
 
 /// Where rendered frames go. The production path owns a swapchain
@@ -303,6 +311,7 @@ pub(crate) struct UpscaleStage {
 pub(crate) enum RenderLayout {
     Biplanar8,
     Biplanar16,
+    Planar444,
     PackedXYUV,
     /// Packed 4:4:4 10-bit (Y410 / `Rgb10a2Unorm`): one 10:10:10:2
     /// texture, native 10-bit (no MSB-align). Linux VAAPI decode-output
@@ -319,6 +328,8 @@ pub(crate) fn render_layout_for(chroma: ChromaSubsampling, bit_depth: u8) -> Ren
         (ChromaSubsampling::Yuv444, 8) => {
             if cfg!(target_os = "macos") {
                 RenderLayout::Biplanar8
+            } else if cfg!(target_os = "linux") && tether_codec::nvenc::nvidia_gpu_present() {
+                RenderLayout::Planar444
             } else {
                 RenderLayout::PackedXYUV
             }
@@ -751,6 +762,22 @@ impl GpuState {
                             },
                         ],
                     }),
+                RenderLayout::Planar444 => {
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("tether-render yuv bgl (444 planar)"),
+                        entries: &[
+                            bgl_texture_entry(0),
+                            bgl_texture_entry(1),
+                            bgl_texture_entry(2),
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 3,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                        ],
+                    })
+                }
                 RenderLayout::PackedXYUV | RenderLayout::PackedY410 => device
                     .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                         label: Some("tether-render yuv bgl (444 packed)"),
@@ -859,6 +886,7 @@ impl GpuState {
             RenderLayout::Biplanar8 | RenderLayout::Biplanar16 => {
                 include_str!("../shader.wgsl")
             }
+            RenderLayout::Planar444 => include_str!("../shader_yuv444p.wgsl"),
             RenderLayout::PackedXYUV => include_str!("../shader_yuv444.wgsl"),
             RenderLayout::PackedY410 => include_str!("../shader_yuv444_10bit.wgsl"),
         };
@@ -866,6 +894,7 @@ impl GpuState {
             label: Some(match layout {
                 RenderLayout::Biplanar8 => "tether-render shader (biplanar 8)",
                 RenderLayout::Biplanar16 => "tether-render shader (biplanar 16)",
+                RenderLayout::Planar444 => "tether-render shader (444 planar)",
                 RenderLayout::PackedXYUV => "tether-render shader (444 packed)",
                 RenderLayout::PackedY410 => "tether-render shader (444 packed 10-bit)",
             }),
@@ -1708,7 +1737,7 @@ fn make_yuv_textures(
                     wgpu::TextureFormat::R16Unorm,
                     wgpu::TextureFormat::Rg16Unorm,
                 ),
-                RenderLayout::PackedXYUV | RenderLayout::PackedY410 => {
+                RenderLayout::Planar444 | RenderLayout::PackedXYUV | RenderLayout::PackedY410 => {
                     unreachable!("guarded by outer match")
                 }
             };
@@ -1751,10 +1780,66 @@ fn make_yuv_textures(
             let planes = match render_layout {
                 RenderLayout::Biplanar8 => YuvPlanes::Biplanar8 { y, uv },
                 RenderLayout::Biplanar16 => YuvPlanes::Biplanar16 { y, uv },
-                RenderLayout::PackedXYUV | RenderLayout::PackedY410 => unreachable!(),
+                RenderLayout::Planar444 | RenderLayout::PackedXYUV | RenderLayout::PackedY410 => {
+                    unreachable!()
+                }
             };
             YuvTextures {
                 planes,
+                bind_group,
+                size: (width, height),
+                _guard: None,
+            }
+        }
+        RenderLayout::Planar444 => {
+            let y = make_plane_texture(
+                device,
+                "tether-render y plane (444 planar)",
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            );
+            let u = make_plane_texture(
+                device,
+                "tether-render u plane (444 planar)",
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            );
+            let v = make_plane_texture(
+                device,
+                "tether-render v plane (444 planar)",
+                width,
+                height,
+                wgpu::TextureFormat::R8Unorm,
+            );
+            let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
+            let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
+            let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tether-render yuv bind group (444 planar)"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&u_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&v_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            });
+            YuvTextures {
+                planes: YuvPlanes::Yuv444Planar { y, u, v },
                 bind_group,
                 size: (width, height),
                 _guard: None,
@@ -1966,6 +2051,10 @@ mod tests {
             range_kind_for(8, RenderLayout::PackedXYUV),
             RANGE_KIND_LIMITED_8
         );
+        assert_eq!(
+            range_kind_for(8, RenderLayout::Planar444),
+            RANGE_KIND_LIMITED_8
+        );
     }
 
     /// Algebraic check on the 10-bit range constants the shader uses.
@@ -2005,6 +2094,8 @@ mod tests {
         let yuv444_8bit = render_layout_for(ChromaSubsampling::Yuv444, 8);
         if cfg!(target_os = "macos") {
             assert_eq!(yuv444_8bit, RenderLayout::Biplanar8);
+        } else if cfg!(target_os = "linux") && tether_codec::nvenc::nvidia_gpu_present() {
+            assert_eq!(yuv444_8bit, RenderLayout::Planar444);
         } else {
             assert_eq!(yuv444_8bit, RenderLayout::PackedXYUV);
         }

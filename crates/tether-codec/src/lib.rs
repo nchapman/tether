@@ -641,6 +641,51 @@ pub fn build_xv30_dmabuf_frame(
     }
 }
 
+/// Build a `DmaBufFrame` matching planar 8-bit 4:4:4 (`DRM_FORMAT_YUV444`,
+/// fourcc `YU24`): one DRM object, one layer carrying three full-resolution
+/// R8 planes at distinct offsets. This is the NVIDIA NVENC/NVDEC 4:4:4
+/// shape; the VAAPI path intentionally stays on packed `XYUV`.
+#[cfg(target_os = "linux")]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_yuv444p_dmabuf_frame(
+    fd: std::os::fd::OwnedFd,
+    size: u64,
+    modifier: u64,
+    y_offset: u64,
+    y_stride: u64,
+    u_offset: u64,
+    u_stride: u64,
+    v_offset: u64,
+    v_stride: u64,
+) -> DmaBufFrame {
+    DmaBufFrame {
+        fourcc: u32::from_le_bytes(*b"YU24"),
+        objects: vec![DmaBufObject {
+            fd,
+            size,
+            drm_format_modifier: modifier,
+        }],
+        layers: vec![DmaBufLayer {
+            drm_format: u32::from_le_bytes(*b"YU24"),
+            num_planes: 3,
+            object_index: [0, 0, 0, 0],
+            offset: [
+                u32::try_from(y_offset).expect("Y plane offset fits in u32"),
+                u32::try_from(u_offset).expect("U plane offset fits in u32"),
+                u32::try_from(v_offset).expect("V plane offset fits in u32"),
+                0,
+            ],
+            pitch: [
+                u32::try_from(y_stride).expect("Y plane stride fits in u32"),
+                u32::try_from(u_stride).expect("U plane stride fits in u32"),
+                u32::try_from(v_stride).expect("V plane stride fits in u32"),
+                0,
+            ],
+        }],
+    }
+}
+
 /// macOS IOSurface descriptor for a captured (encoder input) or
 /// decoded (renderer input) frame. Mirrors what
 /// `tether_capture::CapturedIOSurface` carries on the capture side;

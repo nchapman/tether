@@ -481,7 +481,8 @@ impl EglFns {
         // SAFETY: core EGL symbols present in any libEGL.so.1; bound
         // signatures match <EGL/egl.h>. Copied out of the Symbol guard;
         // sound while `lib` stays resident (held by the importer).
-        let get_proc_address: FnEglGetProcAddress = *unsafe { lib.get(b"eglGetProcAddress\0") }.ok()?;
+        let get_proc_address: FnEglGetProcAddress =
+            *unsafe { lib.get(b"eglGetProcAddress\0") }.ok()?;
         let initialize: FnEglInitialize = *unsafe { lib.get(b"eglInitialize\0") }.ok()?;
         let create_image: FnEglCreateImage = *unsafe { lib.get(b"eglCreateImage\0") }.ok()?;
         let destroy_image: FnEglDestroyImage = *unsafe { lib.get(b"eglDestroyImage\0") }.ok()?;
@@ -504,9 +505,9 @@ impl EglFns {
             ))
         }?;
         let get_platform_display: FnEglGetPlatformDisplayExt = unsafe {
-            std::mem::transmute::<*mut c_void, Option<FnEglGetPlatformDisplayExt>>(get_proc_address(
-                c"eglGetPlatformDisplayEXT".as_ptr(),
-            ))
+            std::mem::transmute::<*mut c_void, Option<FnEglGetPlatformDisplayExt>>(
+                get_proc_address(c"eglGetPlatformDisplayEXT".as_ptr()),
+            )
         }?;
 
         Some(Self {
@@ -919,10 +920,10 @@ impl EglCudaImporter {
                 frame.objects.len()
             ));
         }
-        if frame.layers.is_empty() || frame.layers.len() > 4 {
+        let expected_planes = declared_plane_count(&frame.layers)?;
+        if expected_planes == 0 || expected_planes > 3 {
             return Err(format!(
-                "EGL/CUDA import expects 1..=4 layers, got {}",
-                frame.layers.len()
+                "EGL/CUDA import expects 1..=3 planes, got {expected_planes}"
             ));
         }
         let object = &frame.objects[0];
@@ -942,12 +943,12 @@ impl EglCudaImporter {
             display: self.display,
             cuda: self.cuda,
             egl: self.egl,
-            resources: Vec::with_capacity(frame.layers.len()),
+            resources: Vec::with_capacity(1),
         };
-        let mut planes: Vec<ImportedPlane> = Vec::with_capacity(frame.layers.len());
+        let mut planes: Vec<ImportedPlane> = Vec::with_capacity(expected_planes);
 
         // Import the WHOLE surface as ONE multi-plane EGLImage keyed on the
-        // surface fourcc (NV12 / P010), not one image per plane. CUDA's
+        // surface fourcc (NV12 / P010 / YU24), not one image per plane. CUDA's
         // cuGraphicsEGLRegisterImage rejects a standalone single-channel 8-bit
         // (R8) Y-plane image with INVALID_VALUE; the canonical YUV import is a
         // single semi-planar image, from which the mapped CUeglFrame exposes
@@ -1024,18 +1025,17 @@ impl EglCudaImporter {
         // (the copy path handles both).
         //
         // The mapped plane count MUST equal the surface's dma-buf layer count
-        // (2 for NV12/P010; CUeglFrame holds at most 3). A driver that maps
+        // (2 for NV12/P010, 3 for YU24; CUeglFrame holds at most 3). A driver that maps
         // FEWER planes — e.g. losing the UV plane of a semi-planar image — would
         // otherwise make us copy only Y and ship a surface to NVENC (or, on the
         // decode side, export one) with stale / uninitialised chroma: silent
         // corruption. Require an exact match and fail loudly on any mismatch.
-        let expected_planes = frame.layers.len();
         let mapped_planes = usize::try_from(egl_frame.plane_count).unwrap_or(0);
         if expected_planes == 0 || expected_planes > 3 || mapped_planes != expected_planes {
             self.pop_ctx();
             return Err(format!(
                 "cuGraphicsResourceGetMappedEglFrame mapped {mapped_planes} plane(s) for fourcc \
-                 0x{:08x}, but the surface declares {expected_planes} (2 for NV12/P010); \
+                 0x{:08x}, but the surface declares {expected_planes}; \
                  refusing to import a partially-mapped surface",
                 frame.fourcc
             ));
@@ -1084,13 +1084,33 @@ impl EglCudaImporter {
     }
 }
 
+fn declared_plane_count(layers: &[DmaBufLayer]) -> Result<usize, String> {
+    let mut total = 0usize;
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let n = usize::try_from(layer.num_planes).map_err(|_| {
+            format!(
+                "dma-buf layer {layer_idx} has invalid plane count {}",
+                layer.num_planes
+            )
+        })?;
+        if n == 0 || n > 4 {
+            return Err(format!(
+                "dma-buf layer {layer_idx} has unsupported plane count {n}"
+            ));
+        }
+        total = total.saturating_add(n);
+    }
+    Ok(total)
+}
+
 /// Build the `eglCreateImage` attribute list for the whole multi-plane
 /// dma-buf surface (one EGLImage, not one per plane).
 ///
 /// Factored out (and kept verbose) because the geometry is the most likely
 /// thing to need a hardware tweak: `width`/`height` are the **full luma
 /// surface** dimensions and `fourcc` is the **surface-level** DRM format
-/// (`NV12` for 8-bit 4:2:0, `P010` for 10-bit 4:2:0) passed via
+/// (`NV12` for 8-bit 4:2:0, `P010` for 10-bit 4:2:0, `YU24` for planar
+/// 8-bit 4:4:4) passed via
 /// `EGL_LINUX_DRM_FOURCC_EXT`. Each `layers[i]` contributes one
 /// `EGL_DMA_BUF_PLANE{i}_*` triple (offset/pitch), all sharing the single
 /// object's `fd`. CUDA rejects a standalone single-channel plane image, so the
@@ -1127,25 +1147,33 @@ fn build_frame_attribs(
         EGL_LINUX_DRM_FOURCC_EXT,
         fourcc as EglAttrib,
     ];
-    // One PLANEn_* triple (+ modifier pair) per dma-buf layer, all sharing
+    // One PLANEn_* triple (+ modifier pair) per declared plane, all sharing
     // the single object's fd. EGL_EXT_image_dma_buf_import supports up to 3
-    // planes for the import target.
-    for (i, layer) in layers.iter().enumerate().take(3) {
-        let (fd_tok, off_tok, pitch_tok, lo_tok, hi_tok) = plane_attr_tokens(i);
-        attribs.push(fd_tok);
-        attribs.push(fd as EglAttrib);
-        attribs.push(off_tok);
-        attribs.push(layer.offset[0] as EglAttrib);
-        attribs.push(pitch_tok);
-        attribs.push(layer.pitch[0] as EglAttrib);
-        // Pass the tiling modifier only when the buffer carries an explicit
-        // one. With DRM_FORMAT_MOD_INVALID the driver picks the implicit
-        // modifier; passing the sentinel through would be rejected.
-        if modifier != DRM_FORMAT_MOD_INVALID {
-            attribs.push(lo_tok);
-            attribs.push((modifier & 0xFFFF_FFFF) as EglAttrib);
-            attribs.push(hi_tok);
-            attribs.push((modifier >> 32) as EglAttrib);
+    // planes for the import target. Tether's VAAPI-style descriptors use
+    // separate layers for NV12/P010; YU24 uses one layer with three planes.
+    let mut egl_plane = 0usize;
+    for layer in layers {
+        for plane in 0..usize::try_from(layer.num_planes).unwrap_or(0) {
+            if egl_plane >= 3 {
+                break;
+            }
+            let (fd_tok, off_tok, pitch_tok, lo_tok, hi_tok) = plane_attr_tokens(egl_plane);
+            attribs.push(fd_tok);
+            attribs.push(fd as EglAttrib);
+            attribs.push(off_tok);
+            attribs.push(layer.offset[plane] as EglAttrib);
+            attribs.push(pitch_tok);
+            attribs.push(layer.pitch[plane] as EglAttrib);
+            // Pass the tiling modifier only when the buffer carries an explicit
+            // one. With DRM_FORMAT_MOD_INVALID the driver picks the implicit
+            // modifier; passing the sentinel through would be rejected.
+            if modifier != DRM_FORMAT_MOD_INVALID {
+                attribs.push(lo_tok);
+                attribs.push((modifier & 0xFFFF_FFFF) as EglAttrib);
+                attribs.push(hi_tok);
+                attribs.push((modifier >> 32) as EglAttrib);
+            }
+            egl_plane += 1;
         }
     }
     attribs.push(EGL_NONE);
@@ -1180,6 +1208,63 @@ fn plane_attr_tokens(n: usize) -> (EglAttrib, EglAttrib, EglAttrib, EglAttrib, E
     }
 }
 
+#[cfg(test)]
+mod egl_attrib_tests {
+    use super::*;
+    use crate::DmaBufLayer;
+
+    #[test]
+    fn yuv444p_single_layer_flattens_to_three_egl_planes() {
+        let layer = DmaBufLayer {
+            drm_format: u32::from_le_bytes(*b"YU24"),
+            num_planes: 3,
+            object_index: [0, 0, 0, 0],
+            offset: [10, 20, 30, 0],
+            pitch: [100, 200, 300, 0],
+        };
+        let attribs = build_frame_attribs(
+            64,
+            32,
+            u32::from_le_bytes(*b"YU24"),
+            7,
+            &[layer],
+            DRM_FORMAT_MOD_INVALID,
+        );
+
+        assert_eq!(declared_plane_count(&[layer]).unwrap(), 3);
+        assert!(attribs.windows(6).any(|w| {
+            w == [
+                EGL_DMA_BUF_PLANE0_FD_EXT,
+                7,
+                EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                10,
+                EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                100,
+            ]
+        }));
+        assert!(attribs.windows(6).any(|w| {
+            w == [
+                EGL_DMA_BUF_PLANE1_FD_EXT,
+                7,
+                EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+                20,
+                EGL_DMA_BUF_PLANE1_PITCH_EXT,
+                200,
+            ]
+        }));
+        assert!(attribs.windows(6).any(|w| {
+            w == [
+                EGL_DMA_BUF_PLANE2_FD_EXT,
+                7,
+                EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+                30,
+                EGL_DMA_BUF_PLANE2_PITCH_EXT,
+                300,
+            ]
+        }));
+    }
+}
+
 /// Find the EGL device whose `EGL_CUDA_DEVICE_NV` attribute is the given CUDA
 /// ordinal, open a platform display on it, and `eglInitialize` it.
 ///
@@ -1198,9 +1283,7 @@ fn egl_display_for_cuda_device(egl: &EglFns, cuda_ordinal: i32) -> Option<EglDis
 
     // SAFETY: query_devices fills up to MAX_DEVICES entries and writes the
     // count to num_devices; both out buffers are valid for that span.
-    let ok = unsafe {
-        (egl.query_devices)(MAX_DEVICES, devices.as_mut_ptr(), &mut num_devices)
-    };
+    let ok = unsafe { (egl.query_devices)(MAX_DEVICES, devices.as_mut_ptr(), &mut num_devices) };
     if ok != EGL_TRUE || num_devices <= 0 {
         return None;
     }
@@ -1218,9 +1301,7 @@ fn egl_display_for_cuda_device(egl: &EglFns, cuda_ordinal: i32) -> Option<EglDis
         // SAFETY: device is a valid EGLDeviceEXT from query_devices; the
         // attribute out pointer is valid. A false return means the device
         // doesn't expose EGL_CUDA_DEVICE_NV — skip it.
-        let ok = unsafe {
-            (egl.query_device_attrib)(device, EGL_CUDA_DEVICE_NV, &mut cuda_device)
-        };
+        let ok = unsafe { (egl.query_device_attrib)(device, EGL_CUDA_DEVICE_NV, &mut cuda_device) };
         if ok != EGL_TRUE || cuda_device != target {
             continue;
         }
@@ -1228,11 +1309,7 @@ fn egl_display_for_cuda_device(egl: &EglFns, cuda_ordinal: i32) -> Option<EglDis
         // SAFETY: device is the CUDA-device-0 EGLDeviceEXT; a null attrib
         // list requests the default platform display configuration.
         let display = unsafe {
-            (egl.get_platform_display)(
-                EGL_PLATFORM_DEVICE_EXT,
-                device,
-                std::ptr::null(),
-            )
+            (egl.get_platform_display)(EGL_PLATFORM_DEVICE_EXT, device, std::ptr::null())
         };
         if display == EGL_NO_DISPLAY {
             continue;
@@ -1240,9 +1317,8 @@ fn egl_display_for_cuda_device(egl: &EglFns, cuda_ordinal: i32) -> Option<EglDis
 
         // SAFETY: display is a fresh platform display; null major/minor
         // out pointers are permitted (we don't need the version).
-        let init_ok = unsafe {
-            (egl.initialize)(display, std::ptr::null_mut(), std::ptr::null_mut())
-        };
+        let init_ok =
+            unsafe { (egl.initialize)(display, std::ptr::null_mut(), std::ptr::null_mut()) };
         if init_ok == EGL_TRUE {
             return Some(display);
         }

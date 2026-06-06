@@ -119,14 +119,6 @@ impl NvencEncoder {
             ));
         }
 
-        // 4:4:4 is deferred: NVENC's native 4:4:4 input is planar
-        // (YUV444P / YUV444P16), not the packed VUYX/XV30 the VAAPI
-        // DRM_PRIME path uses, so the zero-copy CUDA path needs a planar
-        // gpuconvert bridge that doesn't exist yet. Until that lands,
-        // map only the 4:2:0 formats; nvenc_sw_format returns
-        // UnsupportedInputFormat for 4:4:4 and the probe records it
-        // unsupported, so host-authoritative negotiation never picks a
-        // profile we'd have to silently downsample.
         let sw_format = nvenc_sw_format(chroma, bit_depth)?;
 
         let codec_cname = nvenc_codec_cname(kind);
@@ -225,11 +217,12 @@ impl NvencEncoder {
             // every decoder we target (VAAPI / VideoToolbox / D3D11VA) handles
             // it, so pinning High is both the safest pin (it's the backend
             // default) and the better one (8×8 transform → tighter compression).
-            raw.profile = match (kind, bit_depth) {
-                (CodecKind::H264, _) => ffi::AV_PROFILE_H264_HIGH as i32,
-                (CodecKind::Hevc, 10) => ffi::AV_PROFILE_HEVC_MAIN_10 as i32,
-                (CodecKind::Hevc, _) => ffi::AV_PROFILE_HEVC_MAIN as i32,
-                (CodecKind::Av1, _) => ffi::AV_PROFILE_AV1_MAIN as i32,
+            raw.profile = match (kind, chroma, bit_depth) {
+                (CodecKind::H264, _, _) => ffi::AV_PROFILE_H264_HIGH as i32,
+                (CodecKind::Hevc, ChromaSubsampling::Yuv444, _) => ffi::AV_PROFILE_HEVC_REXT as i32,
+                (CodecKind::Hevc, _, 10) => ffi::AV_PROFILE_HEVC_MAIN_10 as i32,
+                (CodecKind::Hevc, _, _) => ffi::AV_PROFILE_HEVC_MAIN as i32,
+                (CodecKind::Av1, _, _) => ffi::AV_PROFILE_AV1_MAIN as i32,
             };
         }
 
@@ -370,9 +363,8 @@ impl NvencEncoder {
     /// NVENC twin of [`crate::vaapi::VaapiEncoder::submit_dmabuf`].
     ///
     /// `frame.fourcc` must match the negotiated chroma — `NV12` for 4:2:0
-    /// 8-bit, `P010` for 4:2:0 10-bit (see [`expected_nvenc_dmabuf_fourcc`]).
-    /// 4:4:4 is not accepted here: NVENC wants planar input the gpuconvert
-    /// bridge doesn't produce yet (same deferral as `nvenc_sw_format`).
+    /// 8-bit, `P010` for 4:2:0 10-bit, `YU24` for 4:4:4 8-bit
+    /// (see [`expected_nvenc_dmabuf_fourcc`]).
     /// Width/height are pinned to the encoder's construction values;
     /// resolution changes go through a full encoder rebuild.
     ///
@@ -411,8 +403,9 @@ impl NvencEncoder {
 
         // Lazily-initialised, process-global EGL/CUDA importer. `None`
         // means this host can't do the interop at all.
-        let importer = nvffi::importer()
-            .ok_or_else(|| CodecError::NoHardwareCodec("EGL/CUDA import unavailable".to_string()))?;
+        let importer = nvffi::importer().ok_or_else(|| {
+            CodecError::NoHardwareCodec("EGL/CUDA import unavailable".to_string())
+        })?;
 
         // Import every plane into CUDA. `imported` owns the EGL images +
         // CUDA graphics resources; it must outlive `send_frame` + `drain`
@@ -437,12 +430,11 @@ impl NvencEncoder {
 
         // Copy each imported plane into the pool frame's matching plane.
         // 4:2:0: plane 0 = full height, plane 1 (interleaved UV) = half
-        // height; both rows are `width * bytes_per_sample` bytes wide
-        // (NV12 UV packs w/2 CbCr pairs = w bytes; P010 = 2w bytes).
+        // height. 4:4:4: all three planar planes are full height.
         let bytes_per_sample = if self.bit_depth == 8 { 1 } else { 2 };
         let width_bytes = self.width as usize * bytes_per_sample;
         for i in 0..imported.plane_count() {
-            let plane_height = if i == 0 {
+            let plane_height = if self.chroma == ChromaSubsampling::Yuv444 || i == 0 {
                 self.height as usize
             } else {
                 (self.height as usize).div_ceil(2)
@@ -634,9 +626,8 @@ fn nvenc_codec_display_name(kind: CodecKind) -> &'static str {
 /// `(chroma, bit_depth)` — the **surface-level** fourcc gpuconvert's
 /// NV12/P010 bridges stamp on the frame they hand the encoder.
 ///
-/// 4:2:0 only, matching [`nvenc_sw_format`]: `NV12` (8-bit) / `P010`
-/// (10-bit). 4:4:4 returns `None` (deferred — no planar gpuconvert
-/// bridge yet), which `submit_dmabuf` maps to `UnsupportedInputFormat`.
+/// `NV12` (4:2:0 8-bit), `P010` (4:2:0 10-bit), or `YU24`
+/// (planar 4:4:4 8-bit), matching [`nvenc_sw_format`].
 /// Same `(chroma, bit_depth) → fourcc` relation as the VAAPI sibling's
 /// [`crate::vaapi::expected_dmabuf_fourcc`] for the 4:2:0 rows.
 pub(super) fn expected_nvenc_dmabuf_fourcc(
@@ -646,6 +637,7 @@ pub(super) fn expected_nvenc_dmabuf_fourcc(
     Some(match (chroma, bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => u32::from_le_bytes(*b"NV12"),
         (ChromaSubsampling::Yuv420, 10) => u32::from_le_bytes(*b"P010"),
+        (ChromaSubsampling::Yuv444, 8) => u32::from_le_bytes(*b"YU24"),
         _ => return None,
     })
 }
@@ -653,17 +645,15 @@ pub(super) fn expected_nvenc_dmabuf_fourcc(
 /// FFmpeg CUDA `sw_format` (and matching BGRA→YUV swscale destination /
 /// staging `sw_frame`) for a negotiated `(chroma, bit_depth)`.
 ///
-/// 4:2:0 only for now: NV12 (8-bit) / P010LE (10-bit) match what the
-/// gpuconvert NV12/P010 bridges already produce, so the zero-copy DMA-BUF
-/// import can reuse them. 4:4:4 is deferred — NVENC wants planar
-/// `YUV444P`/`YUV444P16`, not the packed VUYX/XV30 of the VAAPI path, which
-/// needs a new gpuconvert bridge. Unmapped tuples return
+/// NV12 (4:2:0 8-bit), P010LE (4:2:0 10-bit), and YUV444P
+/// (4:4:4 8-bit) match the zero-copy gpuconvert bridges. Unmapped tuples return
 /// `UnsupportedInputFormat` so the profile is recorded unsupported rather
 /// than silently mis-encoded.
 pub(super) fn nvenc_sw_format(chroma: ChromaSubsampling, bit_depth: u8) -> Result<i32> {
     Ok(match (chroma, bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => ffi::AV_PIX_FMT_NV12,
         (ChromaSubsampling::Yuv420, 10) => ffi::AV_PIX_FMT_P010LE,
+        (ChromaSubsampling::Yuv444, 8) => ffi::AV_PIX_FMT_YUV444P,
         _ => return Err(CodecError::UnsupportedInputFormat),
     })
 }

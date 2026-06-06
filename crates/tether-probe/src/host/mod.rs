@@ -49,7 +49,9 @@ pub(crate) use d3d11::D3D11Probe as ActiveProbe;
 /// unsupported rather than dispatching to the decode-only nvidia-vaapi-driver
 /// whose `VaapiEncoder::new` SIGSEGVs. Non-NVIDIA Linux uses VAAPI.
 #[cfg(target_os = "macos")]
-pub(crate) fn probe_encode(profile: tether_protocol::control::VideoProfile) -> crate::profile_probe::Result<()> {
+pub(crate) fn probe_encode(
+    profile: tether_protocol::control::VideoProfile,
+) -> crate::profile_probe::Result<()> {
     use crate::profile_probe::ProfileProbe;
     ActiveProbe::probe_encode(profile)
 }

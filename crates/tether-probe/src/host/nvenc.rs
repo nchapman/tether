@@ -11,7 +11,8 @@
 //! construction-only check: `NvencEncoder::new` opening the codec is not
 //! sufficient evidence the encode actually runs. Both bit depths drive a real
 //! `submit_dmabuf` round trip through the production zero-copy import — 8-bit
-//! via `Nv12DmaBuf`, 10-bit (Main10) via `Bgra2P010DmaBuf`. This is
+//! 4:2:0 via `Nv12DmaBuf`, 10-bit Main10 via `Bgra2P010DmaBuf`, and 8-bit
+//! 4:4:4 via `Yuv444pDmaBuf`. This is
 //! deliberately stronger than the VAAPI probe's 8-bit path (which only does
 //! `encode_bgra`): the live Linux capture loop always feeds 8-bit GPU frames
 //! through `encode_gpu(DmaBuf) → submit_dmabuf` (the EGL→CUDA import), and a
@@ -19,12 +20,10 @@
 //! fallback. Probing only `encode_bgra` would let a host whose EGLImage import
 //! is broken advertise H.264/HEVC 8-bit and then drop every captured frame. The
 //! CPU-upload path stays covered by the `encode_bgra` hardware unit tests.
-//! NVENC 4:4:4 is rejected at construction (no planar bridge yet), so it never
-//! reaches the bit-depth branch.
 
 use tether_codec::nvenc::NvencEncoder;
-use tether_codec::{build_nv12_dmabuf_frame, build_p010_dmabuf_frame};
-use tether_gpuconvert::{Bgra2P010DmaBuf, Nv12DmaBuf};
+use tether_codec::{build_nv12_dmabuf_frame, build_p010_dmabuf_frame, build_yuv444p_dmabuf_frame};
+use tether_gpuconvert::{Bgra2P010DmaBuf, Nv12DmaBuf, Yuv444pDmaBuf};
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
 use crate::profile_probe::{ProbeError, Result};
@@ -64,8 +63,7 @@ impl NvencProbe {
 fn probe_encode_inner(profile: VideoProfile) -> Result<()> {
     // Construction catches "driver/codec can't do this profile at all":
     // codec not built (no `--enable-nvenc`), no NVIDIA device / `libcuda`,
-    // AV1 on a pre-Ada card, or 4:4:4 (no planar bridge yet → mapped
-    // UnsupportedInputFormat in `nvenc_sw_format`).
+    // AV1 on a pre-Ada card, or an unsupported chroma/depth tuple.
     let mut enc = NvencEncoder::new(profile, PROBE_DIM, PROBE_DIM, PROBE_FPS, PROBE_BITRATE_KBPS)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
 
@@ -79,8 +77,14 @@ fn probe_encode_inner(profile: VideoProfile) -> Result<()> {
         // 10-bit 4:2:0 (Main10): same, via the `Bgra2P010DmaBuf` bridge — the
         // encoder's only 10-bit input path (encode_bgra has no 10-bit branch).
         (ChromaSubsampling::Yuv420, 10) => probe_p010_submit(&mut enc)?,
-        // 4:4:4 never reaches here (rejected at NvencEncoder::new, no planar
-        // bridge yet); any other (chroma, bit_depth) is unmapped.
+        // 8-bit 4:4:4: planar YUV444P bridge, the only 4:4:4 layout NVENC
+        // accepts through FFmpeg. Tested NVIDIA EGL stacks currently reject
+        // the YU24 dma-buf at eglCreateImage, so this probe normally records
+        // the profile unsupported rather than advertising it.
+        (ChromaSubsampling::Yuv444, 8) => probe_yuv444p_submit(&mut enc)?,
+        // 10-bit 4:4:4 is deliberately deferred: NVENC/NVDEC can represent
+        // planar YUV444P16, and DRM has Q410/S410 candidates, but the current
+        // NVIDIA EGL dma-buf import path has not accepted planar 4:4:4 formats.
         (chroma, bd) => {
             return Err(ProbeError::new(
                 PipelineStage::Construct,
@@ -88,6 +92,36 @@ fn probe_encode_inner(profile: VideoProfile) -> Result<()> {
             ));
         }
     }
+    Ok(())
+}
+
+fn probe_yuv444p_submit(enc: &mut NvencEncoder) -> Result<()> {
+    let bridge = pollster::block_on(Yuv444pDmaBuf::new(PROBE_DIM, PROBE_DIM)).map_err(|e| {
+        ProbeError::new(
+            PipelineStage::Capture,
+            format!("Yuv444pDmaBuf::new failed (zero-copy YUV444P capture unavailable): {e}"),
+        )
+    })?;
+    let probe_bytes = vec![0x80u8; (PROBE_DIM * PROBE_DIM * 4) as usize];
+    let yuv = bridge.convert_bgra_bytes(&probe_bytes).map_err(|e| {
+        ProbeError::new(
+            PipelineStage::Capture,
+            format!("YUV444P bridge convert: {e}"),
+        )
+    })?;
+    let codec_frame = build_yuv444p_dmabuf_frame(
+        yuv.fd,
+        yuv.size,
+        yuv.modifier,
+        yuv.y_offset,
+        yuv.y_stride,
+        yuv.u_offset,
+        yuv.u_stride,
+        yuv.v_offset,
+        yuv.v_stride,
+    );
+    enc.submit_dmabuf(&codec_frame, 0, true)
+        .map_err(|e| ProbeError::from_codec(PipelineStage::Submit, e))?;
     Ok(())
 }
 

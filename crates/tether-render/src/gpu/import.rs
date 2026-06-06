@@ -6,7 +6,9 @@
 //! packed Y410 in a single Rgb10a2 texture. Pure Linux module — macOS
 //! lands its IOSurface equivalent in `metal.rs`.
 
-use tether_codec::vaapi_interop::{accepts_dmabuf_fourcc, dmabuf_fourcc_expected_label};
+use tether_codec::vaapi_interop::{
+    accepts_dmabuf_fourcc, dmabuf_fourcc_expected_label, YU24_FOURCC,
+};
 use tether_codec::{DmaBufFrame, GpuFrameGuard};
 use tether_protocol::control::ChromaSubsampling;
 
@@ -50,7 +52,11 @@ pub(crate) fn import_dmabuf_textures(
             device, layout, sampler, chroma, dmabuf, width, height, guard, false,
         ),
         (ChromaSubsampling::Yuv444, 8) => {
-            import_yuv444_packed(device, layout, sampler, dmabuf, width, height, guard)
+            if dmabuf.fourcc == YU24_FOURCC {
+                import_yuv444_planar(device, layout, sampler, dmabuf, width, height, guard)
+            } else {
+                import_yuv444_packed(device, layout, sampler, dmabuf, width, height, guard)
+            }
         }
         (ChromaSubsampling::Yuv420, 10) => {
             // P010: biplanar 16-bit cells, MSB-aligned 10-bit data,
@@ -247,6 +253,99 @@ fn import_yuv444_packed(
     });
     Ok(YuvTextures {
         planes: YuvPlanes::Yuv444Packed { packed },
+        bind_group,
+        size: (width, height),
+        _guard: Some(guard),
+    })
+}
+
+fn import_yuv444_planar(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    dmabuf: &DmaBufFrame,
+    width: u32,
+    height: u32,
+    guard: GpuFrameGuard,
+) -> Result<YuvTextures> {
+    if dmabuf.layers.len() != 1 {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444P dma-buf has {} layers; expected 1 (planar YU24)",
+            dmabuf.layers.len()
+        )));
+    }
+    let layer = &dmabuf.layers[0];
+    if layer.num_planes != 3 {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444P layer should have 3 planes, got {}",
+            layer.num_planes
+        )));
+    }
+    if !accepts_dmabuf_fourcc(ChromaSubsampling::Yuv444, 8, layer.drm_format) {
+        return Err(RenderError::DmaBufImport(format!(
+            "YUV444P layer fourcc 0x{:08x} not render-accepted; expected {}",
+            layer.drm_format,
+            dmabuf_fourcc_expected_label(ChromaSubsampling::Yuv444, 8),
+        )));
+    }
+
+    let y = import_one_plane(
+        device,
+        "tether-render y plane (dmabuf 444 planar)",
+        dmabuf,
+        0,
+        0,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )?;
+    let u = import_one_plane(
+        device,
+        "tether-render u plane (dmabuf 444 planar)",
+        dmabuf,
+        0,
+        1,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )?;
+    let v = import_one_plane(
+        device,
+        "tether-render v plane (dmabuf 444 planar)",
+        dmabuf,
+        0,
+        2,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )?;
+    let y_view = y.create_view(&wgpu::TextureViewDescriptor::default());
+    let u_view = u.create_view(&wgpu::TextureViewDescriptor::default());
+    let v_view = v.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tether-render yuv bind group (dmabuf 444 planar)"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&y_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&u_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&v_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    Ok(YuvTextures {
+        planes: YuvPlanes::Yuv444Planar { y, u, v },
         bind_group,
         size: (width, height),
         _guard: Some(guard),

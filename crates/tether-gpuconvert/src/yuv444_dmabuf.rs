@@ -1,18 +1,17 @@
-//! BGRA wgpu texture → YUV 4:4:4 planar DMA-BUF planes, via compute
-//! shader + 3-plane shared export.
+//! BGRA wgpu texture → packed XYUV 4:4:4 DMA-BUF, via compute shader
+//! + single-plane shared export.
 //!
 //! Mirror of [`crate::nv12_dmabuf::Nv12DmaBuf`]. Same shape — open a
 //! wgpu device, build the compute pipeline once, allocate the shared
 //! DMA-BUF target once, run one compute pass per frame and hand back
 //! dup'd fds. The differences are all in the output: 4:4:4 has three
 //! full-resolution R8 planes instead of NV12's R8 + Rg8 at half-chroma,
-//! and the consumer side (VAAPI HEVC Main444) expects DRM_FORMAT_YUV444
-//! `YU24` as the layer fourcc rather than `NV12`.
+//! and the consumer side (VAAPI HEVC Main444) expects DRM_FORMAT_XYUV8888
+//! `XYUV` as the layer fourcc rather than `NV12`.
 //!
 //! This is the path that feeds [`tether_codec::VaapiEncoder`] when the
-//! handshake negotiates HEVC Main444. The encoder's `submit_dmabuf`
-//! check expects a 3-plane `YU24` layer (one DRM object, three offsets);
-//! that's exactly what this bridge produces.
+//! handshake negotiates HEVC Main444. NVIDIA's planar `YU24` path lives
+//! in `yuv444p_dmabuf`.
 
 use std::os::fd::OwnedFd;
 
@@ -21,8 +20,8 @@ use crate::{
     pipeline::build_yuv444_pipeline,
 };
 
-/// One frame's worth of YUV 4:4:4 planes — a single dma-buf fd carrying
-/// Y, U, V at distinct offsets within one shared `VkDeviceMemory`.
+/// One frame's worth of packed XYUV — a single dma-buf fd carrying one
+/// full-resolution 32-bpp plane.
 ///
 /// `fd` is a dup'd copy of the bridge's persistent export. The bridge
 /// keeps the underlying memory alive via its own owned export for as

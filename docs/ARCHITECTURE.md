@@ -211,7 +211,7 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │     • NVIDIA clients: tether-codec::nvdec::NvdecDecoder instead     │
 │       (no VAAPI fallback); NVDEC → CUDA surface → EGLImage-import   │
 │       an NV12/P010 pool dma-buf → cuMemcpy2D planes in; same        │
-│       Frame::Gpu(DmaBuf) handoff (GH #16, Main + Main10)            │
+│       Frame::Gpu(DmaBuf) handoff (Main/Main10; 4:4:4 not advertised)│
 │         │   Frame::Gpu(GpuFrame { DmaBuf { fd, stride, modifier } })│
 │         ▼  (LatestFrame single-slot drop-oldest)                    │
 │   tether-render::gpu                                                │
@@ -680,14 +680,14 @@ of 4:2:0; rate-control absorbs some of that but not all, so a chroma-
 blind budget produces visibly blocky chroma in the same numbers that
 were sized for subsampled video.
 
-**Renderer accepts both YUV444 dma-buf shapes.** `vaExportSurfaceHandle`
-with `SEPARATE_LAYERS` is a *hint* the libva spec lets drivers ignore.
-Intel media-driver and current mesa return three R8 layers (one plane
-each); older mesa and nvidia-vaapi-driver return one `YU24` layer
-carrying three plane offsets. The import path accepts either. The
-encoder-side `yuv444_dmabuf_to_codec_frame` produces the
-one-layer/three-plane form, which matches VAAPI's PRIME_2 *importer*
-expectation on Main444.
+**Renderer accepts the Linux YUV444 dma-buf families that pass probe.**
+VAAPI HEVC Main 4:4:4 decode exports packed `XYUV` (and 10-bit `Y410` on
+the Intel reference path). The NVIDIA planar `YU24` renderer/import path
+exists as diagnostic groundwork, but NVIDIA Linux does not advertise
+4:4:4 today because the tested EGL stack rejects planar 4:4:4 dma-buf
+imports. Both families are still gated through the shared
+`accepts_dmabuf_fourcc` table so probe and renderer import cannot drift if
+a driver starts accepting the planar path.
 
 Four non-negotiable invariants tracked end-to-end:
 

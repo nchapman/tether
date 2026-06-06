@@ -23,10 +23,10 @@ use crate::Encoder;
 // --- format / codec mapping tables -----------------------------------------
 
 #[test]
-fn sw_format_maps_exactly_the_advertised_profiles() {
-    // 4:2:0 8/10-bit are the supported set; everything else (4:4:4, odd
-    // depths) is deferred and must report UnsupportedInputFormat so the
-    // probe records the profile unsupported rather than mis-encoding it.
+fn sw_format_maps_nvenc_staging_formats_attempted_by_probe() {
+    // These are formats FFmpeg/NVENC can stage into. Host advertisement still
+    // depends on the live submit probe; NVIDIA EGL currently rejects the YU24
+    // dma-buf import on tested drivers, so 8-bit 4:4:4 is not advertised there.
     assert_eq!(
         test_sw_format(ChromaSubsampling::Yuv420, 8).unwrap(),
         ffi::AV_PIX_FMT_NV12
@@ -35,7 +35,10 @@ fn sw_format_maps_exactly_the_advertised_profiles() {
         test_sw_format(ChromaSubsampling::Yuv420, 10).unwrap(),
         ffi::AV_PIX_FMT_P010LE
     );
-    assert!(test_sw_format(ChromaSubsampling::Yuv444, 8).is_err());
+    assert_eq!(
+        test_sw_format(ChromaSubsampling::Yuv444, 8).unwrap(),
+        ffi::AV_PIX_FMT_YUV444P
+    );
     assert!(test_sw_format(ChromaSubsampling::Yuv444, 10).is_err());
 }
 
@@ -64,6 +67,7 @@ fn sw_format_and_dmabuf_fourcc_agree_on_supported_set() {
                 let expected_fcc = match sw_fmt {
                     ffi::AV_PIX_FMT_NV12 => u32::from_le_bytes(*b"NV12"),
                     ffi::AV_PIX_FMT_P010LE => u32::from_le_bytes(*b"P010"),
+                    ffi::AV_PIX_FMT_YUV444P => u32::from_le_bytes(*b"YU24"),
                     other => panic!("unexpected sw_format {other} for {chroma:?} {bit_depth}-bit"),
                 };
                 assert_eq!(
@@ -100,11 +104,8 @@ impl SysfsFixture {
     fn new() -> Self {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "tether-nvenc-drm-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tether-nvenc-drm-{}-{}", std::process::id(), n));
         fs::create_dir_all(&root).expect("create fixture root");
         Self { root }
     }
@@ -247,8 +248,14 @@ fn assert_encode_bgra_produces_idr(profile: VideoProfile) {
             }
         }
     }
-    assert!(saw_keyframe, "{profile:?}: expected at least one keyframe (IDR)");
-    assert!(total_bytes > 0, "{profile:?}: encoder produced no bitstream");
+    assert!(
+        saw_keyframe,
+        "{profile:?}: expected at least one keyframe (IDR)"
+    );
+    assert!(
+        total_bytes > 0,
+        "{profile:?}: encoder produced no bitstream"
+    );
 }
 
 #[test]
@@ -399,8 +406,8 @@ fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
         p010.uv_stride,
     );
 
-    let mut enc =
-        NvencEncoder::new(VideoProfile::HEVC_10BIT_420, W, H, 30, 8_000).expect("NVENC HEVC Main10");
+    let mut enc = NvencEncoder::new(VideoProfile::HEVC_10BIT_420, W, H, 30, 8_000)
+        .expect("NVENC HEVC Main10");
     let packets = enc
         .submit_dmabuf(&frame, 0, true)
         .expect("submit_dmabuf (EGL→CUDA import + encode)");
@@ -424,6 +431,75 @@ fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
         (0.25..0.75).contains(&frac),
         "decoded luma mean {:.1} ({:.0}% of full scale) is not mid-range — the import did \
          not deliver the gray we encoded",
+        stats.mean,
+        frac * 100.0
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+fn nvenc_yuv444p_dmabuf_roundtrip_decodes_our_pixels() {
+    use tether_gpuconvert::Yuv444pDmaBuf;
+
+    const W: u32 = 256;
+    const H: u32 = 256;
+
+    let bridge = match pollster::block_on(Yuv444pDmaBuf::new(W, H)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("SKIP nvenc_yuv444p_dmabuf_roundtrip: Yuv444pDmaBuf unavailable: {e}");
+            return;
+        }
+    };
+
+    let mut bgra = vec![0u8; (W * H * 4) as usize];
+    for px in bgra.chunks_exact_mut(4) {
+        px.copy_from_slice(&[128, 128, 128, 255]);
+    }
+    let yuv = bridge.convert_bgra_bytes(&bgra).expect("YUV444P convert");
+    let frame = crate::build_yuv444p_dmabuf_frame(
+        yuv.fd,
+        yuv.size,
+        yuv.modifier,
+        yuv.y_offset,
+        yuv.y_stride,
+        yuv.u_offset,
+        yuv.u_stride,
+        yuv.v_offset,
+        yuv.v_stride,
+    );
+
+    let mut enc =
+        NvencEncoder::new(VideoProfile::HEVC_8BIT_444, W, H, 30, 8_000).expect("NVENC HEVC 444");
+    let packets = match enc.submit_dmabuf(&frame, 0, true) {
+        Ok(packets) => packets,
+        Err(crate::CodecError::NoHardwareCodec(e)) => {
+            eprintln!(
+                "SKIP nvenc_yuv444p_dmabuf_roundtrip: YUV444P EGL→CUDA import unsupported: {e}"
+            );
+            return;
+        }
+        Err(e) => panic!("submit_dmabuf (YUV444P EGL→CUDA import + encode): {e}"),
+    };
+    assert!(
+        packets.iter().any(|p| p.keyframe),
+        "submit_dmabuf should produce an IDR"
+    );
+
+    let stats = sw_hevc_decode_y_stats(&packets)
+        .expect("software HEVC decode of the NVENC 4:4:4 output produced no frame");
+    assert_eq!((stats.w, stats.h), (W, H), "decoded dims mismatch");
+    assert!(
+        stats.stddev < stats.max_scale * 0.05,
+        "decoded luma not uniform (stddev {:.1} of {:.0}) — the YUV444P EGL→CUDA \
+         import likely delivered garbage instead of our solid frame",
+        stats.stddev,
+        stats.max_scale
+    );
+    let frac = stats.mean / stats.max_scale;
+    assert!(
+        (0.25..0.75).contains(&frac),
+        "decoded luma mean {:.1} ({:.0}% of full scale) is not mid-range",
         stats.mean,
         frac * 100.0
     );
@@ -582,8 +658,7 @@ fn nvenc_cuda_enumerates_distinct_nonzero_uuids() {
             "CUDA ordinals should be the dense 0..n FFmpeg indexes by device string"
         );
         assert_ne!(
-            *uuid,
-            [0u8; 16],
+            *uuid, [0u8; 16],
             "CUDA device {ordinal} reported a zero UUID — cross-API correlation would be ambiguous"
         );
         // Every enumerated UUID must resolve back to exactly its own ordinal.

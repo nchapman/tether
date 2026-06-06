@@ -15,7 +15,7 @@
 use tether_codec::nvdec::NvdecDecoder;
 use tether_codec::vaapi_interop::{accepts_dmabuf_fourcc, dmabuf_fourcc_expected_label};
 use tether_codec::{Decoder, Frame, GpuFrameSource};
-use tether_protocol::control::{ChromaSubsampling, VideoProfile};
+use tether_protocol::control::VideoProfile;
 
 use crate::profile_probe::{ProbeError, Result};
 use crate::PipelineStage;
@@ -29,19 +29,6 @@ impl NvdecProbe {
 }
 
 fn probe_decode_inner(profile: VideoProfile, fixture: &[u8]) -> Result<()> {
-    // The NVDEC zero-copy path exports 4:2:0 surfaces only — NV12 (8-bit) and
-    // P010 (10-bit). 4:4:4 has no surface-pool layout, so the decoder rejects
-    // it; don't even attempt it (feeding NVDEC a 4:4:4 bitstream to then reject
-    // is wasted work, and on some streams the NVDEC runtime faults inside
-    // `send_packet` rather than erroring cleanly). Report unsupported up front
-    // so negotiation drops 4:4:4 to a 4:2:0 rung.
-    if profile.chroma != ChromaSubsampling::Yuv420 {
-        return Err(ProbeError::new(
-            PipelineStage::Decode,
-            "NVDEC zero-copy decode is 4:2:0 only (NV12 8-bit / P010 10-bit; 4:4:4 export not wired)",
-        ));
-    }
-
     let mut dec = NvdecDecoder::new(profile.codec)
         .map_err(|e| ProbeError::from_codec(PipelineStage::Construct, e))?;
     dec.submit(fixture)

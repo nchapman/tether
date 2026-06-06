@@ -432,11 +432,16 @@ built `--enable-nvenc --enable-cuda` (the `8.1.0-tether.5` artifact) plus
 the runtime `libnvidia-encode.so` / `libcuda.so` / `libEGL.so`.
 
 - **Codecs / profiles** (Ampere-verified set): H.264 4:2:0 8-bit (High),
-  HEVC 4:2:0 8-bit (Main) + 10-bit (Main10). AV1 is **not advertised** —
-  NVENC AV1 needs Ada (RTX 40+); a pre-Ada card fail-fasts at
-  construction and the probe degrades it. HEVC/H.264 4:4:4 is deferred
-  (NVENC wants planar `YUV444P`, not the packed VUYX/XV30 the gpuconvert
-  4:4:4 bridge produces).
+  HEVC 4:2:0 8-bit (Main), and HEVC 4:2:0 10-bit (Main10). AV1 is **not
+  advertised** — NVENC AV1 needs Ada (RTX 40+); a pre-Ada card fail-fasts
+  at construction and the probe degrades it. HEVC Main 4:4:4 is **not
+  advertised on NVIDIA Linux** today. NVENC/NVDEC have native planar 4:4:4
+  formats (`YUV444P` / `YUV444P16`), and Linux DRM has three-plane 10-bit
+  candidates (`Q410` / `S410` / `S416`), but the tested NVIDIA EGL stack
+  does not advertise/import the planar 4:4:4 dma-buf formats (`YU24`,
+  `Q410`, `S410`, `S416`). The live submit probe therefore records 4:4:4
+  unsupported rather than advertising a profile that will fail at
+  `eglCreateImage`.
 - **Zero-copy input**: NVENC's CUDA input can't consume a Vulkan-exported
   dma-buf via `cuImportExternalMemory` (a dma-buf isn't a CUDA opaque-fd
   handle). The bridge is EGLImage interop, like Sunshine: the gpuconvert
@@ -487,11 +492,10 @@ Uses FFmpeg's generic `h264` / `hevc` / `av1` decoder with a CUDA
   host-memory round-trip. The surface pool is raw `ash` (not gpuconvert's
   exporter) because tether-codec can't depend on gpuconvert without a cargo
   cycle; it mirrors `shared_nv12.rs`'s layout + 64-byte/16-row alignment.
-- **Profiles**: H.264 / HEVC Main (NV12) + HEVC Main10 and AV1 10-bit
-  (P010), all 4:2:0. The pool models the two 4:2:0 layouts — NV12 (`R8` +
-  `R8G8`) and P010 (`R16` + `R16G16`); a non-4:2:0 / 12-bit `sw_format`
-  reports `UnsupportedInputFormat`. 4:4:4 decode is deferred (no pool
-  layout). AV1 decode works on Ampere (decode, unlike encode, isn't Ada-only).
+- **Profiles**: H.264 / HEVC Main (NV12), HEVC Main10 and AV1 10-bit
+  (P010). HEVC Main 4:4:4 is not advertised on NVIDIA Linux until the
+  planar dma-buf import/export leg is proven on NVIDIA EGL/CUDA. AV1 decode
+  works on Ampere (decode, unlike encode, isn't Ada-only).
 - **NVDEC HEVC has a 144×144 minimum coded size** (H.264's is far smaller).
   Below it, `avcodec_send_packet` fails with a bare `-1`. This bit the
   decode probe: the fixtures were 128×128, so HEVC silently dropped to the
@@ -504,7 +508,10 @@ Uses FFmpeg's generic `h264` / `hevc` / `av1` decoder with a CUDA
 - **Verified** on RTX 3090 Ti: `decodes_committed_h264_fixture_via_nvdec`
   (NV12, pixel-exact vs software decode) and
   `decodes_our_hevc_main10_via_nvdec_p010` (P010 round trip from our own
-  NVENC Main10 output, uniform mid-range 10-bit luma readback).
+  NVENC Main10 output, uniform mid-range 10-bit luma readback). The
+  diagnostic `decodes_our_hevc_main444_via_nvdec_yuv444p` test currently
+  SKIPs on this driver because `eglCreateImage(YU24)` returns
+  `EGL_BAD_MATCH`.
 
 ### What's probed
 

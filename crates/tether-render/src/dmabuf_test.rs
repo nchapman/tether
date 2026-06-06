@@ -1002,7 +1002,13 @@ mod cross_table_consistency {
         match &fourcc.to_le_bytes() {
             b"NV12" => RenderLayout::Biplanar8,
             b"P010" => RenderLayout::Biplanar16,
-            b"XYUV" => RenderLayout::PackedXYUV,
+            b"XYUV" => {
+                if tether_codec::nvenc::nvidia_gpu_present() {
+                    RenderLayout::Planar444
+                } else {
+                    RenderLayout::PackedXYUV
+                }
+            }
             b"XV30" => RenderLayout::PackedY410,
             other => panic!("expected_layout_for_fourcc: unknown fourcc {other:?}"),
         }

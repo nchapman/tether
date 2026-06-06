@@ -69,6 +69,8 @@ pub enum NvdecSurfaceFormat {
     Nv12,
     /// 10-bit 4:2:0 — Y as `R16`, UV as `R16G16` (fourcc `P010`).
     P010,
+    /// 8-bit 4:4:4 — three full-resolution R8 planes (fourcc `YU24`).
+    Yuv444p,
 }
 
 impl NvdecSurfaceFormat {
@@ -77,6 +79,7 @@ impl NvdecSurfaceFormat {
         match self {
             Self::Nv12 => vk::Format::R8_UNORM,
             Self::P010 => vk::Format::R16_UNORM,
+            Self::Yuv444p => vk::Format::R8_UNORM,
         }
     }
 
@@ -85,6 +88,14 @@ impl NvdecSurfaceFormat {
         match self {
             Self::Nv12 => vk::Format::R8G8_UNORM,
             Self::P010 => vk::Format::R16G16_UNORM,
+            Self::Yuv444p => vk::Format::R8_UNORM,
+        }
+    }
+
+    fn v_vk_format(self) -> Option<vk::Format> {
+        match self {
+            Self::Yuv444p => Some(vk::Format::R8_UNORM),
+            Self::Nv12 | Self::P010 => None,
         }
     }
 
@@ -93,8 +104,15 @@ impl NvdecSurfaceFormat {
     /// `bytes_per_sample` = `w × bytes_per_sample`, equal to the Y row.)
     pub fn bytes_per_sample(self) -> usize {
         match self {
-            Self::Nv12 => 1,
+            Self::Nv12 | Self::Yuv444p => 1,
             Self::P010 => 2,
+        }
+    }
+
+    pub fn plane_count(self) -> usize {
+        match self {
+            Self::Nv12 | Self::P010 => 2,
+            Self::Yuv444p => 3,
         }
     }
 }
@@ -112,6 +130,8 @@ struct SurfaceExport {
     y_pitch: u64,
     uv_offset: u64,
     uv_pitch: u64,
+    v_offset: u64,
+    v_pitch: u64,
 }
 
 /// One pool slot: the surface's dma-buf export, a free flag, and the shared
@@ -247,6 +267,8 @@ impl NvdecSurfacePool {
                     y_pitch: export.y_pitch,
                     uv_offset: export.uv_offset,
                     uv_pitch: export.uv_pitch,
+                    v_offset: export.v_offset,
+                    v_pitch: export.v_pitch,
                     width: self.width,
                     height: self.height,
                     release: SlotGuard {
@@ -285,6 +307,9 @@ impl Drop for SurfaceBacking {
         // so it is destroyed exactly once, before the device.
         unsafe {
             let device = &self.vk.device;
+            if let Some(v_image) = self.images.v_image {
+                device.destroy_image(v_image, None);
+            }
             device.destroy_image(self.images.uv_image, None);
             device.destroy_image(self.images.y_image, None);
             device.free_memory(self.images.memory, None);
@@ -296,6 +321,7 @@ impl Drop for SurfaceBacking {
 struct SurfaceImages {
     y_image: vk::Image,
     uv_image: vk::Image,
+    v_image: Option<vk::Image>,
     memory: vk::DeviceMemory,
 }
 
@@ -334,6 +360,8 @@ pub struct PooledSurface {
     pub y_pitch: u64,
     pub uv_offset: u64,
     pub uv_pitch: u64,
+    pub v_offset: u64,
+    pub v_pitch: u64,
     pub width: u32,
     pub height: u32,
     /// Returns the slot to the pool's free list on drop. Moved into the
@@ -367,6 +395,17 @@ impl PooledSurface {
                 self.uv_offset,
                 self.uv_pitch,
             ),
+            NvdecSurfaceFormat::Yuv444p => crate::build_yuv444p_dmabuf_frame(
+                fd,
+                self.size,
+                self.modifier,
+                self.y_offset,
+                self.y_pitch,
+                self.uv_offset,
+                self.uv_pitch,
+                self.v_offset,
+                self.v_pitch,
+            ),
         }
     }
 }
@@ -391,10 +430,7 @@ struct VulkanDevice {
 ///
 /// # Safety
 /// `instance` must be live and `physical` one of the devices it enumerated.
-unsafe fn physical_device_uuid(
-    instance: &ash::Instance,
-    physical: vk::PhysicalDevice,
-) -> [u8; 16] {
+unsafe fn physical_device_uuid(instance: &ash::Instance, physical: vk::PhysicalDevice) -> [u8; 16] {
     let mut id_props = vk::PhysicalDeviceIDProperties::default();
     let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id_props);
     // SAFETY: `physical` belongs to `instance`; `props2` is a well-formed
@@ -500,7 +536,8 @@ impl VulkanDevice {
                 // SAFETY: instance is live and otherwise unreferenced.
                 unsafe { instance.destroy_instance(None) };
                 CodecError::NoHardwareCodec(
-                    "NVDEC surface pool: NVIDIA Vulkan device exposes no queue families".to_string(),
+                    "NVDEC surface pool: NVIDIA Vulkan device exposes no queue families"
+                        .to_string(),
                 )
             })?;
         let queue_priorities = [1.0_f32];
@@ -514,9 +551,8 @@ impl VulkanDevice {
         // SAFETY: `physical_device` is from `instance`; the extension list is
         // valid and required for the export below. On failure we tear down the
         // instance to avoid a leak.
-        let device = match unsafe {
-            instance.create_device(physical_device, &device_create, None)
-        } {
+        let device = match unsafe { instance.create_device(physical_device, &device_create, None) }
+        {
             Ok(d) => d,
             Err(e) => {
                 // SAFETY: instance is live and otherwise unreferenced.
@@ -564,41 +600,46 @@ impl VulkanDevice {
     ) -> std::result::Result<(SurfaceImages, SurfaceExport), String> {
         let aligned_w = width.next_multiple_of(LUMA_STRIDE_ALIGN);
         let aligned_h = height.next_multiple_of(HEIGHT_ALIGN);
-        let chroma_w = aligned_w.div_ceil(2);
-        let chroma_h = aligned_h.div_ceil(2);
+        let (chroma_w, chroma_h) = match format {
+            NvdecSurfaceFormat::Nv12 | NvdecSurfaceFormat::P010 => {
+                (aligned_w.div_ceil(2), aligned_h.div_ceil(2))
+            }
+            NvdecSurfaceFormat::Yuv444p => (aligned_w, aligned_h),
+        };
 
         let device = &self.device;
         let modifiers = [DRM_FORMAT_MOD_LINEAR];
 
-        let create_image = |format: vk::Format, w: u32, h: u32| -> std::result::Result<vk::Image, String> {
-            let mut ext_mem_create = vk::ExternalMemoryImageCreateInfo::default()
-                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-            let mut modifier_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-                .drm_format_modifiers(&modifiers);
-            let info = vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(format)
-                .extent(vk::Extent3D {
-                    width: w,
-                    height: h,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                // The decoder writes via CUDA (not Vulkan); TRANSFER_DST is the
-                // honest usage for an externally-filled image.
-                .usage(vk::ImageUsageFlags::TRANSFER_DST)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .push_next(&mut ext_mem_create)
-                .push_next(&mut modifier_info);
-            // SAFETY: `info` is a well-formed external/modifier image descriptor;
-            // the returned image is destroyed by the caller on error / pool drop.
-            unsafe { device.create_image(&info, None) }
-                .map_err(|e| format!("vkCreateImage (NV12 shared): {e}"))
-        };
+        let create_image =
+            |format: vk::Format, w: u32, h: u32| -> std::result::Result<vk::Image, String> {
+                let mut ext_mem_create = vk::ExternalMemoryImageCreateInfo::default()
+                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                let mut modifier_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+                    .drm_format_modifiers(&modifiers);
+                let info = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D {
+                        width: w,
+                        height: h,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                    // The decoder writes via CUDA (not Vulkan); TRANSFER_DST is the
+                    // honest usage for an externally-filled image.
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .push_next(&mut ext_mem_create)
+                    .push_next(&mut modifier_info);
+                // SAFETY: `info` is a well-formed external/modifier image descriptor;
+                // the returned image is destroyed by the caller on error / pool drop.
+                unsafe { device.create_image(&info, None) }
+                    .map_err(|e| format!("vkCreateImage (NV12 shared): {e}"))
+            };
 
         let y_image = create_image(format.y_vk_format(), aligned_w, aligned_h)?;
         let uv_image = match create_image(format.uv_vk_format(), chroma_w, chroma_h) {
@@ -609,17 +650,36 @@ impl VulkanDevice {
                 return Err(e);
             }
         };
+        let v_image = match format.v_vk_format() {
+            Some(v_format) => match create_image(v_format, aligned_w, aligned_h) {
+                Ok(i) => Some(i),
+                Err(e) => {
+                    unsafe {
+                        device.destroy_image(uv_image, None);
+                        device.destroy_image(y_image, None);
+                    }
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
 
-        // From here, any error must destroy both images (+ memory if allocated).
+        // From here, any error must destroy every image (+ memory if allocated).
         let built = (|| -> std::result::Result<(SurfaceImages, SurfaceExport), String> {
-            // SAFETY: both images are live, created on `device`.
-            let (y_req, uv_req) = unsafe {
+            // SAFETY: images are live, created on `device`.
+            let (y_req, uv_req, v_req) = unsafe {
                 (
                     device.get_image_memory_requirements(y_image),
                     device.get_image_memory_requirements(uv_image),
+                    v_image.map(|image| device.get_image_memory_requirements(image)),
                 )
             };
-            let combined_bits = y_req.memory_type_bits & uv_req.memory_type_bits;
+            let combined_bits = match v_req {
+                Some(v_req) => {
+                    y_req.memory_type_bits & uv_req.memory_type_bits & v_req.memory_type_bits
+                }
+                None => y_req.memory_type_bits & uv_req.memory_type_bits,
+            };
             if combined_bits == 0 {
                 return Err("no common memory type for Y+UV images".to_string());
             }
@@ -633,18 +693,27 @@ impl VulkanDevice {
                 combined_bits,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
-            .or_else(|| find_memory_type(&mem_props, combined_bits, vk::MemoryPropertyFlags::empty()))
+            .or_else(|| {
+                find_memory_type(&mem_props, combined_bits, vk::MemoryPropertyFlags::empty())
+            })
             .ok_or_else(|| "no suitable memory type".to_string())?;
 
             // UV bind offset spans the Y image and satisfies both alignments.
             let uv_align = uv_req.alignment.max(y_req.alignment);
             let uv_bind_offset = align_up(y_req.size, uv_align);
+            let (v_bind_offset, total_size) = match v_req {
+                Some(v_req) => {
+                    let v_align = uv_align.max(v_req.alignment);
+                    let offset = align_up(uv_bind_offset.saturating_add(uv_req.size), v_align);
+                    (offset, offset.saturating_add(v_req.size))
+                }
+                None => (0, uv_bind_offset.saturating_add(uv_req.size)),
+            };
             // Saturating, consistent with `align_up`: a driver-reported size near
             // u64::MAX must not wrap to a small `total_size`, which would
             // under-allocate the memory and bind the UV plane past its end.
             // (`MAX_DECODE_DIM` keeps real inputs far from this, but the
             // arithmetic stays honest.)
-            let total_size = uv_bind_offset.saturating_add(uv_req.size);
 
             let mut export_alloc = vk::ExportMemoryAllocateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -666,6 +735,11 @@ impl VulkanDevice {
                     device
                         .bind_image_memory(uv_image, memory, uv_bind_offset)
                         .map_err(|e| format!("vkBindImageMemory (UV): {e}"))?;
+                    if let Some(v_image) = v_image {
+                        device
+                            .bind_image_memory(v_image, memory, v_bind_offset)
+                            .map_err(|e| format!("vkBindImageMemory (V): {e}"))?;
+                    }
                 }
 
                 let fd_info = vk::MemoryGetFdInfoKHR::default()
@@ -684,20 +758,41 @@ impl VulkanDevice {
                 // with an opaque error.
                 let mut y_mod_props = vk::ImageDrmFormatModifierPropertiesEXT::default();
                 let mut uv_mod_props = vk::ImageDrmFormatModifierPropertiesEXT::default();
+                let mut v_mod_props = vk::ImageDrmFormatModifierPropertiesEXT::default();
                 // SAFETY: both are live DRM-modifier images on `device`.
                 unsafe {
                     self.modifier_ext
                         .get_image_drm_format_modifier_properties(y_image, &mut y_mod_props)
-                        .map_err(|e| format!("vkGetImageDrmFormatModifierPropertiesEXT (Y): {e}"))?;
+                        .map_err(|e| {
+                            format!("vkGetImageDrmFormatModifierPropertiesEXT (Y): {e}")
+                        })?;
                     self.modifier_ext
                         .get_image_drm_format_modifier_properties(uv_image, &mut uv_mod_props)
-                        .map_err(|e| format!("vkGetImageDrmFormatModifierPropertiesEXT (UV): {e}"))?;
+                        .map_err(|e| {
+                            format!("vkGetImageDrmFormatModifierPropertiesEXT (UV): {e}")
+                        })?;
+                    if let Some(v_image) = v_image {
+                        self.modifier_ext
+                            .get_image_drm_format_modifier_properties(v_image, &mut v_mod_props)
+                            .map_err(|e| {
+                                format!("vkGetImageDrmFormatModifierPropertiesEXT (V): {e}")
+                            })?;
+                    }
                 }
                 if y_mod_props.drm_format_modifier != uv_mod_props.drm_format_modifier {
                     return Err(format!(
                         "surface Y/UV modifiers differ (Y 0x{:x}, UV 0x{:x}); \
                          single-modifier EGL import would fail",
                         y_mod_props.drm_format_modifier, uv_mod_props.drm_format_modifier
+                    ));
+                }
+                if v_image.is_some()
+                    && y_mod_props.drm_format_modifier != v_mod_props.drm_format_modifier
+                {
+                    return Err(format!(
+                        "surface Y/V modifiers differ (Y 0x{:x}, V 0x{:x}); \
+                         single-modifier EGL import would fail",
+                        y_mod_props.drm_format_modifier, v_mod_props.drm_format_modifier
                     ));
                 }
 
@@ -709,10 +804,11 @@ impl VulkanDevice {
                 let uv_subres = vk::ImageSubresource::default()
                     .aspect_mask(vk::ImageAspectFlags::MEMORY_PLANE_0_EXT);
                 // SAFETY: both images are live LINEAR-modifier images.
-                let (y_layout, uv_layout) = unsafe {
+                let (y_layout, uv_layout, v_layout) = unsafe {
                     (
                         device.get_image_subresource_layout(y_image, y_subres),
                         device.get_image_subresource_layout(uv_image, uv_subres),
+                        v_image.map(|image| device.get_image_subresource_layout(image, uv_subres)),
                     )
                 };
 
@@ -724,6 +820,8 @@ impl VulkanDevice {
                     y_pitch: y_layout.row_pitch,
                     uv_offset: uv_bind_offset + uv_layout.offset,
                     uv_pitch: uv_layout.row_pitch,
+                    v_offset: v_layout.map_or(0, |layout| v_bind_offset + layout.offset),
+                    v_pitch: v_layout.map_or(0, |layout| layout.row_pitch),
                 })
             })();
 
@@ -732,6 +830,7 @@ impl VulkanDevice {
                     SurfaceImages {
                         y_image,
                         uv_image,
+                        v_image,
                         memory,
                     },
                     export,
@@ -748,6 +847,9 @@ impl VulkanDevice {
             // SAFETY: both images live; memory (if it was allocated) was freed
             // in the inner closure's error arm before returning Err.
             unsafe {
+                if let Some(v_image) = v_image {
+                    device.destroy_image(v_image, None);
+                }
                 device.destroy_image(uv_image, None);
                 device.destroy_image(y_image, None);
             }
@@ -829,7 +931,9 @@ mod tests {
         // Drain every slot; each surface must be a well-formed NV12 descriptor.
         let mut held: Vec<PooledSurface> = Vec::new();
         for _ in 0..POOL_SIZE {
-            let s = pool.acquire().expect("a free slot while the pool is not exhausted");
+            let s = pool
+                .acquire()
+                .expect("a free slot while the pool is not exhausted");
             assert_eq!((s.width, s.height), (w, h));
             assert!(s.size > 0, "surface allocation has non-zero size");
             // We asked for a 1-element LINEAR modifier list, so the driver must
@@ -838,8 +942,16 @@ mod tests {
             assert_eq!(s.modifier, 0, "NV12 surface must be DRM_FORMAT_MOD_LINEAR");
             // Y row spans w bytes; UV row spans w bytes (w/2 CbCr pairs × 2).
             // Alignment may make either larger, never smaller.
-            assert!(s.y_pitch >= u64::from(w), "Y pitch {} < width {w}", s.y_pitch);
-            assert!(s.uv_pitch >= u64::from(w), "UV pitch {} < width {w}", s.uv_pitch);
+            assert!(
+                s.y_pitch >= u64::from(w),
+                "Y pitch {} < width {w}",
+                s.y_pitch
+            );
+            assert!(
+                s.uv_pitch >= u64::from(w),
+                "UV pitch {} < width {w}",
+                s.uv_pitch
+            );
             assert!(s.uv_offset >= s.y_offset + s.y_pitch * u64::from(h));
             held.push(s);
         }

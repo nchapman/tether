@@ -69,7 +69,7 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
         .await?;
 
     let video = VideoPacket::First {
-        display: 0,
+        stream_id: tether_protocol::control::VideoStreamId(0),
         stream_epoch: 0,
         frame_seq: 7,
         fragment_count: 1,
@@ -282,7 +282,7 @@ async fn oversize_datagram_is_rejected_locally() -> anyhow::Result<()> {
 
     // Construct a video packet whose encoded form exceeds MAX_DATAGRAM_PAYLOAD.
     let oversized = VideoPacket::First {
-        display: 0,
+        stream_id: tether_protocol::control::VideoStreamId(0),
         stream_epoch: 0,
         frame_seq: 0,
         fragment_count: 1,
@@ -365,7 +365,7 @@ async fn frame_fragmented_at_live_mtu_is_accepted_and_reassembles() -> anyhow::R
         input_echo: InputEchoBatch::default(),
         dimensions: (1920, 1080),
     };
-    let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+    let mut fragmenter = FrameFragmenter::new_with_fec(0u8, 20);
     let packets = fragmenter.fragment(meta, body, budget);
     assert!(
         packets.len() > 1,

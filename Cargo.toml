@@ -61,6 +61,9 @@ crossbeam-channel = "0.5"
 socket2 = "0.5"
 winit = "0.30"
 async-trait = "0.1"
+prost = "0.13"
+prost-build = "0.13"
+protoc-bin-vendored = "3"
 
 # Keep every wgpu sub-crate on the same trunk SHA as the top-level pin
 # in tether-render. Without this, any future workspace member that
@@ -92,4 +95,3 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
 cast_lossless = "warn"
-

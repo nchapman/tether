@@ -22,18 +22,11 @@
 //! or input will get their own focused fakes without dragging in
 //! stubs for channels they don't exercise.
 //!
-//! The handshake methods are split — [`ControlChannel::recv_client_hello`]
-//! returns both the hello and the `t1_server_recv` timestamp; the
-//! orchestration in `tether_session::HostSession::accept` then builds
-//! the application half of the `ServerHello` and calls
-//! [`ControlChannel::send_server_hello`], which stamps in `t0_echo` /
-//! `t1` / `t2_server_send` immediately before serializing the wire
-//! bytes. The clock-sync stamps are a wire-protocol concern (they
-//! govern the `ClockSync::from_probe` estimator's accuracy); profile
-//! negotiation is an application concern (`tether-probe` policy).
-//! Keeping the split aligned to that boundary means the transport
-//! crate doesn't see `VideoProfile` and the session crate doesn't
-//! see `MonoNanos::now`.
+//! The handshake methods are split so `tether_session::HostSession::accept`
+//! can receive the client hello, run application negotiation, and then send
+//! either an accepted `ServerHello` or a typed handshake rejection. Clock sync
+//! is a separate post-handshake `ClockProbeRequest` / `ClockProbeResponse`
+//! exchange on the control channel.
 //!
 //! [`Connection`]: crate::Connection
 //! [`test_support`]: crate::test_support
@@ -42,9 +35,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tether_protocol::control::{ClientHello, ClockSync, ControlMessage, ServerHello};
+use tether_protocol::control::{ClientHello, ControlMessage, ServerHandshake, ServerHello};
 use tether_protocol::input::InputEvent;
-use tether_protocol::MonoNanos;
 
 use crate::{Datagram, Result};
 
@@ -76,52 +68,25 @@ pub trait ControlChannel: Send + Sync {
     async fn recv_control(&self) -> Result<ControlMessage>;
 
     /// Client side of the handshake. Sends the supplied [`ClientHello`]
-    /// after stamping its `clock_probe_t0` with a fresh local
-    /// timestamp, awaits the [`ServerHello`], and returns both the
-    /// parsed hello and a [`ClockSync`] computed from the four probe
-    /// stamps. Single method because there's no application-level
-    /// callback on this side — the client builds its hello up front.
-    async fn client_handshake(&self, hello: ClientHello) -> Result<(ServerHello, ClockSync)>;
+    /// and awaits the [`ServerHello`]. Clock sync is an explicit
+    /// post-handshake [`ControlMessage::ClockProbeRequest`] exchange.
+    async fn client_handshake(&self, hello: ClientHello) -> Result<ServerHandshake>;
 
-    /// Host side of the handshake, first half. Awaits the
-    /// [`ClientHello`] and captures the receive timestamp
-    /// `t1_server_recv`. The caller orchestrates between this and
-    /// [`Self::send_server_hello`] — that's where profile negotiation
-    /// runs.
-    ///
-    /// **Performance contract**: the duration between this returning
-    /// and [`Self::send_server_hello`] being called biases the
-    /// `ClockSync` offset estimator by exactly half its wall-clock
-    /// length (NTP-style: `offset = ((t1 - t0) + (t2 - t3)) / 2`).
-    /// Concretely: a 1 ms orchestration step produces a ~500 µs
-    /// phantom offset; a 10 ms step (e.g., a cold mutex on a busy
-    /// box, or hitting a not-yet-warmed probe cache) produces ~5 ms
-    /// of phantom — detectable in the
-    /// `happy_path_handshake_completes_with_negotiated_profile`
-    /// loopback test (in `tether-session/tests/loopback.rs`), which
-    /// asserts `offset_nanos.abs() < 10ms`.
-    /// Sleep / async I/O between the two calls is now syntactically
-    /// permitted by the trait shape (the old single-method
-    /// `host_handshake` took a sync `FnOnce` closure that couldn't
-    /// `.await`). Don't.
-    async fn recv_client_hello(&self) -> Result<(ClientHello, MonoNanos)>;
+    /// Host side of the handshake, first half. Awaits the [`ClientHello`].
+    /// The caller orchestrates between this and [`Self::send_server_hello`] or
+    /// [`Self::send_server_handshake_rejection`] — that's where profile
+    /// negotiation runs.
+    async fn recv_client_hello(&self) -> Result<ClientHello>;
 
-    /// Host side of the handshake, second half. Stamps `t0_echo`
-    /// (from `client_t0`), `t1_server_recv` (from `t1`), and
-    /// `t2_server_send` (a fresh `MonoNanos::now()` right before the
-    /// serialize+write) into the supplied [`ServerHello`] body, then
-    /// sends it.
-    ///
-    /// Stamping happens inside the trait method so the wire-time
-    /// stamp is as close to the actual write as possible. Doing it
-    /// in the application layer would let mutex contention and
-    /// serialization overhead between stamp-time and write-time
-    /// bias the offset estimator.
-    async fn send_server_hello(
+    /// Host side of the handshake, second half. Sends the supplied
+    /// [`ServerHello`] after application-layer negotiation.
+    async fn send_server_hello(&self, server: ServerHello) -> Result<()>;
+
+    /// Host side of the handshake, rejection path. Sends a typed failure
+    /// instead of a successful [`ServerHello`].
+    async fn send_server_handshake_rejection(
         &self,
-        server: ServerHello,
-        client_t0: MonoNanos,
-        t1_server_recv: MonoNanos,
+        failure: tether_protocol::control::HandshakeFailure,
     ) -> Result<()>;
 }
 

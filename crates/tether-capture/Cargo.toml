@@ -13,6 +13,30 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
+pipewire = "0.10"
+# v0_3_33 gates PropertyFlags::DONT_FIXATE, which we need on the
+# VideoModifier prop so Mutter/KWin recognise our offer as a
+# multi-modifier DMA-BUF intent instead of falling through to SHM.
+libspa = { version = "0.10", features = ["v0_3_33"] }
+# Raw SPA constants (SPA_DATA_DmaBuf, SPA_PARAM_BUFFERS_dataType) that
+# pipewire-rs 0.10's safe wrappers don't re-export. Pinned to the same
+# version as libspa to avoid two sys-crate copies in the dep graph.
+libspa-sys = "0.10"
+# Raw libc::dup for cloning the DMA-BUF fd we receive from PipeWire so
+# it outlives the per-callback Buffer borrow. OwnedFd::try_clone goes
+# the same path with an extra Result wrap.
+libc = "0.2"
+tokio = { workspace = true }
+# Used by ashpd's BitFlags types — adding directly lets us write
+# `BitFlags::from(SourceType::Monitor)` without the bitor-with-self hack.
+enumflags2 = "0.7"
+# Linux cannot ask the screen-cast portal for monitor topology before capture
+# permission, so use winit's compositor-native monitor snapshot as the
+# handshake-time best effort.
+winit = { workspace = true }
+
 [features]
 # Opts in fakes used by integration tests in downstream crates. Empty
 # default features means production builds never carry this code; tests
@@ -48,28 +72,9 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
     "Win32_System_Performance",
 ] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
-pipewire = "0.10"
-# v0_3_33 gates PropertyFlags::DONT_FIXATE, which we need on the
-# VideoModifier prop so Mutter/KWin recognise our offer as a
-# multi-modifier DMA-BUF intent instead of falling through to SHM.
-libspa = { version = "0.10", features = ["v0_3_33"] }
-# Raw SPA constants (SPA_DATA_DmaBuf, SPA_PARAM_BUFFERS_dataType) that
-# pipewire-rs 0.10's safe wrappers don't re-export. Pinned to the same
-# version as libspa to avoid two sys-crate copies in the dep graph.
-libspa-sys = "0.10"
-# Raw libc::dup for cloning the DMA-BUF fd we receive from PipeWire so
-# it outlives the per-callback Buffer borrow. OwnedFd::try_clone goes
-# the same path with an extra Result wrap.
-libc = "0.2"
-tokio = { workspace = true }
-# Used by ashpd's BitFlags types — adding directly lets us write
-# `BitFlags::from(SourceType::Monitor)` without the bitor-with-self hack.
-enumflags2 = "0.7"
 
 [lints]
 workspace = true

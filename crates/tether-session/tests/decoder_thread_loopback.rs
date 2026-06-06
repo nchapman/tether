@@ -67,7 +67,7 @@ fn make_worker_with(outcomes: Vec<FakeOutcome>) -> (Worker, LatestFrame, Arc<Ato
 #[tokio::test]
 async fn pframes_flow_through_full_chain_to_latest_frame() {
     let (host, client) = video_duplex_pair();
-    let mut fragmenter = FrameFragmenter::new(0);
+    let mut fragmenter = FrameFragmenter::new(0u8);
     let mut reassembler = FrameReassembler::new();
 
     let bodies: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![i; 1024])).collect();

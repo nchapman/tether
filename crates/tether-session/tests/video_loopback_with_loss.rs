@@ -42,7 +42,7 @@ async fn lossy_pframe_path_increments_reassembler_loss_counter() {
         },
     ));
 
-    let mut fragmenter = FrameFragmenter::new(0);
+    let mut fragmenter = FrameFragmenter::new(0u8);
     let mut reassembler = FrameReassembler::new();
 
     let bodies: Vec<Bytes> = (0..64u8).map(|i| Bytes::from(vec![i; 4096])).collect();
@@ -122,7 +122,7 @@ async fn idr_keyframe_recovers_via_fec_under_bounded_loss() {
     // reassembler reconstructs the keyframe body exactly — the property that
     // replaces the old reliable-stream guarantee.
     let (host, client) = video_duplex_pair();
-    let mut fragmenter = FrameFragmenter::new_with_fec(0, 20);
+    let mut fragmenter = FrameFragmenter::new_with_fec(0u8, 20);
     let mut reassembler = FrameReassembler::new();
 
     let body: Bytes = vec![0xa5u8; 16 * 1024].into();
@@ -181,7 +181,7 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
         },
     ));
 
-    let mut fragmenter = FrameFragmenter::new(0);
+    let mut fragmenter = FrameFragmenter::new(0u8);
     let mut reassembler = FrameReassembler::new();
 
     // Pump lossy P-frames through the production datagram path.

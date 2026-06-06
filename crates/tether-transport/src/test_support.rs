@@ -15,8 +15,8 @@
 //!
 //! ## Wire-faithfulness contract
 //!
-//! Every fake calls the **production** serializers
-//! (`tether_protocol::encode` / `decode`) — never a hand-rolled stand-in.
+//! Every fake calls the **production** reliable serializers
+//! (`tether_protocol::encode_reliable` / `decode_reliable`) — never a hand-rolled stand-in.
 //! Tests can therefore reproduce real wire-format bugs against the
 //! fake. Where a test wants to inject malformed input, it does so
 //! *before* the fake's serialization layer (raw bytes on the duplex
@@ -25,8 +25,8 @@
 //! ## Channel-shape choices
 //!
 //! - [`ControlChannel`] and [`InputChannel`] are stream-shaped on the
-//!   wire (length-prefix + bincode over a QUIC reliable stream); they
-//!   ride `tokio::io::duplex` here with the same framing.
+//!   wire (length-prefix + prost over QUIC reliable streams); they ride
+//!   `tokio::io::duplex` here with the same framing.
 //! - [`VideoChannel`] carries all video — IDR keyframes included — as
 //!   message-framed datagrams (one `Datagram` per QUIC datagram); they ride
 //!   `tokio::sync::mpsc::channel<Datagram>` here — adding length-prefix
@@ -43,9 +43,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tether_protocol::control::{ClientHello, ClockSync, ControlMessage, ServerHello};
+use tether_protocol::control::{
+    ClientHello, ControlMessage, HandshakeFailure, ServerHandshake, ServerHello,
+};
 use tether_protocol::input::InputEvent;
-use tether_protocol::MonoNanos;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex};
 
@@ -70,11 +71,11 @@ const DEFAULT_VIDEO_DATAGRAM_DEPTH: usize = 256;
 // Stream-shaped framing helpers shared by ControlChannel + InputChannel
 // ---------------------------------------------------------------------
 
-async fn write_framed<W: AsyncWriteExt + Unpin, T: serde::Serialize>(
+async fn write_framed<W: AsyncWriteExt + Unpin, T: tether_protocol::ReliableMessage>(
     w: &mut W,
     msg: &T,
 ) -> Result<()> {
-    let bytes = tether_protocol::encode(msg)?;
+    let bytes = tether_protocol::encode_reliable(msg)?;
     if bytes.len() > MAX_FRAMED_MESSAGE {
         return Err(TransportError::FrameTooLarge {
             size: bytes.len(),
@@ -90,7 +91,7 @@ async fn write_framed<W: AsyncWriteExt + Unpin, T: serde::Serialize>(
     Ok(())
 }
 
-async fn read_framed<R: AsyncReadExt + Unpin, T: for<'de> serde::Deserialize<'de>>(
+async fn read_framed<R: AsyncReadExt + Unpin, T: tether_protocol::ReliableMessage>(
     r: &mut R,
 ) -> Result<T> {
     let mut len_buf = [0u8; 4];
@@ -108,18 +109,18 @@ async fn read_framed<R: AsyncReadExt + Unpin, T: for<'de> serde::Deserialize<'de
     r.read_exact(&mut buf)
         .await
         .map_err(|_| TransportError::StreamClosed)?;
-    Ok(tether_protocol::decode(&buf)?)
+    Ok(tether_protocol::decode_reliable(&buf)?)
 }
 
 // ---------------------------------------------------------------------
-// ControlChannel: duplex stream with length-prefixed bincode
+// ControlChannel: duplex stream with length-prefixed reliable protobuf
 // ---------------------------------------------------------------------
 
 /// One end of an in-memory control channel pair.
 ///
 /// Wraps a `tokio::io::DuplexStream` split into independent read and
-/// write halves. The framing is the same length-prefixed bincode that
-/// the real `Connection` uses on the QUIC control stream, so payload
+/// write halves. The framing is the same length-prefixed reliable protobuf
+/// encoding that the real `Connection` uses on the QUIC control stream, so payload
 /// bugs in the real code (encoding, decoding, length checks) are
 /// reproducible against the fake.
 pub struct DuplexControlChannel {
@@ -161,7 +162,7 @@ pub fn duplex_pair_with_buffer(
 }
 
 impl DuplexControlChannel {
-    async fn send_framed_raw<T: serde::Serialize>(&self, msg: &T) -> Result<()> {
+    async fn send_framed_raw<T: tether_protocol::ReliableMessage>(&self, msg: &T) -> Result<()> {
         // Note: no `flush()` here. The real `Connection::write_framed`
         // doesn't flush either — QUIC streams send as soon as bytes
         // are written. Adding `flush` here would make the fake able
@@ -173,7 +174,7 @@ impl DuplexControlChannel {
         write_framed(&mut *s, msg).await
     }
 
-    async fn recv_framed_raw<T: for<'de> serde::Deserialize<'de>>(&self) -> Result<T> {
+    async fn recv_framed_raw<T: tether_protocol::ReliableMessage>(&self) -> Result<T> {
         let mut r = self.recv.lock().await;
         read_framed(&mut *r).await
     }
@@ -189,47 +190,23 @@ impl ControlChannel for DuplexControlChannel {
         self.recv_framed_raw().await
     }
 
-    async fn client_handshake(&self, mut hello: ClientHello) -> Result<(ServerHello, ClockSync)> {
-        // Mirror Connection::client_handshake exactly — the clock-sync
-        // estimator the test exercises is the same `ClockSync::from_probe`,
-        // so the stamps need to land at the same points.
-        let t0 = MonoNanos::now();
-        match &mut hello {
-            ClientHello::V1(body) => body.clock_probe_t0 = t0,
-        }
+    async fn client_handshake(&self, hello: ClientHello) -> Result<ServerHandshake> {
         self.send_framed_raw(&hello).await?;
-        let server: ServerHello = self.recv_framed_raw().await?;
-        let t3 = MonoNanos::now();
-        let (t1_recv, t2_send) = match &server {
-            ServerHello::V1(body) => (body.t1_server_recv, body.t2_server_send),
-        };
-        let sync = ClockSync::from_probe(t0, t1_recv, t2_send, t3);
-        Ok((server, sync))
+        self.recv_framed_raw().await
     }
 
-    async fn recv_client_hello(&self) -> Result<(ClientHello, MonoNanos)> {
-        let hello: ClientHello = self.recv_framed_raw().await?;
-        let t1 = MonoNanos::now();
-        Ok((hello, t1))
+    async fn recv_client_hello(&self) -> Result<ClientHello> {
+        self.recv_framed_raw().await
     }
 
-    async fn send_server_hello(
-        &self,
-        mut server: ServerHello,
-        client_t0: MonoNanos,
-        t1_server_recv: MonoNanos,
-    ) -> Result<()> {
-        // Same stamp-just-before-write pattern as Connection. Tests
-        // that assert RTT/offset bounds depend on this stamp being
-        // late.
-        match &mut server {
-            ServerHello::V1(body) => {
-                body.clock_probe_t0_echo = client_t0;
-                body.t1_server_recv = t1_server_recv;
-                body.t2_server_send = MonoNanos::now();
-            }
-        }
-        self.send_framed_raw(&server).await
+    async fn send_server_hello(&self, server: ServerHello) -> Result<()> {
+        self.send_framed_raw(&ServerHandshake::Accepted(server))
+            .await
+    }
+
+    async fn send_server_handshake_rejection(&self, failure: HandshakeFailure) -> Result<()> {
+        self.send_framed_raw(&ServerHandshake::Rejected(failure))
+            .await
     }
 }
 
@@ -238,9 +215,9 @@ impl ControlChannel for DuplexControlChannel {
 // ---------------------------------------------------------------------
 
 /// One end of an in-memory input channel pair. The wire shape is the
-/// same length-prefix + bincode that the real `Connection`'s input
-/// stream uses, so a test that serializes 100 events through the fake
-/// will produce identical bytes to the production path.
+/// same length-prefixed protobuf encoding that the real `Connection`'s
+/// input stream uses, so a test that serializes 100 events through the
+/// fake will produce identical bytes to the production path.
 ///
 /// Like the real `Connection::InputStream`, each instance is logically
 /// uni-directional: the host side reads, the client side writes.
@@ -558,46 +535,61 @@ impl<V: VideoChannel + ?Sized> VideoChannel for LossyChannel<V> {
 // ---------------------------------------------------------------------
 
 /// Minimal-valid `ClientHello` for tests that don't care about its
-/// contents. Centralized here so when `ClientHelloV1` gains a field,
+/// contents. Centralized here so when `ClientHello` gains a field,
 /// exactly one site updates and every fake-using test recompiles.
 #[must_use]
 pub fn empty_client_hello() -> ClientHello {
-    use tether_protocol::control::{ClientHelloV1, CodecKind};
-    ClientHello::V1(ClientHelloV1 {
+    use tether_protocol::control::{InputCapabilities, VideoProfile};
+    ClientHello {
         client_name: "test".into(),
-        preferred_codecs: vec![CodecKind::H264],
-        max_resolution: None,
-        viewport: None,
-        clock_probe_t0: MonoNanos::ZERO,
-        extensions: Default::default(),
-        resume_token: None,
-    })
+        decode_profiles: vec![VideoProfile::H264_8BIT_420],
+        initial_viewport: None,
+        input_capabilities: InputCapabilities::default(),
+        requested_features: vec![],
+    }
 }
 
 /// Minimal-valid `ServerHello` for tests. See [`empty_client_hello`].
 #[must_use]
 pub fn empty_server_hello() -> ServerHello {
-    use tether_protocol::control::{ChromaSubsampling, CodecKind, ServerHelloV1, VideoColorSpec};
-    ServerHello::V1(ServerHelloV1 {
+    use tether_protocol::control::{
+        DisplayDescriptor, DisplayId, DisplayMode, NegotiatedVideo, PixelFormat, VideoColorSpec,
+        VideoProfile, VideoStreamId,
+    };
+    let mode = DisplayMode::new(1280, 720, 60_000);
+    ServerHello {
         server_name: "test".into(),
-        chosen_codec: CodecKind::H264,
-        chosen_chroma: ChromaSubsampling::Yuv420,
-        color_space: VideoColorSpec::sdr_desktop(),
-        resolution: (0, 0),
-        clock_probe_t0_echo: MonoNanos::ZERO,
-        t1_server_recv: MonoNanos::ZERO,
-        t2_server_send: MonoNanos::ZERO,
-        extensions: Default::default(),
-        resume_token: None,
-    })
+        video: NegotiatedVideo {
+            stream_id: VideoStreamId(0),
+            display_id: DisplayId(0),
+            profile: VideoProfile::H264_8BIT_420,
+            pixel_format: PixelFormat::Nv12,
+            color_space: VideoColorSpec::sdr_desktop(),
+        },
+        audio: None,
+        displays: vec![DisplayDescriptor {
+            id: DisplayId(0),
+            name: "test".into(),
+            scale_num: 1,
+            scale_den: 1,
+            primary: true,
+            position: (0, 0),
+            current_mode: mode,
+            available_modes: vec![mode],
+            can_set_mode: false,
+        }],
+        accepted_features: vec![],
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tether_protocol::control::GoodbyeCode;
+    use tether_protocol::control::ServerHandshake;
     use tether_protocol::input::{HidUsage, InputEvent, InputEventKind, Modifiers};
     use tether_protocol::video::{FrameFragmenter, VideoFrameMeta};
+    use tether_protocol::MonoNanos;
     use tokio::time::Duration;
 
     #[tokio::test]
@@ -605,18 +597,16 @@ mod tests {
         let (host, client) = duplex_pair();
 
         let host_fut = async move {
-            let (_hello, t1) = host.recv_client_hello().await.unwrap();
-            host.send_server_hello(empty_server_hello(), MonoNanos::ZERO, t1)
-                .await
-                .unwrap();
+            let hello = host.recv_client_hello().await.unwrap();
+            assert_eq!(hello.client_name, "test");
+            host.send_server_hello(empty_server_hello()).await.unwrap();
         };
         let client_fut = async move {
-            let (_server, sync) = client.client_handshake(empty_client_hello()).await.unwrap();
-            assert!(
-                sync.rtt_nanos < 100_000_000,
-                "rtt was {} ns",
-                sync.rtt_nanos
-            );
+            let server = client.client_handshake(empty_client_hello()).await.unwrap();
+            match server {
+                ServerHandshake::Accepted(server) => assert_eq!(server.server_name, "test"),
+                ServerHandshake::Rejected(failure) => panic!("unexpected rejection: {failure:?}"),
+            }
         };
         tokio::join!(host_fut, client_fut);
     }
@@ -695,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn video_datagrams_round_trip_in_order() {
         let (host, client) = video_duplex_pair();
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let packets = fragmenter.fragment(
             make_video_meta(),
             b"hello".to_vec().into(),
@@ -714,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn video_datagram_full_channel_drops_silently() {
         let (host, _client) = video_duplex_pair_with_depth(1);
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let pkt = fragmenter
             .fragment(
                 make_video_meta(),
@@ -745,7 +735,7 @@ mod tests {
                 seed: 42,
             },
         );
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         for _ in 0..10 {
             let pkt = fragmenter
                 .fragment(
@@ -771,7 +761,7 @@ mod tests {
     async fn lossy_channel_zero_drop_passes_through() {
         let (host, client) = video_duplex_pair();
         let lossy = LossyChannel::new(host.clone(), LossyConfig::default());
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let pkt = fragmenter
             .fragment(
                 make_video_meta(),

@@ -19,12 +19,17 @@ bincode = { version = "=2.0.1", features = ["serde"] }
 bytes = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+prost = { workspace = true }
 # Pure-Rust Reed-Solomon erasure coding over GF(2^8). Used to compute
 # parity shards alongside the P-frame primary fragments so the receiver
 # can recover from datagram loss without waiting on a fresh IDR. The
 # encode work is bounded by data_shards * shard_size ≈ frame body size
 # — dwarfed by the encoder's own per-frame cost.
 reed-solomon-erasure = "6"
+
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 # Random body sizes × random fragment drop masks for the fragmenter ↔

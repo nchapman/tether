@@ -107,7 +107,7 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │       report Unknown and pass through; skip predicate is gated      │
 │       additionally by IdrSignal::peek so forced IDRs always go)     │
 │     • viewport rebuild check: encode dims = letterbox-fit of       │
-│       capture inside the latest ControlMessage::SetClientViewport   │
+│       capture inside the latest ControlMessage::SetViewportHint     │
 │       directive, clamped to 16-pixel alignment. Linux GPU paths     │
 │       run tether-scaler (Mitchell-Netravali in linear-light)        │
 │       between PipeWire's BGRA dma-buf import and the chroma         │
@@ -465,17 +465,20 @@ documented in `docs/INVESTIGATION_lan_freeze.md`:
 `tether-protocol` defines five logical channels, each carried by
 its own QUIC primitive:
 
-- **Control** (reliable, bidirectional) — length-prefixed bincode
-  `ControlMessage`. Handshake (`ClientHello` / `ServerHello`, both
-  tagged-enum envelopes), `Goodbye` (with machine-readable
+- **Control** (reliable, bidirectional) — length-prefixed protobuf
+  messages under the `tether.v1` schema. Handshake (`ClientHello` /
+  `ServerHandshake`), `Goodbye` (with machine-readable
   `GoodbyeCode`), `ForceIdr`, `ClockProbe*`, cursor shapes
   (`CursorShape` / `CursorUseShape`), display topology
   (`DisplayList` / `SetActiveDisplays`), stream lifecycle
   (`StreamReady` / `StreamPause` / `StreamResume`), receiver
-  telemetry (`ClientStats`), and the open-ended `Extension { key,
-  payload }` escape for future features that aren't worth a typed
-  variant yet (clipboard, file transfer, gamepad rumble, auth, …).
-- **Video** (unreliable datagrams) — `VideoPacket::First { display,
+  telemetry (`ClientStats`), and the negotiated
+  `Extension(ExtensionMessage)` lane for experimental or third-party
+  features. Extension payloads are capped at 16 KiB and must never carry
+  file-transfer or large-clipboard bulk data; those features need an
+  independent reliable QUIC bulk stream so control messages cannot be
+  head-of-line blocked by multi-MB payloads.
+- **Video** (unreliable datagrams) — `VideoPacket::First { stream_id,
   stream_epoch, frame_seq, fragment_count, fec_pct, shard_size,
   total_body_len, meta: VideoFrameMetaEnvelope, payload }`,
   `::Continuation { …, fragment_index, payload }`, or `::Parity { …,
@@ -493,18 +496,20 @@ its own QUIC primitive:
   (incl. the meta envelope), so every datagram fits the path MTU even
   under an input-echo burst (#37); the receiver derives the identical
   block layout from `fragment_count` + `fec_pct`. `FrameReassembler`
-  keys on `(display, stream_epoch, frame_seq)`; `stream_epoch` is `u32`
+  keys on `(stream_id, stream_epoch, frame_seq)`; `stream_epoch` is `u32`
   so encoder restarts can't wrap. `VideoFrameMetaEnvelope` is a
-  versioned wrap around `VideoFrameMeta` so future per-frame metadata
-  (HDR ROI QP) lands as additive variants instead of struct-field
-  appends.
+  versioned wrap around `VideoFrameMeta`, but media packets use compact
+  bincode rather than protobuf. A future metadata-envelope variant must
+  be negotiated in hello before a host emits it; otherwise an older
+  client rejects the whole packet before it can use the shard payload or
+  FEC parity.
 - **Audio** (unreliable datagrams, host → client) — `AudioPacket::Opus
   { stream_epoch, frame_seq, t_capture, payload, redundant }`. The full
   Opus capture → encode → decode → playback pipeline is implemented in
   `tether-audio` (per-platform system-output capture, libopus codec
   with PLC, lock-free jitter ring + cap-and-drop playback policy),
-  negotiated host-authoritatively via the `tether.audio` hello
-  extension. Audio has no transport-level FEC (unlike video's
+  negotiated host-authoritatively via the typed `ServerHello::audio`
+  field. Audio has no transport-level FEC (unlike video's
   `FrameFragmenter` Reed-Solomon), and Opus in-band FEC doesn't fit the
   fullband-music config (LBRR is SILK-only; our CELT-only mode emits
   none), so `redundant` carries an
@@ -524,19 +529,29 @@ its own QUIC primitive:
 
 Forward-compat hooks every feature added later relies on:
 
-- **Hello extension map** with reverse-DNS-style keys (`tether.audio`,
-  `tether.pixel-format`, `tether.cap.*`). Receivers ignore unknown
-  keys; capability keys (`tether.cap.*`) follow an echo-to-accept
-  convention.
-- **`ControlMessage::Extension { key, payload }`** as the escape for
-  any new control message that doesn't fit the typed variants.
+- **Tagged reliable messages** under the `tether.v1` protobuf schema.
+  Unknown future optional fields are skipped rather than breaking
+  positional decode.
+- **Negotiated extension lane**: `FeatureAdvert` / `FeatureAccept`
+  during hello, then `ControlMessage::Extension(ExtensionMessage)` for
+  accepted experimental or third-party features. When an extension
+  graduates to first-party typed control, peers accept both forms for one
+  feature/protocol version and switch only after negotiation confirms the
+  typed form.
 - **`VideoFrameMetaEnvelope`** so per-frame metadata grows by enum
-  variant rather than struct field.
+  variant rather than struct field, with the envelope version negotiated
+  before any non-`V1` media packet appears on the datagram path.
+- **Typed protocol IDs** (`DisplayId`, `VideoStreamId`, `RequestId`) so
+  display topology, multi-stream video, and request/reply control grow
+  without overloading integers.
+- **Authoritative display topology** starts in `ServerHandshake` from
+  the host's display system, with a follow-up `DisplayList` when the
+  capture backend reports more exact primary capture dimensions.
 
 ### Session orchestration and the channel-trait abstraction
 
-The application-layer handshake (post-QUIC: extension parsing, profile
-negotiation, `Goodbye(InternalError)` on no-match, initial `ForceIdr`)
+The application-layer handshake (post-QUIC: typed feature negotiation,
+profile negotiation, typed rejection on no-match, initial `ForceIdr`)
 lives in `tether-session::{HostSession, ClientSession}`, not inline in
 the app binaries. `tether-transport` defines four role-shaped traits —
 `ControlChannel`, `InputChannel`, `VideoChannel`, `ConnectionInfo` —
@@ -559,13 +574,10 @@ can be driven with synthetic output without VAAPI/VideoToolbox in
 the loop.
 
 The handshake is split across two `ControlChannel` methods —
-`recv_client_hello` returning `(ClientHello, t1_server_recv)`, then
-`send_server_hello(server, client_t0, t1)` which stamps `t0_echo` /
-`t1` / `t2_server_send` immediately before serializing the wire bytes.
-Splitting at that seam keeps the clock-sync stamps inside the wire
-layer (so a slow `HostSession` orchestration step still produces a
-late `t2`) while profile-negotiation policy stays in the session
-layer. The trait methods carry an unenforced ordering invariant (recv
+`recv_client_hello` and `send_server_hello(server)`. Clock sync is an
+explicit post-handshake `ClockProbeRequest` / `ClockProbeResponse`
+exchange on the reliable control channel. The trait methods carry an
+unenforced ordering invariant (recv
 once before send once); orchestration code routes through the
 `HostHandshake` → `ClientHelloReceived` typestate in
 `tether-transport::handshake`, which owns the `Arc<dyn ControlChannel>`
@@ -585,11 +597,11 @@ leaks across reconnects.
 
 ### Codec / chroma / depth negotiation
 
-Video profile is negotiated host-authoritatively via two hello
-extensions. The client advertises its decode capabilities under
-`tether.cap.video.decode-profiles` as `Vec<VideoProfile { codec,
-chroma, bit_depth }>` (computed by `tether_probe::client_decode_profiles()`).
-The host intersects that set with its own buildable encode profiles
+Video profile is negotiated host-authoritatively with typed hello
+fields. The client advertises `ClientHello::decode_profiles` as
+`Vec<VideoProfile { codec, chroma, bit_depth }>` (computed by
+`tether_probe::client_decode_profiles()`). The host intersects that set
+with its own buildable encode profiles
 (from `tether_probe::host_encode_profiles()`, an `OnceLock`-cached
 real-round-trip probe — capture → bridge → encoder → decoder per
 profile) and picks the best mutual match against a fixed preference
@@ -603,10 +615,10 @@ list:
 5. H.264 4:2:0 8-bit (universal floor; H.264 4:4:4 is absent because
    VAAPI has no encode profile for it).
 
-The chosen profile is echoed in `tether.cap.video.encode-profile`;
-`ServerHelloV1.chosen_codec` / `chosen_chroma` carry the same
-information in legacy form so older clients can interoperate. Absent
-client extension is treated as the universal floor.
+The chosen profile, pixel format, color spec, display id, and video
+stream id are returned in `ServerHello::video`. `ServerHello` also
+reserves an additive `video_streams` list for future active multi-display
+sessions where each stream may need its own descriptor.
 
 Both the VAAPI encoder (`VaapiEncoder::new` takes `VideoProfile`,
 switches `sw_format` + the AVCodecContext `profile` field for
@@ -668,16 +680,10 @@ encoder-side `yuv444_dmabuf_to_codec_frame` produces the
 one-layer/three-plane form, which matches VAAPI's PRIME_2 *importer*
 expectation on Main444.
 
-The `tether.pixel-format` extension echoes the on-wire pixel format
-of the encoded stream (`Nv12` for 4:2:0 8-bit, `P010` for 4:2:0
-10-bit, `Yuv444p` for HEVC Main 4:4:4 8-bit, `P410` for HEVC Main
-4:4:4 10-bit) so client decoders that wire their import path before
-the first SPS arrives can pick the right plane layout up front.
-
 Four non-negotiable invariants tracked end-to-end:
 
-1. **Clock sync.** Handshake measures RTT and computes a `MonoNanos`
-   offset between host and client clocks. Every video fragment carries
+1. **Clock sync.** An explicit post-handshake probe measures RTT and
+   computes a `MonoNanos` offset between host and client clocks. Every video fragment carries
    `HostFrameTiming { t_capture_kernel, t_capture_userspace,
    t_encode_submit, t_encode_done }` so the client can attribute
    end-to-end latency to each pipeline segment in its own clock.
@@ -831,12 +837,11 @@ Listed to set expectations; each is a real follow-up, not a "never":
   `vaQueryConfigProfiles`. Both are the principled extensions, both
   need a small libva FFI add (vaQueryConfigProfiles,
   vaGetConfigAttributes) and an AMD test box to validate against.
-- **Multi-monitor.** Single primary monitor capture; the
-  keyframe-sender path assumes one fragmenter, and `display = 0` is
-  hard-coded throughout the host send loop.
+- **Multi-monitor.** Single primary monitor capture; the host send loop
+  currently emits one video stream (`VideoStreamId(0)`).
 - **Audio: remaining gaps.** System-output capture → Opus → playback is
-  wired on all three platforms and negotiated via the `tether.audio`
-  hello extension, but there is no user-facing control yet — audio is
+  wired on all three platforms and negotiated via the typed
+  `ServerHello::audio` field, but there is no user-facing control yet — audio is
   on whenever both peers support it (host `--no-audio` opts out). A
   per-session mute/volume toggle waits on the user-prefs work. No
   microphone / client → host audio path; system output only. Network

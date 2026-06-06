@@ -28,7 +28,7 @@ fn meta() -> VideoFrameMeta {
 #[tokio::test]
 async fn frames_across_epoch_bump_reassemble_independently() {
     let (host, client) = video_duplex_pair();
-    let mut fragmenter = FrameFragmenter::new(0);
+    let mut fragmenter = FrameFragmenter::new(0u8);
     let mut reassembler = FrameReassembler::new();
 
     // Send a complete frame in epoch 0 with a distinctive body.

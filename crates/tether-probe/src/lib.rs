@@ -4,8 +4,8 @@
 //! actually produce a frame, encode it, and round-trip it through the
 //! decoder?* and *can this client construct the decoder and round-trip
 //! a known fixture?*. The result drives the host's
-//! `tether.cap.video.encode-profile` advertisement and the client's
-//! `tether.cap.video.decode-profiles` advertisement.
+//! typed `ServerHello::video` selection and the client's typed
+//! `ClientHello::decode_profiles` advertisement.
 //!
 //! ## Why this crate exists
 //!

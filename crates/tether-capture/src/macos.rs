@@ -37,11 +37,12 @@ use screencapturekit::prelude::{
 use screencapturekit::stream::configuration::SCCaptureResolutionType;
 use screencapturekit::FourCharCode;
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
+use tether_protocol::control::{DisplayDescriptor, DisplayId, DisplayMode};
 use tether_protocol::MonoNanos;
 
 use crate::{
-    damage::NativeDamage, CaptureError, CaptureHandle, CapturedFrame, CapturedIOSurface,
-    GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, Result,
+    damage::NativeDamage, scale_to_ratio, CaptureError, CaptureHandle, CapturedFrame,
+    CapturedIOSurface, GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, Result,
 };
 
 /// Channel depth matches the Linux path's `CAPTURE_CHANNEL_DEPTH` — small,
@@ -134,6 +135,46 @@ pub async fn start(pixel_format: PixelFormat) -> Result<CaptureHandle> {
     let target_fps = Arc::new(AtomicU32::new(CAPTURE_FPS));
     let cursor_source = crate::cursor_macos::start(ready.cursor_geom);
     Ok(CaptureHandle::from_parts(rx, target_fps).with_cursor_source(cursor_source))
+}
+
+pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
+    let content = SCShareableContent::get()?;
+    let displays = content.displays();
+    if displays.is_empty() {
+        return Err(CaptureError::Sck(
+            "no displays reported by SCShareableContent".into(),
+        ));
+    }
+
+    Ok(displays
+        .into_iter()
+        .enumerate()
+        .map(|(idx, display)| {
+            let display_id = display.display_id();
+            let frame = display.frame();
+            let logical_w = display.width().max(1);
+            let logical_h = display.height().max(1);
+            let (pixel_w, pixel_h, refresh_millihz) =
+                active_display_mode(display_id).unwrap_or((logical_w, logical_h, 60_000));
+            let mode = DisplayMode::new(pixel_w, pixel_h, refresh_millihz);
+            let scale = f64::from(pixel_w) / f64::from(logical_w);
+            let (scale_num, scale_den) = scale_to_ratio(scale);
+            DisplayDescriptor {
+                id: DisplayId(display_id),
+                name: format!("display-{display_id}"),
+                scale_num,
+                scale_den,
+                primary: idx == 0,
+                position: (
+                    round_f64_to_i32(frame.origin.x),
+                    round_f64_to_i32(frame.origin.y),
+                ),
+                current_mode: mode,
+                available_modes: vec![mode],
+                can_set_mode: false,
+            }
+        })
+        .collect())
 }
 
 /// Geometry of the live capture stream, plumbed from the capture
@@ -1109,6 +1150,7 @@ unsafe extern "C" {
     fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
     fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
     fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+    fn CGDisplayModeGetRefreshRate(mode: CGDisplayModeRef) -> f64;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -1122,5 +1164,54 @@ unsafe fn cf_release(mode: CGDisplayModeRef) {
         // SAFETY: caller's contract — the pointer was a +1 retained
         // CF reference and is not used after this call.
         unsafe { CFRelease(mode as *const std::ffi::c_void) };
+    }
+}
+
+fn active_display_mode(display_id: u32) -> Option<(u32, u32, u32)> {
+    // SAFETY: CoreGraphics returns either a +1 retained display mode for an
+    // attached display or null. We release non-null results below.
+    let mode = unsafe { CGDisplayCopyDisplayMode(display_id) };
+    if mode.is_null() {
+        return None;
+    }
+
+    let width = u32::try_from(unsafe { CGDisplayModeGetPixelWidth(mode) }).ok();
+    let height = u32::try_from(unsafe { CGDisplayModeGetPixelHeight(mode) }).ok();
+    let refresh = unsafe { CGDisplayModeGetRefreshRate(mode) };
+    // SAFETY: balances the +1 retain from CGDisplayCopyDisplayMode.
+    unsafe { cf_release(mode) };
+
+    let width = width?;
+    let height = height?;
+    let refresh_millihz = if refresh.is_finite() && refresh > 0.0 {
+        round_f64_to_u32(refresh * 1000.0, 1, u32::MAX)
+    } else {
+        60_000
+    };
+    Some((width, height, refresh_millihz))
+}
+
+fn round_f64_to_i32(value: f64) -> i32 {
+    if !value.is_finite() {
+        0
+    } else {
+        let clamped = value
+            .round()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            clamped as i32
+        }
+    }
+}
+
+fn round_f64_to_u32(value: f64, min: u32, max: u32) -> u32 {
+    if !value.is_finite() {
+        return min;
+    }
+    let clamped = value.round().clamp(f64::from(min), f64::from(max));
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        clamped as u32
     }
 }

@@ -38,7 +38,7 @@ fn meta() -> VideoFrameMeta {
 /// `First` payload length of a large multi-shard frame, so the two-packet body
 /// strategy can target it without hard-coding the budget arithmetic.
 fn probe_shard_size() -> usize {
-    let mut frag = FrameFragmenter::new(0);
+    let mut frag = FrameFragmenter::new(0u8);
     let pkts = frag.fragment(meta(), Bytes::from(vec![0u8; 50_000]), BUDGET);
     match &pkts[0] {
         VideoPacket::First { payload, .. } => payload.len(),
@@ -91,7 +91,7 @@ proptest! {
         trace[NUM_FRAMES - 1].1[0] = true;
 
         let shard_size = probe_shard_size();
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let frame_packets: Vec<([bool; 2], Vec<VideoPacket>)> = trace
             .iter()
             .map(|(extra, mask)| {
@@ -150,7 +150,7 @@ proptest! {
     fn epoch_and_seq_monotonic_across_random_interleaving(
         ops in proptest::collection::vec(any::<bool>(), 0..200usize)
     ) {
-        let mut fragmenter = FrameFragmenter::new(0);
+        let mut fragmenter = FrameFragmenter::new(0u8);
         let mut last_seq_per_epoch: std::collections::HashMap<u32, Option<u32>> =
             std::collections::HashMap::new();
 
@@ -253,7 +253,7 @@ proptest! {
         body_len in 1usize..=400_000,
         fec_pct in 1u8..=50,
     ) {
-        let mut frag = FrameFragmenter::new_with_fec(0, fec_pct);
+        let mut frag = FrameFragmenter::new_with_fec(0u8, fec_pct);
         let pkts = frag.fragment(meta(), Bytes::from(vec![0x33u8; body_len]), BUDGET);
 
         // The descriptor the receiver reads off the wire.

@@ -1321,15 +1321,17 @@ async fn handle_client(
         );
     }
 
-    // Close the QUIC connection. This makes send_datagram error in the
-    // send thread, breaking it out of the encode loop, and tells any
-    // still-alive recv tasks that the peer is gone. Cheap and idempotent.
-    conn.close(0, b"session ended");
-
-    // Tell the send thread to stop polling the capture channel. Paired
-    // with the recv_timeout inside the loop so a static desktop (no new
-    // frames) can't keep us blocked in `frames.recv` past disconnect.
+    // Tell the send threads to stop before closing QUIC. Paired with the
+    // recv_timeout inside the loops so a static desktop / idle audio source
+    // can't keep us blocked in `recv` past disconnect. Setting this first also
+    // lets in-flight datagram sends classify ConnectionLost as clean shutdown
+    // noise instead of a fatal transport failure.
     send_shutdown.store(true, Ordering::Relaxed);
+
+    // Close the QUIC connection. This makes any blocked send/recv path error
+    // out and tells still-alive tasks that the peer is gone. Cheap and
+    // idempotent.
+    conn.close(0, b"session ended");
 
     // Abort and await the remaining recv tasks. Each one holds an Arc
     // clone of the injector; once shutdown() returns they're all dropped,
@@ -3041,6 +3043,10 @@ fn run_audio_capture_and_send(
                     tracing::debug!(error = ?e, "dropping audio packet on transient send error");
                     continue;
                 }
+                if shutdown.load(Ordering::Acquire) {
+                    info!(error = ?e, "audio sender stopped during session shutdown");
+                    return;
+                }
                 warn!(error = ?e, "audio datagram send failed; ending audio sender");
                 return;
             }
@@ -3629,6 +3635,11 @@ fn run_capture_and_send(
                     tracing::debug!(error = ?e, "dropping frame on transient datagram send error");
                     sent_frame = false;
                     break;
+                }
+                if shutdown.load(Ordering::Acquire) || shutdown_notice_sent.load(Ordering::Acquire)
+                {
+                    info!(error = ?e, "video send loop stopped during session shutdown");
+                    return;
                 }
                 let reason = format!("host video datagram send failed: {e:?}");
                 warn!(error = ?e, "send_datagram failed (fatal), sending Goodbye(InternalError)");

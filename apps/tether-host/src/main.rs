@@ -1248,6 +1248,7 @@ async fn handle_client(
     {
         let conn = conn.clone();
         let injector = injector.clone();
+        let shutdown_notice_for_input = shutdown_notice_sent.clone();
         tasks.spawn(async move {
             loop {
                 match conn.recv_input().await {
@@ -1264,7 +1265,13 @@ async fn handle_client(
                         }
                     }
                     Err(e) => {
-                        warn!(error = ?e, "input recv failed; ending input task");
+                        if shutdown_notice_for_input.load(Ordering::Acquire)
+                            || e.is_clean_shutdown_recv()
+                        {
+                            info!(error = ?e, "input recv stopped during session shutdown");
+                        } else {
+                            warn!(error = ?e, "input recv failed; ending input task");
+                        }
                         return;
                     }
                 }
@@ -1283,6 +1290,7 @@ async fn handle_client(
     {
         let conn = conn.clone();
         let injector = injector;
+        let shutdown_notice_for_datagram = shutdown_notice_sent.clone();
         tasks.spawn(async move {
             loop {
                 match conn.recv_datagram().await {
@@ -1298,7 +1306,13 @@ async fn handle_client(
                         tracing::trace!("unexpected host-direction datagram on host; ignoring");
                     }
                     Err(e) => {
-                        warn!(error = ?e, "datagram recv failed; ending datagram task");
+                        if shutdown_notice_for_datagram.load(Ordering::Acquire)
+                            || e.is_clean_shutdown_recv()
+                        {
+                            info!(error = ?e, "datagram recv stopped during session shutdown");
+                        } else {
+                            warn!(error = ?e, "datagram recv failed; ending datagram task");
+                        }
                         return;
                     }
                 }

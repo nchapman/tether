@@ -113,6 +113,28 @@ pub enum TransportError {
 pub type Result<T> = std::result::Result<T, TransportError>;
 
 impl TransportError {
+    /// True when a receive-side terminal error is the expected result of either
+    /// side cleanly closing the QUIC connection during teardown.
+    #[must_use]
+    pub fn is_clean_shutdown_recv(&self) -> bool {
+        fn is_clean_connection_error(e: &quinn::ConnectionError) -> bool {
+            match e {
+                quinn::ConnectionError::LocallyClosed => true,
+                quinn::ConnectionError::ApplicationClosed(close) => close.error_code == 0u32.into(),
+                _ => false,
+            }
+        }
+
+        match self {
+            TransportError::Connection(e) => is_clean_connection_error(e),
+            TransportError::Read(quinn::ReadError::ConnectionLost(e)) => {
+                is_clean_connection_error(e)
+            }
+            TransportError::StreamClosed => true,
+            _ => false,
+        }
+    }
+
     /// True when a `send_datagram` failure affects only the current frame, so
     /// the caller should drop the frame and keep the session alive rather than
     /// tear it down.
@@ -177,5 +199,19 @@ mod tests {
             !TransportError::SendDatagram(quinn::SendDatagramError::Disabled).is_transient_send()
         );
         assert!(!TransportError::StreamClosed.is_transient_send());
+    }
+
+    #[test]
+    fn clean_receive_shutdown_errors_are_not_warnings() {
+        let app_closed = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: 0u32.into(),
+            reason: bytes::Bytes::from_static(b"client closing"),
+        });
+        assert!(TransportError::Connection(app_closed.clone()).is_clean_shutdown_recv());
+        assert!(
+            TransportError::Read(quinn::ReadError::ConnectionLost(app_closed))
+                .is_clean_shutdown_recv()
+        );
+        assert!(TransportError::StreamClosed.is_clean_shutdown_recv());
     }
 }

@@ -309,10 +309,16 @@ const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
 
 #[cfg(target_os = "linux")]
 fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
+    use std::sync::OnceLock;
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
     use winit::event_loop::{ActiveEventLoop, EventLoop};
     use winit::window::WindowId;
+
+    static DISPLAY_LIST: OnceLock<Vec<DisplayDescriptor>> = OnceLock::new();
+    if let Some(displays) = DISPLAY_LIST.get() {
+        return Ok(displays.clone());
+    }
 
     let mut builder = EventLoop::builder();
     winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
@@ -358,7 +364,7 @@ fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
             "no monitors reported by winit".into(),
         ));
     }
-    Ok(collector.displays)
+    Ok(DISPLAY_LIST.get_or_init(|| collector.displays).clone())
 }
 
 #[cfg(target_os = "linux")]

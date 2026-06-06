@@ -63,7 +63,7 @@ pub fn adapter_uuid(adapter: &wgpu::Adapter) -> Option<[u8; 16]> {
 /// the EGL importer follow the producer. `None` on a non-Vulkan host (no
 /// dma-buf path there) or when no adapter is available.
 pub async fn preferred_device_uuid() -> Option<[u8; 16]> {
-    let instance = wgpu::Instance::default();
+    let instance = crate::headless_wgpu_instance();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,

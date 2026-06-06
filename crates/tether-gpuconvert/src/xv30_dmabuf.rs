@@ -123,7 +123,7 @@ impl Bgra2Xv30DmaBuf {
     /// `STORAGE_IMAGE` modifier support on XV30 up front — see the
     /// module comment for why.
     pub async fn new(width: u32, height: u32) -> Result<Self> {
-        let instance = wgpu::Instance::default();
+        let instance = crate::headless_wgpu_instance();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,

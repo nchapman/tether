@@ -84,7 +84,7 @@ async fn query_dmabuf_modifiers(
 ) -> Result<Vec<u64>> {
     let vk_format = drm_fourcc_to_vk_format(drm_fourcc)?;
 
-    let instance = wgpu::Instance::default();
+    let instance = crate::headless_wgpu_instance();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,

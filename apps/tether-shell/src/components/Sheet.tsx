@@ -20,7 +20,10 @@ export function Sheet({
   // PIN countdown ticking), which would otherwise re-add the key listener and,
   // worse, yank focus back to the first control mid-typing.
   const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;

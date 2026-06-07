@@ -4,6 +4,10 @@ import { PinInput } from "./PinInput";
 import { ArrowRightIcon } from "../icons";
 
 const DEFAULT_PORT = "7654";
+const PORT_RE = /^\d{1,5}$/;
+const IPV4_PART_RE = /^\d{1,3}$/;
+const BRACKETED_IPV6_SOCKET_RE = /^\[([0-9a-fA-F:.]+)\]:(\d{1,5})$/;
+const IPV4_SOCKET_RE = /^(.+):(\d{1,5})$/;
 
 // Append the default port unless the address already has one. Handles IPv6:
 // a bare literal (`fe80::1`) is bracketed (`[fe80::1]:7654`) so it parses as a
@@ -13,14 +17,17 @@ function withDefaultPort(addr: string): string {
     // Bracketed IPv6, with or without a trailing `:port`.
     return addr.includes("]:") ? addr : `${addr}:${DEFAULT_PORT}`;
   }
-  const colons = (addr.match(/:/g) ?? []).length;
+  let colons = 0;
+  for (const char of addr) {
+    if (char === ":") colons += 1;
+  }
   if (colons === 1) return addr; // host:port or IPv4:port
   if (colons > 1) return `[${addr}]:${DEFAULT_PORT}`; // bare IPv6 literal
   return `${addr}:${DEFAULT_PORT}`; // bare IPv4 or unsupported hostname
 }
 
 function validPort(raw: string): boolean {
-  if (!/^\d{1,5}$/.test(raw)) return false;
+  if (PORT_RE.exec(raw) === null) return false;
   const port = Number(raw);
   return port > 0 && port <= 65535;
 }
@@ -29,18 +36,18 @@ function validIpv4(raw: string): boolean {
   const parts = raw.split(".");
   return (
     parts.length === 4 &&
-    parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+    parts.every((part) => IPV4_PART_RE.exec(part) !== null && Number(part) <= 255)
   );
 }
 
 function validBracketedIpv6Socket(raw: string): boolean {
-  const match = raw.match(/^\[([0-9a-fA-F:.]+)\]:(\d{1,5})$/);
+  const match = BRACKETED_IPV6_SOCKET_RE.exec(raw);
   return match !== null && match[1].includes(":") && validPort(match[2]);
 }
 
 function normalizeSocketAddr(raw: string): string | null {
   const candidate = withDefaultPort(raw);
-  const ipv4 = candidate.match(/^(.+):(\d{1,5})$/);
+  const ipv4 = IPV4_SOCKET_RE.exec(candidate);
   if (ipv4 !== null && validIpv4(ipv4[1]) && validPort(ipv4[2])) {
     return candidate;
   }
@@ -77,7 +84,7 @@ export function AddComputerSheet({
   const canSubmit = addrOk && pinOk && !busy;
 
   function submit() {
-    if (!canSubmit || normalizedAddr === null) return;
+    if (busy || pin.length !== 8 || normalizedAddr === null) return;
     onSubmit(normalizedAddr, pin, label.trim());
   }
 

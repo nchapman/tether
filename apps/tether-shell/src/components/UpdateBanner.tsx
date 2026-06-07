@@ -12,7 +12,7 @@ export function UpdateBanner() {
   useEffect(() => {
     checkForUpdates()
       .then(setVersion)
-      .catch((e) => console.warn("update check failed", e));
+      .catch((e: unknown) => console.warn("update check failed", e));
   }, []);
 
   if (!version) return null;

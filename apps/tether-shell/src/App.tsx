@@ -34,11 +34,13 @@ function App() {
   // The address book mirrored into a ref so the once-registered engine
   // listeners (and label lookups inside the hooks) read the current list.
   const hostsRef = useRef(hosts);
-  hostsRef.current = hosts;
+  useEffect(() => {
+    hostsRef.current = hosts;
+  }, [hosts]);
   // Tracks whether we hid the window for a live session, so we restore it on
   // *any* terminal transition (clean disconnect, error, or crash-exit) without
   // re-showing — and stealing focus — when it was never hidden.
-  const windowHidden = useRef(false);
+  const windowHiddenRef = useRef(false);
   // Guards the launch-time sharing auto-restore so it fires exactly once.
   // React StrictMode (dev) double-invokes the mount effect setup→cleanup→setup,
   // and the cleanup can't cancel the already-dispatched `getPrefs()` chain, so
@@ -48,22 +50,23 @@ function App() {
   const didAutoRestore = useRef(false);
 
   function restoreWindow() {
-    if (windowHidden.current) {
-      showWindow();
-      windowHidden.current = false;
+    if (windowHiddenRef.current) {
+      void showWindow();
+      windowHiddenRef.current = false;
     }
   }
 
-  const refreshHosts = () =>
-    listKnownHosts()
+  const refreshHosts = () => {
+    void listKnownHosts()
       .then(setHosts)
-      .catch((e) => console.warn("list_known_hosts failed", e));
+      .catch((e: unknown) => console.warn("list_known_hosts failed", e));
+  };
 
   const labelFor = (addr: string) =>
     hostsRef.current.find((h) => h.addr === addr)?.label ?? addr;
 
   const session = useClientSession({
-    windowHidden,
+    windowHiddenRef,
     restoreWindow,
     refreshHosts,
     labelFor,
@@ -80,7 +83,9 @@ function App() {
   // stale.
   function openSharing() {
     setSheet("sharing");
-    if (sharing.hostRef.current.running) listPeers().catch((e) => console.warn(e));
+    if (sharing.hostRef.current.running) {
+      void listPeers().catch((e: unknown) => console.warn(e));
+    }
   }
 
   function openAdd(prefill?: string) {
@@ -90,7 +95,9 @@ function App() {
   }
 
   function copy(text: string) {
-    navigator.clipboard?.writeText(text).catch((e) => console.warn("copy failed", e));
+    void navigator.clipboard
+      .writeText(text)
+      .catch((e: unknown) => console.warn("copy failed", e));
   }
 
   // --- Engine event wiring ---------------------------------------------------
@@ -118,7 +125,7 @@ function App() {
     // start it again. Wait until both listeners are live so we don't miss the
     // host's `listening` event (the toggle would otherwise show off while the
     // engine is actually up). startSharing re-persists the posture, harmlessly.
-    Promise.all([unstatus, unexit])
+    void Promise.all([unstatus, unexit])
       .then(() => getPrefs())
       .then((prefs) => {
         // Once-only: the check-and-set is synchronous (no await between), so
@@ -128,13 +135,13 @@ function App() {
           sharing.startSharing();
         }
       })
-      .catch((e) => console.warn("get_prefs failed", e));
+      .catch((e: unknown) => console.warn("get_prefs failed", e));
 
     return () => {
-      unstatus.then((f) => f());
-      unexit.then((f) => f());
-      unsharing.then((f) => f());
-      unconnect.then((f) => f());
+      void unstatus.then((f) => f()).catch((e: unknown) => console.warn(e));
+      void unexit.then((f) => f()).catch((e: unknown) => console.warn(e));
+      void unsharing.then((f) => f()).catch((e: unknown) => console.warn(e));
+      void unconnect.then((f) => f()).catch((e: unknown) => console.warn(e));
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -174,7 +181,9 @@ function App() {
           prefillAddr={addPrefill}
           status={session.addStatus}
           errorMessage={session.addError}
-          onSubmit={(addr, pin, label) => session.beginConnect(addr, "add", pin, label || null)}
+          onSubmit={(addr, pin, label) => {
+            void session.beginConnect(addr, "add", pin, label || null);
+          }}
           onClose={() => setSheet("none")}
         />
       )}

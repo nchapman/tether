@@ -212,7 +212,7 @@ run = [
   # `mise exec --`: under `sh -c`, git-bash mangles the PATH handed to native
   # pnpm and drops node's dir, so the `tsc` shim's bare `node` fails on Windows.
   # See the `shell` task for the full rationale.
-  "mise exec -- pnpm --dir apps/tether-shell exec tsc --noEmit",
+  "mise exec -- pnpm --dir apps/tether-shell run check",
   "cargo check --manifest-path apps/tether-shell/src-tauri/Cargo.toml",
 ]
 

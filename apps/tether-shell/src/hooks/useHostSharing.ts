@@ -22,19 +22,19 @@ export type HostSharingDeps = {
 export function useHostSharing({ setConfirm }: HostSharingDeps) {
   const [host, setHost] = useState<HostState>(initialHostState);
   const hostRef = useRef(host);
-  hostRef.current = host;
+  useEffect(() => {
+    hostRef.current = host;
+  }, [host]);
 
   // Tick the pairing-PIN countdown; clear when it elapses.
   useEffect(() => {
-    if (host.pin === null) return;
-    if (host.secondsLeft <= 0) {
-      setHost((h) => ({ ...h, pin: null }));
-      return;
-    }
-    const t = setTimeout(
-      () => setHost((h) => ({ ...h, secondsLeft: h.secondsLeft - 1 })),
-      1000,
-    );
+    if (host.pin === null || host.secondsLeft <= 0) return;
+    const t = setTimeout(() => {
+      setHost((h) => {
+        const secondsLeft = Math.max(0, h.secondsLeft - 1);
+        return { ...h, secondsLeft, pin: secondsLeft === 0 ? null : h.pin };
+      });
+    }, 1000);
     return () => clearTimeout(t);
   }, [host.pin, host.secondsLeft]);
 
@@ -43,7 +43,7 @@ export function useHostSharing({ setConfirm }: HostSharingDeps) {
     switch (p.event) {
       case "listening":
         setHost((h) => ({ ...h, running: true, addr: p.addr, error: null }));
-        listPeers().catch((e) => console.warn("list_peers failed", e));
+        void listPeers().catch((e: unknown) => console.warn("list_peers failed", e));
         break;
       case "peer_connected":
         setHost((h) => ({ ...h, peer: p.peer }));
@@ -79,7 +79,7 @@ export function useHostSharing({ setConfirm }: HostSharingDeps) {
   /// than a silently-off toggle. Shared by the sheet toggle and the launch-time
   /// posture auto-restore.
   function startSharing() {
-    startHost().catch((e) => {
+    void startHost().catch((e: unknown) => {
       console.warn("start host failed", e);
       setHost((h) => ({ ...h, error: String(e) }));
     });
@@ -90,7 +90,7 @@ export function useHostSharing({ setConfirm }: HostSharingDeps) {
   /// otherwise the toggle would never flip back to off. stop_engine reliably
   /// tears the engine down, so showing "off" immediately is correct.
   function stopSharing() {
-    stopHost().catch((e) => console.warn(e));
+    void stopHost().catch((e: unknown) => console.warn(e));
     setHost(initialHostState);
   }
 
@@ -113,7 +113,7 @@ export function useHostSharing({ setConfirm }: HostSharingDeps) {
   }
 
   function onAddDevice(label: string) {
-    startPairing(label).catch((e) => console.warn(e));
+    void startPairing(label).catch((e: unknown) => console.warn(e));
   }
 
   function onRevoke(peer: PairedPeer) {
@@ -124,7 +124,7 @@ export function useHostSharing({ setConfirm }: HostSharingDeps) {
       danger: true,
       onConfirm: () => {
         setConfirm(null);
-        revokePeer(peer.fingerprint).catch((e) => console.warn(e));
+        void revokePeer(peer.fingerprint).catch((e: unknown) => console.warn(e));
       },
     });
   }

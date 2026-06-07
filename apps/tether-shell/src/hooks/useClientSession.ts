@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   type EngineEvent,
@@ -24,7 +24,7 @@ import {
 /// renders) or a function that only reads through such refs — so the handlers
 /// below stay correct even when captured once by a long-lived Tauri listener.
 export type ClientSessionDeps = {
-  windowHidden: React.MutableRefObject<boolean>;
+  windowHiddenRef: React.RefObject<boolean>;
   restoreWindow: () => void;
   refreshHosts: () => void;
   labelFor: (addr: string) => string;
@@ -37,7 +37,7 @@ export type ClientSessionDeps = {
 /// it. Mirrors the live state through `clientRef` so the once-registered engine
 /// listeners read current values (see [`ClientSessionDeps`]).
 export function useClientSession({
-  windowHidden,
+  windowHiddenRef,
   restoreWindow,
   refreshHosts,
   labelFor,
@@ -47,7 +47,17 @@ export function useClientSession({
   const [client, setClient] = useState<ClientState>({ kind: "idle" });
   const [rowErrors, setRowErrors] = useState<Record<string, RowError>>({});
   const clientRef = useRef(client);
-  clientRef.current = client;
+  useEffect(() => {
+    clientRef.current = client;
+  }, [client]);
+
+  function withoutRowError(errors: Record<string, RowError>, addr: string) {
+    const next: Record<string, RowError> = {};
+    for (const [key, value] of Object.entries(errors)) {
+      if (key !== addr) next[key] = value;
+    }
+    return next;
+  }
 
   /// Fold an `engine-status` event for the client role into state.
   function handleEvent(p: EngineEvent) {
@@ -66,18 +76,14 @@ export function useClientSession({
             ? prev.addr
             : p.host;
         setClient({ kind: "connected", addr, profile: p.profile });
-        setRowErrors((e) => {
-          const n = { ...e };
-          delete n[addr];
-          return n;
-        });
+        setRowErrors((e) => withoutRowError(e, addr));
         // New first-contact entry + refreshed recency both come from disk.
         refreshHosts();
         setSheet("none");
         // Get the chrome out of the way; the engine's video window is what the
         // user wants in front now.
-        hideWindow();
-        windowHidden.current = true;
+        void hideWindow();
+        windowHiddenRef.current = true;
         break;
       }
       case "disconnected":
@@ -87,8 +93,8 @@ export function useClientSession({
       case "error": {
         // Force-show the window so the failure is visible even for a
         // tray-initiated connect (which never hid it through us).
-        showWindow();
-        windowHidden.current = false;
+        void showWindow();
+        windowHiddenRef.current = false;
         const addr = prev.kind !== "idle" ? prev.addr : "";
         const via: ConnectVia =
           prev.kind === "connecting" || prev.kind === "error" ? prev.via : "saved";
@@ -120,14 +126,12 @@ export function useClientSession({
     label: string | null = null,
   ) {
     setRowErrors((e) => {
-      const n = { ...e };
-      delete n[addr];
-      return n;
+      return withoutRowError(e, addr);
     });
     setClient({ kind: "connecting", addr, via });
     try {
       await connectClient({ addr, pin, label });
-    } catch (e) {
+    } catch (e: unknown) {
       const fe = friendlyError(String(e), labelFor(addr));
       if (via === "add") setClient({ kind: "error", addr, via, message: fe.message });
       else {
@@ -148,11 +152,11 @@ export function useClientSession({
         confirmLabel: "Switch",
         onConfirm: () => {
           setConfirm(null);
-          beginConnect(addr, "saved");
+          void beginConnect(addr, "saved");
         },
       });
     } else {
-      beginConnect(addr, "saved");
+      void beginConnect(addr, "saved");
     }
   }
 
@@ -160,8 +164,8 @@ export function useClientSession({
   /// emits no `engine-exited`, so reset optimistically. The window is already
   /// visible (the user clicked Disconnect in it), so there's nothing to restore.
   function onDisconnect() {
-    disconnectClient().catch((e) => console.warn(e));
-    windowHidden.current = false;
+    void disconnectClient().catch((e: unknown) => console.warn(e));
+    windowHiddenRef.current = false;
     setClient({ kind: "idle" });
   }
 
@@ -173,13 +177,17 @@ export function useClientSession({
       danger: true,
       onConfirm: () => {
         setConfirm(null);
-        forgetKnownHost(target.addr).then(refreshHosts).catch((e) => console.warn(e));
+        void forgetKnownHost(target.addr)
+          .then(refreshHosts)
+          .catch((e: unknown) => console.warn(e));
       },
     });
   }
 
   function onRename(addr: string, label: string) {
-    renameKnownHost(addr, label).then(refreshHosts).catch((e) => console.warn(e));
+    void renameKnownHost(addr, label)
+      .then(refreshHosts)
+      .catch((e: unknown) => console.warn(e));
   }
 
   /// Clear a stale Add-sheet error from a prior attempt (called when reopening

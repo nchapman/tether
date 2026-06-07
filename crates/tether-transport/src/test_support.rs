@@ -466,11 +466,13 @@ impl<V: VideoChannel + ?Sized> LossyChannel<V> {
     /// Snapshot of every drop the wrapper has performed so far. Cheap
     /// because `DropEvent: Clone` and the vec is small in practice.
     pub fn drop_log(&self) -> Vec<DropEvent> {
+        self.lock_sync_state().drop_log.clone()
+    }
+
+    fn lock_sync_state(&self) -> std::sync::MutexGuard<'_, SyncState> {
         self.sync_state
             .lock()
-            .expect("LossyChannel mutex poisoned")
-            .drop_log
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -485,7 +487,7 @@ impl<V: VideoChannel + ?Sized> VideoChannel for LossyChannel<V> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let drop_now = {
             use rand::Rng;
-            let mut s = self.sync_state.lock().expect("LossyChannel mutex poisoned");
+            let mut s = self.lock_sync_state();
             let roll = self.config.drop_probability > 0.0
                 && s.rng.random::<f64>() < self.config.drop_probability;
             if roll {
@@ -517,7 +519,7 @@ impl<V: VideoChannel + ?Sized> VideoChannel for LossyChannel<V> {
         }
         let idx = {
             use rand::Rng;
-            let mut s = self.sync_state.lock().expect("LossyChannel mutex poisoned");
+            let mut s = self.lock_sync_state();
             s.rng.random_range(0..buf.len())
         };
         buf.remove(idx).ok_or_else(|| {
@@ -779,5 +781,31 @@ mod tests {
             .unwrap();
         assert!(matches!(received, Datagram::Video(_)));
         assert!(lossy.drop_log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lossy_channel_recovers_poisoned_sync_state() {
+        let (host, _client) = video_duplex_pair();
+        let lossy = Arc::new(LossyChannel::new(host, LossyConfig::default()));
+        let lossy_for_thread = lossy.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = lossy_for_thread.sync_state.lock().unwrap();
+            panic!("poison sync_state");
+        })
+        .join();
+        assert!(result.is_err(), "poisoning thread must panic");
+
+        assert!(lossy.drop_log().is_empty());
+        let mut fragmenter = FrameFragmenter::new(0u8);
+        let pkt = fragmenter
+            .fragment(
+                make_video_meta(),
+                b"x".to_vec().into(),
+                tether_protocol::MAX_DATAGRAM_PAYLOAD,
+            )
+            .into_iter()
+            .next()
+            .unwrap();
+        lossy.send_datagram(&Datagram::Video(pkt)).unwrap();
     }
 }

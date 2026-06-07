@@ -1016,6 +1016,7 @@ impl SCStreamOutputTrait for ProbeFrameSink {
 #[cfg(test)]
 mod sck_tests {
     use super::*;
+    use std::time::Duration;
 
     /// Hardware probe — runs SCK and records what this Mac accepts.
     /// 4:2:0 video range should always come back true; the higher
@@ -1037,6 +1038,47 @@ mod sck_tests {
         // Print everything else for the operator running the probe to
         // record on a new Mac model.
         eprintln!("SCK probe matrix: {caps:#?}");
+    }
+
+    /// Real ScreenCaptureKit smoke test for the production capture start path.
+    /// The pixel-format probe above proves SCK accepts configurations; this
+    /// verifies `start(BGRA)` actually delivers a GPU IOSurface frame through
+    /// `CaptureHandle`.
+    #[tokio::test]
+    #[ignore = "requires macOS + ScreenRecording permission + active display; run with: cargo test -p tether-capture -- --ignored"]
+    async fn sck_capture_start_delivers_one_frame() {
+        let handle = start(sck_bgra_pixel_format())
+            .await
+            .expect("start ScreenCaptureKit BGRA capture");
+        let rx = handle.into_rx();
+        let frame = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("receive first ScreenCaptureKit frame within 10s");
+
+        assert!(frame.width() > 0, "captured frame width must be non-zero");
+        assert!(frame.height() > 0, "captured frame height must be non-zero");
+        let (t_kernel, t_userspace) = frame.timestamps();
+        assert!(t_kernel.0 > 0, "kernel timestamp should be populated");
+        assert!(t_userspace.0 > 0, "userspace timestamp should be populated");
+
+        let CapturedFrame::Gpu(gpu) = frame else {
+            panic!("ScreenCaptureKit should deliver GPU IOSurface frames");
+        };
+        let surface = match gpu.source {
+            GpuCapturedSource::IOSurface(surface) => surface,
+        };
+        assert!(!surface.surface.is_null(), "IOSurfaceRef must be non-null");
+        assert_eq!(surface.width, gpu.width);
+        assert_eq!(surface.height, gpu.height);
+        assert_eq!(
+            surface.pixel_format,
+            u32::from_be_bytes(*b"BGRA"),
+            "BGRA smoke test should receive BGRA IOSurfaces"
+        );
+        assert!(
+            gpu.native_damage.is_some(),
+            "SCK should attach SCStreamFrameInfo.status damage metadata"
+        );
     }
 
     #[test]

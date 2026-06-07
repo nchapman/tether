@@ -818,6 +818,61 @@ fn hresult_io(e: windows::core::Error) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Real DXGI Desktop Duplication smoke test for the production Windows
+    /// capture start path. `pre_create` mirrors host startup ordering, then
+    /// `start_with` must deliver a GPU BGRA texture through `CaptureHandle`.
+    /// The backend skips idle duplication frames, so an entirely static
+    /// desktop may need a visible cursor/window update while this runs.
+    #[test]
+    #[ignore = "requires Windows desktop session + DXGI Desktop Duplication with visible desktop updates; run with: cargo test -p tether-capture -- --ignored"]
+    fn dxgi_capture_start_delivers_one_bgra_texture() {
+        let pre = pre_create().expect("pre-create DXGI Desktop Duplication");
+        let (handle, shared_device) = start_with(pre).expect("start DXGI capture");
+        let rx = handle.into_rx();
+        let frame = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("receive first non-idle DXGI frame within 10s");
+
+        assert!(frame.width() > 0, "captured frame width must be non-zero");
+        assert!(frame.height() > 0, "captured frame height must be non-zero");
+        let (t_kernel, t_userspace) = frame.timestamps();
+        assert!(t_kernel.0 > 0, "kernel timestamp should be populated");
+        assert!(t_userspace.0 > 0, "userspace timestamp should be populated");
+
+        let CapturedFrame::Gpu(gpu) = frame else {
+            panic!("DXGI Desktop Duplication should deliver GPU D3D11 texture frames");
+        };
+        let GpuCapturedFrame {
+            width,
+            height,
+            source,
+            native_damage,
+            ..
+        } = gpu;
+        let tex = match source {
+            GpuCapturedSource::D3D11Texture(tex) => tex,
+        };
+        assert_eq!(tex.width, width);
+        assert_eq!(tex.height, height);
+        assert_eq!(tex.format, DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert_eq!(
+            tex.device.vendor_id, shared_device.vendor_id,
+            "frame texture should carry the shared capture device"
+        );
+        assert_eq!(
+            native_damage,
+            Some(NativeDamage { idle: false }),
+            "sent DXGI frames should be non-idle; idle frames are skipped"
+        );
+
+        let mut desc: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
+        unsafe { tex.texture.GetDesc(&mut desc) };
+        assert_eq!(desc.Width, width);
+        assert_eq!(desc.Height, height);
+        assert_eq!(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM);
+    }
 
     #[test]
     fn slot_return_releases_slot_to_free_list_on_drop() {

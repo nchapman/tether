@@ -98,7 +98,7 @@ messages.
 | `tether-render` | 81 Linux-listed tests incl. hardware cells | Cursor letterbox/aspect; `LatestFrame` Send+Sync + drop-oldest; render health/drop accounting; `transfer_kind` / `range_kind_for` / `render_layout_for` dispatch-table pins (incl. 10-bit limited-range breakpoint algebra and Yuv420 10-bit → Biplanar16); `PresentPolicy` / `FrameAgeTracker` (8 tests on pure `decide_present` logic); **relative-mouse sub-pixel accumulator** (6 tests in `relative_mouse.rs`: whole-pixel passthrough, sub-pixel-held, long-run convergence, mixed-sign no-stall, i16 saturation, reset). Hardware: end-to-end roundtrip harness (`test_harness.rs` + `dmabuf_test.rs`) drives the production multi-pass renderer (`Gpu::new_headless`) through cells covering identity / host-scaler / client-upscale / surface-below-video / full-chain / repro-shape across H.264 4:2:0, HEVC Main, HEVC Main 4:4:4, HEVC Main 10, HEVC Main 4:4:4 10-bit, AV1 4:2:0 8-bit + 10-bit. Primary metric is geometric residual on `Fixture::CoordEncoded`; SSIM + BT.709 Y-PSNR are the secondary catch-net. A parallel set of `Fixture::ColorBars` cells asserts each codec reconstructs true colour. NVIDIA Linux gets fixture decode → NVDEC dma-buf export → production render cells for H.264, HEVC Main10, and AV1 8/10-bit. macOS IOSurface zero-copy covers HEVC Main / Main10 / Main 4:4:4 8 + 10-bit plus AV1 4:2:0 8/10-bit fixture-render cells; BGRA-bridge cells cover the macOS host Metal bridge output for 4:2:0 and 4:4:4 at 8/10-bit; `iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix` records the current VT encode negative for 4:4:4. **Windows D3D11** (cfg-gated, `#[ignore]`): native-renderer headless roundtrips cover synthetic NV12, cursor overlay, Intel QSV plus AMD AMF plus NVIDIA NVENC HEVC/H.264/AV1 coord and colour fixtures, and 8/10-bit non-identity scaling; 4:4:4 is rejected at construction (D3D11 VP is 4:2:0-only). |
 | `tether-gpuconvert` | 6 lib + 18 `#[ignore]` lib + 7 `#[ignore]` integration (`tests/scaler_roundtrip.rs`) | `drm_fourcc_to_vk_format` table coverage (8 + 10-bit biplanar + packed XV30 → A2B10G10R10_UNORM_PACK32 + unknown rejection); BGRA→NV12 + DMA-BUF round-trip; `convert_solid_{white,red}_roundtrip_packed_xv30` (10-bit channel-mapping + BT.709 math); `storable_probe_returns_linear_for_xv30`; structural alignment regression `convert_reports_64_aligned_y_stride_at_unaligned_width`. Integration: `bgra_dmabuf_roundtrip_{1920×1200,2880×1920}` + `imported_bgra_then_scaler_2880×1920_to_2160×1440` — bisect entry points splitting (scaler isolation) ↔ (BGRA dma-buf import/export) ↔ (scaler-on-dma-buf). |
 | `tether-scaler` | 8 lib + 6 integration (`tests/quality.rs`) + 15 `#[ignore]` integration (`tests/hardware.rs`) | Mitchell-Netravali reference vs CPU parity, fp16 linear-light, mip prefilter, asymmetric scale; `matches_reference_coord_encoded_left_edge` (2880×1920 → 2160×1440 left-edge regression — bottom of the bisect stack). |
-| `tether-capture` | 41 Linux lib | `HashDamage::classify` policy incl. native-damage short-circuit; cursor source/shape policy; restore-token file permission hardening; `native_damage_for_frame_status` (macOS) maps all six `SCFrameStatus`; `native_damage_from_region_count` (Linux) empty-list ⇒ idle; `video_damage_meta_pod_has_choice_range_size` pod-shape snapshot. Test-pattern producer lifecycle + `set_target_fps_changes_cadence_mid_stream` + `set_target_fps_clamps_zero_to_one`. SCK pixel-format probe (`#[ignore]` on macOS). `test_support`: `ScriptedSource` for precise-timing scenarios. **Windows D3D11** (cfg-gated): the capture→encode ownership handshake + freshest-wins handoff, plus the consumer-liveness shutdown contract. |
+| `tether-capture` | 42 Linux lib | `HashDamage::classify` policy incl. native-damage short-circuit; cursor source/shape policy; restore-token file permission hardening; `native_damage_for_frame_status` (macOS) maps all six `SCFrameStatus`; `native_damage_from_region_count` (Linux) empty-list ⇒ idle; `video_damage_meta_pod_has_choice_range_size` pod-shape snapshot. Test-pattern producer lifecycle + `set_target_fps_changes_cadence_mid_stream` + `set_target_fps_clamps_zero_to_one`. Real screen-capture hardware smoke tests (`#[ignore]`): Linux PipeWire portal delivers one SHM frame, macOS SCK BGRA start delivers one IOSurface frame, Windows DXGI Desktop Duplication delivers one BGRA D3D11 texture; macOS also keeps the SCK pixel-format probe. `test_support`: `ScriptedSource` for precise-timing scenarios. **Windows D3D11** (cfg-gated): the capture→encode ownership handshake + freshest-wins handoff, plus the consumer-liveness shutdown contract. |
 | `tether-decode` | 21 feature-gated integration (`tests/run_thread.rs`) | `run_thread` (extracted from `apps/tether-client/src/main.rs`) under fault injection: decode success → `LatestFrame`, hard-error → IDR callback, soft-error → IDR callback, rate-limiting, build failure, dropped sender, watchdog escalation, rebuild budget exhaustion, render-drop counting, epoch-advance rebuild and throttle counters, AV1 empty-extradata resume, and the first-IDR decode gate. Exercised via `FakeDecoder` (`one_frame_then_idle`, scriptable submit/next_frame outcomes, `flush_count` field). |
 | `tether-audio` | 38 Linux lib + 3 integration + 1 Linux `#[ignore]` hardware | Lib: Opus encode/decode + config hardening against untrusted `OpusConfig`; lock-free jitter ring drop-oldest + cap-and-drop under overrun; `playback::policy` prebuffer / starve / resync decisions; RED recovery classification; test-pattern producer; Linux PipeWire interleave / truncate / empty-frame adapters; on Windows the WASAPI `FormatConverter` remix (stereo / 5.1 / 7.1 → stereo) + resampler continuity + mix-format clamping. Integration: `audio_loopback.rs` — Opus round-trip through the real `Datagram::Audio` unreliable channel, isolated-loss RED recovery, and 1%-loss concealment. Hardware (`#[ignore]`, one per platform): `{linux,macos,windows}_audio_roundtrip.rs` — real system-output capture → Opus → playback (needs a live audio device + capture permission/daemon). |
 | `tether-vaapi` | 0 | Hand-rolled libva FFI bindings; tested transitively through `tether-codec/vaapi/tests.rs`. |
@@ -247,8 +247,8 @@ behaviour we expect to work everywhere.
   codec-shape gap is 4:4:4, a D3D11 Video Processor hardware limit rather than
   a missing test. macOS VideoToolbox/IOSurface now has AV1 fixture-render cells
   alongside HEVC, but the project still needs a repeatable M1/M2/M3/M4 evidence
-  table and real capture smoke tests before we can call the hardware suite
-  operationally excellent.
+  table and regular runs of the real capture smoke tests before we can call
+  the hardware suite operationally excellent.
 - Releases: `.github/workflows/release.yml` on `v*` tags produces Tauri
   installers + a signed updater manifest (see `docs/RELEASING.md`).
 - Clippy is a blocking gate: `cargo clippy --workspace --all-targets -- -D
@@ -281,19 +281,21 @@ behaviour we expect to work everywhere.
   the prepend in isolation.
 - **`max_concurrent_uni_streams` enforcement.** Quinn enforces the
   limit; trusted to quinn's own test suite.
-- **Capture-backend FFI surface (PipeWire pod negotiation, SCK
-  attachment reads).** We carve testable kernels out of each backend
+- **Capture-backend metadata FFI surface (PipeWire pod negotiation,
+  SCK attachment reads).** We carve testable kernels out of each backend
   (`native_damage_for_frame_status`, `native_damage_from_region_count`,
   `video_damage_meta_pod_has_choice_range_size`) so policy and pod
-  *encoding* are unit-testable without hardware. What stays
-  unverified in-tree: whether a real PipeWire server attaches the
-  meta in response to our `SPA_PARAM_Meta` request (compositor /
-  xdg-desktop-portal version dependent), whether real SCK fires
-  `Idle`/`Stopped` at the rate we expect, and whether `find_meta`
-  returns the same pointer shape across libpipewire minor versions.
-  Any new capture-backend FFI surface (a new SPA meta type, a new
-  SCK attachment) follows the same shape: pure helper + pod-shape
-  snapshot + manual verification note.
+  *encoding* are unit-testable without hardware. The ignored capture
+  smoke tests now start each real backend and assert one delivered
+  frame/resource shape. What stays unverified by deterministic CI:
+  whether a real PipeWire server attaches the meta in response to our
+  `SPA_PARAM_Meta` request (compositor / xdg-desktop-portal version
+  dependent), whether real SCK fires `Idle`/`Stopped` at the rate we
+  expect, and whether `find_meta` returns the same pointer shape across
+  libpipewire minor versions. Any new capture-backend metadata surface
+  (a new SPA meta type, a new SCK attachment) follows the same shape:
+  pure helper + pod-shape snapshot + smoke-test assertion when
+  observable + hardware evidence note.
 
 ## Live session checklist
 

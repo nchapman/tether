@@ -19,7 +19,9 @@
 //! emits them — no speculative variants (e.g. a `Stats` event) ahead of the
 //! feature that drives them.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 
 /// Engine → shell, written one-per-line to the engine's stdout.
 ///
@@ -79,7 +81,7 @@ pub struct PairedPeer {
 /// Stdin EOF (the shell process dying) is an implicit `Stop` — engines
 /// treat a closed stdin the same as an explicit stop so a crashed shell
 /// never orphans an engine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ShellCommand {
     /// Tear down the session and exit gracefully.
@@ -97,10 +99,119 @@ pub enum ShellCommand {
     ListPeers,
 }
 
+const COMMAND_VARIANTS: &[&str] = &["stop", "start_pairing", "revoke_peer", "list_peers"];
+
+const CMD_ONLY_FIELDS: &[&str] = &["cmd"];
+const START_PAIRING_FIELDS: &[&str] = &["cmd", "label"];
+const REVOKE_PEER_FIELDS: &[&str] = &["cmd", "fingerprint"];
+
+impl<'de> Deserialize<'de> for ShellCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Cmd,
+            Label,
+            Fingerprint,
+        }
+
+        struct ShellCommandVisitor;
+
+        impl<'de> Visitor<'de> for ShellCommandVisitor {
+            type Value = ShellCommand;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a shell command object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut cmd = None;
+                let mut label = None;
+                let mut fingerprint = None;
+
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::Cmd => {
+                            if cmd.replace(map.next_value::<String>()?).is_some() {
+                                return Err(de::Error::duplicate_field("cmd"));
+                            }
+                        }
+                        Field::Label => {
+                            if label.replace(map.next_value::<String>()?).is_some() {
+                                return Err(de::Error::duplicate_field("label"));
+                            }
+                        }
+                        Field::Fingerprint => {
+                            if fingerprint.replace(map.next_value::<String>()?).is_some() {
+                                return Err(de::Error::duplicate_field("fingerprint"));
+                            }
+                        }
+                    }
+                }
+
+                let cmd = cmd.ok_or_else(|| de::Error::missing_field("cmd"))?;
+                match cmd.as_str() {
+                    "stop" => {
+                        if label.is_some() {
+                            return Err(de::Error::unknown_field("label", CMD_ONLY_FIELDS));
+                        }
+                        if fingerprint.is_some() {
+                            return Err(de::Error::unknown_field("fingerprint", CMD_ONLY_FIELDS));
+                        }
+                        Ok(ShellCommand::Stop)
+                    }
+                    "start_pairing" => {
+                        if fingerprint.is_some() {
+                            return Err(de::Error::unknown_field(
+                                "fingerprint",
+                                START_PAIRING_FIELDS,
+                            ));
+                        }
+                        let label = label.ok_or_else(|| de::Error::missing_field("label"))?;
+                        Ok(ShellCommand::StartPairing { label })
+                    }
+                    "revoke_peer" => {
+                        if label.is_some() {
+                            return Err(de::Error::unknown_field("label", REVOKE_PEER_FIELDS));
+                        }
+                        let fingerprint =
+                            fingerprint.ok_or_else(|| de::Error::missing_field("fingerprint"))?;
+                        Ok(ShellCommand::RevokePeer { fingerprint })
+                    }
+                    "list_peers" => {
+                        if label.is_some() {
+                            return Err(de::Error::unknown_field("label", CMD_ONLY_FIELDS));
+                        }
+                        if fingerprint.is_some() {
+                            return Err(de::Error::unknown_field("fingerprint", CMD_ONLY_FIELDS));
+                        }
+                        Ok(ShellCommand::ListPeers)
+                    }
+                    other => Err(de::Error::unknown_variant(other, COMMAND_VARIANTS)),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(ShellCommandVisitor)
+    }
+}
+
 impl ShellCommand {
     /// Parse one JSON-line command from the shell. Returns the textual
     /// parse error so the caller can log a malformed line and keep
     /// reading without taking a `serde_json` dependency of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when the line is not a valid JSON
+    /// [`ShellCommand`], including unknown command names, missing fields,
+    /// or extra fields.
     pub fn from_line(line: &str) -> Result<Self, String> {
         serde_json::from_str(line).map_err(|e| e.to_string())
     }
@@ -121,6 +232,7 @@ pub enum Reporter {
 
 impl Reporter {
     /// `--ipc` on the command line selects [`Reporter::Json`].
+    #[must_use]
     pub fn from_ipc_flag(ipc: bool) -> Self {
         if ipc {
             Self::Json
@@ -132,6 +244,7 @@ impl Reporter {
     /// True when the binary is shell-driven (JSON-lines on stdout). The
     /// mains use this to suppress human-only chrome (usage hints, the
     /// cert-dir note) that has no [`EngineEvent`] equivalent.
+    #[must_use]
     pub fn is_json(self) -> bool {
         matches!(self, Self::Json)
     }
@@ -213,50 +326,50 @@ mod tests {
 
     /// Every wire type round-trips through JSON — the shell parses
     /// exactly what the engine serializes.
-    fn assert_event_roundtrip(event: EngineEvent) {
+    fn assert_event_roundtrip(event: &EngineEvent) {
         let line = serde_json::to_string(&event).expect("serialize");
         assert!(!line.contains('\n'), "events must serialize to one line");
         let back: EngineEvent = serde_json::from_str(&line).expect("deserialize");
-        assert_eq!(event, back);
+        assert_eq!(*event, back);
     }
 
     #[test]
     fn engine_events_roundtrip() {
-        assert_event_roundtrip(EngineEvent::Listening {
+        assert_event_roundtrip(&EngineEvent::Listening {
             addr: "127.0.0.1:7654".into(),
             fingerprint: "ab12".into(),
         });
-        assert_event_roundtrip(EngineEvent::PeerConnected {
+        assert_event_roundtrip(&EngineEvent::PeerConnected {
             peer: "127.0.0.1:5000".into(),
         });
-        assert_event_roundtrip(EngineEvent::PeerDisconnected {
+        assert_event_roundtrip(&EngineEvent::PeerDisconnected {
             reason: "clean".into(),
         });
-        assert_event_roundtrip(EngineEvent::Connecting {
+        assert_event_roundtrip(&EngineEvent::Connecting {
             host: "127.0.0.1:7654".into(),
         });
-        assert_event_roundtrip(EngineEvent::Connected {
+        assert_event_roundtrip(&EngineEvent::Connected {
             host: "127.0.0.1:7654".into(),
             profile: "HEVC Main".into(),
         });
-        assert_event_roundtrip(EngineEvent::Disconnected {
+        assert_event_roundtrip(&EngineEvent::Disconnected {
             reason: "host closed".into(),
         });
-        assert_event_roundtrip(EngineEvent::Error {
+        assert_event_roundtrip(&EngineEvent::Error {
             message: "no decoder".into(),
         });
-        assert_event_roundtrip(EngineEvent::PairingPin {
+        assert_event_roundtrip(&EngineEvent::PairingPin {
             pin: "48271930".into(),
             expires_in_secs: 120,
         });
-        assert_event_roundtrip(EngineEvent::Paired {
+        assert_event_roundtrip(&EngineEvent::Paired {
             peer: "127.0.0.1:5000".into(),
             label: "Nick's laptop".into(),
         });
-        assert_event_roundtrip(EngineEvent::PairingRequired {
+        assert_event_roundtrip(&EngineEvent::PairingRequired {
             peer: "127.0.0.1:5000".into(),
         });
-        assert_event_roundtrip(EngineEvent::PeerList {
+        assert_event_roundtrip(&EngineEvent::PeerList {
             peers: vec![PairedPeer {
                 fingerprint: "sha256:abcd".into(),
                 label: "Nick's laptop".into(),
@@ -264,7 +377,7 @@ mod tests {
             }],
         });
         // Empty list must round-trip too (no devices paired yet).
-        assert_event_roundtrip(EngineEvent::PeerList { peers: vec![] });
+        assert_event_roundtrip(&EngineEvent::PeerList { peers: vec![] });
     }
 
     #[test]
@@ -356,6 +469,22 @@ mod tests {
     #[test]
     fn unknown_command_fails_cleanly() {
         assert!(ShellCommand::from_line(r#"{"cmd":"explode"}"#).is_err());
+    }
+
+    /// Extra fields are rejected so a malformed supervisor command cannot
+    /// accidentally execute as a valid command with ignored baggage.
+    #[test]
+    fn command_with_unknown_field_fails_cleanly() {
+        let err = ShellCommand::from_line(r#"{"cmd":"stop","fingerprint":"sha256:ab"}"#)
+            .expect_err("extra fields must be rejected");
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn command_missing_required_field_fails_cleanly() {
+        let err = ShellCommand::from_line(r#"{"cmd":"start_pairing"}"#)
+            .expect_err("missing label must be rejected");
+        assert!(err.contains("missing field"), "{err}");
     }
 
     #[test]

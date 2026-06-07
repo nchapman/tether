@@ -538,7 +538,7 @@ impl Worker {
         let rate_limit_ns = IDR_RATE_LIMIT.as_nanos() as u64;
         let fire = self
             .last_idr_request
-            .is_none_or(|t| now.saturating_sub(t) > rate_limit_ns);
+            .is_none_or(|t| now.saturating_sub(t) >= rate_limit_ns);
         if fire {
             (self.request_idr)();
             self.last_idr_request = Some(now);

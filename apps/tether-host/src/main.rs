@@ -4219,6 +4219,40 @@ mod tests {
         assert!(!host_summary_audio_active(false, false));
     }
 
+    fn profile(codec: CodecKind, chroma: ChromaSubsampling, bit_depth: u8) -> VideoProfile {
+        VideoProfile {
+            codec,
+            chroma,
+            bit_depth,
+        }
+    }
+
+    #[test]
+    fn derive_bitrate_anchors_h264_1080p60_floor() {
+        let p = profile(CodecKind::H264, ChromaSubsampling::Yuv420, 8);
+        assert_eq!(derive_bitrate_kbps(p, 1920, 1080, 60), ENCODER_BITRATE_KBPS);
+    }
+
+    #[test]
+    fn derive_bitrate_applies_codec_chroma_and_depth_multipliers() {
+        let hevc_main = profile(CodecKind::Hevc, ChromaSubsampling::Yuv420, 8);
+        let hevc_444 = profile(CodecKind::Hevc, ChromaSubsampling::Yuv444, 8);
+        let hevc_444_10 = profile(CodecKind::Hevc, ChromaSubsampling::Yuv444, 10);
+        let av1_10 = profile(CodecKind::Av1, ChromaSubsampling::Yuv420, 10);
+
+        assert_eq!(derive_bitrate_kbps(hevc_main, 1920, 1080, 60), 7_000);
+        assert_eq!(derive_bitrate_kbps(hevc_444, 1920, 1080, 60), 9_800);
+        assert_eq!(derive_bitrate_kbps(hevc_444_10, 1920, 1080, 60), 11_760);
+        assert_eq!(derive_bitrate_kbps(av1_10, 1920, 1080, 60), 7_200);
+    }
+
+    #[test]
+    fn derive_bitrate_clamps_extreme_resolutions() {
+        let p = profile(CodecKind::H264, ChromaSubsampling::Yuv420, 8);
+        assert_eq!(derive_bitrate_kbps(p, 64, 64, 30), 500);
+        assert_eq!(derive_bitrate_kbps(p, 7680, 4320, 120), 30_000);
+    }
+
     #[test]
     fn viewport_rebuild_throttle_defers_rapid_changes_only() {
         use std::time::Duration;

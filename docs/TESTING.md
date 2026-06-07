@@ -14,9 +14,30 @@ point the workspace lists hundreds of tests across unit, integration, doc, and
 `#[ignore]` hardware binaries; the table below records the current shape and
 the coverage that matters.
 
-## Unit and integration tests by crate
+## Local commands
 
-| Crate | Tests | Covers |
+The mise tasks separate short edit-loop checks from the authoritative suites:
+
+| Task | Purpose |
+| --- | --- |
+| `mise run test` | Fast library-unit loop: `cargo test --workspace --lib`. |
+| `mise run test-all` | Full no-hardware suite: `cargo test --workspace`; this matches CI's test step. |
+| `mise run coverage` | Advisory no-hardware coverage report via `cargo-llvm-cov`, with an HTML report in `target/llvm-cov/html`. |
+| `mise run test-hw` | Current platform's ignored GPU/video hardware tests, serial. |
+| `mise run test-audio` | Current platform's ignored system-audio round-trip. |
+| `mise run bench` | Current platform's ignored benchmark cells, release, serial. |
+
+Coverage is deliberately local and advisory for now. Use it to find easy
+no-hardware gaps in pure logic, parsers, state machines, protocol contracts,
+and table consistency; do not treat raw line percentage as a release gate.
+Hardware-only paths, FFI surfaces, generated/build files, and manual
+glass-to-glass validation stay governed by the matrix and gap notes below.
+Install the tool with `cargo install cargo-llvm-cov` if `mise run coverage`
+reports that the subcommand is missing.
+
+## Unit and integration tests by package
+
+| Package | Tests | Covers |
 | --- | --- | --- |
 | `tether-protocol` | 100 lib + 4 integration | Wire round-trips for every control variant (handshake, codec negotiation incl. 10-bit `VideoProfile` constants + forward-compat `u8` bit_depth probe, video packets + `stream_epoch>u16` widening, `VideoFrameMetaEnvelope`, cursor position + control-stream cursor shapes, multi-monitor `DisplayList`, stream lifecycle, `ClientStats` named-field mapping, `Goodbye` final session summary incl. video/audio stats, `ControlMessage::Extension`, audio `Opus` incl. near-max-payload datagram-decode, `PixelFormat` hello extension incl. `P010` / `P410`, `InputEvent::device_id`), fragmenter / reassembler invariants (out-of-order, stale eviction, wall-clock-timeout eviction, cross-epoch rejection, duplicate-fragment idempotency, continuation-before-First, unified IDR-keyframe datagram path), `HostFrameTimingBuilder` typestate, forward-compat probes for every tagged enum, clock-sync burst edges, reliable-control field caps (`ExtensionMessage.payload`, cursor-shape pixels), **receiver-side wire-validation** (`video::validation_tests`: oversized / zero fragment_count, continuation index, shard_size, total_body_len, total_body_len above shard capacity, legitimate-accept, `fragments_lost` bump on reject; constants `MAX_FRAGMENTS_PER_FRAME = 4096`, `MAX_FRAME_BODY_BYTES = MAX_FRAGMENTS_PER_FRAME * MAX_DATAGRAM_PAYLOAD`), **multi-block Reed-Solomon FEC** around `VideoPacket::Parity` (fragment + per-block parity emission + RS recovery under simulated loss, multi-block split for large IDRs, every-datagram-fits-budget across input-echo sizes; `FEC_MAX_PRIMARY_SHARDS = 212` per block). Integration: `tests/fragmenter_property.rs` — 4 proptest cases (256 iterations each) over fragmenter ↔ reassembler under random loss + reorder. |
 | `tether-transport` | 17 lib + 8 integration in workspace CI | QUIC handshake, control + datagram round-trip, fingerprint pinning, oversized-datagram local reject, live-MTU video fragmentation, input wrong-role errors, clean datagram shutdown classification, datagram variant round-trips incl. audio, and pairing accept/reject. `test_support` (feature-gated): `DuplexControlChannel` handshake round-trip, post-handshake control message exchange, dropped-peer surfaces `StreamClosed`; `HostHandshake` → `ClientHelloReceived` typestate routes recv-then-send. |
@@ -31,6 +52,9 @@ the coverage that matters.
 | `tether-decode` | 21 feature-gated integration (`tests/run_thread.rs`) | `run_thread` (extracted from `apps/tether-client/src/main.rs`) under fault injection: decode success → `LatestFrame`, hard-error → IDR callback, soft-error → IDR callback, rate-limiting, build failure, dropped sender, watchdog escalation, rebuild budget exhaustion, render-drop counting, epoch-advance rebuild and throttle counters, AV1 empty-extradata resume, and the first-IDR decode gate. Exercised via `FakeDecoder` (`one_frame_then_idle`, scriptable submit/next_frame outcomes, `flush_count` field). |
 | `tether-audio` | 38 Linux lib + 3 integration + 1 Linux `#[ignore]` hardware | Lib: Opus encode/decode + config hardening against untrusted `OpusConfig`; lock-free jitter ring drop-oldest + cap-and-drop under overrun; `playback::policy` prebuffer / starve / resync decisions; RED recovery classification; test-pattern producer; Linux PipeWire interleave / truncate / empty-frame adapters; on Windows the WASAPI `FormatConverter` remix (stereo / 5.1 / 7.1 → stereo) + resampler continuity + mix-format clamping. Integration: `audio_loopback.rs` — Opus round-trip through the real `Datagram::Audio` unreliable channel, isolated-loss RED recovery, and 1%-loss concealment. Hardware (`#[ignore]`, one per platform): `{linux,macos,windows}_audio_roundtrip.rs` — real system-output capture → Opus → playback (needs a live audio device + capture permission/daemon). |
 | `tether-vaapi` | 0 | Hand-rolled libva FFI bindings; tested transitively through `tether-codec/vaapi/tests.rs`. |
+| `tether-host` | app unit tests | Cursor tick emission, session-lifecycle Arc drop invariant, host audio summary gating, viewport/resize policy, bitrate derivation policy, BGRA resize helpers, macOS fourcc table consistency, and Linux `--setup-input` manual fallback text/rule embedding. |
+| `tether-client` | app unit tests | CLI parsing incl. `--pin` / `--label` / `--no-audio`, fingerprint hex parsing, decode-recovery trigger policy, startup viewport drain, and Windows D3D11 decode→render format-table consistency. |
+| `apps/tether-shell/src-tauri` | excluded workspace package, tested in CI shell job | Backend shell helpers: known-host sorting/labels, persisted prefs fallback/round-trip, supervisor engine resolution, tray status labels. TypeScript is typechecked with `pnpm --dir apps/tether-shell exec tsc --noEmit`. |
 
 ## Test infrastructure (`test-support` features)
 
@@ -141,6 +165,9 @@ behaviour we expect to work everywhere.
   The build runs with `RUSTFLAGS=-D warnings`, so any new warning is a hard
   gate. The Tauri shell (excluded from the workspace) is typechecked +
   backend-tested in a separate `shell-check` job.
+- Coverage is not a CI gate. Run `mise run coverage` locally during broad
+  test-suite reviews or before/after larger refactors to guide no-hardware
+  test additions.
 - Hardware tests (VAAPI/Vulkan/Metal/D3D11) are **not** run in CI — GitHub-hosted
   runners have no usable GPU. Run `mise run test-hw` locally on a hardware
   runner. It is platform-symmetric by construction: `cargo test --workspace

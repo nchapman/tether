@@ -544,6 +544,52 @@ async fn goodbye_during_clock_probe_aborts_connect() {
     );
 }
 
+#[tokio::test]
+async fn stale_clock_probe_responses_abort_connect_after_budget() {
+    let (host_chan, client_chan) = duplex_pair();
+    let client_cfg = ClientSessionConfig {
+        client_name: "test-client".to_string(),
+        client_decode_profiles: vec![VideoProfile::H264_8BIT_420],
+        viewport: None,
+    };
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        let _hello = host_chan_dyn.recv_client_hello().await.unwrap();
+        host_chan_dyn
+            .send_server_hello(test_server_hello(VideoProfile::H264_8BIT_420))
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            if host_chan_dyn
+                .send_control(&ControlMessage::ClockProbeResponse(
+                    tether_protocol::control::ClockProbe {
+                        t0_sender: MonoNanos::ZERO,
+                        t1_receiver_recv: MonoNanos::ZERO,
+                        t2_receiver_send: MonoNanos::ZERO,
+                    },
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let err = ClientSession::connect(client_chan_dyn, client_cfg)
+        .await
+        .map(|_| ())
+        .expect_err("stale probe responses should not keep connect pending forever");
+    host_task.await.unwrap();
+    assert!(
+        matches!(err, ConnectError::ClockProbeIgnoredMessageLimit { .. }),
+        "expected ClockProbeIgnoredMessageLimit, got {err:?}"
+    );
+}
+
 // Convenience: a malformed peer (truncated or garbage on the wire)
 // shouldn't deadlock the test — if it ever did, this test would time
 // out and surface that.

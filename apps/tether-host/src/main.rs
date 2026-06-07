@@ -198,6 +198,10 @@ struct ClientStatsObservation {
     fragment_loss_events: u32,
 }
 
+fn host_summary_audio_active(host_audio_available: bool, client_audio_ready: bool) -> bool {
+    host_audio_available && client_audio_ready
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Parse args first so `--ipc` can route tracing off stdout *before*
@@ -880,6 +884,7 @@ async fn handle_client(
         let stream_ready_ctl = stream_ready.clone();
         let video_ready_requested_ctl = video_ready_requested.clone();
         let audio_ready_ctl = audio_ready.clone();
+        let host_audio_available_ctl = audio_active;
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
         let force_idr_for_viewport = force_idr.clone();
@@ -988,6 +993,10 @@ async fn handle_client(
                         // Open the audio gate too; the host audio thread drops
                         // captured frames until the client says it can play them.
                         audio_ready_ctl.store(audio, Ordering::Release);
+                        session_summary_for_ctl.set_audio_active(host_summary_audio_active(
+                            host_audio_available_ctl,
+                            audio,
+                        ));
                     }
                     Ok(ControlMessage::StreamPause { stream_id }) => {
                         info!(%stream_id, "client paused stream (no-op today)");
@@ -4201,6 +4210,14 @@ mod tests {
     //! see the project task list.
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn host_audio_summary_requires_host_and_client_readiness() {
+        assert!(host_summary_audio_active(true, true));
+        assert!(!host_summary_audio_active(true, false));
+        assert!(!host_summary_audio_active(false, true));
+        assert!(!host_summary_audio_active(false, false));
+    }
 
     #[test]
     fn viewport_rebuild_throttle_defers_rapid_changes_only() {

@@ -1047,6 +1047,14 @@ mod sck_tests {
     #[tokio::test]
     #[ignore = "requires macOS + ScreenRecording permission + active display; run with: cargo test -p tether-capture -- --ignored"]
     async fn sck_capture_start_delivers_one_frame() {
+        // Anchor `MonoNanos`' lazily-initialised process-start epoch before
+        // capture begins. The epoch is set on the first `now()` call ever made
+        // in the process, so without this a capture stamp that happens to be
+        // that first call reads exactly 0 — a real value, but indistinguishable
+        // from "unpopulated". With the epoch anchored here, SCK startup burns
+        // real time and the delivered frame's stamp is reliably later.
+        let before = MonoNanos::now();
+
         let handle = start(sck_bgra_pixel_format())
             .await
             .expect("start ScreenCaptureKit BGRA capture");
@@ -1058,15 +1066,21 @@ mod sck_tests {
         assert!(frame.width() > 0, "captured frame width must be non-zero");
         assert!(frame.height() > 0, "captured frame height must be non-zero");
         let (t_kernel, t_userspace) = frame.timestamps();
-        assert!(t_kernel.0 > 0, "kernel timestamp should be populated");
-        assert!(t_userspace.0 > 0, "userspace timestamp should be populated");
+        assert!(
+            t_userspace >= before,
+            "userspace timestamp should be stamped at/after capture start ({before:?})"
+        );
+        // macOS has no separate kernel capture clock, so the capture path
+        // mirrors the userspace stamp into the kernel slot (see `build_frame`).
+        assert_eq!(
+            t_kernel, t_userspace,
+            "macOS capture mirrors the userspace stamp into the kernel slot"
+        );
 
         let CapturedFrame::Gpu(gpu) = frame else {
             panic!("ScreenCaptureKit should deliver GPU IOSurface frames");
         };
-        let surface = match gpu.source {
-            GpuCapturedSource::IOSurface(surface) => surface,
-        };
+        let GpuCapturedSource::IOSurface(surface) = gpu.source;
         assert!(!surface.surface.is_null(), "IOSurfaceRef must be non-null");
         assert_eq!(surface.width, gpu.width);
         assert_eq!(surface.height, gpu.height);
@@ -1075,10 +1089,12 @@ mod sck_tests {
             u32::from_be_bytes(*b"BGRA"),
             "BGRA smoke test should receive BGRA IOSurfaces"
         );
-        assert!(
-            gpu.native_damage.is_some(),
-            "SCK should attach SCStreamFrameInfo.status damage metadata"
-        );
+        // `native_damage` is intentionally not asserted here: SCK does not
+        // attach an `SCStreamFrameInfo.status` to every sample (the first
+        // frame frequently arrives without one), so it is legitimately
+        // `None` for a delivered frame. The status→damage mapping is unit-
+        // tested directly in `native_damage_for_frame_status`'s tests; this
+        // smoke test only verifies one real delivered resource shape.
     }
 
     #[test]

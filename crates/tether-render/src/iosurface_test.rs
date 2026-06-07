@@ -83,25 +83,6 @@ fn make_chroma_detail_bgra(width: u32, height: u32) -> Vec<u8> {
     data
 }
 
-fn region_average_rgb(rgba: &[u8], w: u32, x0: u32, y0: u32, rw: u32, rh: u32) -> (u8, u8, u8) {
-    let mut sum = [0u64; 3];
-    let mut count = 0u64;
-    for y in y0..y0 + rh {
-        for x in x0..x0 + rw {
-            let idx = ((y * w + x) * 4) as usize;
-            sum[0] += u64::from(rgba[idx]);
-            sum[1] += u64::from(rgba[idx + 1]);
-            sum[2] += u64::from(rgba[idx + 2]);
-            count += 1;
-        }
-    }
-    (
-        (sum[0] / count) as u8,
-        (sum[1] / count) as u8,
-        (sum[2] / count) as u8,
-    )
-}
-
 /// Initialise wgpu headless for the IOSurface import path. Returns
 /// `None` if no Metal adapter is available or it lacks the wgpu
 /// features the renderer needs for the requested profile. Both
@@ -1273,8 +1254,16 @@ struct HostScalerArtifacts {
 /// shape as the existing no-scaling cells' return type.
 #[cfg(target_os = "macos")]
 fn host_scaler_wide_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let left = region_average_rgb(rgba, dw, dw / 8, dh / 4, dw / 4, dh / 2);
-    let right = region_average_rgb(rgba, dw, 5 * dw / 8, dh / 4, dw / 4, dh / 2);
+    let left = region_average_rgb(rgba, dw, ChannelOrder::Rgba, dw / 8, dh / 4, dw / 4, dh / 2);
+    let right = region_average_rgb(
+        rgba,
+        dw,
+        ChannelOrder::Rgba,
+        5 * dw / 8,
+        dh / 4,
+        dw / 4,
+        dh / 2,
+    );
     (left, right)
 }
 
@@ -1290,8 +1279,8 @@ fn host_scaler_wide_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8
 /// the seam shifts.
 #[cfg(target_os = "macos")]
 fn host_scaler_seam_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let seam_left = region_average_rgb(rgba, dw, dw / 2 - 4, dh / 4, 4, dh / 2);
-    let seam_right = region_average_rgb(rgba, dw, dw / 2, dh / 4, 4, dh / 2);
+    let seam_left = region_average_rgb(rgba, dw, ChannelOrder::Rgba, dw / 2 - 4, dh / 4, 4, dh / 2);
+    let seam_right = region_average_rgb(rgba, dw, ChannelOrder::Rgba, dw / 2, dh / 4, 4, dh / 2);
     (seam_left, seam_right)
 }
 

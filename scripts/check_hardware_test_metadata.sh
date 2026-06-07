@@ -48,6 +48,10 @@ trap 'rm -f "$TMPFILE"' EXIT
 
 # Emit: file<TAB>line<TAB>test<TAB>ignore_msg
 while IFS= read -r file; do
+  # rg emits backslash separators on Windows. Normalize to forward slashes so
+  # awk's `-v` assignment doesn't escape-process them (\t -> tab, etc.) and so
+  # the family `case "$file"` patterns below still match.
+  file="${file//\\//}"
   awk -v f="$file" '
     BEGIN {
       pending_msg = "";

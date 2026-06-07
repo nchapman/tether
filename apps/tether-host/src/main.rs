@@ -101,6 +101,18 @@ impl Drop for ActiveSessionGuard {
 /// there's headroom.
 const ENCODER_FPS: u32 = 60;
 
+/// Server-side defense throttle on viewport-driven encoder rebuilds. The
+/// client already debounces resize events (~150 ms), so a well-behaved client
+/// drives at most one rebuild per settled size. This throttle bounds a client
+/// that *doesn't* debounce (buggy or hostile) from forcing a full
+/// encoder-teardown + `stream_epoch` bump every frame — which would churn the
+/// hardware encode session (fragile on some drivers) and storm the client's
+/// decoder rebuilds. Set above the client debounce so a single legitimate
+/// resize is never delayed; only sub-throttle bursts coalesce to the latest
+/// viewport. Capture-source resolution changes and the first build are NOT
+/// throttled — they aren't client-controlled.
+const VIEWPORT_REBUILD_THROTTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// VBR target bitrate. The encoder is allowed to overshoot for
 /// motion-heavy frames and undershoot on static content. Calibrated
 /// for 1080p60 H.264 ≈ 10 Mbps and roughly scales linearly with
@@ -2755,6 +2767,26 @@ mod cursor_pump_tests {
 /// ratio.
 const VISIBLE_DIM_ALIGN: u32 = 2;
 
+/// Decide whether to (re)build the encoder this iteration. The first build and
+/// a capture-source resolution change always rebuild (not client-controlled). A
+/// viewport-driven encode-dim change is *throttled*: deferred when it lands
+/// within [`VIEWPORT_REBUILD_THROTTLE`] of the previous rebuild. This is the
+/// server-side defense against a client that doesn't debounce resizes — it
+/// bounds encoder-teardown + `stream_epoch` churn without delaying a single
+/// legitimate resize (the prior rebuild is seeded far in the past).
+fn should_recreate_encoder(
+    first_build: bool,
+    capture_changed: bool,
+    encode_changed: bool,
+    elapsed_since_rebuild: std::time::Duration,
+) -> bool {
+    if first_build || capture_changed {
+        return true;
+    }
+    // Only a viewport-driven encode-dim change remains; throttle it.
+    encode_changed && elapsed_since_rebuild >= VIEWPORT_REBUILD_THROTTLE
+}
+
 /// Compute the encoder-output dimensions for a given capture size
 /// and client viewport. The viewport bounds the longest edge; we
 /// preserve aspect ratio (letterbox at the client; never stretch)
@@ -3181,6 +3213,10 @@ fn run_capture_and_send(
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
     let mut slot: Option<EncoderSlot> = None;
+    // When the encoder was last rebuilt, for the viewport-rebuild throttle
+    // (`VIEWPORT_REBUILD_THROTTLE`). Seeded in the past so the first
+    // viewport-driven rebuild after startup is never throttled.
+    let mut last_encoder_rebuild = Instant::now() - VIEWPORT_REBUILD_THROTTLE;
     #[cfg(target_os = "macos")]
     let mut macos_gpu_state: Option<MacosGpuState> = None;
     let mut pts: i64 = 0;
@@ -3279,13 +3315,25 @@ fn run_capture_and_send(
         // leaves dims unchanged (GPU path while no scaler exists; an
         // upscale-rejected viewport on any path) shouldn't churn the
         // session. The seq is tracked for diagnostic logging only.
-        let needs_recreate = slot.as_ref().is_none_or(|s| {
-            s.capture_width != frame_width
-                || s.capture_height != frame_height
-                || s.width != encode_width
-                || s.height != encode_height
-        });
+        let first_build = slot.is_none();
+        let capture_changed = slot
+            .as_ref()
+            .is_some_and(|s| s.capture_width != frame_width || s.capture_height != frame_height);
+        let encode_changed = slot
+            .as_ref()
+            .is_some_and(|s| s.width != encode_width || s.height != encode_height);
+        // Throttle viewport-driven rebuilds (server-side defense); while
+        // deferred, encoding continues at the current dims (the client
+        // letterboxes) and a later iteration rebuilds to the newest viewport.
+        let needs_recreate = should_recreate_encoder(
+            first_build,
+            capture_changed,
+            encode_changed,
+            Instant::now().duration_since(last_encoder_rebuild),
+        );
+
         if needs_recreate {
+            last_encoder_rebuild = Instant::now();
             // Drop the previous encoder BEFORE constructing its
             // replacement. `slot.take()` moves the old `EncoderSlot` out
             // (slot = None) and it drops at the end of this block —
@@ -4153,6 +4201,36 @@ mod tests {
     //! see the project task list.
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn viewport_rebuild_throttle_defers_rapid_changes_only() {
+        use std::time::Duration;
+        let under = VIEWPORT_REBUILD_THROTTLE / 2;
+        let over = VIEWPORT_REBUILD_THROTTLE + Duration::from_millis(1);
+
+        // First build and capture-source changes always rebuild, regardless of
+        // how recent the last rebuild was — they aren't client-controlled.
+        assert!(should_recreate_encoder(true, false, false, Duration::ZERO));
+        assert!(should_recreate_encoder(false, true, false, under));
+
+        // A viewport-driven encode change is throttled within the window...
+        assert!(
+            !should_recreate_encoder(false, false, true, under),
+            "rapid viewport change within the throttle window must be deferred"
+        );
+        // ...and allowed once the window has passed.
+        assert!(
+            should_recreate_encoder(false, false, true, over),
+            "viewport change past the throttle window must rebuild"
+        );
+
+        // No change at all → never rebuild.
+        assert!(!should_recreate_encoder(false, false, false, over));
+
+        // A capture change is never throttled even if an encode change rode
+        // along inside the window (real source change wins).
+        assert!(should_recreate_encoder(false, true, true, under));
+    }
 
     #[test]
     fn stage_latency_averages_over_recorded_frames() {

@@ -23,6 +23,12 @@ The client sends `ClientHello`:
 - `input_capabilities`
 - `requested_features`
 
+`initial_viewport` is a wire field, but production clients do not rely on a
+guessed size to start video. The real startup gate is a post-handshake
+`SetViewportHint` carrying the renderer's measured viewport followed by
+`StreamReady { video: true, ... }`; the host must not emit video for a stream
+until both the video-ready flag and a valid viewport are present.
+
 The host replies with `ServerHandshake`:
 
 - `Accepted(ServerHello)` for a negotiated session.
@@ -45,8 +51,10 @@ If there is no mutual profile, the host sends a typed handshake rejection rather
 than a fallback `ServerHello`.
 
 Clock sync is not part of hello. Immediately after handshake, the client sends a
-`ClockProbeRequest` over the control channel and computes `ClockSync` from the
-matching `ClockProbeResponse`.
+burst of `CLOCK_SYNC_PROBE_SAMPLES` `ClockProbeRequest` messages over the
+control channel, computes `ClockSync` from the minimum-RTT matching response,
+and repeats the same burst periodically during the session (currently every
+30 seconds).
 
 ## IDs
 
@@ -81,7 +89,9 @@ reveals a more exact primary capture mode, the host sends a fresh
 `DisplayList`.
 
 `SetViewportHint { stream_id, viewport }` is a best-effort encoder sizing hint.
-It does not change host resolution and does not require an acknowledgement.
+It does not change host resolution and does not require an acknowledgement. For
+the initial stream, it is also part of startup readiness: production clients
+send the first viewport hint before `StreamReady`, and hosts wait for both.
 
 `SetDisplayMode` is the real host display-mode request:
 
@@ -123,7 +133,8 @@ The proven media design is unchanged:
 - All video frames, including IDRs, ride unreliable datagrams.
 - `FrameFragmenter` splits frames into bounded shards and Reed-Solomon parity.
 - `stream_epoch` invalidates stale fragments across encoder/display restarts.
-- IDRs are self-decodable.
+- Keyframes are self-decodable: H.264/HEVC carry repeated parameter sets, and
+  AV1 carries the sequence header in-band.
 - Cursor and audio use latest-wins/drop-oldest semantics.
 
 Media envelopes are intentionally compact and do not have protobuf-style
@@ -132,6 +143,39 @@ metadata version is negotiated in hello, either through `NegotiatedVideo` or an
 accepted video feature. A host must not emit a future metadata envelope variant
 to a client that only negotiated `V1`, because old decoders reject unknown
 bincode enum variants before they can use the shard payload or FEC parity.
+
+## Stream Readiness
+
+`StreamReady { video, audio }` is the client's declaration that the receiving
+side has initialized the corresponding pipeline:
+
+- `video = true` means the decoder constructed successfully and the client has
+  sent a valid viewport hint for the stream.
+- `audio = true` means the Opus decoder, jitter ring, and output stream are
+  initialized. If audio startup fails or times out, the client sends
+  `audio = false` and the session proceeds video-only.
+
+The host drops captured video/audio until the matching readiness bit is open.
+For video, the host also forces an IDR when opening the gate so the client starts
+from a self-decodable frame.
+
+## Session Shutdown and Stats
+
+Normal and fatal shutdown use `ControlMessage::Goodbye { reason, code,
+final_stats }`. `code` is machine-readable (`Clean`, `ProtocolError`,
+`UnsupportedVersion`, `InternalError`, or an unknown future value); `reason` is
+diagnostic text.
+
+`final_stats` carries the sender's final `SessionSummary`, including video and
+optional audio counters. The video summary includes send/receive counts, FEC
+recovery, decode errors, render drops, decoder queue drops, and stream-epoch
+drop counters (`decode_stale_epoch_drop_frames`,
+`decode_epoch_throttle_drop_frames`). Audio summaries include packet/frame
+counts, recovery/concealment/drop counters, and `decode_queue_drop_packets`.
+
+A peer that receives `Goodbye` may send one reciprocal stats-bearing `Goodbye`
+if it has not already sent one. Implementations must guard against echo loops;
+the second `Goodbye` is the final exchange, not a new shutdown request.
 
 ## Future-Feature Checks
 

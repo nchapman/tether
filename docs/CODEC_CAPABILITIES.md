@@ -840,23 +840,20 @@ can be negotiated.
 M1 / M2 / M3 / M4 are all identical for HEVC decode capability
 per Softron's documentation and Jellyfin's empirical results.
 
-AV1 on macOS is held out **in both directions** today. Hardware
-decode exists on M3 and M4 generation silicon and FFmpeg ships a
-working `videotoolbox_av1` hwaccel, but tether has no hardware
-test exercising that path, so we don't advertise decode either.
-On the encode side, FFmpeg 8.1 has no `av1_videotoolbox` encoder
-(verified: `ffmpeg -encoders | grep videotoolbox` returns only
-H.264 / HEVC / ProRes; no patch in ffmpeg-devel as of 2026-05).
+AV1 on macOS is asymmetric. On the encode side, FFmpeg 8.1 has no
+`av1_videotoolbox` encoder (verified: `ffmpeg -encoders | grep
+videotoolbox` returns only H.264 / HEVC / ProRes; no patch in
+ffmpeg-devel as of 2026-05), so macOS hosts do not advertise AV1.
 Whether any currently-shipped Apple Silicon exposes hardware AV1
 encode at all is independently unconfirmed in public sources.
 
-Both `vt_av_codec_id(Av1)` and `vt_codec_cname(Av1)` return
-`CodecNotFound`, so the probe surfaces AV1 as Unsupported at the
-codec-construction stage on both encode and decode, and AV1
-disappears from `host_encode_profiles()` and
-`host_decode_profiles()` on this platform. To re-enable decode,
-land a `videotoolbox_av1_decode_smoke` hardware test using the
-existing `tether-probe` fixtures and flip the decoder.rs arm.
+On the decode side, VideoToolbox AV1 is wired through the same
+fixture-driven probe shape as HEVC. M3/M4-class hardware may advertise
+AV1 decode when `probe_decode` feeds the checked-in AV1 fixture, receives
+a GPU IOSurface, and the renderer accepts the output family. Older Macs
+or OS/FFmpeg combinations without the AV1 hwaccel report Unsupported at
+the construction or decode stage and simply omit AV1 from the client's
+decode advert.
 
 ---
 
@@ -901,15 +898,14 @@ the producer side ships ahead of the consumer side.
 ### What's probed
 
 - **Importable dma-buf modifiers at startup** — already in place
-  via `importable_dmabuf_modifiers()`. For 10-bit we'll need to
-  extend this to verify `R16_UNORM` and `R16G16_UNORM` work over
-  dma-buf with the modifiers we'd actually receive.
-- **Metal IOSurface import of 16-bit biplanar** — needs a
-  startup check that `MTLDevice::newTextureWithDescriptor:iosurface:plane:`
-  accepts `R16Unorm` / `Rg16Unorm` on an actual `xf44` or `P410`
-  IOSurface. Apple documents Metal supporting these texture
-  formats since macOS 10.14, but binding them to an IOSurface
-  plane has its own per-fourcc rules.
+  via `importable_dmabuf_modifiers()` for the Linux capture/import leg.
+  The renderer round-trip harness is the end-to-end gate for the decode
+  output formats a driver actually exports.
+- **Metal IOSurface import of 16-bit biplanar** — covered by the
+  `iosurface_zero_copy_roundtrip_*` hardware tests for HEVC Main10 and
+  Main 4:4:4 10-bit. Those tests bind `R16Unorm` / `Rg16Unorm` to real
+  IOSurface planes, which is the part Apple's generic Metal texture
+  format documentation does not prove.
 
 ### What's open
 
@@ -929,13 +925,15 @@ the producer side ships ahead of the consumer side.
 
 ## Shipped protocol matrix
 
-`PROFILE_PREFERENCE` now contains five entries (best-first):
+`PROFILE_PREFERENCE` now contains seven entries (best-first):
 
 1. HEVC 4:4:4 10-bit — `VideoProfile::HEVC_10BIT_444`
 2. HEVC 4:4:4 8-bit  — `VideoProfile::HEVC_8BIT_444`
-3. HEVC 4:2:0 10-bit — `VideoProfile::HEVC_10BIT_420` (Main10)
-4. HEVC 4:2:0 8-bit  — `VideoProfile::HEVC_8BIT_420` (Main)
-5. H.264 4:2:0 8-bit — `VideoProfile::H264_8BIT_420` (universal floor)
+3. AV1 4:2:0 10-bit  — `VideoProfile::AV1_10BIT_420`
+4. AV1 4:2:0 8-bit   — `VideoProfile::AV1_8BIT_420`
+5. HEVC 4:2:0 10-bit — `VideoProfile::HEVC_10BIT_420` (Main10)
+6. HEVC 4:2:0 8-bit  — `VideoProfile::HEVC_8BIT_420` (Main)
+7. H.264 4:2:0 8-bit — `VideoProfile::H264_8BIT_420` (universal floor)
 
 `VideoProfile { codec, chroma, bit_depth }` has a `u8` `bit_depth`
 field. The renderer's `RenderLayout::Biplanar16` variant + the
@@ -968,7 +966,7 @@ previous three-cache scaffolding.
 | macOS M-series | Linux  | HEVC 4:2:0 10-bit (Main10)       | SCK BGRA → Metal bridge emits `'x420'` → VT encodes P010 → client decodes via VAAPI |
 | macOS M-series | macOS  | HEVC 4:2:0 10-bit (Main10)       | Same encode side; client decodes back to `'x420'` IOSurface |
 | Linux      | macOS      | HEVC 4:4:4 8-bit                 | VT client decodes 4:4:4 via NV24 even though encode side is 4:2:0-only |
-| Windows    | Windows    | AV1 4:2:0 10-bit, else HEVC Main10/Main | Vendor-selected encode (QSV/AMF/NVENC, MF fallback) → D3D11VA decode; loopback-verified for HEVC. **4:2:0 only — 4:4:4 excluded** (no VP path). AV1 sits above HEVC 4:2:0 in preference order, so it wins when both ends advertise it (client decode is per-GPU probed; encode is advertised statically and fail-fasts on a pre-RDNA-3 / pre-Ada / pre-Arc card). |
+| Windows    | Windows    | AV1 4:2:0 10-bit, else HEVC Main10/Main | Vendor-selected encode (QSV/AMF/NVENC, MF fallback) → D3D11VA decode; loopback-verified for HEVC and AV1 on supported hardware. **4:2:0 only — 4:4:4 excluded** (no VP path). AV1 sits above HEVC 4:2:0 in preference order, so it wins when both ends advertise it (client decode is per-GPU probed; encode is advertised statically and fail-fasts on a pre-RDNA-3 / pre-Ada / pre-Arc card). |
 | Windows    | any        | AV1 / HEVC 4:2:0 / H.264         | Host advertises H.264 + HEVC Main/Main10 + AV1 8/10-bit; intersection with the client's decode set picks the best rung in preference order. |
 | any        | legacy 8-bit only | H.264 4:2:0 8-bit         | Universal floor; legacy client without decode-profiles extension |
 

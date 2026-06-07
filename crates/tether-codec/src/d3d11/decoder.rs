@@ -81,6 +81,21 @@ pub fn expected_decode_dxgi_format(profile: VideoProfile) -> Option<u32> {
     }
 }
 
+/// CPU-side copy of a decoded frame's planes, for the capability probe's
+/// pixel-sanity check (see `D3D11Decoder::next_frame_planes`). Carries
+/// both bit depths: `bytes_per_sample` is 1 for NV12 (8-bit) and 2 for
+/// P010 (10-bit, little-endian, MSB-aligned — the 10 valid bits sit in the
+/// high bits of each 16-bit sample). `y` is `width*height*bps` bytes; `uv`
+/// is interleaved chroma (Cb,Cr), `chroma_w*chroma_h*2*bps` bytes, with
+/// `chroma_w = ceil(width/2)`, `chroma_h = ceil(height/2)`.
+pub struct DecodedPlanes {
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_sample: usize,
+    pub y: Vec<u8>,
+    pub uv: Vec<u8>,
+}
+
 pub struct D3D11Decoder {
     kind: CodecKind,
     decoder: AVCodecContext,
@@ -426,6 +441,22 @@ impl D3D11Decoder {
         .map_err(|_| CodecError::CodecNotFound("CreateSharedHandle failed"))
     }
 
+    /// Pull the next decoded frame and copy it to CPU planes, for the
+    /// capability probe's pixel-sanity check. Unlike `next_frame`, this is
+    /// independent of `gpu_export`: it always downloads via
+    /// `av_hwframe_transfer_data`, so the probe can validate decoded
+    /// *pixels* (not merely that a frame returned) without disturbing the
+    /// production GPU-export path. Handles NV12 (8-bit) and P010 (10-bit);
+    /// returns `Ok(None)` when the decoder needs more input (same drain
+    /// semantics as `next_frame`).
+    pub fn next_frame_planes(&mut self) -> Result<Option<DecodedPlanes>> {
+        match self.decoder.receive_frame() {
+            Ok(frame) => Ok(Some(transfer_planes(&frame)?)),
+            Err(RsmpegError::DecoderDrainError) => Ok(None),
+            Err(e) => Err(CodecError::Ffmpeg(e)),
+        }
+    }
+
     /// Fallback: download to CPU when GPU export isn't possible. 8-bit
     /// NV12 only — the `DecodedFrame` plane buffers are `Vec<u8>`, so a
     /// 10-bit P010 surface can't be represented faithfully. The live
@@ -543,14 +574,71 @@ impl Decoder for D3D11Decoder {
     }
 }
 
+/// Download a decoded D3D11VA surface to tightly-packed CPU planes via
+/// `av_hwframe_transfer_data`, honoring the source row strides. Handles
+/// NV12 (1 byte/sample) and P010 (2 bytes/sample); any other transfer
+/// format is a decoder/negotiation bug and returns
+/// `UnsupportedInputFormat`. Shared by the probe's `next_frame_planes`.
+#[allow(clippy::cast_sign_loss)]
+fn transfer_planes(hw_frame: &AVFrame) -> Result<DecodedPlanes> {
+    let mut sw_frame = AVFrame::new();
+    // Leave the format unset so the transfer picks the surface's native sw
+    // format (NV12 for 8-bit, P010 for 10-bit).
+    let rc = unsafe { ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), hw_frame.as_ptr(), 0) };
+    if rc < 0 {
+        return Err(CodecError::Ffmpeg(RsmpegError::AVError(rc)));
+    }
+    let bytes_per_sample = if sw_frame.format == ffi::AV_PIX_FMT_NV12 {
+        1usize
+    } else if sw_frame.format == ffi::AV_PIX_FMT_P010LE {
+        2usize
+    } else {
+        return Err(CodecError::UnsupportedInputFormat);
+    };
+
+    let width = sw_frame.width as u32;
+    let height = sw_frame.height as u32;
+    let y_stride = unsafe { (*sw_frame.as_ptr()).linesize[0] as usize };
+    let uv_stride = unsafe { (*sw_frame.as_ptr()).linesize[1] as usize };
+    let y_ptr = sw_frame.data[0];
+    let uv_ptr = sw_frame.data[1];
+
+    let w = width as usize;
+    let h = height as usize;
+    let chroma_w = w.div_ceil(2);
+    let chroma_h = h.div_ceil(2);
+
+    let y_row_bytes = w * bytes_per_sample;
+    let mut y = Vec::with_capacity(y_row_bytes * h);
+    for row in 0..h {
+        let src = unsafe { y_ptr.add(row * y_stride) };
+        y.extend_from_slice(unsafe { std::slice::from_raw_parts(src, y_row_bytes) });
+    }
+
+    // Interleaved chroma: two samples (Cb, Cr) per chroma texel.
+    let uv_row_bytes = chroma_w * 2 * bytes_per_sample;
+    let mut uv = Vec::with_capacity(uv_row_bytes * chroma_h);
+    for row in 0..chroma_h {
+        let src = unsafe { uv_ptr.add(row * uv_stride) };
+        uv.extend_from_slice(unsafe { std::slice::from_raw_parts(src, uv_row_bytes) });
+    }
+
+    Ok(DecodedPlanes {
+        width,
+        height,
+        bytes_per_sample,
+        y,
+        uv,
+    })
+}
+
 /// Submit the prior `CopySubresourceRegion` copies to the GPU so the
 /// renderer's (separate) D3D11 device can open the shared texture and
 /// sample the result. `Flush` guarantees submission, not completion;
 /// there is no keyed mutex, so cross-device visibility relies on the
-/// decode→render handoff latency on a shared iGPU (validated by
-/// `d3d11_cross_device_shared_handle_coherency`). On discrete GPUs with
-/// separate hardware queues this assumption may not hold — the durable
-/// fix is a single shared device for decode + present (Moonlight's model).
+/// decode→render handoff latency dwarfing the copy on a shared GPU. The
+/// hardware loopback runs clean on this path; revisit (a single shared
+/// device for decode+present, Moonlight's model) only if tearing shows up.
 unsafe fn gpu_sync(_device: &ID3D11Device, context: &ID3D11DeviceContext) {
     unsafe { context.Flush() };
 }

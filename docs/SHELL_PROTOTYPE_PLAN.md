@@ -42,7 +42,8 @@ boundary is proven.
   `revoke_peer` shell commands and the client's `--pin` flag, backed by SPAKE2 +
   mutual TLS. There is no `token` field; see `crates/tether-pairing`.
 - Code signing / notarization.
-- Audio, clipboard, gamepad — no new engine features at all.
+- Clipboard, gamepad, and shell-level audio controls. The audio engine has since
+  landed; this prototype still does not add mute/volume/device controls.
 - Windows service / session-0 secure desktop.
 - Pretty styling. Functional UI only.
 

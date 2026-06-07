@@ -73,7 +73,7 @@ pub struct Yuv444pDmaBuf {
 
 impl Yuv444pDmaBuf {
     pub async fn new(width: u32, height: u32) -> Result<Self> {
-        let instance = wgpu::Instance::default();
+        let instance = crate::headless_wgpu_instance();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,

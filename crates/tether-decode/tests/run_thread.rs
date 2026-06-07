@@ -17,7 +17,9 @@ use std::time::Duration;
 use tether_codec::bytes::Bytes;
 use tether_codec::CodecError;
 use tether_decode::test_support::{FakeDecoder, FakeOutcome};
-use tether_decode::{run_thread_with_init, DecodeCompletion, DecodeJob, Worker, IDR_RATE_LIMIT};
+use tether_decode::{
+    run_thread_with_init, DecodeEvent, DecodeJob, EpochDropReason, Worker, IDR_RATE_LIMIT,
+};
 use tether_protocol::MonoNanos;
 use tether_render::LatestFrame;
 
@@ -48,6 +50,7 @@ fn job() -> DecodeJob {
         body: Bytes::from_static(b"encoded-bytes"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: true,
+        stream_epoch: 0,
     }
 }
 
@@ -280,7 +283,7 @@ async fn init_failure_drops_ready_tx_without_send() {
     // decoder construction; a `Err` here triggers session teardown
     // (a clean Goodbye rather than a silent hang).
     let (job_tx, job_rx) = crossbeam_channel::bounded::<DecodeJob>(1);
-    let (completion_tx, _completion_rx) = crossbeam_channel::unbounded::<DecodeCompletion>();
+    let (completion_tx, _completion_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let (frames, _idr_calls, request_idr, warnings) = lifecycle_callbacks();
 
@@ -320,7 +323,7 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
     // it into LatestFrame; completion stream reports success; thread
     // exits when the job sender drops.
     let (job_tx, job_rx) = crossbeam_channel::bounded::<DecodeJob>(4);
-    let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<DecodeCompletion>();
+    let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let (frames, _idr_calls, request_idr, warnings) = lifecycle_callbacks();
 
@@ -346,6 +349,7 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
             body: Bytes::from_static(b"x"),
             host_in_client_clock: MonoNanos::now(),
             keyframe: true,
+            stream_epoch: 0,
         })
         .unwrap();
     let completion = tokio::task::spawn_blocking(move || {
@@ -354,6 +358,9 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
     .await
     .unwrap()
     .expect("completion");
+    let DecodeEvent::Completion(completion) = completion else {
+        panic!("expected DecodeEvent::Completion, got {completion:?}");
+    };
     assert!(!completion.decode_err);
     assert!(!completion.soft_failure);
 
@@ -362,6 +369,80 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
         tether_render::Frame::Cpu(c) => assert_eq!(c.y[0], 0xab),
         _ => panic!("expected Cpu frame"),
     }
+
+    drop(job_tx);
+    let joined = tokio::task::spawn_blocking(move || handle.join())
+        .await
+        .unwrap();
+    joined.expect("decode thread exits on sender drop");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn epoch_rate_limited_drop_is_reported_without_decode_completion() {
+    // The recv-loop stats rely on epoch drops arriving as distinct events, not
+    // fake zero-duration DecodeCompletions that would skew avg/min decode time.
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<DecodeJob>(4);
+    let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (frames, _idr_calls, request_idr, warnings) = lifecycle_callbacks();
+
+    let decoder: Box<dyn tether_codec::Decoder> = Box::new(FakeDecoder::new(vec![
+        FakeOutcome::Frames(vec![small_solid(8, 8, 0xab)]),
+    ]));
+    let handle = run_thread_with_init(
+        VideoProfile::H264_8BIT_420,
+        Ok(decoder),
+        job_rx,
+        completion_tx,
+        frames,
+        request_idr,
+        warnings,
+        ready_tx,
+        false,
+    );
+
+    ready_rx.await.expect("ready signal");
+    job_tx
+        .send(DecodeJob {
+            body: Bytes::from_static(b"epoch-0"),
+            host_in_client_clock: MonoNanos::now(),
+            keyframe: true,
+            stream_epoch: 0,
+        })
+        .unwrap();
+    let first = tokio::task::spawn_blocking({
+        let completion_rx = completion_rx.clone();
+        move || completion_rx.recv_timeout(std::time::Duration::from_secs(2))
+    })
+    .await
+    .unwrap()
+    .expect("first completion");
+    assert!(
+        matches!(first, DecodeEvent::Completion(_)),
+        "baseline epoch should decode, got {first:?}"
+    );
+
+    job_tx
+        .send(DecodeJob {
+            body: Bytes::from_static(b"epoch-1"),
+            host_in_client_clock: MonoNanos::now(),
+            keyframe: true,
+            stream_epoch: 1,
+        })
+        .unwrap();
+    let second = tokio::task::spawn_blocking(move || {
+        completion_rx.recv_timeout(std::time::Duration::from_secs(2))
+    })
+    .await
+    .unwrap()
+    .expect("epoch drop event");
+    assert_eq!(
+        second,
+        DecodeEvent::EpochDrop {
+            reason: EpochDropReason::RebuildRateLimited,
+            stream_epoch: 1,
+        }
+    );
 
     drop(job_tx);
     let joined = tokio::task::spawn_blocking(move || handle.join())
@@ -497,6 +578,103 @@ fn rebuild_request_clears_after_replace_decoder() {
 }
 
 #[test]
+fn classify_epoch_advances_rebuild_drops_stragglers_and_rate_limits() {
+    // The host bumps `stream_epoch` (host-monotonic) on a resolution/codec
+    // change. classify_epoch treats it as a high-water mark:
+    //   - same epoch → Decode
+    //   - forward advance (past the rate-limit window) → Rebuild
+    //   - older epoch (a late FEC straggler) → Drop, never fed to the new
+    //     decoder
+    //   - forward advance within the rate-limit window → Drop (bounds churn)
+    use tether_decode::{EpochAction, EPOCH_REBUILD_MIN_INTERVAL};
+
+    let decoder = FakeDecoder::new(vec![FakeOutcome::Solid {
+        width: 8,
+        height: 8,
+        luma: 5,
+    }]);
+    let (mut worker, _idr, _warn, _frames) = make_worker(decoder);
+    let base = MonoNanos::now();
+
+    assert_eq!(
+        worker.classify_epoch(0, base),
+        EpochAction::Decode,
+        "first job decodes, never rebuilds"
+    );
+    assert_eq!(
+        worker.classify_epoch(0, base),
+        EpochAction::Decode,
+        "same epoch decodes"
+    );
+
+    // Advance past the rate-limit window → Rebuild. The high-water mark is only
+    // advanced by `confirm_epoch_rebuilt` (what the run loop calls after a
+    // successful rebuild), so simulate that here.
+    let t1 = at(base, EPOCH_REBUILD_MIN_INTERVAL + Duration::from_millis(50));
+    assert_eq!(
+        worker.classify_epoch(1, t1),
+        EpochAction::Rebuild,
+        "epoch advance after the window rebuilds"
+    );
+    worker.confirm_epoch_rebuilt(1, t1);
+
+    // A late straggler from the OLD epoch must be dropped, not decoded.
+    assert_eq!(
+        worker.classify_epoch(0, t1),
+        EpochAction::Drop(EpochDropReason::Stale),
+        "older-epoch straggler is dropped"
+    );
+
+    // A second advance immediately after the rebuild is rate-limited (dropped),
+    // and must NOT latch — a later frame still rebuilds to the newest epoch.
+    assert_eq!(
+        worker.classify_epoch(2, t1),
+        EpochAction::Drop(EpochDropReason::RebuildRateLimited),
+        "advance within the rate-limit window is dropped"
+    );
+    // Once the window since the last (confirmed) rebuild at `t1` passes, the
+    // coalesced advance to the newest epoch rebuilds.
+    let t2 = at(t1, EPOCH_REBUILD_MIN_INTERVAL + Duration::from_millis(50));
+    assert_eq!(
+        worker.classify_epoch(2, t2),
+        EpochAction::Rebuild,
+        "the coalesced advance rebuilds once the window passes"
+    );
+}
+
+#[test]
+fn av1_inband_sequence_header_resumes_decode_without_keyframe_flag() {
+    // AMF/VAAPI don't reliably set the wire keyframe flag on an AV1 IDR. The
+    // in-band sequence-header OBU must still release the awaiting-IDR gate, or
+    // the stream stays green after a (re)build. Body = a low-overhead AV1 TU:
+    // temporal-delimiter OBU (type 2, size 0) + sequence-header OBU (type 1).
+    let decoder = FakeDecoder::new(vec![FakeOutcome::Solid {
+        width: 8,
+        height: 8,
+        luma: 5,
+    }]);
+    let (mut worker, _idr, _warn, frames) = make_worker(decoder);
+    worker.gate_on_first_idr();
+
+    let body = Bytes::from_static(&[0x12, 0x00, 0x0A, 0x01, 0x00]);
+    let job = DecodeJob {
+        body,
+        host_in_client_clock: MonoNanos::now(),
+        keyframe: false, // flag deliberately unset — detection must be in-band
+        stream_epoch: 0,
+    };
+    let c = worker.process_job(job, MonoNanos::now());
+    assert!(
+        !c.decode_err,
+        "AV1 in-band sequence header must be recognised as an IDR and decoded"
+    );
+    assert!(
+        frames.take().is_some(),
+        "the frame should decode (gate released), not be discarded as a P-frame"
+    );
+}
+
+#[test]
 fn awaiting_idr_rerequests_keyframe_then_resumes_on_idr() {
     // Regression: after a rebuild the worker awaits an IDR. If the
     // initial ForceIdr is lost or un-honoured, P-frames must not be
@@ -523,6 +701,7 @@ fn awaiting_idr_rerequests_keyframe_then_resumes_on_idr() {
         body: Bytes::from_static(b"pframe"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: false,
+        stream_epoch: 0,
     };
     let c = worker.process_job(p_frame, base);
     assert!(
@@ -548,6 +727,7 @@ fn awaiting_idr_rerequests_keyframe_then_resumes_on_idr() {
         body: Bytes::from_static(b"idr"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: true,
+        stream_epoch: 0,
     };
     let c2 = worker.process_job(keyframe, at(base, Duration::from_millis(600)));
     assert!(!c2.decode_err, "keyframe must decode cleanly once awaited");
@@ -578,6 +758,7 @@ fn gate_on_first_idr_discards_pframes_until_first_keyframe() {
         body: Bytes::from_static(b"pframe"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: false,
+        stream_epoch: 0,
     };
     let c = worker.process_job(p, MonoNanos::now());
     assert!(
@@ -599,6 +780,7 @@ fn gate_on_first_idr_discards_pframes_until_first_keyframe() {
         body: Bytes::from_static(b"idr"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: true,
+        stream_epoch: 0,
     };
     let c = worker.process_job(idr, MonoNanos::now());
     assert!(!c.decode_err);
@@ -623,6 +805,7 @@ fn awaiting_idr_rerequests_are_rate_limited() {
         body: Bytes::from_static(b"pframe"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: false,
+        stream_epoch: 0,
     };
     // Three discards within the rate-limit window → a single request.
     let _ = worker.process_job(p(), base);
@@ -819,6 +1002,7 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
         body: Bytes::from_static(b"p-frame-1"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: false,
+        stream_epoch: 0,
     };
     let c = worker.process_job(p_frame, MonoNanos::now());
     assert!(!c.decode_err, "skipped frames should not count as errors");
@@ -831,6 +1015,7 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
         body: Bytes::from_static(b"p-frame-2"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: false,
+        stream_epoch: 0,
     };
     let _c = worker.process_job(p_frame2, MonoNanos::now());
     assert!(
@@ -843,6 +1028,7 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
         body: Bytes::from_static(b"idr-frame"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: true,
+        stream_epoch: 0,
     };
     let c = worker.process_job(idr, MonoNanos::now());
     assert!(!c.decode_err);
@@ -856,6 +1042,7 @@ fn after_rebuild_non_idr_frames_are_skipped_until_keyframe_arrives() {
         body: Bytes::from_static(b"p-frame-after-idr"),
         host_in_client_clock: MonoNanos::now(),
         keyframe: false,
+        stream_epoch: 0,
     };
     let c = worker.process_job(p_after, MonoNanos::now());
     assert!(!c.decode_err);

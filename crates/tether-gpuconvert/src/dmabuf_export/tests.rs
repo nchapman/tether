@@ -6,7 +6,7 @@ use super::*;
 use std::os::fd::AsRawFd;
 
 async fn make_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::default();
+    let instance = crate::headless_wgpu_instance();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,

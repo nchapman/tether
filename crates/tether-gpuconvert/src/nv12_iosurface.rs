@@ -66,7 +66,7 @@ const BGRA_FOURCC: u32 = u32::from_be_bytes(*b"BGRA");
 /// [`BridgeError::TenBitStorageUnsupported`] when those come up.
 pub async fn build_bridge_device(
 ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, BridgeDeviceCapabilities)> {
-    let instance = wgpu::Instance::default();
+    let instance = crate::headless_wgpu_instance();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,

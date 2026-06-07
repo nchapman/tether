@@ -435,15 +435,11 @@ impl D3D11RenderState {
     /// reuses its staging texture across frames at a fixed resolution, so
     /// this opens once per resolution and resamples after.
     ///
-    /// Synchronization: the staging texture carries no keyed mutex, so
-    /// there is no cross-device GPU fence between the decoder's
+    /// Synchronization: the staging texture carries no keyed mutex, so there
+    /// is no cross-device GPU fence between the decoder's
     /// `CopySubresourceRegion` (+ `Flush`) and our sample. We rely on the
-    /// decode→render channel handoff latency (~ms) dwarfing the copy
-    /// (~µs) on a shared iGPU. If the hardware loopback shows tearing,
-    /// the correct fix is a single shared D3D11 device for decode+present
-    /// (Moonlight's model) — not a keyed mutex on this single staging
-    /// texture, which would serialize producer/consumer and defeat the
-    /// drop-oldest `LatestFrame` handoff.
+    /// decode→render channel handoff latency dwarfing the copy on a shared
+    /// GPU; the hardware loopback runs clean on this path.
     fn import_shared_biplanar(
         &mut self,
         handle: *mut c_void,
@@ -1427,6 +1423,98 @@ mod tests {
     #[ignore = "requires AV1-encode QSV 10-bit (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
     fn d3d11_av1_colorbars_decode_render_roundtrip_10bit() {
         d3d11_roundtrip(CodecKind::Av1, 10, true, None);
+    }
+
+    /// Decode a checked-in grey fixture and render it through the FULL
+    /// production path — D3D11VA decode → shared-handle export → cross-device
+    /// open → YUV shader → readback — on whatever GPU runs the test. Unlike
+    /// the QSV-gated roundtrips above this needs only a *decoder*, so it covers
+    /// AMD/NVIDIA, where the AV1 garbling was found. The fixtures are flat grey,
+    /// so a correct result is coherent near-grey; a corrupt cross-device read
+    /// shows as black bands or a green cast.
+    // Reuse the decode-probe IDR fixtures (single grey frame per profile)
+    // rather than duplicating binaries. The path is resolved at compile time,
+    // so a move/rename in `tether-probe` is a loud build error, not silent rot.
+    #[test]
+    #[ignore = "requires D3D11VA AV1 decode (RDNA 2+ / Ada / Arc, Windows)"]
+    fn d3d11_av1_fixture_decode_render_crossdevice_10bit() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../../../tether-probe/fixtures/probe/av1_yuv420_10bit.idr");
+        fixture_decode_render(CodecKind::Av1, 10, FIXTURE);
+    }
+
+    #[test]
+    #[ignore = "requires D3D11VA HEVC Main10 decode (Windows)"]
+    fn d3d11_hevc_fixture_decode_render_crossdevice_10bit() {
+        const FIXTURE: &[u8] =
+            include_bytes!("../../../tether-probe/fixtures/probe/hevc_yuv420_10bit.idr");
+        fixture_decode_render(CodecKind::Hevc, 10, FIXTURE);
+    }
+
+    /// Decode a single-IDR `fixture` and render it headless through the
+    /// cross-device path, asserting the output is coherent near-grey.
+    fn fixture_decode_render(codec: CodecKind, bit_depth: u8, fixture: &[u8]) {
+        use tether_codec::{Decoder, Frame as CodecFrame};
+
+        let mut dec = match tether_codec::d3d11::D3D11Decoder::new(codec, true) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("SKIP {codec:?}: decoder unavailable on this GPU: {e:?}");
+                return;
+            }
+        };
+        dec.submit(fixture).expect("submit fixture");
+        dec.signal_eof().expect("signal_eof");
+        let mut decoded = None;
+        for _ in 0..8 {
+            if let Some(f) = dec.next_frame().expect("next_frame") {
+                decoded = Some(f);
+                break;
+            }
+        }
+        let Some(CodecFrame::Gpu(g)) = decoded else {
+            eprintln!("SKIP {codec:?}: no GPU frame decoded on this GPU");
+            return;
+        };
+        let (gw, gh, _pts, source, guard) = g.into_parts();
+        let render_frame = Frame::Gpu(crate::GpuFrame {
+            width: gw,
+            height: gh,
+            t_capture_client_clock: None,
+            source,
+            guard,
+        });
+
+        let mut state =
+            D3D11RenderState::new_headless(gw, gh, VideoColorSpec::sdr_desktop(), bit_depth)
+                .expect("headless renderer");
+        state.apply_frame(render_frame).expect("apply_frame");
+        state.render().expect("render");
+        let bgra = state.read_back_bgra();
+
+        // The fixture is a flat grey; a correct cross-device decode→render is
+        // coherent near-grey. Sample a grid and assert each is non-black and
+        // roughly neutral — corruption (stale staging / unsynced read) shows
+        // as black bands or a green cast.
+        let (w, h) = (gw as usize, gh as usize);
+        // Sample points as integer fractions (numerator/4) to avoid float casts.
+        for (nx, ny) in [(1usize, 1usize), (2, 2), (3, 3), (2, 1)] {
+            let x = w * nx / 4;
+            let y = h * ny / 4;
+            let i = (y * w + x) * 4;
+            let (b, gg, r) = (bgra[i], bgra[i + 1], bgra[i + 2]);
+            assert!(
+                r > 40 && gg > 40 && b > 40,
+                "{codec:?} {bit_depth}-bit @({x},{y}): near-black ({b},{gg},{r}) — \
+                 cross-device read returned an unwritten/half-written staging"
+            );
+            let (max, min) = (i32::from(r.max(gg).max(b)), i32::from(r.min(gg).min(b)));
+            assert!(
+                max - min < 48,
+                "{codec:?} {bit_depth}-bit @({x},{y}): not neutral grey ({b},{gg},{r}) — \
+                 a green/colour cast is the chroma-corruption signature"
+            );
+        }
     }
 
     /// `surface`: the render-target dims. `None` = identity (surface == video,

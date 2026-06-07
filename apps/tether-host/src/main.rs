@@ -43,16 +43,17 @@ use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
     ChromaSubsampling, CodecKind, ControlMessage, DisplayDescriptor, DisplayModeStatus,
-    VideoProfile, VideoStreamId, Viewport,
+    GoodbyeCode, VideoProfile, VideoStreamId, Viewport,
 };
 use tether_protocol::video::{
-    FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta,
+    FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta, VideoPacket,
 };
 use tether_protocol::MonoNanos;
 #[cfg(target_os = "linux")]
 use tether_scaler::{Pipelines as ScalerPipelines, Scaler, ScalerError};
 use tether_session::{
-    AbrConfig, AbrController, AbrSample, AcceptError, HostSession, HostSessionConfig,
+    log_peer_session_summary, AbrConfig, AbrController, AbrSample, AcceptError, HostSession,
+    HostSessionConfig, SessionSummaryState,
 };
 use tether_transport::{AbrSnapshot, Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
@@ -99,6 +100,18 @@ impl Drop for ActiveSessionGuard {
 /// is 16.6 ms; current Intel iGPU encode times sit around 7–8 ms, so
 /// there's headroom.
 const ENCODER_FPS: u32 = 60;
+
+/// Server-side defense throttle on viewport-driven encoder rebuilds. The
+/// client already debounces resize events (~150 ms), so a well-behaved client
+/// drives at most one rebuild per settled size. This throttle bounds a client
+/// that *doesn't* debounce (buggy or hostile) from forcing a full
+/// encoder-teardown + `stream_epoch` bump every frame — which would churn the
+/// hardware encode session (fragile on some drivers) and storm the client's
+/// decoder rebuilds. Set above the client debounce so a single legitimate
+/// resize is never delayed; only sub-throttle bursts coalesce to the latest
+/// viewport. Capture-source resolution changes and the first build are NOT
+/// throttled — they aren't client-controlled.
+const VIEWPORT_REBUILD_THROTTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// VBR target bitrate. The encoder is allowed to overshoot for
 /// motion-heavy frames and undershoot on static content. Calibrated
@@ -176,13 +189,17 @@ struct ViewportState {
 
 /// One window of client-side telemetry. Mirrors the fields in
 /// [`ControlMessage::ClientStats`] that the ABR controller actually
-/// consumes; `interval_ms` and `frames_received` are dropped at the
+/// consumes; `window_ms` and `frames_received` are dropped at the
 /// boundary because the controller takes wall-clock dt itself and
 /// doesn't need the success-count.
 #[derive(Debug, Clone, Copy)]
 struct ClientStatsObservation {
-    frames_dropped: u32,
-    fragments_lost: u32,
+    incomplete_frames: u32,
+    fragment_loss_events: u32,
+}
+
+fn host_summary_audio_active(host_audio_available: bool, client_audio_ready: bool) -> bool {
+    host_audio_available && client_audio_ready
 }
 
 #[tokio::main]
@@ -518,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
         // `ControlChannel` trait object so it's mockable in tests.
         // We keep the original `Arc<Connection>` in scope for the rest
         // of `handle_client`, which uses concrete-type methods
-        // (video keyframe streams, datagram send, input recv) that
+        // (datagram send/recv, input recv, connection stats) that
         // are outside the `ControlChannel` surface.
         let session = match HostSession::accept(
             conn.clone() as Arc<dyn tether_transport::ControlChannel>,
@@ -535,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(s) => s,
             Err(AcceptError::NoProfileIntersection { client }) => {
-                // HostSession has already sent Goodbye(InternalError).
+                // HostSession has already sent a typed handshake rejection.
                 // We log the host list ourselves — the error doesn't
                 // carry it because the selector (which closes over it)
                 // is the only thing that saw both sides.
@@ -644,7 +661,7 @@ async fn handle_client(
     // pointing to the same `Connection` that `conn` holds, just
     // type-erased for the session-level abstraction. The recv tasks
     // and send thread below need concrete-`Connection` methods
-    // (video keyframe streams, datagram send, input recv), so we use
+    // (datagram send/recv, input recv, connection stats), so we use
     // `conn` directly.
     //
     // Bind `_client_decode_profiles` and `_client_hello` because the
@@ -661,6 +678,19 @@ async fn handle_client(
         stream_ready,
     } = session;
     let initial_viewport = client_hello.initial_viewport.filter(|v| v.is_valid());
+    if let Some(v) = initial_viewport {
+        info!(
+            width = v.width,
+            height = v.height,
+            "client hello included an initial viewport; waiting for live viewport hint before streaming"
+        );
+    }
+    let audio_active = audio_enabled && tether_audio::capture::is_supported();
+    let session_summary = Arc::new(SessionSummaryState::new(
+        "host",
+        chosen_profile,
+        audio_active,
+    ));
 
     // `use_test_pattern` from here on only switches the capture source;
     // the handshake-time profile floor it implied is already baked into
@@ -682,8 +712,7 @@ async fn handle_client(
     // per-backend follow-up work). Re-grab the Arc clone via
     // `capture_handle.fps_handle()` when the first backend wires
     // through. See `tether_capture::CaptureHandle` docs.
-    let mut capture_handle =
-        pick_capture_source(use_test_pattern, chosen_profile, initial_viewport).await?;
+    let mut capture_handle = pick_capture_source(use_test_pattern, chosen_profile, None).await?;
     // Take the per-backend cursor source out before we drop the
     // handle. Wayland/PipeWire fills this with a `SPA_META_Cursor`
     // parser; the test-pattern and macOS-stub backends leave it
@@ -737,15 +766,23 @@ async fn handle_client(
     // no-op.
     let send_exited = Arc::new(tokio::sync::Notify::new());
     let send_exited_for_thread = send_exited.clone();
+    // Set once this side has sent a typed shutdown reason on the control
+    // stream. Prevents the final teardown from overwriting a specific protocol
+    // error / fatal send-loop Goodbye with a generic clean "session ended"
+    // notice, while still allowing a reciprocal stats-bearing Goodbye when the
+    // peer initiates shutdown.
+    let shutdown_notice_sent = Arc::new(AtomicBool::new(false));
     // Drop-oldest single-slot mailbox for the most recent `ClientStats`
     // window. Written by the control recv task, drained by the
     // encode-and-send thread on each loop iteration.
     let latest_client_stats: LatestClientStats = Arc::new(StdMutex::new(None));
-    // Latest viewport-target the client has communicated. Seeded
-    // from ClientHello; mutated by SetViewportHint.
+    // Latest viewport-target the client has communicated. Startup requires a
+    // live SetViewportHint from the renderer before the video gate opens; the
+    // older ClientHello hint is ignored because the app can only know the real
+    // physical viewport after the window exists.
     let latest_viewport: LatestViewport = Arc::new(StdMutex::new(ViewportState {
-        viewport: initial_viewport,
-        seq: if initial_viewport.is_some() { 1 } else { 0 },
+        viewport: None,
+        seq: 0,
     }));
     // `stream_ready`: gate at the head of the send loop. The client
     // signals it has built its decoders by sending
@@ -758,24 +795,16 @@ async fn handle_client(
     let force_idr_for_send = force_idr.clone();
     let send_shutdown_for_thread = send_shutdown.clone();
     let stream_ready_for_thread = stream_ready.clone();
+    let video_ready_requested = Arc::new(AtomicBool::new(false));
     let latest_client_stats_for_send = latest_client_stats.clone();
     let latest_viewport_for_send = latest_viewport.clone();
-    // Keyframes ride a reliable per-IDR QUIC unidirectional stream
-    // rather than the unreliable datagram path used for P-frames.
-    // The sync send thread is not a tokio worker, so it calls into
-    // the async send via `Handle::block_on`. We send keyframes
-    // synchronously (block the send thread until the IDR is queued
-    // into quinn) instead of routing them through an mpsc to a
-    // separate task, because:
-    //   1. Ordering: a P-frame's stream_epoch must agree with the
-    //      IDR's. The earlier mpsc design opened a window where
-    //      `bump_epoch()` could fire between IDR enqueue and IDR
-    //      wire-write, mis-attributing the IDR to the old epoch.
-    //   2. Cost: keyframes are request-driven and infrequent. The
-    //      blocking write is ~1 ms on LAN (open_uni + write_all +
-    //      finish into quinn's send buffer). That frame's latency
-    //      budget already absorbs an extra round trip for
-    //      reliability.
+    let shutdown_notice_for_send = shutdown_notice_sent.clone();
+    let session_summary_for_send = session_summary.clone();
+    // The sync send thread is not a tokio worker, so it uses the
+    // runtime handle only for the few async control sends needed on
+    // fatal exits. Regular video output is synchronous datagram send:
+    // every frame, IDR and P alike, goes through FrameFragmenter and
+    // quinn's non-blocking datagram queue.
     let runtime_handle_for_send = tokio::runtime::Handle::current();
     let send_handle = std::thread::Builder::new()
         .name("tether-host-send".into())
@@ -793,6 +822,8 @@ async fn handle_client(
                 latest_client_stats_for_send,
                 latest_viewport_for_send,
                 send_exited_for_thread,
+                shutdown_notice_for_send,
+                session_summary_for_send,
             )
         })?;
 
@@ -803,15 +834,21 @@ async fn handle_client(
     // tear down with the session. Skipped (and left silent) when audio is off
     // or the platform has no capture backend.
     let audio_ready = Arc::new(AtomicBool::new(false));
-    let audio_handle = if audio_enabled && tether_audio::capture::is_supported() {
+    let audio_handle = if audio_active {
         let conn_audio = conn.clone();
         let audio_shutdown = send_shutdown.clone();
         let audio_ready_thread = audio_ready.clone();
+        let session_summary_for_audio = session_summary.clone();
         Some(
             std::thread::Builder::new()
                 .name("tether-host-audio".into())
                 .spawn(move || {
-                    run_audio_capture_and_send(conn_audio, audio_shutdown, audio_ready_thread);
+                    run_audio_capture_and_send(
+                        conn_audio,
+                        audio_shutdown,
+                        audio_ready_thread,
+                        session_summary_for_audio,
+                    );
                 })?,
         )
     } else {
@@ -845,10 +882,14 @@ async fn handle_client(
         let conn = conn.clone();
         let force_idr = force_idr.clone();
         let stream_ready_ctl = stream_ready.clone();
+        let video_ready_requested_ctl = video_ready_requested.clone();
         let audio_ready_ctl = audio_ready.clone();
+        let host_audio_available_ctl = audio_active;
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
         let force_idr_for_viewport = force_idr.clone();
+        let shutdown_notice_for_ctl = shutdown_notice_sent.clone();
+        let session_summary_for_ctl = session_summary.clone();
         tasks.spawn(async move {
             // Per-message rate limit for IDR-triggering control messages.
             // A client flooding ForceIdr / RequestRecovery on the
@@ -921,22 +962,41 @@ async fn handle_client(
                     }
                     Ok(ControlMessage::StreamReady { video, audio }) => {
                         info!(
-                            video,
-                            audio, "client signalled StreamReady; opening the gate"
+                            event = "stream_ready",
+                            video, audio, "client signalled StreamReady"
                         );
-                        stream_ready_ctl.store(true, Ordering::Release);
-                        // Defensive IDR at gate-open. A fresh encoder's
-                        // first frame is already an IDR, so this is usually
-                        // redundant — but if StreamReady lands before the
-                        // encoder lazy-inits, the pending flag guarantees
-                        // the first encoded frame is still forced to a
-                        // keyframe. Coalesces harmlessly via IdrSignal.
-                        // Matches Moonlight/Sunshine forcing an IDR at
-                        // stream start.
-                        force_idr.raise();
+                        if video {
+                            video_ready_requested_ctl.store(true, Ordering::Release);
+                            let has_viewport = latest_viewport_for_ctl
+                                .lock()
+                                .unwrap()
+                                .viewport
+                                .is_some();
+                            if has_viewport {
+                                stream_ready_ctl.store(true, Ordering::Release);
+                                // Defensive IDR at gate-open. A fresh encoder's
+                                // first frame is already an IDR, so this is usually
+                                // redundant — but if StreamReady lands before the
+                                // encoder lazy-inits, the pending flag guarantees
+                                // the first encoded frame is still forced to a
+                                // keyframe. Coalesces harmlessly via IdrSignal.
+                                // Matches Moonlight/Sunshine forcing an IDR at
+                                // stream start.
+                                force_idr.raise();
+                            } else {
+                                info!(
+                                    "video StreamReady received before viewport; waiting for \
+                                     SetViewportHint before opening video gate"
+                                );
+                            }
+                        }
                         // Open the audio gate too; the host audio thread drops
                         // captured frames until the client says it can play them.
                         audio_ready_ctl.store(audio, Ordering::Release);
+                        session_summary_for_ctl.set_audio_active(host_summary_audio_active(
+                            host_audio_available_ctl,
+                            audio,
+                        ));
                     }
                     Ok(ControlMessage::StreamPause { stream_id }) => {
                         info!(%stream_id, "client paused stream (no-op today)");
@@ -948,18 +1008,22 @@ async fn handle_client(
                         force_idr.raise();
                     }
                     Ok(ControlMessage::ClientStats {
-                        interval_ms,
+                        window_ms,
                         frames_received,
-                        frames_dropped,
-                        fragments_lost,
-                        rtt_ewma_us,
+                        incomplete_frames,
+                        fragment_loss_events,
+                        rtt_us,
+                        fec_recovered_frames,
+                        fec_recovered_fragments,
                     }) => {
                         info!(
-                            interval_ms,
+                            window_ms,
                             frames_received,
-                            frames_dropped,
-                            fragments_lost,
-                            rtt_ewma_us,
+                            incomplete_frames,
+                            fragment_loss_events,
+                            rtt_us,
+                            fec_recovered_frames,
+                            fec_recovered_fragments,
                             "client stats"
                         );
                         // Drop-oldest: the ABR controller only needs
@@ -969,8 +1033,8 @@ async fn handle_client(
                         // on fresh telemetry than queue stale data.
                         *latest_client_stats_for_ctl.lock().unwrap() =
                             Some(ClientStatsObservation {
-                                frames_dropped,
-                                fragments_lost,
+                                incomplete_frames,
+                                fragment_loss_events,
                             });
                     }
                     Ok(ControlMessage::SetViewportHint {
@@ -989,11 +1053,31 @@ async fn handle_client(
                         // actually change. We force an IDR regardless
                         // so the client sees a clean cut on whatever
                         // dimensions the backend chooses.
-                        let next = if v.is_valid() { Some(v) } else { None };
+                        let next = if v.is_valid() {
+                            Some(v)
+                        } else {
+                            warn!(
+                                width = v.width,
+                                height = v.height,
+                                "invalid viewport hint; video gate remains closed until a valid viewport arrives"
+                            );
+                            None
+                        };
                         let mut guard = latest_viewport_for_ctl.lock().unwrap();
                         guard.viewport = next;
                         guard.seq = guard.seq.wrapping_add(1);
                         drop(guard);
+                        if next.is_some()
+                            && video_ready_requested_ctl.load(Ordering::Acquire)
+                            && !stream_ready_ctl.load(Ordering::Acquire)
+                        {
+                            info!(
+                                width = v.width,
+                                height = v.height,
+                                "initial viewport received; opening video gate"
+                            );
+                            stream_ready_ctl.store(true, Ordering::Release);
+                        }
                         tracing::debug!(
                             width = v.width,
                             height = v.height,
@@ -1045,8 +1129,30 @@ async fn handle_client(
                         // we ever do, the matching response handler goes here.
                         tracing::trace!("unsolicited clock probe response; ignoring");
                     }
-                    Ok(ControlMessage::Goodbye { reason, code }) => {
-                        info!(%reason, ?code, "client said goodbye");
+                    Ok(ControlMessage::Goodbye {
+                        reason,
+                        code,
+                        final_stats,
+                    }) => {
+                        info!(event = "peer_goodbye", %reason, ?code, "client said goodbye");
+                        log_peer_session_summary("client", final_stats.as_deref());
+                        if !shutdown_notice_for_ctl.swap(true, Ordering::AcqRel) {
+                            let ack_reason = "host acknowledged client goodbye";
+                            let sent = send_goodbye_notice(
+                                &conn,
+                                ack_reason,
+                                GoodbyeCode::Clean,
+                                &session_summary_for_ctl,
+                            )
+                            .await;
+                            info!(
+                                event = "session_teardown",
+                                reason = ack_reason,
+                                code = ?GoodbyeCode::Clean,
+                                sent,
+                                "host session shutdown notice"
+                            );
+                        }
                         return;
                     }
                     Ok(ControlMessage::Extension(msg)) => {
@@ -1057,12 +1163,23 @@ async fn handle_client(
                             payload_len = msg.payload.len(),
                             "unnegotiated control extension; closing session"
                         );
-                        let _ = conn
-                            .send_control(&ControlMessage::Goodbye {
-                                reason: format!("unnegotiated extension {}", msg.key),
-                                code: tether_protocol::control::GoodbyeCode::ProtocolError,
-                            })
+                        let reason = format!("unnegotiated extension {}", msg.key);
+                        if !shutdown_notice_for_ctl.swap(true, Ordering::AcqRel) {
+                            let sent = send_goodbye_notice(
+                                &conn,
+                                reason.as_str(),
+                                GoodbyeCode::ProtocolError,
+                                &session_summary_for_ctl,
+                            )
                             .await;
+                            info!(
+                                event = "session_teardown",
+                                reason = reason.as_str(),
+                                code = ?GoodbyeCode::ProtocolError,
+                                sent,
+                                "host session shutdown notice"
+                            );
+                        }
                         return;
                     }
                     Ok(
@@ -1152,6 +1269,7 @@ async fn handle_client(
     {
         let conn = conn.clone();
         let injector = injector.clone();
+        let shutdown_notice_for_input = shutdown_notice_sent.clone();
         tasks.spawn(async move {
             loop {
                 match conn.recv_input().await {
@@ -1168,7 +1286,13 @@ async fn handle_client(
                         }
                     }
                     Err(e) => {
-                        warn!(error = ?e, "input recv failed; ending input task");
+                        if shutdown_notice_for_input.load(Ordering::Acquire)
+                            || e.is_clean_shutdown_recv()
+                        {
+                            info!(error = ?e, "input recv stopped during session shutdown");
+                        } else {
+                            warn!(error = ?e, "input recv failed; ending input task");
+                        }
                         return;
                     }
                 }
@@ -1187,6 +1311,7 @@ async fn handle_client(
     {
         let conn = conn.clone();
         let injector = injector;
+        let shutdown_notice_for_datagram = shutdown_notice_sent.clone();
         tasks.spawn(async move {
             loop {
                 match conn.recv_datagram().await {
@@ -1202,7 +1327,13 @@ async fn handle_client(
                         tracing::trace!("unexpected host-direction datagram on host; ignoring");
                     }
                     Err(e) => {
-                        warn!(error = ?e, "datagram recv failed; ending datagram task");
+                        if shutdown_notice_for_datagram.load(Ordering::Acquire)
+                            || e.is_clean_shutdown_recv()
+                        {
+                            info!(error = ?e, "datagram recv stopped during session shutdown");
+                        } else {
+                            warn!(error = ?e, "datagram recv failed; ending datagram task");
+                        }
                         return;
                     }
                 }
@@ -1228,13 +1359,14 @@ async fn handle_client(
     //   - Ctrl-C: user wants out
     //   - any per-connection task exited: disconnect, Goodbye, or recv error
     // Whichever fires first, the cleanup path below runs.
-    tokio::select! {
+    let (teardown_reason, teardown_code) = tokio::select! {
         ctrl_c = tokio::signal::ctrl_c() => {
             if let Err(e) = ctrl_c {
                 warn!(error = %e, "ctrl-c handler failed; tearing down anyway");
             } else {
                 info!("ctrl-c received, ending session");
             }
+            ("host interrupted", GoodbyeCode::Clean)
         }
         res = tasks.join_next() => {
             match res {
@@ -1242,6 +1374,7 @@ async fn handle_client(
                 Some(Err(e)) => warn!(error = ?e, "per-connection task failed; tearing down"),
                 None => warn!("joined empty task set; tearing down"),
             }
+            ("host session task ended", GoodbyeCode::Clean)
         }
         () = send_exited.notified() => {
             // Send thread exited (fatal encoder init failure, GPU
@@ -1252,18 +1385,33 @@ async fn handle_client(
             // down immediately rather than waiting for the client to
             // ack-by-disconnect.
             info!("send thread exited; tearing down");
+            ("host send loop ended", GoodbyeCode::Clean)
         }
+    };
+
+    if !shutdown_notice_sent.swap(true, Ordering::AcqRel) {
+        let sent =
+            send_goodbye_notice(&conn, teardown_reason, teardown_code, &session_summary).await;
+        info!(
+            event = "session_teardown",
+            reason = teardown_reason,
+            code = ?teardown_code,
+            sent,
+            "host session shutdown notice"
+        );
     }
 
-    // Close the QUIC connection. This makes send_datagram error in the
-    // send thread, breaking it out of the encode loop, and tells any
-    // still-alive recv tasks that the peer is gone. Cheap and idempotent.
-    conn.close(0, b"session ended");
-
-    // Tell the send thread to stop polling the capture channel. Paired
-    // with the recv_timeout inside the loop so a static desktop (no new
-    // frames) can't keep us blocked in `frames.recv` past disconnect.
+    // Tell the send threads to stop before closing QUIC. Paired with the
+    // recv_timeout inside the loops so a static desktop / idle audio source
+    // can't keep us blocked in `recv` past disconnect. Setting this first also
+    // lets in-flight datagram sends classify ConnectionLost as clean shutdown
+    // noise instead of a fatal transport failure.
     send_shutdown.store(true, Ordering::Relaxed);
+
+    // Close the QUIC connection. This makes any blocked send/recv path error
+    // out and tells still-alive tasks that the peer is gone. Cheap and
+    // idempotent.
+    conn.close(0, b"session ended");
 
     // Abort and await the remaining recv tasks. Each one holds an Arc
     // clone of the injector; once shutdown() returns they're all dropped,
@@ -1285,6 +1433,54 @@ async fn handle_client(
     }
 
     Ok(())
+}
+
+async fn send_goodbye_notice(
+    conn: &Connection,
+    reason: &str,
+    code: GoodbyeCode,
+    summary: &SessionSummaryState,
+) -> bool {
+    let msg = ControlMessage::Goodbye {
+        reason: reason.to_string(),
+        code,
+        final_stats: Some(Box::new(summary.snapshot())),
+    };
+    match conn.send_control(&msg).await {
+        Ok(()) => {
+            let wait = (2 * conn.rtt()).clamp(
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(200),
+            );
+            tokio::time::sleep(wait).await;
+            true
+        }
+        Err(e) => {
+            warn!(error = ?e, reason, ?code, "send Goodbye failed");
+            false
+        }
+    }
+}
+
+fn send_goodbye_notice_blocking(
+    runtime: &tokio::runtime::Handle,
+    conn: &Connection,
+    sent: &AtomicBool,
+    reason: &str,
+    code: GoodbyeCode,
+    summary: &SessionSummaryState,
+) {
+    if sent.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let sent = runtime.block_on(send_goodbye_notice(conn, reason, code, summary));
+    info!(
+        event = "session_teardown",
+        reason,
+        ?code,
+        sent,
+        "host session shutdown notice"
+    );
 }
 
 /// Encoder paired with the input dimensions it was configured for, so we
@@ -2580,6 +2776,26 @@ mod cursor_pump_tests {
 /// ratio.
 const VISIBLE_DIM_ALIGN: u32 = 2;
 
+/// Decide whether to (re)build the encoder this iteration. The first build and
+/// a capture-source resolution change always rebuild (not client-controlled). A
+/// viewport-driven encode-dim change is *throttled*: deferred when it lands
+/// within [`VIEWPORT_REBUILD_THROTTLE`] of the previous rebuild. This is the
+/// server-side defense against a client that doesn't debounce resizes — it
+/// bounds encoder-teardown + `stream_epoch` churn without delaying a single
+/// legitimate resize (the prior rebuild is seeded far in the past).
+fn should_recreate_encoder(
+    first_build: bool,
+    capture_changed: bool,
+    encode_changed: bool,
+    elapsed_since_rebuild: std::time::Duration,
+) -> bool {
+    if first_build || capture_changed {
+        return true;
+    }
+    // Only a viewport-driven encode-dim change remains; throttle it.
+    encode_changed && elapsed_since_rebuild >= VIEWPORT_REBUILD_THROTTLE
+}
+
 /// Compute the encoder-output dimensions for a given capture size
 /// and client viewport. The viewport bounds the longest edge; we
 /// preserve aspect ratio (letterbox at the client; never stretch)
@@ -2716,8 +2932,8 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
         lost_packets_delta: quinn
             .lost_packets
             .saturating_sub(abr.last_quinn.lost_packets),
-        client_fragments_lost: stats.fragments_lost,
-        client_frames_dropped: stats.frames_dropped,
+        client_fragment_loss_events: stats.fragment_loss_events,
+        client_incomplete_frames: stats.incomplete_frames,
     };
     abr.last_quinn = quinn;
     abr.last_observed_at = now;
@@ -2731,8 +2947,8 @@ fn tick_abr(slot: &mut EncoderSlot, conn: &Connection, stats: ClientStatsObserva
                     rtt_ms = sample.rtt.as_millis() as u64,
                     congestion_events_delta = sample.congestion_events_delta,
                     lost_packets_delta = sample.lost_packets_delta,
-                    client_fragments_lost = sample.client_fragments_lost,
-                    client_frames_dropped = sample.client_frames_dropped,
+                    client_fragment_loss_events = sample.client_fragment_loss_events,
+                    client_incomplete_frames = sample.client_incomplete_frames,
                     "abr: bitrate retuned"
                 );
                 abr.last_applied_kbps = decision.target_kbps;
@@ -2766,13 +2982,26 @@ struct StageLatency {
     frames: u64,
     capture_age_ns: u64,
     send_ns: u64,
+    min_capture_age_ns: u64,
+    max_capture_age_ns: u64,
+    min_send_ns: u64,
+    max_send_ns: u64,
 }
 
 impl StageLatency {
     fn record(&mut self, capture_age_ns: u64, send_ns: u64) {
+        if self.frames == 0 {
+            self.min_capture_age_ns = capture_age_ns;
+            self.min_send_ns = send_ns;
+        } else {
+            self.min_capture_age_ns = self.min_capture_age_ns.min(capture_age_ns);
+            self.min_send_ns = self.min_send_ns.min(send_ns);
+        }
         self.frames += 1;
         self.capture_age_ns += capture_age_ns;
         self.send_ns += send_ns;
+        self.max_capture_age_ns = self.max_capture_age_ns.max(capture_age_ns);
+        self.max_send_ns = self.max_send_ns.max(send_ns);
     }
 
     /// Mean of `sum_ns` over recorded frames, in milliseconds.
@@ -2781,6 +3010,14 @@ impl StageLatency {
             0.0
         } else {
             sum_ns as f64 / frames as f64 / 1_000_000.0
+        }
+    }
+
+    fn ns_to_ms(ns: u64, frames: u64) -> f64 {
+        if frames == 0 {
+            0.0
+        } else {
+            ns as f64 / 1_000_000.0
         }
     }
 }
@@ -2794,6 +3031,7 @@ fn run_audio_capture_and_send(
     conn: Arc<Connection>,
     shutdown: Arc<AtomicBool>,
     audio_ready: Arc<AtomicBool>,
+    summary: Arc<SessionSummaryState>,
 ) {
     let opus_cfg = tether_audio::OpusConfig::default();
     let capture = match tether_audio::capture::start(opus_cfg) {
@@ -2850,13 +3088,14 @@ fn run_audio_capture_and_send(
             }
         };
         frames_captured += 1;
+        summary.audio.capture_frames.fetch_add(1, Ordering::Relaxed);
         for &s in &frame.samples {
             peak = peak.max(s.abs());
         }
         if last_stats_log.elapsed() >= AUDIO_STATS_INTERVAL {
             info!(
                 frames_captured,
-                peak = format!("{peak:.4}"),
+                peak,
                 gated = !audio_ready.load(Ordering::Acquire),
                 "audio capture stats"
             );
@@ -2904,9 +3143,14 @@ fn run_audio_capture_and_send(
                     tracing::debug!(error = ?e, "dropping audio packet on transient send error");
                     continue;
                 }
+                if shutdown.load(Ordering::Acquire) {
+                    info!(error = ?e, "audio sender stopped during session shutdown");
+                    return;
+                }
                 warn!(error = ?e, "audio datagram send failed; ending audio sender");
                 return;
             }
+            summary.audio.packets_sent.fetch_add(1, Ordering::Relaxed);
         }
     }
     capture.stop();
@@ -2929,6 +3173,8 @@ fn run_capture_and_send(
     latest_client_stats: LatestClientStats,
     latest_viewport: LatestViewport,
     send_exited: Arc<tokio::sync::Notify>,
+    shutdown_notice_sent: Arc<AtomicBool>,
+    summary: Arc<SessionSummaryState>,
 ) {
     // RAII: notify handle_client on *any* exit from this function —
     // including the six fatal-return sites below, a panic that's
@@ -2966,10 +3212,20 @@ fn run_capture_and_send(
     // per-window rates, so a flapping path shows up as recent drops rather than
     // a silent monotonic total.
     let mut transient_send_drops: u64 = 0;
+    let mut datagrams_sent: u64 = 0;
+    let mut parity_datagrams_sent: u64 = 0;
+    let mut max_datagrams_per_frame: u64 = 0;
+    let mut max_frame_bytes: u64 = 0;
+    let mut max_keyframe_bytes: u64 = 0;
+    let mut forced_idr_misses: u64 = 0;
     // Per-stage latency (handoff + send), averaged over the same window
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
     let mut slot: Option<EncoderSlot> = None;
+    // When the encoder was last rebuilt, for the viewport-rebuild throttle
+    // (`VIEWPORT_REBUILD_THROTTLE`). Seeded in the past so the first
+    // viewport-driven rebuild after startup is never throttled.
+    let mut last_encoder_rebuild = Instant::now() - VIEWPORT_REBUILD_THROTTLE;
     #[cfg(target_os = "macos")]
     let mut macos_gpu_state: Option<MacosGpuState> = None;
     let mut pts: i64 = 0;
@@ -3068,13 +3324,25 @@ fn run_capture_and_send(
         // leaves dims unchanged (GPU path while no scaler exists; an
         // upscale-rejected viewport on any path) shouldn't churn the
         // session. The seq is tracked for diagnostic logging only.
-        let needs_recreate = slot.as_ref().is_none_or(|s| {
-            s.capture_width != frame_width
-                || s.capture_height != frame_height
-                || s.width != encode_width
-                || s.height != encode_height
-        });
+        let first_build = slot.is_none();
+        let capture_changed = slot
+            .as_ref()
+            .is_some_and(|s| s.capture_width != frame_width || s.capture_height != frame_height);
+        let encode_changed = slot
+            .as_ref()
+            .is_some_and(|s| s.width != encode_width || s.height != encode_height);
+        // Throttle viewport-driven rebuilds (server-side defense); while
+        // deferred, encoding continues at the current dims (the client
+        // letterboxes) and a later iteration rebuilds to the newest viewport.
+        let needs_recreate = should_recreate_encoder(
+            first_build,
+            capture_changed,
+            encode_changed,
+            Instant::now().duration_since(last_encoder_rebuild),
+        );
+
         if needs_recreate {
+            last_encoder_rebuild = Instant::now();
             // Drop the previous encoder BEFORE constructing its
             // replacement. `slot.take()` moves the old `EncoderSlot` out
             // (slot = None) and it drops at the end of this block —
@@ -3224,15 +3492,18 @@ fn run_capture_and_send(
                         encode_height,
                         "encoder init failed; sending Goodbye(InternalError) and exiting send loop"
                     );
-                    let goodbye_conn = conn.clone();
                     let reason = format!(
                         "host could not construct {:?} {:?} encoder for {}x{}: {}",
                         chosen_profile.codec, chosen_profile.chroma, encode_width, encode_height, e
                     );
-                    let _ = runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
-                        reason,
-                        code: tether_protocol::control::GoodbyeCode::InternalError,
-                    }));
+                    send_goodbye_notice_blocking(
+                        &runtime,
+                        &conn,
+                        &shutdown_notice_sent,
+                        reason.as_str(),
+                        GoodbyeCode::InternalError,
+                        &summary,
+                    );
                     return;
                 }
             };
@@ -3298,12 +3569,15 @@ fn run_capture_and_send(
                         error = %e,
                         "GPU encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
                     );
-                    let goodbye_conn = conn.clone();
                     let reason = format!("host GPU encode bridge collapsed: {e}");
-                    let _ = runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
-                        reason,
-                        code: tether_protocol::control::GoodbyeCode::InternalError,
-                    }));
+                    send_goodbye_notice_blocking(
+                        &runtime,
+                        &conn,
+                        &shutdown_notice_sent,
+                        reason.as_str(),
+                        GoodbyeCode::InternalError,
+                        &summary,
+                    );
                     return;
                 }
             },
@@ -3320,13 +3594,15 @@ fn run_capture_and_send(
                             error = %e,
                             "IOSurface encode bridge collapsed; sending Goodbye(InternalError) and exiting send loop"
                         );
-                        let goodbye_conn = conn.clone();
                         let reason = format!("host IOSurface encode bridge collapsed: {e}");
-                        let _ =
-                            runtime.block_on(goodbye_conn.send_control(&ControlMessage::Goodbye {
-                                reason,
-                                code: tether_protocol::control::GoodbyeCode::InternalError,
-                            }));
+                        send_goodbye_notice_blocking(
+                            &runtime,
+                            &conn,
+                            &shutdown_notice_sent,
+                            reason.as_str(),
+                            GoodbyeCode::InternalError,
+                            &summary,
+                        );
                         return;
                     }
                 }
@@ -3377,7 +3653,17 @@ fn run_capture_and_send(
         // pre-sized `BytesMut`.
         let mut keyframe = false;
         let body: tether_codec::bytes::Bytes = match encoded.len() {
-            0 => continue,
+            0 => {
+                if force_kf {
+                    forced_idr_misses = forced_idr_misses.saturating_add(1);
+                    summary
+                        .video
+                        .forced_idr_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(pts, "encoder produced no packet for a forced-IDR request");
+                }
+                continue;
+            }
             1 => {
                 let pkt = encoded.into_iter().next().expect("len == 1");
                 keyframe = pkt.keyframe;
@@ -3396,10 +3682,31 @@ fn run_capture_and_send(
             }
         };
         if body.is_empty() {
+            if force_kf {
+                forced_idr_misses = forced_idr_misses.saturating_add(1);
+                summary
+                    .video
+                    .forced_idr_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    pts,
+                    "encoder produced an empty body for a forced-IDR request"
+                );
+            }
             continue;
         }
-        stats.record_frame(encode_delta_ns, body.len() as u64, keyframe);
-
+        let body_len = body.len() as u64;
+        if force_kf && !keyframe {
+            forced_idr_misses = forced_idr_misses.saturating_add(1);
+            summary
+                .video
+                .forced_idr_misses
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                pts,
+                body_len, "encoder did not emit a keyframe for a forced-IDR request"
+            );
+        }
         let meta = VideoFrameMeta {
             timing: timing.finish(),
             keyframe,
@@ -3421,7 +3728,11 @@ fn run_capture_and_send(
             .map_or(tether_protocol::MAX_DATAGRAM_PAYLOAD, |m| {
                 m.min(tether_protocol::MAX_DATAGRAM_PAYLOAD)
             });
-        for packet in fragmenter.fragment(meta, body, budget) {
+        let mut sent_frame = true;
+        let packets = fragmenter.fragment(meta, body, budget);
+        let planned_frame_datagrams = u64::try_from(packets.len()).unwrap_or(u64::MAX);
+        for packet in packets {
+            let is_parity = matches!(&packet, VideoPacket::Parity { .. });
             if let Err(e) = conn.send_datagram(&Datagram::Video(packet)) {
                 if e.is_transient_send() {
                     // MTU shrank mid-frame (PLPMTUD black-hole / path change),
@@ -3433,17 +3744,72 @@ fn run_capture_and_send(
                     // sacrificed, but a single dropped frame is recoverable and
                     // a torn-down session is not.
                     transient_send_drops += 1;
+                    summary
+                        .video
+                        .transient_send_drop_frames
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(error = ?e, "dropping frame on transient datagram send error");
+                    sent_frame = false;
                     break;
                 }
-                warn!(error = ?e, "send_datagram failed (fatal), terminating send loop");
+                if shutdown.load(Ordering::Acquire) || shutdown_notice_sent.load(Ordering::Acquire)
+                {
+                    info!(error = ?e, "video send loop stopped during session shutdown");
+                    return;
+                }
+                let reason = format!("host video datagram send failed: {e:?}");
+                warn!(error = ?e, "send_datagram failed (fatal), sending Goodbye(InternalError)");
+                send_goodbye_notice_blocking(
+                    &runtime,
+                    &conn,
+                    &shutdown_notice_sent,
+                    reason.as_str(),
+                    GoodbyeCode::InternalError,
+                    &summary,
+                );
                 return;
             }
+            datagrams_sent = datagrams_sent.saturating_add(1);
+            summary.video.datagrams_sent.fetch_add(1, Ordering::Relaxed);
+            if is_parity {
+                parity_datagrams_sent = parity_datagrams_sent.saturating_add(1);
+                summary
+                    .video
+                    .parity_datagrams_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
-        // Accumulated only for frames that complete encode + send;
-        // damage-skipped and rebuild-failed frames are excluded, so this
-        // is the handoff age of frames that actually reach the wire.
-        stage_latency.record(capture_age_ns, send_t0.elapsed().as_nanos() as u64);
+        if sent_frame {
+            max_datagrams_per_frame = max_datagrams_per_frame.max(planned_frame_datagrams);
+            max_frame_bytes = max_frame_bytes.max(body_len);
+            summary.video.frames_sent.fetch_add(1, Ordering::Relaxed);
+            summary
+                .video
+                .bytes_sent
+                .fetch_add(body_len, Ordering::Relaxed);
+            summary
+                .video
+                .max_datagrams_per_frame
+                .fetch_max(planned_frame_datagrams, Ordering::Relaxed);
+            summary
+                .video
+                .max_frame_bytes
+                .fetch_max(body_len, Ordering::Relaxed);
+            if keyframe {
+                summary.video.keyframes.fetch_add(1, Ordering::Relaxed);
+                max_keyframe_bytes = max_keyframe_bytes.max(body_len);
+                summary
+                    .video
+                    .max_keyframe_bytes
+                    .fetch_max(body_len, Ordering::Relaxed);
+            }
+            stats.record_frame(encode_delta_ns, body_len, keyframe);
+            // Accumulated only for frames that complete encode + send;
+            // damage-skipped, rebuild-failed, and transient-send-dropped frames
+            // are excluded, so this is the handoff age of frames that actually
+            // reach the wire.
+            stage_latency.record(capture_age_ns, send_t0.elapsed().as_nanos() as u64);
+        }
 
         if stats.should_emit() {
             if let Some(snap) = stats.snapshot_and_reset() {
@@ -3458,24 +3824,45 @@ fn run_capture_and_send(
                 // fragment+wire. Their sum ≈ host-side end-to-end latency.
                 info!(
                     frames = snap.frame_count,
-                    capture_age_ms = format!(
-                        "{:.2}",
-                        StageLatency::avg_ms(stage_latency.capture_age_ns, stage_latency.frames)
+                    avg_capture_age_ms =
+                        StageLatency::avg_ms(stage_latency.capture_age_ns, stage_latency.frames),
+                    min_capture_age_ms = StageLatency::ns_to_ms(
+                        stage_latency.min_capture_age_ns,
+                        stage_latency.frames
                     ),
-                    avg_encode_ms = format!("{:.2}", snap.avg_encode_ms),
-                    send_ms = format!(
-                        "{:.2}",
-                        StageLatency::avg_ms(stage_latency.send_ns, stage_latency.frames)
+                    max_capture_age_ms = StageLatency::ns_to_ms(
+                        stage_latency.max_capture_age_ns,
+                        stage_latency.frames
                     ),
-                    kbps_out = format!("{:.0}", snap.kbps_out),
-                    kf_per_s = format!("{kf_per_s:.2}"),
-                    transient_send_drops,
+                    avg_encode_ms = snap.avg_encode_ms,
+                    min_encode_ms = snap.min_encode_ms,
+                    max_encode_ms = snap.max_encode_ms,
+                    avg_send_ms = StageLatency::avg_ms(stage_latency.send_ns, stage_latency.frames),
+                    min_send_ms =
+                        StageLatency::ns_to_ms(stage_latency.min_send_ns, stage_latency.frames),
+                    max_send_ms =
+                        StageLatency::ns_to_ms(stage_latency.max_send_ns, stage_latency.frames),
+                    kbps_out = snap.kbps_out,
+                    keyframes_per_s = kf_per_s,
+                    transient_send_drop_frames = transient_send_drops,
+                    datagrams_sent,
+                    parity_datagrams_sent,
+                    max_datagrams_per_frame,
+                    max_frame_bytes = max_frame_bytes.max(snap.max_frame_bytes),
+                    max_keyframe_bytes,
+                    forced_idr_misses,
                     "send stats"
                 );
                 stage_latency = StageLatency::default();
                 // Per-window like the rates above: zero so the next log shows
                 // drops in that window, not a monotonic lifetime total.
                 transient_send_drops = 0;
+                datagrams_sent = 0;
+                parity_datagrams_sent = 0;
+                max_datagrams_per_frame = 0;
+                max_frame_bytes = 0;
+                max_keyframe_bytes = 0;
+                forced_idr_misses = 0;
             }
         }
     }
@@ -3825,6 +4212,44 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn host_audio_summary_requires_host_and_client_readiness() {
+        assert!(host_summary_audio_active(true, true));
+        assert!(!host_summary_audio_active(true, false));
+        assert!(!host_summary_audio_active(false, true));
+        assert!(!host_summary_audio_active(false, false));
+    }
+
+    #[test]
+    fn viewport_rebuild_throttle_defers_rapid_changes_only() {
+        use std::time::Duration;
+        let under = VIEWPORT_REBUILD_THROTTLE / 2;
+        let over = VIEWPORT_REBUILD_THROTTLE + Duration::from_millis(1);
+
+        // First build and capture-source changes always rebuild, regardless of
+        // how recent the last rebuild was — they aren't client-controlled.
+        assert!(should_recreate_encoder(true, false, false, Duration::ZERO));
+        assert!(should_recreate_encoder(false, true, false, under));
+
+        // A viewport-driven encode change is throttled within the window...
+        assert!(
+            !should_recreate_encoder(false, false, true, under),
+            "rapid viewport change within the throttle window must be deferred"
+        );
+        // ...and allowed once the window has passed.
+        assert!(
+            should_recreate_encoder(false, false, true, over),
+            "viewport change past the throttle window must rebuild"
+        );
+
+        // No change at all → never rebuild.
+        assert!(!should_recreate_encoder(false, false, false, over));
+
+        // A capture change is never throttled even if an encode change rode
+        // along inside the window (real source change wins).
+        assert!(should_recreate_encoder(false, true, true, under));
+    }
+
+    #[test]
     fn stage_latency_averages_over_recorded_frames() {
         let mut s = StageLatency::default();
         // No frames recorded → zero, not a divide-by-zero.
@@ -3836,6 +4261,10 @@ mod tests {
         assert_eq!(s.frames, 2);
         assert!((StageLatency::avg_ms(s.capture_age_ns, s.frames) - 2.0).abs() < 1e-9);
         assert!((StageLatency::avg_ms(s.send_ns, s.frames) - 3.0).abs() < 1e-9);
+        assert!((StageLatency::ns_to_ms(s.min_capture_age_ns, s.frames) - 1.0).abs() < 1e-9);
+        assert!((StageLatency::ns_to_ms(s.max_capture_age_ns, s.frames) - 3.0).abs() < 1e-9);
+        assert!((StageLatency::ns_to_ms(s.min_send_ns, s.frames) - 2.0).abs() < 1e-9);
+        assert!((StageLatency::ns_to_ms(s.max_send_ns, s.frames) - 4.0).abs() < 1e-9);
     }
     use std::sync::Arc;
     use tokio::task::JoinSet;

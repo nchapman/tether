@@ -527,6 +527,59 @@ pub enum GoodbyeCode {
     Unknown(i32),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub role: String,
+    pub duration_ms: u64,
+    pub codec: String,
+    pub chroma: String,
+    pub bit_depth: u32,
+    pub video: VideoSessionStats,
+    pub audio: Option<AudioSessionStats>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoSessionStats {
+    pub frames_sent: u64,
+    pub frames_received: u64,
+    pub keyframes: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub incomplete_frames: u64,
+    pub fragment_loss_events: u64,
+    pub decode_errors: u64,
+    pub render_drop_frames: u64,
+    pub idr_requests: u64,
+    pub decode_queue_drop_frames: u64,
+    pub transient_send_drop_frames: u64,
+    pub fec_recovered_frames: u64,
+    pub fec_recovered_fragments: u64,
+    pub datagrams_sent: u64,
+    pub parity_datagrams_sent: u64,
+    pub max_datagrams_per_frame: u64,
+    pub max_frame_bytes: u64,
+    pub max_keyframe_bytes: u64,
+    pub forced_idr_misses: u64,
+    pub decode_stale_epoch_drop_frames: u64,
+    pub decode_epoch_throttle_drop_frames: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioSessionStats {
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub capture_frames: u64,
+    pub underruns: u64,
+    pub dropped_samples: u64,
+    pub recovered_frames: u64,
+    pub concealed_frames: u64,
+    pub dropout_frames: u64,
+    pub dropouts: u64,
+    pub stale_packets: u64,
+    pub decode_errors: u64,
+    pub decode_queue_drop_packets: u64,
+}
+
 /// Cursor input model. Carried by
 /// [`ControlMessage::SetCursorMode`]; default is `Absolute`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -587,6 +640,7 @@ pub enum ControlMessage {
     Goodbye {
         reason: String,
         code: GoodbyeCode,
+        final_stats: Option<Box<SessionSummary>>,
     },
     /// Escape hatch for features that don't yet warrant a typed variant.
     /// Payload is opaque to the core protocol; feature specs define their own
@@ -650,15 +704,18 @@ pub enum ControlMessage {
         stream_id: VideoStreamId,
     },
     /// Client → host. Periodic receive-side telemetry (1 Hz typical).
-    /// Feeds future adaptive-bitrate / FEC / codec-downshift policy on
-    /// the host. Counters are per the elapsed `interval_ms` window;
-    /// `rtt_ewma_us` is the EWMA over the connection's lifetime so far.
+    /// Feeds adaptive-bitrate / FEC / codec-downshift policy on the host.
+    /// Count fields are per the elapsed `window_ms`; `rtt_us` is the
+    /// client's current QUIC RTT estimate. FEC recovery counts are successful
+    /// repairs only; failed incomplete frames are reported separately.
     ClientStats {
-        interval_ms: u32,
+        window_ms: u32,
         frames_received: u32,
-        frames_dropped: u32,
-        fragments_lost: u32,
-        rtt_ewma_us: u32,
+        incomplete_frames: u32,
+        fragment_loss_events: u32,
+        rtt_us: u32,
+        fec_recovered_frames: u32,
+        fec_recovered_fragments: u32,
     },
     /// Either side → other. Switch the cursor input model. Toggles
     /// mid-session without renegotiating; the receiver echoes the
@@ -732,6 +789,16 @@ impl Viewport {
 
 // --- ClockSync ----------------------------------------------------------
 
+/// Number of timestamp probes the client sends as a burst after handshake.
+///
+/// Clock offset estimation is only as good as the least-queued sample. A
+/// single probe taken while the host/client are still spawning render and GPU
+/// resources can overestimate frame age by an RTT-sized queueing spike, which
+/// feeds directly into latency telemetry and present-policy frame skipping.
+/// A small min-RTT burst follows standard NTP/PTP practice without adding N
+/// full round trips to startup.
+pub const CLOCK_SYNC_PROBE_SAMPLES: usize = 8;
+
 /// Result of a successful three-way handshake probe. Computed from
 /// `t0_client_send`, `t1_server_recv`, `t2_server_send`, `t3_client_recv`
 /// using the standard NTP formula: `offset = ((t1 - t0) + (t2 - t3)) / 2`,
@@ -780,6 +847,14 @@ impl ClockSync {
                 .expect("clamped to u64 range"),
             sampled_at_local: t3_local_recv,
         }
+    }
+
+    /// Pick the least-queued probe sample. Min-RTT is the best available proxy
+    /// for path symmetry, so its offset is the least likely to include startup
+    /// queueing from process spawn, GPU probing, or a busy control loop.
+    #[must_use]
+    pub fn best_sample(samples: impl IntoIterator<Item = Self>) -> Option<Self> {
+        samples.into_iter().min_by_key(|sync| sync.rtt_nanos)
     }
 
     /// Translate a timestamp from the remote clock into the local clock.
@@ -1183,6 +1258,121 @@ fn goodbye_from_pb(value: i32) -> GoodbyeCode {
     }
 }
 
+fn session_summary_to_pb(value: SessionSummary) -> pb::SessionSummary {
+    pb::SessionSummary {
+        role: value.role,
+        duration_ms: value.duration_ms,
+        codec: value.codec,
+        chroma: value.chroma,
+        bit_depth: value.bit_depth,
+        video: Some(video_session_stats_to_pb(value.video)),
+        audio: value.audio.map(audio_session_stats_to_pb),
+    }
+}
+
+fn session_summary_from_pb(value: pb::SessionSummary) -> Result<SessionSummary, CodecError> {
+    Ok(SessionSummary {
+        role: value.role,
+        duration_ms: value.duration_ms,
+        codec: value.codec,
+        chroma: value.chroma,
+        bit_depth: value.bit_depth,
+        video: value
+            .video
+            .map(video_session_stats_from_pb)
+            .unwrap_or_default(),
+        audio: value.audio.map(audio_session_stats_from_pb),
+    })
+}
+
+fn video_session_stats_to_pb(value: VideoSessionStats) -> pb::VideoSessionStats {
+    pb::VideoSessionStats {
+        frames_sent: value.frames_sent,
+        frames_received: value.frames_received,
+        keyframes: value.keyframes,
+        bytes_sent: value.bytes_sent,
+        bytes_received: value.bytes_received,
+        incomplete_frames: value.incomplete_frames,
+        fragment_loss_events: value.fragment_loss_events,
+        decode_errors: value.decode_errors,
+        render_drop_frames: value.render_drop_frames,
+        idr_requests: value.idr_requests,
+        decode_queue_drop_frames: value.decode_queue_drop_frames,
+        transient_send_drop_frames: value.transient_send_drop_frames,
+        fec_recovered_frames: value.fec_recovered_frames,
+        fec_recovered_fragments: value.fec_recovered_fragments,
+        datagrams_sent: value.datagrams_sent,
+        parity_datagrams_sent: value.parity_datagrams_sent,
+        max_datagrams_per_frame: value.max_datagrams_per_frame,
+        max_frame_bytes: value.max_frame_bytes,
+        max_keyframe_bytes: value.max_keyframe_bytes,
+        forced_idr_misses: value.forced_idr_misses,
+        decode_stale_epoch_drop_frames: value.decode_stale_epoch_drop_frames,
+        decode_epoch_throttle_drop_frames: value.decode_epoch_throttle_drop_frames,
+    }
+}
+
+fn video_session_stats_from_pb(value: pb::VideoSessionStats) -> VideoSessionStats {
+    VideoSessionStats {
+        frames_sent: value.frames_sent,
+        frames_received: value.frames_received,
+        keyframes: value.keyframes,
+        bytes_sent: value.bytes_sent,
+        bytes_received: value.bytes_received,
+        incomplete_frames: value.incomplete_frames,
+        fragment_loss_events: value.fragment_loss_events,
+        decode_errors: value.decode_errors,
+        render_drop_frames: value.render_drop_frames,
+        idr_requests: value.idr_requests,
+        decode_queue_drop_frames: value.decode_queue_drop_frames,
+        transient_send_drop_frames: value.transient_send_drop_frames,
+        fec_recovered_frames: value.fec_recovered_frames,
+        fec_recovered_fragments: value.fec_recovered_fragments,
+        datagrams_sent: value.datagrams_sent,
+        parity_datagrams_sent: value.parity_datagrams_sent,
+        max_datagrams_per_frame: value.max_datagrams_per_frame,
+        max_frame_bytes: value.max_frame_bytes,
+        max_keyframe_bytes: value.max_keyframe_bytes,
+        forced_idr_misses: value.forced_idr_misses,
+        decode_stale_epoch_drop_frames: value.decode_stale_epoch_drop_frames,
+        decode_epoch_throttle_drop_frames: value.decode_epoch_throttle_drop_frames,
+    }
+}
+
+fn audio_session_stats_to_pb(value: AudioSessionStats) -> pb::AudioSessionStats {
+    pb::AudioSessionStats {
+        packets_sent: value.packets_sent,
+        packets_received: value.packets_received,
+        capture_frames: value.capture_frames,
+        underruns: value.underruns,
+        dropped_samples: value.dropped_samples,
+        recovered_frames: value.recovered_frames,
+        concealed_frames: value.concealed_frames,
+        dropout_frames: value.dropout_frames,
+        dropouts: value.dropouts,
+        stale_packets: value.stale_packets,
+        decode_errors: value.decode_errors,
+        decode_queue_drop_packets: value.decode_queue_drop_packets,
+    }
+}
+
+fn audio_session_stats_from_pb(value: pb::AudioSessionStats) -> AudioSessionStats {
+    AudioSessionStats {
+        packets_sent: value.packets_sent,
+        packets_received: value.packets_received,
+        capture_frames: value.capture_frames,
+        underruns: value.underruns,
+        dropped_samples: value.dropped_samples,
+        recovered_frames: value.recovered_frames,
+        concealed_frames: value.concealed_frames,
+        dropout_frames: value.dropout_frames,
+        dropouts: value.dropouts,
+        stale_packets: value.stale_packets,
+        decode_errors: value.decode_errors,
+        decode_queue_drop_packets: value.decode_queue_drop_packets,
+    }
+}
+
 fn cursor_mode_to_pb(value: CursorMode) -> i32 {
     match value {
         CursorMode::Absolute => 1,
@@ -1365,9 +1555,14 @@ impl ReliableMessage for ControlMessage {
                 t1_receiver_recv: Some(mono_to_pb(probe.t1_receiver_recv)),
                 t2_receiver_send: Some(mono_to_pb(probe.t2_receiver_send)),
             }),
-            ControlMessage::Goodbye { reason, code } => Kind::Goodbye(pb::Goodbye {
+            ControlMessage::Goodbye {
+                reason,
+                code,
+                final_stats,
+            } => Kind::Goodbye(pb::Goodbye {
                 reason,
                 code: goodbye_to_pb(code),
+                final_stats: final_stats.map(|summary| Box::new(session_summary_to_pb(*summary))),
             }),
             ControlMessage::Extension(msg) => Kind::Extension(extension_to_pb(msg)),
             ControlMessage::CursorShape {
@@ -1407,17 +1602,21 @@ impl ReliableMessage for ControlMessage {
                 stream_id: stream_id.0,
             }),
             ControlMessage::ClientStats {
-                interval_ms,
+                window_ms,
                 frames_received,
-                frames_dropped,
-                fragments_lost,
-                rtt_ewma_us,
+                incomplete_frames,
+                fragment_loss_events,
+                rtt_us,
+                fec_recovered_frames,
+                fec_recovered_fragments,
             } => Kind::ClientStats(pb::ClientStats {
-                interval_ms,
+                window_ms,
                 frames_received,
-                frames_dropped,
-                fragments_lost,
-                rtt_ewma_us,
+                incomplete_frames,
+                fragment_loss_events,
+                rtt_us,
+                fec_recovered_frames,
+                fec_recovered_fragments,
             }),
             ControlMessage::SetCursorMode { mode } => Kind::SetCursorMode(pb::SetCursorMode {
                 mode: cursor_mode_to_pb(mode),
@@ -1477,6 +1676,10 @@ impl ReliableMessage for ControlMessage {
             Kind::Goodbye(v) => Ok(ControlMessage::Goodbye {
                 reason: v.reason,
                 code: goodbye_from_pb(v.code),
+                final_stats: v
+                    .final_stats
+                    .map(|summary| session_summary_from_pb(*summary).map(Box::new))
+                    .transpose()?,
             }),
             Kind::Extension(v) => {
                 if v.payload.len() > MAX_EXTENSION_PAYLOAD_BYTES {
@@ -1534,11 +1737,13 @@ impl ReliableMessage for ControlMessage {
                 stream_id: VideoStreamId(v.stream_id),
             }),
             Kind::ClientStats(v) => Ok(ControlMessage::ClientStats {
-                interval_ms: v.interval_ms,
+                window_ms: v.window_ms,
                 frames_received: v.frames_received,
-                frames_dropped: v.frames_dropped,
-                fragments_lost: v.fragments_lost,
-                rtt_ewma_us: v.rtt_ewma_us,
+                incomplete_frames: v.incomplete_frames,
+                fragment_loss_events: v.fragment_loss_events,
+                rtt_us: v.rtt_us,
+                fec_recovered_frames: v.fec_recovered_frames,
+                fec_recovered_fragments: v.fec_recovered_fragments,
             }),
             Kind::SetCursorMode(v) => Ok(ControlMessage::SetCursorMode {
                 mode: cursor_mode_from_pb(v.mode),
@@ -1584,6 +1789,22 @@ mod tests {
         let sync = ClockSync::from_probe(t0, t1, t2, t3);
         assert_eq!(sync.offset_nanos, 400);
         assert_eq!(sync.rtt_nanos, 10);
+    }
+
+    #[test]
+    fn clock_sync_best_sample_keeps_min_rtt_offset() {
+        let noisy = ClockSync {
+            offset_nanos: 145_000_000,
+            rtt_nanos: 290_000_000,
+            sampled_at_local: MonoNanos(10),
+        };
+        let clean = ClockSync {
+            offset_nanos: 4_000,
+            rtt_nanos: 5_000_000,
+            sampled_at_local: MonoNanos(20),
+        };
+
+        assert_eq!(ClockSync::best_sample([noisy, clean]), Some(clean));
     }
 
     #[test]

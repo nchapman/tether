@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tether_protocol::control::{
     ChromaSubsampling, ClientHello, CodecKind, ControlMessage, DisplayDescriptor, DisplayId,
     DisplayMode, DisplayModeStatus, NegotiatedVideo, PixelFormat, RequestId, ServerHello,
-    VideoColorSpec, VideoProfile, VideoStreamId, Viewport,
+    VideoColorSpec, VideoProfile, VideoStreamId, Viewport, CLOCK_SYNC_PROBE_SAMPLES,
 };
 use tether_protocol::MonoNanos;
 use tether_session::{
@@ -72,20 +72,22 @@ fn test_server_hello(profile: VideoProfile) -> ServerHello {
 }
 
 async fn answer_clock_probe(channel: &dyn ControlChannel) {
-    match channel.recv_control().await.unwrap() {
-        ControlMessage::ClockProbeRequest { t0_sender } => {
-            channel
-                .send_control(&ControlMessage::ClockProbeResponse(
-                    tether_protocol::control::ClockProbe {
-                        t0_sender,
-                        t1_receiver_recv: MonoNanos::now(),
-                        t2_receiver_send: MonoNanos::now(),
-                    },
-                ))
-                .await
-                .unwrap();
+    for _ in 0..CLOCK_SYNC_PROBE_SAMPLES {
+        match channel.recv_control().await.unwrap() {
+            ControlMessage::ClockProbeRequest { t0_sender } => {
+                channel
+                    .send_control(&ControlMessage::ClockProbeResponse(
+                        tether_protocol::control::ClockProbe {
+                            t0_sender,
+                            t1_receiver_recv: MonoNanos::now(),
+                            t2_receiver_send: MonoNanos::now(),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+            }
+            other => panic!("expected ClockProbeRequest, got {other:?}"),
         }
-        other => panic!("expected ClockProbeRequest, got {other:?}"),
     }
 }
 
@@ -134,6 +136,74 @@ async fn happy_path_handshake_completes_with_negotiated_profile() {
         client.clock_sync.offset_nanos.unsigned_abs() < 10_000_000,
         "expected sub-10ms clock offset on loopback, got {} ns",
         client.clock_sync.offset_nanos
+    );
+}
+
+#[tokio::test]
+async fn clock_probe_burst_rejects_noisy_high_rtt_sample() {
+    let (host_chan, client_chan) = duplex_pair();
+    let client_cfg = ClientSessionConfig {
+        client_name: "test-client".to_string(),
+        client_decode_profiles: vec![VideoProfile::H264_8BIT_420],
+        viewport: None,
+    };
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        let _hello = host_chan_dyn.recv_client_hello().await.unwrap();
+        host_chan_dyn
+            .send_server_hello(test_server_hello(VideoProfile::H264_8BIT_420))
+            .await
+            .unwrap();
+
+        for sample_idx in 0..CLOCK_SYNC_PROBE_SAMPLES {
+            let t0_sender = match host_chan_dyn.recv_control().await.unwrap() {
+                ControlMessage::ClockProbeRequest { t0_sender } => t0_sender,
+                other => panic!("expected ClockProbeRequest, got {other:?}"),
+            };
+            let probe = if sample_idx == 0 {
+                // Simulate the exact failure shape from issue #58: one queued
+                // startup sample with an RTT-sized offset bias. The reducer
+                // should reject it once cleaner samples arrive.
+                tether_protocol::control::ClockProbe {
+                    t0_sender,
+                    t1_receiver_recv: MonoNanos(t0_sender.0.saturating_add(300_000_000)),
+                    t2_receiver_send: t0_sender,
+                }
+            } else {
+                // A near-zero-queue sample. In loopback, `t2` is effectively
+                // the client's `t3`, so the offset and RTT should both be tiny.
+                tether_protocol::control::ClockProbe {
+                    t0_sender,
+                    t1_receiver_recv: t0_sender,
+                    t2_receiver_send: MonoNanos::now(),
+                }
+            };
+            host_chan_dyn
+                .send_control(&ControlMessage::ClockProbeResponse(probe))
+                .await
+                .unwrap();
+        }
+    });
+
+    let client = ClientSession::connect(client_chan_dyn, client_cfg)
+        .await
+        .unwrap();
+    host_task.await.unwrap();
+
+    assert!(
+        client.clock_sync.offset_nanos.unsigned_abs() < 5_000_000,
+        "expected clean min-RTT sample, got offset={}ns rtt={}ns",
+        client.clock_sync.offset_nanos,
+        client.clock_sync.rtt_nanos
+    );
+    assert!(
+        client.clock_sync.rtt_nanos < 5_000_000,
+        "expected low-RTT sample, got offset={}ns rtt={}ns",
+        client.clock_sync.offset_nanos,
+        client.clock_sync.rtt_nanos
     );
 }
 
@@ -274,6 +344,16 @@ async fn host_picks_unadvertised_profile_client_refuses() {
     let host_session = host_task.await.unwrap().unwrap();
     assert_eq!(host_session.negotiated, VideoProfile::HEVC_8BIT_420);
     client_task.await.unwrap();
+    match host_session.channel.recv_control().await.unwrap() {
+        ControlMessage::Goodbye { reason, code, .. } => {
+            assert_eq!(code, tether_protocol::control::GoodbyeCode::ProtocolError);
+            assert!(
+                reason.contains("unadvertised video profile"),
+                "unexpected goodbye reason: {reason}"
+            );
+        }
+        other => panic!("expected client Goodbye after invalid profile, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -317,10 +397,21 @@ async fn client_filters_unknown_bit_depth_from_host_advert() {
         );
     });
 
-    // Host doesn't see the refusal (it succeeds on its side); the
-    // client is the gate for unknown depths.
-    let _host = host_task.await.unwrap().unwrap();
+    // HostSession itself succeeds because it sent a syntactically valid
+    // ServerHello, but the client reports the protocol error on the control
+    // stream before returning its local validation failure.
+    let host = host_task.await.unwrap().unwrap();
     client_task.await.unwrap();
+    match host.channel.recv_control().await.unwrap() {
+        ControlMessage::Goodbye { reason, code, .. } => {
+            assert_eq!(code, tether_protocol::control::GoodbyeCode::ProtocolError);
+            assert!(
+                reason.contains("unknown bit_depth 12"),
+                "unexpected goodbye reason: {reason}"
+            );
+        }
+        other => panic!("expected client Goodbye after unknown bit_depth, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -433,6 +524,7 @@ async fn goodbye_during_clock_probe_aborts_connect() {
                     .send_control(&ControlMessage::Goodbye {
                         reason: "probe denied".into(),
                         code: tether_protocol::control::GoodbyeCode::ProtocolError,
+                        final_stats: None,
                     })
                     .await
                     .unwrap();
@@ -583,6 +675,71 @@ async fn mid_session_set_viewport_round_trips_on_control_stream() {
             assert_eq!(v, Viewport::new(640, 480));
         }
         other => panic!("expected SetViewportHint, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mid_session_client_stats_round_trips_on_control_stream() {
+    let (host_chan, client_chan) = duplex_pair();
+    let (host_cfg, client_cfg) = cfgs();
+
+    let host_chan_for_session: Arc<dyn ControlChannel> = host_chan.clone();
+    let client_chan_for_session: Arc<dyn ControlChannel> = client_chan.clone();
+    let host_chan_for_probe = host_chan_for_session.clone();
+
+    let host_task = tokio::spawn(async move {
+        let session = HostSession::accept(host_chan_for_session, host_cfg, |client_caps| {
+            client_caps.iter().copied().next()
+        })
+        .await
+        .unwrap();
+        answer_clock_probe(host_chan_for_probe.as_ref()).await;
+        session
+    });
+    let client_task = tokio::spawn(async move {
+        ClientSession::connect(client_chan_for_session, client_cfg)
+            .await
+            .unwrap()
+    });
+    let _host = host_task.await.unwrap();
+    let _client = client_task.await.unwrap();
+
+    client_chan
+        .send_control(&ControlMessage::ClientStats {
+            window_ms: 1001,
+            frames_received: 62,
+            incomplete_frames: 3,
+            fragment_loss_events: 5,
+            rtt_us: 7000,
+            fec_recovered_frames: 7,
+            fec_recovered_fragments: 11,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match host_chan.recv_control().await.unwrap() {
+            ControlMessage::ForceIdr => continue,
+            ControlMessage::ClientStats {
+                window_ms,
+                frames_received,
+                incomplete_frames,
+                fragment_loss_events,
+                rtt_us,
+                fec_recovered_frames,
+                fec_recovered_fragments,
+            } => {
+                assert_eq!(window_ms, 1001);
+                assert_eq!(frames_received, 62);
+                assert_eq!(incomplete_frames, 3);
+                assert_eq!(fragment_loss_events, 5);
+                assert_eq!(rtt_us, 7000);
+                assert_eq!(fec_recovered_frames, 7);
+                assert_eq!(fec_recovered_fragments, 11);
+                break;
+            }
+            other => panic!("expected ClientStats, got {other:?}"),
+        }
     }
 }
 

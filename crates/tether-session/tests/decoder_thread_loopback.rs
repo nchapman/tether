@@ -109,6 +109,7 @@ async fn pframes_flow_through_full_chain_to_latest_frame() {
             body,
             host_in_client_clock: MonoNanos::now(),
             keyframe: i == 0,
+            stream_epoch: 0,
         };
         let c = worker.process_job(job, MonoNanos::now());
         assert!(!c.decode_err);
@@ -156,6 +157,7 @@ async fn render_drops_accounting_is_exact() {
             body: Bytes::from(vec![0u8; 32]),
             host_in_client_clock: MonoNanos::now(),
             keyframe: i == 0,
+            stream_epoch: 0,
         };
         let c = worker.process_job(job, MonoNanos::now());
         produced += 1;

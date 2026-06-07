@@ -52,15 +52,26 @@ impl HostSession {
     where
         S: FnOnce(&[VideoProfile]) -> Option<VideoProfile>,
     {
+        info!(
+            event = "handshake_start",
+            role = "host",
+            server = %cfg.server_name,
+            "waiting for client hello"
+        );
         let (client_hello, pending) = HostHandshake::new(channel).recv_client_hello().await?;
         let client_decode_profiles = parse_client_decode_profiles(&client_hello);
         info!(
+            event = "client_capabilities",
+            client = %client_hello.client_name,
             client_decode_profiles = ?client_decode_profiles,
             "client video decode capabilities"
         );
 
         let Some(chosen_profile) = selector(&client_decode_profiles) else {
             warn!(
+                event = "handshake_rejected",
+                client = %client_hello.client_name,
+                reason = "no_profile_intersection",
                 client_decode_profiles = ?client_decode_profiles,
                 "no video profile intersects host encode + client decode capabilities; ending session"
             );
@@ -85,6 +96,8 @@ impl HostSession {
         let channel = pending.send_server_hello(server_hello).await?;
 
         info!(
+            event = "handshake_accepted",
+            role = "host",
             client = %client_hello.client_name,
             negotiated_codec = ?chosen_profile.codec,
             negotiated_chroma = ?chosen_profile.chroma,

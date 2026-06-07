@@ -40,7 +40,7 @@ Full client log: `mind:~/Code/tether/client.log`. Host log: `~/Drive/Code/tether
 
 ## Why this matters
 
-Fragment loss this frequent on a quiet LAN is not expected. The application-level recovery (auto-IDR) is doing what it's designed to do, but it's papering over a real underlying issue. Before adding more bandaids (next-step plan is to carry IDR fragments on a reliable QUIC stream — see "Followup work" below), we should confirm whether the loss is genuine wire loss or whether something on the client is dropping packets before QUIC ever sees them.
+Fragment loss this frequent on a quiet LAN is not expected. The application-level recovery (auto-IDR) is doing what it's designed to do, but it's papering over a real underlying issue. The later protocol overhaul intentionally kept IDR and P-frames on one datagram channel and added per-block FEC so IDRs cannot overtake their dependent P-frames. With that design in place, the remaining question is whether loss is genuine wire loss or whether something on the client is dropping packets before QUIC ever sees them.
 
 The "video and mouse freeze together" symptom is the most diagnostic clue. Video flows over **unreliable QUIC datagrams**; mouse flows over a **reliable QUIC stream**. Different transport primitives. If both freeze simultaneously, the cause is either:
 - **Below QUIC**: the actual network is dropping packets / WiFi is unhealthy / the OS UDP socket queue is overflowing
@@ -133,7 +133,7 @@ If the freezes don't happen with ffmpeg logging suppressed, the av_log bridge is
 
 These are real improvements regardless of what we find above, but should be informed by what we learn:
 
-1. **Carry IDR fragments on a reliable QUIC stream.** Today every video fragment rides an unreliable datagram. If an IDR loses one fragment, the entire frame is dropped and the decoder stays stuck until another IDR arrives. Marking the keyframes as reliable would make loss-recovery deterministic (one round trip) instead of stochastic. Sketch: `VideoPacket::First` for a keyframe gets sent via `conn.send_uni` on a fresh stream; P-frames stay on datagrams. Receiver-side reassembly already keys on `frame_seq`. ~100 lines split between `tether-transport` and the host's fragmenter.
+1. **Unified video datagram + FEC overhaul — done.** IDR and P-frames now ride the same unreliable datagram channel, and the fragmenter emits per-block Reed-Solomon parity so large IDRs stay loss-protected without adding a reliable side channel. The rejected reliable-IDR-stream sketch would reintroduce cross-channel ordering hazards, so future recovery work should tune FEC/recovery policy rather than split keyframes back out.
 
 2. **Move av_log formatting off the decoder thread** (mentioned in hypothesis 3). Right thing to do regardless — synchronous tracing in an FFmpeg callback is a latency footgun.
 

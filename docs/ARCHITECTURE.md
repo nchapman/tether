@@ -20,18 +20,20 @@ biplanar 16 / packed XYUV layouts cover the IOSurface and dma-buf
 shapes each profile produces, verified by the four
 `iosurface_zero_copy_roundtrip_*` tests in
 `tether-render/src/iosurface_test.rs`. **Windows host** (DXGI Desktop
-Duplication capture → D3D11 Video Processor BGRA→NV12 → vendor-selected
-hardware encode) and a **Windows client** decode→render path are wired
-end-to-end and verified in a live loopback session. Encode picks the
-backend from the DXGI adapter's PCI vendor — Intel→QSV, AMD→AMF,
-NVIDIA→NVENC — with Media Foundation as the vendor-agnostic fallback;
-4:2:0 only (the Video Processor has no 4:4:4 output path, so Windows
-never advertises 4:4:4). **System-output audio** is wired end-to-end
-on all three platforms — capture (Linux PipeWire sink monitor, macOS
-ScreenCaptureKit, Windows WASAPI loopback) → Opus → unreliable
-datagrams → cpal playback (see `tether-audio` and the audio packet
-below). See `docs/CODEC_CAPABILITIES.md` for the Windows capture/encode
-layers and their per-backend limits.
+Duplication capture → D3D11 Video Processor BGRA→NV12/P010 →
+vendor-selected hardware encode) and a **Windows client** decode→render
+path are wired end-to-end and verified in live loopback sessions. Encode
+picks the backend from the DXGI adapter's PCI vendor — Intel→QSV,
+AMD→AMF, NVIDIA→NVENC — with Media Foundation as the vendor-agnostic
+fallback; 4:2:0 only (the Video Processor has no 4:4:4 output path, so
+Windows never advertises 4:4:4). AV1 4:2:0 sits above HEVC 4:2:0 in the
+preference order and is selected when both sides advertise it.
+**System-output audio** is wired end-to-end on all three platforms —
+capture (Linux PipeWire sink monitor, macOS ScreenCaptureKit, Windows
+WASAPI loopback) → Opus → unreliable datagrams → cpal playback (see
+`tether-audio` and the audio packet below). See
+`docs/CODEC_CAPABILITIES.md` for the Windows capture/encode layers and
+their per-backend limits.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -50,17 +52,22 @@ tether/
 └── crates/
     ├── tether-protocol      # wire format, no I/O. Pure types + framing.
     ├── tether-transport     # QUIC server + client (quinn-backed) + role traits (ControlChannel etc.) for loopback testing
-    ├── tether-capture       # screen capture: PipeWire (Linux), test pattern
-    ├── tether-codec         # Encoder + Decoder traits; H.264 SW + VAAPI
+    ├── tether-capture       # screen capture: PipeWire, SCK, DXGI, test pattern
+    ├── tether-codec         # Encoder + Decoder traits; VAAPI/VT/D3D11/NVENC/NVDEC
+    ├── tether-audio         # system-output capture, Opus, playback/recovery
     ├── tether-gpuconvert    # host-side BGRA→NV12 compute + DMA-BUF export
-    ├── tether-render        # client-side wgpu renderer (NV12 → window)
+    ├── tether-render        # client-side wgpu / native D3D11 renderers
+    ├── tether-scaler        # GPU/CPU scaling kernels + test references
     ├── tether-input         # keyboard/mouse capture (client) + injection (host)
     ├── tether-session       # HostSession/ClientSession handshake + IDR coalescing + stats
+    ├── tether-probe         # codec/profile capability probes + preference policy
+    ├── tether-pairing       # host/client pairing state
+    ├── tether-ipc           # shell ↔ engine JSON-lines protocol
     └── tether-vaapi         # hand-rolled libva FFI (vaExportSurfaceHandle etc.)
 ```
 
-Two binaries, nine library crates. `tether-protocol` has no I/O at
-all — it's the contract both sides speak. Every other crate is
+Two binaries plus focused library crates. `tether-protocol` has no I/O
+at all — it's the contract both sides speak. Every other crate is
 single-purpose so a future platform backend lands as a sibling file in
 the relevant crate (e.g. `tether-capture/src/macos.rs`).
 
@@ -201,17 +208,19 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │         │   complete encoded frame                                  │
 │         ▼  (bounded crossbeam channel, capacity 8)                  │
 │   tether-decode::run::run_thread (owns the Decoder)                 │
-│     • VAAPI submit + drain                                          │
+│     • first decoded output is gated on an IDR so startup never       │
+│       presents a dependent P-frame before its reference chain        │
+│     • platform submit + drain: VAAPI/NVDEC, VideoToolbox, or D3D11VA│
 │     • classified error recovery: Flush (cheap) → Rebuild            │
 │       (REBUILD_BUDGET=10) → Idr (request from host); rate-limited   │
 │       at IDR_RATE_LIMIT (500ms) so a decode-error storm can't pin   │
 │       the encoder. NO_OUTPUT_WATCHDOG=1500ms triggers Idr on        │
 │       silent decoder stalls.                                        │
-│     • vaSyncSurface + vaExportSurfaceHandle → DRM_PRIME             │
-│     • NVIDIA clients: tether-codec::nvdec::NvdecDecoder instead     │
-│       (no VAAPI fallback); NVDEC → CUDA surface → EGLImage-import   │
-│       an NV12/P010 pool dma-buf → cuMemcpy2D planes in; same        │
-│       Frame::Gpu(DmaBuf) handoff (Main/Main10; 4:4:4 not advertised)│
+│     • stream_epoch advance rebuilds the decoder before decode;      │
+│       stale/too-chatty epoch frames are dropped and counted          │
+│     • GPU frame export: VAAPI → DRM_PRIME dma-buf; NVDEC → CUDA     │
+│       surface → EGLImage-backed NV12/P010 dma-buf; VideoToolbox →   │
+│       IOSurface; D3D11VA → shared NT handle for native D3D11 render │
 │         │   Frame::Gpu(GpuFrame { DmaBuf { fd, stride, modifier } })│
 │         ▼  (LatestFrame single-slot drop-oldest)                    │
 │   tether-render::gpu                                                │
@@ -234,20 +243,21 @@ is ~20-25 ms including the ~10 ms present scheduler wait.
 **Threading model on the client.** Three concurrent owners on the
 critical path: the recv tokio task (QUIC poll + reassemble + hand off
 to decoder), a dedicated `std::thread` named `tether-decode` running
-`tether_decode::run::run_thread` (owns the VAAPI decoder, classified
-error recovery, and the auto-IDR rate-limit; the host-recovery seam
-is an injected `request_idr: Arc<dyn Fn() + Send + Sync>` callback
-plus a `warnings: Arc<dyn Fn() -> u64>` reader so the run-thread is
-backend- and transport-agnostic and loopback-testable), and winit's
-main thread running the wgpu render loop. Communication is via crossbeam channels
-(recv→decode is bounded(8) so decoder backpressure shows up as
-`decode_queue_drops` rather than starving the recv loop;
-decode→stats is unbounded, drained non-blocking once per recv
-iteration) and the `LatestFrame` single-slot mutex for the
-decode→render handoff. A GPU-driver stall inside libavcodec/libva
-(`vaSyncSurface`, `vaExportSurfaceHandle`) is contained to the decode
-thread — the recv loop keeps polling QUIC and the input-send task
-keeps responding.
+`tether_decode::run::run_thread` (owns the platform decoder, classified
+error recovery, stream-epoch rebuilds, and the auto-IDR rate-limit; the
+host-recovery seam is an injected `request_idr: Arc<dyn Fn() + Send +
+Sync>` callback plus a `warnings: Arc<dyn Fn() -> u64>` reader so the
+run-thread is backend- and transport-agnostic and loopback-testable),
+and winit's main thread running the renderer. Communication is via
+crossbeam channels (recv→decode is bounded(8) so decoder backpressure
+shows up as `decode_queue_drop_frames` rather than starving the recv
+loop; decode→stats is an unbounded `DecodeEvent` channel drained
+non-blocking on each completed recv frame, on a 100 ms idle tick, and
+before final stats snapshots) and the `LatestFrame` single-slot mutex
+for the decode→render handoff. A GPU-driver stall inside libavcodec /
+the hardware API (`vaSyncSurface`, `vaExportSurfaceHandle`, D3D11VA, or
+VideoToolbox) is contained to the decode thread — the recv loop keeps
+polling QUIC and the input-send task keeps responding.
 
 **Threading model on the host.** Capture + encode + send live on a
 dedicated `std::thread` (`tether-host-send`). Every frame — IDR and
@@ -477,7 +487,8 @@ its own QUIC primitive:
 - **Control** (reliable, bidirectional) — length-prefixed protobuf
   messages under the `tether.v1` schema. Handshake (`ClientHello` /
   `ServerHandshake`), `Goodbye` (with machine-readable
-  `GoodbyeCode`), `ForceIdr`, `ClockProbe*`, cursor shapes
+  `GoodbyeCode` and final session stats summary), `ForceIdr`,
+  `ClockProbe*`, cursor shapes
   (`CursorShape` / `CursorUseShape`), display topology
   (`DisplayList` / `SetActiveDisplays`), stream lifecycle
   (`StreamReady` / `StreamPause` / `StreamResume`), receiver
@@ -619,9 +630,11 @@ list:
 1. HEVC 4:4:4 10-bit (desktop-quality top rung — preserves text and UI
    chroma detail and adds precision).
 2. HEVC 4:4:4 8-bit.
-3. HEVC 4:2:0 10-bit (Main10).
-4. HEVC 4:2:0 8-bit.
-5. H.264 4:2:0 8-bit (universal floor; H.264 4:4:4 is absent because
+3. AV1 4:2:0 10-bit.
+4. AV1 4:2:0 8-bit.
+5. HEVC 4:2:0 10-bit (Main10).
+6. HEVC 4:2:0 8-bit.
+7. H.264 4:2:0 8-bit (universal floor; H.264 4:4:4 is absent because
    VAAPI has no encode profile for it).
 
 The chosen profile, pixel format, color spec, display id, and video
@@ -663,15 +676,18 @@ driver (fixture IDRs ship in `crates/tether-probe/fixtures/probe/`;
 the `ProfileProbe` trait is in `crates/tether-probe/src/profile_probe.rs`).
 On Linux the round trip pulls in `tether-gpuconvert` to produce a
 real dma-buf, which is the architectural reason this crate exists —
-the codec layer can't depend on gpuconvert without a cycle. Empirical results on M-series Apple Silicon:
-VideoToolbox has no HEVC Main 4:4:4 *encode* path (so macOS hosts
-never advertise 4:4:4 — the intersection lands on HEVC 4:2:0 or H.264
-4:2:0), but the *decode* path produces a `'444v'` NV24 IOSurface and
-the renderer's biplanar import handles it. A Linux→Mac session can
-therefore negotiate HEVC 4:4:4 even though Mac→anything cannot. On
-Linux, VAAPI driver capabilities vary; the probe catches
-driver-specific 4:4:4 gaps that a codec-keyed construction probe
-would miss.
+the codec layer can't depend on gpuconvert without a cycle. Empirical
+results on M-series Apple Silicon: VideoToolbox has no HEVC Main 4:4:4
+*encode* path (so macOS hosts never advertise 4:4:4 — the intersection
+lands on HEVC 4:2:0 or H.264 4:2:0), but the *decode* path produces a
+`'444v'` NV24 IOSurface and the renderer's biplanar import handles it.
+A Linux→Mac session can therefore negotiate HEVC 4:4:4 even though
+Mac→anything cannot. AV1 decode on macOS is probe-driven and only
+advertised on hardware/OS combinations where the VideoToolbox fixture
+decode and renderer import pass; macOS hosts do not advertise AV1 encode
+because FFmpeg ships no `av1_videotoolbox` encoder. On Linux,
+VAAPI/NVENC driver capabilities vary; the probe catches driver-specific
+4:4:4 and AV1 gaps that a codec-keyed construction probe would miss.
 
 **Bitrate is chroma-aware.** `derive_bitrate_kbps` takes a
 `VideoProfile` and applies a 1.4× multiplier for `Yuv444` on top of
@@ -692,14 +708,21 @@ a driver starts accepting the planar path.
 Four non-negotiable invariants tracked end-to-end:
 
 1. **Clock sync.** An explicit post-handshake probe measures RTT and
-   computes a `MonoNanos` offset between host and client clocks. Every video fragment carries
-   `HostFrameTiming { t_capture_kernel, t_capture_userspace,
+   computes a `MonoNanos` offset between host and client clocks. The
+   initial sync sends `CLOCK_SYNC_PROBE_SAMPLES` probes and chooses the
+   minimum-RTT sample; the client repeats the same burst every 30 s so
+   long-running sessions recover from clock drift or sleep/wake. Every
+   video fragment carries `HostFrameTiming { t_capture_kernel, t_capture_userspace,
    t_encode_submit, t_encode_done }` so the client can attribute
    end-to-end latency to each pipeline segment in its own clock.
 2. **Stream epoch.** Resolution changes (display reconfig, future
    monitor handoff) bump the epoch and force a fresh IDR. The
    defragmenter discards any pre-epoch fragments still in flight,
-   preventing fusion of a partial old frame with a new one.
+   preventing fusion of a partial old frame with a new one. The decode
+   run-thread also rebuilds the decoder before submitting the first
+   frame of a newer epoch and reports `decode_stale_epoch_drop_frames`
+   / `decode_epoch_throttle_drop_frames` when late or noisy epoch
+   traffic is discarded.
 3. **On-demand IDR.** Client can request a keyframe at any time via
    `ControlMessage::ForceIdr` or `ControlMessage::RequestRecovery
    { last_reassembled_frame_id }`. The host swap-and-zeros an
@@ -725,14 +748,15 @@ Four non-negotiable invariants tracked end-to-end:
    high-water mark, logged for diagnostics only — it is **not**
    decode-verified and must not select an encoder reference (see
    the `RequestRecovery` doc + CODEC_CAPABILITIES.md).
-4. **Self-decodable IDRs.** Every keyframe carries its own codec
-   parameter sets (SPS/PPS for H.264, VPS+SPS+PPS for HEVC).
-   Achieved by setting `AV_CODEC_FLAG_GLOBAL_HEADER` on the VAAPI
-   encoder so libavcodec stashes parameter sets in `extradata` at
-   `open()`, and prepending `extradata` to every keyframe packet
-   inside `drain_encoder`. Without this, only the encoder's very
-   first packet would carry parameter sets, and a client that loses
-   that first IDR or rebuilds its decoder mid-session is stuck.
+4. **Self-decodable keyframes.** Every keyframe carries the codec
+   headers a fresh decoder needs: SPS/PPS for H.264, VPS+SPS+PPS for
+   HEVC, and AV1 sequence headers in-band. Achieved by setting
+   `AV_CODEC_FLAG_GLOBAL_HEADER` where the backend exposes `extradata`
+   and prepending that data to every keyframe packet inside
+   `drain_encoder`; AV1 backends that emit sequence headers in-band keep
+   the empty-extradata path valid. Without this, only the encoder's very
+   first packet would carry parameter sets, and a client that loses that
+   first keyframe or rebuilds its decoder mid-session is stuck.
 
 ---
 
@@ -802,16 +826,19 @@ Listed to set expectations; each is a real follow-up, not a "never":
   vendor-selected encode) and client (D3D11VA decode → native D3D11
   render) are wired and loopback-verified, with the decoder exporting
   GPU-resident shared-handle frames (no CPU download, no wgpu/Vulkan
-  bridge) at 4:2:0 8-bit (NV12) and 10-bit (P010 / Main10). What's still
+  bridge) at 4:2:0 8-bit (NV12) and 10-bit (P010 / Main10), including
+  H.264, HEVC, and AV1 where the hardware supports it. What's still
   open: there is no 4:4:4 encode path (the Video Processor only outputs
   4:2:0); cross-device decode→present sync currently relies on the
   handoff latency rather than a shared device, validated on shared iGPUs
   (discrete GPUs may need the single-device model — see the
   `import_shared_biplanar` note).
-- **AV1.** H.264 and HEVC are supported; AV1 needs a different VAAPI
-  decoder probe (no `vaapi_av1` encode entrypoint on most current
-  Intel iGPUs) and a separate codec_id path. The probe stub returns
-  `CodecNotFound` for AV1 today.
+- **AV1 remaining gaps.** AV1 4:2:0 8/10-bit is wired in the preference
+  list and exercised on Linux/Windows when the live probes or backend
+  gates support it. Remaining gaps are profile-shaped, not protocol-
+  shaped: no AV1 4:4:4 encode/render path, no macOS AV1 encode path, and
+  macOS AV1 decode stays probe/hardware-test gated by the VideoToolbox
+  fixture path.
 - **HDR (BT.2020 + PQ / HLG).** The 10-bit *bit-depth* path is in
   place at every layer (see `docs/CODEC_CAPABILITIES.md`):
   `PROFILE_PREFERENCE` advertises HEVC Main10 and HEVC Main 4:4:4
@@ -851,7 +878,7 @@ Listed to set expectations; each is a real follow-up, not a "never":
 - **Audio: remaining gaps.** System-output capture → Opus → playback is
   wired on all three platforms and negotiated via the typed
   `ServerHello::audio` field, but there is no user-facing control yet — audio is
-  on whenever both peers support it (host `--no-audio` opts out). A
+  on whenever both peers support it (host/client `--no-audio` opts out). A
   per-session mute/volume toggle waits on the user-prefs work. No
   microphone / client → host audio path; system output only. Network
   loss is handled by RFC-2198 RED (depth-2, covering a short 2-frame
@@ -872,10 +899,6 @@ Listed to set expectations; each is a real follow-up, not a "never":
 - **Wgpu device-loss recovery on the client.** A driver crash today
   exits the client process. A single rebuild attempt before fatal
   exit would be a UX win.
-- **Periodic clock re-probe.** The handshake measures one offset; on a
-  long-running session (thermal drift, laptop sleep/wake) the offset
-  could drift. `ClockProbeRequest` exists but nothing initiates
-  re-probes. For sub-minute sessions, fine.
 - **Wraparound safety for `frame_seq` / `stream_epoch`.** Both are
   `u32` with `wrapping_add`; at 60 fps it'd take 828 days to wrap
   `frame_seq` and 2^32 encoder restarts for `stream_epoch`. Not

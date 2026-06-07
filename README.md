@@ -13,9 +13,13 @@ and [Sunshine](https://github.com/LizardByte/Sunshine).
   encode + CGEvent input; VideoToolbox decode + Metal render.
 - **Windows** host and client — DXGI Desktop Duplication capture +
   vendor-selected D3D11 encode (QSV / AMF / NVENC, Media Foundation
-  fallback) + D3D11VA decode; loopback-verified, 4:2:0 only.
+  fallback) + D3D11VA decode; loopback-verified, 4:2:0 only, with
+  AV1 / HEVC / H.264 selected by negotiated hardware support.
 
-Audio is deferred on all platforms.
+System-output audio is wired end-to-end on all three platforms: host capture
+is Opus-encoded onto unreliable datagrams and the client plays it through a
+low-latency jitter ring. It is on by default when both peers support it; host
+`--no-audio` and client `--no-audio` opt out.
 
 ## Install
 

@@ -51,6 +51,18 @@ pub const REBUILD_BUDGET: u32 = 10;
 /// escalates to a rebuild on the second.
 pub const NO_OUTPUT_WATCHDOG: Duration = Duration::from_millis(1500);
 
+/// Minimum spacing between epoch-driven decoder rebuilds. An epoch bump means
+/// the host changed resolution / codec / hw-context; each rebuild tears down
+/// and recreates the hardware decode session (D3D11VA on Windows, VAAPI on
+/// Linux, VideoToolbox on macOS), which is fragile under rapid churn on some
+/// drivers (e.g. AMD RDNA 4). Legitimate resizes
+/// are already debounced ~150 ms client-side, so this only bites a host that
+/// bumps the epoch every frame (drag-resize edge or a misbehaving host): such
+/// new-epoch frames are dropped until the window passes, then we rebuild to the
+/// newest epoch. Below the 150 ms viewport debounce so normal resizes never
+/// drop.
+pub const EPOCH_REBUILD_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
 /// One frame's worth of work handed from the recv (tokio) task to the
 /// decode (std::thread) worker. Keeping `host_in_client_clock` here
 /// (already translated through clock_sync on the recv side) lets the
@@ -64,6 +76,14 @@ pub struct DecodeJob {
     /// skip non-IDR frames after a decoder rebuild — a fresh decoder
     /// has no parameter sets and will fail on P-frames.
     pub keyframe: bool,
+    /// Wire `stream_epoch` this frame belongs to. The host bumps it on a
+    /// resolution / codec / hw-context change (see `VideoPacket`); when it
+    /// changes, the decode worker rebuilds the decoder so the new-epoch IDR
+    /// lands in a fresh context. Feeding a mid-stream resolution change into
+    /// a running D3D11VA AV1 decoder corrupts/crashes it on some GPUs
+    /// (observed: AMD RDNA 4), so a clean rebuild is required, not an
+    /// in-place reconfigure.
+    pub stream_epoch: u32,
 }
 
 /// Per-frame metrics shipped back from the decode thread to the recv
@@ -84,6 +104,20 @@ pub struct DecodeCompletion {
     pub recovery: Option<RecoveryAction>,
 }
 
+/// Message emitted by the decode thread to the recv loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeEvent {
+    /// A job reached [`Worker::process_job`]; fold into decode latency and
+    /// recovery stats.
+    Completion(DecodeCompletion),
+    /// A reassembled frame was intentionally discarded before decode because
+    /// its stream epoch could not be submitted to the current decoder.
+    EpochDrop {
+        reason: EpochDropReason,
+        stream_epoch: u32,
+    },
+}
+
 /// What the worker is asking the run-thread to do beyond the
 /// per-job rate-limited `request_idr` callback. Carried back inside
 /// [`DecodeCompletion::recovery`] so the loop can branch on it
@@ -96,6 +130,32 @@ pub enum RecoveryAction {
     /// instance back via [`Worker::replace_decoder`]. Subject to
     /// [`REBUILD_BUDGET`].
     Rebuild,
+}
+
+/// What the run-loop should do with a job given its wire `stream_epoch`,
+/// returned by [`Worker::classify_epoch`]. The epoch is host-monotonic, so it
+/// is treated as a high-water mark: only a forward advance rebuilds; an older
+/// epoch is a late straggler and must never reach the (new-resolution) decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochAction {
+    /// Same epoch as the current decoder — decode normally.
+    Decode,
+    /// Epoch advanced — rebuild the decoder, then decode this (new-epoch) frame.
+    Rebuild,
+    /// Drop without decoding. Carries the reason so stats can distinguish a
+    /// harmless late straggler from resize/reconfigure churn.
+    Drop(EpochDropReason),
+}
+
+/// Why an epoch-classified job was dropped before decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochDropReason {
+    /// Older than the decoder epoch high-water mark; typically a late FEC
+    /// completion from before a resize/reconfigure.
+    Stale,
+    /// Newer than the decoder epoch, but arrived inside
+    /// [`EPOCH_REBUILD_MIN_INTERVAL`]; dropped to bound hardware-context churn.
+    RebuildRateLimited,
 }
 
 /// Per-thread mutable state plus its injected dependencies.
@@ -140,6 +200,14 @@ pub struct Worker {
     /// un-honoured initial IDR can't strand the stream indefinitely;
     /// reset to 0 when an IDR finally arrives.
     awaiting_idr_discards: u64,
+    /// Highest wire `stream_epoch` seen (host-monotonic high-water mark). The
+    /// host bumps it on a resolution / codec / hw-context change; an advance
+    /// means the decoder must be rebuilt before the new-epoch IDR is fed in
+    /// (see [`Self::classify_epoch`]). `None` until the first job.
+    current_epoch: Option<u32>,
+    /// When the last epoch-driven rebuild happened, to rate-limit rebuilds
+    /// (see [`EPOCH_REBUILD_MIN_INTERVAL`]). `None` until the first job.
+    last_epoch_rebuild: Option<MonoNanos>,
 }
 
 impl Worker {
@@ -164,7 +232,73 @@ impl Worker {
             watchdog_armed: false,
             awaiting_idr: false,
             awaiting_idr_discards: 0,
+            current_epoch: None,
+            last_epoch_rebuild: None,
         }
+    }
+
+    /// Classify a job by its wire `stream_epoch` against the current decoder's
+    /// epoch, deciding whether to decode, rebuild-then-decode, or drop.
+    ///
+    /// The epoch is host-monotonic (bumped on a resolution / codec / hw-context
+    /// change), so it is a high-water mark:
+    ///   - **Same** epoch → [`EpochAction::Decode`].
+    ///   - **Advance** → [`EpochAction::Rebuild`]: rebuild the decoder BEFORE
+    ///     submitting, so the new-resolution IDR initialises a fresh decoder
+    ///     rather than forcing an in-place reconfigure (which corrupts/crashes
+    ///     the D3D11VA AV1 decoder on AMD RDNA 4). Rate-limited by
+    ///     [`EPOCH_REBUILD_MIN_INTERVAL`]: an advance arriving too soon after
+    ///     the last rebuild is **dropped** (not latched), so a host bumping the
+    ///     epoch every frame can't drive unbounded device churn — a later frame
+    ///     rebuilds to the newest epoch once the window passes.
+    ///   - **Older** epoch → [`EpochAction::Drop`]: a late straggler (e.g. a
+    ///     FEC-completed pre-resize frame). It must never reach the
+    ///     new-resolution decoder. The reassembler keys per epoch and has no
+    ///     global watermark, so these can be delivered after an advance.
+    ///
+    /// The first job is always `Decode` (no prior epoch to compare). On a
+    /// `Rebuild` the high-water mark is NOT advanced here — the caller must
+    /// call [`Self::confirm_epoch_rebuilt`] *after* the decoder is actually
+    /// rebuilt, so a failed rebuild can't strand `current_epoch` ahead of the
+    /// decoder and let the next same-epoch frame decode on the wrong context.
+    pub fn classify_epoch(&mut self, epoch: u32, now: MonoNanos) -> EpochAction {
+        match self.current_epoch {
+            None => {
+                // First job: establish the baseline. The initial decoder
+                // already exists, so this is a Decode, not a Rebuild.
+                self.current_epoch = Some(epoch);
+                self.last_epoch_rebuild = Some(now);
+                EpochAction::Decode
+            }
+            Some(cur) if epoch == cur => EpochAction::Decode,
+            // Wrap-safe forward compare: `epoch` is newer than `cur`.
+            Some(cur) if epoch.wrapping_sub(cur) < u32::MAX / 2 => {
+                // EPOCH_REBUILD_MIN_INTERVAL is a small constant; nanos fit u64.
+                #[allow(clippy::cast_possible_truncation)]
+                let min_interval_ns = EPOCH_REBUILD_MIN_INTERVAL.as_nanos() as u64;
+                if self
+                    .last_epoch_rebuild
+                    .is_some_and(|t| now.saturating_sub(t) < min_interval_ns)
+                {
+                    // Too soon after the last rebuild — drop without latching so
+                    // a later frame still rebuilds to the newest epoch.
+                    return EpochAction::Drop(EpochDropReason::RebuildRateLimited);
+                }
+                // Latching deferred to `confirm_epoch_rebuilt` (after success).
+                EpochAction::Rebuild
+            }
+            // `epoch` older than the high-water mark: a late straggler.
+            Some(_) => EpochAction::Drop(EpochDropReason::Stale),
+        }
+    }
+
+    /// Advance the epoch high-water mark after a successful epoch-driven
+    /// rebuild (the [`EpochAction::Rebuild`] arm of [`Self::classify_epoch`]).
+    /// Kept separate so the mark only moves once the decoder for the new epoch
+    /// actually exists — a `build_decoder` failure leaves the mark unchanged.
+    pub fn confirm_epoch_rebuilt(&mut self, epoch: u32, now: MonoNanos) {
+        self.current_epoch = Some(epoch);
+        self.last_epoch_rebuild = Some(now);
     }
 
     /// Gate the worker on its first IDR before any P-frame is fed.
@@ -194,6 +328,12 @@ impl Worker {
         self.watchdog_armed = false;
         self.awaiting_idr = true;
         self.awaiting_idr_discards = 0;
+        // Clear the IDR rate-limiter: a fresh decoder must be able to
+        // re-request its keyframe immediately. Without this, a rebuild that
+        // lands inside the 500 ms window of a prior request (e.g. a resize
+        // right after a recovery IDR) would sit gated awaiting an IDR it isn't
+        // allowed to re-request yet.
+        self.last_idr_request = None;
         // `last_successful_decode` stays as-is: the watchdog clock
         // shouldn't reset just because we rebuilt; if the rebuild
         // doesn't produce a frame either, we want the *original*
@@ -478,7 +618,7 @@ impl Worker {
 pub fn run_thread(
     profile: VideoProfile,
     job_rx: XbReceiver<DecodeJob>,
-    completion_tx: XbSender<DecodeCompletion>,
+    completion_tx: XbSender<DecodeEvent>,
     frames: LatestFrame,
     request_idr: Arc<dyn Fn() + Send + Sync + 'static>,
     warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static>,
@@ -510,7 +650,7 @@ pub fn run_thread_with_init(
     profile: VideoProfile,
     decoder_init: Result<Box<dyn tether_codec::Decoder>, CodecError>,
     job_rx: XbReceiver<DecodeJob>,
-    completion_tx: XbSender<DecodeCompletion>,
+    completion_tx: XbSender<DecodeEvent>,
     frames: LatestFrame,
     request_idr: Arc<dyn Fn() + Send + Sync + 'static>,
     warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static>,
@@ -556,12 +696,53 @@ pub fn run_thread_with_init(
             let mut rebuilds_used: u32 = 0;
             while let Ok(job) = job_rx.recv() {
                 let now = MonoNanos::now();
+                // Classify by wire epoch BEFORE submitting. An advance means the
+                // host changed resolution/codec/hw-context: rebuild so the
+                // new-resolution IDR initialises a clean decoder instead of
+                // forcing an in-place reconfigure (which corrupts/crashes the
+                // D3D11VA AV1 decoder on AMD RDNA 4). Distinct from the
+                // failure-driven rebuild below and not subject to its budget —
+                // epoch changes are expected (resizes), not faults.
+                match worker.classify_epoch(job.stream_epoch, now) {
+                    EpochAction::Decode => {}
+                    EpochAction::Rebuild => match build_decoder(profile, gpu_export) {
+                        Ok(new) => {
+                            info!(
+                                new_epoch = job.stream_epoch,
+                                backend = new.name(),
+                                "stream epoch advanced; rebuilt decoder for clean reconfigure"
+                            );
+                            worker.replace_decoder(new);
+                            // Advance the high-water mark only now that the new
+                            // decoder exists (see `classify_epoch`).
+                            worker.confirm_epoch_rebuilt(job.stream_epoch, now);
+                        }
+                        Err(e) => {
+                            error!(error = %e, "decoder rebuild on epoch change failed; exiting decode thread");
+                            break;
+                        }
+                    },
+                    EpochAction::Drop(reason) => {
+                        // Old-epoch straggler, or a new-epoch frame inside the
+                        // rebuild rate-limit window. Don't feed it to the
+                        // decoder and don't emit a DecodeCompletion, because
+                        // completions are the avg/min/max decode-latency
+                        // divisor. Emit a separate event so live stats still
+                        // explain why recv frames did not become decode work.
+                        let _ = completion_tx.send(DecodeEvent::EpochDrop {
+                            reason,
+                            stream_epoch: job.stream_epoch,
+                        });
+                        continue;
+                    }
+                }
+
                 let completion = worker.process_job(job, now);
                 let recovery = completion.recovery;
                 // Send completion. If the recv loop has exited, the
                 // receiver is dropped — that's expected at session
                 // end; ignore.
-                let _ = completion_tx.send(completion);
+                let _ = completion_tx.send(DecodeEvent::Completion(completion));
 
                 if matches!(recovery, Some(RecoveryAction::Rebuild)) {
                     if rebuilds_used >= REBUILD_BUDGET {
@@ -618,7 +799,10 @@ fn body_starts_with_parameter_sets(body: &[u8]) -> bool {
         } else {
             None
         };
-    let Some(b) = nalu_byte else { return false };
+    // No Annex-B start code → not HEVC/H.264; try AV1 OBU framing instead.
+    let Some(b) = nalu_byte else {
+        return av1_has_sequence_header(body);
+    };
     // HEVC: VPS = type 32, first byte = (32 << 1) | 0 = 0x40.
     // NALU type is bits [6:1] of the first byte.
     let hevc_type = (b >> 1) & 0x3F;
@@ -629,4 +813,55 @@ fn body_starts_with_parameter_sets(body: &[u8]) -> bool {
     // NALU type is bits [4:0] of the first byte.
     let h264_type = b & 0x1F;
     h264_type == 7 || h264_type == 8
+}
+
+/// True if an AV1 low-overhead bitstream carries a sequence-header OBU (type 1)
+/// near the start — the in-band parameter set a keyframe temporal unit always
+/// includes. AV1 has no Annex-B start codes, and AMF / VAAPI don't reliably set
+/// the wire keyframe flag, so this is the AV1 analog of the HEVC/H.264 NAL check
+/// that lets the worker recognise an IDR even when the flag is missing. Bounded
+/// scan of the first few OBUs. OBU header: bit7 forbidden, bits6-3 type, bit2
+/// extension, bit1 has_size, bit0 reserved; optional 1-byte extension; leb128
+/// size.
+fn av1_has_sequence_header(body: &[u8]) -> bool {
+    let mut i = 0usize;
+    // A keyframe TU leads with a temporal delimiter then the sequence header;
+    // a handful of OBUs is plenty — don't walk the whole frame.
+    for _ in 0..4 {
+        let Some(&hdr) = body.get(i) else {
+            return false;
+        };
+        if hdr & 0x80 != 0 {
+            return false; // forbidden bit set — not a valid OBU stream
+        }
+        let obu_type = (hdr >> 3) & 0x0f;
+        if obu_type == 1 {
+            return true; // OBU_SEQUENCE_HEADER
+        }
+        let ext = (hdr >> 2) & 1 == 1;
+        let has_size = (hdr >> 1) & 1 == 1;
+        if !has_size {
+            return false; // can't advance without sizes
+        }
+        let mut p = i + 1 + usize::from(ext);
+        // leb128 OBU size.
+        let mut size = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let Some(&byte) = body.get(p) else {
+                return false;
+            };
+            p += 1;
+            size |= ((byte & 0x7f) as usize) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 28 {
+                return false; // malformed / unbounded leb128
+            }
+        }
+        i = p.saturating_add(size);
+    }
+    false
 }

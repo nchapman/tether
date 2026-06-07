@@ -981,15 +981,47 @@ mod tests {
     #[test]
     fn round_trip_client_stats() {
         let msg = ControlMessage::ClientStats {
-            interval_ms: 1000,
+            window_ms: 1000,
             frames_received: 60,
-            frames_dropped: 2,
-            fragments_lost: 4,
-            rtt_ewma_us: 9_500,
+            incomplete_frames: 2,
+            fragment_loss_events: 4,
+            rtt_us: 9_500,
+            fec_recovered_frames: 1,
+            fec_recovered_fragments: 3,
         };
         let bytes = encode_reliable(&msg).unwrap();
         let msg2: ControlMessage = decode_reliable(&bytes).unwrap();
         assert_eq!(msg, msg2);
+    }
+
+    #[test]
+    fn client_stats_maps_named_fields_without_cross_wire_swap() {
+        use crate::pb::control_message::Kind;
+        use prost::Message as _;
+
+        let msg = ControlMessage::ClientStats {
+            window_ms: 1001,
+            frames_received: 62,
+            incomplete_frames: 3,
+            fragment_loss_events: 5,
+            rtt_us: 7000,
+            fec_recovered_frames: 7,
+            fec_recovered_fragments: 11,
+        };
+        let bytes = encode_reliable(&msg).unwrap();
+        let wire = pb::ControlMessage::decode(bytes.as_slice()).unwrap();
+        match wire.kind.expect("kind") {
+            Kind::ClientStats(stats) => {
+                assert_eq!(stats.window_ms, 1001);
+                assert_eq!(stats.frames_received, 62);
+                assert_eq!(stats.incomplete_frames, 3);
+                assert_eq!(stats.fragment_loss_events, 5);
+                assert_eq!(stats.rtt_us, 7000);
+                assert_eq!(stats.fec_recovered_frames, 7);
+                assert_eq!(stats.fec_recovered_fragments, 11);
+            }
+            other => panic!("expected ClientStats, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1068,6 +1100,7 @@ mod tests {
                 crate::pb::Goodbye {
                     reason: "future".into(),
                     code: 99,
+                    final_stats: None,
                 },
             )),
         };
@@ -1153,15 +1186,91 @@ mod tests {
         let g = ControlMessage::Goodbye {
             reason: "user quit".into(),
             code: GoodbyeCode::Clean,
+            final_stats: None,
         };
         let bytes = encode_reliable(&g).unwrap();
         let g2: ControlMessage = decode_reliable(&bytes).unwrap();
         match g2 {
-            ControlMessage::Goodbye { reason, code } => {
+            ControlMessage::Goodbye {
+                reason,
+                code,
+                final_stats,
+            } => {
                 assert_eq!(reason, "user quit");
                 assert_eq!(code, GoodbyeCode::Clean);
+                assert!(final_stats.is_none());
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn goodbye_carries_final_session_summary() {
+        let summary = SessionSummary {
+            role: "client".into(),
+            duration_ms: 1_234,
+            codec: "Hevc".into(),
+            chroma: "Yuv420".into(),
+            bit_depth: 10,
+            video: VideoSessionStats {
+                frames_sent: 0,
+                frames_received: 99,
+                keyframes: 2,
+                bytes_sent: 0,
+                bytes_received: 4_096,
+                incomplete_frames: 1,
+                fragment_loss_events: 3,
+                decode_errors: 4,
+                render_drop_frames: 5,
+                idr_requests: 6,
+                decode_queue_drop_frames: 7,
+                transient_send_drop_frames: 0,
+                fec_recovered_frames: 8,
+                fec_recovered_fragments: 9,
+                datagrams_sent: 10,
+                parity_datagrams_sent: 11,
+                max_datagrams_per_frame: 12,
+                max_frame_bytes: 13,
+                max_keyframe_bytes: 14,
+                forced_idr_misses: 15,
+                decode_stale_epoch_drop_frames: 16,
+                decode_epoch_throttle_drop_frames: 17,
+            },
+            audio: Some(AudioSessionStats {
+                packets_sent: 0,
+                packets_received: 88,
+                capture_frames: 0,
+                underruns: 1,
+                dropped_samples: 2,
+                recovered_frames: 3,
+                concealed_frames: 4,
+                dropout_frames: 5,
+                dropouts: 6,
+                stale_packets: 7,
+                decode_errors: 8,
+                decode_queue_drop_packets: 9,
+            }),
+        };
+        let msg = ControlMessage::Goodbye {
+            reason: "done".into(),
+            code: GoodbyeCode::Clean,
+            final_stats: Some(Box::new(summary.clone())),
+        };
+
+        let bytes = encode_reliable(&msg).unwrap();
+        let decoded: ControlMessage = decode_reliable(&bytes).unwrap();
+
+        match decoded {
+            ControlMessage::Goodbye {
+                reason,
+                code,
+                final_stats,
+            } => {
+                assert_eq!(reason, "done");
+                assert_eq!(code, GoodbyeCode::Clean);
+                assert_eq!(final_stats.as_deref(), Some(&summary));
+            }
+            other => panic!("expected Goodbye, got {other:?}"),
         }
     }
 
@@ -1544,6 +1653,7 @@ mod tests {
             .map(|(_, p)| p)
             .collect();
         let mut r = FrameReassembler::new();
+        let recovery_before = r.recovery_counters();
         let mut got = None;
         for p in kept {
             if let Some(f) = r.handle(p) {
@@ -1552,6 +1662,12 @@ mod tests {
         }
         let f = got.expect("reassembled via FEC");
         assert_eq!(f.body.as_ref(), body.as_ref());
+        let recovery_after = r.recovery_counters();
+        assert_eq!(recovery_after.0, recovery_before.0 + 1);
+        assert_eq!(
+            recovery_after.1,
+            recovery_before.1 + u64::try_from(parity_count).unwrap()
+        );
     }
 
     #[test]
@@ -1580,6 +1696,11 @@ mod tests {
             }
         }
         assert!(got.is_none(), "loss above parity must not reconstruct");
+        assert_eq!(
+            r.recovery_counters(),
+            (0, 0),
+            "failed partial recovery must not count as useful repair"
+        );
     }
 
     #[test]

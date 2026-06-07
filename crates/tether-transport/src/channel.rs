@@ -8,8 +8,8 @@
 //!   recv loops in both binaries.
 //! - [`InputChannel`] — the unidirectional input stream
 //!   (client → host).
-//! - [`VideoChannel`] — datagrams (unreliable) plus per-IDR
-//!   unidirectional streams (reliable).
+//! - [`VideoChannel`] — unreliable datagrams for all video, cursor,
+//!   and audio packets.
 //! - [`ConnectionInfo`] — observability handles (`rtt`,
 //!   `remote_address`, `max_datagram_size`). Kept off the channel
 //!   traits because it isn't a channel role — it's about the

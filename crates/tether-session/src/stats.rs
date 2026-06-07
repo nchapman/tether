@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 pub struct EncodeStatsWindow {
     frame_count: u64,
     encode_latency_sum_ns: u64,
+    encode_latency_min_ns: u64,
+    encode_latency_max_ns: u64,
     encoded_bytes_sum: u64,
+    max_frame_bytes: u64,
     keyframe_count: u32,
     started: Instant,
     interval: Duration,
@@ -31,7 +34,10 @@ impl EncodeStatsWindow {
         Self {
             frame_count: 0,
             encode_latency_sum_ns: 0,
+            encode_latency_min_ns: 0,
+            encode_latency_max_ns: 0,
             encoded_bytes_sum: 0,
+            max_frame_bytes: 0,
             keyframe_count: 0,
             started: Instant::now(),
             interval,
@@ -43,9 +49,16 @@ impl EncodeStatsWindow {
     /// (this crate doesn't depend on tether-protocol to keep the
     /// dependency cone tight).
     pub fn record_frame(&mut self, encode_delta_ns: u64, encoded_bytes: u64, keyframe: bool) {
+        if self.frame_count == 0 {
+            self.encode_latency_min_ns = encode_delta_ns;
+        } else {
+            self.encode_latency_min_ns = self.encode_latency_min_ns.min(encode_delta_ns);
+        }
         self.frame_count = self.frame_count.saturating_add(1);
         self.encode_latency_sum_ns = self.encode_latency_sum_ns.saturating_add(encode_delta_ns);
+        self.encode_latency_max_ns = self.encode_latency_max_ns.max(encode_delta_ns);
         self.encoded_bytes_sum = self.encoded_bytes_sum.saturating_add(encoded_bytes);
+        self.max_frame_bytes = self.max_frame_bytes.max(encoded_bytes);
         if keyframe {
             self.keyframe_count = self.keyframe_count.saturating_add(1);
         }
@@ -84,13 +97,19 @@ impl EncodeStatsWindow {
         let snapshot = EncodeStats {
             frame_count: self.frame_count,
             avg_encode_ms,
+            min_encode_ms: self.encode_latency_min_ns as f64 / 1_000_000.0,
+            max_encode_ms: self.encode_latency_max_ns as f64 / 1_000_000.0,
             kbps_out,
+            max_frame_bytes: self.max_frame_bytes,
             keyframe_count: self.keyframe_count,
             window_secs,
         };
         self.frame_count = 0;
         self.encode_latency_sum_ns = 0;
+        self.encode_latency_min_ns = 0;
+        self.encode_latency_max_ns = 0;
         self.encoded_bytes_sum = 0;
+        self.max_frame_bytes = 0;
         self.keyframe_count = 0;
         self.started = Instant::now();
         Some(snapshot)
@@ -102,7 +121,10 @@ impl EncodeStatsWindow {
 pub struct EncodeStats {
     pub frame_count: u64,
     pub avg_encode_ms: f64,
+    pub min_encode_ms: f64,
+    pub max_encode_ms: f64,
     pub kbps_out: f64,
+    pub max_frame_bytes: u64,
     pub keyframe_count: u32,
     pub window_secs: f64,
 }
@@ -121,6 +143,9 @@ mod tests {
         assert_eq!(snap.frame_count, 1);
         assert_eq!(snap.keyframe_count, 1);
         assert!((snap.avg_encode_ms - 1.0).abs() < 0.01);
+        assert!((snap.min_encode_ms - 1.0).abs() < 0.01);
+        assert!((snap.max_encode_ms - 1.0).abs() < 0.01);
+        assert_eq!(snap.max_frame_bytes, 1024);
     }
 
     #[test]
@@ -143,5 +168,8 @@ mod tests {
         assert_eq!(snap.frame_count, 3);
         assert_eq!(snap.keyframe_count, 1);
         assert!((snap.avg_encode_ms - 2.0).abs() < 0.01);
+        assert!((snap.min_encode_ms - 1.0).abs() < 0.01);
+        assert!((snap.max_encode_ms - 3.0).abs() < 0.01);
+        assert_eq!(snap.max_frame_bytes, 300);
     }
 }

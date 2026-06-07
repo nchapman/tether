@@ -13,23 +13,29 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use bytes::Bytes;
 use crossbeam_channel::bounded;
-use tether_decode::{DecodeCompletion, DecodeJob};
+use tether_decode::{DecodeEvent, DecodeJob, EpochDropReason};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
-use tether_protocol::control::{ControlMessage, GoodbyeCode, ServerHello, VideoStreamId, Viewport};
+use tether_protocol::control::{
+    ClockSync, ControlMessage, GoodbyeCode, ServerHello, VideoStreamId, Viewport,
+    CLOCK_SYNC_PROBE_SAMPLES,
+};
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::LatestFrame;
 use tether_render::RenderEvent;
-use tether_session::{ClientSession, ClientSessionConfig, ConnectError};
+use tether_session::{
+    log_peer_session_summary, ClientSession, ClientSessionConfig, ConnectError, SessionSummaryState,
+};
 use tether_transport::{Client, Datagram, ServerAuth};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 mod client_pairing;
@@ -41,21 +47,142 @@ use client_pairing::HostAuth;
 // texture on dimension change.
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
+const CLOCK_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Default)]
+struct ClockResyncState {
+    pending: Vec<MonoNanos>,
+    samples: Vec<ClockSync>,
+}
 
 /// Whether a `FrameReassembler::handle()` loss-counter delta warrants a
-/// `RequestRecovery`. `before`/`after` are `(frames_dropped, fragments_lost)`
-/// snapshots taken around the `handle()` call.
+/// `RequestRecovery`. `before`/`after` are reassembler
+/// `(incomplete_frames, fragment_loss_events)` snapshots taken around the
+/// `handle()` call.
 ///
-/// Fires only on a `frames_dropped` increase — a frame started but pruned
+/// Fires only on an incomplete-frame increase — a frame started but pruned
 /// before completing, the genuine "this frame will never arrive" signal.
-/// Never fires on `fragments_lost` alone: that counts stale stragglers (a late
-/// fragment for an already-finalized or already-pruned frame) and malformed
-/// packets, neither of which is independently actionable. Triggering on them
-/// would emit spurious recovery IDRs that add bandwidth and worsen congestion
-/// on an already-lossy path; a frame that truly won't complete still bumps
-/// `frames_dropped` when it's pruned, so the real signal survives.
+/// Never fires on fragment-loss events alone: that counts stale stragglers
+/// (a late fragment for an already-finalized or already-pruned frame) and
+/// malformed packets, neither of which is independently actionable. Triggering
+/// on them would emit spurious recovery IDRs that add bandwidth and worsen
+/// congestion on an already-lossy path; a frame that truly won't complete
+/// still bumps the incomplete-frame counter when it's pruned, so the real
+/// signal survives.
 fn recovery_warranted(before: (u64, u64), after: (u64, u64)) -> bool {
     after.0 > before.0
+}
+
+fn drain_latest_valid_viewport(
+    mut latest: Viewport,
+    rx: &mut mpsc::UnboundedReceiver<(u32, u32)>,
+) -> Viewport {
+    while let Ok((width, height)) = rx.try_recv() {
+        let candidate = Viewport::new(width, height);
+        if candidate.is_valid() {
+            latest = candidate;
+        }
+    }
+    latest
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ns_to_ms(ns: u64, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        ns as f64 / 1_000_000.0
+    }
+}
+
+#[derive(Default)]
+struct DecodeEventWindow {
+    latency_sum_ns: u64,
+    latency_min_ns: u64,
+    latency_max_ns: u64,
+    decode_errors: u32,
+    render_drops: u32,
+    idr_requests: u32,
+    queue_drops: u32,
+    stale_epoch_drops: u32,
+    epoch_throttle_drops: u32,
+    completion_count: u64,
+}
+
+impl DecodeEventWindow {
+    fn record_completion(&mut self, c: tether_decode::DecodeCompletion) {
+        self.completion_count = self.completion_count.saturating_add(1);
+        self.latency_sum_ns = self.latency_sum_ns.saturating_add(c.decode_duration_ns);
+        if self.completion_count == 1 {
+            self.latency_min_ns = c.decode_duration_ns;
+        } else {
+            self.latency_min_ns = self.latency_min_ns.min(c.decode_duration_ns);
+        }
+        self.latency_max_ns = self.latency_max_ns.max(c.decode_duration_ns);
+        if c.decode_err || c.soft_failure {
+            self.decode_errors = self.decode_errors.saturating_add(1);
+        }
+        self.render_drops = self.render_drops.saturating_add(c.render_drops);
+        if c.idr_request_fired {
+            self.idr_requests = self.idr_requests.saturating_add(1);
+        }
+    }
+
+    fn record_epoch_drop(&mut self, reason: EpochDropReason) {
+        match reason {
+            EpochDropReason::Stale => {
+                self.stale_epoch_drops = self.stale_epoch_drops.saturating_add(1);
+            }
+            EpochDropReason::RebuildRateLimited => {
+                self.epoch_throttle_drops = self.epoch_throttle_drops.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn drain_decode_events(
+    rx: &crossbeam_channel::Receiver<DecodeEvent>,
+    summary: &SessionSummaryState,
+    mut window: Option<&mut DecodeEventWindow>,
+) {
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            DecodeEvent::Completion(c) => {
+                if c.decode_err || c.soft_failure {
+                    summary.video.decode_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                summary
+                    .video
+                    .render_drop_frames
+                    .fetch_add(u64::from(c.render_drops), Ordering::Relaxed);
+                if c.idr_request_fired {
+                    summary.video.idr_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(w) = window.as_deref_mut() {
+                    w.record_completion(c);
+                }
+            }
+            DecodeEvent::EpochDrop { reason, .. } => {
+                match reason {
+                    EpochDropReason::Stale => {
+                        summary
+                            .video
+                            .decode_stale_epoch_drop_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    EpochDropReason::RebuildRateLimited => {
+                        summary
+                            .video
+                            .decode_epoch_throttle_drop_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if let Some(w) = window.as_deref_mut() {
+                    w.record_epoch_drop(reason);
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -249,28 +376,24 @@ async fn main() -> anyhow::Result<()> {
     // Application-layer handshake: identify ourselves, advertise our
     // decode profiles, resolve + validate the host's pick, and prime
     // the host with a `ForceIdr` so the next frame is a keyframe.
-    // The clock-sync probe round-trip happens inside `client_handshake`
-    // so latency logs are wall-clock-accurate from the first frame.
+    // The clock-sync probe round-trip happens immediately after the
+    // typed handshake, so latency logs are wall-clock-accurate from
+    // the first frame.
     // ClientSession takes the channel through the `ControlChannel`
     // trait object so it's mockable in tests. The original
     // `Arc<Connection>` stays in `conn` for the rest of `main` — the
     // recv tasks below use concrete-`Connection` methods (datagram,
-    // keyframe-stream accept, input send) that aren't on the trait.
+    // input send, connection stats) that aren't on the trait.
     let session = ClientSession::connect(
         conn.clone() as Arc<dyn tether_transport::ControlChannel>,
         ClientSessionConfig {
             client_name: "tether-client".to_string(),
             client_decode_profiles: client_decode_profiles.clone(),
-            // Initial viewport = the window's logical size at connect
-            // time. The renderer's first WindowEvent::Resized will fire
-            // shortly after the window is created (the WM sizes it to
-            // the actual physical pixels for the display's scale
-            // factor) and the viewport debouncer task below will follow
-            // up with a SetViewportHint reflecting the physical dims.
-            // Sending an initial guess here means the first encoded
-            // frame is already at roughly-the-right size instead of
-            // wasting one frame at native capture dims.
-            viewport: Some(Viewport::new(INITIAL_WIDTH, INITIAL_HEIGHT)),
+            // Startup video is gated on the first real renderer viewport.
+            // A guessed logical size here causes the host to build a doomed
+            // first encoder epoch on HiDPI clients, then immediately rebuild
+            // when the physical viewport arrives.
+            viewport: None,
         },
     )
     .await;
@@ -306,6 +429,14 @@ async fn main() -> anyhow::Result<()> {
             negotiated_profile.codec, negotiated_profile.chroma, negotiated_profile.bit_depth
         ),
     });
+    let session_summary = Arc::new(SessionSummaryState::new(
+        "client",
+        negotiated_profile,
+        false,
+    ));
+    let shutdown_notice_sent = Arc::new(AtomicBool::new(false));
+    let clock_sync_state = Arc::new(RwLock::new(clock_sync));
+    let clock_resync_state = Arc::new(Mutex::new(ClockResyncState::default()));
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -319,13 +450,76 @@ async fn main() -> anyhow::Result<()> {
     // frame. Cloned through to all three consumers (cheap `Arc`).
     let cursor_channel = tether_render::CursorChannel::new();
 
+    // Renderer resize events drive startup video readiness. The host must not
+    // begin streaming until it has the client's real physical viewport, so the
+    // viewport task sends SetViewportHint before StreamReady.
+    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
+    let (decoder_ready_for_startup_tx, decoder_ready_for_startup_rx) = watch::channel(false);
+    let (decode_event_tx, decode_event_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
+    let decode_event_rx = Arc::new(decode_event_rx);
+
     // Receive-side control loop. Today the host doesn't initiate any
     // typed messages we need to act on, but the Extension escape and
     // future variants (CursorShape, DisplayList, StreamPause/Resume)
     // arrive here, so the loop exists from V1 onward.
     {
         let conn = conn.clone();
+        let clock_resync_state = clock_resync_state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(CLOCK_RESYNC_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // Skip the immediate tick; handshake just sampled.
+            loop {
+                ticker.tick().await;
+                {
+                    let mut state = clock_resync_state
+                        .lock()
+                        .expect("clock resync lock poisoned");
+                    if !state.pending.is_empty() {
+                        warn!(
+                            pending = state.pending.len(),
+                            samples = state.samples.len(),
+                            "clock resync probe burst did not complete before next interval; restarting"
+                        );
+                        state.pending.clear();
+                        state.samples.clear();
+                    }
+                    state.pending.reserve(CLOCK_SYNC_PROBE_SAMPLES);
+                    state.samples.reserve(CLOCK_SYNC_PROBE_SAMPLES);
+                }
+
+                for _ in 0..CLOCK_SYNC_PROBE_SAMPLES {
+                    let t0 = MonoNanos::now();
+                    {
+                        let mut state = clock_resync_state
+                            .lock()
+                            .expect("clock resync lock poisoned");
+                        state.pending.push(t0);
+                    }
+                    if let Err(e) = conn
+                        .send_control(&ControlMessage::ClockProbeRequest { t0_sender: t0 })
+                        .await
+                    {
+                        let mut state = clock_resync_state
+                            .lock()
+                            .expect("clock resync lock poisoned");
+                        state.pending.clear();
+                        state.samples.clear();
+                        warn!(error = ?e, "clock resync probe send failed; ending resync task");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    {
+        let conn = conn.clone();
         let cursor_channel_ctrl = cursor_channel.clone();
+        let session_summary = session_summary.clone();
+        let shutdown_notice_sent = shutdown_notice_sent.clone();
+        let decode_event_rx = decode_event_rx.clone();
+        let clock_sync_state = clock_sync_state.clone();
+        let clock_resync_state = clock_resync_state.clone();
         tokio::spawn(async move {
             loop {
                 match conn.recv_control().await {
@@ -359,11 +553,76 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     }
-                    Ok(ControlMessage::ClockProbeResponse(_)) => {
-                        tracing::trace!("unsolicited clock probe response; ignoring");
+                    Ok(ControlMessage::ClockProbeResponse(probe)) => {
+                        let selected = {
+                            let mut state = clock_resync_state
+                                .lock()
+                                .expect("clock resync lock poisoned");
+                            let Some(pos) =
+                                state.pending.iter().position(|t0| *t0 == probe.t0_sender)
+                            else {
+                                tracing::trace!("unsolicited clock probe response; ignoring");
+                                continue;
+                            };
+                            let t0 = state.pending.swap_remove(pos);
+                            let t3 = MonoNanos::now();
+                            state.samples.push(ClockSync::from_probe(
+                                t0,
+                                probe.t1_receiver_recv,
+                                probe.t2_receiver_send,
+                                t3,
+                            ));
+                            if state.samples.len() == CLOCK_SYNC_PROBE_SAMPLES {
+                                let min_rtt =
+                                    state.samples.iter().map(|s| s.rtt_nanos).min().unwrap_or(0);
+                                let max_rtt =
+                                    state.samples.iter().map(|s| s.rtt_nanos).max().unwrap_or(0);
+                                let samples = std::mem::take(&mut state.samples);
+                                state.pending.clear();
+                                ClockSync::best_sample(samples).map(|sync| (sync, min_rtt, max_rtt))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((selected, min_rtt, max_rtt)) = selected {
+                            let previous =
+                                *clock_sync_state.read().expect("clock sync lock poisoned");
+                            *clock_sync_state.write().expect("clock sync lock poisoned") = selected;
+                            let offset_delta_us = ((i128::from(selected.offset_nanos)
+                                - i128::from(previous.offset_nanos))
+                                / 1_000)
+                                .clamp(i128::from(i64::MIN), i128::from(i64::MAX));
+                            let offset_delta_us =
+                                i64::try_from(offset_delta_us).expect("clamped to i64 range");
+                            info!(
+                                event = "clock_sync",
+                                phase = "resync",
+                                samples = CLOCK_SYNC_PROBE_SAMPLES,
+                                selected_rtt_us = selected.rtt_nanos / 1_000,
+                                min_rtt_us = min_rtt / 1_000,
+                                max_rtt_us = max_rtt / 1_000,
+                                clock_offset_us = selected.offset_nanos / 1_000,
+                                offset_delta_us,
+                                "refreshed clock-sync sample"
+                            );
+                        }
                     }
-                    Ok(ControlMessage::Goodbye { reason, code }) => {
-                        info!(%reason, ?code, "host said goodbye");
+                    Ok(ControlMessage::Goodbye {
+                        reason,
+                        code,
+                        final_stats,
+                    }) => {
+                        info!(event = "peer_goodbye", %reason, ?code, "host said goodbye");
+                        log_peer_session_summary("host", final_stats.as_deref());
+                        say_goodbye_once(
+                            &conn,
+                            "client acknowledged host goodbye",
+                            GoodbyeCode::Clean,
+                            &session_summary,
+                            &shutdown_notice_sent,
+                            Some(&decode_event_rx),
+                        )
+                        .await;
                         return;
                     }
                     Ok(ControlMessage::Extension(msg)) => {
@@ -374,12 +633,16 @@ async fn main() -> anyhow::Result<()> {
                             payload_len = msg.payload.len(),
                             "unnegotiated control extension; closing session"
                         );
-                        let _ = conn
-                            .send_control(&ControlMessage::Goodbye {
-                                reason: format!("unnegotiated extension {}", msg.key),
-                                code: GoodbyeCode::ProtocolError,
-                            })
-                            .await;
+                        let reason = format!("unnegotiated extension {}", msg.key);
+                        say_goodbye_once(
+                            &conn,
+                            reason.as_str(),
+                            GoodbyeCode::ProtocolError,
+                            &session_summary,
+                            &shutdown_notice_sent,
+                            Some(&decode_event_rx),
+                        )
+                        .await;
                         return;
                     }
                     Ok(ControlMessage::CursorShape {
@@ -493,7 +756,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let conn_recv = conn.clone();
-    let recv_clock_sync = clock_sync;
+    let recv_clock_sync = clock_sync_state.clone();
     let decode_profile = negotiated_profile;
     let conn_ready = conn.clone();
     let cursor_channel_datagram = cursor_channel.clone();
@@ -506,8 +769,6 @@ async fn main() -> anyhow::Result<()> {
     // recv loop drops frames at the channel rather than blocking on
     // the await.
     let (decode_job_tx, decode_job_rx) = bounded::<DecodeJob>(8);
-    let (decode_completion_tx, decode_completion_rx) =
-        crossbeam_channel::unbounded::<DecodeCompletion>();
     // Oneshot from the decode thread back to the recv task: lets the
     // recv loop wait for decoder construction before announcing
     // StreamReady to the host. If the decoder fails to build, the
@@ -539,7 +800,7 @@ async fn main() -> anyhow::Result<()> {
     tether_decode::run_thread(
         decode_profile,
         decode_job_rx,
-        decode_completion_tx,
+        decode_event_tx,
         frames_for_decode,
         request_idr,
         warnings,
@@ -551,9 +812,14 @@ async fn main() -> anyhow::Result<()> {
     // decode → jitter buffer → cpal playback path on its own thread.
     // `audio_tx` feeds it from the datagram recv loop below; `audio_active`
     // gates `StreamReady.audio`. Both are moved into the recv task.
-    let (audio_tx, audio_active) = setup_audio_playback(audio_enabled, &server_hello);
+    let (audio_tx, audio_active) =
+        setup_audio_playback(audio_enabled, &server_hello, session_summary.clone());
+    session_summary.set_audio_active(audio_active);
 
     let conn_for_recovery_send = conn.clone();
+    let session_summary_for_recv = session_summary.clone();
+    let shutdown_notice_for_recv = shutdown_notice_sent.clone();
+    let decode_event_rx_for_recv = decode_event_rx.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
         if decoder_ready_rx.await.is_err() {
@@ -563,37 +829,36 @@ async fn main() -> anyhow::Result<()> {
             // Goodbye(InternalError) before exiting — otherwise the
             // host keeps encoding into a black hole until idle
             // timeout, and the user sees a frozen window with no
-            // explanation. `say_goodbye_with_code` closes the
+            // explanation. `say_goodbye_once` closes the
             // connection as part of its shutdown.
             error!(
                 "decode thread failed to initialise; sending Goodbye(InternalError) and exiting"
             );
-            say_goodbye_with_code(
+            say_goodbye_once(
                 &conn_ready,
                 "client decoder failed to initialise",
                 GoodbyeCode::InternalError,
+                &session_summary_for_recv,
+                &shutdown_notice_for_recv,
+                Some(&decode_event_rx_for_recv),
             )
             .await;
             return;
         }
-        // Decoder is up; tell the host to start streaming. `audio` is true only
-        // when we built a playback path for the host's advertised AudioConfig —
-        // the host's audio gate keys off this.
-        if let Err(e) = conn_ready
-            .send_control(&ControlMessage::StreamReady {
-                video: true,
-                audio: audio_active,
-            })
-            .await
-        {
-            warn!(error = ?e, "StreamReady send failed; host will not emit video");
-        }
+        // Decoder is up, but video startup still waits for the renderer's real
+        // physical viewport. The viewport task sends SetViewportHint and then
+        // StreamReady on the same control stream so the host opens the gate only
+        // after it has the dimensions it will encode for.
+        let _ = decoder_ready_for_startup_tx.send(true);
+        info!("client decoder ready; waiting for first viewport before StreamReady");
         let mut frame_count: u64 = 0;
-        // Reassembler cumulative counters at the start of the current
-        // stats window. Diff against the live counters to compute the
-        // per-interval drop and fragment-loss rates for ClientStats.
-        let mut last_frames_dropped: u64 = 0;
-        let mut last_fragments_lost: u64 = 0;
+        // Reassembler cumulative counters at the start of the current stats
+        // window. Diff against the live counters to compute per-window
+        // incomplete-frame and fragment-loss-event counts for ClientStats.
+        let mut last_incomplete_frames: u64 = 0;
+        let mut last_fragment_loss_events: u64 = 0;
+        let mut last_fec_recovered_frames: u64 = 0;
+        let mut last_fec_recovered_fragments: u64 = 0;
         // Most-recent frame_seq the reassembler *completed*. Quoted in
         // RequestRecovery when the reassembler observes a stale drop, and
         // doubles as the "have we received any frame yet" sentinel that gates
@@ -610,53 +875,32 @@ async fn main() -> anyhow::Result<()> {
         // of drops collapses into a single recovery action — same
         // cadence the decoder thread's auto-IDR uses.
         let mut last_request_recovery_at: Option<MonoNanos> = None;
-        // Sum of decode call wall-clocks across the frames in the
-        // current log window, surfaced as avg_decode_ms on the
-        // frame-stats line. Same shape as the host's avg_encode_ms
-        // metric so the two together show where pipeline time is
-        // going.
-        let mut decode_latency_sum_ns: u64 = 0;
         // Sum of capture-to-recv ages over the window. The previous
         // implementation logged the last frame's age which is
         // misleading when the metric is supposed to summarise a
         // second of behaviour; averaging across frames gives an
         // actually-meaningful number.
         let mut latency_sum_ns: u64 = 0;
+        let mut latency_min_ns: u64 = 0;
+        let mut latency_max_ns: u64 = 0;
         // Sum of t_send (host clock, translated via clock_sync) to
         // local recv times. Isolates the network leg from compute
         // — pair with avg_encode_ms / avg_decode_ms to attribute
         // any latency budget movement to the right component.
         let mut network_latency_sum_ns: u64 = 0;
+        let mut network_latency_min_ns: u64 = 0;
+        let mut network_latency_max_ns: u64 = 0;
         // Bytes off the wire (encoded H.264 payloads after
         // reassembly). With matching host kbps_out, a divergence
         // means packets are being dropped between host and client.
         let mut bytes_received: u64 = 0;
-        // Decode failures in the window. Steady non-zero values
-        // mean we're losing IDR/SPS/PPS frames or the bitstream is
-        // getting corrupted between encode and decode.
-        let mut decode_errors: u32 = 0;
-        // Frames the decoder produced but displaced before the
-        // renderer could pick them up (LatestFrame is single-slot
-        // drop-oldest). Non-zero means the render thread isn't
-        // keeping up with arrival rate — typically a wgpu/present
-        // pacing issue, not a codec issue.
-        let mut render_drops: u32 = 0;
-        // ForceIdr control messages we sent in the window. Pairs
-        // with the host's kf_per_s — if these match, the storm of
-        // keyframes on the host is *our* fault, not the encoder
-        // misbehaving.
-        let mut idr_requests: u32 = 0;
-        // Frames the recv loop reassembled but couldn't enqueue for
-        // decode because the bounded channel was full. Non-zero means
-        // the decoder is falling behind the network — a strong signal
-        // to drop quality or alert the user.
-        let mut decode_queue_drops: u32 = 0;
-        // Decode completions folded into the current stats window.
-        // Used as the divisor for avg_decode_ms so the metric stays
-        // honest when frame_count (recv-side) and completions drift
-        // under backpressure.
-        let mut decode_completion_count: u64 = 0;
+        // Decode-side events folded into the current stats window. Decode
+        // completions drive avg/min/max decode latency; epoch drops are tracked
+        // separately so they explain missing completions without skewing timing.
+        let mut decode_window = DecodeEventWindow::default();
         let mut last_log = Instant::now();
+        let mut decode_event_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        decode_event_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Cursor datagram observability — separate cadence so a
         // chatty cursor channel doesn't bury the video stats line.
         let mut cursor_pos_packets: u64 = 0;
@@ -667,7 +911,18 @@ async fn main() -> anyhow::Result<()> {
             // unreliable datagram channel and feeds the same reassembler; there
             // is no separate reliable keyframe stream to race. Cursor and audio
             // datagrams share the channel and are dispatched out here.
-            let packet: VideoPacket = match conn_recv.recv_datagram().await {
+            let datagram = tokio::select! {
+                result = conn_recv.recv_datagram() => result,
+                _ = decode_event_tick.tick() => {
+                    drain_decode_events(
+                        &decode_event_rx_for_recv,
+                        &session_summary_for_recv,
+                        Some(&mut decode_window),
+                    );
+                    continue;
+                }
+            };
+            let packet: VideoPacket = match datagram {
                 Ok(Datagram::Video(p)) => p,
                 Ok(Datagram::HostCursor(hc)) => {
                     // Position datagrams ride latest-wins; the overlay's render
@@ -710,48 +965,95 @@ async fn main() -> anyhow::Result<()> {
                     ..
                 })) => {
                     // Forward to the audio decode thread; drop on a full channel
-                    // (decoder behind) — audio is loss-tolerant.
+                    // (decoder behind) — audio is loss-tolerant, but the drop
+                    // is surfaced separately from packets_received.
                     if let Some(tx) = &audio_tx {
-                        let _ = tx.try_send(AudioFrameMsg {
-                            stream_epoch,
-                            seq: frame_seq,
-                            payload,
-                            redundant,
-                        });
+                        if tx
+                            .try_send(AudioFrameMsg {
+                                stream_epoch,
+                                seq: frame_seq,
+                                payload,
+                                redundant,
+                            })
+                            .is_err()
+                        {
+                            session_summary_for_recv
+                                .audio
+                                .decode_queue_drop_packets
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
+                    session_summary_for_recv
+                        .audio
+                        .packets_received
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 Err(e) => {
-                    // Promoted from warn → error: this is terminal for the video
-                    // stream and the user otherwise sees a frozen last-frame with
-                    // no indication anything broke. Also close the connection
-                    // explicitly so the host learns about it instead of waiting
-                    // for the idle timeout.
-                    error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
-                    conn_recv.close(1, b"recv failed");
+                    drain_decode_events(
+                        &decode_event_rx_for_recv,
+                        &session_summary_for_recv,
+                        Some(&mut decode_window),
+                    );
+                    if shutdown_notice_for_recv.load(Ordering::Acquire)
+                        || e.is_clean_shutdown_recv()
+                    {
+                        info!(error = ?e, "datagram recv ended during clean shutdown");
+                    } else {
+                        // This is terminal for the video stream and the user
+                        // otherwise sees a frozen last-frame with no indication
+                        // anything broke. Also close explicitly so the host
+                        // learns about it instead of waiting for idle timeout.
+                        error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
+                        conn_recv.close(1, b"recv failed");
+                    }
                     break;
                 }
             };
 
             // Snapshot loss counters around the handle() so we can see if
             // this packet's processing caused the reassembler to give up on
-            // a frame. We gate recovery on `frames_dropped` only — the count
-            // of frames started but pruned incomplete. That is the genuine
-            // "a frame will never complete" signal worth a recovery IDR.
+            // a frame. We gate recovery on incomplete frames only — the count
+            // of frames started but pruned incomplete. That is the genuine "a
+            // frame will never complete" signal worth a recovery IDR.
             //
-            // We deliberately do NOT trigger on `fragments_lost`: that counter
-            // bumps when a *straggler* fragment arrives for a frame that was
-            // already finalized or pruned, or when a malformed packet is
-            // rejected. Neither is independently actionable — by the time a
+            // We deliberately do NOT trigger on fragment-loss events: that
+            // counter bumps when a *straggler* fragment arrives for a frame
+            // that was already finalized or pruned, or when a malformed packet
+            // is rejected. Neither is independently actionable — by the time a
             // late fragment shows up the frame is already gone (recovered or
             // abandoned), so firing on it just emits spurious recovery IDRs
             // that add bandwidth and worsen congestion exactly when the path
             // is already lossy. A frame that truly won't complete still bumps
-            // `frames_dropped` when `prune_old` evicts it, so the real signal
+            // incomplete frames when `prune_old` evicts it, so the real signal
             // is not lost — only the noise.
             let pre_loss = reassembler.loss_counters();
+            let pre_recovery = reassembler.recovery_counters();
             let result = reassembler.handle(packet);
             let post_loss = reassembler.loss_counters();
+            let post_recovery = reassembler.recovery_counters();
+            session_summary_for_recv
+                .video
+                .incomplete_frames
+                .fetch_add(post_loss.0.saturating_sub(pre_loss.0), Ordering::Relaxed);
+            session_summary_for_recv
+                .video
+                .fragment_loss_events
+                .fetch_add(post_loss.1.saturating_sub(pre_loss.1), Ordering::Relaxed);
+            session_summary_for_recv
+                .video
+                .fec_recovered_frames
+                .fetch_add(
+                    post_recovery.0.saturating_sub(pre_recovery.0),
+                    Ordering::Relaxed,
+                );
+            session_summary_for_recv
+                .video
+                .fec_recovered_fragments
+                .fetch_add(
+                    post_recovery.1.saturating_sub(pre_recovery.1),
+                    Ordering::Relaxed,
+                );
             if recovery_warranted(pre_loss, post_loss) {
                 if let Some(last_reassembled) = last_reassembled_frame_seq {
                     let now = MonoNanos::now();
@@ -788,27 +1090,62 @@ async fn main() -> anyhow::Result<()> {
             // difference between them and `now` decomposes
             // total latency into capture-to-send (host
             // pipeline) and send-to-recv (network + reassembly).
+            let current_clock_sync = *recv_clock_sync.read().expect("clock sync lock poisoned");
             let host_in_client_clock =
-                recv_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
-            let send_in_client_clock = recv_clock_sync.remote_to_local(frame.meta.timing.t_send);
+                current_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
+            let send_in_client_clock = current_clock_sync.remote_to_local(frame.meta.timing.t_send);
             let age_ns = now.saturating_sub(host_in_client_clock);
             let network_ns = now.saturating_sub(send_in_client_clock);
             frame_count += 1;
             latency_sum_ns = latency_sum_ns.saturating_add(age_ns);
             network_latency_sum_ns = network_latency_sum_ns.saturating_add(network_ns);
-            bytes_received = bytes_received.saturating_add(frame.body.len() as u64);
+            if frame_count == 1 {
+                latency_min_ns = age_ns;
+                network_latency_min_ns = network_ns;
+            } else {
+                latency_min_ns = latency_min_ns.min(age_ns);
+                network_latency_min_ns = network_latency_min_ns.min(network_ns);
+            }
+            latency_max_ns = latency_max_ns.max(age_ns);
+            network_latency_max_ns = network_latency_max_ns.max(network_ns);
+            let frame_body_len = frame.body.len() as u64;
+            bytes_received = bytes_received.saturating_add(frame_body_len);
+            session_summary_for_recv
+                .video
+                .frames_received
+                .fetch_add(1, Ordering::Relaxed);
+            session_summary_for_recv
+                .video
+                .bytes_received
+                .fetch_add(frame_body_len, Ordering::Relaxed);
+            if frame.meta.keyframe {
+                session_summary_for_recv
+                    .video
+                    .keyframes
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
             // Hand the reassembled frame to the decode thread.
             // Bounded channel + try_send means a stalled decoder
             // doesn't block the recv loop — we drop the frame and
             // count the loss so the stats line surfaces it.
+            // `frame.stream_epoch` is the reassembler's authority on which
+            // epoch this frame belongs to (it keys fragments by epoch). The
+            // decode worker rebuilds the decoder when the epoch advances —
+            // the host bumps it on a resolution/codec change, and an in-place
+            // reconfigure corrupts the AV1 decoder on AMD.
             let job = DecodeJob {
                 body: frame.body,
                 host_in_client_clock,
                 keyframe: frame.meta.keyframe,
+                stream_epoch: frame.stream_epoch,
             };
             if decode_job_tx.try_send(job).is_err() {
-                decode_queue_drops = decode_queue_drops.saturating_add(1);
+                decode_window.queue_drops = decode_window.queue_drops.saturating_add(1);
+                session_summary_for_recv
+                    .video
+                    .decode_queue_drop_frames
+                    .fetch_add(1, Ordering::Relaxed);
             }
 
             // Drain decode completions that arrived since the last
@@ -816,48 +1153,54 @@ async fn main() -> anyhow::Result<()> {
             // produced anything yet, we'll pick it up next time
             // round. Folds per-frame metrics into the stats window
             // the recv loop owns.
-            while let Ok(c) = decode_completion_rx.try_recv() {
-                decode_completion_count = decode_completion_count.saturating_add(1);
-                decode_latency_sum_ns = decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
-                if c.decode_err || c.soft_failure {
-                    decode_errors = decode_errors.saturating_add(1);
-                }
-                render_drops = render_drops.saturating_add(c.render_drops);
-                if c.idr_request_fired {
-                    idr_requests = idr_requests.saturating_add(1);
-                }
-            }
+            drain_decode_events(
+                &decode_event_rx_for_recv,
+                &session_summary_for_recv,
+                Some(&mut decode_window),
+            );
 
             if last_log.elapsed() >= std::time::Duration::from_secs(1) {
                 let window_secs = last_log.elapsed().as_secs_f64();
                 // ClientStats — host uses this to drive future
                 // adaptive bitrate / FEC strength / codec
-                // downshift decisions. Counters are diffed
-                // against last window so the wire field is a
-                // per-interval rate; rtt_ewma_us is whole-
-                // session EWMA on the QUIC RTT.
-                let (frames_dropped_now, fragments_lost_now) = reassembler.loss_counters();
-                let frames_dropped_delta =
-                    u32::try_from(frames_dropped_now.saturating_sub(last_frames_dropped))
+                // downshift decisions. Counters are per-window; rtt_us is the
+                // current QUIC RTT estimate.
+                let (incomplete_frames_now, fragment_loss_events_now) = reassembler.loss_counters();
+                let incomplete_frames =
+                    u32::try_from(incomplete_frames_now.saturating_sub(last_incomplete_frames))
                         .unwrap_or(u32::MAX);
-                let fragments_lost_delta =
-                    u32::try_from(fragments_lost_now.saturating_sub(last_fragments_lost))
-                        .unwrap_or(u32::MAX);
-                last_frames_dropped = frames_dropped_now;
-                last_fragments_lost = fragments_lost_now;
+                let fragment_loss_events = u32::try_from(
+                    fragment_loss_events_now.saturating_sub(last_fragment_loss_events),
+                )
+                .unwrap_or(u32::MAX);
+                last_incomplete_frames = incomplete_frames_now;
+                last_fragment_loss_events = fragment_loss_events_now;
+                let (fec_recovered_frames_now, fec_recovered_fragments_now) =
+                    reassembler.recovery_counters();
+                let fec_recovered_frames = u32::try_from(
+                    fec_recovered_frames_now.saturating_sub(last_fec_recovered_frames),
+                )
+                .unwrap_or(u32::MAX);
+                let fec_recovered_fragments = u32::try_from(
+                    fec_recovered_fragments_now.saturating_sub(last_fec_recovered_fragments),
+                )
+                .unwrap_or(u32::MAX);
+                last_fec_recovered_frames = fec_recovered_frames_now;
+                last_fec_recovered_fragments = fec_recovered_fragments_now;
                 // window_secs is a small positive duration; round-to-i64 is intentional.
                 #[allow(clippy::cast_possible_truncation)]
-                let interval_ms =
+                let window_ms =
                     u32::try_from((window_secs * 1000.0).round() as i64).unwrap_or(u32::MAX);
-                let rtt_ewma_us =
-                    u32::try_from(conn_recv.rtt().as_micros().min(u128::from(u32::MAX)))
-                        .unwrap_or(u32::MAX);
+                let rtt_us = u32::try_from(conn_recv.rtt().as_micros().min(u128::from(u32::MAX)))
+                    .unwrap_or(u32::MAX);
                 let stats = ControlMessage::ClientStats {
-                    interval_ms,
+                    window_ms,
                     frames_received: u32::try_from(frame_count).unwrap_or(u32::MAX),
-                    frames_dropped: frames_dropped_delta,
-                    fragments_lost: fragments_lost_delta,
-                    rtt_ewma_us,
+                    incomplete_frames,
+                    fragment_loss_events,
+                    rtt_us,
+                    fec_recovered_frames,
+                    fec_recovered_fragments,
                 };
                 let conn_stats = conn_recv.clone();
                 tokio::spawn(async move {
@@ -871,51 +1214,76 @@ async fn main() -> anyhow::Result<()> {
                 // completions lag). Dividing by frame_count would
                 // understate decode time exactly when it matters.
                 #[allow(clippy::cast_precision_loss)] // u64 well under 2^53
-                let avg_decode_ms = if decode_completion_count > 0 {
-                    (decode_latency_sum_ns as f64 / decode_completion_count as f64) / 1_000_000.0
+                let avg_decode_ms = if decode_window.completion_count > 0 {
+                    (decode_window.latency_sum_ns as f64 / decode_window.completion_count as f64)
+                        / 1_000_000.0
                 } else {
                     0.0
                 };
+                let min_decode_ms =
+                    ns_to_ms(decode_window.latency_min_ns, decode_window.completion_count);
+                let max_decode_ms =
+                    ns_to_ms(decode_window.latency_max_ns, decode_window.completion_count);
                 #[allow(clippy::cast_precision_loss)]
                 let avg_latency_ms = if frame_count > 0 {
                     (latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
                 } else {
                     0.0
                 };
+                let min_latency_ms = ns_to_ms(latency_min_ns, frame_count);
+                let max_latency_ms = ns_to_ms(latency_max_ns, frame_count);
                 #[allow(clippy::cast_precision_loss)]
                 let avg_network_ms = if frame_count > 0 {
                     (network_latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
                 } else {
                     0.0
                 };
+                let min_network_ms = ns_to_ms(network_latency_min_ns, frame_count);
+                let max_network_ms = ns_to_ms(network_latency_max_ns, frame_count);
                 #[allow(clippy::cast_precision_loss)]
                 let kbps_in = if window_secs > 0.0 {
                     (bytes_received as f64 * 8.0 / 1000.0) / window_secs
                 } else {
                     0.0
                 };
+                #[allow(clippy::cast_precision_loss)]
+                let fps = if window_secs > 0.0 {
+                    frame_count as f64 / window_secs
+                } else {
+                    0.0
+                };
                 info!(
-                    frames_per_s = frame_count,
-                    latency_ms = format!("{avg_latency_ms:.2}"),
-                    network_ms = format!("{avg_network_ms:.2}"),
-                    avg_decode_ms = format!("{avg_decode_ms:.2}"),
-                    kbps_in = format!("{kbps_in:.0}"),
-                    decode_errs = decode_errors,
-                    render_drops = render_drops,
-                    idr_reqs = idr_requests,
-                    decode_queue_drops,
+                    frames = frame_count,
+                    fps,
+                    avg_latency_ms,
+                    min_latency_ms,
+                    max_latency_ms,
+                    avg_network_ms,
+                    min_network_ms,
+                    max_network_ms,
+                    avg_decode_ms,
+                    min_decode_ms,
+                    max_decode_ms,
+                    kbps_in,
+                    decode_errors = decode_window.decode_errors,
+                    render_drop_frames = decode_window.render_drops,
+                    idr_requests = decode_window.idr_requests,
+                    decode_queue_drop_frames = decode_window.queue_drops,
+                    decode_stale_epoch_drop_frames = decode_window.stale_epoch_drops,
+                    decode_epoch_throttle_drop_frames = decode_window.epoch_throttle_drops,
+                    fec_recovered_frames,
+                    fec_recovered_fragments,
                     "frame stats"
                 );
                 frame_count = 0;
-                decode_latency_sum_ns = 0;
                 latency_sum_ns = 0;
+                latency_min_ns = 0;
+                latency_max_ns = 0;
                 network_latency_sum_ns = 0;
+                network_latency_min_ns = 0;
+                network_latency_max_ns = 0;
                 bytes_received = 0;
-                decode_errors = 0;
-                render_drops = 0;
-                idr_requests = 0;
-                decode_queue_drops = 0;
-                decode_completion_count = 0;
+                decode_window = DecodeEventWindow::default();
                 last_log = Instant::now();
             }
         }
@@ -928,7 +1296,6 @@ async fn main() -> anyhow::Result<()> {
     // unreliable datagram channel; everything else on the reliable
     // input stream.
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<RenderEvent>();
-    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
     let conn_input = conn.clone();
     tokio::spawn(async move {
         let mut translator = WinitTranslator::new();
@@ -986,6 +1353,8 @@ async fn main() -> anyhow::Result<()> {
         use std::time::Duration;
         let debounce = Duration::from_millis(150);
         let mut pending: Option<(u32, u32)> = None;
+        let mut startup_sent = false;
+        let mut decoder_ready_for_startup_rx = decoder_ready_for_startup_rx;
         loop {
             // Either receive a new size, or fire the pending one after
             // the debounce window elapses with no new event.
@@ -995,20 +1364,75 @@ async fn main() -> anyhow::Result<()> {
             };
             match next {
                 Ok(Some(size)) => {
+                    let viewport = Viewport::new(size.0, size.1);
+                    if !viewport.is_valid() {
+                        continue;
+                    }
+                    if !startup_sent {
+                        while !*decoder_ready_for_startup_rx.borrow_and_update() {
+                            if decoder_ready_for_startup_rx.changed().await.is_err() {
+                                warn!(
+                                    "decoder readiness channel closed before initial viewport; \
+                                     viewport task exiting"
+                                );
+                                return;
+                            }
+                        }
+                        let viewport = drain_latest_valid_viewport(viewport, &mut viewport_rx);
+                        if let Err(e) = conn_viewport
+                            .send_control(&ControlMessage::SetViewportHint {
+                                stream_id: VideoStreamId(0),
+                                viewport,
+                            })
+                            .await
+                        {
+                            warn!(
+                                error = ?e,
+                                "initial SetViewportHint send failed; viewport task exiting"
+                            );
+                            return;
+                        }
+                        info!(
+                            width = viewport.width,
+                            height = viewport.height,
+                            "sent initial SetViewportHint to host"
+                        );
+                        if let Err(e) = conn_viewport
+                            .send_control(&ControlMessage::StreamReady {
+                                video: true,
+                                audio: audio_active,
+                            })
+                            .await
+                        {
+                            warn!(error = ?e, "StreamReady send failed; host will not emit video");
+                            return;
+                        }
+                        info!(
+                            event = "stream_ready",
+                            video = true,
+                            audio = audio_active,
+                            "client signalled StreamReady after initial viewport"
+                        );
+                        startup_sent = true;
+                        pending = None;
+                        continue;
+                    }
                     pending = Some(size);
                 }
                 Ok(None) => {
                     // Sender dropped. Fire any pending before exiting
                     // so the last resize event still makes it.
-                    if let Some((w, h)) = pending {
-                        let viewport = Viewport::new(w, h);
-                        if viewport.is_valid() {
-                            let _ = conn_viewport
-                                .send_control(&ControlMessage::SetViewportHint {
-                                    stream_id: VideoStreamId(0),
-                                    viewport,
-                                })
-                                .await;
+                    if startup_sent {
+                        if let Some((w, h)) = pending {
+                            let viewport = Viewport::new(w, h);
+                            if viewport.is_valid() {
+                                let _ = conn_viewport
+                                    .send_control(&ControlMessage::SetViewportHint {
+                                        stream_id: VideoStreamId(0),
+                                        viewport,
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     return;
@@ -1016,9 +1440,6 @@ async fn main() -> anyhow::Result<()> {
                 Err(_) => {
                     if let Some((w, h)) = pending.take() {
                         let viewport = Viewport::new(w, h);
-                        if !viewport.is_valid() {
-                            continue;
-                        }
                         if let Err(e) = conn_viewport
                             .send_control(&ControlMessage::SetViewportHint {
                                 stream_id: VideoStreamId(0),
@@ -1061,6 +1482,9 @@ async fn main() -> anyhow::Result<()> {
     // before adding anything in those categories.
     {
         let conn = conn.clone();
+        let session_summary = session_summary.clone();
+        let shutdown_notice_sent = shutdown_notice_sent.clone();
+        let decode_event_rx = decode_event_rx.clone();
         tokio::spawn(async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
                 warn!(error = %e, "ctrl-c handler failed; exiting anyway");
@@ -1070,7 +1494,14 @@ async fn main() -> anyhow::Result<()> {
             reporter.emit(&EngineEvent::Disconnected {
                 reason: "interrupted".to_string(),
             });
-            say_goodbye(&conn, "client interrupted").await;
+            say_goodbye(
+                &conn,
+                "client interrupted",
+                &session_summary,
+                &shutdown_notice_sent,
+                Some(&decode_event_rx),
+            )
+            .await;
             std::process::exit(0);
         });
     }
@@ -1082,13 +1513,23 @@ async fn main() -> anyhow::Result<()> {
     // through winit.
     if reporter.is_json() {
         let conn = conn.clone();
+        let session_summary = session_summary.clone();
+        let shutdown_notice_sent = shutdown_notice_sent.clone();
+        let decode_event_rx = decode_event_rx.clone();
         tokio::spawn(async move {
             wait_for_stdin_stop().await;
             info!("shell stop received; sending Goodbye and exiting");
             reporter.emit(&EngineEvent::Disconnected {
                 reason: "stopped by shell".to_string(),
             });
-            say_goodbye(&conn, "client stopped").await;
+            say_goodbye(
+                &conn,
+                "client stopped",
+                &session_summary,
+                &shutdown_notice_sent,
+                Some(&decode_event_rx),
+            )
+            .await;
             std::process::exit(0);
         });
     }
@@ -1117,7 +1558,14 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => format!("render error: {e}"),
     };
     reporter.emit(&EngineEvent::Disconnected { reason });
-    say_goodbye(&conn, "client closing").await;
+    say_goodbye(
+        &conn,
+        "client closing",
+        &session_summary,
+        &shutdown_notice_sent,
+        Some(&decode_event_rx),
+    )
+    .await;
 
     // In `--ipc` mode the stdin stop-watcher parks a `tokio::io::stdin()`
     // blocking read that can't be cancelled, so letting `main` return would
@@ -1184,8 +1632,39 @@ async fn wait_for_stdin_stop() {
 /// any sane link. The floor handles loopback (RTT in the microseconds)
 /// and the cap bounds shutdown latency on a high-RTT link where the
 /// peer may already be unreachable anyway.
-async fn say_goodbye(conn: &tether_transport::Connection, reason: &str) {
-    say_goodbye_with_code(conn, reason, GoodbyeCode::Clean).await;
+async fn say_goodbye(
+    conn: &tether_transport::Connection,
+    reason: &str,
+    summary: &SessionSummaryState,
+    sent: &AtomicBool,
+    decode_events: Option<&crossbeam_channel::Receiver<DecodeEvent>>,
+) {
+    say_goodbye_once(
+        conn,
+        reason,
+        GoodbyeCode::Clean,
+        summary,
+        sent,
+        decode_events,
+    )
+    .await;
+}
+
+/// Send local final stats once and close the connection. The `sent` guard
+/// prevents a reciprocal Goodbye from echoing forever when both peers exchange
+/// shutdown summaries.
+async fn say_goodbye_once(
+    conn: &tether_transport::Connection,
+    reason: &str,
+    code: GoodbyeCode,
+    summary: &SessionSummaryState,
+    sent: &AtomicBool,
+    decode_events: Option<&crossbeam_channel::Receiver<DecodeEvent>>,
+) {
+    if sent.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    say_goodbye_with_code(conn, reason, code, summary, decode_events).await;
 }
 
 /// Variant that lets the caller signal *why* the session ended.
@@ -1196,15 +1675,27 @@ async fn say_goodbye_with_code(
     conn: &tether_transport::Connection,
     reason: &str,
     code: GoodbyeCode,
+    summary: &SessionSummaryState,
+    decode_events: Option<&crossbeam_channel::Receiver<DecodeEvent>>,
 ) {
     use std::time::Duration;
+    if let Some(rx) = decode_events {
+        drain_decode_events(rx, summary, None);
+    }
     let msg = ControlMessage::Goodbye {
         reason: reason.to_string(),
         code,
+        final_stats: Some(Box::new(summary.snapshot())),
     };
     if let Err(e) = conn.send_control(&msg).await {
         warn!(error = ?e, "send Goodbye failed; host will fall back to timeout");
     } else {
+        info!(
+            event = "session_teardown",
+            reason,
+            ?code,
+            "client sent Goodbye"
+        );
         let wait = (2 * conn.rtt()).clamp(Duration::from_millis(20), Duration::from_millis(200));
         tokio::time::sleep(wait).await;
     }
@@ -1327,7 +1818,10 @@ struct AudioFrameMsg {
 fn setup_audio_playback(
     enabled: bool,
     server_hello: &ServerHello,
+    summary: Arc<SessionSummaryState>,
 ) -> (Option<crossbeam_channel::Sender<AudioFrameMsg>>, bool) {
+    const AUDIO_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
     if !enabled {
         info!("audio disabled via --no-audio");
         return (None, false);
@@ -1366,17 +1860,37 @@ fn setup_audio_playback(
     // ~640 ms of 10 ms frames — generous headroom so the recv loop never
     // blocks; the jitter buffer downstream bounds actual playback latency.
     let (tx, rx) = crossbeam_channel::bounded::<AudioFrameMsg>(64);
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
     match std::thread::Builder::new()
         .name("tether-client-audio".into())
-        .spawn(move || run_audio_playback(opus_cfg, rx))
+        .spawn(move || run_audio_playback(opus_cfg, rx, summary, startup_tx))
     {
         Ok(_) => {
-            info!(
-                sample_rate = audio_cfg.sample_rate_hz,
-                channels = audio_cfg.channels,
-                "audio playback enabled"
-            );
-            (Some(tx), true)
+            match startup_rx.recv_timeout(AUDIO_STARTUP_TIMEOUT) {
+                Ok(Ok(())) => {
+                    info!(
+                        sample_rate = audio_cfg.sample_rate_hz,
+                        channels = audio_cfg.channels,
+                        "audio playback enabled"
+                    );
+                    (Some(tx), true)
+                }
+                Ok(Err(reason)) => {
+                    warn!(%reason, "audio playback unavailable; running video-only");
+                    (None, false)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    warn!(
+                        timeout_ms = AUDIO_STARTUP_TIMEOUT.as_millis(),
+                        "audio playback startup timed out; running video-only"
+                    );
+                    (None, false)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    warn!("audio playback thread exited before reporting readiness; running video-only");
+                    (None, false)
+                }
+            }
         }
         Err(e) => {
             warn!(error = %e, "failed to spawn audio thread; running video-only");
@@ -1393,21 +1907,26 @@ fn setup_audio_playback(
 fn run_audio_playback(
     cfg: tether_audio::OpusConfig,
     rx: crossbeam_channel::Receiver<AudioFrameMsg>,
+    summary: Arc<SessionSummaryState>,
+    startup_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
     let (player, sink) = match tether_audio::AudioPlayer::with_defaults(cfg) {
         Ok(pair) => pair,
         Err(e) => {
-            warn!(error = %e, "audio output device unavailable; no playback");
+            let _ = startup_tx.send(Err(format!("audio output device unavailable: {e}")));
             return;
         }
     };
     let decoder = match tether_audio::OpusDecoder::new(cfg) {
         Ok(d) => d,
         Err(e) => {
-            warn!(error = %e, "opus decoder init failed; no playback");
+            let _ = startup_tx.send(Err(format!("opus decoder init failed: {e}")));
             return;
         }
     };
+    if startup_tx.send(Ok(())).is_err() {
+        return;
+    }
     // Owns the decoder + sequence state; turns each datagram into PCM frames,
     // healing losses from the RED tail before falling back to PLC. The loss
     // counters it accumulates (recovered/concealed/dropout/stale) are surfaced
@@ -1436,6 +1955,9 @@ fn run_audio_playback(
     let mut prev_underruns: u64 = 0;
     let mut prev_dropped_samples: u64 = 0;
     let mut prev_recovery = tether_audio::RecoveryStats::default();
+    let mut summary_prev_underruns: u64 = 0;
+    let mut summary_prev_dropped_samples: u64 = 0;
+    let mut summary_prev_recovery = tether_audio::RecoveryStats::default();
     // Peak |sample| of decoded audio since the last log. ~0 means the frames
     // arriving are silent (the silence is upstream — capture/encode), which
     // distinguishes that from a local output-routing problem where non-zero
@@ -1472,6 +1994,20 @@ fn run_audio_playback(
             }
             sink.submit(pcm);
         });
+        let (summary_underruns, summary_dropped_samples, _) = sink.stats();
+        let summary_recovery = recovery.stats();
+        record_audio_playback_summary_delta(
+            &summary,
+            summary_underruns,
+            summary_prev_underruns,
+            summary_dropped_samples,
+            summary_prev_dropped_samples,
+            summary_recovery,
+            summary_prev_recovery,
+        );
+        summary_prev_underruns = summary_underruns;
+        summary_prev_dropped_samples = summary_dropped_samples;
+        summary_prev_recovery = summary_recovery;
 
         if last_stats_log.elapsed() >= STATS_INTERVAL {
             let (underruns, dropped_samples, buffered) = sink.stats();
@@ -1493,7 +2029,7 @@ fn run_audio_playback(
                 dropouts = s.dropouts - prev_recovery.dropouts,
                 stale_packets = s.stale_packets - prev_recovery.stale_packets,
                 decode_errors = s.decode_errors - prev_recovery.decode_errors,
-                peak = format!("{peak:.4}"),
+                peak,
                 "audio playback stats"
             );
             prev_underruns = underruns;
@@ -1504,8 +2040,73 @@ fn run_audio_playback(
         }
     }
 
+    let (underruns, dropped_samples, _) = sink.stats();
+    let s = recovery.stats();
+    record_audio_playback_summary_delta(
+        &summary,
+        underruns,
+        summary_prev_underruns,
+        dropped_samples,
+        summary_prev_dropped_samples,
+        s,
+        summary_prev_recovery,
+    );
+
     // Channel closed: drop the player to stop the output stream.
     drop(player);
+}
+
+fn record_audio_playback_summary_delta(
+    summary: &SessionSummaryState,
+    underruns: u64,
+    prev_underruns: u64,
+    dropped_samples: u64,
+    prev_dropped_samples: u64,
+    recovery: tether_audio::RecoveryStats,
+    prev_recovery: tether_audio::RecoveryStats,
+) {
+    summary
+        .audio
+        .underruns
+        .fetch_add(underruns.saturating_sub(prev_underruns), Ordering::Relaxed);
+    summary.audio.dropped_samples.fetch_add(
+        dropped_samples.saturating_sub(prev_dropped_samples),
+        Ordering::Relaxed,
+    );
+    summary.audio.recovered_frames.fetch_add(
+        recovery
+            .recovered_frames
+            .saturating_sub(prev_recovery.recovered_frames),
+        Ordering::Relaxed,
+    );
+    summary.audio.concealed_frames.fetch_add(
+        recovery
+            .concealed_frames
+            .saturating_sub(prev_recovery.concealed_frames),
+        Ordering::Relaxed,
+    );
+    summary.audio.dropout_frames.fetch_add(
+        recovery
+            .dropout_frames
+            .saturating_sub(prev_recovery.dropout_frames),
+        Ordering::Relaxed,
+    );
+    summary.audio.dropouts.fetch_add(
+        recovery.dropouts.saturating_sub(prev_recovery.dropouts),
+        Ordering::Relaxed,
+    );
+    summary.audio.stale_packets.fetch_add(
+        recovery
+            .stale_packets
+            .saturating_sub(prev_recovery.stale_packets),
+        Ordering::Relaxed,
+    );
+    summary.audio.decode_errors.fetch_add(
+        recovery
+            .decode_errors
+            .saturating_sub(prev_recovery.decode_errors),
+        Ordering::Relaxed,
+    );
 }
 
 /// Directory the client caches its identity (`client_cert.der`/`client_key.der`)
@@ -1659,15 +2260,31 @@ mod arg_tests {
 
     #[test]
     fn recovery_fires_only_on_a_pruned_frame_not_a_straggler() {
-        // (frames_dropped, fragments_lost)
-        // A frame pruned incomplete (frames_dropped++) → recover.
+        // (incomplete_frames, fragment_loss_events)
+        // A frame pruned incomplete (incomplete_frames++) → recover.
         assert!(recovery_warranted((0, 0), (1, 0)));
-        // A stale straggler / malformed packet (fragments_lost++ only) →
-        // do NOT recover; it's not independently actionable.
+        // A stale straggler / malformed packet (fragment_loss_events++ only)
+        // → do NOT recover; it's not independently actionable.
         assert!(!recovery_warranted((0, 0), (0, 1)));
         // Both moving still recovers — the dropped frame is the reason.
         assert!(recovery_warranted((0, 0), (1, 1)));
         // Nothing moved → nothing to recover.
         assert!(!recovery_warranted((3, 7), (3, 7)));
+    }
+
+    #[test]
+    fn startup_viewport_drain_uses_newest_queued_valid_size() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send((1600, 900)).unwrap();
+        tx.send((0, 0)).unwrap();
+        tx.send((1920, 1080)).unwrap();
+
+        let selected = drain_latest_valid_viewport(Viewport::new(1280, 720), &mut rx);
+
+        assert_eq!(selected, Viewport::new(1920, 1080));
+        assert!(
+            rx.try_recv().is_err(),
+            "queued resize events should be drained"
+        );
     }
 }

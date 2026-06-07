@@ -3783,7 +3783,7 @@ dependencies = [
 
 [[package]]
 name = "tether-ipc"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3791,7 +3791,7 @@ dependencies = [
 
 [[package]]
 name = "tether-pairing"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -3808,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "tether-shell"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",

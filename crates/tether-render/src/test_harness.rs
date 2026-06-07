@@ -235,6 +235,25 @@ pub(crate) fn run_roundtrip(case: &RoundtripCase) -> RoundtripResult {
             };
         }
     };
+    if case.requires.contains(&Capability::VaapiHevcMain10DmaBuf) && vaapi_selected_vendor_is_amd()
+    {
+        return RoundtripResult::Skip {
+            capability: Capability::VaapiHevcMain10DmaBuf,
+            detail: "AMD VAAPI P010 DMA-BUF submit is skipped on this host: \
+                     Mesa/amdgpu can abort the process during command submission instead of \
+                     returning a recoverable error"
+                .to_string(),
+        };
+    }
+    if case.capture_dims != case.encode_dims && vaapi_selected_vendor_is_amd() {
+        return RoundtripResult::Skip {
+            capability: capability_for_profile(case.profile),
+            detail: "AMD VAAPI scaler-active DMA-BUF roundtrips are skipped on this host: \
+                     Mesa/amdgpu can abort the process during command submission instead of \
+                     returning a recoverable error"
+                .to_string(),
+        };
+    }
 
     // 2. Fixture → BGRA at capture_dims.
     let capture_bgra = load_fixture(case.fixture, case.capture_dims);
@@ -515,6 +534,13 @@ fn encode_chain(case: &RoundtripCase, capture_bgra: &[u8]) -> Vec<tether_codec::
                     case.frames_encoded,
                 )
             }
+        } else if case.profile.chroma == ChromaSubsampling::Yuv420 {
+            encode_via_bridge_no_scaler(
+                case.profile,
+                case.capture_dims,
+                capture_bgra,
+                case.frames_encoded,
+            )
         } else {
             encode_via_cpu_upload(
                 case.profile,
@@ -1153,6 +1179,48 @@ fn capability_for_profile(profile: VideoProfile) -> Capability {
         (CodecKind::Hevc, _, _) => Capability::VaapiHevcMain,
         (CodecKind::Av1, _, _) => Capability::VaapiAv1,
     }
+}
+
+fn vaapi_selected_vendor_is_amd() -> bool {
+    const NVIDIA: &str = "0x10de";
+    const AMD: &str = "0x1002";
+
+    if let Some(path) = std::env::var_os("TETHER_VAAPI_DEVICE") {
+        if let Some(name) = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|s| s.to_str())
+        {
+            return render_node_vendor(name).is_some_and(|vendor| vendor == AMD);
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return false;
+    };
+    let mut nodes = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let number = name.strip_prefix("renderD")?.parse::<u32>().ok()?;
+            let vendor = std::fs::read_to_string(entry.path().join("device/vendor"))
+                .ok()?
+                .trim()
+                .to_ascii_lowercase();
+            Some((number, vendor))
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by_key(|(number, _)| *number);
+
+    nodes
+        .into_iter()
+        .find(|(_, vendor)| vendor != NVIDIA)
+        .is_some_and(|(_, vendor)| vendor == AMD)
+}
+
+fn render_node_vendor(name: &str) -> Option<String> {
+    let vendor = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/vendor")).ok()?;
+    Some(vendor.trim().to_ascii_lowercase())
 }
 
 // =====================================================================

@@ -5,6 +5,8 @@ use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 
 pub type VADisplay = *mut c_void;
+pub type VAProfile = c_int;
+pub type VAEntrypoint = c_int;
 pub type VAStatus = c_int;
 pub type VAGenericID = u32;
 pub type VASurfaceID = VAGenericID;
@@ -15,6 +17,17 @@ pub const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
 pub const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
 pub const VA_EXPORT_SURFACE_WRITE_ONLY: u32 = 0x0002;
 pub const VA_EXPORT_SURFACE_SEPARATE_LAYERS: u32 = 0x0004;
+
+// From <va/va.h>. Values are ABI-stable enum discriminants in libva 2.x.
+pub const VA_PROFILE_H264_MAIN: VAProfile = 6;
+pub const VA_PROFILE_HEVC_MAIN: VAProfile = 17;
+pub const VA_PROFILE_HEVC_MAIN10: VAProfile = 18;
+pub const VA_PROFILE_HEVC_MAIN444: VAProfile = 26;
+pub const VA_PROFILE_HEVC_MAIN444_10: VAProfile = 27;
+pub const VA_PROFILE_AV1_PROFILE0: VAProfile = 32;
+
+pub const VA_ENTRYPOINT_ENC_SLICE: VAEntrypoint = 6;
+pub const VA_ENTRYPOINT_ENC_SLICE_LP: VAEntrypoint = 8;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -54,6 +67,23 @@ impl DRMPRIMESurfaceDescriptor {
 }
 
 extern "C" {
+    pub fn vaMaxNumProfiles(dpy: VADisplay) -> c_int;
+
+    pub fn vaMaxNumEntrypoints(dpy: VADisplay) -> c_int;
+
+    pub fn vaQueryConfigProfiles(
+        dpy: VADisplay,
+        profile_list: *mut VAProfile,
+        num_profiles: *mut c_int,
+    ) -> VAStatus;
+
+    pub fn vaQueryConfigEntrypoints(
+        dpy: VADisplay,
+        profile: VAProfile,
+        entrypoint_list: *mut VAEntrypoint,
+        num_entrypoints: *mut c_int,
+    ) -> VAStatus;
+
     pub fn vaExportSurfaceHandle(
         dpy: VADisplay,
         surface_id: VASurfaceID,

@@ -30,6 +30,7 @@ The mise tasks separate short edit-loop checks from the authoritative suites:
 | `mise run test-hw-gpuconvert` | Ignored gpuconvert hardware tests only (serial, skips benchmark cells). |
 | `mise run test-hw-scaler` | Ignored scaler hardware tests only (serial, skips benchmark cells). |
 | `mise run test-hw-probe` | Ignored probe hardware tests only (serial, skips benchmark cells). |
+| `mise run test-hw-capture` | Real screen-capture smoke test; may prompt for capture permission/share. |
 | `mise run test-audio` | Current platform's ignored system-audio round-trip. |
 | `mise run bench` | Current platform's ignored benchmark cells, release, serial. |
 
@@ -54,6 +55,9 @@ pipeline:
   frame format conversion and shared-buffer export/import preconditions.
 - **scaler** (`tether-scaler`): hardware-accelerated scaler geometry and
   quality cells.
+- **screen-capture** (`tether-capture`): real capture backend starts and
+  delivers one platform-native frame shape. This is opt-in because desktop
+  portals / OS privacy layers can prompt for permission or screen selection.
 - **audio-loopback** (`tether-audio`): system-output capture → Opus → playback.
 
 Use these commands for family-specific sweeps:
@@ -65,11 +69,14 @@ Use these commands for family-specific sweeps:
 | `mise run test-hw-gpuconvert` | `cargo test -p tether-gpuconvert --tests --no-fail-fast [--release on macOS] -- --ignored --test-threads=1 --skip bench` |
 | `mise run test-hw-scaler` | `cargo test -p tether-scaler --tests --no-fail-fast [--release on macOS] -- --ignored --test-threads=1 --skip bench` |
 | `mise run test-hw-probe` | `cargo test -p tether-probe --tests --no-fail-fast [--release on macOS] -- --ignored --test-threads=1 --skip bench` |
+| `mise run test-hw-capture` | `cargo test -p tether-capture -- --ignored --test-threads=1 --nocapture` |
 
-These focused tasks intentionally match `mise run test-hw` launch semantics:
+The focused GPU tasks intentionally match `mise run test-hw` launch semantics:
 hardware tests run serially, benchmark-only cells stay in `mise run bench`, and
 macOS runs release-mode because the IOSurface/Metal comparison thresholds are
-not reliable in debug builds.
+not reliable in debug builds. Capture and audio are separate opt-in tasks
+because they can require interactive OS permission, screen selection, or active
+audio output.
 
 Canonical skip annotation style for hardware tests:
 

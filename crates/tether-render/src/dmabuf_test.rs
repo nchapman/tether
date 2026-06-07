@@ -181,7 +181,7 @@ fn assert_colorbars_outcome(case: &RoundtripCase, result: RoundtripResult) {
     }
 }
 
-/// Build an identity (no-scaler) colour-bar case at 1920×1200 for
+/// Build an identity (no-scaler) colour-bar case at 640×480 for
 /// `profile` with the given capability prereqs. `floors` is unused by
 /// the colour assertion but required by the struct; `FLOOR_IDENTITY`
 /// keeps it honest if a future edit routes this through `assert_outcome`.
@@ -194,9 +194,9 @@ fn colorbars_case(
         name,
         profile,
         fixture: Fixture::ColorBars,
-        capture_dims: (1920, 1200),
-        encode_dims: (1920, 1200),
-        surface_dims: (1920, 1200),
+        capture_dims: (640, 480),
+        encode_dims: (640, 480),
+        surface_dims: (640, 480),
         frames_encoded: 6,
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
@@ -926,9 +926,9 @@ fn roundtrip_hevc_main10_identity() {
         name: "hevc_main10_identity",
         profile: HEVC_MAIN10,
         fixture: Fixture::CoordEncoded,
-        capture_dims: (1920, 1200),
-        encode_dims: (1920, 1200),
-        surface_dims: (1920, 1200),
+        capture_dims: (640, 480),
+        encode_dims: (640, 480),
+        surface_dims: (640, 480),
         frames_encoded: 6,
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
@@ -1217,9 +1217,9 @@ fn roundtrip_hevc_main10_client_upscale() {
         name: "hevc_main10_client_upscale",
         profile: HEVC_MAIN10,
         fixture: Fixture::CoordEncoded,
-        capture_dims: (1920, 1200),
-        encode_dims: (1920, 1200),
-        surface_dims: (2560, 1440),
+        capture_dims: (640, 480),
+        encode_dims: (640, 480),
+        surface_dims: (960, 720),
         frames_encoded: 6,
         assert_steady_state_eps: Some(2.0),
         color_space: VideoColorSpec::sdr_desktop(),

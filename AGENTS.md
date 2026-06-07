@@ -30,8 +30,9 @@ Key tasks:
 - `mise run build` — `cargo build --workspace`
 - `mise run test` — `cargo test --workspace --lib` (no hardware)
 - `mise run test-all` — `cargo test --workspace` (full no-hardware test suite; matches CI's cargo test step)
-- `mise run test-hw` — every `#[ignore]` hardware test for the current platform, workspace-wide (`--workspace --exclude tether-audio --tests`): codec + render + gpuconvert + scaler + probe + capture. cfg-gating selects the backend (VAAPI/VideoToolbox/D3D11, PipeWire/SCK/DXGI capture) and the cross-platform GPU tests (scaler, probe) run on all three — no platform-shaped crate list. Serial (`--test-threads=1`) to avoid GPU contention; macOS adds `--release` (IOSurface/Metal threshold timing); skips bench
+- `mise run test-hw` — unattended GPU/video `#[ignore]` hardware tests for the current platform, workspace-wide (`--workspace --exclude tether-audio --exclude tether-capture --tests`): codec + render + gpuconvert + scaler + probe. cfg-gating selects the backend (VAAPI/NVENC/NVDEC, VideoToolbox, D3D11) and the cross-platform GPU tests (scaler, probe) run on all three — no platform-shaped crate list. Serial (`--test-threads=1`) to avoid GPU contention; macOS adds `--release` (IOSurface/Metal threshold timing); skips bench. Capture is excluded because Linux/macOS can show an OS screen-share/permission prompt.
 - `mise run test-hw-{codec,render,gpuconvert,scaler,probe}` — focused ignored hardware sweeps with the same serial / no-bench / macOS-release semantics as `test-hw`
+- `mise run test-hw-capture` — the current platform's real screen-capture smoke test (Linux PipeWire portal, macOS ScreenCaptureKit, Windows DXGI); may prompt for capture permission/screen selection
 - `mise run test-audio` — the current platform's system-audio capture→Opus→playback round-trip (needs an audio device with sound playing)
 - `mise run bench` — the current platform's benchmark cells in release: VAAPI encode matrix (Linux) + the cross-platform scaler microbench (everywhere); no-op where a backend has no bench cells yet
 - `mise run probe` — print this host's codec capability matrix (encode/decode per profile)

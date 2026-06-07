@@ -62,8 +62,9 @@ const TRANSFER_KIND_BT709: u32 = 0u;
 const TRANSFER_KIND_SRGB: u32 = 1u;
 
 // Limited-range BT.709 -> normalised. 8-bit only by construction:
-// `render_layout_for` routes 10-bit 4:4:4 to Biplanar16 (P410), so a
-// PackedXYUV pipeline can only be built for 8-bit data. If that
+// `render_layout_for` routes Linux 10-bit 4:4:4 to the separate
+// PackedY410 shader, while macOS 10-bit 4:4:4 uses Biplanar16 (P410).
+// A PackedXYUV pipeline can only be built for 8-bit data. If that
 // invariant ever changes, mirror `shader.wgsl`'s RANGE_KIND_LIMITED_10
 // branch here too.
 fn limited_y_to_normalized(y_lim: f32) -> f32 {

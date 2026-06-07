@@ -9,29 +9,17 @@
 //!
 //! ## Why this crate exists
 //!
-//! `tether-codec::probe::supported_profiles()` already runs a per-profile
-//! round-trip via the `ProfileProbe` trait — but `tether-codec` can't
-//! depend on `tether-gpuconvert` (the producer side of the Linux hot
-//! path) without inverting the project's dependency graph. So the
-//! codec-internal probe is *construction-only* for 10-bit: it builds a
-//! P010LE encoder and confirms `avcodec_open2` accepts it, but never
-//! feeds the encoder a real dma-buf. The Intel iHD + Mesa + FFmpeg 8.1
-//! combination accepts construction and then rejects the actual
-//! `av_hwframe_map(DRM_PRIME → VAAPI)` at submit time — so the host
-//! used to advertise Main10 it couldn't serve, and clients hit a
-//! silent freeze after handshake.
+//! `tether-codec::probe::supported_profiles()` runs codec-local checks, but
+//! `tether-codec` can't depend on `tether-gpuconvert` (the producer side of the
+//! Linux hot path) without inverting the dependency graph. This crate owns the
+//! production-shaped layer: Linux encode probes submit real P010/XV30 DMA-BUFs
+//! through the gpuconvert bridges before a host advertises those profiles. That
+//! catches failures such as Intel iHD + Mesa + FFmpeg accepting construction but
+//! rejecting `av_hwframe_map(DRM_PRIME → VAAPI)` at submit time.
 //!
-//! We patched it with a second probe layer in `tether-host`
-//! (`warm_gpuconvert_capability_cache` + `probe_p010_submit_round_trip`)
-//! and a third filter layer (`capture_filtered_encode_profiles`). Three
-//! caches, three platform cfg arms — workaround scaffolding for one
-//! architectural fact: the probe needs to round-trip the production
-//! chain *including the bridge*. The bridge lives one crate up from
-//! tether-codec, so the probe orchestration belongs here.
-//!
-//! After this lands, `host_supported_profiles()` is the single source
-//! of truth. Adding a new hardware combo means none of the host's
-//! caches change — the round-trip is the answer.
+//! `host_supported_profiles()` is the single source of truth for the host
+//! advert. Adding a new hardware combo means teaching this crate how to run the
+//! corresponding production chain; the round-trip is the answer.
 //!
 //! ## Public surface
 //!
@@ -96,9 +84,9 @@ impl ProfileSupport {
 /// stack of "10-bit encode probe failed" log lines from three layers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupportStatus {
-    /// Full round trip succeeded. The host/client may advertise this
-    /// profile and the session is guaranteed not to fail at that
-    /// specific stage of the pipeline at runtime.
+    /// Full probe round trip succeeded. The host/client may advertise this
+    /// profile; runtime can still fail later on device loss, OOM, driver reset,
+    /// or dimensions/resource shapes not covered by the fixed probe.
     Supported,
     /// Round trip rejected at `stage`. `reason` is free-form English
     /// suitable for logs.

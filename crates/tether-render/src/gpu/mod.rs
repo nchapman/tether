@@ -291,9 +291,9 @@ pub(crate) struct UpscaleStage {
 ///   interleaved UV in Rg16Unorm, with 10-bit data MSB-aligned in
 ///   the 16-bit storage cells. Apple's `'P410'` IOSurface (10-bit
 ///   4:4:4 from VT HEVC Main 4:4:4 10-bit decode), `'xf44'` (same
-///   shape via SCK capture), and Linux's `DRM_FORMAT_P010`/`P410`
-///   dma-bufs all land here. Same bind-group layout + same shader
-///   as Biplanar8 — the `range_kind` uniform in `color_params`
+///   shape via SCK capture), and Linux's `DRM_FORMAT_P010` dma-bufs land
+///   here. Same bind-group layout + same shader as Biplanar8 — the
+///   `range_kind` uniform in `color_params`
 ///   selects the 10-bit limited-range branch, which compensates the
 ///   MSB-align so max-value samples normalise to 1.0 instead of
 ///   `≈0.999`.
@@ -301,8 +301,8 @@ pub(crate) struct UpscaleStage {
 ///   Only the Linux dma-buf path for Yuv444 8-bit — VAAPI's 4:4:4
 ///   8-bit surfaces are exposed this way and the shader pulls Y
 ///   from `.z`, U from `.y`, V from `.x`. There is no 10-bit
-///   PackedXYUV path; Linux 10-bit 4:4:4 lands on Biplanar16
-///   instead.
+///   PackedXYUV path; Linux 10-bit 4:4:4 uses the separate
+///   `PackedY410` / `Rgb10a2Unorm` shader path.
 ///
 /// Adding a new `(chroma, bit_depth, backend)` combo means returning
 /// the right variant from [`render_layout_for`] and (if it's a third

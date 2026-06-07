@@ -2021,11 +2021,10 @@ fn encode_gpu_frame(
     }
 }
 
-/// Encode one ScreenCaptureKit-supplied IOSurface through the
-/// VideoToolbox zero-copy path. Simpler than the Linux equivalent —
-/// no gpuconvert bridge, no NV12 conversion, no `BridgeState`: SCK
-/// hands us NV12 IOSurfaces directly and the encoder consumes them
-/// as-is via `CVPixelBufferCreateWithIOSurface`.
+/// Encode one ScreenCaptureKit-supplied BGRA IOSurface through the
+/// VideoToolbox zero-copy path. The host bridge converts BGRA into the
+/// negotiated VideoToolbox input family (NV12/P010/NV24/P410-style IOSurface)
+/// before the encoder consumes it via `CVPixelBufferCreateWithIOSurface`.
 ///
 /// The capture-side `release_guard` keeps the underlying IOSurface
 /// alive for the duration of this call; the encoder's

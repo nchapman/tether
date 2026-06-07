@@ -411,10 +411,10 @@ fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
 /// A single captured frame from the host's display.
 ///
 /// Two shapes: CPU-side owned bytes (the SHM fallback path), and a
-/// platform-specific GPU handle (DMA-BUF on Linux, IOSurface on macOS
-/// later, D3D11 shared handle on Windows later). The host's encode
-/// path pattern-matches: GPU frames go through the gpuconvert + VAAPI
-/// zero-copy pipeline; CPU frames fall through to `encode_bgra`.
+/// platform-specific GPU handle (DMA-BUF on Linux, IOSurface on macOS, D3D11
+/// texture on Windows). The host's encode path pattern-matches: GPU frames go
+/// through the platform bridge/encoder path; CPU frames fall through to
+/// `encode_bgra`.
 ///
 /// Shape mirrors [`tether_codec::Frame`] / [`tether_codec::GpuFrame`]
 /// for consistency — the producer and consumer end of the same

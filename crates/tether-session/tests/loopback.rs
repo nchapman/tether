@@ -264,10 +264,10 @@ async fn double_send_server_hello_corrupts_the_stream() {
     // second `ServerHello` frame on the wire after the client has
     // moved on to reading `ControlMessage`s — prost decode/conversion fails.
     //
-    // This regression test exists to keep future refactors of
-    // `HostSession::accept` honest. The proper fix is a typestate
-    // wrapper that makes the double-call uncompilable; until that
-    // lands, this catches the misuse at runtime.
+    // Production orchestration goes through the `HostHandshake` typestate
+    // wrapper, which makes this double-call uncompilable. This regression test
+    // pins the lower-level `ControlChannel` escape hatch that tests and custom
+    // harnesses can still call directly.
     let (host_chan, client_chan) = duplex_pair();
     let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
 

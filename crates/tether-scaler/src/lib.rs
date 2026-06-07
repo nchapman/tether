@@ -74,11 +74,12 @@ pub enum ScalerError {
         got: (u32, u32),
     },
 
-    /// A YUV-plane scaling [`ColorSpace`] ([`ColorSpace::LumaR8`] or
-    /// [`ColorSpace::ChromaRg8`]) was requested, but the `Pipelines`
-    /// handed to the scaler was built without YUV plane support. Use
-    /// [`Pipelines::build_with_plane_storage`] on a device that has
-    /// opted into `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`.
+    /// A YUV-plane scaling [`ColorSpace`] ([`ColorSpace::LumaR8`],
+    /// [`ColorSpace::ChromaRg8`], [`ColorSpace::LumaR16`], or
+    /// [`ColorSpace::ChromaRg16`]) was requested, but the `Pipelines` handed to
+    /// the scaler was built without the matching YUV plane support. Use
+    /// [`Pipelines::build_with_plane_storage`] on a device that has opted into
+    /// `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`.
     #[error(
         "YUV plane pipelines not built (use Pipelines::build_with_plane_storage \
          and ensure the device opted into TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)"

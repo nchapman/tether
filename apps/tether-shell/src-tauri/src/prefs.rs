@@ -3,9 +3,9 @@
 //! Currently this is just the *sharing posture*: whether "Allow remote
 //! connections" was last left on. The shell re-applies it on launch — off on
 //! first run, sticky after — so a machine the user wants reachable doesn't need
-//! the window re-opened every boot. Both the Sharing sheet toggle and (later)
-//! the tray toggle drive this through `start_host` / `stop_engine`, so the
-//! persisted posture has a single writer path and can't drift from them.
+//! the window re-opened every boot. Both the Sharing sheet toggle and the tray
+//! toggle drive this through `start_host` / `stop_engine`, so the persisted
+//! posture has a single writer path and can't drift from them.
 //!
 //! Stored next to the trust store in the shared config dir. Unlike
 //! `known_hosts.json` this is non-secret UI state, so a plain atomic write

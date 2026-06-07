@@ -980,7 +980,7 @@ mod tests {
 
     /// Drive the client half of a first-contact pairing over its pending
     /// connection: SPAKE2 message, confirmation MAC, and verification of the
-    /// host's reply. Mirrors what the Phase 6 client main will do.
+    /// host's reply. Mirrors the client main's first-contact pairing path.
     async fn drive_client_pair(
         mut p: PendingConnection,
         pin: &[u8],

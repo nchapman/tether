@@ -193,12 +193,12 @@ impl VideoFrameMetaEnvelope {
 /// `stream_epoch` + `frame_seq` counters (cribbed from RustDesk's
 /// `video_threads: HashMap<usize, _>` pattern).
 ///
-/// `stream_epoch` is `u32` (varint-encoded as 1 byte for typical values) so
-/// a long-lived session that restarts the encoder cannot wrap and reuse a
-/// prior epoch (which would let the client misattribute fragments at the
-/// wrong resolution / codec / hw context). The host bumps `stream_epoch`
-/// whenever the encoder is restarted (resize, codec switch, HW context
-/// loss). Clients drop all packets from prior epochs.
+/// `stream_epoch` is `u32` (varint-encoded as 1 byte for typical values). The
+/// host bumps it whenever the encoder is restarted (resize, codec switch, HW
+/// context loss), and clients treat epochs as monotonic for the lifetime of a
+/// session so packets from prior epochs are dropped. A session must not survive
+/// enough encoder restarts to wrap and reuse an epoch; wrap is outside the
+/// supported wire contract rather than something receivers try to recover from.
 ///
 /// The frame descriptor (`fragment_count`, `fec_pct`, `shard_size`,
 /// `total_body_len`) rides on `First` and on every `Parity` packet so a frame

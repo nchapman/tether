@@ -338,25 +338,25 @@ async fn main() -> anyhow::Result<()> {
     // function returns profiles in PROFILE_PREFERENCE order so logs
     // look natural.
     let mut client_decode_profiles = tether_probe::client_decode_profiles();
-    // Renderer capability gate for 10-bit. The codec decode probe can't
-    // see whether the *renderer* can present 10-bit, so each backend's
-    // `supports_10bit_render` answers that (the platform-specific reason
-    // lives in its doc comment): on Linux/macOS it's the wgpu adapter's
-    // `TEXTURE_FORMAT_16BIT_NORM`; on Windows it's D3D11 P010 texture
-    // support. Filter 10-bit profiles out of our advert when the renderer
-    // can't present them so the host's negotiator never picks one we
-    // can't actually render.
-    if !tether_render::supports_10bit_render().await {
-        let before = client_decode_profiles.len();
-        client_decode_profiles.retain(|p| p.bit_depth == 8);
-        let dropped = before - client_decode_profiles.len();
-        if dropped > 0 {
-            info!(
-                dropped_profiles = dropped,
-                "renderer cannot present 10-bit; dropping 10-bit profiles \
-                 from the decode-capability advert"
-            );
+    // Renderer capability gate. The codec decode probe can't see whether the
+    // renderer can present a profile, so each backend answers per profile. That
+    // matters for Linux 4:4:4 10-bit: it uses a packed 10:10:10:2 texture path,
+    // not the 16-bit biplanar feature gate used by P010/P410.
+    let before_render_gate = client_decode_profiles.len();
+    let mut renderable_profiles = Vec::with_capacity(client_decode_profiles.len());
+    for profile in client_decode_profiles {
+        if tether_render::supports_video_profile_render(profile).await {
+            renderable_profiles.push(profile);
         }
+    }
+    let dropped = before_render_gate - renderable_profiles.len();
+    client_decode_profiles = renderable_profiles;
+    if dropped > 0 {
+        info!(
+            dropped_profiles = dropped,
+            "renderer cannot present some decoded profiles; dropping them \
+             from the decode-capability advert"
+        );
     }
     let forced_video_profile = match tether_probe::forced_video_profile_from_env() {
         Ok(profile) => profile,

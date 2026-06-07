@@ -244,12 +244,11 @@ pub trait Encoder: Send {
 }
 
 /// Platform-tagged GPU-resident frame input for [`Encoder::encode_gpu`].
-/// Variants are cfg-gated internally so the enum is cross-platform but
-/// each platform compiles with exactly the variants its capture backends
-/// can produce — no catch-all that silently swallows future variants.
-/// On a platform with no GPU input backends the enum is uninhabited, so
-/// the host can't accidentally construct one and the default trait body
-/// is the only callable path.
+/// Variants are cfg-gated internally so each platform compiles with exactly
+/// the variants its capture backends can produce — no catch-all that silently
+/// swallows future variants. On a platform with no GPU input backends the only
+/// variant is an uninhabited marker, so safe code still cannot construct a GPU
+/// frame and the default trait body is the only callable path.
 #[derive(Debug)]
 pub enum GpuEncoderFrame<'a> {
     /// DRM_PRIME / DMA-BUF input. Today consumed by [`crate::vaapi`]
@@ -272,12 +271,11 @@ pub enum GpuEncoderFrame<'a> {
     /// (`AVFrame` mapped from the shared `ID3D11Texture2D`).
     #[cfg(target_os = "windows")]
     D3D11Texture(&'a D3D11TextureFrame),
-    // Keeps the enum inhabited on platforms where no cfg branch above
-    // fires. On platforms that have a real variant this is unreachable
-    // by safe code; the encoder's `encode_gpu` default body never
-    // matches it.
+    // Keeps the lifetime parameter live on platforms where no cfg branch above
+    // fires without making the enum constructible by safe code.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     #[doc(hidden)]
-    _Phantom(std::marker::PhantomData<&'a ()>),
+    _Unsupported(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
 }
 
 /// Output of one decoded frame, either CPU-resident NV12 planes or a

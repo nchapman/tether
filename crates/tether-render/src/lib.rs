@@ -72,9 +72,9 @@ pub use winit::keyboard::{KeyCode, ModifiersState};
 pub use gpu::accepts_iosurface_fourcc;
 
 #[cfg(target_os = "windows")]
-pub use d3d11::supports_10bit_render;
+pub use d3d11::{supports_10bit_render, supports_video_profile_render};
 #[cfg(not(target_os = "windows"))]
-pub use gpu::supports_10bit_render;
+pub use gpu::{supports_10bit_render, supports_video_profile_render};
 // Windows decode-format accept table, exported for the cross-crate
 // consistency test in tether-client (see `decode_plane_srv_formats`).
 #[cfg(target_os = "windows")]

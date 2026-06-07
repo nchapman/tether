@@ -59,7 +59,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use winit::window::Window;
 
-use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
+use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec, VideoProfile};
 
 use tether_codec::GpuFrameSource;
 
@@ -148,6 +148,19 @@ pub async fn supports_10bit_render() -> bool {
             Ok(flags) => (flags & D3D11_FORMAT_SUPPORT_TEXTURE2D.0 as u32) != 0,
             Err(_) => false,
         }
+    }
+}
+
+/// Whether the D3D11 renderer can render a negotiated video profile.
+///
+/// Windows decode/present is wired for 4:2:0 NV12/P010 surfaces today; 4:4:4
+/// profiles are intentionally not render-advertised until a D3D11 4:4:4 path
+/// exists.
+pub async fn supports_video_profile_render(profile: VideoProfile) -> bool {
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => true,
+        (ChromaSubsampling::Yuv420, 10) => supports_10bit_render().await,
+        _ => false,
     }
 }
 

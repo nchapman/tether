@@ -331,13 +331,13 @@ pub fn video_duplex_pair_with_depth(
 #[async_trait]
 impl VideoChannel for DuplexVideoChannel {
     fn send_datagram(&self, d: &Datagram) -> Result<()> {
-        // Production round-trip: encode→decode so payload bugs surface
-        // the same way they would on the wire. The decode is paid by
-        // the receiver in recv_datagram; here we only validate that
-        // the value *can* serialize at all (matches production: the
-        // real send_datagram also calls encode before quinn ingests).
+        // Production-shaped round-trip: encode→bounded datagram decode so
+        // payload bugs and receive-side allocation caps surface the same way
+        // they would on the wire. The real send path only encodes before quinn
+        // ingests; the fake stores decoded values, so it must validate through
+        // the production receive decoder here.
         let bytes = tether_protocol::encode(d)?;
-        let decoded: Datagram = tether_protocol::decode(&bytes)?;
+        let decoded = tether_protocol::decode_datagram(&bytes)?;
         match self.dgram_tx.try_send(decoded) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {

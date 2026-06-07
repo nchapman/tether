@@ -965,7 +965,6 @@ impl Encoder for VaapiEncoder {
             crate::GpuEncoderFrame::DmaBuf(f) => {
                 VaapiEncoder::submit_dmabuf(self, f, pts, force_keyframe)
             }
-            crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
         }
     }
 }

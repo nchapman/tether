@@ -3635,6 +3635,21 @@ fn run_capture_and_send(
                     force_kf,
                 ) {
                     Ok(p) => p,
+                    Err(tether_codec::CodecError::UnsupportedInputFormat) => {
+                        tracing::error!(
+                            "D3D11 GPU encode input path unavailable; sending Goodbye(InternalError) and exiting send loop"
+                        );
+                        let reason = "host D3D11 GPU encode input path unavailable";
+                        send_goodbye_notice_blocking(
+                            &runtime,
+                            &conn,
+                            &shutdown_notice_sent,
+                            reason,
+                            GoodbyeCode::InternalError,
+                            &summary,
+                        );
+                        return;
+                    }
                     Err(e) => {
                         warn!(error = %e, "D3D11 GPU encode failed; dropping frame");
                         continue;

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
-use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
+use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec, VideoProfile};
 use winit::window::Window;
 
 use crate::{CpuFrame, Frame, GpuFrame, RenderError, Result};
@@ -456,6 +456,19 @@ pub async fn supports_10bit_render() -> bool {
     adapter
         .features()
         .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+}
+
+/// Whether this backend can render a negotiated video profile.
+///
+/// The check is layout-specific: 10-bit biplanar layouts need
+/// `TEXTURE_FORMAT_16BIT_NORM`, while Linux's packed 10-bit 4:4:4 path imports
+/// one `Rgb10a2Unorm` texture and must not be rejected by the biplanar gate.
+pub async fn supports_video_profile_render(profile: VideoProfile) -> bool {
+    match render_layout_for(profile.chroma, profile.bit_depth) {
+        RenderLayout::Biplanar8 | RenderLayout::Planar444 | RenderLayout::PackedXYUV => true,
+        RenderLayout::Biplanar16 => supports_10bit_render().await,
+        RenderLayout::PackedY410 => true,
+    }
 }
 
 impl GpuState {

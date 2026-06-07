@@ -1018,10 +1018,16 @@ async fn main() -> anyhow::Result<()> {
             // Bounded channel + try_send means a stalled decoder
             // doesn't block the recv loop — we drop the frame and
             // count the loss so the stats line surfaces it.
+            // `frame.stream_epoch` is the reassembler's authority on which
+            // epoch this frame belongs to (it keys fragments by epoch). The
+            // decode worker rebuilds the decoder when the epoch advances —
+            // the host bumps it on a resolution/codec change, and an in-place
+            // reconfigure corrupts the AV1 decoder on AMD.
             let job = DecodeJob {
                 body: frame.body,
                 host_in_client_clock,
                 keyframe: frame.meta.keyframe,
+                stream_epoch: frame.stream_epoch,
             };
             if decode_job_tx.try_send(job).is_err() {
                 decode_queue_drops = decode_queue_drops.saturating_add(1);

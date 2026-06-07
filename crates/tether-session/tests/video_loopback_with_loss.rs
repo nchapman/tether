@@ -246,6 +246,7 @@ async fn loss_drives_worker_soft_failure_then_keyframe_recovers() {
             body,
             host_in_client_clock: MonoNanos::now(),
             keyframe: false,
+            stream_epoch: 0,
         };
         let c = worker.process_job(job, MonoNanos::now());
         assert!(

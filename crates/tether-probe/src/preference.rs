@@ -135,17 +135,17 @@ pub fn parse_forced_video_profile(raw: &str) -> Result<VideoProfile, String> {
         ));
     }
 
-    match (codec, chroma, bit_depth) {
-        (CodecKind::H264, ChromaSubsampling::Yuv420, 8) => Ok(VideoProfile::H264_8BIT_420),
-        (CodecKind::Hevc, ChromaSubsampling::Yuv420, 8) => Ok(VideoProfile::HEVC_8BIT_420),
-        (CodecKind::Hevc, ChromaSubsampling::Yuv420, 10) => Ok(VideoProfile::HEVC_10BIT_420),
-        (CodecKind::Hevc, ChromaSubsampling::Yuv444, 8) => Ok(VideoProfile::HEVC_8BIT_444),
-        (CodecKind::Hevc, ChromaSubsampling::Yuv444, 10) => Ok(VideoProfile::HEVC_10BIT_444),
-        (CodecKind::Av1, ChromaSubsampling::Yuv420, 8) => Ok(VideoProfile::AV1_8BIT_420),
-        (CodecKind::Av1, ChromaSubsampling::Yuv420, 10) => Ok(VideoProfile::AV1_10BIT_420),
-        _ => Err(format!(
+    let profile = VideoProfile {
+        codec,
+        chroma,
+        bit_depth,
+    };
+    if PROFILE_PREFERENCE.contains(&profile) {
+        Ok(profile)
+    } else {
+        Err(format!(
             "{FORCE_VIDEO_PROFILE_ENV}={raw:?} is not in PROFILE_PREFERENCE"
-        )),
+        ))
     }
 }
 
@@ -226,6 +226,23 @@ mod tests {
             parse_forced_video_profile("h264-8-yuv420").unwrap(),
             VideoProfile::H264_8BIT_420
         );
+    }
+
+    #[test]
+    fn forced_profile_parser_accepts_every_preferred_profile() {
+        for &profile in PROFILE_PREFERENCE {
+            let codec = match profile.codec {
+                CodecKind::H264 => "h264",
+                CodecKind::Hevc => "hevc",
+                CodecKind::Av1 => "av1",
+            };
+            let chroma = match profile.chroma {
+                ChromaSubsampling::Yuv420 => "420",
+                ChromaSubsampling::Yuv444 => "444",
+            };
+            let value = format!("{codec}-{}-{chroma}", profile.bit_depth);
+            assert_eq!(parse_forced_video_profile(&value), Ok(profile));
+        }
     }
 
     #[test]

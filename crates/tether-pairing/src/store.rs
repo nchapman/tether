@@ -238,9 +238,19 @@ fn save_json_private<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let json = serde_json::to_vec_pretty(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
+    let tmp = temp_store_path(path, seq);
     write_private(&tmp, &json)?;
-    std::fs::rename(&tmp, path)
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn temp_store_path(path: &Path, seq: u64) -> std::path::PathBuf {
+    path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()))
 }
 
 /// Render a fingerprint as `"sha256:<lowercase-hex>"`.
@@ -542,6 +552,37 @@ mod tests {
         let loaded = KnownHosts::load(&path).expect("load");
         assert_eq!(loaded.fingerprint("host.local:7654"), Some(fp));
         assert_eq!(loaded.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_save_removes_temp_file() {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("tether-pairing-failed-save-{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+
+        let path = dir.join("known_hosts.json");
+        std::fs::create_dir(&path).expect("create target directory");
+
+        let mut hosts = KnownHosts::default();
+        let fp = [10u8; 32];
+        hosts.insert("host.local:7654".to_string(), &fp, "work".to_string(), 100);
+
+        let result = hosts.save(&path);
+        assert!(result.is_err(), "saving over a directory must fail");
+
+        let leftover_tmp = std::fs::read_dir(&dir)
+            .expect("read test dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".tmp"))
+            });
+        assert!(!leftover_tmp, "failed save must remove its temp file");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

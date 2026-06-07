@@ -6,8 +6,8 @@
 //!   extension escape hatch.
 //! - **Video datagrams** (unreliable) — fragmented encoded frames.
 //! - **Audio datagrams** (unreliable) — Opus packets, host→client.
-//!   Wire shape defined; pipeline (capture/encode/decode/output) is
-//!   future work — see [`audio`].
+//!   Capture/encode/decode/output is wired end-to-end and negotiated by
+//!   `ServerHello::audio`; see [`audio`].
 //! - **Cursor datagrams** (unreliable, high priority) — pointer
 //!   position. Sprite payloads ride the reliable control stream.
 //! - **Input stream** (reliable, client→host) — keyboard + mouse events.

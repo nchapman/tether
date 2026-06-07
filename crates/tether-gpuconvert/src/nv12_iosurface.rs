@@ -20,7 +20,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
@@ -569,8 +569,16 @@ struct IOSurfacePool {
 }
 
 impl IOSurfacePool {
+    fn lock_inner(&self) -> MutexGuard<'_, PoolInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn depth(&self) -> usize {
+        self.lock_inner().slots.len()
+    }
+
     fn acquire(&self) -> Option<usize> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock_inner();
         for (i, slot) in g.slots.iter_mut().enumerate() {
             if !slot.in_use {
                 slot.in_use = true;
@@ -581,7 +589,7 @@ impl IOSurfacePool {
     }
 
     fn release(&self, idx: usize) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock_inner();
         if let Some(slot) = g.slots.get_mut(idx) {
             slot.in_use = false;
         }
@@ -863,7 +871,7 @@ impl Nv12IOSurfaceBridge {
     /// slot to the pool, so the caller MUST keep the handle alive
     /// until VideoToolbox's compression-output callback fires.
     pub fn scale_to_iosurface(&self, src: &IOSurfaceFrame) -> Result<PooledIOSurface, BridgeError> {
-        let pool_depth = self.pool.inner.lock().unwrap().slots.len();
+        let pool_depth = self.pool.depth();
         let slot_idx = self
             .pool
             .acquire()
@@ -935,7 +943,7 @@ impl Nv12IOSurfaceBridge {
         // `in_use` is set and only the `SlotGuard` / `PooledIOSurface`
         // drop paths can clear it — neither fires here.
         let (frame, attachments_already_seeded, y_dst_tex, uv_dst_tex) = {
-            let g = self.pool.inner.lock().unwrap();
+            let g = self.pool.lock_inner();
             let slot = &g.slots[slot_idx];
             (
                 slot.iosurface
@@ -952,7 +960,7 @@ impl Nv12IOSurfaceBridge {
         if !attachments_already_seeded {
             // SAFETY: src.surface was just successfully imported
             // above (so it's not null and is a live IOSurface).
-            let mut g = self.pool.inner.lock().unwrap();
+            let mut g = self.pool.lock_inner();
             let slot = &mut g.slots[slot_idx];
             slot.iosurface.copy_colorimetry_attachments(src.surface);
             slot.attachments_seeded = true;
@@ -1188,7 +1196,7 @@ impl BgraIOSurfaceBridge {
             });
         }
 
-        let pool_depth = self.pool.inner.lock().unwrap().slots.len();
+        let pool_depth = self.pool.depth();
         let slot_idx = self
             .pool
             .acquire()
@@ -1213,7 +1221,7 @@ impl BgraIOSurfaceBridge {
         };
 
         let (frame, attachments_already_seeded, y_dst_mtl, uv_dst_mtl) = {
-            let g = self.pool.inner.lock().unwrap();
+            let g = self.pool.lock_inner();
             let slot = &g.slots[slot_idx];
             (
                 slot.iosurface
@@ -1224,7 +1232,7 @@ impl BgraIOSurfaceBridge {
             )
         };
         if !attachments_already_seeded {
-            let mut g = self.pool.inner.lock().unwrap();
+            let mut g = self.pool.lock_inner();
             let slot = &mut g.slots[slot_idx];
             slot.iosurface.copy_colorimetry_attachments(src.surface);
             slot.attachments_seeded = true;
@@ -1794,6 +1802,25 @@ mod tests {
                  `if bit_depth == 10` guard fires"
             );
         }
+    }
+
+    #[test]
+    fn iosurface_pool_recovers_poisoned_lock() {
+        let pool = Arc::new(IOSurfacePool {
+            inner: Mutex::new(PoolInner { slots: Vec::new() }),
+        });
+        let poisoned_pool = Arc::clone(&pool);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poisoned_pool.inner.lock().expect("lock test pool");
+            panic!("poison test pool");
+        }));
+        assert!(result.is_err());
+        assert!(pool.inner.is_poisoned());
+
+        assert_eq!(pool.depth(), 0);
+        assert_eq!(pool.acquire(), None);
+        pool.release(0);
     }
 
     /// Verify the cosited-NV12 horizontal chroma offset formula

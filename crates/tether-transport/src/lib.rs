@@ -45,8 +45,9 @@ use tether_protocol::CodecError;
 
 /// Hard cap on the size of a single framed message on the control or input
 /// stream. Guards [`tether_protocol::decode`] against forged length prefixes
-/// from a hostile peer (the QUIC datagram path is already capped by
-/// [`tether_protocol::MAX_DATAGRAM_PAYLOAD`]).
+/// from a hostile peer. QUIC datagrams use
+/// [`tether_protocol::decode_datagram`], which has its own receive-side cap
+/// separate from the soft video fragmentation target.
 pub const MAX_FRAMED_MESSAGE: usize = 64 * 1024;
 
 /// Per-connection cap on concurrent peer-initiated unidirectional streams.

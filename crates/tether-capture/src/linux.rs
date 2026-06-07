@@ -36,7 +36,7 @@ use std::sync::Mutex;
 use tether_protocol::cursor::CursorPixelFormat;
 use tether_protocol::MonoNanos;
 
-use crate::cursor::{CursorEvent, CursorPosition, CursorShapeEvent, CursorSource};
+use crate::cursor::{fnv1a_64, CursorEvent, CursorPosition, CursorShapeEvent, CursorSource};
 use crate::{
     damage::NativeDamage, CaptureError, CaptureHandle, CapturedDmaBuf, CapturedFrame, CpuFrame,
     GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, PixelFormat, Result,
@@ -1253,26 +1253,8 @@ fn build_cursor_shape(
             rgba.extend_from_slice(&[r, g, b, a]);
         }
     }
-    // FNV-1a 64-bit. Build-stable and platform-stable so the same
-    // sprite produces the same id across reconnects (and across
-    // host binaries) — required by both the host's `seen_ids` dedup
-    // and the client's LRU shape cache. `DefaultHasher`'s output is
-    // explicitly not stable, so we hand-roll the standard one.
-    let id = {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for byte in width
-            .to_le_bytes()
-            .iter()
-            .chain(height.to_le_bytes().iter())
-            .chain(rgba.iter())
-        {
-            h ^= u64::from(*byte);
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
-    };
     Some(CursorShapeEvent {
-        id,
+        id: fnv1a_64(width, height, &rgba),
         width,
         height,
         hotspot: (

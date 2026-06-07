@@ -1272,6 +1272,43 @@ fn rg8_plane_scaler_matches_reference() {
 
 #[test]
 #[ignore = "requires wgpu adapter with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
+fn r16_plane_scalers_require_16bit_pipelines_at_construction() {
+    let Some((device, queue)) = pollster::block_on(build_device_with_plane_storage()) else {
+        return;
+    };
+    let pipelines = Arc::new(Pipelines::build_with_plane_storage(&device));
+
+    let luma = Scaler::new_with_color_space(
+        pipelines.clone(),
+        device.clone(),
+        queue.clone(),
+        (256, 256),
+        (128, 128),
+        ColorSpace::LumaR16,
+    );
+    assert!(
+        matches!(luma, Err(ScalerError::MissingPlanePipelines)),
+        "LumaR16 should require build_with_plane_storage_16bit pipelines"
+    );
+
+    let chroma = Scaler::new_with_color_space(
+        pipelines,
+        device,
+        queue,
+        (128, 128),
+        (64, 64),
+        ColorSpace::ChromaRg16 {
+            chroma_offset: (0.0, 0.0),
+        },
+    );
+    assert!(
+        matches!(chroma, Err(ScalerError::MissingPlanePipelines)),
+        "ChromaRg16 should require build_with_plane_storage_16bit pipelines"
+    );
+}
+
+#[test]
+#[ignore = "requires wgpu adapter with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn uv_chroma_siting_no_half_pixel_shift() {
     // The chroma-siting regression test the expert review demanded.
     //

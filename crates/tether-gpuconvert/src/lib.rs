@@ -1,22 +1,21 @@
 //! Host-side GPU colour-space conversion.
 //!
-//! v1 scope: BGRA → NV12 via a wgpu compute shader. The eventual
-//! consumer is the zero-copy capture pipeline:
+//! Converts captured BGRA into the GPU-resident YUV layouts that hardware
+//! encoders consume. Linux exports DMA-BUFs for NV12, P010, packed 4:4:4
+//! (`XYUV`/`XV30`), and NVIDIA's planar 4:4:4 path; macOS bridges BGRA
+//! IOSurfaces into VideoToolbox-compatible NV12/P010/NV24/P410-family
+//! IOSurfaces. The common producer→encoder shape is:
 //!
 //!   PipeWire DMA-BUF (BGRx, compositor format)
 //!     -> wgpu texture import (VK_EXT_external_memory_dma_buf)
-//!     -> [this crate] compute pass writes Y + UV storage textures
+//!     -> [this crate] compute pass writes encoder-format storage textures
 //!     -> wgpu texture export as DMA-BUFs
-//!     -> VAAPI surface import (already wired via VaapiEncoder::submit_dmabuf)
-//!     -> h264_vaapi encode
+//!     -> VAAPI/NVENC surface import
+//!     -> hardware encode
 //!
-//! This file currently exposes only the CPU↔CPU path
-//! ([`Bgra2Nv12::convert`]) — copy BGRA in, get NV12 planes out. That's
-//! the form the conversion math can be validated against known-colour
-//! inputs without involving PipeWire or VAAPI; once it's correct, the
-//! DMA-BUF import/export plumbing wraps the same compute pipeline
-//! without changing the shader. Keeping the API split this way means
-//! the eventual zero-copy path is purely glue.
+//! The CPU↔CPU [`Bgra2Nv12::convert`] API remains as a deterministic reference
+//! and fallback for validating conversion math against known-colour inputs; the
+//! production hot paths are the exported DMA-BUF and IOSurface bridge types.
 //!
 //! Why a separate crate (not under `tether-render` or `tether-codec`):
 //! - `tether-render` is the client's display path; conflating it with

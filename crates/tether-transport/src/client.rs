@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,7 +84,7 @@ impl Client {
 
     fn with_identity_cert(identity: SelfSignedCert) -> Result<Self> {
         ensure_crypto_provider();
-        let bind: SocketAddr = "0.0.0.0:0".parse().expect("static literal");
+        let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket.bind(&bind.into())?;
         // Best-effort recv-buffer bump. Failure here isn't fatal —

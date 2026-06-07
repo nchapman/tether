@@ -3,9 +3,9 @@
 //! Currently this is just the *sharing posture*: whether "Allow remote
 //! connections" was last left on. The shell re-applies it on launch — off on
 //! first run, sticky after — so a machine the user wants reachable doesn't need
-//! the window re-opened every boot. Both the Sharing sheet toggle and (later)
-//! the tray toggle drive this through `start_host` / `stop_engine`, so the
-//! persisted posture has a single writer path and can't drift from them.
+//! the window re-opened every boot. Both the Sharing sheet toggle and the tray
+//! toggle drive this through `start_host` / `stop_engine`, so the persisted
+//! posture has a single writer path and can't drift from them.
 //!
 //! Stored next to the trust store in the shared config dir. Unlike
 //! `known_hosts.json` this is non-secret UI state, so a plain atomic write
@@ -68,7 +68,10 @@ fn save_to(path: &Path, prefs: &ShellPrefs) -> Result<(), String> {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
     std::fs::write(&tmp, &json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename into {}: {e}", path.display()));
+    }
     Ok(())
 }
 
@@ -163,5 +166,36 @@ mod tests {
         // deserializes, with the missing field defaulting.
         let prefs: ShellPrefs = serde_json::from_slice(b"{}").unwrap();
         assert_eq!(prefs, ShellPrefs::default());
+    }
+
+    #[test]
+    fn failed_save_removes_temp_file() {
+        let root = std::env::temp_dir().join(format!(
+            "tether-prefs-rename-fail.{}.{}",
+            std::process::id(),
+            temp_path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("fallback")
+        ));
+        let path = root.join("shell-prefs.json");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = save_to(
+            &path,
+            &ShellPrefs {
+                sharing_enabled: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("rename into"));
+
+        let tmp_left = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .any(|path| path.extension().is_some_and(|ext| ext == "tmp"));
+        assert!(!tmp_left);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

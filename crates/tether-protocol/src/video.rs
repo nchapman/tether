@@ -193,12 +193,12 @@ impl VideoFrameMetaEnvelope {
 /// `stream_epoch` + `frame_seq` counters (cribbed from RustDesk's
 /// `video_threads: HashMap<usize, _>` pattern).
 ///
-/// `stream_epoch` is `u32` (varint-encoded as 1 byte for typical values) so
-/// a long-lived session that restarts the encoder cannot wrap and reuse a
-/// prior epoch (which would let the client misattribute fragments at the
-/// wrong resolution / codec / hw context). The host bumps `stream_epoch`
-/// whenever the encoder is restarted (resize, codec switch, HW context
-/// loss). Clients drop all packets from prior epochs.
+/// `stream_epoch` is `u32` (varint-encoded as 1 byte for typical values). The
+/// host bumps it whenever the encoder is restarted (resize, codec switch, HW
+/// context loss), and clients treat epochs as monotonic for the lifetime of a
+/// session so packets from prior epochs are dropped. A session must not survive
+/// enough encoder restarts to wrap and reuse an epoch; wrap is outside the
+/// supported wire contract rather than something receivers try to recover from.
 ///
 /// The frame descriptor (`fragment_count`, `fec_pct`, `shard_size`,
 /// `total_body_len`) rides on `First` and on every `Parity` packet so a frame
@@ -749,9 +749,12 @@ pub struct ReassembledFrame {
 /// and emits a [`ReassembledFrame`] when all primaries for a key have
 /// arrived (directly or via per-block RS recovery). Drops fragments
 /// belonging to frames more than `max_age` frames behind the latest seen on
-/// that stream, so a permanent loss can't leak memory.
+/// that stream, so a permanent loss can't leak memory. Once a newer
+/// `stream_epoch` is observed for a stream, incomplete older-epoch frames are
+/// evicted and late older-epoch fragments are rejected.
 pub struct FrameReassembler {
     pending: HashMap<FrameKey, Pending>,
+    latest_epoch: HashMap<VideoStreamId, u32>,
     latest_seq: HashMap<StreamKey, u32>,
     /// Highest `frame_seq` we've successfully returned a
     /// `ReassembledFrame` for, per stream. Used to drop late packets
@@ -873,6 +876,7 @@ impl FrameReassembler {
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            latest_epoch: HashMap::new(),
             latest_seq: HashMap::new(),
             finalized_seq: HashMap::new(),
             max_age: 4,
@@ -927,6 +931,17 @@ impl FrameReassembler {
         }
 
         let (stream_id, stream_epoch, frame_seq) = packet.route_key();
+        if self.is_superseded_epoch(stream_id, stream_epoch) {
+            tracing::trace!(
+                "dropping fragment from superseded epoch: stream_id={} epoch={} seq={}",
+                stream_id,
+                stream_epoch,
+                frame_seq
+            );
+            self.fragments_lost = self.fragments_lost.saturating_add(1);
+            return None;
+        }
+
         let stream_key = (stream_id, stream_epoch);
         let latest = *self
             .latest_seq
@@ -1190,6 +1205,43 @@ impl FrameReassembler {
             .entry((stream_id, stream_epoch))
             .and_modify(|s| *s = (*s).max(frame_seq))
             .or_insert(frame_seq);
+    }
+
+    fn is_superseded_epoch(&mut self, stream_id: VideoStreamId, stream_epoch: u32) -> bool {
+        let Some(&latest_epoch) = self.latest_epoch.get(&stream_id) else {
+            self.latest_epoch.insert(stream_id, stream_epoch);
+            return false;
+        };
+
+        if stream_epoch < latest_epoch {
+            return true;
+        }
+
+        if stream_epoch > latest_epoch {
+            self.latest_epoch.insert(stream_id, stream_epoch);
+            self.drop_older_epochs(stream_id, stream_epoch);
+        }
+
+        false
+    }
+
+    fn drop_older_epochs(&mut self, stream_id: VideoStreamId, stream_epoch: u32) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|(pending_stream_id, pending_epoch, _), _| {
+                *pending_stream_id != stream_id || *pending_epoch >= stream_epoch
+            });
+        let dropped = before.saturating_sub(self.pending.len());
+        self.frames_dropped = self.frames_dropped.saturating_add(dropped as u64);
+
+        self.latest_seq
+            .retain(|(pending_stream_id, pending_epoch), _| {
+                *pending_stream_id != stream_id || *pending_epoch >= stream_epoch
+            });
+        self.finalized_seq
+            .retain(|(pending_stream_id, pending_epoch), _| {
+                *pending_stream_id != stream_id || *pending_epoch >= stream_epoch
+            });
     }
 
     fn prune_old(&mut self) {
@@ -1604,14 +1656,14 @@ mod validation_tests {
     /// maximum `fragment_count`, the worst case for per-entry allocation.
     #[test]
     fn flood_of_incomplete_frames_is_capped_at_max_pending_frames() {
-        let mut reassembler = FrameReassembler::new();
+        let mut reassembler = FrameReassembler::new().with_max_age(u32::MAX);
         let frag_count = u16::try_from(MAX_FRAGMENTS_PER_FRAME).unwrap();
         let flood = u32::try_from(MAX_PENDING_FRAMES * 4).unwrap();
-        for epoch in 0..flood {
+        for frame_seq in 0..flood {
             let packet = VideoPacket::First {
                 stream_id: VideoStreamId(0),
-                stream_epoch: epoch,
-                frame_seq: 0,
+                stream_epoch: 0,
+                frame_seq,
                 // Multi-shard so the lone First never completes the frame.
                 fragment_count: frag_count,
                 fec_pct: 20,
@@ -1634,6 +1686,83 @@ mod validation_tests {
             reassembler.loss_counters().1 > 0,
             "dropped-over-cap fragments must register as fragment losses"
         );
+    }
+
+    #[test]
+    fn newer_stream_epoch_evicts_incomplete_older_frame() {
+        let mut reassembler = FrameReassembler::new();
+        let first_epoch0 = VideoPacket::First {
+            stream_id: VideoStreamId(0),
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_count: 2,
+            fec_pct: 0,
+            shard_size: 8,
+            total_body_len: 16,
+            meta: dummy_envelope(),
+            payload: Bytes::from_static(&[1u8; 8]),
+        };
+        assert!(reassembler.handle(first_epoch0).is_none());
+        assert_eq!(reassembler.pending.len(), 1);
+
+        let (dropped_before, lost_before) = reassembler.loss_counters();
+        let first_epoch1 = VideoPacket::First {
+            stream_id: VideoStreamId(0),
+            stream_epoch: 1,
+            frame_seq: 0,
+            fragment_count: 1,
+            fec_pct: 0,
+            shard_size: 4,
+            total_body_len: 4,
+            meta: dummy_envelope(),
+            payload: Bytes::from_static(&[2u8; 4]),
+        };
+        assert!(reassembler.handle(first_epoch1).is_some());
+
+        let (dropped_after, lost_after) = reassembler.loss_counters();
+        assert_eq!(dropped_after, dropped_before + 1);
+        assert_eq!(lost_after, lost_before);
+        assert!(
+            reassembler
+                .pending
+                .keys()
+                .all(|&(stream_id, stream_epoch, _)| {
+                    stream_id != VideoStreamId(0) || stream_epoch >= 1
+                }),
+            "older epoch pending frames must be evicted when the stream advances"
+        );
+    }
+
+    #[test]
+    fn late_superseded_epoch_fragment_is_rejected() {
+        let mut reassembler = FrameReassembler::new();
+        let epoch1 = VideoPacket::First {
+            stream_id: VideoStreamId(0),
+            stream_epoch: 1,
+            frame_seq: 0,
+            fragment_count: 1,
+            fec_pct: 0,
+            shard_size: 4,
+            total_body_len: 4,
+            meta: dummy_envelope(),
+            payload: Bytes::from_static(&[2u8; 4]),
+        };
+        assert!(reassembler.handle(epoch1).is_some());
+
+        let (dropped_before, lost_before) = reassembler.loss_counters();
+        let late_epoch0 = VideoPacket::Continuation {
+            stream_id: VideoStreamId(0),
+            stream_epoch: 0,
+            frame_seq: 0,
+            fragment_index: 1,
+            payload: Bytes::from_static(&[1u8; 4]),
+        };
+        assert!(reassembler.handle(late_epoch0).is_none());
+
+        let (dropped_after, lost_after) = reassembler.loss_counters();
+        assert_eq!(dropped_after, dropped_before);
+        assert_eq!(lost_after, lost_before + 1);
+        assert!(reassembler.pending.is_empty());
     }
 
     /// A malformed/hostile peer can send a `Continuation` with a

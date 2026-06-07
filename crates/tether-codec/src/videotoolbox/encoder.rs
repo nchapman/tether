@@ -669,7 +669,6 @@ impl Encoder for VideoToolboxEncoder {
             crate::GpuEncoderFrame::IOSurface(f) => {
                 VideoToolboxEncoder::submit_iosurface(self, f, pts, force_keyframe)
             }
-            crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
         }
     }
 }

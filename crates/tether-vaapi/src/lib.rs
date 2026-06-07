@@ -35,6 +35,7 @@ pub use ffi::{
 /// `VA_STATUS_SUCCESS` is 0; anything else is an error code reportable by
 /// `vaErrorStr`.
 const VA_STATUS_SUCCESS: ffi::VAStatus = 0;
+const VA_STATUS_INVALID_DESCRIPTOR: ffi::VAStatus = -1;
 
 /// libva-reported failure. We carry both the numeric status and the
 /// human-readable string from `vaErrorStr` so callers don't have to do the
@@ -61,6 +62,13 @@ impl VaError {
         Self {
             status,
             message: msg,
+        }
+    }
+
+    fn invalid_descriptor(message: impl Into<String>) -> Self {
+        Self {
+            status: VA_STATUS_INVALID_DESCRIPTOR,
+            message: message.into(),
         }
     }
 }
@@ -236,8 +244,30 @@ pub unsafe fn export_surface_handle(
         return Err(VaError::from_status(status));
     }
 
-    let mut objects = Vec::with_capacity(desc.num_objects as usize);
-    for raw in &desc.objects[..desc.num_objects as usize] {
+    drm_prime_surface_from_descriptor(desc)
+}
+
+fn drm_prime_surface_from_descriptor(
+    desc: ffi::DRMPRIMESurfaceDescriptor,
+) -> Result<DrmPrimeSurface, VaError> {
+    let object_count = usize::try_from(desc.num_objects)
+        .map_err(|_| VaError::invalid_descriptor("object count does not fit usize"))?;
+    let raw_objects = desc.objects.get(..object_count).ok_or_else(|| {
+        VaError::invalid_descriptor(format!(
+            "object count {} exceeds descriptor capacity {}",
+            desc.num_objects,
+            desc.objects.len()
+        ))
+    })?;
+
+    let mut objects = Vec::with_capacity(object_count);
+    for raw in raw_objects {
+        if raw.fd < 0 {
+            return Err(VaError::invalid_descriptor(format!(
+                "object fd must be non-negative, got {}",
+                raw.fd
+            )));
+        }
         // SAFETY: vaExportSurfaceHandle returned this fd open and
         // transferred ownership to us. We wrap it immediately so any
         // subsequent panic still closes it.
@@ -249,11 +279,17 @@ pub unsafe fn export_surface_handle(
         });
     }
 
-    let layers = desc.layers[..desc.num_layers as usize]
-        .iter()
-        .copied()
-        .map(PrimeLayer::from)
-        .collect();
+    let layer_count = usize::try_from(desc.num_layers)
+        .map_err(|_| VaError::invalid_descriptor("layer count does not fit usize"))?;
+    let raw_layers = desc.layers.get(..layer_count).ok_or_else(|| {
+        VaError::invalid_descriptor(format!(
+            "layer count {} exceeds descriptor capacity {}",
+            desc.num_layers,
+            desc.layers.len()
+        ))
+    })?;
+
+    let layers = raw_layers.iter().copied().map(PrimeLayer::from).collect();
 
     Ok(DrmPrimeSurface {
         fourcc: desc.fourcc,
@@ -262,4 +298,95 @@ pub unsafe fn export_surface_handle(
         objects,
         layers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::os::fd::IntoRawFd;
+
+    fn descriptor_with_fd(fd: std::os::raw::c_int) -> ffi::DRMPRIMESurfaceDescriptor {
+        let mut desc = ffi::DRMPRIMESurfaceDescriptor::zeroed();
+        desc.fourcc = u32::from_le_bytes(*b"NV12");
+        desc.width = 1920;
+        desc.height = 1080;
+        desc.num_objects = 1;
+        desc.objects[0] = ffi::PrimeObject {
+            fd,
+            size: 4096,
+            drm_format_modifier: 0,
+        };
+        desc.num_layers = 1;
+        desc.layers[0] = ffi::PrimeLayer {
+            drm_format: u32::from_le_bytes(*b"NV12"),
+            num_planes: 2,
+            object_index: [0, 0, 0, 0],
+            offset: [0, 2048, 0, 0],
+            pitch: [1920, 1920, 0, 0],
+        };
+        desc
+    }
+
+    #[test]
+    fn descriptor_conversion_takes_fd_ownership() {
+        let fd = File::open("/dev/null")
+            .expect("/dev/null should open")
+            .into_raw_fd();
+        let surface = drm_prime_surface_from_descriptor(descriptor_with_fd(fd))
+            .expect("valid descriptor should convert");
+
+        assert_eq!(surface.fourcc, u32::from_le_bytes(*b"NV12"));
+        assert_eq!(surface.width, 1920);
+        assert_eq!(surface.height, 1080);
+        assert_eq!(surface.objects.len(), 1);
+        assert_eq!(surface.objects[0].size, 4096);
+        assert_eq!(surface.layers.len(), 1);
+        assert_eq!(surface.layers[0].num_planes, 2);
+    }
+
+    #[test]
+    fn descriptor_conversion_rejects_too_many_objects() {
+        let mut desc = ffi::DRMPRIMESurfaceDescriptor::zeroed();
+        desc.num_objects = 5;
+
+        let err = drm_prime_surface_from_descriptor(desc).expect_err("count should be rejected");
+
+        assert!(err.message.contains("object count 5 exceeds"));
+    }
+
+    #[test]
+    fn descriptor_conversion_rejects_too_many_layers() {
+        let mut desc = ffi::DRMPRIMESurfaceDescriptor::zeroed();
+        desc.num_layers = 5;
+
+        let err = drm_prime_surface_from_descriptor(desc).expect_err("count should be rejected");
+
+        assert!(err.message.contains("layer count 5 exceeds"));
+    }
+
+    #[test]
+    fn descriptor_conversion_closes_fd_when_later_validation_fails() {
+        let fd = File::open("/dev/null")
+            .expect("/dev/null should open")
+            .into_raw_fd();
+        let mut desc = descriptor_with_fd(fd);
+        desc.num_layers = 5;
+
+        let err = drm_prime_surface_from_descriptor(desc).expect_err("count should be rejected");
+
+        assert!(err.message.contains("layer count 5 exceeds"));
+        assert!(
+            std::fs::read_link(format!("/proc/self/fd/{fd}")).is_err(),
+            "descriptor conversion should close owned fd on later validation failure"
+        );
+    }
+
+    #[test]
+    fn descriptor_conversion_rejects_negative_fd() {
+        let err = drm_prime_surface_from_descriptor(descriptor_with_fd(-1))
+            .expect_err("negative fd should be rejected");
+
+        assert!(err.message.contains("object fd must be non-negative"));
+    }
 }

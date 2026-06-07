@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -84,6 +84,10 @@ pub(crate) struct ExitedPayload {
 }
 
 impl Supervisor {
+    fn lock_engines(&self) -> MutexGuard<'_, HashMap<String, EngineHandle>> {
+        self.engines.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Spawn an engine binary for `role` with `args`, wire up its stdout
     /// reader, and register it. Replaces any existing engine in that role
     /// (the old one is stopped first). Returns an error string the UI can
@@ -135,7 +139,7 @@ impl Supervisor {
         // reader's generation check sees this engine, so it can emit
         // `engine-exited` and reap it instead of silently leaving the UI think
         // the role is still running.
-        self.engines.lock().unwrap().insert(
+        self.lock_engines().insert(
             role.to_string(),
             EngineHandle {
                 generation,
@@ -204,7 +208,7 @@ impl Supervisor {
             // still draining its stdout; clobbering its handle (or emitting
             // a spurious `engine-exited`) would orphan it in the UI.
             let removed = app_for_reader.try_state::<Supervisor>().and_then(|sup| {
-                let mut engines = sup.engines.lock().unwrap();
+                let mut engines = sup.lock_engines();
                 if engines.get(&role_owned).map(|h| h.generation) == Some(generation) {
                     engines.remove(&role_owned)
                 } else {
@@ -236,7 +240,7 @@ impl Supervisor {
         // Clone out the stdin handle under the brief std lock, then write under
         // the async lock — never hold the std mutex across an await.
         let stdin = {
-            let engines = self.engines.lock().unwrap();
+            let engines = self.lock_engines();
             engines.get(role).map(|h| h.stdin.clone())
         };
         let Some(stdin) = stdin else {
@@ -268,7 +272,7 @@ impl Supervisor {
     /// The body of [`Self::stop`], without the lifecycle lock. Call only while
     /// already holding it (from `spawn` or `stop`).
     async fn stop_inner(&self, role: &str) {
-        let handle = self.engines.lock().unwrap().remove(role);
+        let handle = self.lock_engines().remove(role);
         let Some(EngineHandle {
             stdin, mut child, ..
         }) = handle
@@ -308,7 +312,7 @@ impl Supervisor {
     /// backstop — the children would also see their stdin close and stop
     /// on their own, but this makes teardown prompt.
     pub fn kill_all(&self) {
-        let mut engines = self.engines.lock().unwrap();
+        let mut engines = self.lock_engines();
         for (role, mut handle) in engines.drain() {
             tracing::info!(role, "killing engine on shell exit");
             let _ = handle.child.start_kill();
@@ -447,5 +451,17 @@ mod tests {
         let candidates = resolve_engine_path(&dirs, "tether-host", |_| false).unwrap_err();
         assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0], PathBuf::from("/override/tether-host"));
+    }
+
+    #[test]
+    fn engine_lock_recovers_from_poisoned_mutex() {
+        let supervisor = Supervisor::default();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = supervisor.engines.lock().unwrap();
+            panic!("poison engines lock");
+        }));
+        assert!(poison.is_err());
+
+        assert!(supervisor.lock_engines().is_empty());
     }
 }

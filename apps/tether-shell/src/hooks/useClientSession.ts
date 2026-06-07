@@ -57,15 +57,15 @@ export function useClientSession({
         // We set "connecting" optimistically at initiate-time (so we know the
         // addr + via); only adopt the event if we somehow missed that.
         if (prev.kind === "idle") {
-          setClient({ kind: "connecting", addr: p.host ?? "", via: "saved" });
+          setClient({ kind: "connecting", addr: p.host, via: "saved" });
         }
         break;
       case "connected": {
         const addr =
           prev.kind === "connecting" || prev.kind === "connected"
             ? prev.addr
-            : p.host ?? "";
-        setClient({ kind: "connected", addr, profile: p.profile ?? "" });
+            : p.host;
+        setClient({ kind: "connected", addr, profile: p.profile });
         setRowErrors((e) => {
           const n = { ...e };
           delete n[addr];
@@ -89,10 +89,10 @@ export function useClientSession({
         // tray-initiated connect (which never hid it through us).
         showWindow();
         windowHidden.current = false;
-        const addr = prev.kind !== "idle" ? prev.addr : p.host ?? "";
+        const addr = prev.kind !== "idle" ? prev.addr : "";
         const via: ConnectVia =
           prev.kind === "connecting" || prev.kind === "error" ? prev.via : "saved";
-        const fe = friendlyError(p.message ?? "Something went wrong.", labelFor(addr));
+        const fe = friendlyError(p.message, labelFor(addr));
         if (via === "add") {
           setClient({ kind: "error", addr, via, message: fe.message });
         } else {

@@ -42,29 +42,29 @@ export function useHostSharing({ setConfirm }: HostSharingDeps) {
   function handleEvent(p: EngineEvent) {
     switch (p.event) {
       case "listening":
-        setHost((h) => ({ ...h, running: true, addr: p.addr ?? "", error: null }));
+        setHost((h) => ({ ...h, running: true, addr: p.addr, error: null }));
         listPeers().catch((e) => console.warn("list_peers failed", e));
         break;
       case "peer_connected":
-        setHost((h) => ({ ...h, peer: p.peer ?? "a client" }));
+        setHost((h) => ({ ...h, peer: p.peer }));
         break;
       case "peer_disconnected":
         setHost((h) => ({ ...h, peer: null }));
         break;
       case "pairing_pin":
-        setHost((h) => ({ ...h, pin: p.pin ?? null, secondsLeft: p.expires_in_secs ?? 0 }));
+        setHost((h) => ({ ...h, pin: p.pin, secondsLeft: p.expires_in_secs }));
         break;
       case "paired":
         setHost((h) => ({ ...h, pin: null, pendingPeer: null }));
         break;
       case "pairing_required":
-        setHost((h) => ({ ...h, pendingPeer: p.peer ?? "a device" }));
+        setHost((h) => ({ ...h, pendingPeer: p.peer }));
         break;
       case "peer_list":
-        setHost((h) => ({ ...h, peers: p.peers ?? [] }));
+        setHost((h) => ({ ...h, peers: p.peers }));
         break;
       case "error":
-        setHost((h) => ({ ...h, running: false, error: p.message ?? "unknown error" }));
+        setHost((h) => ({ ...h, running: false, error: p.message }));
         break;
     }
   }

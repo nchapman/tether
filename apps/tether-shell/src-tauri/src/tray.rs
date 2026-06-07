@@ -13,7 +13,7 @@
 //! and the React state. Status is shown as menu text + tooltip only — no
 //! per-state icon art (that's a later polish pass).
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::Deserialize;
 use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
@@ -41,7 +41,7 @@ const ID_QUIT: &str = "quit";
 /// managed state so the event listeners can update it and the rebuild can read
 /// it back. Equality drives change-detection so we don't rebuild on every
 /// unrelated event.
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct TrayStatus {
     /// The host engine is listening — we're sharing.
     sharing: bool,
@@ -58,6 +58,10 @@ impl Default for TrayState {
     fn default() -> Self {
         TrayState(Mutex::new(TrayStatus::default()))
     }
+}
+
+fn lock_status(state: &TrayState) -> MutexGuard<'_, TrayStatus> {
+    state.0.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Build the tray, seed its menu, and subscribe to engine events so it stays
@@ -122,7 +126,7 @@ struct ExitEvent {
 /// shows actually changed, so the caller can skip a no-op rebuild.
 fn apply_status(app: &AppHandle, ev: &StatusEvent) -> bool {
     let state = app.state::<TrayState>();
-    let mut s = state.0.lock().unwrap();
+    let mut s = lock_status(state.inner());
     let before = s.clone();
     match (ev.role.as_str(), ev.event.as_str()) {
         ("host", "listening") => s.sharing = true,
@@ -142,7 +146,7 @@ fn apply_status(app: &AppHandle, ev: &StatusEvent) -> bool {
 /// Fold an engine exit into the tray state (a crash or a clean stop).
 fn apply_exit(app: &AppHandle, ev: &ExitEvent) {
     let state = app.state::<TrayState>();
-    let mut s = state.0.lock().unwrap();
+    let mut s = lock_status(state.inner());
     match ev.role.as_str() {
         ROLE_HOST => {
             s.sharing = false;
@@ -159,7 +163,8 @@ fn rebuild(app: &AppHandle) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
-    let status = app.state::<TrayState>().0.lock().unwrap().clone();
+    let state = app.state::<TrayState>();
+    let status = lock_status(state.inner()).clone();
     let recents = known_hosts::recent_hosts(MAX_RECENTS);
     match build_menu(app, &status, &recents) {
         // Only update the tooltip once the menu actually swapped, so the two
@@ -284,7 +289,8 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 /// host engine; the resulting `listening`/exit event rebuilds the menu (and the
 /// supervisor persists the posture on `listening` — see `crate::prefs`).
 fn toggle_sharing(app: &AppHandle) {
-    let sharing = app.state::<TrayState>().0.lock().unwrap().sharing;
+    let state = app.state::<TrayState>();
+    let sharing = lock_status(state.inner()).sharing;
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let supervisor = app.state::<Supervisor>();
@@ -312,13 +318,8 @@ fn toggle_sharing(app: &AppHandle) {
 /// the user isn't left wondering; engine-emitted errors after spawn surface
 /// through the webview's handler.
 fn connect_to(app: &AppHandle, addr: String) {
-    let in_session = app
-        .state::<TrayState>()
-        .0
-        .lock()
-        .unwrap()
-        .client_target
-        .is_some();
+    let state = app.state::<TrayState>();
+    let in_session = lock_status(state.inner()).client_target.is_some();
     if in_session {
         crate::show_main_window(app);
         let _ = app.emit("request-connect", addr);
@@ -396,5 +397,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(status_line(&status, &[]), "Connected to 10.0.0.5:7654");
+    }
+
+    #[test]
+    fn tray_status_lock_recovers_from_poisoned_mutex() {
+        let state = TrayState::default();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.0.lock().unwrap();
+            panic!("poison tray status lock");
+        }));
+        assert!(poison.is_err());
+
+        assert_eq!(*lock_status(&state), TrayStatus::default());
     }
 }

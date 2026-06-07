@@ -51,12 +51,6 @@ pub struct WinitTranslator {
     /// (a stale x,y after a fresher one would visibly snap the
     /// pointer backwards).
     next_cursor_seq: u32,
-    /// Last cursor position inside the video region, normalised to
-    /// `[0,1]^2`. We remember it across mouse-button and mouse-wheel
-    /// events because winit delivers button/scroll events without
-    /// coordinates — the host needs the most recent position to know
-    /// *where* a click landed.
-    last_cursor: Option<(f32, f32)>,
 }
 
 impl Default for WinitTranslator {
@@ -71,7 +65,6 @@ impl WinitTranslator {
             modifiers: Modifiers::default(),
             next_event_id: 0,
             next_cursor_seq: 0,
-            last_cursor: None,
         }
     }
 
@@ -96,13 +89,11 @@ impl WinitTranslator {
                     // so its synthetic cursor disappears.
                     self.modifiers = Modifiers::default();
                     let pkt = self.next_cursor_packet(0.0, 0.0, false);
-                    self.last_cursor = None;
                     return vec![WireEvent::Cursor(pkt)];
                 }
                 return Vec::new();
             }
             RenderEvent::Cursor { video_normalized } => {
-                self.last_cursor = video_normalized;
                 let pkt = match video_normalized {
                     Some((x, y)) => self.next_cursor_packet(x, y, true),
                     None => self.next_cursor_packet(0.0, 0.0, false),
@@ -499,7 +490,11 @@ mod tests {
             m |= ModifiersState::CONTROL;
             m
         }));
-        t.translate(RenderEvent::Focused(false));
+        let focus_loss = t.translate(RenderEvent::Focused(false));
+        match &focus_loss[0] {
+            WireEvent::Cursor(cursor) => assert!(!cursor.visible),
+            other => panic!("expected invisible Cursor packet, got {other:?}"),
+        }
         // Now press 'a'; modifiers should be clear.
         let evts = t.translate(RenderEvent::Key {
             code: KeyCode::KeyA,

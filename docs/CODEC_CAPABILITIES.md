@@ -584,15 +584,12 @@ CTUs and the analogous pitch boundary lands at 4× the NV12-luma
 constraint. The probe-side gate (`tether-probe/src/host/vaapi.rs`)
 runs a real `submit_dmabuf` round trip through the same bridge, so
 `(Yuv444, 10)` only ends up in the advertised set when the driver
-actually accepts it. Decoder output format for the 4:4:4 10-bit case
-is driver-dependent (RADV has emitted both packed XV30 and biplanar
-P410-style 16-bit across Mesa versions) — the renderer-import side
-assumes biplanar 16-bit (`RenderLayout::Biplanar16`); if a driver
-emits packed XV30, the import errors with "expected 2 layers, got 1"
-and a new `RenderLayout::Packed1010102` variant is needed. See
-`gpu/import.rs:53` for the comment that surfaces this on the
-failure path, and `dmabuf_test.rs::roundtrip_hevc_main444_10bit_identity`
-for the hardware test that gates it on RADV/NVK.
+actually accepts it. Decoder output format for the 4:4:4 10-bit case is
+driver-dependent; current Linux imports handle the packed Y410/XV30-style
+10:10:10:2 shape via `RenderLayout::PackedY410`, while macOS 4:4:4 10-bit
+IOSurfaces stay on the biplanar P410/`xf44` path. See
+`dmabuf_test.rs::roundtrip_hevc_main444_10bit_identity` for the hardware test
+that gates the Linux path on RADV/NVK.
 
 ---
 
@@ -873,13 +870,12 @@ simply omit AV1 from the client's decode advert.
 
 The renderer doesn't care what codec produced the surface; it
 cares about plane count, per-plane format, and DRM/IOSurface
-fourcc. Today we support three layouts: `RenderLayout::Biplanar8`
+fourcc. Today we support four layouts: `RenderLayout::Biplanar8`
 (NV12 / NV24, 8-bit), `RenderLayout::Biplanar16` (P010 / P410 /
-`'xf44'`, 10-bit MSB-aligned in 16-bit cells), and
-`RenderLayout::PackedXYUV` (DRM_FORMAT_XYUV8888, 4:4:4 8-bit).
-A packed 10-bit 4:4:4 variant (`Rgb10a2Unorm`) is not yet wired
-on the import side — see `## Layer 5 — VAAPI encode` for why
-the producer side ships ahead of the consumer side.
+`'xf44'`, 10-bit MSB-aligned in 16-bit cells),
+`RenderLayout::PackedXYUV` (DRM_FORMAT_XYUV8888, 4:4:4 8-bit),
+and `RenderLayout::PackedY410` (`Rgb10a2Unorm`, 4:4:4 10-bit
+packed 10:10:10:2 on Linux).
 
 ### What's hard-limited
 
@@ -948,11 +944,9 @@ the producer side ships ahead of the consumer side.
 7. H.264 4:2:0 8-bit — `VideoProfile::H264_8BIT_420` (universal floor)
 
 `VideoProfile { codec, chroma, bit_depth }` has a `u8` `bit_depth`
-field. The renderer's `RenderLayout::Biplanar16` variant + the
-shader's `range_kind` dispatch handle the 10-bit display side
-(native 10-bit limited-range breakpoints, no intermediate
-`luma_scale` indirection); the encoder/decoder probes handle the
-host side. The negotiator picks the first entry that appears in
+field. The renderer's 10-bit layouts (`Biplanar16` and `PackedY410`)
+plus shader dispatch handle the display side; the encoder/decoder probes
+handle the host side. The negotiator picks the first entry that appears in
 *both* the host's `tether_probe::host_encode_profiles()` and the
 client's advertised `tether_probe::client_decode_profiles()` —
 anything a given device's hardware can't deliver gets filtered out

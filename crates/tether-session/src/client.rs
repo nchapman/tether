@@ -10,6 +10,8 @@ use tether_protocol::MonoNanos;
 use tether_transport::{ControlChannel, TransportError};
 use tracing::{info, warn};
 
+const MAX_IGNORED_CLOCK_PROBE_MESSAGES: usize = CLOCK_SYNC_PROBE_SAMPLES * 4;
+
 #[derive(Debug, Clone)]
 pub struct ClientSessionConfig {
     pub client_name: String,
@@ -48,6 +50,9 @@ pub enum ConnectError {
 
     #[error("host ended session during clock probe: {reason}")]
     PeerGoodbyeDuringClockProbe { code: GoodbyeCode, reason: String },
+
+    #[error("clock probe exceeded ignored-message limit ({ignored} ignored)")]
+    ClockProbeIgnoredMessageLimit { ignored: usize },
 }
 
 impl ClientSession {
@@ -179,6 +184,7 @@ async fn run_clock_probe(channel: &dyn ControlChannel) -> Result<ClockSync, Conn
     }
 
     let mut samples = Vec::with_capacity(CLOCK_SYNC_PROBE_SAMPLES);
+    let mut ignored_messages = 0usize;
     loop {
         let msg = channel.recv_control().await?;
         let t3 = MonoNanos::now();
@@ -186,6 +192,7 @@ async fn run_clock_probe(channel: &dyn ControlChannel) -> Result<ClockSync, Conn
             ControlMessage::ClockProbeResponse(probe) => {
                 let Some(pos) = pending.iter().position(|t0| *t0 == probe.t0_sender) else {
                     tracing::debug!("ignoring stale ClockProbeResponse during handshake probe");
+                    ignored_messages = note_ignored_clock_probe_message(ignored_messages)?;
                     continue;
                 };
                 let t0 = pending.swap_remove(pos);
@@ -218,17 +225,43 @@ async fn run_clock_probe(channel: &dyn ControlChannel) -> Result<ClockSync, Conn
                     return Err(ConnectError::PeerGoodbyeDuringClockProbe { reason, code });
                 }
                 tracing::debug!(?other, "ignoring non-clock message during handshake probe");
+                ignored_messages = note_ignored_clock_probe_message(ignored_messages)?;
             }
         }
     }
 }
 
+fn note_ignored_clock_probe_message(ignored: usize) -> Result<usize, ConnectError> {
+    let ignored = ignored.saturating_add(1);
+    if ignored > MAX_IGNORED_CLOCK_PROBE_MESSAGES {
+        return Err(ConnectError::ClockProbeIgnoredMessageLimit { ignored });
+    }
+    Ok(ignored)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn unknown_bit_depth_is_rejected_via_helper() {
         assert!(tether_protocol::control::is_known_bit_depth(8));
         assert!(tether_protocol::control::is_known_bit_depth(10));
         assert!(!tether_protocol::control::is_known_bit_depth(12));
+    }
+
+    #[test]
+    fn ignored_clock_probe_limit_trips_after_budget() {
+        let mut ignored = 0;
+        for _ in 0..MAX_IGNORED_CLOCK_PROBE_MESSAGES {
+            ignored = note_ignored_clock_probe_message(ignored).expect("within ignored budget");
+        }
+        let err = note_ignored_clock_probe_message(ignored)
+            .expect_err("one more ignored probe message should trip the guard");
+        assert!(
+            matches!(err, ConnectError::ClockProbeIgnoredMessageLimit { ignored }
+                if ignored == MAX_IGNORED_CLOCK_PROBE_MESSAGES + 1),
+            "expected ClockProbeIgnoredMessageLimit, got {err:?}"
+        );
     }
 }

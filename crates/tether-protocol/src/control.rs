@@ -682,10 +682,9 @@ pub enum ControlMessage {
         displays: Vec<DisplayId>,
     },
     /// Client → host. Sent once after the client has finished building
-    /// its decoders, so the host doesn't start blasting video before
-    /// the receive side is ready. Booleans indicate which streams the
-    /// client is prepared to consume; `audio` is reserved for the
-    /// future Opus pipeline (always `false` from clients today).
+    /// its decoders and audio sink, so the host doesn't start blasting
+    /// media before the receive side is ready. Booleans indicate which
+    /// negotiated streams the client is prepared to consume.
     StreamReady {
         video: bool,
         audio: bool,

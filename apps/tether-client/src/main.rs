@@ -14,7 +14,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -36,7 +36,7 @@ use tether_session::{
 };
 use tether_transport::{Client, Datagram, ServerAuth};
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod client_pairing;
 use client_pairing::HostAuth;
@@ -53,6 +53,27 @@ const CLOCK_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 struct ClockResyncState {
     pending: Vec<MonoNanos>,
     samples: Vec<ClockSync>,
+}
+
+fn lock_clock_resync(state: &Mutex<ClockResyncState>) -> MutexGuard<'_, ClockResyncState> {
+    state.lock().unwrap_or_else(|poisoned| {
+        warn!("clock resync lock poisoned; recovering pending probe state");
+        poisoned.into_inner()
+    })
+}
+
+fn read_clock_sync(state: &RwLock<ClockSync>) -> RwLockReadGuard<'_, ClockSync> {
+    state.read().unwrap_or_else(|poisoned| {
+        warn!("clock sync read lock poisoned; recovering last sample");
+        poisoned.into_inner()
+    })
+}
+
+fn write_clock_sync(state: &RwLock<ClockSync>) -> RwLockWriteGuard<'_, ClockSync> {
+    state.write().unwrap_or_else(|poisoned| {
+        warn!("clock sync write lock poisoned; recovering last sample");
+        poisoned.into_inner()
+    })
 }
 
 /// Whether a `FrameReassembler::handle()` loss-counter delta warrants a
@@ -198,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
     // worker down; binding it for the duration of `main` ensures
     // logs aren't truncated at process exit.
     let _tracing_guard = init_tracing(reporter.is_json());
+    let stdin_stop = spawn_stdin_stop_signal(reporter.is_json());
 
     // Parse args: positional host addr (and optional explicit fingerprint),
     // plus `--pin <PIN>` (first-contact pairing) and `--label <name>` (display
@@ -264,10 +286,22 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::with_identity(&config_dir)?;
     let client_fp = client.fingerprint();
-    let pending = match client
-        .connect_pending(addr, "tether-host", server_auth)
-        .await
-    {
+    let connect_result = if let Some(rx) = stdin_stop.clone() {
+        tokio::select! {
+            () = wait_for_stdin_stop_signal(rx) => {
+                reporter.emit(&EngineEvent::Disconnected {
+                    reason: "stopped by shell".to_string(),
+                });
+                return Ok(());
+            }
+            result = client.connect_pending(addr, "tether-host", server_auth) => result,
+        }
+    } else {
+        client
+            .connect_pending(addr, "tether-host", server_auth)
+            .await
+    };
+    let pending = match connect_result {
         Ok(p) => p,
         Err(e) => {
             reporter.emit(&EngineEvent::Error {
@@ -277,7 +311,20 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let is_first_contact = matches!(mode, HostAuth::FirstContact { .. });
-    let (conn, host_fp) = match client_pairing::establish(pending, &mode, client_fp).await {
+    let pairing_result = if let Some(rx) = stdin_stop.clone() {
+        tokio::select! {
+            () = wait_for_stdin_stop_signal(rx) => {
+                reporter.emit(&EngineEvent::Disconnected {
+                    reason: "stopped by shell".to_string(),
+                });
+                return Ok(());
+            }
+            result = client_pairing::establish(pending, &mode, client_fp) => result,
+        }
+    } else {
+        client_pairing::establish(pending, &mode, client_fp).await
+    };
+    let (conn, host_fp) = match pairing_result {
         Ok(pair) => pair,
         Err(e) => {
             reporter.emit(&EngineEvent::Error {
@@ -288,18 +335,32 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Persist known-hosts: on first contact, pin the host so the next connect
-    // is one-click; on every successful connect (first-contact or resume),
-    // stamp the time so the shell's address book can show recency.
+    // is one-click; on every successful connect to an entry that still exists,
+    // stamp the time so the shell's address book can show recency. Reload right
+    // before saving so a shell-side Forget during connect does not get
+    // resurrected by the startup snapshot.
     {
-        let mut known_hosts = known_hosts;
         let addr_key = addr.to_string();
         let now = unix_now();
-        if is_first_contact {
-            let label = label.unwrap_or_else(|| addr_key.clone());
-            known_hosts.insert(addr_key.clone(), &host_fp, label, now);
-        }
-        known_hosts.set_last_connected(&addr_key, now);
-        if let Err(e) = known_hosts.save(&known_hosts_path) {
+        let save_result = (|| -> std::io::Result<()> {
+            let mut known_hosts = tether_pairing::KnownHosts::load(&known_hosts_path)?;
+            if is_first_contact {
+                let label = label.unwrap_or_else(|| addr_key.clone());
+                known_hosts.insert(addr_key.clone(), &host_fp, label, now);
+                known_hosts.set_last_connected(&addr_key, now);
+                known_hosts.save(&known_hosts_path)?;
+            } else if known_hosts.fingerprint(&addr_key) == Some(host_fp) {
+                known_hosts.set_last_connected(&addr_key, now);
+                known_hosts.save(&known_hosts_path)?;
+            } else {
+                debug!(
+                    host = %addr_key,
+                    "connected host is no longer in known-hosts; not rewriting forgotten entry"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(e) = save_result {
             warn!(error = %e, "connected but failed to persist known-hosts; first-contact reconnect may need --pin again");
         }
     }
@@ -317,25 +378,25 @@ async fn main() -> anyhow::Result<()> {
     // function returns profiles in PROFILE_PREFERENCE order so logs
     // look natural.
     let mut client_decode_profiles = tether_probe::client_decode_profiles();
-    // Renderer capability gate for 10-bit. The codec decode probe can't
-    // see whether the *renderer* can present 10-bit, so each backend's
-    // `supports_10bit_render` answers that (the platform-specific reason
-    // lives in its doc comment): on Linux/macOS it's the wgpu adapter's
-    // `TEXTURE_FORMAT_16BIT_NORM`; on Windows it's D3D11 P010 texture
-    // support. Filter 10-bit profiles out of our advert when the renderer
-    // can't present them so the host's negotiator never picks one we
-    // can't actually render.
-    if !tether_render::supports_10bit_render().await {
-        let before = client_decode_profiles.len();
-        client_decode_profiles.retain(|p| p.bit_depth == 8);
-        let dropped = before - client_decode_profiles.len();
-        if dropped > 0 {
-            info!(
-                dropped_profiles = dropped,
-                "renderer cannot present 10-bit; dropping 10-bit profiles \
-                 from the decode-capability advert"
-            );
+    // Renderer capability gate. The codec decode probe can't see whether the
+    // renderer can present a profile, so each backend answers per profile. That
+    // matters for Linux 4:4:4 10-bit: it uses a packed 10:10:10:2 texture path,
+    // not the 16-bit biplanar feature gate used by P010/P410.
+    let before_render_gate = client_decode_profiles.len();
+    let mut renderable_profiles = Vec::with_capacity(client_decode_profiles.len());
+    for profile in client_decode_profiles {
+        if tether_render::supports_video_profile_render(profile).await {
+            renderable_profiles.push(profile);
         }
+    }
+    let dropped = before_render_gate - renderable_profiles.len();
+    client_decode_profiles = renderable_profiles;
+    if dropped > 0 {
+        info!(
+            dropped_profiles = dropped,
+            "renderer cannot present some decoded profiles; dropping them \
+             from the decode-capability advert"
+        );
     }
     let forced_video_profile = match tether_probe::forced_video_profile_from_env() {
         Ok(profile) => profile,
@@ -404,7 +465,8 @@ async fn main() -> anyhow::Result<()> {
                 ConnectError::ProfileNotAdvertised { .. }
                 | ConnectError::UnknownBitDepth(_, _)
                 | ConnectError::HandshakeRejected { .. }
-                | ConnectError::PeerGoodbyeDuringClockProbe { .. } => anyhow::anyhow!("{e}"),
+                | ConnectError::PeerGoodbyeDuringClockProbe { .. }
+                | ConnectError::ClockProbeIgnoredMessageLimit { .. } => anyhow::anyhow!("{e}"),
                 ConnectError::Transport(t) => anyhow::Error::from(t),
             };
             reporter.emit(&EngineEvent::Error {
@@ -472,9 +534,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 ticker.tick().await;
                 {
-                    let mut state = clock_resync_state
-                        .lock()
-                        .expect("clock resync lock poisoned");
+                    let mut state = lock_clock_resync(&clock_resync_state);
                     if !state.pending.is_empty() {
                         warn!(
                             pending = state.pending.len(),
@@ -491,18 +551,14 @@ async fn main() -> anyhow::Result<()> {
                 for _ in 0..CLOCK_SYNC_PROBE_SAMPLES {
                     let t0 = MonoNanos::now();
                     {
-                        let mut state = clock_resync_state
-                            .lock()
-                            .expect("clock resync lock poisoned");
+                        let mut state = lock_clock_resync(&clock_resync_state);
                         state.pending.push(t0);
                     }
                     if let Err(e) = conn
                         .send_control(&ControlMessage::ClockProbeRequest { t0_sender: t0 })
                         .await
                     {
-                        let mut state = clock_resync_state
-                            .lock()
-                            .expect("clock resync lock poisoned");
+                        let mut state = lock_clock_resync(&clock_resync_state);
                         state.pending.clear();
                         state.samples.clear();
                         warn!(error = ?e, "clock resync probe send failed; ending resync task");
@@ -555,9 +611,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(ControlMessage::ClockProbeResponse(probe)) => {
                         let selected = {
-                            let mut state = clock_resync_state
-                                .lock()
-                                .expect("clock resync lock poisoned");
+                            let mut state = lock_clock_resync(&clock_resync_state);
                             let Some(pos) =
                                 state.pending.iter().position(|t0| *t0 == probe.t0_sender)
                             else {
@@ -585,9 +639,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                         };
                         if let Some((selected, min_rtt, max_rtt)) = selected {
-                            let previous =
-                                *clock_sync_state.read().expect("clock sync lock poisoned");
-                            *clock_sync_state.write().expect("clock sync lock poisoned") = selected;
+                            let previous = *read_clock_sync(&clock_sync_state);
+                            *write_clock_sync(&clock_sync_state) = selected;
                             let offset_delta_us = ((i128::from(selected.offset_nanos)
                                 - i128::from(previous.offset_nanos))
                                 / 1_000)
@@ -1090,7 +1143,7 @@ async fn main() -> anyhow::Result<()> {
             // difference between them and `now` decomposes
             // total latency into capture-to-send (host
             // pipeline) and send-to-recv (network + reassembly).
-            let current_clock_sync = *recv_clock_sync.read().expect("clock sync lock poisoned");
+            let current_clock_sync = *read_clock_sync(&recv_clock_sync);
             let host_in_client_clock =
                 current_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
             let send_in_client_clock = current_clock_sync.remote_to_local(frame.meta.timing.t_send);
@@ -1511,13 +1564,13 @@ async fn main() -> anyhow::Result<()> {
     // owns the main thread, so like the Ctrl-C handler this task sends
     // Goodbye and exits the process directly rather than trying to unwind
     // through winit.
-    if reporter.is_json() {
+    if let Some(rx) = stdin_stop {
         let conn = conn.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
         let decode_event_rx = decode_event_rx.clone();
         tokio::spawn(async move {
-            wait_for_stdin_stop().await;
+            wait_for_stdin_stop_signal(rx).await;
             info!("shell stop received; sending Goodbye and exiting");
             reporter.emit(&EngineEvent::Disconnected {
                 reason: "stopped by shell".to_string(),
@@ -1613,6 +1666,29 @@ async fn wait_for_stdin_stop() {
             }
             // EOF or read error: the shell is gone — treat as stop.
             Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+fn spawn_stdin_stop_signal(enabled: bool) -> Option<tokio::sync::watch::Receiver<bool>> {
+    if !enabled {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_stdin_stop().await;
+        let _ = tx.send(true);
+    });
+    Some(rx)
+}
+
+async fn wait_for_stdin_stop_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
         }
     }
 }
@@ -2320,5 +2396,47 @@ mod arg_tests {
             hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1g")
                 .expect_err("non-hex digit must fail");
         assert!(bad_digit.to_string().contains("bad hex at byte 31"));
+    }
+
+    #[test]
+    fn clock_resync_lock_recovers_from_poisoned_state() {
+        let state = Arc::new(Mutex::new(ClockResyncState::default()));
+        let poisoned = state.clone();
+        let _ = std::thread::spawn(move || {
+            let mut state = poisoned.lock().unwrap();
+            state.pending.push(MonoNanos(7));
+            panic!("poison clock resync state");
+        })
+        .join();
+
+        let mut recovered = lock_clock_resync(&state);
+        assert_eq!(recovered.pending, vec![MonoNanos(7)]);
+        recovered.samples.push(ClockSync {
+            offset_nanos: 1,
+            rtt_nanos: 2,
+            sampled_at_local: MonoNanos(3),
+        });
+        assert_eq!(recovered.samples.len(), 1);
+    }
+
+    #[test]
+    fn clock_sync_lock_recovers_from_poisoned_state() {
+        let initial = ClockSync {
+            offset_nanos: 0,
+            rtt_nanos: 1,
+            sampled_at_local: MonoNanos(2),
+        };
+        let state = Arc::new(RwLock::new(initial));
+        let poisoned = state.clone();
+        let _ = std::thread::spawn(move || {
+            let mut state = poisoned.write().unwrap();
+            state.offset_nanos = 42;
+            panic!("poison clock sync state");
+        })
+        .join();
+
+        assert_eq!(read_clock_sync(&state).offset_nanos, 42);
+        write_clock_sync(&state).rtt_nanos = 99;
+        assert_eq!(read_clock_sync(&state).rtt_nanos, 99);
     }
 }

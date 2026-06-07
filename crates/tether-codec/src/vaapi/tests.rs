@@ -607,14 +607,10 @@ fn hevc_main444_10bit_xv30_dmabuf_roundtrip() {
                 let GpuFrameSource::DmaBuf(dmabuf) = g.source;
                 assert_eq!(g.width, w);
                 assert_eq!(g.height, h);
-                // Log the decoder's chosen export shape so a driver-
-                // dependent decision (packed XV30 vs biplanar P410-
-                // style 16-bit) shows up in test output. The
-                // renderer's `b"XV30" → RenderLayout::Biplanar16`
-                // mapping in `tether-render::dmabuf_test::cross_table_consistency`
-                // assumes biplanar 16-bit; if the driver emits
-                // something else, the renderer needs a new
-                // `RenderLayout::Packed1010102` variant.
+                // Log the decoder's chosen export shape so a driver-dependent
+                // decision shows up in test output. Intel VAAPI commonly
+                // exports 4:4:4 10-bit as packed Y410/XV30-style 10:10:10:2;
+                // the renderer maps that to `RenderLayout::PackedY410`.
                 eprintln!(
                     "decoded 4:4:4 10-bit surface exported: fourcc=0x{:08x} ({:?}) \
                      layers={} planes_per_layer={:?}",

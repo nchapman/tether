@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 import {
   type EngineEvent,
@@ -23,8 +23,12 @@ import {
 /// stable React setter or a `useRef` (whose object identity is stable across
 /// renders) or a function that only reads through such refs — so the handlers
 /// below stay correct even when captured once by a long-lived Tauri listener.
+export type WritableRef<T> = {
+  current: T;
+};
+
 export type ClientSessionDeps = {
-  windowHiddenRef: React.RefObject<boolean>;
+  windowHiddenRef: WritableRef<boolean>;
   restoreWindow: () => void;
   refreshHosts: () => void;
   labelFor: (addr: string) => string;
@@ -47,7 +51,7 @@ export function useClientSession({
   const [client, setClient] = useState<ClientState>({ kind: "idle" });
   const [rowErrors, setRowErrors] = useState<Record<string, RowError>>({});
   const clientRef = useRef(client);
-  useEffect(() => {
+  useLayoutEffect(() => {
     clientRef.current = client;
   }, [client]);
 

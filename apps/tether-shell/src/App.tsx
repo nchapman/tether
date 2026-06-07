@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
@@ -34,7 +34,7 @@ function App() {
   // The address book mirrored into a ref so the once-registered engine
   // listeners (and label lookups inside the hooks) read the current list.
   const hostsRef = useRef(hosts);
-  useEffect(() => {
+  useLayoutEffect(() => {
     hostsRef.current = hosts;
   }, [hosts]);
   // Tracks whether we hid the window for a live session, so we restore it on
@@ -95,9 +95,9 @@ function App() {
   }
 
   function copy(text: string) {
-    void navigator.clipboard
-      .writeText(text)
-      .catch((e: unknown) => console.warn("copy failed", e));
+    const clipboard = "clipboard" in navigator ? navigator.clipboard : undefined;
+    if (clipboard === undefined) return;
+    void clipboard.writeText(text).catch((e: unknown) => console.warn("copy failed", e));
   }
 
   // --- Engine event wiring ---------------------------------------------------

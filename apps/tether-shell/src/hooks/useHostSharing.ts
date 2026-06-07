@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   type EngineEvent,
@@ -22,7 +22,7 @@ export type HostSharingDeps = {
 export function useHostSharing({ setConfirm }: HostSharingDeps) {
   const [host, setHost] = useState<HostState>(initialHostState);
   const hostRef = useRef(host);
-  useEffect(() => {
+  useLayoutEffect(() => {
     hostRef.current = host;
   }, [host]);
 

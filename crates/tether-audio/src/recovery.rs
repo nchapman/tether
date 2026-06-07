@@ -113,6 +113,7 @@ impl LossRecovery {
         redundant: &[Bytes],
         mut submit: impl FnMut(&AudioFrame),
     ) {
+        let mut last_played_seq = self.last_seq;
         if let Some(prev) = self.last_seq {
             match classify_gap(prev, seq, MAX_CONCEAL) {
                 SeqGap::InOrder => {}
@@ -122,6 +123,7 @@ impl LossRecovery {
                     // tail when present, else PLC. PLC and recovered decodes both
                     // advance decoder state, so the later frames stay coherent.
                     for j in (1..=missing).rev() {
+                        let missing_seq = seq.wrapping_sub(j);
                         let mut played = false;
                         if let Some(red) = redundant.get((j - 1) as usize) {
                             match self.decoder.decode(red) {
@@ -141,6 +143,7 @@ impl LossRecovery {
                             let pcm = self.decoder.conceal();
                             submit(&pcm);
                         }
+                        last_played_seq = Some(missing_seq);
                     }
                 }
                 SeqGap::Dropout { missing } => {
@@ -159,13 +162,21 @@ impl LossRecovery {
             }
         }
         match self.decoder.decode(payload) {
-            Ok(pcm) => submit(&pcm),
+            Ok(pcm) => {
+                submit(&pcm);
+                self.last_seq = Some(seq);
+            }
             Err(e) => {
                 self.stats.decode_errors += 1;
                 tracing::warn!(error = %e, "opus decode failed; dropping audio frame");
+                // `last_seq` tracks frames actually emitted to playback. A
+                // corrupt primary did not advance the playback clock, so leave
+                // the gap visible to the next packet; its RED tail or PLC can
+                // then repair the missing slot instead of silently shortening
+                // the stream.
+                self.last_seq = last_played_seq;
             }
         }
-        self.last_seq = Some(seq);
     }
 }
 
@@ -303,6 +314,36 @@ mod tests {
             "recovered frame must carry energy, peak={peak}"
         );
         assert!(!recovered.is_silent());
+    }
+
+    /// A corrupt primary payload should not advance `last_seq`: no PCM reached
+    /// playback for that sequence number. The next in-order datagram must still
+    /// see the one-frame gap and recover it from RED instead of silently
+    /// shortening the audio clock by one frame.
+    #[test]
+    fn corrupt_primary_keeps_gap_recoverable_from_next_red_tail() {
+        let (cfg, packets) = encode_with_red(12);
+        let mut rec = LossRecovery::new(OpusDecoder::new(cfg).unwrap());
+        let mut played = 0usize;
+
+        for (seq, payload, red) in &packets[..5] {
+            rec.accept(*seq, payload, red, |_| played += 1);
+        }
+        assert_eq!(played, 5);
+
+        let (bad_seq, _bad_payload, bad_red) = &packets[5];
+        let corrupt = Bytes::from(vec![0u8; 4096]);
+        rec.accept(*bad_seq, &corrupt, bad_red, |_| played += 1);
+        assert_eq!(played, 5, "corrupt primary emitted no PCM");
+        assert_eq!(rec.stats().decode_errors, 1);
+
+        let (seq, payload, red) = &packets[6];
+        rec.accept(*seq, payload, red, |_| played += 1);
+        assert_eq!(played, 7, "RED-recovered frame 5 plus primary frame 6");
+        let s = rec.stats();
+        assert_eq!(s.recovered_frames, 1);
+        assert_eq!(s.concealed_frames, 0);
+        assert_eq!(s.dropouts, 0);
     }
 
     /// Two adjacent losses with depth-1 RED: the newer is recovered from the

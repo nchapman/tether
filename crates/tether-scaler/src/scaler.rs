@@ -126,7 +126,6 @@ impl ColorSpace {
     /// but not 16BIT_NORM (rare on Metal, more common on older
     /// Vulkan ICDs) gets the 8-bit pipelines and refuses 10-bit
     /// scaling via [`ScalerError::MissingPlanePipelines`].
-    #[allow(dead_code)] // referenced once we expose it to PlanePipelines below
     fn is_16bit_plane(self) -> bool {
         matches!(self, Self::LumaR16 | Self::ChromaRg16 { .. })
     }
@@ -236,8 +235,15 @@ impl Scaler {
         // built without plane pipelines is permanently broken, and
         // catching it here turns a runtime frame-rate error into a
         // bridge-init error that names the cause.
-        if color_space.needs_plane_pipelines() && pipelines.plane.is_none() {
-            return Err(ScalerError::MissingPlanePipelines);
+        if color_space.needs_plane_pipelines() {
+            let Some(plane) = pipelines.plane.as_ref() else {
+                return Err(ScalerError::MissingPlanePipelines);
+            };
+            if color_space.is_16bit_plane()
+                && (plane.vertical_plane_r16.is_none() || plane.vertical_plane_rg16.is_none())
+            {
+                return Err(ScalerError::MissingPlanePipelines);
+            }
         }
         // YUV plane paths skip the mip prefilter (would need r8unorm /
         // rg8unorm mip variants of `mip_box_down`, which we haven't

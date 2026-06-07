@@ -577,6 +577,7 @@ pub struct AudioSessionStats {
     pub dropouts: u64,
     pub stale_packets: u64,
     pub decode_errors: u64,
+    pub decode_queue_drop_packets: u64,
 }
 
 /// Cursor input model. Carried by
@@ -1351,6 +1352,7 @@ fn audio_session_stats_to_pb(value: AudioSessionStats) -> pb::AudioSessionStats 
         dropouts: value.dropouts,
         stale_packets: value.stale_packets,
         decode_errors: value.decode_errors,
+        decode_queue_drop_packets: value.decode_queue_drop_packets,
     }
 }
 
@@ -1367,6 +1369,7 @@ fn audio_session_stats_from_pb(value: pb::AudioSessionStats) -> AudioSessionStat
         dropouts: value.dropouts,
         stale_packets: value.stale_packets,
         decode_errors: value.decode_errors,
+        decode_queue_drop_packets: value.decode_queue_drop_packets,
     }
 }
 

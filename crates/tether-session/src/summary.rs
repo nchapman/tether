@@ -124,6 +124,7 @@ pub struct AudioSummaryCounters {
     pub dropouts: AtomicU64,
     pub stale_packets: AtomicU64,
     pub decode_errors: AtomicU64,
+    pub decode_queue_drop_packets: AtomicU64,
 }
 
 impl AudioSummaryCounters {
@@ -140,6 +141,7 @@ impl AudioSummaryCounters {
             dropouts: self.dropouts.load(Ordering::Relaxed),
             stale_packets: self.stale_packets.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            decode_queue_drop_packets: self.decode_queue_drop_packets.load(Ordering::Relaxed),
         }
     }
 }
@@ -188,6 +190,7 @@ pub fn log_peer_session_summary(peer: &str, summary: Option<&SessionSummary>) {
         audio_dropouts = audio.map_or(0, |s| s.dropouts),
         audio_stale_packets = audio.map_or(0, |s| s.stale_packets),
         audio_decode_errors = audio.map_or(0, |s| s.decode_errors),
+        audio_decode_queue_drop_packets = audio.map_or(0, |s| s.decode_queue_drop_packets),
         "peer final session stats"
     );
 }

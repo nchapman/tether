@@ -952,14 +952,23 @@ async fn main() -> anyhow::Result<()> {
                     ..
                 })) => {
                     // Forward to the audio decode thread; drop on a full channel
-                    // (decoder behind) — audio is loss-tolerant.
+                    // (decoder behind) — audio is loss-tolerant, but the drop
+                    // is surfaced separately from packets_received.
                     if let Some(tx) = &audio_tx {
-                        let _ = tx.try_send(AudioFrameMsg {
-                            stream_epoch,
-                            seq: frame_seq,
-                            payload,
-                            redundant,
-                        });
+                        if tx
+                            .try_send(AudioFrameMsg {
+                                stream_epoch,
+                                seq: frame_seq,
+                                payload,
+                                redundant,
+                            })
+                            .is_err()
+                        {
+                            session_summary_for_recv
+                                .audio
+                                .decode_queue_drop_packets
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     session_summary_for_recv
                         .audio
@@ -1797,6 +1806,8 @@ fn setup_audio_playback(
     server_hello: &ServerHello,
     summary: Arc<SessionSummaryState>,
 ) -> (Option<crossbeam_channel::Sender<AudioFrameMsg>>, bool) {
+    const AUDIO_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
     if !enabled {
         info!("audio disabled via --no-audio");
         return (None, false);
@@ -1835,17 +1846,37 @@ fn setup_audio_playback(
     // ~640 ms of 10 ms frames — generous headroom so the recv loop never
     // blocks; the jitter buffer downstream bounds actual playback latency.
     let (tx, rx) = crossbeam_channel::bounded::<AudioFrameMsg>(64);
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
     match std::thread::Builder::new()
         .name("tether-client-audio".into())
-        .spawn(move || run_audio_playback(opus_cfg, rx, summary))
+        .spawn(move || run_audio_playback(opus_cfg, rx, summary, startup_tx))
     {
         Ok(_) => {
-            info!(
-                sample_rate = audio_cfg.sample_rate_hz,
-                channels = audio_cfg.channels,
-                "audio playback enabled"
-            );
-            (Some(tx), true)
+            match startup_rx.recv_timeout(AUDIO_STARTUP_TIMEOUT) {
+                Ok(Ok(())) => {
+                    info!(
+                        sample_rate = audio_cfg.sample_rate_hz,
+                        channels = audio_cfg.channels,
+                        "audio playback enabled"
+                    );
+                    (Some(tx), true)
+                }
+                Ok(Err(reason)) => {
+                    warn!(%reason, "audio playback unavailable; running video-only");
+                    (None, false)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    warn!(
+                        timeout_ms = AUDIO_STARTUP_TIMEOUT.as_millis(),
+                        "audio playback startup timed out; running video-only"
+                    );
+                    (None, false)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    warn!("audio playback thread exited before reporting readiness; running video-only");
+                    (None, false)
+                }
+            }
         }
         Err(e) => {
             warn!(error = %e, "failed to spawn audio thread; running video-only");
@@ -1863,21 +1894,25 @@ fn run_audio_playback(
     cfg: tether_audio::OpusConfig,
     rx: crossbeam_channel::Receiver<AudioFrameMsg>,
     summary: Arc<SessionSummaryState>,
+    startup_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
     let (player, sink) = match tether_audio::AudioPlayer::with_defaults(cfg) {
         Ok(pair) => pair,
         Err(e) => {
-            warn!(error = %e, "audio output device unavailable; no playback");
+            let _ = startup_tx.send(Err(format!("audio output device unavailable: {e}")));
             return;
         }
     };
     let decoder = match tether_audio::OpusDecoder::new(cfg) {
         Ok(d) => d,
         Err(e) => {
-            warn!(error = %e, "opus decoder init failed; no playback");
+            let _ = startup_tx.send(Err(format!("opus decoder init failed: {e}")));
             return;
         }
     };
+    if startup_tx.send(Ok(())).is_err() {
+        return;
+    }
     // Owns the decoder + sequence state; turns each datagram into PCM frames,
     // healing losses from the RED tail before falling back to PLC. The loss
     // counters it accumulates (recovered/concealed/dropout/stale) are surfaced

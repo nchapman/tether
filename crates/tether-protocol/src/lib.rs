@@ -1248,6 +1248,7 @@ mod tests {
                 dropouts: 6,
                 stale_packets: 7,
                 decode_errors: 8,
+                decode_queue_drop_packets: 9,
             }),
         };
         let msg = ControlMessage::Goodbye {

@@ -313,6 +313,7 @@ message AudioSessionStats {
   uint64 dropouts = 9;
   uint64 stale_packets = 10;
   uint64 decode_errors = 11;
+  uint64 decode_queue_drop_packets = 12;
 }
 
 message CursorUseShape {

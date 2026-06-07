@@ -44,7 +44,7 @@ reports that the subcommand is missing.
 
 ## Hardware test organization
 
-Hardware tests are organized into five families that map to the runtime
+Hardware tests are organized into six families that map to the runtime
 pipeline:
 
 - **codec** (`tether-codec`, `tether-probe`): encoder/decoder constructors,

@@ -591,7 +591,6 @@ impl Encoder for NvencEncoder {
             // failure is returned to the host send loop as a hard encode
             // error for this GPU frame.
             crate::GpuEncoderFrame::DmaBuf(f) => self.submit_dmabuf(f, pts, force_keyframe),
-            crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
         }
     }
 }

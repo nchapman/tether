@@ -20,7 +20,7 @@
 //! permits exactly one pairing attempt.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tether_pairing::{
@@ -61,6 +61,8 @@ const REVOKED_CLOSE_CODE: u32 = 5;
 /// message it sent (a refused `Resume` ⇒ "not paired, go pair"; a refused
 /// `Pair` ⇒ "pairing failed"), so a uniform string costs no UX.
 const REFUSAL_REASON: &str = "pairing failed";
+const MAX_LABEL_BYTES: usize = 255;
+const DEFAULT_PAIRING_LABEL: &str = "Unnamed device";
 
 /// An open pairing window: the host is willing to accept exactly one first-
 /// contact attempt with this PIN until it expires. Created by `StartPairing`.
@@ -130,16 +132,14 @@ impl PairingState {
     /// "Add a device" again before the last one was used).
     pub fn open_window(&self, label: String) -> String {
         let pin = tether_pairing::generate_pin();
-        *self.window.lock().expect("pairing window lock") =
-            Some(PairingWindow::open(pin.clone(), label));
+        *lock_pairing_state(&self.window, "pairing window") =
+            Some(PairingWindow::open(pin.clone(), normalize_label(label)));
         pin
     }
 
     /// Snapshot the allowlist as IPC peer entries for the shell's device list.
     pub fn peer_list(&self) -> Vec<tether_ipc::PairedPeer> {
-        self.paired
-            .lock()
-            .expect("paired store lock")
+        lock_pairing_state(&self.paired, "paired store")
             .iter()
             .map(|(fingerprint, entry)| tether_ipc::PairedPeer {
                 fingerprint: fingerprint.to_string(),
@@ -152,16 +152,21 @@ impl PairingState {
     /// Revoke a paired peer by its tagged fingerprint (`"sha256:<hex>"`),
     /// persisting the change and tearing down any live session from that peer.
     /// Returns whether the peer was present in the allowlist.
-    pub fn revoke(&self, tagged_fp: &str) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns the persistence error and leaves in-memory state unchanged when
+    /// the updated allowlist cannot be saved.
+    pub fn revoke(&self, tagged_fp: &str) -> std::io::Result<bool> {
         let removed = {
-            let mut store = self.paired.lock().expect("paired store lock");
-            let removed = store.remove_tagged(tagged_fp);
-            if removed {
-                if let Err(e) = store.save(&self.paired_path) {
-                    warn!(error = %e, "allowlist save after revoke failed");
-                }
+            let mut store = lock_pairing_state(&self.paired, "paired store");
+            let mut next = store.clone();
+            if !next.remove_tagged(tagged_fp) {
+                return Ok(false);
             }
-            removed
+            next.save(&self.paired_path)?;
+            *store = next;
+            true
         };
         // Tear down a live session from the revoked peer, if it matches, by
         // closing its connection. That breaks the encode/send thread out of its
@@ -169,7 +174,7 @@ impl PairingState {
         // path (and the client sees the disconnect). The accept loop's
         // `ActiveSessionGuard` clears the slot when that session ends.
         if let Some(fp) = tether_pairing::parse_tagged_fingerprint(tagged_fp) {
-            if let Some(active) = self.active.lock().expect("active session lock").as_ref() {
+            if let Some(active) = lock_pairing_state(&self.active, "active session").as_ref() {
                 if active.fp == fp {
                     info!("revoked peer has a live session; closing it");
                     active.revoked.store(true, Ordering::Relaxed);
@@ -181,8 +186,35 @@ impl PairingState {
                 }
             }
         }
-        removed
+        Ok(removed)
     }
+}
+
+fn normalize_label(label: String) -> String {
+    let trimmed = label.trim();
+    let label = if trimmed.is_empty() {
+        DEFAULT_PAIRING_LABEL
+    } else {
+        trimmed
+    };
+    if label.len() <= MAX_LABEL_BYTES {
+        return label.to_string();
+    }
+    let mut end = MAX_LABEL_BYTES;
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    label[..end].to_string()
+}
+
+fn lock_pairing_state<'a, T>(lock: &'a StdMutex<T>, name: &str) -> MutexGuard<'a, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        warn!(
+            state = name,
+            "pairing state mutex poisoned; recovering inner state"
+        );
+        poisoned.into_inner()
+    })
 }
 
 /// Outcome of authorizing a [`PendingConnection`].
@@ -261,11 +293,7 @@ async fn authorize_resume(
     state: &PairingState,
     fp: CertFingerprint,
 ) -> Authorized {
-    let known = state
-        .paired
-        .lock()
-        .expect("paired store lock")
-        .contains(&fp);
+    let known = lock_pairing_state(&state.paired, "paired store").contains(&fp);
     if !known {
         // Uniform on-wire reason; the local refusal reason is specific. (An
         // attacker can only `Resume` with a cert it holds the key for, so this
@@ -332,7 +360,7 @@ async fn authorize_pair(
     // Burn-on-attempt: take the window now, before touching the PIN. An expired
     // window is treated as no window (and cleared).
     let window = {
-        let mut guard = state.window.lock().expect("pairing window lock");
+        let mut guard = lock_pairing_state(&state.window, "pairing window");
         match guard.take() {
             Some(w) if !w.is_expired(now) => w,
             _ => {
@@ -421,7 +449,7 @@ async fn authorize_pair(
     // Persist the now-trusted client. Hold the lock across save() — this path is
     // rare and serializing it with reads is simpler than cloning out.
     {
-        let mut store = state.paired.lock().expect("paired store lock");
+        let mut store = lock_pairing_state(&state.paired, "paired store");
         store.insert(&fp, window.label.clone(), unix_now());
         if let Err(e) = store.save(&state.paired_path) {
             // Pairing succeeded cryptographically but we couldn't persist it.
@@ -504,6 +532,28 @@ mod tests {
         assert_eq!(window.label, "laptop");
     }
 
+    #[test]
+    fn open_window_normalizes_label() {
+        let state = test_state([9u8; 32]);
+
+        state.open_window("  laptop  ".into());
+        assert_eq!(
+            state.window.lock().unwrap().as_ref().unwrap().label,
+            "laptop"
+        );
+
+        state.open_window("   ".into());
+        assert_eq!(
+            state.window.lock().unwrap().as_ref().unwrap().label,
+            DEFAULT_PAIRING_LABEL
+        );
+
+        state.open_window(format!("{}é", "x".repeat(MAX_LABEL_BYTES)));
+        let label = state.window.lock().unwrap().as_ref().unwrap().label.clone();
+        assert_eq!(label.len(), MAX_LABEL_BYTES);
+        assert!(label.is_char_boundary(label.len()));
+    }
+
     #[tokio::test]
     async fn revoke_removes_peer_and_closes_matching_session() {
         // Stand up a real session connection so we can prove revoke actually
@@ -527,7 +577,9 @@ mod tests {
             revoked: revoked.clone(),
         });
 
-        let removed = state.revoke(&tether_pairing::tag_fingerprint(&fp));
+        let removed = state
+            .revoke(&tether_pairing::tag_fingerprint(&fp))
+            .expect("revoke");
 
         assert!(removed);
         assert!(!state.paired.lock().unwrap().contains(&fp));
@@ -564,7 +616,9 @@ mod tests {
         });
 
         // Revoke some other (unpaired) fingerprint.
-        let _ = state.revoke(&tether_pairing::tag_fingerprint(&[0xEEu8; 32]));
+        let _ = state
+            .revoke(&tether_pairing::tag_fingerprint(&[0xEEu8; 32]))
+            .expect("revoke");
 
         assert!(
             !revoked.load(Ordering::Relaxed),
@@ -587,8 +641,59 @@ mod tests {
     #[tokio::test]
     async fn revoke_unknown_peer_is_noop() {
         let state = test_state([9u8; 32]);
-        let removed = state.revoke(&tether_pairing::tag_fingerprint(&[7u8; 32]));
+        let removed = state
+            .revoke(&tether_pairing::tag_fingerprint(&[7u8; 32]))
+            .expect("revoke");
         assert!(!removed);
+    }
+
+    #[test]
+    fn revoke_save_failure_leaves_allowlist_unchanged() {
+        let state = test_state([9u8; 32]);
+        let fp = [7u8; 32];
+        state.paired.lock().unwrap().insert(&fp, "laptop".into(), 0);
+        std::fs::create_dir_all(state.paired_path.as_ref()).expect("make path a directory");
+
+        let result = state.revoke(&tether_pairing::tag_fingerprint(&fp));
+
+        assert!(result.is_err());
+        assert!(
+            state.paired.lock().unwrap().contains(&fp),
+            "failed persistence must not make memory disagree with disk"
+        );
+    }
+
+    #[test]
+    fn open_window_recovers_poisoned_window_lock() {
+        let state = test_state([9u8; 32]);
+        poison_lock(state.window.clone());
+
+        let pin = state.open_window("laptop".into());
+
+        let window = lock_pairing_state(&state.window, "pairing window")
+            .clone()
+            .expect("window open");
+        assert_eq!(window.pin, pin);
+        assert_eq!(window.label, "laptop");
+    }
+
+    #[test]
+    fn peer_list_recovers_poisoned_store_lock() {
+        let state = test_state([9u8; 32]);
+        let fp = [7u8; 32];
+        state
+            .paired
+            .lock()
+            .unwrap()
+            .insert(&fp, "desktop".into(), 1234);
+        poison_lock(state.paired.clone());
+
+        let peers = state.peer_list();
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].fingerprint, tether_pairing::tag_fingerprint(&fp));
+        assert_eq!(peers[0].label, "desktop");
+        assert_eq!(peers[0].paired_at_unix, 1234);
     }
 
     #[tokio::test]
@@ -807,6 +912,14 @@ mod tests {
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    fn poison_lock<T: Send + 'static>(lock: Arc<StdMutex<T>>) {
+        let result = std::panic::catch_unwind(move || {
+            let _guard = lock.lock().unwrap();
+            panic!("poison test lock");
+        });
+        assert!(result.is_err());
+    }
+
     fn test_state(host_fp: CertFingerprint) -> PairingState {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir =
@@ -867,7 +980,7 @@ mod tests {
 
     /// Drive the client half of a first-contact pairing over its pending
     /// connection: SPAKE2 message, confirmation MAC, and verification of the
-    /// host's reply. Mirrors what the Phase 6 client main will do.
+    /// host's reply. Mirrors the client main's first-contact pairing path.
     async fn drive_client_pair(
         mut p: PendingConnection,
         pin: &[u8],

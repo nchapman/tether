@@ -659,14 +659,12 @@ bridge branch on `(chroma, bit_depth)` at construction:
   `vaapi_drm_format_map` entry, so packed is the only viable input).
 
 The renderer dispatches on a derived `RenderLayout`
-(`Biplanar8` / `Biplanar16` / `PackedXYUV`) rather than chroma
+(`Biplanar8` / `Biplanar16` / `PackedXYUV` / `PackedY410`) rather than chroma
 directly: Yuv420 is always biplanar (NV12 / P010, half-res UV);
 Yuv444 is biplanar on macOS (NV24 / `'xf44'` / `'P410'` IOSurface from
 VT, full-res UV through the same Y + UV shader at 8 or 16 bit) and on
-Linux is packed XYUV at 8-bit, biplanar P410-style 16-bit at 10-bit
-(driver-dependent — RADV has emitted both packed and biplanar across
-Mesa versions; see `gpu/import.rs:53` for the failure mode if the
-decoder picks packed). Mid-session chroma or bit-depth switch is not
+Linux is packed XYUV at 8-bit, packed Y410/XV30-style 10:10:10:2 at
+10-bit. Mid-session chroma or bit-depth switch is not
 supported — same rebuild path as a mid-session resolution change
 (encoder + bridge + render pipeline all reset).
 
@@ -845,8 +843,8 @@ Listed to set expectations; each is a real follow-up, not a "never":
   10-bit; the host encode-side bridge produces P010 dma-buf for
   4:2:0 (R16 + Rg16 biplanar) and packed XV30 dma-buf for 4:4:4
   (Rgb10a2Unorm, via `Bgra2Xv30DmaBuf`); the renderer has an
-  R16/Rg16 biplanar `RenderLayout::Biplanar16` for both Linux
-  dma-buf and macOS IOSurface (`'P010'`/`'P410'`/`'xf44'`) paths, and the
+  R16/Rg16 biplanar `RenderLayout::Biplanar16` for P010/P410-family
+  paths and a packed `RenderLayout::PackedY410` for Linux 4:4:4 10-bit, and the
   Windows native D3D11 renderer samples P010 via R16/R16G16 plane SRVs
   (Main10 4:2:0); the shader carries a `luma_scale` uniform (D3D11: a
   `RANGE_KIND_LIMITED_10` branch) that compensates 10-in-16 MSB-aligned

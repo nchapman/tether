@@ -26,22 +26,31 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("server closed")?;
 
-        // Receive a video datagram
-        match conn.recv_datagram().await? {
-            Datagram::Video(VideoPacket::First { frame_seq, .. }) => {
-                assert_eq!(frame_seq, 7);
-            }
-            other => panic!("expected video First, got {other:?}"),
-        }
+        let video = VideoPacket::First {
+            stream_id: tether_protocol::control::VideoStreamId(0),
+            stream_epoch: 0,
+            frame_seq: 7,
+            fragment_count: 1,
+            fec_pct: 0,
+            shard_size: 100,
+            total_body_len: 100,
+            meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
+                timing: HostFrameTiming::default(),
+                keyframe: true,
+                input_echo: InputEchoBatch::default(),
+                dimensions: (320, 240),
+            }),
+            payload: bytes::Bytes::from(vec![0u8; 100]),
+        };
+        conn.send_datagram(&Datagram::Video(video))?;
 
-        // Receive a host-cursor datagram (host → client direction).
-        match conn.recv_datagram().await? {
-            Datagram::HostCursor(HostCursorPacket::Position { x, y, .. }) => {
-                assert_eq!(x, 100);
-                assert_eq!(y, 200);
-            }
-            other => panic!("expected host cursor Position, got {other:?}"),
-        }
+        let host_cursor = HostCursorPacket::Position {
+            t_capture: MonoNanos::now(),
+            x: 100,
+            y: 200,
+            visible: true,
+        };
+        conn.send_datagram(&Datagram::HostCursor(host_cursor))?;
 
         // Receive a client-cursor datagram (client → host direction).
         match conn.recv_datagram().await? {
@@ -68,31 +77,21 @@ async fn roundtrip_datagrams_control_input() -> anyhow::Result<()> {
         .connect(server_addr, "tether-host", fingerprint)
         .await?;
 
-    let video = VideoPacket::First {
-        stream_id: tether_protocol::control::VideoStreamId(0),
-        stream_epoch: 0,
-        frame_seq: 7,
-        fragment_count: 1,
-        fec_pct: 0,
-        shard_size: 100,
-        total_body_len: 100,
-        meta: VideoFrameMetaEnvelope::V1(VideoFrameMeta {
-            timing: HostFrameTiming::default(),
-            keyframe: true,
-            input_echo: InputEchoBatch::default(),
-            dimensions: (320, 240),
-        }),
-        payload: bytes::Bytes::from(vec![0u8; 100]),
-    };
-    conn.send_datagram(&Datagram::Video(video))?;
+    // Receive host → client datagrams.
+    match conn.recv_datagram().await? {
+        Datagram::Video(VideoPacket::First { frame_seq, .. }) => {
+            assert_eq!(frame_seq, 7);
+        }
+        other => panic!("expected video First, got {other:?}"),
+    }
 
-    let host_cursor = HostCursorPacket::Position {
-        t_capture: MonoNanos::now(),
-        x: 100,
-        y: 200,
-        visible: true,
-    };
-    conn.send_datagram(&Datagram::HostCursor(host_cursor))?;
+    match conn.recv_datagram().await? {
+        Datagram::HostCursor(HostCursorPacket::Position { x, y, .. }) => {
+            assert_eq!(x, 100);
+            assert_eq!(y, 200);
+        }
+        other => panic!("expected host cursor Position, got {other:?}"),
+    }
 
     let client_cursor = ClientCursorPacket {
         seq: 1,

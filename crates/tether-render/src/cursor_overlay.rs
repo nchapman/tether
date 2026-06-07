@@ -295,7 +295,10 @@ impl CursorChannel {
     /// Borrow the underlying state with a write lock. Used by both
     /// wire-side updaters and the renderer's per-frame snapshot.
     pub fn with<R>(&self, f: impl FnOnce(&mut CursorState) -> R) -> R {
-        let mut guard = self.0.lock().expect("CursorChannel mutex poisoned");
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&mut guard)
     }
 }
@@ -722,6 +725,7 @@ mod wgpu_overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
     fn snapshot_skipped_when_relative_mode() {
@@ -834,5 +838,24 @@ mod tests {
         assert_eq!(s.cache_len(), CURSOR_CACHE_MAX);
         assert!(!s.contains(0), "oldest sprite should be evicted");
         assert!(s.contains(999), "newest sprite should be cached");
+    }
+
+    #[test]
+    fn channel_recovers_after_poisoned_update() {
+        let channel = CursorChannel::new();
+
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            channel.with(|state| {
+                state.set_host_visible(true);
+                panic!("poison cursor channel");
+            });
+        }));
+        assert!(poisoned.is_err());
+
+        channel.with(|state| {
+            assert!(state.visible);
+            state.set_host_visible(false);
+        });
+        channel.with(|state| assert!(!state.visible));
     }
 }

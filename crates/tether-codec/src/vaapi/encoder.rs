@@ -582,11 +582,11 @@ impl VaapiEncoder {
     /// immediately after this returns. `force_keyframe` mirrors
     /// `encode_bgra`.
     ///
-    /// Constraints: `frame.fourcc` must match the negotiated chroma
-    /// — `NV12` for 4:2:0 (the encoder's NV12 `sw_format`) or `XYUV`
-    /// (DRM_FORMAT_XYUV8888 packed) for HEVC Main444. Width/height
-    /// are pinned to the encoder's construction values; resolution
-    /// changes go through a full encoder rebuild.
+    /// Constraints: `frame.fourcc` must match the negotiated chroma and
+    /// bit-depth: `NV12` for 4:2:0 8-bit, `P010` for 4:2:0 10-bit, `XYUV`
+    /// (DRM_FORMAT_XYUV8888 packed) for 4:4:4 8-bit, or `XV30` for 4:4:4
+    /// 10-bit. Width/height are pinned to the encoder's construction values;
+    /// resolution changes go through a full encoder rebuild.
     ///
     /// Approach: reuse the encoder's existing VAAPI hwframes pool and
     /// let `vaapi_map_from_drm` add each imported surface into it
@@ -965,7 +965,6 @@ impl Encoder for VaapiEncoder {
             crate::GpuEncoderFrame::DmaBuf(f) => {
                 VaapiEncoder::submit_dmabuf(self, f, pts, force_keyframe)
             }
-            crate::GpuEncoderFrame::_Phantom(_) => unreachable!("phantom variant"),
         }
     }
 }
@@ -1023,9 +1022,8 @@ fn vaapi_codec_name(kind: CodecKind) -> &'static str {
 ///   AV_PIX_FMT_VUYX. The only 4:4:4 8-bit format in
 ///   `vaapi_drm_format_map`.
 /// - `XV30` — 4:4:4 10-bit packed 10:10:10:2 ("X:Cr:Y:Cb": bits[9:0]=Cb,
-///   bits[19:10]=Y, bits[29:20]=Cr); AV_PIX_FMT_XV30LE. The
-///   entry is preserved so adding an XV30 bridge later doesn't need
-///   to touch this table.
+///   bits[19:10]=Y, bits[29:20]=Cr); AV_PIX_FMT_XV30LE. Used by the
+///   production `Bgra2Xv30DmaBuf` bridge.
 pub fn expected_dmabuf_fourcc(chroma: ChromaSubsampling, bit_depth: u8) -> Option<u32> {
     Some(match (chroma, bit_depth) {
         (ChromaSubsampling::Yuv420, 8) => u32::from_le_bytes(*b"NV12"),

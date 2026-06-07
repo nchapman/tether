@@ -769,7 +769,6 @@ impl Encoder for D3D11Encoder {
             GpuEncoderFrame::D3D11Texture(tex) => {
                 self.submit_d3d11_texture(tex, pts, force_keyframe)
             }
-            _ => Err(CodecError::UnsupportedInputFormat),
         }
     }
 

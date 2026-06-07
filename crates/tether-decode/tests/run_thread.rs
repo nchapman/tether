@@ -6,9 +6,8 @@
 //! is covered by integration tests in `tether-session/tests`.
 
 #![cfg(feature = "test-support")]
-// Test timing offsets derived from small loop indices; casts are in range.
 // The lifecycle-callbacks tuple is a test helper, not a public API.
-#![allow(clippy::cast_sign_loss, clippy::type_complexity)]
+#![allow(clippy::type_complexity)]
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,27 +54,11 @@ fn job() -> DecodeJob {
 }
 
 fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).expect("duration fits in u64 ns")
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn at(base: MonoNanos, offset: Duration) -> MonoNanos {
-    // MonoNanos is opaque (no add API), so produce an "offset" instance
-    // by adding nanoseconds via the only available channel: wait. For
-    // tests we want determinism, so derive via the trait's `From<u64>`
-    // if any. Fall back to recreating from raw u64 via Debug parse.
-    // The simplest stable path: subtract `base` later via saturating_sub.
-    // We need a MonoNanos value `base + offset`. Since MonoNanos has no
-    // constructor from u64, return base for offset=0 and otherwise
-    // sleep. We avoid sleeping in tests by using the fact that
-    // `MonoNanos::now()` is monotonic and offset-only matters via
-    // `saturating_sub`; tests pass `now` values that are real
-    // `MonoNanos::now()` samples bracketing real (short) elapsed time.
-    if offset.is_zero() {
-        base
-    } else {
-        std::thread::sleep(offset);
-        MonoNanos::now()
-    }
+    MonoNanos(base.0.saturating_add(nanos(offset)))
 }
 
 #[test]
@@ -213,6 +196,38 @@ fn soft_error_past_rate_limit_window_fires_again() {
     let later = at(base, IDR_RATE_LIMIT + Duration::from_millis(50));
     let c2 = worker.process_job(job(), later);
     assert!(c2.idr_request_fired);
+    assert_eq!(idr_calls.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn idr_rate_limit_reopens_at_exact_window() {
+    let warnings_state = Arc::new(AtomicU64::new(0));
+    let idr_calls = Arc::new(AtomicU32::new(0));
+    let frames = LatestFrame::new();
+
+    let warn_cb_state = Arc::clone(&warnings_state);
+    let idr_cb = Arc::clone(&idr_calls);
+    let mut worker = Worker::new(
+        Box::new(FakeDecoder::new(vec![
+            FakeOutcome::Frames(vec![]),
+            FakeOutcome::Frames(vec![]),
+        ])),
+        frames,
+        Arc::new(move || {
+            idr_cb.fetch_add(1, Ordering::Relaxed);
+        }),
+        Arc::new(move || warn_cb_state.fetch_add(1, Ordering::Relaxed) + 1),
+    );
+
+    let base = MonoNanos::now();
+    let c1 = worker.process_job(job(), base);
+    let c2 = worker.process_job(job(), at(base, IDR_RATE_LIMIT));
+
+    assert!(c1.idr_request_fired);
+    assert!(
+        c2.idr_request_fired,
+        "IDR rate limit should reopen once the full window has elapsed"
+    );
     assert_eq!(idr_calls.load(Ordering::Relaxed), 2);
 }
 
@@ -535,8 +550,8 @@ fn three_consecutive_failures_request_rebuild() {
     let (mut worker, _idr, _warn, _frames) = make_worker(decoder);
     let base = MonoNanos::now();
     let mut last = None;
-    for i in 0..3 {
-        let c = worker.process_job(job(), at(base, Duration::from_millis(10 * (i as u64 + 1))));
+    for i in 0..3_u64 {
+        let c = worker.process_job(job(), at(base, Duration::from_millis(10 * (i + 1))));
         last = Some(c);
     }
     assert_eq!(
@@ -555,8 +570,8 @@ fn rebuild_request_clears_after_replace_decoder() {
     ]);
     let (mut worker, _idr, _warn, _frames) = make_worker(decoder);
     let base = MonoNanos::now();
-    for i in 0..3 {
-        let _ = worker.process_job(job(), at(base, Duration::from_millis(10 * (i as u64 + 1))));
+    for i in 0..3_u64 {
+        let _ = worker.process_job(job(), at(base, Duration::from_millis(10 * (i + 1))));
     }
     // Swap in a fresh, healthy decoder. The next job must not
     // re-trigger Rebuild — counter must have been reset.
@@ -672,6 +687,39 @@ fn av1_inband_sequence_header_resumes_decode_without_keyframe_flag() {
         frames.take().is_some(),
         "the frame should decode (gate released), not be discarded as a P-frame"
     );
+}
+
+#[test]
+fn annex_b_parameter_sets_resume_decode_without_keyframe_flag() {
+    for body in [
+        Bytes::from_static(&[0x00, 0x00, 0x00, 0x01, 0x67]), // H.264 SPS
+        Bytes::from_static(&[0x00, 0x00, 0x01, 0x40]),       // HEVC VPS
+    ] {
+        let decoder = FakeDecoder::new(vec![FakeOutcome::Solid {
+            width: 8,
+            height: 8,
+            luma: 5,
+        }]);
+        let (mut worker, _idr, _warn, frames) = make_worker(decoder);
+        worker.gate_on_first_idr();
+
+        let job = DecodeJob {
+            body,
+            host_in_client_clock: MonoNanos::now(),
+            keyframe: false,
+            stream_epoch: 0,
+        };
+        let c = worker.process_job(job, MonoNanos::now());
+
+        assert!(
+            !c.decode_err,
+            "Annex-B parameter sets must release the IDR gate without relying on the wire flag"
+        );
+        assert!(
+            frames.take().is_some(),
+            "the frame should decode after the gate recognises parameter sets"
+        );
+    }
 }
 
 #[test]

@@ -411,10 +411,10 @@ fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
 /// A single captured frame from the host's display.
 ///
 /// Two shapes: CPU-side owned bytes (the SHM fallback path), and a
-/// platform-specific GPU handle (DMA-BUF on Linux, IOSurface on macOS
-/// later, D3D11 shared handle on Windows later). The host's encode
-/// path pattern-matches: GPU frames go through the gpuconvert + VAAPI
-/// zero-copy pipeline; CPU frames fall through to `encode_bgra`.
+/// platform-specific GPU handle (DMA-BUF on Linux, IOSurface on macOS, D3D11
+/// texture on Windows). The host's encode path pattern-matches: GPU frames go
+/// through the platform bridge/encoder path; CPU frames fall through to
+/// `encode_bgra`.
 ///
 /// Shape mirrors [`tether_codec::Frame`] / [`tether_codec::GpuFrame`]
 /// for consistency — the producer and consumer end of the same
@@ -445,10 +445,13 @@ pub struct CpuFrame {
 }
 
 /// GPU-resident captured frame. The descriptor varies per platform via
-/// [`GpuCapturedSource`]; a release guard keeps the producer's backing
-/// buffer alive until the consumer is done with it (PipeWire's buffer
-/// must stay queued back to the stream; ScreenCaptureKit's
-/// `IOSurface` needs its `CMSampleBuffer` retained; etc.).
+/// [`GpuCapturedSource`]; a release guard keeps backend objects needed by the
+/// consumer alive until it is done with them. The exact guarantee is
+/// backend-specific: ScreenCaptureKit retains the `CMSampleBuffer` that owns
+/// the `IOSurface`, while Linux DMA-BUF capture dup's the fd so the object
+/// remains importable after PipeWire requeues the slot. Linux does not promise
+/// exclusive content ownership after requeue; consumers rely on the capture
+/// pool's latency headroom and should copy/submit promptly.
 pub struct GpuCapturedFrame {
     pub width: u32,
     pub height: u32,

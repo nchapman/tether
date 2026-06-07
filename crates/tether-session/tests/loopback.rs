@@ -264,10 +264,10 @@ async fn double_send_server_hello_corrupts_the_stream() {
     // second `ServerHello` frame on the wire after the client has
     // moved on to reading `ControlMessage`s — prost decode/conversion fails.
     //
-    // This regression test exists to keep future refactors of
-    // `HostSession::accept` honest. The proper fix is a typestate
-    // wrapper that makes the double-call uncompilable; until that
-    // lands, this catches the misuse at runtime.
+    // Production orchestration goes through the `HostHandshake` typestate
+    // wrapper, which makes this double-call uncompilable. This regression test
+    // pins the lower-level `ControlChannel` escape hatch that tests and custom
+    // harnesses can still call directly.
     let (host_chan, client_chan) = duplex_pair();
     let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
 
@@ -541,6 +541,52 @@ async fn goodbye_during_clock_probe_aborts_connect() {
     assert!(
         matches!(err, ConnectError::PeerGoodbyeDuringClockProbe { ref reason, .. } if reason == "probe denied"),
         "expected PeerGoodbyeDuringClockProbe, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_clock_probe_responses_abort_connect_after_budget() {
+    let (host_chan, client_chan) = duplex_pair();
+    let client_cfg = ClientSessionConfig {
+        client_name: "test-client".to_string(),
+        client_decode_profiles: vec![VideoProfile::H264_8BIT_420],
+        viewport: None,
+    };
+
+    let host_chan_dyn: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_dyn: Arc<dyn ControlChannel> = client_chan;
+
+    let host_task = tokio::spawn(async move {
+        let _hello = host_chan_dyn.recv_client_hello().await.unwrap();
+        host_chan_dyn
+            .send_server_hello(test_server_hello(VideoProfile::H264_8BIT_420))
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            if host_chan_dyn
+                .send_control(&ControlMessage::ClockProbeResponse(
+                    tether_protocol::control::ClockProbe {
+                        t0_sender: MonoNanos::ZERO,
+                        t1_receiver_recv: MonoNanos::ZERO,
+                        t2_receiver_send: MonoNanos::ZERO,
+                    },
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let err = ClientSession::connect(client_chan_dyn, client_cfg)
+        .await
+        .map(|_| ())
+        .expect_err("stale probe responses should not keep connect pending forever");
+    host_task.await.unwrap();
+    assert!(
+        matches!(err, ConnectError::ClockProbeIgnoredMessageLimit { .. }),
+        "expected ClockProbeIgnoredMessageLimit, got {err:?}"
     );
 }
 

@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
-use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
+use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec, VideoProfile};
 use winit::window::Window;
 
 use crate::{CpuFrame, Frame, GpuFrame, RenderError, Result};
@@ -291,9 +291,9 @@ pub(crate) struct UpscaleStage {
 ///   interleaved UV in Rg16Unorm, with 10-bit data MSB-aligned in
 ///   the 16-bit storage cells. Apple's `'P410'` IOSurface (10-bit
 ///   4:4:4 from VT HEVC Main 4:4:4 10-bit decode), `'xf44'` (same
-///   shape via SCK capture), and Linux's `DRM_FORMAT_P010`/`P410`
-///   dma-bufs all land here. Same bind-group layout + same shader
-///   as Biplanar8 — the `range_kind` uniform in `color_params`
+///   shape via SCK capture), and Linux's `DRM_FORMAT_P010` dma-bufs land
+///   here. Same bind-group layout + same shader as Biplanar8 — the
+///   `range_kind` uniform in `color_params`
 ///   selects the 10-bit limited-range branch, which compensates the
 ///   MSB-align so max-value samples normalise to 1.0 instead of
 ///   `≈0.999`.
@@ -301,8 +301,8 @@ pub(crate) struct UpscaleStage {
 ///   Only the Linux dma-buf path for Yuv444 8-bit — VAAPI's 4:4:4
 ///   8-bit surfaces are exposed this way and the shader pulls Y
 ///   from `.z`, U from `.y`, V from `.x`. There is no 10-bit
-///   PackedXYUV path; Linux 10-bit 4:4:4 lands on Biplanar16
-///   instead.
+///   PackedXYUV path; Linux 10-bit 4:4:4 uses the separate
+///   `PackedY410` / `Rgb10a2Unorm` shader path.
 ///
 /// Adding a new `(chroma, bit_depth, backend)` combo means returning
 /// the right variant from [`render_layout_for`] and (if it's a third
@@ -440,22 +440,38 @@ fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
 /// mean sharing one adapter handle between this probe and
 /// `GpuState::new`, which is more plumbing than the residual risk
 /// justifies today.
-pub async fn supports_10bit_render() -> bool {
+fn probe_10bit_render() -> bool {
     let instance = wgpu::Instance::default();
-    let Ok(adapter) = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        })
-        .await
-    else {
+    let options = wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    };
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&options)) else {
         return false;
     };
     adapter
         .features()
         .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+}
+
+pub async fn supports_10bit_render() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(probe_10bit_render)
+}
+
+/// Whether this backend can render a negotiated video profile.
+///
+/// The check is layout-specific: 10-bit biplanar layouts need
+/// `TEXTURE_FORMAT_16BIT_NORM`, while Linux's packed 10-bit 4:4:4 path imports
+/// one `Rgb10a2Unorm` texture and must not be rejected by the biplanar gate.
+pub async fn supports_video_profile_render(profile: VideoProfile) -> bool {
+    match render_layout_for(profile.chroma, profile.bit_depth) {
+        RenderLayout::Biplanar8 | RenderLayout::Planar444 | RenderLayout::PackedXYUV => true,
+        RenderLayout::Biplanar16 => supports_10bit_render().await,
+        RenderLayout::PackedY410 => true,
+    }
 }
 
 impl GpuState {

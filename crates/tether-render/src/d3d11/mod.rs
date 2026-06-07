@@ -18,7 +18,7 @@
 mod cursor;
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::core::{s, Interface, PCSTR};
@@ -59,7 +59,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use winit::window::Window;
 
-use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
+use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec, VideoProfile};
 
 use tether_codec::GpuFrameSource;
 
@@ -117,7 +117,7 @@ fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
 /// this just keeps the renderer from advertising a format it can't open
 /// (and returns `false` if no D3D11 device can be created — negotiation
 /// then settles on an 8-bit profile).
-pub async fn supports_10bit_render() -> bool {
+fn probe_10bit_render() -> bool {
     unsafe {
         // Throwaway device: the renderer's own device isn't created until
         // `D3D11RenderState::new`, well after this startup-time probe.
@@ -148,6 +148,24 @@ pub async fn supports_10bit_render() -> bool {
             Ok(flags) => (flags & D3D11_FORMAT_SUPPORT_TEXTURE2D.0 as u32) != 0,
             Err(_) => false,
         }
+    }
+}
+
+pub async fn supports_10bit_render() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(probe_10bit_render)
+}
+
+/// Whether the D3D11 renderer can render a negotiated video profile.
+///
+/// Windows decode/present is wired for 4:2:0 NV12/P010 surfaces today; 4:4:4
+/// profiles are intentionally not render-advertised until a D3D11 4:4:4 path
+/// exists.
+pub async fn supports_video_profile_render(profile: VideoProfile) -> bool {
+    match (profile.chroma, profile.bit_depth) {
+        (ChromaSubsampling::Yuv420, 8) => true,
+        (ChromaSubsampling::Yuv420, 10) => supports_10bit_render().await,
+        _ => false,
     }
 }
 

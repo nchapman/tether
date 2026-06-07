@@ -1,4 +1,4 @@
-//! Device-pairing cryptography for Tether — pure logic, zero network I/O.
+//! Device-pairing cryptography and trust-store persistence for Tether.
 //!
 //! Tether is remote-control software, so the host must authenticate every
 //! client before it can inject input. Pairing turns a short human-transcribed
@@ -9,13 +9,12 @@
 //!
 //! ## What lives here vs. the transport
 //!
-//! This crate is deliberately I/O-free, mirroring `tether-protocol`: it knows
-//! how to run the SPAKE2 exchange and build/verify confirmation MACs given the
-//! TLS exporter + peer fingerprints as plain bytes, but it never touches quinn
-//! or the wire. `tether-transport` owns the streams and feeds those bytes in.
-//! Isolating the (pre-1.0, unaudited) `spake2` dependency behind one boundary
-//! keeps the rest of the tree clean and makes the whole exchange unit-testable
-//! without a network.
+//! The pairing protocol logic is deliberately network-I/O-free, mirroring
+//! `tether-protocol`: it knows how to run the SPAKE2 exchange and build/verify
+//! confirmation MACs given the TLS exporter + peer fingerprints as plain bytes,
+//! but it never touches quinn or the wire. `tether-transport` owns the streams
+//! and feeds those bytes in. This crate also owns the small JSON trust stores so
+//! host, client, and shell share one persistence format.
 //!
 //! ## The exchange
 //!

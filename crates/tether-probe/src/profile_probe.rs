@@ -10,12 +10,11 @@
 //!
 //! The fix is a real round-trip probe: actually try to encode + decode
 //! at the target profile and observe what the hardware does. Encode
-//! probe runs the backend's own encoder at 128×128 *plus*, on Linux,
-//! the production gpuconvert bridge (step 3 of the migration will wire
-//! this — for now Linux 10-bit is construction-only). Decode probe
-//! loads a small checked-in IDR fixture for the profile and feeds it
-//! to the backend's decoder, demanding back a hardware frame (no
-//! software fallback).
+//! probe runs the backend's own encoder at 128×128 and, on Linux, the
+//! production gpuconvert bridge submit path for GPU-only formats such
+//! as P010 and XV30. Decode probe loads a small checked-in IDR fixture
+//! for the profile and feeds it to the backend's decoder, demanding
+//! back a hardware frame (no software fallback).
 //!
 //! The [`ProfileProbe`] trait expresses the shape every backend must
 //! satisfy. We pick the active backend at compile time via cfg in

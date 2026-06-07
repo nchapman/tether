@@ -3972,12 +3972,21 @@ fn spawn_stdin_command_watcher(
                             });
                         }
                         Ok(tether_ipc::ShellCommand::RevokePeer { fingerprint }) => {
-                            let removed = pairing_state.revoke(&fingerprint);
-                            info!(removed, "revoke peer requested");
-                            // Push the updated list so the UI reflects the removal.
-                            reporter.emit(&EngineEvent::PeerList {
-                                peers: pairing_state.peer_list(),
-                            });
+                            match pairing_state.revoke(&fingerprint) {
+                                Ok(removed) => {
+                                    info!(removed, "revoke peer requested");
+                                    // Push the updated list so the UI reflects the removal.
+                                    reporter.emit(&EngineEvent::PeerList {
+                                        peers: pairing_state.peer_list(),
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "revoke peer failed");
+                                    reporter.emit(&EngineEvent::Error {
+                                        message: format!("failed to revoke peer: {e}"),
+                                    });
+                                }
+                            }
                         }
                         Ok(tether_ipc::ShellCommand::ListPeers) => {
                             reporter.emit(&EngineEvent::PeerList {

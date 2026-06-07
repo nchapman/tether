@@ -150,16 +150,21 @@ impl PairingState {
     /// Revoke a paired peer by its tagged fingerprint (`"sha256:<hex>"`),
     /// persisting the change and tearing down any live session from that peer.
     /// Returns whether the peer was present in the allowlist.
-    pub fn revoke(&self, tagged_fp: &str) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns the persistence error and leaves in-memory state unchanged when
+    /// the updated allowlist cannot be saved.
+    pub fn revoke(&self, tagged_fp: &str) -> std::io::Result<bool> {
         let removed = {
             let mut store = lock_pairing_state(&self.paired, "paired store");
-            let removed = store.remove_tagged(tagged_fp);
-            if removed {
-                if let Err(e) = store.save(&self.paired_path) {
-                    warn!(error = %e, "allowlist save after revoke failed");
-                }
+            let mut next = store.clone();
+            if !next.remove_tagged(tagged_fp) {
+                return Ok(false);
             }
-            removed
+            next.save(&self.paired_path)?;
+            *store = next;
+            true
         };
         // Tear down a live session from the revoked peer, if it matches, by
         // closing its connection. That breaks the encode/send thread out of its
@@ -179,7 +184,7 @@ impl PairingState {
                 }
             }
         }
-        removed
+        Ok(removed)
     }
 }
 
@@ -531,7 +536,9 @@ mod tests {
             revoked: revoked.clone(),
         });
 
-        let removed = state.revoke(&tether_pairing::tag_fingerprint(&fp));
+        let removed = state
+            .revoke(&tether_pairing::tag_fingerprint(&fp))
+            .expect("revoke");
 
         assert!(removed);
         assert!(!state.paired.lock().unwrap().contains(&fp));
@@ -568,7 +575,9 @@ mod tests {
         });
 
         // Revoke some other (unpaired) fingerprint.
-        let _ = state.revoke(&tether_pairing::tag_fingerprint(&[0xEEu8; 32]));
+        let _ = state
+            .revoke(&tether_pairing::tag_fingerprint(&[0xEEu8; 32]))
+            .expect("revoke");
 
         assert!(
             !revoked.load(Ordering::Relaxed),
@@ -591,8 +600,26 @@ mod tests {
     #[tokio::test]
     async fn revoke_unknown_peer_is_noop() {
         let state = test_state([9u8; 32]);
-        let removed = state.revoke(&tether_pairing::tag_fingerprint(&[7u8; 32]));
+        let removed = state
+            .revoke(&tether_pairing::tag_fingerprint(&[7u8; 32]))
+            .expect("revoke");
         assert!(!removed);
+    }
+
+    #[test]
+    fn revoke_save_failure_leaves_allowlist_unchanged() {
+        let state = test_state([9u8; 32]);
+        let fp = [7u8; 32];
+        state.paired.lock().unwrap().insert(&fp, "laptop".into(), 0);
+        std::fs::create_dir_all(state.paired_path.as_ref()).expect("make path a directory");
+
+        let result = state.revoke(&tether_pairing::tag_fingerprint(&fp));
+
+        assert!(result.is_err());
+        assert!(
+            state.paired.lock().unwrap().contains(&fp),
+            "failed persistence must not make memory disagree with disk"
+        );
     }
 
     #[test]

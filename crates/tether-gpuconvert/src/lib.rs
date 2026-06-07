@@ -67,14 +67,23 @@ pub mod nv12_iosurface;
 mod pipeline;
 
 pub(crate) fn headless_wgpu_instance() -> wgpu::Instance {
-    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-    #[cfg(target_os = "linux")]
-    {
-        // Linux gpuconvert paths require Vulkan for DMA-BUF import/export and
-        // HAL access. Restricting the instance avoids noisy GLES/EGL probing
-        // failures while preserving the actual supported backend.
-        desc.backends = wgpu::Backends::VULKAN;
-    }
+    let desc = {
+        let desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        #[cfg(target_os = "linux")]
+        {
+            // Linux gpuconvert paths require Vulkan for DMA-BUF import/export and
+            // HAL access. Restricting the instance avoids noisy GLES/EGL probing
+            // failures while preserving the actual supported backend.
+            wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..desc
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            desc
+        }
+    };
     wgpu::Instance::new(desc)
 }
 

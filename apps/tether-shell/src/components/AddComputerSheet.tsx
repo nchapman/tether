@@ -16,7 +16,38 @@ function withDefaultPort(addr: string): string {
   const colons = (addr.match(/:/g) ?? []).length;
   if (colons === 1) return addr; // host:port or IPv4:port
   if (colons > 1) return `[${addr}]:${DEFAULT_PORT}`; // bare IPv6 literal
-  return `${addr}:${DEFAULT_PORT}`; // bare host / IPv4
+  return `${addr}:${DEFAULT_PORT}`; // bare IPv4 or unsupported hostname
+}
+
+function validPort(raw: string): boolean {
+  if (!/^\d{1,5}$/.test(raw)) return false;
+  const port = Number(raw);
+  return port > 0 && port <= 65535;
+}
+
+function validIpv4(raw: string): boolean {
+  const parts = raw.split(".");
+  return (
+    parts.length === 4 &&
+    parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+  );
+}
+
+function validBracketedIpv6Socket(raw: string): boolean {
+  const match = raw.match(/^\[([0-9a-fA-F:.]+)\]:(\d{1,5})$/);
+  return match !== null && match[1].includes(":") && validPort(match[2]);
+}
+
+function normalizeSocketAddr(raw: string): string | null {
+  const candidate = withDefaultPort(raw);
+  const ipv4 = candidate.match(/^(.+):(\d{1,5})$/);
+  if (ipv4 !== null && validIpv4(ipv4[1]) && validPort(ipv4[2])) {
+    return candidate;
+  }
+  if (validBracketedIpv6Socket(candidate)) {
+    return candidate;
+  }
+  return null;
 }
 
 // First-contact pairing. The highest-stakes, rarest action, so it gets its own
@@ -40,13 +71,14 @@ export function AddComputerSheet({
   const [label, setLabel] = useState("");
 
   const busy = status === "connecting";
-  const addrOk = addr.trim().length > 0;
+  const normalizedAddr = normalizeSocketAddr(addr.trim());
+  const addrOk = normalizedAddr !== null;
   const pinOk = pin.length === 8;
   const canSubmit = addrOk && pinOk && !busy;
 
   function submit() {
-    if (!canSubmit) return;
-    onSubmit(withDefaultPort(addr.trim()), pin, label.trim());
+    if (!canSubmit || normalizedAddr === null) return;
+    onSubmit(normalizedAddr, pin, label.trim());
   }
 
   return (
@@ -68,7 +100,9 @@ export function AddComputerSheet({
             autoFocus
             onChange={(e) => setAddr(e.currentTarget.value)}
           />
-          <span className="field-hint">Port {DEFAULT_PORT} is added automatically.</span>
+          <span className="field-hint">
+            Use an IP address. Port {DEFAULT_PORT} is added automatically.
+          </span>
         </label>
 
         <div className="field">

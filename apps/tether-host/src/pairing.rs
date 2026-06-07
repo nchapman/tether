@@ -61,6 +61,8 @@ const REVOKED_CLOSE_CODE: u32 = 5;
 /// message it sent (a refused `Resume` ⇒ "not paired, go pair"; a refused
 /// `Pair` ⇒ "pairing failed"), so a uniform string costs no UX.
 const REFUSAL_REASON: &str = "pairing failed";
+const MAX_LABEL_BYTES: usize = 255;
+const DEFAULT_PAIRING_LABEL: &str = "Unnamed device";
 
 /// An open pairing window: the host is willing to accept exactly one first-
 /// contact attempt with this PIN until it expires. Created by `StartPairing`.
@@ -131,7 +133,7 @@ impl PairingState {
     pub fn open_window(&self, label: String) -> String {
         let pin = tether_pairing::generate_pin();
         *lock_pairing_state(&self.window, "pairing window") =
-            Some(PairingWindow::open(pin.clone(), label));
+            Some(PairingWindow::open(pin.clone(), normalize_label(label)));
         pin
     }
 
@@ -186,6 +188,23 @@ impl PairingState {
         }
         Ok(removed)
     }
+}
+
+fn normalize_label(label: String) -> String {
+    let trimmed = label.trim();
+    let label = if trimmed.is_empty() {
+        DEFAULT_PAIRING_LABEL
+    } else {
+        trimmed
+    };
+    if label.len() <= MAX_LABEL_BYTES {
+        return label.to_string();
+    }
+    let mut end = MAX_LABEL_BYTES;
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    label[..end].to_string()
 }
 
 fn lock_pairing_state<'a, T>(lock: &'a StdMutex<T>, name: &str) -> MutexGuard<'a, T> {
@@ -511,6 +530,28 @@ mod tests {
         let window = state.window.lock().unwrap().clone().expect("window open");
         assert_eq!(window.pin, pin);
         assert_eq!(window.label, "laptop");
+    }
+
+    #[test]
+    fn open_window_normalizes_label() {
+        let state = test_state([9u8; 32]);
+
+        state.open_window("  laptop  ".into());
+        assert_eq!(
+            state.window.lock().unwrap().as_ref().unwrap().label,
+            "laptop"
+        );
+
+        state.open_window("   ".into());
+        assert_eq!(
+            state.window.lock().unwrap().as_ref().unwrap().label,
+            DEFAULT_PAIRING_LABEL
+        );
+
+        state.open_window(format!("{}é", "x".repeat(MAX_LABEL_BYTES)));
+        let label = state.window.lock().unwrap().as_ref().unwrap().label.clone();
+        assert_eq!(label.len(), MAX_LABEL_BYTES);
+        assert!(label.is_char_boundary(label.len()));
     }
 
     #[tokio::test]

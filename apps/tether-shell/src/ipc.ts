@@ -20,34 +20,19 @@ export type PairedPeer = {
 };
 
 /// Engine → shell lifecycle events, mirroring `tether_ipc::EngineEvent`
-/// (flattened) plus the `role` the supervisor tags each line with. Only the
-/// fields the UI reads are typed.
-export type EngineEvent = {
-  role: "host" | "client";
-  event:
-    | "listening"
-    | "peer_connected"
-    | "peer_disconnected"
-    | "connecting"
-    | "connected"
-    | "disconnected"
-    | "error"
-    | "pairing_pin"
-    | "paired"
-    | "pairing_required"
-    | "peer_list";
-  addr?: string;
-  fingerprint?: string;
-  peer?: string;
-  host?: string;
-  profile?: string;
-  reason?: string;
-  message?: string;
-  pin?: string;
-  expires_in_secs?: number;
-  label?: string;
-  peers?: PairedPeer[];
-};
+/// (flattened) plus the `role` the supervisor tags each line with.
+export type EngineEvent =
+  | { role: "host" | "client"; event: "listening"; addr: string; fingerprint: string }
+  | { role: "host" | "client"; event: "peer_connected"; peer: string }
+  | { role: "host" | "client"; event: "peer_disconnected"; reason: string }
+  | { role: "host" | "client"; event: "connecting"; host: string }
+  | { role: "host" | "client"; event: "connected"; host: string; profile: string }
+  | { role: "host" | "client"; event: "disconnected"; reason: string }
+  | { role: "host" | "client"; event: "error"; message: string }
+  | { role: "host" | "client"; event: "pairing_pin"; pin: string; expires_in_secs: number }
+  | { role: "host" | "client"; event: "paired"; peer: string; label: string }
+  | { role: "host" | "client"; event: "pairing_required"; peer: string }
+  | { role: "host" | "client"; event: "peer_list"; peers: PairedPeer[] };
 
 export type EngineExited = { role: "host" | "client" };
 

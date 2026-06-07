@@ -36,7 +36,7 @@ use tether_session::{
 };
 use tether_transport::{Client, Datagram, ServerAuth};
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod client_pairing;
 use client_pairing::HostAuth;
@@ -219,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
     // worker down; binding it for the duration of `main` ensures
     // logs aren't truncated at process exit.
     let _tracing_guard = init_tracing(reporter.is_json());
+    let stdin_stop = spawn_stdin_stop_signal(reporter.is_json());
 
     // Parse args: positional host addr (and optional explicit fingerprint),
     // plus `--pin <PIN>` (first-contact pairing) and `--label <name>` (display
@@ -285,10 +286,22 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::with_identity(&config_dir)?;
     let client_fp = client.fingerprint();
-    let pending = match client
-        .connect_pending(addr, "tether-host", server_auth)
-        .await
-    {
+    let connect_result = if let Some(rx) = stdin_stop.clone() {
+        tokio::select! {
+            () = wait_for_stdin_stop_signal(rx) => {
+                reporter.emit(&EngineEvent::Disconnected {
+                    reason: "stopped by shell".to_string(),
+                });
+                return Ok(());
+            }
+            result = client.connect_pending(addr, "tether-host", server_auth) => result,
+        }
+    } else {
+        client
+            .connect_pending(addr, "tether-host", server_auth)
+            .await
+    };
+    let pending = match connect_result {
         Ok(p) => p,
         Err(e) => {
             reporter.emit(&EngineEvent::Error {
@@ -298,7 +311,20 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let is_first_contact = matches!(mode, HostAuth::FirstContact { .. });
-    let (conn, host_fp) = match client_pairing::establish(pending, &mode, client_fp).await {
+    let pairing_result = if let Some(rx) = stdin_stop.clone() {
+        tokio::select! {
+            () = wait_for_stdin_stop_signal(rx) => {
+                reporter.emit(&EngineEvent::Disconnected {
+                    reason: "stopped by shell".to_string(),
+                });
+                return Ok(());
+            }
+            result = client_pairing::establish(pending, &mode, client_fp) => result,
+        }
+    } else {
+        client_pairing::establish(pending, &mode, client_fp).await
+    };
+    let (conn, host_fp) = match pairing_result {
         Ok(pair) => pair,
         Err(e) => {
             reporter.emit(&EngineEvent::Error {
@@ -309,18 +335,32 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Persist known-hosts: on first contact, pin the host so the next connect
-    // is one-click; on every successful connect (first-contact or resume),
-    // stamp the time so the shell's address book can show recency.
+    // is one-click; on every successful connect to an entry that still exists,
+    // stamp the time so the shell's address book can show recency. Reload right
+    // before saving so a shell-side Forget during connect does not get
+    // resurrected by the startup snapshot.
     {
-        let mut known_hosts = known_hosts;
         let addr_key = addr.to_string();
         let now = unix_now();
-        if is_first_contact {
-            let label = label.unwrap_or_else(|| addr_key.clone());
-            known_hosts.insert(addr_key.clone(), &host_fp, label, now);
-        }
-        known_hosts.set_last_connected(&addr_key, now);
-        if let Err(e) = known_hosts.save(&known_hosts_path) {
+        let save_result = (|| -> std::io::Result<()> {
+            let mut known_hosts = tether_pairing::KnownHosts::load(&known_hosts_path)?;
+            if is_first_contact {
+                let label = label.unwrap_or_else(|| addr_key.clone());
+                known_hosts.insert(addr_key.clone(), &host_fp, label, now);
+                known_hosts.set_last_connected(&addr_key, now);
+                known_hosts.save(&known_hosts_path)?;
+            } else if known_hosts.fingerprint(&addr_key) == Some(host_fp) {
+                known_hosts.set_last_connected(&addr_key, now);
+                known_hosts.save(&known_hosts_path)?;
+            } else {
+                debug!(
+                    host = %addr_key,
+                    "connected host is no longer in known-hosts; not rewriting forgotten entry"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(e) = save_result {
             warn!(error = %e, "connected but failed to persist known-hosts; first-contact reconnect may need --pin again");
         }
     }
@@ -1524,13 +1564,13 @@ async fn main() -> anyhow::Result<()> {
     // owns the main thread, so like the Ctrl-C handler this task sends
     // Goodbye and exits the process directly rather than trying to unwind
     // through winit.
-    if reporter.is_json() {
+    if let Some(rx) = stdin_stop {
         let conn = conn.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
         let decode_event_rx = decode_event_rx.clone();
         tokio::spawn(async move {
-            wait_for_stdin_stop().await;
+            wait_for_stdin_stop_signal(rx).await;
             info!("shell stop received; sending Goodbye and exiting");
             reporter.emit(&EngineEvent::Disconnected {
                 reason: "stopped by shell".to_string(),
@@ -1626,6 +1666,29 @@ async fn wait_for_stdin_stop() {
             }
             // EOF or read error: the shell is gone — treat as stop.
             Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+fn spawn_stdin_stop_signal(enabled: bool) -> Option<tokio::sync::watch::Receiver<bool>> {
+    if !enabled {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_stdin_stop().await;
+        let _ = tx.send(true);
+    });
+    Some(rx)
+}
+
+async fn wait_for_stdin_stop_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
         }
     }
 }

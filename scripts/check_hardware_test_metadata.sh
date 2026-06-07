@@ -48,9 +48,9 @@ trap 'rm -f "$TMPFILE"' EXIT
 
 # Emit: file<TAB>line<TAB>test<TAB>ignore_msg
 while IFS= read -r file; do
-  # rg emits backslash separators on Windows. Normalize to forward slashes so
-  # awk's `-v` assignment doesn't escape-process them (\t -> tab, etc.) and so
-  # the family `case "$file"` patterns below still match.
+  # Normalize any backslash separators so awk's `-v` assignment doesn't
+  # escape-process them (\t -> tab, etc.) and so the family `case "$file"`
+  # patterns below still match.
   file="${file//\\//}"
   awk -v f="$file" '
     BEGIN {
@@ -124,7 +124,11 @@ while IFS= read -r file; do
       }
     }
   ' "$file"
-done < <(rg --files crates apps -g '*.rs') > "$TMPFILE"
+done < <(
+  find crates apps -type f -name '*.rs' \
+    -not -path '*/target/*' \
+  | sort
+) > "$TMPFILE"
 
 total=$(wc -l < "$TMPFILE")
 missing_require=0

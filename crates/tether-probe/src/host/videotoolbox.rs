@@ -386,7 +386,7 @@ mod tests {
     /// regression target is required to land — every Apple Silicon Mac
     /// decodes it.
     #[test]
-    #[ignore = "requires macOS + VideoToolbox"]
+    #[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-probe -- --ignored"]
     fn decoded_fixture_fourcc_is_renderer_accepted() {
         // The macOS-negotiated decode set that ships a fixture.
         let profiles = [

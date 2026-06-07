@@ -469,7 +469,7 @@ mod tests {
     /// (`Y_STORAGE_CEILING = 60160/65535`) doesn't activate at this
     /// luma — pure red Y is well inside the limited-range envelope.
     #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF + storage-writable R16/Rg16"]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF + storage-writable R16/Rg16; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_red_roundtrip_p010() {
         let width = 64u32;
         let height = 32u32;

@@ -504,7 +504,7 @@ mod tests {
     /// `PipelineStage` reason for any it can't. Ignored by default
     /// because it constructs real encoders/decoders.
     #[test]
-    #[ignore = "requires a working host codec backend (VAAPI on Linux, VideoToolbox on macOS, D3D11 on Windows)"]
+    #[ignore = "requires a working host codec backend (VAAPI on Linux, VideoToolbox on macOS, D3D11 on Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn print_host_supported_profiles() {
         println!("Host codec capability matrix:");
         for support in host_supported_profiles() {
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn probe_host_includes_h264_encode() {
         let profiles = host_supported_profiles();
         let h264 = profiles.iter().find(|s| {
@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn probe_host_includes_hevc_420_encode() {
         let profiles = host_supported_profiles();
         let hevc = profiles.iter().find(|s| {
@@ -684,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn probe_client_includes_h264_decode() {
         let profiles = client_supported_profiles();
         let h264 = profiles.iter().find(|s| {
@@ -702,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn probe_client_includes_hevc_420_decode() {
         let profiles = client_supported_profiles();
         let hevc = profiles.iter().find(|s| {
@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn probe_host_and_client_intersect_on_at_least_one_profile() {
         let host = host_encode_profiles();
         let client: Vec<_> = client_supported_profiles()
@@ -747,7 +747,7 @@ mod tests {
     /// dropping Main10 from the advert before it could ever negotiate.
     #[cfg(target_os = "windows")]
     #[test]
-    #[ignore = "requires D3D11 GPU with HEVC Main10 decode (Windows)"]
+    #[ignore = "requires D3D11 GPU with HEVC Main10 decode (Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn client_offers_hevc_main10() {
         let profiles = client_decode_profiles();
         eprintln!("client decode profiles: {profiles:?}");
@@ -769,7 +769,7 @@ mod tests {
     /// (the assert would fail there — run only on RDNA 2+ / Ada / Arc).
     #[cfg(target_os = "windows")]
     #[test]
-    #[ignore = "requires D3D11 GPU with AV1 decode (RDNA 2+ / Ada / Arc, Windows)"]
+    #[ignore = "requires D3D11 GPU with AV1 decode (RDNA 2+ / Ada / Arc, Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn client_offers_av1_420() {
         let profiles = client_decode_profiles();
         eprintln!("client decode profiles: {profiles:?}");

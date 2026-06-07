@@ -320,7 +320,7 @@ fn max_abs_diff_rgb(a: &[u8], b: &[u8]) -> u8 {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn fiducial_channel_order_red_stays_red() {
     // A 4×4 image of solid red pixels (255, 0, 0, 255) downscaled to
     // 2×2 must come out red, not blue (which would mean the source
@@ -426,7 +426,7 @@ fn assert_matches_reference(
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn matches_reference_typical_downscale() {
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
@@ -457,7 +457,7 @@ fn matches_reference_typical_downscale() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn matches_reference_upscale() {
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
@@ -476,7 +476,7 @@ fn matches_reference_upscale() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn matches_reference_heavy_downscale_with_mip() {
     // 8× downscale exercises the mip prefilter chain (3 levels).
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
@@ -496,7 +496,7 @@ fn matches_reference_heavy_downscale_with_mip() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn matches_reference_realistic_screen_dim() {
     // The motivating production case: 4K capture → 720p encode. We
     // use a smaller-but-proportional 1920×1080 → 1280×720 to keep the
@@ -528,7 +528,7 @@ fn matches_reference_realistic_screen_dim() {
 /// Asserts both the global PSNR/SSIM/max-diff bounds and a hard
 /// left-edge bound: no first-32-column MAE may exceed 4.0 vs interior.
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn matches_reference_coord_encoded_left_edge() {
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = Arc::new(Pipelines::build(&device));
@@ -568,7 +568,7 @@ fn matches_reference_coord_encoded_left_edge() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn matches_reference_asymmetric_scale() {
     // Aspect-changing scale: 256×256 → 192×128 (0.75× horizontal,
     // 0.5× vertical). Exercises that x and y scale independently
@@ -591,7 +591,7 @@ fn matches_reference_asymmetric_scale() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn no_scale_needed_errors_at_exact_match() {
     // Validation path: 1:1 dims return NoScaleNeeded so callers can
     // skip the scaler entirely. Pure upscale (dst > src) must NOT
@@ -786,7 +786,7 @@ fn mitchell_filter_linear(src: &[f32], src_w: u32, src_h: u32, dst_w: u32, dst_h
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn linear_light_scaler_matches_linear_reference() {
     // The renderer's client upscale path runs LinearF16 — same
     // Mitchell math, no sRGB transfer. The Srgb8 path's PSNR/SSIM
@@ -862,7 +862,7 @@ fn linear_light_scaler_matches_linear_reference() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn linear_light_solid_color_preserves_color() {
     // Solid color round-trip in LinearF16: the simplest possible
     // sanity check that the shader isn't swizzling channels,
@@ -937,7 +937,7 @@ fn time_scale(
 ///   cargo test -p tether-scaler --test hardware --release \
 ///     -- --ignored --nocapture bench_scale
 #[test]
-#[ignore = "perf microbenchmark; prints timings, no assertions"]
+#[ignore = "perf: scaler microbenchmark; prints timings, no assertions; run with: cargo test -p tether-scaler --test hardware -- --ignored --nocapture bench_scale_realistic_dims"]
 fn bench_scale_realistic_dims() {
     let (device, queue) = pollster::block_on(build_device()).expect("wgpu device");
     let pipelines = std::sync::Arc::new(Pipelines::build(&device));
@@ -1189,7 +1189,7 @@ fn mean_abs_diff_plane(a: &[u8], b: &[u8]) -> f64 {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES"]
+#[ignore = "requires wgpu adapter with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn r8_plane_scaler_matches_reference() {
     // Y-plane downscale 256×256 → 128×128 over a vertical gradient
     // (smooth, surfaces both edge-clamp and interior arithmetic).
@@ -1226,7 +1226,7 @@ fn r8_plane_scaler_matches_reference() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES"]
+#[ignore = "requires wgpu adapter with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn rg8_plane_scaler_matches_reference() {
     // UV-plane downscale 128×128 → 64×64 (half-luma resolution
     // typical for NV12 chroma) with chroma_offset = 0 (zero-baseline:
@@ -1271,7 +1271,7 @@ fn rg8_plane_scaler_matches_reference() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES"]
+#[ignore = "requires wgpu adapter with TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn uv_chroma_siting_no_half_pixel_shift() {
     // The chroma-siting regression test the expert review demanded.
     //
@@ -1351,7 +1351,7 @@ fn uv_chroma_siting_no_half_pixel_shift() {
 }
 
 #[test]
-#[ignore = "requires wgpu adapter"]
+#[ignore = "requires wgpu adapter; run with: cargo test -p tether-scaler --test hardware -- --ignored"]
 fn dim_mismatch_errors_typed() {
     // Build a scaler for 64×64 → 32×32 but hand it a 128×128 source.
     // The scaler must return DimMismatch rather than silently scaling

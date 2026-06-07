@@ -523,7 +523,7 @@ mod tests {
     /// (XV30LE "X:Cr:Y:Cb") — the red cell additionally catches a U↔V
     /// swap, since pure red has very distinct Cb vs Cr codes.
     #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF and Rgb10a2Unorm storage"]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF and Rgb10a2Unorm storage; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_white_roundtrip_packed_xv30() {
         let width = 64u32;
         let height = 32u32;
@@ -589,7 +589,7 @@ mod tests {
     /// pure red has very distinct V vs U values, so a U↔V swap would
     /// show up as wildly wrong codes (V≈806, U≈400 in 10-bit).
     #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF and Rgb10a2Unorm storage"]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF and Rgb10a2Unorm storage; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_red_roundtrip_packed_xv30() {
         let width = 64u32;
         let height = 32u32;

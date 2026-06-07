@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tether_audio::{capture, AudioPlayer, OpusConfig, OpusDecoder, OpusEncoder};
 
 #[test]
-#[ignore = "requires macOS audio output device + Screen Recording permission"]
+#[ignore = "requires macOS audio output device + Screen Recording permission; run with: cargo test -p tether-audio -- --ignored"]
 fn macos_capture_encode_decode_playback_roundtrip() {
     let cfg = OpusConfig::default();
 

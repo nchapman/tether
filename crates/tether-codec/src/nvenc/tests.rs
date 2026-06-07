@@ -271,13 +271,13 @@ fn assert_encode_bgra_produces_idr(profile: VideoProfile) {
 }
 
 #[test]
-#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_hevc_8bit_encode_bgra_produces_idr() {
     assert_encode_bgra_produces_idr(VideoProfile::HEVC_8BIT_420);
 }
 
 #[test]
-#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_h264_8bit_encode_bgra_produces_idr() {
     assert_encode_bgra_produces_idr(VideoProfile::H264_8BIT_420);
 }
@@ -289,7 +289,7 @@ fn nvenc_h264_8bit_encode_bgra_produces_idr() {
 /// analogue of VAAPI's verified-negative SKIP tests, and exercises the
 /// otherwise test-only getter.
 #[test]
-#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + NVENC-enabled FFmpeg; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_latency_avoptions_are_all_consumed() {
     if !require_nvidia_gpu("nvenc_latency_avoptions_are_all_consumed") {
         return;
@@ -307,7 +307,7 @@ fn nvenc_latency_avoptions_are_all_consumed() {
 }
 
 #[test]
-#[ignore = "requires NVIDIA GPU (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_detection_true_on_this_nvidia_host() {
     // Sanity: the production detection path (real /sys/class/drm) agrees that
     // this is an NVIDIA host. Guards against a sysfs-layout assumption that
@@ -386,7 +386,7 @@ fn y_stats(frame: &rsmpeg::avutil::AVFrame) -> DecodedYStats {
 }
 
 #[test]
-#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
     use tether_gpuconvert::Bgra2P010DmaBuf;
 
@@ -454,7 +454,7 @@ fn nvenc_p010_dmabuf_roundtrip_decodes_our_pixels() {
 }
 
 #[test]
-#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_yuv444p_dmabuf_roundtrip_decodes_our_pixels() {
     use tether_gpuconvert::Yuv444pDmaBuf;
 
@@ -545,7 +545,7 @@ fn encode_noisy(enc: &mut NvencEncoder, w: u32, h: u32, start_t: u32, n: u32) ->
 }
 
 #[test]
-#[ignore = "requires NVIDIA GPU + NVENC (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + NVENC; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_bitrate_retune_changes_bitstream_size() {
     if !require_nvidia_gpu("nvenc_bitrate_retune_changes_bitstream_size") {
         return;
@@ -598,7 +598,7 @@ fn nvenc_bitrate_retune_changes_bitstream_size() {
 }
 
 #[test]
-#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + NVENC + Vulkan dma-buf; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_nv12_dmabuf_roundtrip_decodes_our_pixels() {
     use tether_gpuconvert::Nv12DmaBuf;
 
@@ -672,7 +672,7 @@ fn nvenc_nv12_dmabuf_roundtrip_decodes_our_pixels() {
 /// would silently pin the wrong GPU. On the dev box (2× RTX 3090 Ti + 1 AMD)
 /// CUDA sees the two NVIDIA GPUs.
 #[test]
-#[ignore = "requires NVIDIA GPU + libcuda (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + libcuda; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_cuda_enumerates_distinct_nonzero_uuids() {
     if !require_nvidia_gpu("nvenc_cuda_enumerates_distinct_nonzero_uuids") {
         return;
@@ -722,7 +722,7 @@ fn nvenc_cuda_enumerates_distinct_nonzero_uuids() {
 /// UUIDs ever diverged, or either query read the wrong bytes, pinning would
 /// silently target the wrong GPU; only real hardware catches that.
 #[test]
-#[ignore = "requires NVIDIA GPU + Vulkan + libcuda (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + Vulkan + libcuda; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_producer_uuid_resolves_to_a_cuda_ordinal() {
     use tether_gpuconvert::Nv12DmaBuf;
 
@@ -768,7 +768,7 @@ fn nvenc_producer_uuid_resolves_to_a_cuda_ordinal() {
 /// box (2 NVIDIA GPUs) this confirms ordinal 1 selects a display too, which the
 /// old hardcoded `== 0` path could never have done.
 #[test]
-#[ignore = "requires NVIDIA GPU + libEGL device extensions (cargo test -p tether-codec --ignored nvenc_)"]
+#[ignore = "requires NVIDIA GPU + libEGL device extensions; run with: cargo test -p tether-codec -- --ignored"]
 fn nvenc_egl_display_selects_per_cuda_ordinal() {
     if !require_nvidia_gpu("nvenc_egl_display_selects_per_cuda_ordinal") {
         return;

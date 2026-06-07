@@ -23,7 +23,13 @@ The mise tasks separate short edit-loop checks from the authoritative suites:
 | `mise run test` | Fast library-unit loop: `cargo test --workspace --lib`. |
 | `mise run test-all` | Full no-hardware suite: `cargo test --workspace`; this matches CI's test step. |
 | `mise run coverage` | Advisory no-hardware coverage report via `cargo-llvm-cov`, with an HTML report in `target/llvm-cov/html`. |
+| `mise run hwtag-audit` | Audit `#[ignore = "..."]` hardware-skip metadata and print a canonical inventory. |
 | `mise run test-hw` | Current platform's ignored GPU/video hardware tests, serial. |
+| `mise run test-hw-codec` | Ignored codec hardware tests only (serial, skips benchmark cells). |
+| `mise run test-hw-render` | Ignored render hardware tests only (serial, skips benchmark cells). |
+| `mise run test-hw-gpuconvert` | Ignored gpuconvert hardware tests only (serial, skips benchmark cells). |
+| `mise run test-hw-scaler` | Ignored scaler hardware tests only (serial, skips benchmark cells). |
+| `mise run test-hw-probe` | Ignored probe hardware tests only (serial, skips benchmark cells). |
 | `mise run test-audio` | Current platform's ignored system-audio round-trip. |
 | `mise run bench` | Current platform's ignored benchmark cells, release, serial. |
 
@@ -35,6 +41,50 @@ glass-to-glass validation stay governed by the matrix and gap notes below.
 Install the tool with `cargo install cargo-llvm-cov` if `mise run coverage`
 reports that the subcommand is missing.
 
+## Hardware test organization
+
+Hardware tests are organized into five families that map to the runtime
+pipeline:
+
+- **codec** (`tether-codec`, `tether-probe`): encoder/decoder constructors,
+  round-trips, capability probes, and vendor/codec behaviour checks.
+- **render** (`tether-render`): zero-copy / import / present paths,
+  hardware-specific renderer behavior.
+- **gpuconvert** (`tether-gpuconvert`, capture/mode conversion helpers):
+  frame format conversion and shared-buffer export/import preconditions.
+- **scaler** (`tether-scaler`): hardware-accelerated scaler geometry and
+  quality cells.
+- **audio-loopback** (`tether-audio`): system-output capture → Opus → playback.
+
+Use these commands for family-specific sweeps:
+
+| Task | Command |
+| --- | --- |
+| `mise run test-hw-codec` | `cargo test -p tether-codec --tests --no-fail-fast [--release on macOS] -- --ignored --test-threads=1 --skip bench` |
+| `mise run test-hw-render` | `cargo test -p tether-render --tests --no-fail-fast [--release on macOS] -- --ignored --test-threads=1 --skip bench` |
+| `mise run test-hw-gpuconvert` | `cargo test -p tether-gpuconvert --tests --no-fail-fast [--release on macOS] -- --ignored --test-threads=1 --skip bench` |
+| `mise run test-hw-scaler` | `cargo test -p tether-scaler --tests --no-fail-fast [--release on macOS] -- --ignored --test-threads=1 --skip bench` |
+| `mise run test-hw-probe` | `cargo test -p tether-probe --tests --no-fail-fast [--release on macOS] -- --ignored --test-threads=1 --skip bench` |
+
+These focused tasks intentionally match `mise run test-hw` launch semantics:
+hardware tests run serially, benchmark-only cells stay in `mise run bench`, and
+macOS runs release-mode because the IOSurface/Metal comparison thresholds are
+not reliable in debug builds.
+
+Canonical skip annotation style for hardware tests:
+
+- Use `#[ignore = "requires …"]` for hardware-gated functional cells.
+- Use `#[ignore = "diagnostic: ..."]` for verified-negative behavior checks.
+- Use `#[ignore = "perf: ..."]` for benchmark-only cells.
+- Prefer the `run with:` command hint when the launch shape differs from
+  `mise run test-hw` (e.g. profile-specific crates, release-only paths).
+- Keep command-run text on the ignore line so triage logs and automated
+  inventories can be machine-parsed without opening the file.
+
+Run `mise run hwtag-audit` after adding or moving ignored tests. It prints
+an inventory of every `#[ignore = "..."]` test and highlights non-standard
+messages.
+
 ## Unit and integration tests by package
 
 | Package | Tests | Covers |
@@ -45,7 +95,7 @@ reports that the subcommand is missing.
 | `tether-probe` | 22 lib + platform `#[ignore]` hardware | `PipelineStage` exhaustiveness, `ProfileSupport` helpers, seven-entry preference order (HEVC 4:4:4, AV1 4:2:0, HEVC 4:2:0, H.264 floor), forced-profile parser/selector, `pick_supported_profile` (best mutual / fallback / disjoint / empty / forward-compat unknown bit_depth), Mac 4:4:4 decode-without-encode invariant, host/client probe intersection, and decode advert guards for H.264/HEVC/AV1 paths. Windows (`#[ignore]`): `client_offers_hevc_main10` — regression guard that the P010 GPU-export decode probe keeps Main10 in the advert. |
 | `tether-input` | 27 Linux / 15 macOS-Windows | 11 cross-platform translator tests (modifier tracking, HID routing, cursor normalization). On Linux, `inject/uinput.rs` adds 16 unit tests: HID→evdev mapping, ASCII char→keystroke, scroll-detent sign/quantisation/overflow, normalised→ABS coordinates, pointer-button↔device cross-table, and modifier-reconcile release-variant logic. On macOS/Windows the 4 `clamp_relative_delta` (±1000 px) tests live in `inject/enigo_backend.rs`. |
 | `tether-session` | 21 lib + 24 integration | Lib: `IdrSignal` coalescing + clone-share; `EncodeStatsWindow` emit / idle / accumulate; host-side typed `ServerHello` construction + unknown bit-depth filtering; client-side unknown bit-depth rejection helper. Integration (via `tether-transport`'s `test-support` feature): `loopback.rs` covers successful typed handshake + clock-probe burst, typed no-profile rejection, unadvertised-profile rejection + client `Goodbye(ProtocolError)`, unknown host bit-depth rejection + client `Goodbye(ProtocolError)`, host filtering of unknown client bit-depths, Goodbye during clock probe, initial viewport wire field, post-handshake `ClientStats`, `SetViewportHint`, `SetDisplayMode -> Unsupported`, dropped-peer Transport error, and the double-send corruption guard; `decoder_thread_loopback.rs` (3) — `run_thread` + `DuplexVideoChannel` + `LatestFrame` smoke; `video_loopback.rs` (2); `video_loopback_with_loss.rs` (3) via `LossyChannel`; `epoch_bump_invalidates_inflight.rs` (1); `input_loopback.rs` (1). |
-| `tether-render` | 77 Linux-listed tests incl. hardware cells | Cursor letterbox/aspect; `LatestFrame` Send+Sync + drop-oldest; render health/drop accounting; `transfer_kind` / `range_kind_for` / `render_layout_for` dispatch-table pins (incl. 10-bit limited-range breakpoint algebra and Yuv420 10-bit → Biplanar16); `PresentPolicy` / `FrameAgeTracker` (8 tests on pure `decide_present` logic); **relative-mouse sub-pixel accumulator** (6 tests in `relative_mouse.rs`: whole-pixel passthrough, sub-pixel-held, long-run convergence, mixed-sign no-stall, i16 saturation, reset). Hardware: end-to-end roundtrip harness (`test_harness.rs` + `dmabuf_test.rs`) drives the production multi-pass renderer (`Gpu::new_headless`) through cells covering identity / host-scaler / client-upscale / surface-below-video / full-chain / repro-shape across H.264 4:2:0, HEVC Main, HEVC Main 4:4:4, HEVC Main 10, HEVC Main 4:4:4 10-bit, AV1 4:2:0 8-bit + 10-bit. Primary metric is geometric residual on `Fixture::CoordEncoded`; SSIM + BT.709 Y-PSNR are the secondary catch-net. A parallel set of `Fixture::ColorBars` cells asserts each codec reconstructs true colour. macOS IOSurface zero-copy covers HEVC Main / Main10 / Main 4:4:4 8 + 10-bit; BGRA-bridge cells cover the macOS host Metal bridge output for 4:2:0 and 4:4:4 at 8/10-bit; `iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix` records the current VT encode negative for 4:4:4. **Windows D3D11** (cfg-gated, `#[ignore]`): native-renderer headless roundtrips cover synthetic NV12, cursor overlay, HEVC/H.264/AV1 coord and colour fixtures, and non-identity scaling; 4:4:4 is rejected at construction (D3D11 VP is 4:2:0-only). |
+| `tether-render` | 81 Linux-listed tests incl. hardware cells | Cursor letterbox/aspect; `LatestFrame` Send+Sync + drop-oldest; render health/drop accounting; `transfer_kind` / `range_kind_for` / `render_layout_for` dispatch-table pins (incl. 10-bit limited-range breakpoint algebra and Yuv420 10-bit → Biplanar16); `PresentPolicy` / `FrameAgeTracker` (8 tests on pure `decide_present` logic); **relative-mouse sub-pixel accumulator** (6 tests in `relative_mouse.rs`: whole-pixel passthrough, sub-pixel-held, long-run convergence, mixed-sign no-stall, i16 saturation, reset). Hardware: end-to-end roundtrip harness (`test_harness.rs` + `dmabuf_test.rs`) drives the production multi-pass renderer (`Gpu::new_headless`) through cells covering identity / host-scaler / client-upscale / surface-below-video / full-chain / repro-shape across H.264 4:2:0, HEVC Main, HEVC Main 4:4:4, HEVC Main 10, HEVC Main 4:4:4 10-bit, AV1 4:2:0 8-bit + 10-bit. Primary metric is geometric residual on `Fixture::CoordEncoded`; SSIM + BT.709 Y-PSNR are the secondary catch-net. A parallel set of `Fixture::ColorBars` cells asserts each codec reconstructs true colour. NVIDIA Linux gets fixture decode → NVDEC dma-buf export → production render cells for H.264, HEVC Main10, and AV1 8/10-bit. macOS IOSurface zero-copy covers HEVC Main / Main10 / Main 4:4:4 8 + 10-bit plus AV1 4:2:0 8/10-bit fixture-render cells; BGRA-bridge cells cover the macOS host Metal bridge output for 4:2:0 and 4:4:4 at 8/10-bit; `iosurface_bgra_bridge_videotoolbox_encode_chroma_matrix` records the current VT encode negative for 4:4:4. **Windows D3D11** (cfg-gated, `#[ignore]`): native-renderer headless roundtrips cover synthetic NV12, cursor overlay, Intel QSV plus AMD AMF plus NVIDIA NVENC HEVC/H.264/AV1 coord and colour fixtures, and 8/10-bit non-identity scaling; 4:4:4 is rejected at construction (D3D11 VP is 4:2:0-only). |
 | `tether-gpuconvert` | 6 lib + 18 `#[ignore]` lib + 7 `#[ignore]` integration (`tests/scaler_roundtrip.rs`) | `drm_fourcc_to_vk_format` table coverage (8 + 10-bit biplanar + packed XV30 → A2B10G10R10_UNORM_PACK32 + unknown rejection); BGRA→NV12 + DMA-BUF round-trip; `convert_solid_{white,red}_roundtrip_packed_xv30` (10-bit channel-mapping + BT.709 math); `storable_probe_returns_linear_for_xv30`; structural alignment regression `convert_reports_64_aligned_y_stride_at_unaligned_width`. Integration: `bgra_dmabuf_roundtrip_{1920×1200,2880×1920}` + `imported_bgra_then_scaler_2880×1920_to_2160×1440` — bisect entry points splitting (scaler isolation) ↔ (BGRA dma-buf import/export) ↔ (scaler-on-dma-buf). |
 | `tether-scaler` | 8 lib + 6 integration (`tests/quality.rs`) + 15 `#[ignore]` integration (`tests/hardware.rs`) | Mitchell-Netravali reference vs CPU parity, fp16 linear-light, mip prefilter, asymmetric scale; `matches_reference_coord_encoded_left_edge` (2880×1920 → 2160×1440 left-edge regression — bottom of the bisect stack). |
 | `tether-capture` | 41 Linux lib | `HashDamage::classify` policy incl. native-damage short-circuit; cursor source/shape policy; restore-token file permission hardening; `native_damage_for_frame_status` (macOS) maps all six `SCFrameStatus`; `native_damage_from_region_count` (Linux) empty-list ⇒ idle; `video_damage_meta_pod_has_choice_range_size` pod-shape snapshot. Test-pattern producer lifecycle + `set_target_fps_changes_cadence_mid_stream` + `set_target_fps_clamps_zero_to_one`. SCK pixel-format probe (`#[ignore]` on macOS). `test_support`: `ScriptedSource` for precise-timing scenarios. **Windows D3D11** (cfg-gated): the capture→encode ownership handshake + freshest-wins handoff, plus the consumer-liveness shutdown contract. |
@@ -187,15 +237,18 @@ behaviour we expect to work everywhere.
   documented follow-up.
 
   Note the suites are symmetric in *infrastructure* (one command, every crate,
-  every platform) but not yet in *cell coverage*: the Linux VAAPI/dma-buf path
-  is the most mature (the 23-cell render harness, 4:4:4 + AV1 dma-buf, encoder-
-  knob SKIP tests). The Windows D3D11 render matrix now covers the shapes it can
-  — HEVC + H.264 + AV1 coord/colour (8/10-bit where the codec supports it),
-  client-upscale, and surface-below-video — with AV1 verified on Arc/Lunar-Lake-
-  class encode; its only remaining gap is 4:4:4 (no D3D11 Video Processor path),
-  a hardware limit rather than a missing test. The macOS VideoToolbox/IOSurface
-  matrix is the next to broaden. Closing that is tracked separately; the runner
-  no longer assumes Linux is the reference.
+  every platform) but still need regular *hardware evidence* across vendors and
+  OS generations. Linux VAAPI/dma-buf remains the deepest matrix (4:4:4 + AV1
+  dma-buf, encoder-knob SKIP tests), and Linux NVIDIA now has NVDEC fixture →
+  production-render cells for the 4:2:0 decode surfaces it advertises. Windows
+  D3D11 render cells bind to Intel/QSV, AMD/AMF, and NVIDIA/NVENC adapters
+  explicitly, cover HEVC + H.264 + AV1 coord/colour (8/10-bit where the codec
+  supports it), and exercise 8/10-bit non-identity scaling; its only remaining
+  codec-shape gap is 4:4:4, a D3D11 Video Processor hardware limit rather than
+  a missing test. macOS VideoToolbox/IOSurface now has AV1 fixture-render cells
+  alongside HEVC, but the project still needs a repeatable M1/M2/M3/M4 evidence
+  table and real capture smoke tests before we can call the hardware suite
+  operationally excellent.
 - Releases: `.github/workflows/release.yml` on `v*` tags produces Tauri
   installers + a signed updater manifest (see `docs/RELEASING.md`).
 - Clippy is a blocking gate: `cargo clippy --workspace --all-targets -- -D

@@ -503,7 +503,7 @@ mod tests {
     /// covers the full frame. Catches binding-order regressions in
     /// [`crate::pipeline::build_pipeline`] too.
     #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_red_roundtrip() {
         let width = 64u32;
         let height = 32u32;
@@ -831,7 +831,7 @@ mod tests {
     /// `export_texture_as_dmabuf` to stand in for PipeWire as the
     /// producer.
     #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_via_imported_bgra() {
         let width = 32u32;
         let height = 32u32;
@@ -1036,7 +1036,7 @@ mod tests {
     /// production hits on HiDPI 2× displays and it's the exact width
     /// the end-to-end roundtrip-harness `repro_shape` cell uses.
     #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_reports_64_aligned_y_stride_at_unaligned_width() {
         let width = 2160u32;
         let height = 1440u32;

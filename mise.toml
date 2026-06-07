@@ -105,6 +105,34 @@ description = "All hardware tests for the current platform (codec + render + gpu
 depends = ["ffmpeg"]
 run = "cargo test --workspace --exclude tether-audio --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
 
+# Focused hardware sweeps by family. These mirror the top-level hardware sweep:
+# serial, no benchmark cells, and release-mode on macOS for the IOSurface/Metal
+# threshold-sensitive paths.
+[tasks.test-hw-codec]
+description = "Codec-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-codec --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+[tasks.test-hw-render]
+description = "Render-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-render --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+[tasks.test-hw-gpuconvert]
+description = "Gpuconvert-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-gpuconvert --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+[tasks.test-hw-scaler]
+description = "Scaler-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-scaler --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+[tasks.test-hw-probe]
+description = "Probe-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-probe --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
 # System-audio capture → Opus → playback round-trip for the current platform
 # (PipeWire monitor on Linux, ScreenCaptureKit on macOS, WASAPI loopback on
 # Windows). Separate from `test-hw` because it needs an audio output device
@@ -132,7 +160,14 @@ run = "cargo test -p tether-probe --lib print_host_supported_profiles -- --ignor
 [tasks.check]
 description = "Static workspace hygiene checks (no compile / no codegen)"
 shell = "sh -c"
-run = "scripts/check_test_support_gating.sh"
+run = [
+  "scripts/check_test_support_gating.sh",
+  "scripts/check_hardware_test_metadata.sh --strict --summary-only",
+]
+
+[tasks.hwtag-audit]
+description = "Audit #[ignore] hardware-test skip messages and print consistency report"
+run = "scripts/check_hardware_test_metadata.sh"
 
 [tasks.clippy]
 description = "Lint the workspace + shell, warnings-as-errors (CI gate)"
@@ -161,6 +196,7 @@ run = [
   "cargo fmt --all --check",
   "cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check",
   "scripts/check_test_support_gating.sh",
+  "scripts/check_hardware_test_metadata.sh --strict --summary-only",
   "cargo build --workspace --all-targets",
   "cargo test --workspace",
   "cargo clippy --workspace --all-targets -- -D warnings",

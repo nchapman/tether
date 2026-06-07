@@ -40,7 +40,7 @@ mod tests {
     /// Routes through vendor 0 → MF-only (`backends_for_vendor`), so it runs
     /// on any D3D11 GPU regardless of which vendor it is.
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows); exercises the Media Foundation fallback"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); exercises the Media Foundation fallback; run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_mf_keyframes_carry_inband_parameter_sets() {
         // (label, profile, codec, required in-band header types). For HEVC
         // and H.264 these are NAL unit types; for AV1, OBU types.
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_encoder_constructs_h264() {
         let enc = D3D11Encoder::new(
             h264_profile(),
@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_encoder_constructs_hevc() {
         let enc = D3D11Encoder::new(
             hevc_profile(),
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_encoder_shared_device_h264() {
         use windows::core::Interface;
         use windows::Win32::Foundation::HMODULE;
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_decoder_constructs_h264() {
         let dec = D3D11Decoder::new(CodecKind::H264, false);
         assert!(
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_decoder_constructs_hevc() {
         let dec = D3D11Decoder::new(CodecKind::Hevc, false);
         assert!(
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_h264_encode_decode_roundtrip() {
         let mut enc = D3D11Encoder::new(
             h264_profile(),
@@ -453,13 +453,13 @@ mod tests {
     /// the renderer-side Vulkan import is exercised by the client
     /// end-to-end. SKIPs on non-Intel GPUs (see the helper's vendor gate).
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11; run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_qsv_decode_exports_gpu_shared_handles() {
         gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", true, hevc_profile());
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_viewport_scale_encode_decode_roundtrip() {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_hevc_encode_decode_roundtrip() {
         let mut enc = D3D11Encoder::new(
             hevc_profile(),
@@ -632,7 +632,7 @@ mod tests {
     /// hangs `encode_bgra` on some drivers (observed on AMD RDNA 4). Skips on
     /// unknown-vendor GPUs (which would fall back to that MF path).
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU with HEVC Main10 (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU with HEVC Main10 (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_hevc_main10_encode_produces_packets() {
         use windows::core::Interface;
 
@@ -698,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_hevc_extradata_is_valid_annexb() {
         use crate::bitstream_sps::parse_sps_chroma_bit_depth;
         use tether_protocol::control::CodecKind;
@@ -763,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU with H.264 encode (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU with H.264 encode (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_h264_extradata_is_valid_annexb() {
         use crate::bitstream_sps::parse_sps_chroma_bit_depth;
         use tether_protocol::control::CodecKind;
@@ -831,7 +831,7 @@ mod tests {
     /// verify a frame comes back. This isolates whether the decoder
     /// can handle a single self-contained IDR (extradata + slice).
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_hevc_single_idr_decode() {
         let mut enc = D3D11Encoder::new(
             hevc_profile(),
@@ -922,7 +922,7 @@ mod tests {
     /// `d3d11_mf_keyframes_carry_inband_parameter_sets`), so there is no
     /// extradata ordering to check.
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU with HEVC encode (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_hevc_extradata_starts_with_vps() {
         use windows::core::Interface;
 
@@ -1385,7 +1385,7 @@ mod tests {
     /// QSV via the zero-copy GPU submit path. The vendor-agnostic tests
     /// pass `vendor_id=0` (→ MF), so this is the only coverage of QSV.
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11; run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_qsv_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_INTEL, "hevc_qsv", false, hevc_profile());
     }
@@ -1395,7 +1395,7 @@ mod tests {
     /// Arc. Asserts `av1_qsv` opened (not the `av1_mf` fallback). SKIPs on
     /// non-Intel GPUs via the helper's vendor gate.
     #[test]
-    #[ignore = "requires Intel Arc AV1 QSV (Windows) + FFmpeg oneVPL-over-D3D11"]
+    #[ignore = "requires Intel Arc AV1 QSV (Windows) + FFmpeg oneVPL-over-D3D11; run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_qsv_av1_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_INTEL, "av1_qsv", false, av1_profile());
     }
@@ -1403,7 +1403,7 @@ mod tests {
     /// AMF via the zero-copy GPU submit path — the only coverage of the
     /// AMD backend (dynamic hw_frames pool, async session, `async_depth=1`).
     #[test]
-    #[ignore = "requires AMD GPU with AMF (Windows)"]
+    #[ignore = "requires AMD GPU with AMF (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", false, hevc_profile());
     }
@@ -1413,7 +1413,7 @@ mod tests {
     /// Intel QSV, so the AMD H.264 encode path (`h264_amf`, distinct from
     /// the HEVC one) had no coverage at all.
     #[test]
-    #[ignore = "requires AMD GPU with AMF (Windows)"]
+    #[ignore = "requires AMD GPU with AMF (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_h264_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_AMD, "h264_amf", false, h264_profile());
     }
@@ -1427,7 +1427,7 @@ mod tests {
     /// representation, so the GPU shared-handle export is the only valid
     /// path (mirrors the host decode probe).
     #[test]
-    #[ignore = "requires AMD GPU with AMF HEVC Main10 (Windows)"]
+    #[ignore = "requires AMD GPU with AMF HEVC Main10 (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_hevc_main10_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_AMD, "hevc_amf", true, hevc_main10_profile());
     }
@@ -1440,7 +1440,7 @@ mod tests {
     /// so the production fallback needs its own coverage, not just `av1_amf`.
     /// Runs on any Windows GPU with an AV1 MF encoder + D3D11VA AV1 decode.
     #[test]
-    #[ignore = "requires Windows GPU with AV1 MF encode + D3D11VA AV1 decode"]
+    #[ignore = "requires Windows GPU with AV1 MF encode + D3D11VA AV1 decode; run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_av1_mf_encode_decode_roundtrip() {
         let mut enc = D3D11Encoder::new(
             av1_profile(),
@@ -1500,7 +1500,7 @@ mod tests {
     /// D3D11VA AV1 decode chain on AMD. Asserts `av1_amf` opened (not the
     /// `av1_mf` fallback), so a build missing the AV1 AMF encoder fails loud.
     #[test]
-    #[ignore = "requires AMD GPU with AMF AV1 (Windows, RDNA 3+)"]
+    #[ignore = "requires AMD GPU with AMF AV1 (Windows, RDNA 3+); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_av1_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_AMD, "av1_amf", false, av1_profile());
     }
@@ -1510,7 +1510,7 @@ mod tests {
     /// has no 8-bit CPU-download representation, so `gpu_export = true` is
     /// the only valid path (mirrors the Main10 HEVC test).
     #[test]
-    #[ignore = "requires AMD GPU with AMF AV1 10-bit (Windows, RDNA 3+)"]
+    #[ignore = "requires AMD GPU with AMF AV1 10-bit (Windows, RDNA 3+); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_av1_10bit_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_AMD, "av1_amf", true, av1_10bit_profile());
     }
@@ -1521,7 +1521,7 @@ mod tests {
     /// AV1-specific dict still yields a mid-stream keyframe — the load-
     /// bearing behaviour for loss recovery. Mirrors the HEVC forced-IDR test.
     #[test]
-    #[ignore = "requires AMD GPU with AMF AV1 (Windows, RDNA 3+)"]
+    #[ignore = "requires AMD GPU with AMF AV1 (Windows, RDNA 3+); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_av1_forced_idr_midstream_produces_keyframe() {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
@@ -1597,7 +1597,7 @@ mod tests {
     /// construction can fail the single-session limit. The host rebuilds the
     /// encoder on every viewport change, so this must hold.
     #[test]
-    #[ignore = "requires AMD GPU with AMF (Windows)"]
+    #[ignore = "requires AMD GPU with AMF (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_encoder_rebuild_same_device() {
         use windows::core::Interface;
 
@@ -1655,7 +1655,7 @@ mod tests {
     /// real `hevc_amf` encoder and asserts the stored extradata leads with
     /// VPS — covering the actual backend the fix was written for.
     #[test]
-    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows)"]
+    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_hevc_extradata_starts_with_vps() {
         use windows::core::Interface;
 
@@ -1704,7 +1704,7 @@ mod tests {
     /// forced submit after the stream is warm must yield a keyframe packet,
     /// not just at frame 0. If AMF ignored it, recovery would silently fail.
     #[test]
-    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows)"]
+    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_forced_idr_midstream_produces_keyframe() {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
@@ -1781,7 +1781,7 @@ mod tests {
     /// async_depth=1 ⇒ a frame or two; a double-digit count ⇒ the override
     /// didn't take. Records the negative per the codec-knob rule in CLAUDE.md.
     #[test]
-    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows)"]
+    #[ignore = "requires AMD GPU with AMF HEVC encode (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_amf_async_depth_one_bounds_output_delay() {
         use crate::D3D11TextureFrame;
         use windows::core::Interface;
@@ -1854,7 +1854,7 @@ mod tests {
     /// NVENC via the zero-copy GPU submit path — the only coverage of the
     /// NVIDIA backend (dynamic hw_frames pool, `delay=0` + `zerolatency`).
     #[test]
-    #[ignore = "requires NVIDIA GPU with NVENC (Windows)"]
+    #[ignore = "requires NVIDIA GPU with NVENC (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_nvenc_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "hevc_nvenc", false, hevc_profile());
     }
@@ -1863,7 +1863,7 @@ mod tests {
     /// NVENC round trip (Ada+ does AV1 in hardware). Asserts `av1_nvenc`
     /// opened, not the `av1_mf` fallback. SKIPs on non-NVIDIA GPUs.
     #[test]
-    #[ignore = "requires NVIDIA Ada+ GPU with AV1 NVENC (Windows)"]
+    #[ignore = "requires NVIDIA Ada+ GPU with AV1 NVENC (Windows); run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_nvenc_av1_gpu_encode_decode_roundtrip() {
         gpu_roundtrip_for_vendor(VENDOR_NVIDIA, "av1_nvenc", false, av1_profile());
     }
@@ -2020,7 +2020,7 @@ mod tests {
     /// GPU path: if this passes but `d3d11_qsv_gpu_encode_decode_roundtrip`
     /// fails, the bug is specifically the VP-blit-into-mapped-QSV-surface.
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11; run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_qsv_encode_bgra_roundtrip() {
         use windows::core::Interface;
 
@@ -2258,7 +2258,7 @@ mod tests {
     /// `DXGI_ERROR_INVALID_CALL`. The host recreates the encoder on every
     /// viewport change, so this must hold.
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + FFmpeg build with working oneVPL-over-D3D11; run with: cargo test -p tether-codec -- --ignored"]
     fn d3d11_qsv_encoder_rebuild_same_device() {
         use windows::core::Interface;
 

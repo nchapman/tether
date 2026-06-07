@@ -1022,7 +1022,7 @@ mod sck_tests {
     /// chroma / 10-bit results are the interesting ones to log.
     /// Triggers the ScreenRecording TCC prompt on first run.
     #[tokio::test]
-    #[ignore = "requires macOS + ScreenRecording permission"]
+    #[ignore = "requires macOS + ScreenRecording permission; run with: cargo test -p tether-capture -- --ignored"]
     async fn probe_capture_pixel_formats_reports_baseline() {
         let caps = probe_capture_pixel_formats()
             .await

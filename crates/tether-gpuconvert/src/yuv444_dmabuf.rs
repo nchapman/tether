@@ -434,7 +434,7 @@ mod tests {
     /// the right Y for solid white but the U/V channels would land in
     /// the wrong memory positions.
     #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_white_roundtrip_packed_xyuv() {
         let width = 64u32;
         let height = 32u32;
@@ -528,7 +528,7 @@ mod tests {
     /// chroma math and a U↔V swap. Asserts against the BT.709 limited-
     /// range spec directly (the compliant reference), not a round-trip.
     #[test]
-    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+    #[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_red_roundtrip_packed_xyuv() {
         let width = 64u32;
         let height = 32u32;

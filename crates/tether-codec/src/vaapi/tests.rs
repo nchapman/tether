@@ -19,7 +19,7 @@ use super::{VaapiDecoder, VaapiEncoder};
 /// drivers where the retune is silently ignored — currently the case
 /// on Intel iHD Meteor Lake.
 #[test]
-#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_set_bitrate_live_continues_to_encode)"]
+#[ignore = "requires a working VAAPI device; run with: cargo test -p tether-codec -- --ignored"]
 fn vaapi_set_bitrate_live_continues_to_encode() {
     let w = 640;
     let h = 480;
@@ -71,7 +71,7 @@ fn vaapi_set_bitrate_live_continues_to_encode() {
 }
 
 #[test]
-#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi)"]
+#[ignore = "requires a working VAAPI device; run with: cargo test -p tether-codec -- --ignored"]
 fn vaapi_encoder_smoke() {
     let w = 640;
     let h = 480;
@@ -102,7 +102,7 @@ fn vaapi_encoder_smoke() {
 /// ones this change newly pins). 10-bit is covered by the probe's P010
 /// dma-buf round trip, not the BGRA path here.
 #[test]
-#[ignore = "requires a working VAAPI device"]
+#[ignore = "requires a working VAAPI device; run with: cargo test -p tether-codec -- --ignored"]
 fn vaapi_encoder_pins_explicit_profile() {
     use crate::bitstream_sps::parse_sps_chroma_bit_depth;
     use tether_protocol::control::{CodecKind, VideoProfile};
@@ -160,7 +160,7 @@ fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi)"]
+#[ignore = "requires a working VAAPI device; run with: cargo test -p tether-codec -- --ignored"]
 fn vaapi_decoder_smoke() {
     // Feed the committed 320×240 Annex-B fixture (the LGPL FFmpeg has no
     // software encoder to make one on the fly), then verify the VAAPI
@@ -232,7 +232,7 @@ fn vaapi_decoder_smoke() {
 /// inside ffmpeg's hwcontext_vaapi. The decoder input is the committed
 /// 320×240 fixture (no software encoder in the LGPL build).
 #[test]
-#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_encoder_dmabuf_import)"]
+#[ignore = "requires a working VAAPI device; run with: cargo test -p tether-codec -- --ignored"]
 fn vaapi_encoder_dmabuf_import() {
     // The fixture's dimensions, the VAAPI decoder (implicit — picks
     // them up from the SPS), and the VAAPI encoder built below must all
@@ -302,7 +302,7 @@ fn vaapi_encoder_dmabuf_import() {
 }
 
 #[test]
-#[ignore = "requires VAAPI HEVC Main444 (Intel Tiger Lake+ / AMD VCN3+)"]
+#[ignore = "requires VAAPI HEVC Main444 (Intel Tiger Lake+ / AMD VCN3+); run with: cargo test -p tether-codec -- --ignored"]
 fn hevc_main444_encoder_constructs() {
     // The desktop-quality top rung. If this fails on a known-good
     // box, the negotiator silently downgrades sessions to 4:2:0 and
@@ -350,7 +350,7 @@ fn hevc_main444_encoder_constructs() {
 /// "does the pipeline run end-to-end?", not chroma fidelity (that's
 /// covered by gpuconvert's own packed-XYUV round-trip test).
 #[test]
-#[ignore = "requires VAAPI HEVC Main444 + Vulkan DMA-BUF export"]
+#[ignore = "requires VAAPI HEVC Main444 + Vulkan DMA-BUF export; run with: cargo test -p tether-codec -- --ignored"]
 fn hevc_main444_dmabuf_roundtrip() {
     use crate::{DmaBufFrame, DmaBufLayer, DmaBufObject};
     use tether_gpuconvert::Yuv444DmaBuf;
@@ -511,7 +511,7 @@ fn hevc_main444_dmabuf_roundtrip() {
 /// 6. The decoded surface is exportable as a DMA-BUF (catches the
 ///    symmetric ffmpeg gap on the decode side).
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Vulkan DMA-BUF export + Rgb10a2Unorm storage"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Vulkan DMA-BUF export + Rgb10a2Unorm storage; run with: cargo test -p tether-codec -- --ignored"]
 fn hevc_main444_10bit_xv30_dmabuf_roundtrip() {
     use crate::build_xv30_dmabuf_frame;
     use tether_gpuconvert::Bgra2Xv30DmaBuf;
@@ -651,7 +651,7 @@ fn hevc_main444_10bit_xv30_dmabuf_roundtrip() {
 /// blind. The test exists as the green-light gate for any future
 /// driver/wrapper combination that does plumb live retune through.
 #[test]
-#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_bitrate_retune_changes_bitstream_size)"]
+#[ignore = "requires a working VAAPI device; run with: cargo test -p tether-codec -- --ignored"]
 fn vaapi_bitrate_retune_changes_bitstream_size() {
     use tether_protocol::control::VideoProfile;
 
@@ -805,7 +805,7 @@ fn h264_nal_types(annex_b: &[u8]) -> Vec<u8> {
 /// (property 1) and the bitstream stays decodable (property 3) is
 /// the load-bearing verification.
 #[test]
-#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_intra_refresh_round_trip)"]
+#[ignore = "requires a working VAAPI device; run with: cargo test -p tether-codec -- --ignored"]
 fn vaapi_intra_refresh_round_trip() {
     use tether_protocol::control::VideoProfile;
 
@@ -993,7 +993,7 @@ fn encode_with_env_and_measure(
 /// writing — the generic AVCodecContext.qmin handler is wired
 /// independent of the encoder-specific gradual-refresh gap.
 #[test]
-#[ignore = "requires a working VAAPI device (run on hardware with: cargo test -p tether-codec --ignored vaapi_min_qp_floor_reduces_bitstream)"]
+#[ignore = "requires a working VAAPI device; run with: cargo test -p tether-codec -- --ignored"]
 fn vaapi_min_qp_floor_reduces_bitstream() {
     const W: u32 = 640;
     const H: u32 = 480;
@@ -1081,7 +1081,7 @@ fn vaapi_min_qp_floor_reduces_bitstream() {
 /// 6. The decoded surface exports as DMA-BUF with the expected NV12
 ///    layer shape (Y as R8, UV as GR88, two layers).
 #[test]
-#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA 3) + VAAPI AV1 decode + Vulkan DMA-BUF export"]
+#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA 3) + VAAPI AV1 decode + Vulkan DMA-BUF export; run with: cargo test -p tether-codec -- --ignored"]
 fn av1_main_dmabuf_roundtrip() {
     use crate::{DmaBufFrame, DmaBufLayer, DmaBufObject};
     use tether_gpuconvert::Nv12DmaBuf;

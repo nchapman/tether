@@ -312,7 +312,7 @@ mod tests {
     /// construction loudly rather than crash at
     /// `create_compute_pipeline`.
     #[test]
-    #[ignore = "requires a working Vulkan adapter advertising VK_EXT_image_drm_format_modifier"]
+    #[ignore = "requires a working Vulkan adapter advertising VK_EXT_image_drm_format_modifier; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn storable_probe_returns_linear_for_r16_and_gr32() {
         let r16 = u32::from_le_bytes(*b"R16 ");
         let gr32 = u32::from_le_bytes(*b"GR32");
@@ -343,7 +343,7 @@ mod tests {
     /// Intel iHD per the same driver-gap CLAUDE.md documents for the
     /// other 10-bit paths.
     #[test]
-    #[ignore = "requires a working Vulkan adapter advertising VK_EXT_image_drm_format_modifier; may SKIP on Intel iHD"]
+    #[ignore = "requires a working Vulkan adapter advertising VK_EXT_image_drm_format_modifier; may SKIP on Intel iHD; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn storable_probe_returns_linear_for_xv30() {
         let xv30 = u32::from_le_bytes(*b"XV30");
         let xv30_mods =

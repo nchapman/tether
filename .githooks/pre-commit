@@ -4,8 +4,8 @@
 # `mise run hooks` (sets core.hooksPath to .githooks).
 #
 # Deliberately excludes the slow gates (build, test, clippy) — those run in CI
-# and via `mise run ci`. This hook is just rustfmt + the test-support gating check,
-# so it stays sub-second and never needs the FFmpeg toolchain.
+# and via `mise run ci`. This hook is just rustfmt + static metadata gates, so
+# it stays sub-second and never needs the FFmpeg toolchain.
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -31,4 +31,9 @@ if ! gating_out=$(scripts/check_test_support_gating.sh 2>&1); then
   fail "test-support gating violation" "fix the violation reported above"
 fi
 
-printf '\033[36m[pre-commit] fmt + gating OK\033[0m\n' >&2
+if ! hwtag_out=$(scripts/check_hardware_test_metadata.sh --strict --summary-only 2>&1); then
+  printf '%s\n' "${hwtag_out}" >&2
+  fail "hardware-test metadata violation" "fix the violation reported above"
+fi
+
+printf '\033[36m[pre-commit] fmt + static gates OK\033[0m\n' >&2

@@ -41,7 +41,7 @@ fn make_test_bgra(width: u32, height: u32, t: u32) -> Vec<u8> {
 /// 4:2:2 Main42210), and the chroma-survival probe rejects HEVC 4:4:4
 /// encode on Apple Silicon, so there is no stable profile id to assert.
 #[test]
-#[ignore = "requires macOS + VideoToolbox"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored"]
 fn videotoolbox_encoder_pins_explicit_profile() {
     use crate::bitstream_sps::parse_sps_chroma_bit_depth;
 
@@ -102,7 +102,7 @@ fn videotoolbox_encoder_pins_explicit_profile() {
 /// VideoToolbox and the encoder keeps producing decodable packets
 /// afterwards. The ABR controller relies on this property.
 #[test]
-#[ignore = "requires macOS + VideoToolbox (run on Apple Silicon / Intel mac with: cargo test -p tether-codec --ignored videotoolbox_set_bitrate_live_continues_to_encode)"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored"]
 fn videotoolbox_set_bitrate_live_continues_to_encode() {
     let w = 640;
     let h = 480;
@@ -141,7 +141,7 @@ fn videotoolbox_set_bitrate_live_continues_to_encode() {
 }
 
 #[test]
-#[ignore = "requires macOS + VideoToolbox (run on Apple Silicon / Intel mac with: cargo test -p tether-codec --ignored videotoolbox)"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored"]
 fn videotoolbox_encoder_smoke() {
     let w = 640;
     let h = 480;
@@ -167,7 +167,7 @@ fn videotoolbox_encoder_smoke() {
 }
 
 #[test]
-#[ignore = "requires macOS + VideoToolbox"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored"]
 fn videotoolbox_hevc_constructs() {
     // HEVC availability is closer to universal on Apple Silicon than
     // on the H.264 path on Intel/AMD VAAPI, but the failure mode is
@@ -183,7 +183,7 @@ fn videotoolbox_hevc_constructs() {
 }
 
 #[test]
-#[ignore = "requires macOS + VideoToolbox"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored"]
 fn videotoolbox_keyframes_carry_extradata() {
     // Every keyframe must be self-decodable: clients that join
     // mid-session, rebuild their decoder, or lose the session's first
@@ -263,7 +263,7 @@ fn videotoolbox_keyframes_carry_extradata() {
 }
 
 #[test]
-#[ignore = "requires macOS + VideoToolbox"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored"]
 fn videotoolbox_decoder_constructs() {
     // Symmetric with `videotoolbox_hevc_constructs` on the encoder
     // side: confirms FFmpeg's `--enable-videotoolbox` build path is
@@ -296,7 +296,7 @@ fn videotoolbox_decoder_constructs() {
 /// Run on real macOS hardware with:
 /// `cargo test -p tether-codec --lib videotoolbox_round_trip -- --ignored --nocapture`.
 #[test]
-#[ignore = "requires macOS + VideoToolbox (run with: cargo test -p tether-codec --ignored videotoolbox_round_trip)"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored videotoolbox_round_trip"]
 fn videotoolbox_round_trip() {
     // NV12 fourccs the IOSurface may carry (matches what the renderer
     // accepts in `tether-render/src/gpu/metal.rs`).
@@ -422,7 +422,7 @@ fn videotoolbox_round_trip() {
 /// Here we keep just the round-trip + fourcc-family invariants that
 /// don't need the probe layer.)
 #[test]
-#[ignore = "requires macOS + VideoToolbox"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored"]
 fn videotoolbox_round_trip_chroma_matrix() {
     const W: u32 = 128;
     const H: u32 = 128;
@@ -577,7 +577,7 @@ fn expected_iosurface_fourccs_for(profile: VideoProfile) -> &'static [u32] {
 /// a frame from the next IDR alone, which only works if that IDR
 /// packet carries its own SPS/PPS prefix.
 #[test]
-#[ignore = "requires macOS + VideoToolbox"]
+#[ignore = "requires macOS + VideoToolbox; run with: cargo test -p tether-codec -- --ignored"]
 fn videotoolbox_decoder_recovers_from_mid_session_idr() {
     for kind in [CodecKind::H264, CodecKind::Hevc] {
         let w = 320;

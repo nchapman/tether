@@ -8,6 +8,7 @@
 
 pub mod decoder;
 pub mod encoder;
+mod nvenc_caps;
 #[cfg(test)]
 mod tests;
 mod video_processor;

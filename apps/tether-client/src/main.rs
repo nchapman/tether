@@ -82,6 +82,96 @@ fn ns_to_ms(ns: u64, samples: u64) -> f64 {
     }
 }
 
+#[derive(Default)]
+struct DecodeEventWindow {
+    latency_sum_ns: u64,
+    latency_min_ns: u64,
+    latency_max_ns: u64,
+    decode_errors: u32,
+    render_drops: u32,
+    idr_requests: u32,
+    queue_drops: u32,
+    stale_epoch_drops: u32,
+    epoch_throttle_drops: u32,
+    completion_count: u64,
+}
+
+impl DecodeEventWindow {
+    fn record_completion(&mut self, c: tether_decode::DecodeCompletion) {
+        self.completion_count = self.completion_count.saturating_add(1);
+        self.latency_sum_ns = self.latency_sum_ns.saturating_add(c.decode_duration_ns);
+        if self.completion_count == 1 {
+            self.latency_min_ns = c.decode_duration_ns;
+        } else {
+            self.latency_min_ns = self.latency_min_ns.min(c.decode_duration_ns);
+        }
+        self.latency_max_ns = self.latency_max_ns.max(c.decode_duration_ns);
+        if c.decode_err || c.soft_failure {
+            self.decode_errors = self.decode_errors.saturating_add(1);
+        }
+        self.render_drops = self.render_drops.saturating_add(c.render_drops);
+        if c.idr_request_fired {
+            self.idr_requests = self.idr_requests.saturating_add(1);
+        }
+    }
+
+    fn record_epoch_drop(&mut self, reason: EpochDropReason) {
+        match reason {
+            EpochDropReason::Stale => {
+                self.stale_epoch_drops = self.stale_epoch_drops.saturating_add(1);
+            }
+            EpochDropReason::RebuildRateLimited => {
+                self.epoch_throttle_drops = self.epoch_throttle_drops.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn drain_decode_events(
+    rx: &crossbeam_channel::Receiver<DecodeEvent>,
+    summary: &SessionSummaryState,
+    mut window: Option<&mut DecodeEventWindow>,
+) {
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            DecodeEvent::Completion(c) => {
+                if c.decode_err || c.soft_failure {
+                    summary.video.decode_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                summary
+                    .video
+                    .render_drop_frames
+                    .fetch_add(u64::from(c.render_drops), Ordering::Relaxed);
+                if c.idr_request_fired {
+                    summary.video.idr_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(w) = window.as_deref_mut() {
+                    w.record_completion(c);
+                }
+            }
+            DecodeEvent::EpochDrop { reason, .. } => {
+                match reason {
+                    EpochDropReason::Stale => {
+                        summary
+                            .video
+                            .decode_stale_epoch_drop_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    EpochDropReason::RebuildRateLimited => {
+                        summary
+                            .video
+                            .decode_epoch_throttle_drop_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if let Some(w) = window.as_deref_mut() {
+                    w.record_epoch_drop(reason);
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     // Parse args first so `--ipc` routes tracing off stdout (reserved for
@@ -352,6 +442,8 @@ async fn main() -> anyhow::Result<()> {
     // viewport task sends SetViewportHint before StreamReady.
     let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
     let (decoder_ready_for_startup_tx, decoder_ready_for_startup_rx) = watch::channel(false);
+    let (decode_event_tx, decode_event_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
+    let decode_event_rx = Arc::new(decode_event_rx);
 
     // Receive-side control loop. Today the host doesn't initiate any
     // typed messages we need to act on, but the Extension escape and
@@ -412,6 +504,7 @@ async fn main() -> anyhow::Result<()> {
         let cursor_channel_ctrl = cursor_channel.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
+        let decode_event_rx = decode_event_rx.clone();
         let clock_sync_state = clock_sync_state.clone();
         let clock_resync_state = clock_resync_state.clone();
         tokio::spawn(async move {
@@ -514,6 +607,7 @@ async fn main() -> anyhow::Result<()> {
                             GoodbyeCode::Clean,
                             &session_summary,
                             &shutdown_notice_sent,
+                            Some(&decode_event_rx),
                         )
                         .await;
                         return;
@@ -533,6 +627,7 @@ async fn main() -> anyhow::Result<()> {
                             GoodbyeCode::ProtocolError,
                             &session_summary,
                             &shutdown_notice_sent,
+                            Some(&decode_event_rx),
                         )
                         .await;
                         return;
@@ -661,8 +756,6 @@ async fn main() -> anyhow::Result<()> {
     // recv loop drops frames at the channel rather than blocking on
     // the await.
     let (decode_job_tx, decode_job_rx) = bounded::<DecodeJob>(8);
-    let (decode_completion_tx, decode_completion_rx) =
-        crossbeam_channel::unbounded::<DecodeEvent>();
     // Oneshot from the decode thread back to the recv task: lets the
     // recv loop wait for decoder construction before announcing
     // StreamReady to the host. If the decoder fails to build, the
@@ -694,7 +787,7 @@ async fn main() -> anyhow::Result<()> {
     tether_decode::run_thread(
         decode_profile,
         decode_job_rx,
-        decode_completion_tx,
+        decode_event_tx,
         frames_for_decode,
         request_idr,
         warnings,
@@ -713,6 +806,7 @@ async fn main() -> anyhow::Result<()> {
     let conn_for_recovery_send = conn.clone();
     let session_summary_for_recv = session_summary.clone();
     let shutdown_notice_for_recv = shutdown_notice_sent.clone();
+    let decode_event_rx_for_recv = decode_event_rx.clone();
     tokio::spawn(async move {
         let mut reassembler = FrameReassembler::new();
         if decoder_ready_rx.await.is_err() {
@@ -733,6 +827,7 @@ async fn main() -> anyhow::Result<()> {
                 GoodbyeCode::InternalError,
                 &session_summary_for_recv,
                 &shutdown_notice_for_recv,
+                Some(&decode_event_rx_for_recv),
             )
             .await;
             return;
@@ -767,14 +862,6 @@ async fn main() -> anyhow::Result<()> {
         // of drops collapses into a single recovery action — same
         // cadence the decoder thread's auto-IDR uses.
         let mut last_request_recovery_at: Option<MonoNanos> = None;
-        // Sum of decode call wall-clocks across the frames in the
-        // current log window, surfaced as avg_decode_ms on the
-        // frame-stats line. Same shape as the host's avg_encode_ms
-        // metric so the two together show where pipeline time is
-        // going.
-        let mut decode_latency_sum_ns: u64 = 0;
-        let mut decode_latency_min_ns: u64 = 0;
-        let mut decode_latency_max_ns: u64 = 0;
         // Sum of capture-to-recv ages over the window. The previous
         // implementation logged the last frame's age which is
         // misleading when the metric is supposed to summarise a
@@ -794,36 +881,13 @@ async fn main() -> anyhow::Result<()> {
         // reassembly). With matching host kbps_out, a divergence
         // means packets are being dropped between host and client.
         let mut bytes_received: u64 = 0;
-        // Decode failures in the window. Steady non-zero values
-        // mean we're losing IDR/SPS/PPS frames or the bitstream is
-        // getting corrupted between encode and decode.
-        let mut decode_errors: u32 = 0;
-        // Frames the decoder produced but displaced before the
-        // renderer could pick them up (LatestFrame is single-slot
-        // drop-oldest). Non-zero means the render thread isn't
-        // keeping up with arrival rate — typically a wgpu/present
-        // pacing issue, not a codec issue.
-        let mut render_drops: u32 = 0;
-        // ForceIdr control messages we sent in the window. Pairs
-        // with the host's kf_per_s — if these match, the storm of
-        // keyframes on the host is *our* fault, not the encoder
-        // misbehaving.
-        let mut idr_requests: u32 = 0;
-        // Frames the recv loop reassembled but couldn't enqueue for
-        // decode because the bounded channel was full. Non-zero means
-        // the decoder is falling behind the network — a strong signal
-        // to drop quality or alert the user.
-        let mut decode_queue_drops: u32 = 0;
-        // Frames intentionally discarded by the decode thread before submit
-        // because their stream epoch was unsafe for the current decoder.
-        let mut decode_stale_epoch_drops: u32 = 0;
-        let mut decode_epoch_throttle_drops: u32 = 0;
-        // Decode completions folded into the current stats window.
-        // Used as the divisor for avg_decode_ms so the metric stays
-        // honest when frame_count (recv-side) and completions drift
-        // under backpressure.
-        let mut decode_completion_count: u64 = 0;
+        // Decode-side events folded into the current stats window. Decode
+        // completions drive avg/min/max decode latency; epoch drops are tracked
+        // separately so they explain missing completions without skewing timing.
+        let mut decode_window = DecodeEventWindow::default();
         let mut last_log = Instant::now();
+        let mut decode_event_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        decode_event_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Cursor datagram observability — separate cadence so a
         // chatty cursor channel doesn't bury the video stats line.
         let mut cursor_pos_packets: u64 = 0;
@@ -834,7 +898,18 @@ async fn main() -> anyhow::Result<()> {
             // unreliable datagram channel and feeds the same reassembler; there
             // is no separate reliable keyframe stream to race. Cursor and audio
             // datagrams share the channel and are dispatched out here.
-            let packet: VideoPacket = match conn_recv.recv_datagram().await {
+            let datagram = tokio::select! {
+                result = conn_recv.recv_datagram() => result,
+                _ = decode_event_tick.tick() => {
+                    drain_decode_events(
+                        &decode_event_rx_for_recv,
+                        &session_summary_for_recv,
+                        Some(&mut decode_window),
+                    );
+                    continue;
+                }
+            };
+            let packet: VideoPacket = match datagram {
                 Ok(Datagram::Video(p)) => p,
                 Ok(Datagram::HostCursor(hc)) => {
                     // Position datagrams ride latest-wins; the overlay's render
@@ -893,13 +968,23 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 Err(e) => {
-                    // Promoted from warn → error: this is terminal for the video
-                    // stream and the user otherwise sees a frozen last-frame with
-                    // no indication anything broke. Also close the connection
-                    // explicitly so the host learns about it instead of waiting
-                    // for the idle timeout.
-                    error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
-                    conn_recv.close(1, b"recv failed");
+                    drain_decode_events(
+                        &decode_event_rx_for_recv,
+                        &session_summary_for_recv,
+                        Some(&mut decode_window),
+                    );
+                    if shutdown_notice_for_recv.load(Ordering::Acquire)
+                        || e.is_clean_shutdown_recv()
+                    {
+                        info!(error = ?e, "datagram recv ended during clean shutdown");
+                    } else {
+                        // This is terminal for the video stream and the user
+                        // otherwise sees a frozen last-frame with no indication
+                        // anything broke. Also close explicitly so the host
+                        // learns about it instead of waiting for idle timeout.
+                        error!(error = ?e, "datagram recv failed; closing connection and ending recv loop");
+                        conn_recv.close(1, b"recv failed");
+                    }
                     break;
                 }
             };
@@ -1034,7 +1119,7 @@ async fn main() -> anyhow::Result<()> {
                 stream_epoch: frame.stream_epoch,
             };
             if decode_job_tx.try_send(job).is_err() {
-                decode_queue_drops = decode_queue_drops.saturating_add(1);
+                decode_window.queue_drops = decode_window.queue_drops.saturating_add(1);
                 session_summary_for_recv
                     .video
                     .decode_queue_drop_frames
@@ -1046,57 +1131,11 @@ async fn main() -> anyhow::Result<()> {
             // produced anything yet, we'll pick it up next time
             // round. Folds per-frame metrics into the stats window
             // the recv loop owns.
-            while let Ok(event) = decode_completion_rx.try_recv() {
-                match event {
-                    DecodeEvent::Completion(c) => {
-                        decode_completion_count = decode_completion_count.saturating_add(1);
-                        decode_latency_sum_ns =
-                            decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
-                        if decode_completion_count == 1 {
-                            decode_latency_min_ns = c.decode_duration_ns;
-                        } else {
-                            decode_latency_min_ns = decode_latency_min_ns.min(c.decode_duration_ns);
-                        }
-                        decode_latency_max_ns = decode_latency_max_ns.max(c.decode_duration_ns);
-                        if c.decode_err || c.soft_failure {
-                            decode_errors = decode_errors.saturating_add(1);
-                            session_summary_for_recv
-                                .video
-                                .decode_errors
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        render_drops = render_drops.saturating_add(c.render_drops);
-                        session_summary_for_recv
-                            .video
-                            .render_drop_frames
-                            .fetch_add(u64::from(c.render_drops), Ordering::Relaxed);
-                        if c.idr_request_fired {
-                            idr_requests = idr_requests.saturating_add(1);
-                            session_summary_for_recv
-                                .video
-                                .idr_requests
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    DecodeEvent::EpochDrop { reason, .. } => match reason {
-                        EpochDropReason::Stale => {
-                            decode_stale_epoch_drops = decode_stale_epoch_drops.saturating_add(1);
-                            session_summary_for_recv
-                                .video
-                                .decode_stale_epoch_drop_frames
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        EpochDropReason::RebuildRateLimited => {
-                            decode_epoch_throttle_drops =
-                                decode_epoch_throttle_drops.saturating_add(1);
-                            session_summary_for_recv
-                                .video
-                                .decode_epoch_throttle_drop_frames
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    },
-                }
-            }
+            drain_decode_events(
+                &decode_event_rx_for_recv,
+                &session_summary_for_recv,
+                Some(&mut decode_window),
+            );
 
             if last_log.elapsed() >= std::time::Duration::from_secs(1) {
                 let window_secs = last_log.elapsed().as_secs_f64();
@@ -1153,13 +1192,16 @@ async fn main() -> anyhow::Result<()> {
                 // completions lag). Dividing by frame_count would
                 // understate decode time exactly when it matters.
                 #[allow(clippy::cast_precision_loss)] // u64 well under 2^53
-                let avg_decode_ms = if decode_completion_count > 0 {
-                    (decode_latency_sum_ns as f64 / decode_completion_count as f64) / 1_000_000.0
+                let avg_decode_ms = if decode_window.completion_count > 0 {
+                    (decode_window.latency_sum_ns as f64 / decode_window.completion_count as f64)
+                        / 1_000_000.0
                 } else {
                     0.0
                 };
-                let min_decode_ms = ns_to_ms(decode_latency_min_ns, decode_completion_count);
-                let max_decode_ms = ns_to_ms(decode_latency_max_ns, decode_completion_count);
+                let min_decode_ms =
+                    ns_to_ms(decode_window.latency_min_ns, decode_window.completion_count);
+                let max_decode_ms =
+                    ns_to_ms(decode_window.latency_max_ns, decode_window.completion_count);
                 #[allow(clippy::cast_precision_loss)]
                 let avg_latency_ms = if frame_count > 0 {
                     (latency_sum_ns as f64 / frame_count as f64) / 1_000_000.0
@@ -1201,20 +1243,17 @@ async fn main() -> anyhow::Result<()> {
                     min_decode_ms,
                     max_decode_ms,
                     kbps_in,
-                    decode_errors,
-                    render_drop_frames = render_drops,
-                    idr_requests,
-                    decode_queue_drop_frames = decode_queue_drops,
-                    decode_stale_epoch_drop_frames = decode_stale_epoch_drops,
-                    decode_epoch_throttle_drop_frames = decode_epoch_throttle_drops,
+                    decode_errors = decode_window.decode_errors,
+                    render_drop_frames = decode_window.render_drops,
+                    idr_requests = decode_window.idr_requests,
+                    decode_queue_drop_frames = decode_window.queue_drops,
+                    decode_stale_epoch_drop_frames = decode_window.stale_epoch_drops,
+                    decode_epoch_throttle_drop_frames = decode_window.epoch_throttle_drops,
                     fec_recovered_frames,
                     fec_recovered_fragments,
                     "frame stats"
                 );
                 frame_count = 0;
-                decode_latency_sum_ns = 0;
-                decode_latency_min_ns = 0;
-                decode_latency_max_ns = 0;
                 latency_sum_ns = 0;
                 latency_min_ns = 0;
                 latency_max_ns = 0;
@@ -1222,13 +1261,7 @@ async fn main() -> anyhow::Result<()> {
                 network_latency_min_ns = 0;
                 network_latency_max_ns = 0;
                 bytes_received = 0;
-                decode_errors = 0;
-                render_drops = 0;
-                idr_requests = 0;
-                decode_queue_drops = 0;
-                decode_stale_epoch_drops = 0;
-                decode_epoch_throttle_drops = 0;
-                decode_completion_count = 0;
+                decode_window = DecodeEventWindow::default();
                 last_log = Instant::now();
             }
         }
@@ -1428,6 +1461,7 @@ async fn main() -> anyhow::Result<()> {
         let conn = conn.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
+        let decode_event_rx = decode_event_rx.clone();
         tokio::spawn(async move {
             if let Err(e) = tokio::signal::ctrl_c().await {
                 warn!(error = %e, "ctrl-c handler failed; exiting anyway");
@@ -1442,6 +1476,7 @@ async fn main() -> anyhow::Result<()> {
                 "client interrupted",
                 &session_summary,
                 &shutdown_notice_sent,
+                Some(&decode_event_rx),
             )
             .await;
             std::process::exit(0);
@@ -1457,6 +1492,7 @@ async fn main() -> anyhow::Result<()> {
         let conn = conn.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
+        let decode_event_rx = decode_event_rx.clone();
         tokio::spawn(async move {
             wait_for_stdin_stop().await;
             info!("shell stop received; sending Goodbye and exiting");
@@ -1468,6 +1504,7 @@ async fn main() -> anyhow::Result<()> {
                 "client stopped",
                 &session_summary,
                 &shutdown_notice_sent,
+                Some(&decode_event_rx),
             )
             .await;
             std::process::exit(0);
@@ -1503,6 +1540,7 @@ async fn main() -> anyhow::Result<()> {
         "client closing",
         &session_summary,
         &shutdown_notice_sent,
+        Some(&decode_event_rx),
     )
     .await;
 
@@ -1576,8 +1614,17 @@ async fn say_goodbye(
     reason: &str,
     summary: &SessionSummaryState,
     sent: &AtomicBool,
+    decode_events: Option<&crossbeam_channel::Receiver<DecodeEvent>>,
 ) {
-    say_goodbye_once(conn, reason, GoodbyeCode::Clean, summary, sent).await;
+    say_goodbye_once(
+        conn,
+        reason,
+        GoodbyeCode::Clean,
+        summary,
+        sent,
+        decode_events,
+    )
+    .await;
 }
 
 /// Send local final stats once and close the connection. The `sent` guard
@@ -1589,11 +1636,12 @@ async fn say_goodbye_once(
     code: GoodbyeCode,
     summary: &SessionSummaryState,
     sent: &AtomicBool,
+    decode_events: Option<&crossbeam_channel::Receiver<DecodeEvent>>,
 ) {
     if sent.swap(true, Ordering::AcqRel) {
         return;
     }
-    say_goodbye_with_code(conn, reason, code, summary).await;
+    say_goodbye_with_code(conn, reason, code, summary, decode_events).await;
 }
 
 /// Variant that lets the caller signal *why* the session ended.
@@ -1605,8 +1653,12 @@ async fn say_goodbye_with_code(
     reason: &str,
     code: GoodbyeCode,
     summary: &SessionSummaryState,
+    decode_events: Option<&crossbeam_channel::Receiver<DecodeEvent>>,
 ) {
     use std::time::Duration;
+    if let Some(rx) = decode_events {
+        drain_decode_events(rx, summary, None);
+    }
     let msg = ControlMessage::Goodbye {
         reason: reason.to_string(),
         code,

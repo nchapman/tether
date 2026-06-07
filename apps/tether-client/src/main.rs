@@ -14,7 +14,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -53,6 +53,27 @@ const CLOCK_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 struct ClockResyncState {
     pending: Vec<MonoNanos>,
     samples: Vec<ClockSync>,
+}
+
+fn lock_clock_resync(state: &Mutex<ClockResyncState>) -> MutexGuard<'_, ClockResyncState> {
+    state.lock().unwrap_or_else(|poisoned| {
+        warn!("clock resync lock poisoned; recovering pending probe state");
+        poisoned.into_inner()
+    })
+}
+
+fn read_clock_sync(state: &RwLock<ClockSync>) -> RwLockReadGuard<'_, ClockSync> {
+    state.read().unwrap_or_else(|poisoned| {
+        warn!("clock sync read lock poisoned; recovering last sample");
+        poisoned.into_inner()
+    })
+}
+
+fn write_clock_sync(state: &RwLock<ClockSync>) -> RwLockWriteGuard<'_, ClockSync> {
+    state.write().unwrap_or_else(|poisoned| {
+        warn!("clock sync write lock poisoned; recovering last sample");
+        poisoned.into_inner()
+    })
 }
 
 /// Whether a `FrameReassembler::handle()` loss-counter delta warrants a
@@ -404,7 +425,8 @@ async fn main() -> anyhow::Result<()> {
                 ConnectError::ProfileNotAdvertised { .. }
                 | ConnectError::UnknownBitDepth(_, _)
                 | ConnectError::HandshakeRejected { .. }
-                | ConnectError::PeerGoodbyeDuringClockProbe { .. } => anyhow::anyhow!("{e}"),
+                | ConnectError::PeerGoodbyeDuringClockProbe { .. }
+                | ConnectError::ClockProbeIgnoredMessageLimit { .. } => anyhow::anyhow!("{e}"),
                 ConnectError::Transport(t) => anyhow::Error::from(t),
             };
             reporter.emit(&EngineEvent::Error {
@@ -472,9 +494,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 ticker.tick().await;
                 {
-                    let mut state = clock_resync_state
-                        .lock()
-                        .expect("clock resync lock poisoned");
+                    let mut state = lock_clock_resync(&clock_resync_state);
                     if !state.pending.is_empty() {
                         warn!(
                             pending = state.pending.len(),
@@ -491,18 +511,14 @@ async fn main() -> anyhow::Result<()> {
                 for _ in 0..CLOCK_SYNC_PROBE_SAMPLES {
                     let t0 = MonoNanos::now();
                     {
-                        let mut state = clock_resync_state
-                            .lock()
-                            .expect("clock resync lock poisoned");
+                        let mut state = lock_clock_resync(&clock_resync_state);
                         state.pending.push(t0);
                     }
                     if let Err(e) = conn
                         .send_control(&ControlMessage::ClockProbeRequest { t0_sender: t0 })
                         .await
                     {
-                        let mut state = clock_resync_state
-                            .lock()
-                            .expect("clock resync lock poisoned");
+                        let mut state = lock_clock_resync(&clock_resync_state);
                         state.pending.clear();
                         state.samples.clear();
                         warn!(error = ?e, "clock resync probe send failed; ending resync task");
@@ -555,9 +571,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(ControlMessage::ClockProbeResponse(probe)) => {
                         let selected = {
-                            let mut state = clock_resync_state
-                                .lock()
-                                .expect("clock resync lock poisoned");
+                            let mut state = lock_clock_resync(&clock_resync_state);
                             let Some(pos) =
                                 state.pending.iter().position(|t0| *t0 == probe.t0_sender)
                             else {
@@ -585,9 +599,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                         };
                         if let Some((selected, min_rtt, max_rtt)) = selected {
-                            let previous =
-                                *clock_sync_state.read().expect("clock sync lock poisoned");
-                            *clock_sync_state.write().expect("clock sync lock poisoned") = selected;
+                            let previous = *read_clock_sync(&clock_sync_state);
+                            *write_clock_sync(&clock_sync_state) = selected;
                             let offset_delta_us = ((i128::from(selected.offset_nanos)
                                 - i128::from(previous.offset_nanos))
                                 / 1_000)
@@ -1090,7 +1103,7 @@ async fn main() -> anyhow::Result<()> {
             // difference between them and `now` decomposes
             // total latency into capture-to-send (host
             // pipeline) and send-to-recv (network + reassembly).
-            let current_clock_sync = *recv_clock_sync.read().expect("clock sync lock poisoned");
+            let current_clock_sync = *read_clock_sync(&recv_clock_sync);
             let host_in_client_clock =
                 current_clock_sync.remote_to_local(frame.meta.timing.t_capture_userspace);
             let send_in_client_clock = current_clock_sync.remote_to_local(frame.meta.timing.t_send);
@@ -2286,5 +2299,47 @@ mod arg_tests {
             rx.try_recv().is_err(),
             "queued resize events should be drained"
         );
+    }
+
+    #[test]
+    fn clock_resync_lock_recovers_from_poisoned_state() {
+        let state = Arc::new(Mutex::new(ClockResyncState::default()));
+        let poisoned = state.clone();
+        let _ = std::thread::spawn(move || {
+            let mut state = poisoned.lock().unwrap();
+            state.pending.push(MonoNanos(7));
+            panic!("poison clock resync state");
+        })
+        .join();
+
+        let mut recovered = lock_clock_resync(&state);
+        assert_eq!(recovered.pending, vec![MonoNanos(7)]);
+        recovered.samples.push(ClockSync {
+            offset_nanos: 1,
+            rtt_nanos: 2,
+            sampled_at_local: MonoNanos(3),
+        });
+        assert_eq!(recovered.samples.len(), 1);
+    }
+
+    #[test]
+    fn clock_sync_lock_recovers_from_poisoned_state() {
+        let initial = ClockSync {
+            offset_nanos: 0,
+            rtt_nanos: 1,
+            sampled_at_local: MonoNanos(2),
+        };
+        let state = Arc::new(RwLock::new(initial));
+        let poisoned = state.clone();
+        let _ = std::thread::spawn(move || {
+            let mut state = poisoned.write().unwrap();
+            state.offset_nanos = 42;
+            panic!("poison clock sync state");
+        })
+        .join();
+
+        assert_eq!(read_clock_sync(&state).offset_nanos, 42);
+        write_clock_sync(&state).rtt_nanos = 99;
+        assert_eq!(read_clock_sync(&state).rtt_nanos, 99);
     }
 }

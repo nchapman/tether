@@ -22,19 +22,20 @@ mod tests {
     /// backend (see `backends_for_vendor`).
     const VENDOR_INTEL: u32 = 0x8086;
 
-    /// Media Foundation encoders (`*_mf`, the unknown-vendor fallback)
-    /// never populate `AVCodecContext::extradata`, so `snapshot_extradata`
-    /// must NOT hard-fail construction for them (the bug that turned all 12
-    /// MF-path tests red on the static FFmpeg build). They keep the
-    /// self-decodable-IDR invariant a different way — parameter sets ride
-    /// in-band on *every* keyframe (including mid-stream forced IDRs), so
-    /// each IDR decodes standalone with no prepend:
+    /// Media Foundation encoders (`*_mf`, the unknown-vendor fallback) must
+    /// keep the self-decodable-IDR invariant: parameter sets ride in-band on
+    /// *every* keyframe (including mid-stream forced IDRs), so each IDR
+    /// decodes standalone with no extradata prepend:
     ///   - HEVC: VPS (32) + SPS (33) + PPS (34) NAL units
     ///   - H.264: SPS (7) + PPS (8) NAL units
     ///   - AV1: a sequence-header OBU (type 1)
     ///
-    /// This pins both facts for all three MF codecs: empty extradata at
-    /// open, and the in-band headers on each keyframe.
+    /// This is the load-bearing fact the test pins. Whether the encoder also
+    /// populates `extradata` at open is MFT-implementation-specific — the
+    /// generic Intel MF MFT leaves it empty, but the system HEVC MFT backed
+    /// by AMD's driver populates it (~93 bytes). Either is fine as long as the
+    /// keyframes self-decode, so we don't assert emptiness (doing so made the
+    /// test fail on AMD); we just log what the MFT chose.
     ///
     /// Routes through vendor 0 → MF-only (`backends_for_vendor`), so it runs
     /// on any D3D11 GPU regardless of which vendor it is.
@@ -62,11 +63,11 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("{label}: construction must succeed, got {e:?}"));
 
-            // MF leaves extradata empty — that's expected, not a failure.
-            assert!(
-                enc.extradata().is_empty(),
-                "{label}: MF is expected to leave extradata empty (parameter \
-                 sets ride in-band); got {} bytes",
+            // Extradata population is MFT-specific (Intel MF: empty; AMD's
+            // system MFT: ~93 bytes). Not a correctness signal — the in-band
+            // keyframe check below is. Log it for triage, don't assert on it.
+            eprintln!(
+                "{label}: extradata at open = {} bytes",
                 enc.extradata().len()
             );
 
@@ -1122,36 +1123,50 @@ mod tests {
         }
     }
 
-    /// Create a video device, returning it only if an AMD GPU is present;
-    /// otherwise print a SKIP diagnostic and return `None`. AMF-specific
-    /// tests must gate on the real vendor *before* constructing the encoder:
-    /// `D3D11Encoder::new(.., VENDOR_AMD)` on non-AMD hardware faults inside
-    /// a foreign vendor runtime (STATUS_ACCESS_VIOLATION), not a catchable
-    /// error. Binds to the AMD adapter itself (see `video_device_for_vendor`)
-    /// so a box where AMD isn't the default adapter still runs these.
+    /// Bind a video device to the GPU of `vendor_id`, or print a SKIP
+    /// diagnostic and return `None` when that vendor is absent / unusable.
+    /// Vendor-specific encoder tests MUST gate on the real vendor *before*
+    /// `D3D11Encoder::new(.., vendor_id)`: constructing a vendor's encoder on
+    /// a foreign vendor's device faults inside that runtime
+    /// (STATUS_ACCESS_VIOLATION, uncatchable), which aborts the whole test
+    /// binary — exactly what was happening to the QSV tests on an AMD box.
+    /// Binds to the requested vendor's adapter (not the default one) so a box
+    /// where it isn't the display adapter still runs the test.
+    fn vendor_video_device_or_skip(
+        vendor_id: u32,
+        vendor_name: &str,
+        test: &str,
+    ) -> Option<(
+        windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    )> {
+        match video_device_for_vendor(vendor_id) {
+            VendorVideoDevice::Ready(dev) => Some(dev),
+            VendorVideoDevice::Absent => {
+                eprintln!(
+                    "SKIP {test}: no {vendor_name} GPU (0x{vendor_id:04x}) present; \
+                     run on matching hardware"
+                );
+                None
+            }
+            VendorVideoDevice::Unusable(e) => {
+                eprintln!(
+                    "SKIP {test}: {vendor_name} GPU (0x{vendor_id:04x}) present but \
+                     D3D11CreateDevice (UNKNOWN driver, VIDEO_SUPPORT) failed: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    /// AMD convenience wrapper over `vendor_video_device_or_skip`.
     fn amd_video_device_or_skip(
         test: &str,
     ) -> Option<(
         windows::Win32::Graphics::Direct3D11::ID3D11Device,
         windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     )> {
-        match video_device_for_vendor(VENDOR_AMD) {
-            VendorVideoDevice::Ready(dev) => Some(dev),
-            VendorVideoDevice::Absent => {
-                eprintln!(
-                    "SKIP {test}: no AMD GPU (0x{VENDOR_AMD:04x}) present; \
-                     run on an AMF-capable AMD GPU"
-                );
-                None
-            }
-            VendorVideoDevice::Unusable(e) => {
-                eprintln!(
-                    "SKIP {test}: AMD GPU (0x{VENDOR_AMD:04x}) present but \
-                     D3D11CreateDevice (UNKNOWN driver, VIDEO_SUPPORT) failed: {e}"
-                );
-                None
-            }
-        }
+        vendor_video_device_or_skip(VENDOR_AMD, "AMD", test)
     }
 
     /// Allocate a mid-grey BGRA `ID3D11Texture2D` to feed the zero-copy
@@ -1883,7 +1898,15 @@ mod tests {
         let encode_w = 1440u32;
         let encode_h = 896u32;
 
-        let (device, context) = create_video_device();
+        // QSV diagnostic — bind to the Intel adapter or SKIP (constructing QSV
+        // on a non-Intel device faults uncatchably and aborts the binary).
+        let Some((device, context)) = vendor_video_device_or_skip(
+            VENDOR_INTEL,
+            "Intel",
+            "d3d11_qsv_submit_under_capture_contention",
+        ) else {
+            return;
+        };
 
         let make_bgra = |w: u32, h: u32| -> ID3D11Texture2D {
             let data = vec![128u8; (w * h * 4) as usize];
@@ -2001,7 +2024,13 @@ mod tests {
     fn d3d11_qsv_encode_bgra_roundtrip() {
         use windows::core::Interface;
 
-        let (device, context) = create_video_device();
+        // Bind to the Intel adapter; SKIP (not crash) on a non-Intel box —
+        // QSV construction on a foreign vendor's device faults uncatchably.
+        let Some((device, context)) =
+            vendor_video_device_or_skip(VENDOR_INTEL, "Intel", "d3d11_qsv_encode_bgra_roundtrip")
+        else {
+            return;
+        };
         let mut enc = D3D11Encoder::new(
             hevc_profile(),
             TEST_WIDTH,
@@ -2233,7 +2262,13 @@ mod tests {
     fn d3d11_qsv_encoder_rebuild_same_device() {
         use windows::core::Interface;
 
-        let (device, context) = create_video_device();
+        let Some((device, context)) = vendor_video_device_or_skip(
+            VENDOR_INTEL,
+            "Intel",
+            "d3d11_qsv_encoder_rebuild_same_device",
+        ) else {
+            return;
+        };
         let dev_ptr = device.as_raw() as *mut _;
         let ctx_ptr = context.as_raw() as *mut _;
 

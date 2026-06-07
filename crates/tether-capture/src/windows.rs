@@ -828,18 +828,44 @@ mod tests {
     #[test]
     #[ignore = "requires Windows desktop session + DXGI Desktop Duplication with visible desktop updates; run with: cargo test -p tether-capture -- --ignored"]
     fn dxgi_capture_start_delivers_one_bgra_texture() {
+        // Anchor `MonoNanos`' lazily-initialised process-start epoch before
+        // capture begins (same reason as `sck_capture_start_delivers_one_frame`
+        // on macOS): the epoch is set on the first `now()` call ever made in
+        // the process, so a stamp that happens to be that first call reads
+        // exactly 0 — a real value indistinguishable from "unpopulated".
+        let before = MonoNanos::now();
         let pre = pre_create().expect("pre-create DXGI Desktop Duplication");
         let (handle, shared_device) = start_with(pre).expect("start DXGI capture");
         let rx = handle.into_rx();
         let frame = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("receive first non-idle DXGI frame within 10s");
+        let after = MonoNanos::now();
 
         assert!(frame.width() > 0, "captured frame width must be non-zero");
         assert!(frame.height() > 0, "captured frame height must be non-zero");
         let (t_kernel, t_userspace) = frame.timestamps();
-        assert!(t_kernel.0 > 0, "kernel timestamp should be populated");
-        assert!(t_userspace.0 > 0, "userspace timestamp should be populated");
+        assert!(
+            t_userspace >= before && t_userspace <= after,
+            "userspace timestamp should be stamped during capture \
+             (before={before:?}, after={after:?}, got {t_userspace:?})"
+        );
+        // The kernel stamp is DXGI's `LastPresentTime` (a QPC value) mapped
+        // into the `MonoNanos` domain by `qpc_to_mono_nanos`. It can
+        // legitimately be 0: DXGI reports `LastPresentTime == 0` when the
+        // present time is unavailable (we then fall back to the userspace
+        // stamp), and a present that predates the process-start epoch clamps
+        // to 0 via `saturating_sub`. So `> 0` is a flaky assertion; the robust
+        // invariant is that the present happened at or before we observed the
+        // frame in userspace. This holds because `LastPresentTime` necessarily
+        // predates `AcquireNextFrame` returning (a full vsync interval before
+        // `t_userspace` is stamped), which dwarfs the sub-microsecond gap
+        // between that stamp and `qpc_to_mono_nanos`'s own internal `now()`.
+        assert!(
+            t_kernel <= t_userspace,
+            "kernel present time must be at or before the userspace capture stamp \
+             (kernel={t_kernel:?}, userspace={t_userspace:?})"
+        );
 
         let CapturedFrame::Gpu(gpu) = frame else {
             panic!("DXGI Desktop Duplication should deliver GPU D3D11 texture frames");
@@ -851,9 +877,7 @@ mod tests {
             native_damage,
             ..
         } = gpu;
-        let tex = match source {
-            GpuCapturedSource::D3D11Texture(tex) => tex,
-        };
+        let GpuCapturedSource::D3D11Texture(tex) = source;
         assert_eq!(tex.width, width);
         assert_eq!(tex.height, height);
         assert_eq!(tex.format, DXGI_FORMAT_B8G8R8A8_UNORM);

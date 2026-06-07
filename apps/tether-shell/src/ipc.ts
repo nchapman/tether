@@ -4,6 +4,12 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+type InvokeArgs = Record<string, unknown>;
+
+function invokeVoid(command: string, args?: InvokeArgs): Promise<void> {
+  return invoke(command, args).then(() => undefined);
+}
+
 /// One saved computer, mirroring `known_hosts::SavedHost` on the Rust side.
 export type SavedHost = {
   addr: string;
@@ -47,10 +53,10 @@ export type ShellPrefs = {
 export const listKnownHosts = () => invoke<SavedHost[]>("list_known_hosts");
 
 export const renameKnownHost = (addr: string, label: string) =>
-  invoke<void>("rename_known_host", { addr, label });
+  invokeVoid("rename_known_host", { addr, label });
 
 export const forgetKnownHost = (addr: string) =>
-  invoke<void>("forget_known_host", { addr });
+  invokeVoid("forget_known_host", { addr });
 
 /// Connect to a host. A `pin` means first-contact pairing; without one the
 /// client reconnects via the host fingerprint it pinned last time.
@@ -58,23 +64,23 @@ export const connectClient = (args: {
   addr: string;
   pin?: string | null;
   label?: string | null;
-}) => invoke<void>("connect_client", args);
+}) => invokeVoid("connect_client", args);
 
-export const disconnectClient = () => invoke<void>("stop_engine", { role: "client" });
+export const disconnectClient = () => invokeVoid("stop_engine", { role: "client" });
 
 // --- Host / sharing ----------------------------------------------------------
 
-export const startHost = () => invoke<void>("start_host");
+export const startHost = () => invokeVoid("start_host");
 
-export const stopHost = () => invoke<void>("stop_engine", { role: "host" });
+export const stopHost = () => invokeVoid("stop_engine", { role: "host" });
 
 export const startPairing = (label: string) =>
-  invoke<void>("start_pairing", { label });
+  invokeVoid("start_pairing", { label });
 
 export const revokePeer = (fingerprint: string) =>
-  invoke<void>("revoke_peer", { fingerprint });
+  invokeVoid("revoke_peer", { fingerprint });
 
-export const listPeers = () => invoke<void>("list_peers");
+export const listPeers = () => invokeVoid("list_peers");
 
 // --- Preferences -------------------------------------------------------------
 
@@ -84,13 +90,13 @@ export const getPrefs = () => invoke<ShellPrefs>("get_prefs");
 
 // --- Window chrome -----------------------------------------------------------
 
-export const hideWindow = () => invoke<void>("hide_window");
-export const showWindow = () => invoke<void>("show_window");
+export const hideWindow = () => invokeVoid("hide_window");
+export const showWindow = () => invokeVoid("show_window");
 
 // --- Updates -----------------------------------------------------------------
 
 export const checkForUpdates = () => invoke<string | null>("check_for_updates");
-export const installUpdate = () => invoke<void>("install_update");
+export const installUpdate = () => invokeVoid("install_update");
 
 // --- Helpers -----------------------------------------------------------------
 
@@ -140,12 +146,12 @@ function relativeTime(thenMs: number, nowMs: number): string {
   const sec = Math.max(0, Math.round((nowMs - thenMs) / 1000));
   if (sec < 45) return "just now";
   const min = Math.round(sec / 60);
-  if (min < 60) return `${min}m ago`;
+  if (min < 60) return `${String(min)}m ago`;
   const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr}h ago`;
+  if (hr < 24) return `${String(hr)}h ago`;
   const day = Math.round(hr / 24);
   if (day === 1) return "yesterday";
-  if (day < 7) return `${day}d ago`;
+  if (day < 7) return `${String(day)}d ago`;
   // Older than a week: a calendar date reads better than "37d ago".
   return new Date(thenMs).toLocaleDateString(undefined, {
     month: "short",

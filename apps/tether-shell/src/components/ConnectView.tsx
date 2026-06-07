@@ -1,9 +1,8 @@
 import { useState } from "react";
 import type { SavedHost } from "../ipc";
-import { recencyLabel } from "../ipc";
 import type { ClientState, RowError } from "../state";
-import { OverflowMenu } from "./OverflowMenu";
 import { PlusIcon, SettingsIcon, MonitorIcon } from "../icons";
+import { HostRow } from "./HostRow";
 
 // The address book: the Connect window's home screen. Single-click a row's
 // name region to reconnect (pinned-cert resume); Rename/Forget/Copy live in a
@@ -79,17 +78,7 @@ export function ConnectView({
       </header>
 
       {hosts.length === 0 ? (
-        <div className="empty">
-          <MonitorIcon size={40} className="empty-glyph" />
-          <p className="empty-title">No computers yet.</p>
-          <p className="empty-sub">Add one to connect.</p>
-          <button className="btn primary" onClick={onAdd}>
-            <PlusIcon size={15} /> Add a computer
-          </button>
-          <p className="empty-hint">
-            You'll need its address and a pairing PIN from that computer.
-          </p>
-        </div>
+        <EmptyHosts onAdd={onAdd} />
       ) : (
         <ul className="host-list" onKeyDown={onListKeyDown}>
           {hosts.map((host) => (
@@ -117,113 +106,54 @@ export function ConnectView({
       )}
 
       {client.kind === "connected" && (
-        <div className="session-bar">
-          <span className="dot on" />
-          <span className="session-text">
-            Streaming{client.profile ? ` ${client.profile}` : ""} ·{" "}
-            {hostLabel(hosts, client.addr)}
-          </span>
-          <button className="btn ghost sm" onClick={onDisconnect}>
-            Disconnect
-          </button>
-        </div>
+        <SessionBar
+          profile={client.profile}
+          hostLabel={hostLabel(hosts, client.addr)}
+          onDisconnect={onDisconnect}
+        />
       )}
+    </div>
+  );
+}
+
+function EmptyHosts({ onAdd }: { onAdd: () => void }) {
+  return (
+    <div className="empty">
+      <MonitorIcon size={40} className="empty-glyph" />
+      <p className="empty-title">No computers yet.</p>
+      <p className="empty-sub">Add one to connect.</p>
+      <button className="btn primary" onClick={onAdd}>
+        <PlusIcon size={15} /> Add a computer
+      </button>
+      <p className="empty-hint">
+        You'll need its address and a pairing PIN from that computer.
+      </p>
+    </div>
+  );
+}
+
+function SessionBar({
+  profile,
+  hostLabel,
+  onDisconnect,
+}: {
+  profile: string;
+  hostLabel: string;
+  onDisconnect: () => void;
+}) {
+  return (
+    <div className="session-bar">
+      <span className="dot on" />
+      <span className="session-text">
+        Streaming{profile ? ` ${profile}` : ""} · {hostLabel}
+      </span>
+      <button className="btn ghost sm" onClick={onDisconnect}>
+        Disconnect
+      </button>
     </div>
   );
 }
 
 function hostLabel(hosts: SavedHost[], addr: string): string {
   return hosts.find((h) => h.addr === addr)?.label ?? addr;
-}
-
-function HostRow({
-  host,
-  editing,
-  connecting,
-  connected,
-  disabled,
-  error,
-  onConnect,
-  onStartRename,
-  onCancelRename,
-  onCommitRename,
-  onForget,
-  onCopyAddress,
-  onPairAgain,
-}: {
-  host: SavedHost;
-  editing: boolean;
-  connecting: boolean;
-  connected: boolean;
-  disabled: boolean;
-  error?: RowError;
-  onConnect: () => void;
-  onStartRename: () => void;
-  onCancelRename: () => void;
-  onCommitRename: (label: string) => void;
-  onForget: () => void;
-  onCopyAddress: () => void;
-  onPairAgain: () => void;
-}) {
-  // Seeded once from the prop; rows are keyed by addr so this instance is
-  // stable across refreshes. (If a background refresh while editing is ever
-  // added, reset the draft when host.label changes.)
-  const [draft, setDraft] = useState(host.label);
-
-  if (editing) {
-    return (
-      <li className="host-row editing">
-        <input
-          className="rename-input"
-          autoFocus
-          value={draft}
-          onChange={(e) => setDraft(e.currentTarget.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") onCommitRename(draft.trim());
-            if (e.key === "Escape") onCancelRename();
-          }}
-          onBlur={() => onCommitRename(draft.trim())}
-        />
-      </li>
-    );
-  }
-
-  return (
-    <li className={"host-row" + (connected ? " active" : "")}>
-      <div className="host-row-line">
-        <button
-          className="host-main"
-          disabled={disabled}
-          onClick={onConnect}
-          title={`Connect to ${host.label}`}
-        >
-          <span className={"row-dot" + (connecting ? " connecting" : connected ? " on" : "")} />
-          <span className="row-text">
-            <span className="row-name">{host.label}</span>
-            <span className="row-sub mono">
-              {host.addr} · {connecting ? "connecting…" : recencyLabel(host)}
-            </span>
-          </span>
-        </button>
-        <OverflowMenu
-          label={`Actions for ${host.label}`}
-          actions={[
-            { label: "Rename", onSelect: onStartRename },
-            { label: "Copy address", onSelect: onCopyAddress },
-            { label: "Forget", onSelect: onForget, danger: true },
-          ]}
-        />
-      </div>
-      {error && (
-        <p className="row-error">
-          <span>{error.message}</span>
-          {error.pairAgain && (
-            <button className="link-btn" onClick={onPairAgain}>
-              Pair again
-            </button>
-          )}
-        </p>
-      )}
-    </li>
-  );
 }

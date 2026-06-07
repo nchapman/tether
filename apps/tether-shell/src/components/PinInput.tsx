@@ -70,7 +70,7 @@ export function PinInput({
           maxLength={1}
           disabled={disabled}
           value={value[i] ?? ""}
-          aria-label={`Digit ${i + 1}`}
+          aria-label={`Digit ${String(i + 1)}`}
           onChange={(e) => setDigit(i, e.currentTarget.value.replace(/\D/g, "").slice(-1))}
           onKeyDown={(e) => onKeyDown(i, e)}
           onPaste={(e) => onPaste(i, e)}

@@ -23,7 +23,10 @@ export function ConfirmDialog({
   // would re-run it every parent render (e.g. a PIN countdown ticking) and yank
   // focus back to the confirm button each time.
   const handlers = useRef({ onConfirm, onCancel });
-  handlers.current = { onConfirm, onCancel };
+
+  useEffect(() => {
+    handlers.current = { onConfirm, onCancel };
+  }, [onConfirm, onCancel]);
 
   useEffect(() => {
     confirmRef.current?.focus();

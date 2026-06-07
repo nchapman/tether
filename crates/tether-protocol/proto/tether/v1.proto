@@ -297,6 +297,8 @@ message VideoSessionStats {
   uint64 max_frame_bytes = 18;
   uint64 max_keyframe_bytes = 19;
   uint64 forced_idr_misses = 20;
+  uint64 decode_stale_epoch_drop_frames = 21;
+  uint64 decode_epoch_throttle_drop_frames = 22;
 }
 
 message AudioSessionStats {

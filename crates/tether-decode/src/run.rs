@@ -104,6 +104,20 @@ pub struct DecodeCompletion {
     pub recovery: Option<RecoveryAction>,
 }
 
+/// Message emitted by the decode thread to the recv loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeEvent {
+    /// A job reached [`Worker::process_job`]; fold into decode latency and
+    /// recovery stats.
+    Completion(DecodeCompletion),
+    /// A reassembled frame was intentionally discarded before decode because
+    /// its stream epoch could not be submitted to the current decoder.
+    EpochDrop {
+        reason: EpochDropReason,
+        stream_epoch: u32,
+    },
+}
+
 /// What the worker is asking the run-thread to do beyond the
 /// per-job rate-limited `request_idr` callback. Carried back inside
 /// [`DecodeCompletion::recovery`] so the loop can branch on it
@@ -128,10 +142,20 @@ pub enum EpochAction {
     Decode,
     /// Epoch advanced — rebuild the decoder, then decode this (new-epoch) frame.
     Rebuild,
-    /// Drop without decoding: either an older-epoch straggler (would corrupt
-    /// the new-resolution decoder) or a new-epoch frame arriving inside the
-    /// [`EPOCH_REBUILD_MIN_INTERVAL`] rebuild rate-limit window.
-    Drop,
+    /// Drop without decoding. Carries the reason so stats can distinguish a
+    /// harmless late straggler from resize/reconfigure churn.
+    Drop(EpochDropReason),
+}
+
+/// Why an epoch-classified job was dropped before decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochDropReason {
+    /// Older than the decoder epoch high-water mark; typically a late FEC
+    /// completion from before a resize/reconfigure.
+    Stale,
+    /// Newer than the decoder epoch, but arrived inside
+    /// [`EPOCH_REBUILD_MIN_INTERVAL`]; dropped to bound hardware-context churn.
+    RebuildRateLimited,
 }
 
 /// Per-thread mutable state plus its injected dependencies.
@@ -258,13 +282,13 @@ impl Worker {
                 {
                     // Too soon after the last rebuild — drop without latching so
                     // a later frame still rebuilds to the newest epoch.
-                    return EpochAction::Drop;
+                    return EpochAction::Drop(EpochDropReason::RebuildRateLimited);
                 }
                 // Latching deferred to `confirm_epoch_rebuilt` (after success).
                 EpochAction::Rebuild
             }
             // `epoch` older than the high-water mark: a late straggler.
-            Some(_) => EpochAction::Drop,
+            Some(_) => EpochAction::Drop(EpochDropReason::Stale),
         }
     }
 
@@ -594,7 +618,7 @@ impl Worker {
 pub fn run_thread(
     profile: VideoProfile,
     job_rx: XbReceiver<DecodeJob>,
-    completion_tx: XbSender<DecodeCompletion>,
+    completion_tx: XbSender<DecodeEvent>,
     frames: LatestFrame,
     request_idr: Arc<dyn Fn() + Send + Sync + 'static>,
     warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static>,
@@ -626,7 +650,7 @@ pub fn run_thread_with_init(
     profile: VideoProfile,
     decoder_init: Result<Box<dyn tether_codec::Decoder>, CodecError>,
     job_rx: XbReceiver<DecodeJob>,
-    completion_tx: XbSender<DecodeCompletion>,
+    completion_tx: XbSender<DecodeEvent>,
     frames: LatestFrame,
     request_idr: Arc<dyn Fn() + Send + Sync + 'static>,
     warnings: Arc<dyn Fn() -> u64 + Send + Sync + 'static>,
@@ -698,13 +722,17 @@ pub fn run_thread_with_init(
                             break;
                         }
                     },
-                    EpochAction::Drop => {
+                    EpochAction::Drop(reason) => {
                         // Old-epoch straggler, or a new-epoch frame inside the
                         // rebuild rate-limit window. Don't feed it to the
-                        // decoder. We send NO completion: the recv loop drains
-                        // completions best-effort (not 1:1 with jobs) and sums
-                        // every one into avg/min decode latency, so a
-                        // zero-duration entry would skew those metrics.
+                        // decoder and don't emit a DecodeCompletion, because
+                        // completions are the avg/min/max decode-latency
+                        // divisor. Emit a separate event so live stats still
+                        // explain why recv frames did not become decode work.
+                        let _ = completion_tx.send(DecodeEvent::EpochDrop {
+                            reason,
+                            stream_epoch: job.stream_epoch,
+                        });
                         continue;
                     }
                 }
@@ -714,7 +742,7 @@ pub fn run_thread_with_init(
                 // Send completion. If the recv loop has exited, the
                 // receiver is dropped — that's expected at session
                 // end; ignore.
-                let _ = completion_tx.send(completion);
+                let _ = completion_tx.send(DecodeEvent::Completion(completion));
 
                 if matches!(recovery, Some(RecoveryAction::Rebuild)) {
                     if rebuilds_used >= REBUILD_BUDGET {

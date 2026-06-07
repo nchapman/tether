@@ -17,7 +17,9 @@ use std::time::Duration;
 use tether_codec::bytes::Bytes;
 use tether_codec::CodecError;
 use tether_decode::test_support::{FakeDecoder, FakeOutcome};
-use tether_decode::{run_thread_with_init, DecodeCompletion, DecodeJob, Worker, IDR_RATE_LIMIT};
+use tether_decode::{
+    run_thread_with_init, DecodeEvent, DecodeJob, EpochDropReason, Worker, IDR_RATE_LIMIT,
+};
 use tether_protocol::MonoNanos;
 use tether_render::LatestFrame;
 
@@ -281,7 +283,7 @@ async fn init_failure_drops_ready_tx_without_send() {
     // decoder construction; a `Err` here triggers session teardown
     // (a clean Goodbye rather than a silent hang).
     let (job_tx, job_rx) = crossbeam_channel::bounded::<DecodeJob>(1);
-    let (completion_tx, _completion_rx) = crossbeam_channel::unbounded::<DecodeCompletion>();
+    let (completion_tx, _completion_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let (frames, _idr_calls, request_idr, warnings) = lifecycle_callbacks();
 
@@ -321,7 +323,7 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
     // it into LatestFrame; completion stream reports success; thread
     // exits when the job sender drops.
     let (job_tx, job_rx) = crossbeam_channel::bounded::<DecodeJob>(4);
-    let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<DecodeCompletion>();
+    let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let (frames, _idr_calls, request_idr, warnings) = lifecycle_callbacks();
 
@@ -356,6 +358,9 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
     .await
     .unwrap()
     .expect("completion");
+    let DecodeEvent::Completion(completion) = completion else {
+        panic!("expected DecodeEvent::Completion, got {completion:?}");
+    };
     assert!(!completion.decode_err);
     assert!(!completion.soft_failure);
 
@@ -364,6 +369,80 @@ async fn happy_path_thread_runs_jobs_and_exits_on_sender_drop() {
         tether_render::Frame::Cpu(c) => assert_eq!(c.y[0], 0xab),
         _ => panic!("expected Cpu frame"),
     }
+
+    drop(job_tx);
+    let joined = tokio::task::spawn_blocking(move || handle.join())
+        .await
+        .unwrap();
+    joined.expect("decode thread exits on sender drop");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn epoch_rate_limited_drop_is_reported_without_decode_completion() {
+    // The recv-loop stats rely on epoch drops arriving as distinct events, not
+    // fake zero-duration DecodeCompletions that would skew avg/min decode time.
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<DecodeJob>(4);
+    let (completion_tx, completion_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (frames, _idr_calls, request_idr, warnings) = lifecycle_callbacks();
+
+    let decoder: Box<dyn tether_codec::Decoder> = Box::new(FakeDecoder::new(vec![
+        FakeOutcome::Frames(vec![small_solid(8, 8, 0xab)]),
+    ]));
+    let handle = run_thread_with_init(
+        VideoProfile::H264_8BIT_420,
+        Ok(decoder),
+        job_rx,
+        completion_tx,
+        frames,
+        request_idr,
+        warnings,
+        ready_tx,
+        false,
+    );
+
+    ready_rx.await.expect("ready signal");
+    job_tx
+        .send(DecodeJob {
+            body: Bytes::from_static(b"epoch-0"),
+            host_in_client_clock: MonoNanos::now(),
+            keyframe: true,
+            stream_epoch: 0,
+        })
+        .unwrap();
+    let first = tokio::task::spawn_blocking({
+        let completion_rx = completion_rx.clone();
+        move || completion_rx.recv_timeout(std::time::Duration::from_secs(2))
+    })
+    .await
+    .unwrap()
+    .expect("first completion");
+    assert!(
+        matches!(first, DecodeEvent::Completion(_)),
+        "baseline epoch should decode, got {first:?}"
+    );
+
+    job_tx
+        .send(DecodeJob {
+            body: Bytes::from_static(b"epoch-1"),
+            host_in_client_clock: MonoNanos::now(),
+            keyframe: true,
+            stream_epoch: 1,
+        })
+        .unwrap();
+    let second = tokio::task::spawn_blocking(move || {
+        completion_rx.recv_timeout(std::time::Duration::from_secs(2))
+    })
+    .await
+    .unwrap()
+    .expect("epoch drop event");
+    assert_eq!(
+        second,
+        DecodeEvent::EpochDrop {
+            reason: EpochDropReason::RebuildRateLimited,
+            stream_epoch: 1,
+        }
+    );
 
     drop(job_tx);
     let joined = tokio::task::spawn_blocking(move || handle.join())
@@ -542,7 +621,7 @@ fn classify_epoch_advances_rebuild_drops_stragglers_and_rate_limits() {
     // A late straggler from the OLD epoch must be dropped, not decoded.
     assert_eq!(
         worker.classify_epoch(0, t1),
-        EpochAction::Drop,
+        EpochAction::Drop(EpochDropReason::Stale),
         "older-epoch straggler is dropped"
     );
 
@@ -550,7 +629,7 @@ fn classify_epoch_advances_rebuild_drops_stragglers_and_rate_limits() {
     // and must NOT latch — a later frame still rebuilds to the newest epoch.
     assert_eq!(
         worker.classify_epoch(2, t1),
-        EpochAction::Drop,
+        EpochAction::Drop(EpochDropReason::RebuildRateLimited),
         "advance within the rate-limit window is dropped"
     );
     // Once the window since the last (confirmed) rebuild at `t1` passes, the

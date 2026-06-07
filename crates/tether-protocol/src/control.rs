@@ -560,6 +560,8 @@ pub struct VideoSessionStats {
     pub max_frame_bytes: u64,
     pub max_keyframe_bytes: u64,
     pub forced_idr_misses: u64,
+    pub decode_stale_epoch_drop_frames: u64,
+    pub decode_epoch_throttle_drop_frames: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1304,6 +1306,8 @@ fn video_session_stats_to_pb(value: VideoSessionStats) -> pb::VideoSessionStats 
         max_frame_bytes: value.max_frame_bytes,
         max_keyframe_bytes: value.max_keyframe_bytes,
         forced_idr_misses: value.forced_idr_misses,
+        decode_stale_epoch_drop_frames: value.decode_stale_epoch_drop_frames,
+        decode_epoch_throttle_drop_frames: value.decode_epoch_throttle_drop_frames,
     }
 }
 
@@ -1329,6 +1333,8 @@ fn video_session_stats_from_pb(value: pb::VideoSessionStats) -> VideoSessionStat
         max_frame_bytes: value.max_frame_bytes,
         max_keyframe_bytes: value.max_keyframe_bytes,
         forced_idr_misses: value.forced_idr_misses,
+        decode_stale_epoch_drop_frames: value.decode_stale_epoch_drop_frames,
+        decode_epoch_throttle_drop_frames: value.decode_epoch_throttle_drop_frames,
     }
 }
 

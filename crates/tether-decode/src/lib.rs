@@ -21,7 +21,7 @@ pub mod run;
 pub mod test_support;
 
 pub use run::{
-    run_thread, run_thread_with_init, DecodeCompletion, DecodeJob, EpochAction, RecoveryAction,
-    Worker, EPOCH_REBUILD_MIN_INTERVAL, IDR_RATE_LIMIT, NO_OUTPUT_WATCHDOG, REBUILD_BUDGET,
-    TRANSIENT_FAILURE_THRESHOLD,
+    run_thread, run_thread_with_init, DecodeCompletion, DecodeEvent, DecodeJob, EpochAction,
+    EpochDropReason, RecoveryAction, Worker, EPOCH_REBUILD_MIN_INTERVAL, IDR_RATE_LIMIT,
+    NO_OUTPUT_WATCHDOG, REBUILD_BUDGET, TRANSIENT_FAILURE_THRESHOLD,
 };

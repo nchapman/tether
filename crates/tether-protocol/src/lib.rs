@@ -1233,6 +1233,8 @@ mod tests {
                 max_frame_bytes: 13,
                 max_keyframe_bytes: 14,
                 forced_idr_misses: 15,
+                decode_stale_epoch_drop_frames: 16,
+                decode_epoch_throttle_drop_frames: 17,
             },
             audio: Some(AudioSessionStats {
                 packets_sent: 0,

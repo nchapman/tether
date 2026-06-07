@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use crossbeam_channel::bounded;
-use tether_decode::{DecodeCompletion, DecodeJob};
+use tether_decode::{DecodeEvent, DecodeJob, EpochDropReason};
 use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
@@ -662,7 +662,7 @@ async fn main() -> anyhow::Result<()> {
     // the await.
     let (decode_job_tx, decode_job_rx) = bounded::<DecodeJob>(8);
     let (decode_completion_tx, decode_completion_rx) =
-        crossbeam_channel::unbounded::<DecodeCompletion>();
+        crossbeam_channel::unbounded::<DecodeEvent>();
     // Oneshot from the decode thread back to the recv task: lets the
     // recv loop wait for decoder construction before announcing
     // StreamReady to the host. If the decoder fails to build, the
@@ -814,6 +814,10 @@ async fn main() -> anyhow::Result<()> {
         // the decoder is falling behind the network — a strong signal
         // to drop quality or alert the user.
         let mut decode_queue_drops: u32 = 0;
+        // Frames intentionally discarded by the decode thread before submit
+        // because their stream epoch was unsafe for the current decoder.
+        let mut decode_stale_epoch_drops: u32 = 0;
+        let mut decode_epoch_throttle_drops: u32 = 0;
         // Decode completions folded into the current stats window.
         // Used as the divisor for avg_decode_ms so the metric stays
         // honest when frame_count (recv-side) and completions drift
@@ -1042,33 +1046,55 @@ async fn main() -> anyhow::Result<()> {
             // produced anything yet, we'll pick it up next time
             // round. Folds per-frame metrics into the stats window
             // the recv loop owns.
-            while let Ok(c) = decode_completion_rx.try_recv() {
-                decode_completion_count = decode_completion_count.saturating_add(1);
-                decode_latency_sum_ns = decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
-                if decode_completion_count == 1 {
-                    decode_latency_min_ns = c.decode_duration_ns;
-                } else {
-                    decode_latency_min_ns = decode_latency_min_ns.min(c.decode_duration_ns);
-                }
-                decode_latency_max_ns = decode_latency_max_ns.max(c.decode_duration_ns);
-                if c.decode_err || c.soft_failure {
-                    decode_errors = decode_errors.saturating_add(1);
-                    session_summary_for_recv
-                        .video
-                        .decode_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                render_drops = render_drops.saturating_add(c.render_drops);
-                session_summary_for_recv
-                    .video
-                    .render_drop_frames
-                    .fetch_add(u64::from(c.render_drops), Ordering::Relaxed);
-                if c.idr_request_fired {
-                    idr_requests = idr_requests.saturating_add(1);
-                    session_summary_for_recv
-                        .video
-                        .idr_requests
-                        .fetch_add(1, Ordering::Relaxed);
+            while let Ok(event) = decode_completion_rx.try_recv() {
+                match event {
+                    DecodeEvent::Completion(c) => {
+                        decode_completion_count = decode_completion_count.saturating_add(1);
+                        decode_latency_sum_ns =
+                            decode_latency_sum_ns.saturating_add(c.decode_duration_ns);
+                        if decode_completion_count == 1 {
+                            decode_latency_min_ns = c.decode_duration_ns;
+                        } else {
+                            decode_latency_min_ns = decode_latency_min_ns.min(c.decode_duration_ns);
+                        }
+                        decode_latency_max_ns = decode_latency_max_ns.max(c.decode_duration_ns);
+                        if c.decode_err || c.soft_failure {
+                            decode_errors = decode_errors.saturating_add(1);
+                            session_summary_for_recv
+                                .video
+                                .decode_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        render_drops = render_drops.saturating_add(c.render_drops);
+                        session_summary_for_recv
+                            .video
+                            .render_drop_frames
+                            .fetch_add(u64::from(c.render_drops), Ordering::Relaxed);
+                        if c.idr_request_fired {
+                            idr_requests = idr_requests.saturating_add(1);
+                            session_summary_for_recv
+                                .video
+                                .idr_requests
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    DecodeEvent::EpochDrop { reason, .. } => match reason {
+                        EpochDropReason::Stale => {
+                            decode_stale_epoch_drops = decode_stale_epoch_drops.saturating_add(1);
+                            session_summary_for_recv
+                                .video
+                                .decode_stale_epoch_drop_frames
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        EpochDropReason::RebuildRateLimited => {
+                            decode_epoch_throttle_drops =
+                                decode_epoch_throttle_drops.saturating_add(1);
+                            session_summary_for_recv
+                                .video
+                                .decode_epoch_throttle_drop_frames
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
                 }
             }
 
@@ -1179,6 +1205,8 @@ async fn main() -> anyhow::Result<()> {
                     render_drop_frames = render_drops,
                     idr_requests,
                     decode_queue_drop_frames = decode_queue_drops,
+                    decode_stale_epoch_drop_frames = decode_stale_epoch_drops,
+                    decode_epoch_throttle_drop_frames = decode_epoch_throttle_drops,
                     fec_recovered_frames,
                     fec_recovered_fragments,
                     "frame stats"
@@ -1198,6 +1226,8 @@ async fn main() -> anyhow::Result<()> {
                 render_drops = 0;
                 idr_requests = 0;
                 decode_queue_drops = 0;
+                decode_stale_epoch_drops = 0;
+                decode_epoch_throttle_drops = 0;
                 decode_completion_count = 0;
                 last_log = Instant::now();
             }

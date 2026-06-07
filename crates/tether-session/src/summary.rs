@@ -74,6 +74,8 @@ pub struct VideoSummaryCounters {
     pub max_frame_bytes: AtomicU64,
     pub max_keyframe_bytes: AtomicU64,
     pub forced_idr_misses: AtomicU64,
+    pub decode_stale_epoch_drop_frames: AtomicU64,
+    pub decode_epoch_throttle_drop_frames: AtomicU64,
 }
 
 impl VideoSummaryCounters {
@@ -99,6 +101,12 @@ impl VideoSummaryCounters {
             max_frame_bytes: self.max_frame_bytes.load(Ordering::Relaxed),
             max_keyframe_bytes: self.max_keyframe_bytes.load(Ordering::Relaxed),
             forced_idr_misses: self.forced_idr_misses.load(Ordering::Relaxed),
+            decode_stale_epoch_drop_frames: self
+                .decode_stale_epoch_drop_frames
+                .load(Ordering::Relaxed),
+            decode_epoch_throttle_drop_frames: self
+                .decode_epoch_throttle_drop_frames
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -167,6 +175,8 @@ pub fn log_peer_session_summary(peer: &str, summary: Option<&SessionSummary>) {
         video_max_frame_bytes = summary.video.max_frame_bytes,
         video_max_keyframe_bytes = summary.video.max_keyframe_bytes,
         video_forced_idr_misses = summary.video.forced_idr_misses,
+        video_decode_stale_epoch_drop_frames = summary.video.decode_stale_epoch_drop_frames,
+        video_decode_epoch_throttle_drop_frames = summary.video.decode_epoch_throttle_drop_frames,
         audio_packets_sent = audio.map_or(0, |s| s.packets_sent),
         audio_packets_received = audio.map_or(0, |s| s.packets_received),
         audio_capture_frames = audio.map_or(0, |s| s.capture_frames),

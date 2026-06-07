@@ -73,13 +73,13 @@ the secret above. **Never commit the private key.**
 
 1. Bump the version everywhere it appears:
    ```sh
-   scripts/sync-version.sh 0.1.0
+   scripts/sync-version.sh 0.2.2
    cargo build          # refresh Cargo.lock
    ```
 2. Commit and tag:
    ```sh
-   git commit -am "Release v0.1.0"
-   git tag v0.1.0
+   git commit -am "Release v0.2.2"
+   git tag v0.2.2
    git push origin main --tags
    ```
 3. The tag triggers `release.yml`. When it finishes, a **draft** release holds

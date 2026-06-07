@@ -1,39 +1,40 @@
 # Tether — Architecture
 
-Tether is a low-latency open-source remote desktop in Rust. The first
-working end-to-end target is **Linux ↔ Linux on a LAN over QUIC**,
-with hardware H.264 or HEVC (negotiated per session) at 60 fps default
-and a zero-copy capture→encode→decode→render path. Profile negotiation
-is **probe-driven** — every layer (capture, encode, decode, renderer
-import) advertises only what a real attempt against the live driver
-has confirmed it can deliver. The shipped preference list ranks
-4:4:4 over 4:2:0 (text fidelity beats subsampled chroma on desktop
-content), and 10-bit over 8-bit at each chroma rung (precision
-beats banding). See `docs/CODEC_CAPABILITIES.md` for the per-layer
-hard-limit vs. probed framing and the M-series VT capability matrix.
-**macOS host** (ScreenCaptureKit capture, VideoToolbox encoder,
-CGEvent input injection) and **macOS client** (VideoToolbox decode
-+ Metal IOSurface→wgpu render + winit input capture) are both
-wired end-to-end. The macOS client covers HEVC Main, Main10, and
-Main 4:4:4 (8 and 10-bit) decode — the renderer's biplanar 8 /
-biplanar 16 / packed XYUV layouts cover the IOSurface and dma-buf
-shapes each profile produces, verified by the four
-`iosurface_zero_copy_roundtrip_*` tests in
-`tether-render/src/iosurface_test.rs`. **Windows host** (DXGI Desktop
-Duplication capture → D3D11 Video Processor BGRA→NV12/P010 →
-vendor-selected hardware encode) and a **Windows client** decode→render
-path are wired end-to-end and verified in live loopback sessions. Encode
-picks the backend from the DXGI adapter's PCI vendor — Intel→QSV,
-AMD→AMF, NVIDIA→NVENC — with Media Foundation as the vendor-agnostic
-fallback; 4:2:0 only (the Video Processor has no 4:4:4 output path, so
-Windows never advertises 4:4:4). AV1 4:2:0 sits above HEVC 4:2:0 in the
-preference order and is selected when both sides advertise it.
-**System-output audio** is wired end-to-end on all three platforms —
+Tether is a low-latency open-source remote desktop in Rust. The core
+host/client engines are wired end-to-end on Linux, macOS, and Windows
+over QUIC. The project is still pre-MVP and assumes hardware video
+codecs; unsupported hardware returns an explicit `NoHardwareCodec`
+diagnostic rather than falling back to software.
+
+Profile negotiation is **probe-driven**: each side advertises only what
+a real attempt against the live capture, encode, decode, and renderer
+import stack has confirmed. The preference list ranks HEVC 4:4:4 above
+4:2:0 for desktop text fidelity, then AV1 4:2:0 above HEVC 4:2:0 when
+hardware supports it, with H.264 4:2:0 as the floor. See
+`docs/CODEC_CAPABILITIES.md` for the per-layer hard-limit vs. probed
+framing.
+
+Platform shape today:
+
+- **Linux** host/client: PipeWire DMA-BUF capture, VAAPI or NVENC
+  encode, hardware decode, dma-buf export, wgpu render. This is the
+  deepest test matrix and can negotiate HEVC Main 4:4:4 8-bit and
+  10-bit when the live probe passes.
+- **macOS** host/client: ScreenCaptureKit capture, Metal conversion,
+  VideoToolbox HEVC encode/decode, IOSurface import, Metal/wgpu render,
+  and CGEvent input injection. macOS hosts advertise HEVC Main/Main10
+  today; macOS clients can decode/render Linux-host HEVC Main 4:4:4
+  8-bit and 10-bit.
+- **Windows** host/client: DXGI Desktop Duplication capture,
+  `ID3D11VideoProcessor` BGRA→NV12/P010 conversion, vendor-selected
+  D3D11 encode (Intel→QSV, AMD→AMF, NVIDIA→NVENC, Media Foundation
+  fallback), D3D11VA decode, and native D3D11 render. Windows is 4:2:0
+  only because the Video Processor has no 4:4:4 output path.
+
+**System-output audio** is wired end-to-end on all three platforms:
 capture (Linux PipeWire sink monitor, macOS ScreenCaptureKit, Windows
-WASAPI loopback) → Opus → unreliable datagrams → cpal playback (see
-`tether-audio` and the audio packet below). See
-`docs/CODEC_CAPABILITIES.md` for the Windows capture/encode layers and
-their per-backend limits.
+WASAPI loopback) → Opus → unreliable datagrams → cpal playback. See
+`tether-audio` and the audio packet below.
 
 This document walks the system top-down: what the workspace contains,
 how a single frame flows from compositor pixels to the remote display,
@@ -75,8 +76,8 @@ the relevant crate (e.g. `tether-capture/src/macos.rs`).
 
 ## The frame hot path
 
-End-to-end for one frame, host on a Linux Wayland session, client on
-any Linux machine. The **macOS host** variant diverges only inside the
+End-to-end for one frame, with a Linux Wayland host as the concrete
+zero-copy example. The **macOS host** variant diverges only inside the
 capture→encoder hop: real sessions capture full-resolution BGRA
 IOSurfaces from ScreenCaptureKit, run MPS Lanczos on Metal when the
 client viewport asks for a smaller encode, then convert into the
@@ -186,7 +187,7 @@ from `FrameFragmenter` onward is identical. See the dedicated
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
-                                  ▼  network (LAN today; NAT TBD)
+                                  ▼  network (direct QUIC; LAN today)
                                   │
 ┌─────────────────────────────────────────────────────────────────────┐
 │ CLIENT                                                              │

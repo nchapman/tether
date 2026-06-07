@@ -1,101 +1,106 @@
 # Tether
 
-Low-latency, open-source remote desktop in Rust. Inspired by
-[Parsec](https://parsec.app/), [Moonlight](https://moonlight-stream.org/),
-and [Sunshine](https://github.com/LizardByte/Sunshine).
+Tether is a low-latency remote desktop project written in Rust.
 
-**Status:** early (v0.2.1). Three platforms are wired end-to-end over QUIC:
+It is pre-MVP. The core host/client engines are wired end-to-end on Linux,
+macOS, and Windows, but the project still expects hardware video codecs and a
+LAN-style direct connection. There is no software codec fallback.
 
-- **Linux** host → client — VAAPI hardware encode, PipeWire DMA-BUF
-  capture, wgpu present (the most-exercised path; negotiates up to
-  HEVC Main 4:4:4 10-bit).
-- **macOS** host and client — ScreenCaptureKit capture + VideoToolbox
-  encode + CGEvent input; VideoToolbox decode + Metal render.
-- **Windows** host and client — DXGI Desktop Duplication capture +
-  vendor-selected D3D11 encode (QSV / AMF / NVENC, Media Foundation
-  fallback) + D3D11VA decode; loopback-verified, 4:2:0 only, with
-  AV1 / HEVC / H.264 selected by negotiated hardware support.
+## Platforms
 
-System-output audio is wired end-to-end on all three platforms: host capture
-is Opus-encoded onto unreliable datagrams and the client plays it through a
-low-latency jitter ring. It is on by default when both peers support it; host
-`--no-audio` and client `--no-audio` opt out.
+**Linux**
 
-## Install
+- Host: PipeWire capture, DMA-BUF GPU frames, VAAPI or NVENC encode.
+- Client: hardware decode, dma-buf export, wgpu render.
+- Best-tested path. Can negotiate HEVC Main 4:4:4 8-bit and 10-bit when the
+  live probe passes. AV1 4:2:0 8-bit and 10-bit are preferred above HEVC 4:2:0
+  when supported.
 
-Tether ships as a single **Tether shell** installer per platform — a
-system-tray app that supervises the native host/client engines. Installers
-are published to [GitHub Releases](https://github.com/nchapman/tether/releases).
+**macOS**
 
-> OS code signing isn't set up yet, so first launch needs a manual override:
-> **macOS** right-click → Open (ad-hoc signed); **Windows** dismiss the
-> SmartScreen prompt. Auto-update is signed independently and verified.
+- Host: ScreenCaptureKit capture, Metal conversion, VideoToolbox HEVC encode,
+  CGEvent input.
+- Client: VideoToolbox decode, IOSurface import, Metal/wgpu render.
+- Hosts currently advertise HEVC 4:2:0 Main/Main10. Clients can decode and
+  render Linux-host HEVC Main 4:4:4 8-bit and 10-bit.
 
-## The shell
+**Windows**
 
-The user-facing product is `apps/tether-shell`: a Tauri (React + TS) tray app
-that supervises the engines (`tether-host`, `tether-client`) over the
-`tether-ipc` protocol. The webview is chrome only — connection forms, status,
-tray; the video session is the engine's own native winit/wgpu window in a
-separate process.
+- Host: DXGI Desktop Duplication capture, D3D11 video processing, hardware
+  encode selected by GPU vendor: QSV, AMF, NVENC, then Media Foundation.
+- Client: D3D11VA decode and native D3D11 render.
+- Supports H.264, HEVC, and AV1 4:2:0 NV12/P010 where the hardware supports it.
+  Windows does not advertise 4:4:4.
 
-## Layout
+System-output audio is wired on all three platforms: platform capture,
+Opus over unreliable datagrams, jitter-buffered playback through `cpal`.
+Audio is on when both peers support it; host and client `--no-audio` flags opt
+out.
 
-- `apps/tether-host` — capture + encode + send
-- `apps/tether-client` — receive + decode + present
-- `apps/tether-shell` — Tauri tray UI that supervises the engines
-- `crates/` — `tether-protocol`, `tether-transport`, `tether-capture`,
-  `tether-codec`, `tether-decode`, `tether-gpuconvert`, `tether-vaapi`,
-  `tether-render`, `tether-scaler`, `tether-input`, `tether-session`,
-  `tether-probe`, `tether-pairing`, `tether-ipc`
+## User-facing app
+
+`apps/tether-shell` is the desktop shell: a Tauri tray app that starts and
+supervises `tether-host` and `tether-client` over the `tether-ipc` protocol.
+The shell is control-plane only. Video sessions use the native engine window.
+
+Installers are published on
+[GitHub Releases](https://github.com/nchapman/tether/releases). OS code signing
+is not set up yet, so first launch may need a manual override on macOS or
+Windows.
+
+## Repository layout
+
+- `apps/tether-host` - capture, encode, send, input injection.
+- `apps/tether-client` - receive, decode, render, input capture.
+- `apps/tether-shell` - Tauri tray UI and engine supervisor.
+- `crates/tether-protocol` - wire types and media fragmentation.
+- `crates/tether-transport` - QUIC transport and loopback test channels.
+- `crates/tether-session` - host/client session policy.
+- `crates/tether-capture` - PipeWire, ScreenCaptureKit, DXGI, test pattern.
+- `crates/tether-codec` / `crates/tether-decode` - hardware encode/decode.
+- `crates/tether-gpuconvert`, `tether-render`, `tether-scaler` - GPU format
+  conversion, presentation, and scaling.
+- `crates/tether-audio`, `tether-input`, `tether-probe`, `tether-pairing`,
+  `tether-ipc`, `tether-vaapi` - focused support crates.
 
 ## Build
 
-Dev tasks run through [mise](https://mise.jdx.dev/) (already required — it
-pins the Rust/Node toolchain), so the same commands work on Linux, macOS, and
-Windows. First build on a fresh clone fetches the pinned static FFmpeg once:
+Use `mise`; it pins the Rust and Node toolchains and owns the common tasks.
+On a fresh clone, the build tasks fetch the pinned static FFmpeg package into
+`vendor/ffmpeg/`.
 
-```
-mise run ffmpeg    # download + stage FFmpeg (idempotent; build tasks call it)
-mise run build     # cargo build --workspace
-mise run test      # fast unit tests, no hardware
-mise run test-hw   # this platform's hardware tests (codec + render + gpuconvert)
-mise run probe     # print this host's codec capability matrix
-mise run shell     # run the Tauri shell in dev mode
-mise run package   # build local installer bundles
-mise tasks         # full task list
+```sh
+mise run ffmpeg     # fetch the pinned FFmpeg artifact
+mise run build      # cargo build --workspace
+mise run test       # fast lib tests, no hardware
+mise run test-all   # full no-hardware workspace tests
+mise run test-hw    # current platform's ignored GPU/video tests
+mise run probe      # print this host's codec capability matrix
+mise run shell      # run the Tauri shell in dev mode
+mise run package    # build local installer bundles
+mise tasks          # list all tasks
 ```
 
 ## Linux host permissions
 
-A Linux host asks for two permissions, both **once, on first use** — no
-terminal commands required:
+Linux screen capture uses the desktop portal. The first connection may show the
+standard screen-share dialog; Tether stores the portal restore token under
+`~/.tether/`.
 
-- **Screen capture** is granted through the xdg-desktop-portal "share your
-  screen" dialog on the first connection. Tether stores the portal restore
-  token under `~/.tether/` and replays it, so the dialog won't appear again
-  (until you revoke it in your desktop's privacy settings).
-- **Input injection** needs access to `/dev/uinput`, gated by a udev rule:
-  - The **deb/rpm packages install the rule at install time**, so input
-    just works — no prompt at all.
-  - The **AppImage** (and running from source) request it the first time a
-    client connects: a system **PolicyKit dialog** appears to authorize the
-    one-time setup, exactly like the screen-share prompt. Approve it once
-    and input works from then on, no per-session dialog.
-
-Headless hosts with no active local seat must add the user to the `input`
-group (`sudo usermod -aG input $USER`) and log back in — `uaccess` only
-applies to the user of an active seat.
+Linux input injection uses `/dev/uinput`. Deb/rpm packages install the udev rule
+at install time. The AppImage and source builds can request the one-time setup
+through PolicyKit when a client connects. Headless hosts with no active local
+seat need the user in the `input` group.
 
 ## Docs
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — channels, handshake,
-  forward-compat hooks
-- [docs/CODEC_CAPABILITIES.md](docs/CODEC_CAPABILITIES.md) — per-backend
-  codec/chroma/bit-depth matrix
-- [docs/TESTING.md](docs/TESTING.md) — what the test matrix covers
-- [docs/RELEASING.md](docs/RELEASING.md) — how releases are cut
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - system design and invariants.
+- [docs/CODEC_CAPABILITIES.md](docs/CODEC_CAPABILITIES.md) - platform codec,
+  chroma, and bit-depth matrix.
+- [docs/PROTOCOL_V1.md](docs/PROTOCOL_V1.md) - current wire protocol.
+- [docs/TESTING.md](docs/TESTING.md) - test matrix and conventions.
+- [docs/RELEASING.md](docs/RELEASING.md) - release and packaging flow.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+See [LICENSE](LICENSE).

@@ -12,7 +12,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Instant;
 
 #[cfg(target_os = "linux")]
@@ -77,9 +77,7 @@ struct ActiveSessionGuard {
 
 impl ActiveSessionGuard {
     fn register(slot: Arc<StdMutex<Option<ActiveSession>>>, session: ActiveSession) -> Self {
-        if let Ok(mut g) = slot.lock() {
-            *g = Some(session);
-        }
+        *lock_host_state(&slot, "active session") = Some(session);
         Self { slot }
     }
 }
@@ -87,10 +85,18 @@ impl ActiveSessionGuard {
 impl Drop for ActiveSessionGuard {
     fn drop(&mut self) {
         // Tolerate a poisoned lock rather than double-panicking on the way out.
-        if let Ok(mut g) = self.slot.lock() {
-            *g = None;
-        }
+        *lock_host_state(&self.slot, "active session") = None;
     }
+}
+
+fn lock_host_state<'a, T>(lock: &'a StdMutex<T>, name: &str) -> MutexGuard<'a, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        warn!(
+            state = name,
+            "host shared-state mutex poisoned; recovering inner state"
+        );
+        poisoned.into_inner()
+    })
 }
 
 /// Default target frame rate. Sunshine and Apollo run desktop / game
@@ -348,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
     if !use_test_pattern {
         match tether_capture::windows::pre_create() {
             Ok(pre) => {
-                *PRECREATED_CAPTURE.lock().unwrap() = Some(pre);
+                *lock_host_state(&PRECREATED_CAPTURE, "precreated capture") = Some(pre);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "DXGI pre-create failed; capture will retry later");
@@ -529,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
         let cfg = HostSessionConfig {
             server_name: "tether-host".to_string(),
             audio_config,
-            displays: display_descriptors.lock().unwrap().clone(),
+            displays: lock_host_state(&display_descriptors, "display descriptors").clone(),
         };
         // `HostSession::accept` takes the channel through the
         // `ControlChannel` trait object so it's mockable in tests.
@@ -967,11 +973,10 @@ async fn handle_client(
                         );
                         if video {
                             video_ready_requested_ctl.store(true, Ordering::Release);
-                            let has_viewport = latest_viewport_for_ctl
-                                .lock()
-                                .unwrap()
-                                .viewport
-                                .is_some();
+                            let has_viewport =
+                                lock_host_state(&latest_viewport_for_ctl, "latest viewport")
+                                    .viewport
+                                    .is_some();
                             if has_viewport {
                                 stream_ready_ctl.store(true, Ordering::Release);
                                 // Defensive IDR at gate-open. A fresh encoder's
@@ -1031,7 +1036,7 @@ async fn handle_client(
                         // hasn't drained yet (slow encoder loop), the
                         // older sample is discarded — we'd rather act
                         // on fresh telemetry than queue stale data.
-                        *latest_client_stats_for_ctl.lock().unwrap() =
+                        *lock_host_state(&latest_client_stats_for_ctl, "latest client stats") =
                             Some(ClientStatsObservation {
                                 incomplete_frames,
                                 fragment_loss_events,
@@ -1063,7 +1068,8 @@ async fn handle_client(
                             );
                             None
                         };
-                        let mut guard = latest_viewport_for_ctl.lock().unwrap();
+                        let mut guard =
+                            lock_host_state(&latest_viewport_for_ctl, "latest viewport");
                         guard.viewport = next;
                         guard.seq = guard.seq.wrapping_add(1);
                         drop(guard);
@@ -1233,7 +1239,8 @@ async fn handle_client(
                 if let Some((w, h)) = dims {
                     injector.lock().await.set_display_size(w, h);
                     let next = {
-                        let mut guard = display_descriptors.lock().unwrap();
+                        let mut guard =
+                            lock_host_state(&display_descriptors, "display descriptors");
                         let next = tether_capture::display_list_with_primary_mode(
                             guard.clone(),
                             w,
@@ -3304,7 +3311,7 @@ fn run_capture_and_send(
         // post-resize keyframe — that's exactly what
         // `VideoPacket::stream_epoch` exists for.
         let (current_viewport, current_viewport_seq) = {
-            let g = latest_viewport.lock().unwrap();
+            let g = lock_host_state(&latest_viewport, "latest viewport");
             (g.viewport, g.seq)
         };
         // Viewport-driven downscale applies per frame source:
@@ -3515,7 +3522,7 @@ fn run_capture_and_send(
         // ~60 Hz, so most iterations bypass this entirely. Quinn's
         // cumulative counters are read here so the controller sees a
         // snapshot that's coherent with the client's window.
-        if let Some(stats) = latest_client_stats.lock().unwrap().take() {
+        if let Some(stats) = lock_host_state(&latest_client_stats, "latest client stats").take() {
             tick_abr(slot_mut, &conn, stats);
         }
 
@@ -4086,7 +4093,7 @@ async fn real_capture(
     _initial_viewport: Option<Viewport>,
 ) -> anyhow::Result<tether_capture::CaptureHandle> {
     info!("capture source: windows (DXGI Desktop Duplication)");
-    let pre = PRECREATED_CAPTURE.lock().unwrap().take();
+    let pre = lock_host_state(&PRECREATED_CAPTURE, "precreated capture").take();
     let (handle, d3d11_device) = match pre {
         Some(p) => tether_capture::windows::start_with(p).map_err(anyhow::Error::from)?,
         None => tether_capture::windows::start_with(
@@ -4217,6 +4224,25 @@ mod tests {
         assert!(!host_summary_audio_active(true, false));
         assert!(!host_summary_audio_active(false, true));
         assert!(!host_summary_audio_active(false, false));
+    }
+
+    #[test]
+    fn lock_host_state_recovers_poisoned_mutex() {
+        let lock = Arc::new(StdMutex::new(7u32));
+        let poisoned = lock.clone();
+        let result = std::panic::catch_unwind(move || {
+            let mut guard = poisoned.lock().unwrap();
+            *guard = 11;
+            panic!("poison test lock");
+        });
+        assert!(result.is_err());
+
+        let mut guard = lock_host_state(&lock, "test");
+        assert_eq!(*guard, 11);
+        *guard = 13;
+        drop(guard);
+
+        assert_eq!(*lock_host_state(&lock, "test"), 13);
     }
 
     #[test]

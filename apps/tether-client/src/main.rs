@@ -73,6 +73,19 @@ fn recovery_warranted(before: (u64, u64), after: (u64, u64)) -> bool {
     after.0 > before.0
 }
 
+fn drain_latest_valid_viewport(
+    mut latest: Viewport,
+    rx: &mut mpsc::UnboundedReceiver<(u32, u32)>,
+) -> Viewport {
+    while let Ok((width, height)) = rx.try_recv() {
+        let candidate = Viewport::new(width, height);
+        if candidate.is_valid() {
+            latest = candidate;
+        }
+    }
+    latest
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn ns_to_ms(ns: u64, samples: u64) -> f64 {
     if samples == 0 {
@@ -1365,6 +1378,7 @@ async fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         }
+                        let viewport = drain_latest_valid_viewport(viewport, &mut viewport_rx);
                         if let Err(e) = conn_viewport
                             .send_control(&ControlMessage::SetViewportHint {
                                 stream_id: VideoStreamId(0),
@@ -2256,5 +2270,21 @@ mod arg_tests {
         assert!(recovery_warranted((0, 0), (1, 1)));
         // Nothing moved → nothing to recover.
         assert!(!recovery_warranted((3, 7), (3, 7)));
+    }
+
+    #[test]
+    fn startup_viewport_drain_uses_newest_queued_valid_size() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send((1600, 900)).unwrap();
+        tx.send((0, 0)).unwrap();
+        tx.send((1920, 1080)).unwrap();
+
+        let selected = drain_latest_valid_viewport(Viewport::new(1280, 720), &mut rx);
+
+        assert_eq!(selected, Viewport::new(1920, 1080));
+        assert!(
+            rx.try_recv().is_err(),
+            "queued resize events should be drained"
+        );
     }
 }

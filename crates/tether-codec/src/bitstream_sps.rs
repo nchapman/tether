@@ -22,8 +22,9 @@
 //! on its own).
 
 // Bitstream parsing: narrowing reads of small spec-bounded fields
-// (e.g. read_bits(3), read_ue() for chroma_format_idc / bit_depth)
-// into u8/usize is intentional and range-checked by the spec.
+// (e.g. read_bits(3)) into u8/usize is intentional and range-checked
+// by the spec or the read width. Exp-Golomb fields read from the
+// bytestream stay checked at the conversion site.
 #![allow(clippy::cast_possible_truncation)]
 
 use tether_protocol::control::{ChromaSubsampling, CodecKind};
@@ -230,7 +231,10 @@ fn parse_hevc_sps(rbsp: &[u8]) -> Option<SpsChromaAndBitDepth> {
     // include the general PTL. We skip the bits without interpreting.
     let general_profile_idc = skip_hevc_ptl(&mut r, sps_max_sub_layers_minus1)?;
     let _sps_seq_parameter_set_id = r.read_ue()?;
-    let chroma_format_idc = r.read_ue()? as u8;
+    let chroma_format_idc = u8::try_from(r.read_ue()?).ok()?;
+    if chroma_format_idc > 3 {
+        return None;
+    }
     if chroma_format_idc == 3 {
         let _separate_colour_plane_flag = r.read_bits(1)?;
     }
@@ -243,7 +247,10 @@ fn parse_hevc_sps(rbsp: &[u8]) -> Option<SpsChromaAndBitDepth> {
         let _ = r.read_ue()?;
         let _ = r.read_ue()?;
     }
-    let bit_depth_luma_minus8 = r.read_ue()? as u8;
+    let bit_depth_luma_minus8 = u8::try_from(r.read_ue()?).ok()?;
+    if bit_depth_luma_minus8 > 6 {
+        return None;
+    }
     // We don't enforce luma == chroma; chroma bit depth is read by spec
     // immediately after, but for our cross-check the luma value is the
     // one that pairs with `profile.bit_depth`.
@@ -319,11 +326,17 @@ fn parse_h264_sps(rbsp: &[u8]) -> Option<SpsChromaAndBitDepth> {
     // spec (Annex E).
     const HIGH_FAMILY: [u8; 13] = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
     if HIGH_FAMILY.contains(&profile_idc) {
-        let chroma_format_idc = r.read_ue()? as u8;
+        let chroma_format_idc = u8::try_from(r.read_ue()?).ok()?;
+        if chroma_format_idc > 3 {
+            return None;
+        }
         if chroma_format_idc == 3 {
             let _separate_colour_plane_flag = r.read_bits(1)?;
         }
-        let bit_depth_luma_minus8 = r.read_ue()? as u8;
+        let bit_depth_luma_minus8 = u8::try_from(r.read_ue()?).ok()?;
+        if bit_depth_luma_minus8 > 6 {
+            return None;
+        }
         Some(SpsChromaAndBitDepth {
             chroma_format_idc,
             bit_depth_luma: bit_depth_luma_minus8.checked_add(8)?,
@@ -406,6 +419,24 @@ mod tests {
             r.read_ue(),
             None,
             "32-leading-zeros code must reject, not truncate to a corrupted u32"
+        );
+    }
+
+    #[test]
+    fn h264_parser_rejects_chroma_idc_that_would_truncate() {
+        let rbsp = h264_high_sps_rbsp(256, 0);
+        assert!(
+            parse_h264_sps(&rbsp).is_none(),
+            "malformed chroma_format_idc must reject instead of narrowing"
+        );
+    }
+
+    #[test]
+    fn h264_parser_rejects_out_of_range_bit_depth() {
+        let rbsp = h264_high_sps_rbsp(1, 7);
+        assert!(
+            parse_h264_sps(&rbsp).is_none(),
+            "bit_depth_luma_minus8 above the parser's modeled range must reject"
         );
     }
 
@@ -505,5 +536,42 @@ mod tests {
                 expected
             );
         }
+    }
+
+    fn h264_high_sps_rbsp(chroma_format_idc: u32, bit_depth_luma_minus8: u32) -> Vec<u8> {
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 100, 8); // profile_idc = High
+        push_bits(&mut bits, 0, 8); // constraint flags
+        push_bits(&mut bits, 30, 8); // level_idc
+        push_ue(&mut bits, 0); // seq_parameter_set_id
+        push_ue(&mut bits, chroma_format_idc);
+        if chroma_format_idc == 3 {
+            push_bits(&mut bits, 0, 1); // separate_colour_plane_flag
+        }
+        push_ue(&mut bits, bit_depth_luma_minus8);
+        bits_to_bytes(&bits)
+    }
+
+    fn push_bits(out: &mut Vec<bool>, value: u64, width: usize) {
+        for bit in (0..width).rev() {
+            out.push(((value >> bit) & 1) != 0);
+        }
+    }
+
+    fn push_ue(out: &mut Vec<bool>, value: u32) {
+        let code_num = u64::from(value) + 1;
+        let width = u64::BITS as usize - code_num.leading_zeros() as usize;
+        out.extend(std::iter::repeat_n(false, width - 1));
+        push_bits(out, code_num, width);
+    }
+
+    fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
+        let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+        for (idx, bit) in bits.iter().enumerate() {
+            if *bit {
+                bytes[idx / 8] |= 1 << (7 - (idx % 8));
+            }
+        }
+        bytes
     }
 }

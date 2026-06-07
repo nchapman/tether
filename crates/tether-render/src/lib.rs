@@ -938,12 +938,19 @@ impl LatestFrame {
     /// that for a drop count or just drop it.
     #[must_use = "displaced frame should be counted as a render drop or explicitly ignored"]
     pub fn set(&self, frame: Frame) -> Option<Frame> {
-        (*self.0.lock().expect("LatestFrame mutex poisoned")).replace(frame)
+        (*self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
+        .replace(frame)
     }
 
     /// Take the currently-held frame, leaving the slot empty.
     pub fn take(&self) -> Option<Frame> {
-        self.0.lock().expect("LatestFrame mutex poisoned").take()
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
@@ -1003,6 +1010,7 @@ pub(crate) fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
     fn cursor_centre_maps_to_centre() {
@@ -1105,6 +1113,27 @@ mod tests {
             _ => panic!("expected Cpu frame"),
         }
         assert!(frames.take().is_none(), "slot should be empty after take");
+    }
+
+    #[test]
+    fn latest_frame_recovers_after_poisoned_lock() {
+        let frames = LatestFrame::new();
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = frames.0.lock().expect("initial lock succeeds");
+            panic!("poison latest-frame slot");
+        }));
+        assert!(poisoned.is_err());
+
+        let frame = Frame::Cpu(CpuFrame {
+            width: 3,
+            height: 2,
+            y: vec![0; 6],
+            uv: vec![128; 4],
+            t_capture_client_clock: None,
+        });
+        assert!(frames.set(frame).is_none());
+        let latest = frames.take().expect("slot should recover and hold frame");
+        assert_eq!((latest.width(), latest.height()), (3, 2));
     }
 
     #[test]

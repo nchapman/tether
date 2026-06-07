@@ -19,6 +19,7 @@
 // u32 dims → u16/u8 wire fields) are intentional and range-bounded.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
+use tether_protocol::control::MAX_CURSOR_SHAPE_BYTES;
 use tether_protocol::cursor::CursorPixelFormat;
 
 /// One change to the host's cursor sprite. `id` is a stable hash of
@@ -153,9 +154,23 @@ pub fn rescale_shape_to_frame(
     src: (u32, u32),
     dst: (u32, u32),
 ) -> CursorShapeEvent {
-    if src == dst || src.0 == 0 || src.1 == 0 || dst.0 == 0 || dst.1 == 0 {
+    if src == dst
+        || src.0 == 0
+        || src.1 == 0
+        || dst.0 == 0
+        || dst.1 == 0
+        || shape.width == 0
+        || shape.height == 0
+    {
         return shape;
     }
+    let Some(expected_len) = expected_rgba_len(shape.width, shape.height) else {
+        return shape;
+    };
+    if shape.pixels.len() != expected_len {
+        return shape;
+    }
+
     let ratio_x = f64::from(dst.0) / f64::from(src.0);
     let ratio_y = f64::from(dst.1) / f64::from(src.1);
     // Use the smaller ratio so the sprite stays in the displayed
@@ -164,13 +179,12 @@ pub fn rescale_shape_to_frame(
     if (ratio - 1.0).abs() < 1e-6 {
         return shape;
     }
-    let new_w = ((f64::from(shape.width) * ratio).round() as u32).max(1) as u16;
-    let new_h = ((f64::from(shape.height) * ratio).round() as u32).max(1) as u16;
+    let (new_w, new_h) = scaled_shape_dimensions(shape.width, shape.height, ratio);
     let new_pixels =
         crate::cursor::box_downsample_rgba(shape.width, shape.height, &shape.pixels, new_w, new_h);
     let new_hot = (
-        ((f64::from(shape.hotspot.0) * ratio).round() as u32) as u16,
-        ((f64::from(shape.hotspot.1) * ratio).round() as u32) as u16,
+        scale_hotspot(shape.hotspot.0, f64::from(new_w) / f64::from(shape.width)),
+        scale_hotspot(shape.hotspot.1, f64::from(new_h) / f64::from(shape.height)),
     );
     // Recompute the id from the rescaled pixels: the wire id must
     // uniquely identify the *exact bitmap* the client will cache. If
@@ -187,6 +201,58 @@ pub fn rescale_shape_to_frame(
         format: shape.format,
         pixels: new_pixels,
     }
+}
+
+fn expected_rgba_len(width: u16, height: u16) -> Option<usize> {
+    usize::from(width)
+        .checked_mul(usize::from(height))?
+        .checked_mul(4)
+}
+
+fn scale_dimension(value: u16, ratio: f64) -> u16 {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return 1;
+    }
+    let scaled = (f64::from(value) * ratio)
+        .round()
+        .clamp(1.0, f64::from(u16::MAX));
+    scaled as u16
+}
+
+fn scaled_shape_dimensions(width: u16, height: u16, ratio: f64) -> (u16, u16) {
+    let mut width = scale_dimension(width, ratio);
+    let mut height = scale_dimension(height, ratio);
+    if expected_rgba_len(width, height).is_some_and(|len| len <= MAX_CURSOR_SHAPE_BYTES) {
+        return (width, height);
+    }
+
+    let max_pixels = MAX_CURSOR_SHAPE_BYTES / 4;
+    let pixels = f64::from(width) * f64::from(height);
+    let cap_ratio = ((max_pixels as f64) / pixels).sqrt().min(1.0);
+    width = scale_dimension(width, cap_ratio);
+    height = scale_dimension(height, cap_ratio);
+
+    while expected_rgba_len(width, height).is_none_or(|len| len > MAX_CURSOR_SHAPE_BYTES) {
+        if width >= height && width > 1 {
+            width -= 1;
+        } else if height > 1 {
+            height -= 1;
+        } else {
+            break;
+        }
+    }
+
+    (width, height)
+}
+
+fn scale_hotspot(value: u16, ratio: f64) -> u16 {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return 0;
+    }
+    let scaled = (f64::from(value) * ratio)
+        .round()
+        .clamp(0.0, f64::from(u16::MAX));
+    scaled as u16
 }
 
 /// FNV-1a 64-bit over `(width, height, pixel bytes)`. Wire-stable
@@ -231,6 +297,15 @@ pub(crate) fn box_downsample_rgba(
     let dst_h_us = dst_h as usize;
     let mut out = vec![0u8; dst_w_us * dst_h_us * 4];
     if src_w == 0 || src_h == 0 || dst_w_us == 0 || dst_h_us == 0 {
+        return out;
+    }
+    let Some(expected_src_len) = src_w
+        .checked_mul(src_h)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return out;
+    };
+    if src.len() < expected_src_len {
         return out;
     }
     for dy in 0..dst_h_us {
@@ -293,5 +368,56 @@ mod tests {
             CursorEvent::Idle,
             "Idle is sticky once emitted"
         );
+    }
+
+    #[test]
+    fn rescale_shape_with_malformed_pixels_returns_unchanged() {
+        let shape = CursorShapeEvent {
+            id: 7,
+            width: 4,
+            height: 4,
+            hotspot: (1, 1),
+            format: CursorPixelFormat::Rgba8,
+            pixels: vec![0; 4 * 4 * 4 - 1],
+        };
+
+        let out = rescale_shape_to_frame(shape.clone(), (100, 100), (50, 50));
+
+        assert_eq!(out, shape);
+    }
+
+    #[test]
+    fn rescale_shape_with_zero_shape_dimension_returns_unchanged() {
+        let shape = CursorShapeEvent {
+            id: 7,
+            width: 0,
+            height: 4,
+            hotspot: (0, 0),
+            format: CursorPixelFormat::Rgba8,
+            pixels: Vec::new(),
+        };
+
+        let out = rescale_shape_to_frame(shape.clone(), (100, 100), (50, 50));
+
+        assert_eq!(out, shape);
+    }
+
+    #[test]
+    fn rescale_shape_caps_oversized_payload() {
+        let shape = CursorShapeEvent {
+            id: 7,
+            width: 2,
+            height: 2,
+            hotspot: (2, 2),
+            format: CursorPixelFormat::Rgba8,
+            pixels: vec![0xFF; 2 * 2 * 4],
+        };
+
+        let out = rescale_shape_to_frame(shape, (1, 1), (100_000, 100_000));
+
+        assert_eq!(out.width, 128);
+        assert_eq!(out.height, 128);
+        assert_eq!(out.hotspot, (128, 128));
+        assert_eq!(out.pixels.len(), MAX_CURSOR_SHAPE_BYTES);
     }
 }

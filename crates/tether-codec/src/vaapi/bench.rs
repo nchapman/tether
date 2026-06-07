@@ -314,25 +314,25 @@ fn run_cell(codec: CodecKind, width: u32, height: u32, fps: u32, bitrate_kbps: u
 }
 
 #[test]
-#[ignore = "VAAPI benchmark (1080p60 H.264). Run: cargo test -p tether-codec --lib bench -- --ignored --nocapture"]
+#[ignore = "perf: VAAPI benchmark (1080p60 H.264); run with: cargo test -p tether-codec --lib bench -- --ignored --nocapture"]
 fn bench_h264_1080p60() {
     run_cell(CodecKind::H264, 1920, 1080, 60, 8_000);
 }
 
 #[test]
-#[ignore = "VAAPI benchmark (1080p60 HEVC). Run: cargo test -p tether-codec --lib bench -- --ignored --nocapture"]
+#[ignore = "perf: VAAPI benchmark (1080p60 HEVC); run with: cargo test -p tether-codec --lib bench -- --ignored --nocapture"]
 fn bench_hevc_1080p60() {
     run_cell(CodecKind::Hevc, 1920, 1080, 60, 8_000);
 }
 
 #[test]
-#[ignore = "VAAPI benchmark (4K60 H.264). Run: cargo test -p tether-codec --lib bench -- --ignored --nocapture"]
+#[ignore = "perf: VAAPI benchmark (4K60 H.264); run with: cargo test -p tether-codec --lib bench -- --ignored --nocapture"]
 fn bench_h264_4k60() {
     run_cell(CodecKind::H264, 3840, 2160, 60, 25_000);
 }
 
 #[test]
-#[ignore = "VAAPI benchmark (4K60 HEVC). Run: cargo test -p tether-codec --lib bench -- --ignored --nocapture"]
+#[ignore = "perf: VAAPI benchmark (4K60 HEVC); run with: cargo test -p tether-codec --lib bench -- --ignored --nocapture"]
 fn bench_hevc_4k60() {
     run_cell(CodecKind::Hevc, 3840, 2160, 60, 25_000);
 }

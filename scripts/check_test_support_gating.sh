@@ -18,7 +18,11 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
 # Discover every Cargo.toml in the workspace (members + apps).
-mapfile -t tomls < <(
+# Plain read loop instead of `mapfile`: macOS ships bash 3.2, which has no `mapfile`.
+tomls=()
+while IFS= read -r toml; do
+  tomls+=("$toml")
+done < <(
   find . -name Cargo.toml \
     -not -path './target/*' \
     -not -path './.git/*' \

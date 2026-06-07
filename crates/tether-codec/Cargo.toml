@@ -96,6 +96,10 @@ pollster = "0.4"
 # encode_gpu path. Only the Video* interfaces are needed — the base
 # device/texture types come through as raw pointers from tether-capture.
 [target.'cfg(target_os = "windows")'.dependencies]
+# Runtime dlopen of nvcuda.dll to read NVIDIA GPU compute capability, gating
+# `av1_nvenc` on Ada+ hardware before FFmpeg init (see `d3d11::nvenc_caps`).
+# dlopen rather than link-time so a non-NVIDIA host has no CUDA dependency.
+libloading = "0.8"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D11",

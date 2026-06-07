@@ -929,7 +929,7 @@ mod tests {
     /// surface descriptor (LINEAR modifier, plane pitches ≥ width). `#[ignore]`
     /// — needs an NVIDIA GPU + a Vulkan dma-buf device.
     #[test]
-    #[ignore = "requires NVIDIA GPU + Vulkan dma-buf"]
+    #[ignore = "requires NVIDIA GPU + Vulkan dma-buf; run with: cargo test -p tether-codec -- --ignored"]
     fn acquire_exhausts_then_release_reuses_slots() {
         if !require_nvidia_gpu("acquire_exhausts_then_release_reuses_slots") {
             return;
@@ -989,7 +989,7 @@ mod tests {
     /// EGL/CUDA pinning proofs in `nvenc::tests`. Sets the process GPU pin, so
     /// run it in isolation. `#[ignore]` — needs an NVIDIA GPU + Vulkan.
     #[test]
-    #[ignore = "requires NVIDIA GPU + Vulkan; sets the process GPU pin (run in isolation)"]
+    #[ignore = "requires NVIDIA GPU + Vulkan; sets the process GPU pin (run in isolation); run with: cargo test -p tether-codec -- --ignored"]
     fn surface_pool_allocates_on_the_pinned_gpu() {
         use crate::nvenc::gpu_pin;
 

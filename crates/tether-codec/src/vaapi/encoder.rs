@@ -153,11 +153,8 @@ impl VaapiEncoder {
         let codec = AVCodec::find_encoder_by_name(codec_cname)
             .ok_or(CodecError::CodecNotFound(vaapi_codec_name(kind)))?;
 
-        // Default VAAPI device (typically /dev/dri/renderD128). None
-        // lets FFmpeg pick — explicit device strings only matter on
-        // multi-GPU systems, which we'll handle when a user with that
-        // setup hits us up.
-        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_VAAPI, None, None, 0)?;
+        let hw_device = super::device::create_hw_device()?;
+        super::device::ensure_encode_entrypoint(&hw_device, profile)?;
 
         let width_i32 = i32::try_from(width).expect("width fits in i32");
         let height_i32 = i32::try_from(height).expect("height fits in i32");

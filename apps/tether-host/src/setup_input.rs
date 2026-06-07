@@ -193,3 +193,36 @@ async fn connect_after_grant() -> Option<Box<dyn Injector>> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_install_hint_embeds_packaged_rule() {
+        let hint = manual_install_hint();
+
+        assert!(hint.contains(RULE_PATH));
+        assert!(hint.contains("sudo tee"));
+        assert!(hint.contains("udevadm control --reload-rules"));
+        assert!(hint.contains("modprobe uinput"));
+        assert!(
+            hint.contains(RULE),
+            "installed/AppImage users do not have a source checkout, so the hint must embed the rule body"
+        );
+        assert!(
+            !hint.contains("packaging/linux/udev"),
+            "manual fallback must not point at a source-tree path"
+        );
+    }
+
+    #[test]
+    fn packaged_rule_matches_runtime_rule_bytes() {
+        let packaged = include_str!("../../../packaging/linux/udev/60-tether-uinput.rules");
+        assert_eq!(RULE, packaged);
+        assert!(
+            RULE.contains("uinput"),
+            "runtime rule should be the packaged uinput access rule, not an empty placeholder"
+        );
+    }
+}

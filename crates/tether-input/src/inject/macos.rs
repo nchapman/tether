@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a live macOS main display"]
+    #[ignore = "requires a live macOS main display; run with: cargo test -p tether-input -- --ignored"]
     fn main_display_query_returns_sane_point_dims() {
         // Sanity anchor for the real query: on any Mac with a display it
         // yields non-zero point dims. Logical points are never larger

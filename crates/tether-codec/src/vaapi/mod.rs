@@ -39,6 +39,7 @@
 //! that `submit_dmabuf` re-imports via DRM_PRIME → VAAPI.
 
 mod decoder;
+mod device;
 mod encoder;
 mod ffi;
 

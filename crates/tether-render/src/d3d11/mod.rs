@@ -1195,6 +1195,68 @@ mod tests {
     use super::*;
     use tether_protocol::control::{CodecKind, VideoColorSpec};
 
+    const VENDOR_INTEL: u32 = 0x8086;
+    const VENDOR_AMD: u32 = 0x1002;
+    const VENDOR_NVIDIA: u32 = 0x10de;
+
+    enum VendorVideoDevice {
+        Ready((ID3D11Device, ID3D11DeviceContext)),
+        Absent,
+        Unusable(windows::core::Error),
+    }
+
+    fn video_device_for_vendor(vendor_id: u32) -> VendorVideoDevice {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+        use windows::Win32::Graphics::Direct3D11::{
+            ID3D11Multithread, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        };
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("CreateDXGIFactory1");
+        let mut adapter_idx = 0u32;
+        let mut last_create_err = None;
+
+        while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_idx) } {
+            adapter_idx += 1;
+            let desc = unsafe { adapter.GetDesc1() }.expect("IDXGIAdapter1::GetDesc1");
+            if desc.VendorId != vendor_id {
+                continue;
+            }
+
+            let mut device = None;
+            let mut context = None;
+            if let Err(e) = unsafe {
+                D3D11CreateDevice(
+                    &adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            } {
+                last_create_err = Some(e);
+                continue;
+            }
+
+            let device = device.unwrap();
+            let context = context.unwrap();
+            if let Ok(mt) = device.cast::<ID3D11Multithread>() {
+                let _ = unsafe { mt.SetMultithreadProtected(true) };
+            }
+            return VendorVideoDevice::Ready((device, context));
+        }
+
+        match last_create_err {
+            Some(e) => VendorVideoDevice::Unusable(e),
+            None => VendorVideoDevice::Absent,
+        }
+    }
+
     /// Pins the renderer's decode-format → plane-SRV table against the
     /// real `DXGI_FORMAT` constants: NV12 (8-bit) samples through R8 luma
     /// plus R8G8 chroma; P010 (10-bit MSB-aligned) through R16 plus R16G16
@@ -1244,7 +1306,7 @@ mod tests {
     /// if it's the expected gray, the black-screen loopback bug is
     /// swapchain/present-side (or decoder-export-side).
     #[test]
-    #[ignore = "requires D3D11 GPU (Windows)"]
+    #[ignore = "requires D3D11 GPU (Windows); run with: cargo test -p tether-render -- --ignored"]
     fn synthetic_nv12_renders_non_black_gray() {
         let (w, h) = (64u32, 64u32);
         let mut state = D3D11RenderState::new_headless(w, h, VideoColorSpec::sdr_bt709(), 8)
@@ -1281,7 +1343,7 @@ mod tests {
     /// Exercises sprite upload → SRV → alpha-blend draw on top of the
     /// video, and that the blend state doesn't bleed onto the video.
     #[test]
-    #[ignore = "requires D3D11 GPU (Windows)"]
+    #[ignore = "requires D3D11 GPU (Windows); run with: cargo test -p tether-render -- --ignored"]
     fn cursor_overlay_composites_over_video() {
         let (w, h) = (64u32, 64u32);
         let mut state = D3D11RenderState::new_headless(w, h, VideoColorSpec::sdr_bt709(), 8)
@@ -1339,21 +1401,38 @@ mod tests {
     /// decoder-export corruption (wrong array slice / plane / format) and
     /// renderer sampling bugs — a uniform-green or scrambled result blows
     /// the residual far past the quantisation floor. Windows analog of the
-    /// Linux `dmabuf_test` roundtrip. Intel-only (QSV); SKIPs elsewhere.
+    /// Linux `dmabuf_test` roundtrip. These historical test names are the
+    /// Intel/QSV cells; AMD/NVIDIA siblings below bind to their own adapters.
     ///
     /// Run at both bit depths via the two `#[test]` wrappers below: 8-bit
     /// exercises the NV12 → R8/R8G8 path, 10-bit the P010 → R16/R16G16
     /// path (Main10 decode + the shader's limited-range-10 branch).
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_coord_fixture_decode_render_roundtrip_8bit() {
-        d3d11_roundtrip(CodecKind::Hevc, 8, false, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "hevc_qsv",
+            CodecKind::Hevc,
+            8,
+            false,
+            None,
+        );
     }
 
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10)"]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10); run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_coord_fixture_decode_render_roundtrip_10bit() {
-        d3d11_roundtrip(CodecKind::Hevc, 10, false, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "hevc_qsv",
+            CodecKind::Hevc,
+            10,
+            false,
+            None,
+        );
     }
 
     /// Client upscale: decode at video dims (1280×720) and render into a
@@ -1363,9 +1442,31 @@ mod tests {
     /// scale/letterbox math, not just that pixels survive. Mirrors the Linux
     /// `*_client_upscale` dma-buf cells.
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_hevc_client_upscale_render_roundtrip_8bit() {
-        d3d11_roundtrip(CodecKind::Hevc, 8, false, Some((1920, 1080)));
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "hevc_qsv",
+            CodecKind::Hevc,
+            8,
+            false,
+            Some((1920, 1080)),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_hevc_client_upscale_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "hevc_qsv",
+            CodecKind::Hevc,
+            10,
+            false,
+            Some((1920, 1080)),
+        );
     }
 
     /// Surface below video: decode at 1280×720 and render into a smaller
@@ -1374,9 +1475,31 @@ mod tests {
     /// from the upscale path above. Mirrors the Linux
     /// `h264_8bit_surface_below_video` cell.
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_hevc_surface_below_video_render_roundtrip_8bit() {
-        d3d11_roundtrip(CodecKind::Hevc, 8, false, Some((960, 540)));
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "hevc_qsv",
+            CodecKind::Hevc,
+            8,
+            false,
+            Some((960, 540)),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_hevc_surface_below_video_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "hevc_qsv",
+            CodecKind::Hevc,
+            10,
+            false,
+            Some((960, 540)),
+        );
     }
 
     /// Colour-decode validation: red/green/blue/white bars through the
@@ -1385,15 +1508,31 @@ mod tests {
     /// swap; the white bar here can. Shared pattern with macOS/Linux via
     /// `crate::color_fixture`. Windows is 4:2:0 only (NV12 / P010).
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_colorbars_decode_render_roundtrip_8bit() {
-        d3d11_roundtrip(CodecKind::Hevc, 8, true, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "hevc_qsv",
+            CodecKind::Hevc,
+            8,
+            true,
+            None,
+        );
     }
 
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10)"]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11 (Main10); run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_colorbars_decode_render_roundtrip_10bit() {
-        d3d11_roundtrip(CodecKind::Hevc, 10, true, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "hevc_qsv",
+            CodecKind::Hevc,
+            10,
+            true,
+            None,
+        );
     }
 
     /// H.264 (the floor codec) through the full QSV encode → D3D11VA decode →
@@ -1402,45 +1541,354 @@ mod tests {
     /// coord-geometry + colour-bar pair at 8-bit. Guards the H.264 decode SRV
     /// + shader branch end-to-end, not just the codec round-trip.
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_h264_coord_fixture_decode_render_roundtrip_8bit() {
-        d3d11_roundtrip(CodecKind::H264, 8, false, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "h264_qsv",
+            CodecKind::H264,
+            8,
+            false,
+            None,
+        );
     }
 
     #[test]
-    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11"]
+    #[ignore = "requires Intel QSV (Windows) + working oneVPL-over-D3D11; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_h264_colorbars_decode_render_roundtrip_8bit() {
-        d3d11_roundtrip(CodecKind::H264, 8, true, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "h264_qsv",
+            CodecKind::H264,
+            8,
+            true,
+            None,
+        );
     }
 
     /// AV1 through the full av1_qsv encode → D3D11VA AV1 decode → native render
     /// path, at 8-bit (NV12) and 10-bit (P010). AV1 carries its sequence header
     /// in-band (no extradata), so this also guards that the in-band path stays
-    /// self-decodable through render. Needs an AV1-encode GPU (Intel Arc /
-    /// Lunar Lake+, AMD RDNA 3+, NVIDIA Ada); skips via the encoder's vendor
-    /// fallback otherwise.
+    /// self-decodable through render. These wrappers are the Intel/QSV cells;
+    /// the AMF/NVENC AV1 cells below cover AMD RDNA 3+ and NVIDIA Ada+.
     #[test]
-    #[ignore = "requires AV1-encode QSV (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
+    #[ignore = "requires AV1-encode QSV (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_av1_coord_fixture_decode_render_roundtrip_8bit() {
-        d3d11_roundtrip(CodecKind::Av1, 8, false, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "av1_qsv",
+            CodecKind::Av1,
+            8,
+            false,
+            None,
+        );
     }
 
     #[test]
-    #[ignore = "requires AV1-encode QSV (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
+    #[ignore = "requires AV1-encode QSV (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_av1_colorbars_decode_render_roundtrip_8bit() {
-        d3d11_roundtrip(CodecKind::Av1, 8, true, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "av1_qsv",
+            CodecKind::Av1,
+            8,
+            true,
+            None,
+        );
     }
 
     #[test]
-    #[ignore = "requires AV1-encode QSV 10-bit (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
+    #[ignore = "requires AV1-encode QSV 10-bit (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_av1_coord_fixture_decode_render_roundtrip_10bit() {
-        d3d11_roundtrip(CodecKind::Av1, 10, false, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "av1_qsv",
+            CodecKind::Av1,
+            10,
+            false,
+            None,
+        );
     }
 
     #[test]
-    #[ignore = "requires AV1-encode QSV 10-bit (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode"]
+    #[ignore = "requires AV1-encode QSV 10-bit (Intel Arc / Lunar Lake+) + D3D11VA AV1 decode; run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_av1_colorbars_decode_render_roundtrip_10bit() {
-        d3d11_roundtrip(CodecKind::Av1, 10, true, None);
+        d3d11_roundtrip(
+            VENDOR_INTEL,
+            "Intel",
+            "av1_qsv",
+            CodecKind::Av1,
+            10,
+            true,
+            None,
+        );
+    }
+
+    /// AMF-backed full render path. The codec crate already proves AMF can
+    /// encode/decode on AMD hardware; these cells add the missing renderer leg:
+    /// AMF encode → D3D11VA decode → shared-handle export → native render.
+    #[test]
+    #[ignore = "requires AMD GPU with AMF HEVC encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_hevc_coord_fixture_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_AMD,
+            "AMD",
+            "hevc_amf",
+            CodecKind::Hevc,
+            8,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF HEVC encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_hevc_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_AMD,
+            "AMD",
+            "hevc_amf",
+            CodecKind::Hevc,
+            8,
+            true,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF HEVC Main10 encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_hevc_coord_fixture_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_AMD,
+            "AMD",
+            "hevc_amf",
+            CodecKind::Hevc,
+            10,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF HEVC Main10 encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_hevc_colorbars_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_AMD,
+            "AMD",
+            "hevc_amf",
+            CodecKind::Hevc,
+            10,
+            true,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF H.264 encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_h264_coord_fixture_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_AMD,
+            "AMD",
+            "h264_amf",
+            CodecKind::H264,
+            8,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF H.264 encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_h264_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_AMD,
+            "AMD",
+            "h264_amf",
+            CodecKind::H264,
+            8,
+            true,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 encode/decode (Windows, RDNA 3+); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_av1_coord_fixture_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(VENDOR_AMD, "AMD", "av1_amf", CodecKind::Av1, 8, false, None);
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 encode/decode (Windows, RDNA 3+); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_av1_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(VENDOR_AMD, "AMD", "av1_amf", CodecKind::Av1, 8, true, None);
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 10-bit encode/decode (Windows, RDNA 3+); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_av1_coord_fixture_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_AMD,
+            "AMD",
+            "av1_amf",
+            CodecKind::Av1,
+            10,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AMD GPU with AMF AV1 10-bit encode/decode (Windows, RDNA 3+); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_amf_av1_colorbars_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(VENDOR_AMD, "AMD", "av1_amf", CodecKind::Av1, 10, true, None);
+    }
+
+    /// NVENC-backed full render path. These mirror the AMF cells so an
+    /// NVIDIA Windows host proves more than codec viability: the decoded
+    /// D3D11VA surfaces must survive cross-device render and color sampling.
+    #[test]
+    #[ignore = "requires NVIDIA GPU with NVENC HEVC encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_hevc_coord_fixture_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "hevc_nvenc",
+            CodecKind::Hevc,
+            8,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU with NVENC HEVC encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_hevc_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "hevc_nvenc",
+            CodecKind::Hevc,
+            8,
+            true,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU with NVENC HEVC Main10 encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_hevc_coord_fixture_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "hevc_nvenc",
+            CodecKind::Hevc,
+            10,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU with NVENC HEVC Main10 encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_hevc_colorbars_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "hevc_nvenc",
+            CodecKind::Hevc,
+            10,
+            true,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU with NVENC H.264 encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_h264_coord_fixture_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "h264_nvenc",
+            CodecKind::H264,
+            8,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU with NVENC H.264 encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_h264_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "h264_nvenc",
+            CodecKind::H264,
+            8,
+            true,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA Ada+ GPU with AV1 NVENC encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_av1_coord_fixture_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "av1_nvenc",
+            CodecKind::Av1,
+            8,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA Ada+ GPU with AV1 NVENC encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_av1_colorbars_decode_render_roundtrip_8bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "av1_nvenc",
+            CodecKind::Av1,
+            8,
+            true,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA Ada+ GPU with AV1 NVENC 10-bit encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_av1_coord_fixture_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "av1_nvenc",
+            CodecKind::Av1,
+            10,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA Ada+ GPU with AV1 NVENC 10-bit encode/decode (Windows); run with: cargo test -p tether-render -- --ignored"]
+    fn d3d11_nvenc_av1_colorbars_decode_render_roundtrip_10bit() {
+        d3d11_roundtrip(
+            VENDOR_NVIDIA,
+            "NVIDIA",
+            "av1_nvenc",
+            CodecKind::Av1,
+            10,
+            true,
+            None,
+        );
     }
 
     /// Decode a checked-in grey fixture and render it through the FULL
@@ -1454,7 +1902,7 @@ mod tests {
     // rather than duplicating binaries. The path is resolved at compile time,
     // so a move/rename in `tether-probe` is a loud build error, not silent rot.
     #[test]
-    #[ignore = "requires D3D11VA AV1 decode (RDNA 2+ / Ada / Arc, Windows)"]
+    #[ignore = "requires D3D11VA AV1 decode (RDNA 2+ / Ada / Arc, Windows); run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_av1_fixture_decode_render_crossdevice_10bit() {
         const FIXTURE: &[u8] =
             include_bytes!("../../../tether-probe/fixtures/probe/av1_yuv420_10bit.idr");
@@ -1462,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D3D11VA HEVC Main10 decode (Windows)"]
+    #[ignore = "requires D3D11VA HEVC Main10 decode (Windows); run with: cargo test -p tether-render -- --ignored"]
     fn d3d11_hevc_fixture_decode_render_crossdevice_10bit() {
         const FIXTURE: &[u8] =
             include_bytes!("../../../tether-probe/fixtures/probe/hevc_yuv420_10bit.idr");
@@ -1539,6 +1987,9 @@ mod tests {
     /// the encode/decode/render measurement is pure). `Some(dims)` larger than
     /// the video drives the renderer's upscale + letterbox path.
     fn d3d11_roundtrip(
+        vendor_id: u32,
+        vendor_name: &str,
+        expected_backend: &str,
         codec: CodecKind,
         bit_depth: u8,
         colorbars: bool,
@@ -1551,54 +2002,30 @@ mod tests {
             coord_fixture_fill, coord_fixture_residual_px_rms, LetterboxMap,
         };
         use windows::core::Interface;
-        use windows::Win32::Foundation::HMODULE;
-        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-        use windows::Win32::Graphics::Direct3D11::{
-            D3D11CreateDevice, ID3D11Multithread, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
-            D3D11_USAGE_DEFAULT,
-        };
+        use windows::Win32::Graphics::Direct3D11::{D3D11_SUBRESOURCE_DATA, D3D11_USAGE_DEFAULT};
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
         };
-        use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 
-        const VENDOR_INTEL: u32 = 0x8086;
         let (w, h) = (1280u32, 720u32);
 
-        // Shared video device for the QSV encoder (VIDEO_SUPPORT + the
-        // multithread protection QSV requires on a derived device).
-        let mut device = None;
-        let mut context = None;
-        unsafe {
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-        }
-        .expect("D3D11CreateDevice");
-        let device: ID3D11Device = device.unwrap();
-        let context = context.unwrap();
-        if let Ok(mt) = device.cast::<ID3D11Multithread>() {
-            let _ = unsafe { mt.SetMultithreadProtected(true) };
-        }
-
-        let vendor = unsafe {
-            let dxgi: IDXGIDevice = device.cast().unwrap();
-            let adapter: IDXGIAdapter = dxgi.GetAdapter().unwrap();
-            adapter.GetDesc().map(|d| d.VendorId).unwrap_or(0)
+        let (device, context) = match video_device_for_vendor(vendor_id) {
+            VendorVideoDevice::Ready(dev) => dev,
+            VendorVideoDevice::Absent => {
+                eprintln!(
+                    "SKIP {expected_backend}: no {vendor_name} GPU (0x{vendor_id:04x}) present; \
+                     run on matching hardware"
+                );
+                return;
+            }
+            VendorVideoDevice::Unusable(e) => {
+                eprintln!(
+                    "SKIP {expected_backend}: {vendor_name} GPU (0x{vendor_id:04x}) present but \
+                     D3D11CreateDevice (UNKNOWN driver, VIDEO_SUPPORT) failed: {e}"
+                );
+                return;
+            }
         };
-        if vendor != VENDOR_INTEL {
-            eprintln!("SKIP: GPU vendor 0x{vendor:04x} != Intel; run on a QSV-capable GPU");
-            return;
-        }
 
         // BGRA source at capture==encode dims (identity VP scale keeps
         // the metric a pure encode/decode/render measurement).
@@ -1639,12 +2066,7 @@ mod tests {
             chroma: ChromaSubsampling::Yuv420,
             bit_depth,
         };
-        let expected_backend = match codec {
-            CodecKind::H264 => "h264_qsv",
-            CodecKind::Hevc => "hevc_qsv",
-            CodecKind::Av1 => "av1_qsv",
-        };
-        let mut enc = D3D11Encoder::new(
+        let mut enc = match D3D11Encoder::new(
             profile,
             w,
             h,
@@ -1652,15 +2074,33 @@ mod tests {
             8000,
             device.as_raw() as *mut _,
             context.as_raw() as *mut _,
-            VENDOR_INTEL,
-        )
-        .expect("QSV encoder");
-        assert_eq!(
-            enc.name(),
-            expected_backend,
-            "QSV unavailable; got {}",
-            enc.name()
-        );
+            vendor_id,
+        ) {
+            Ok(enc) => enc,
+            Err(e) if expected_backend.starts_with("av1") => {
+                eprintln!(
+                    "SKIP {expected_backend}: {vendor_name} GPU/driver cannot open AV1 hardware \
+                     encode for the render roundtrip: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("{expected_backend} encoder construction failed: {e}"),
+        };
+        if enc.name() != expected_backend {
+            if expected_backend.starts_with("av1") && enc.name().ends_with("_mf") {
+                eprintln!(
+                    "SKIP {expected_backend}: {vendor_name} GPU lacks AV1 hardware encode \
+                     (opened {}); needs Intel Arc / AMD RDNA 3+ / NVIDIA Ada",
+                    enc.name()
+                );
+                return;
+            }
+            panic!(
+                "{vendor_name} GPU (0x{vendor_id:04x}) should open {expected_backend}, got {}; \
+                 the render roundtrip must not pass through Media Foundation fallback",
+                enc.name()
+            );
+        }
 
         let mut dec = D3D11Decoder::new(codec, true).expect("decoder");
         let frame_desc = D3D11TextureFrame {

@@ -77,7 +77,7 @@ impl VaapiDecoder {
             return Err(CodecError::CodecNotFound(vaapi_decoder_name(kind)));
         }
 
-        let hw_device = AVHWDeviceContext::create(ffi::AV_HWDEVICE_TYPE_VAAPI, None, None, 0)?;
+        let hw_device = super::device::create_hw_device()?;
 
         let mut decoder = AVCodecContext::new(&codec);
         // Cloning an AVHWDeviceContext is an av_buffer_ref under the

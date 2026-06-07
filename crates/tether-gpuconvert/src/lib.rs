@@ -649,31 +649,31 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a working wgpu adapter (run on a machine with a real GPU)"]
+    #[ignore = "requires a working wgpu adapter (run on a machine with a real GPU); run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_black() {
         check_solid(64, 64, 0, 0, 0);
     }
 
     #[test]
-    #[ignore = "requires a working wgpu adapter"]
+    #[ignore = "requires a working wgpu adapter; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_white() {
         check_solid(64, 64, 255, 255, 255);
     }
 
     #[test]
-    #[ignore = "requires a working wgpu adapter"]
+    #[ignore = "requires a working wgpu adapter; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_red() {
         check_solid(64, 64, 0, 0, 255);
     }
 
     #[test]
-    #[ignore = "requires a working wgpu adapter"]
+    #[ignore = "requires a working wgpu adapter; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_green() {
         check_solid(64, 64, 0, 255, 0);
     }
 
     #[test]
-    #[ignore = "requires a working wgpu adapter"]
+    #[ignore = "requires a working wgpu adapter; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_solid_blue() {
         check_solid(64, 64, 255, 0, 0);
     }
@@ -682,7 +682,7 @@ mod tests {
     /// that spatial layout survives the conversion + 2×2 chroma
     /// averaging (the boundary column averages to magenta).
     #[test]
-    #[ignore = "requires a working wgpu adapter"]
+    #[ignore = "requires a working wgpu adapter; run with: cargo test -p tether-gpuconvert -- --ignored"]
     fn convert_split_red_blue() {
         let w = 64u32;
         let h = 32u32;

@@ -67,7 +67,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
 
 use tether_codec::vaapi::VaapiEncoder;
-use tether_codec::{Encoder, GpuFrameGuard, GpuFrameSource};
+use tether_codec::{Decoder, Encoder, Frame as CodecFrame, GpuFrameGuard, GpuFrameSource};
 use tether_protocol::control::{ChromaSubsampling, CodecKind, VideoColorSpec, VideoProfile};
 
 use crate::gpu::GpuState;
@@ -181,7 +181,7 @@ fn assert_colorbars_outcome(case: &RoundtripCase, result: RoundtripResult) {
     }
 }
 
-/// Build an identity (no-scaler) colour-bar case at 1920×1200 for
+/// Build an identity (no-scaler) colour-bar case at 640×480 for
 /// `profile` with the given capability prereqs. `floors` is unused by
 /// the colour assertion but required by the struct; `FLOOR_IDENTITY`
 /// keeps it honest if a future edit routes this through `assert_outcome`.
@@ -194,9 +194,9 @@ fn colorbars_case(
         name,
         profile,
         fixture: Fixture::ColorBars,
-        capture_dims: (1920, 1200),
-        encode_dims: (1920, 1200),
-        surface_dims: (1920, 1200),
+        capture_dims: (640, 480),
+        encode_dims: (640, 480),
+        surface_dims: (640, 480),
         frames_encoded: 6,
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
@@ -206,7 +206,7 @@ fn colorbars_case(
 }
 
 #[test]
-#[ignore = "requires VAAPI H.264 + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI H.264 + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_colorbars_h264_8bit() {
     let case = colorbars_case(
         "colorbars_h264_8bit",
@@ -224,7 +224,7 @@ fn roundtrip_colorbars_h264_8bit() {
 /// can't catch a hue cast or Cb/Cr swap; this is the AV1 colour guard.
 /// SKIPs (via `Capability::VaapiAv1`) on drivers without AV1 encode.
 #[test]
-#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA3+) + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA3+) + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_colorbars_av1_8bit() {
     let case = colorbars_case(
         "colorbars_av1_8bit",
@@ -245,7 +245,7 @@ fn roundtrip_colorbars_av1_8bit() {
 /// Lake. SKIPs only where the driver lacks AV1 10-bit encode or R16/Rg16
 /// storage.
 #[test]
-#[ignore = "requires VAAPI AV1 10-bit encode + storage R16/Rg16 + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI AV1 10-bit encode + storage R16/Rg16 + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_colorbars_av1_10bit() {
     let case = colorbars_case(
         "colorbars_av1_10bit",
@@ -260,7 +260,7 @@ fn roundtrip_colorbars_av1_10bit() {
 }
 
 #[test]
-#[ignore = "requires VAAPI HEVC Main + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HEVC Main + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_colorbars_hevc_main_8bit() {
     let case = colorbars_case(
         "colorbars_hevc_main_8bit",
@@ -271,7 +271,7 @@ fn roundtrip_colorbars_hevc_main_8bit() {
 }
 
 #[test]
-#[ignore = "requires VAAPI HEVC Main 10 (P010) + storage R16/Rg16"]
+#[ignore = "requires VAAPI HEVC Main 10 (P010) + storage R16/Rg16; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_colorbars_hevc_main10() {
     let case = colorbars_case(
         "colorbars_hevc_main10",
@@ -286,7 +286,7 @@ fn roundtrip_colorbars_hevc_main10() {
 }
 
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 8-bit (XYUV) + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 8-bit (XYUV) + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_colorbars_hevc_main444_8bit() {
     let case = colorbars_case(
         "colorbars_hevc_main444_8bit",
@@ -300,7 +300,7 @@ fn roundtrip_colorbars_hevc_main444_8bit() {
 /// via `Bgra2Xv30DmaBuf`. If the host miscolors 4:4:4 10-bit, the white
 /// bar comes back tinted here even though SSIM/geom stay green.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit (XV30) + storage R16/Rg16 + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit (XV30) + storage R16/Rg16 + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_colorbars_hevc_main444_10bit() {
     let case = colorbars_case(
         "colorbars_hevc_main444_10bit",
@@ -325,7 +325,7 @@ fn roundtrip_colorbars_hevc_main444_10bit() {
 /// shader path, pinning the decode side to the standard. Decode-conformant
 /// here + a passing round-trip above ⟹ the encode side is conformant too.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit (Y410) + storage R16/Rg16 + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit (Y410) + storage R16/Rg16 + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn decode_reference_colorbars_hevc_main444_10bit() {
     const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_10bit_1920x1200.idr");
     let dims = (1920, 1200);
@@ -360,7 +360,7 @@ fn decode_reference_colorbars_hevc_main444_10bit() {
 /// this 8-bit anchor; Linux only had the 10-bit one. See the
 /// fixtures/README "Linux/Windows render tests" note.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 8-bit (XYUV) + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 8-bit (XYUV) + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn decode_reference_colorbars_hevc_main444_8bit() {
     const FIXTURE: &[u8] = include_bytes!("../fixtures/colorbars_hevc_yuv444_8bit.idr");
     let dims = (128, 128);
@@ -382,6 +382,156 @@ fn decode_reference_colorbars_hevc_main444_8bit() {
     );
 }
 
+fn render_nvdec_fixture(profile: VideoProfile, bitstream: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if !tether_codec::nvenc::nvidia_gpu_present() {
+        eprintln!("SKIPPED NVDEC render fixture: no NVIDIA GPU present");
+        return None;
+    }
+
+    let mut dec = match tether_codec::nvdec::NvdecDecoder::new(profile.codec) {
+        Ok(dec) => dec,
+        Err(e) => {
+            eprintln!("SKIPPED NVDEC render fixture: decoder construction failed: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = dec.submit(bitstream) {
+        eprintln!("SKIPPED NVDEC render fixture: submit failed: {e}");
+        return None;
+    }
+    if let Err(e) = dec.signal_eof() {
+        eprintln!("SKIPPED NVDEC render fixture: signal_eof failed: {e}");
+        return None;
+    }
+
+    let mut decoded = None;
+    for _ in 0..8 {
+        match dec.next_frame() {
+            Ok(Some(CodecFrame::Gpu(g))) => decoded = Some(g),
+            Ok(Some(CodecFrame::Cpu(_))) => {
+                panic!("NVDEC render fixture produced a CPU frame — hardware path regressed");
+            }
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("SKIPPED NVDEC render fixture: next_frame failed: {e}");
+                return None;
+            }
+        }
+    }
+    let Some(decoded) = decoded else {
+        eprintln!("SKIPPED NVDEC render fixture: decoder produced no GPU frame");
+        return None;
+    };
+    let (w, h, _pts, source, guard) = decoded.into_parts();
+    let Some((device, queue)) =
+        pollster::block_on(try_init_wgpu_for_dmabuf(profile.bit_depth)).map(|(d, q, _)| (d, q))
+    else {
+        eprintln!(
+            "SKIPPED NVDEC render fixture: wgpu adapter lacks dma-buf import{}",
+            if profile.bit_depth == 10 {
+                " or 16-bit texture support"
+            } else {
+                ""
+            }
+        );
+        return None;
+    };
+
+    let mut renderer = match GpuState::new_headless(
+        device.clone(),
+        queue,
+        (w, h),
+        VideoColorSpec::sdr_desktop(),
+        profile.chroma,
+        profile.bit_depth,
+    ) {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln!("SKIPPED NVDEC render fixture: headless renderer unavailable: {e}");
+            return None;
+        }
+    };
+    renderer
+        .apply_frame(Frame::Gpu(GpuFrame {
+            width: w,
+            height: h,
+            t_capture_client_clock: None,
+            source,
+            guard,
+        }))
+        .expect("apply NVDEC frame");
+    renderer.render().expect("render NVDEC frame");
+    Some((readback_offscreen(&renderer, &device), w, h))
+}
+
+fn assert_neutral_grey_bgra(label: &str, bgra: &[u8], w: u32, h: u32) {
+    for (x0, y0) in [(w / 4, h / 4), (w / 2, h / 2), (w * 3 / 4, h * 3 / 4)] {
+        let sample_w = (w / 16).max(8).min(w - x0);
+        let sample_h = (h / 16).max(8).min(h - y0);
+        let rgb = crate::color_fixture::region_average_rgb(
+            bgra,
+            w,
+            crate::color_fixture::ChannelOrder::Bgra,
+            x0,
+            y0,
+            sample_w,
+            sample_h,
+        );
+        let (r, g, b) = rgb;
+        let min = r.min(g).min(b);
+        let spread = r.max(g).max(b) - min;
+        eprintln!("{label}: sample ({x0},{y0}) rgb={rgb:?}");
+        assert!(
+            min > 40 && spread < 48,
+            "{label}: expected neutral non-black grey at ({x0},{y0}), got {rgb:?}"
+        );
+    }
+}
+
+/// NVIDIA Linux decode → dma-buf export → wgpu render for H.264. Codec tests
+/// compare NVDEC luma against software decode; this cell adds the renderer's
+/// import/shader/readback leg on the actual NVDEC-exported dma-buf.
+#[test]
+#[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
+fn nvdec_h264_fixture_decode_render_roundtrip() {
+    const FIXTURE: &[u8] = include_bytes!("../../tether-probe/fixtures/probe/h264_yuv420_8bit.idr");
+    let Some((bgra, w, h)) = render_nvdec_fixture(H264_8BIT_420, FIXTURE) else {
+        return;
+    };
+    assert_neutral_grey_bgra("NVDEC H.264 8-bit", &bgra, w, h);
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
+fn nvdec_hevc_main10_fixture_decode_render_roundtrip() {
+    const FIXTURE: &[u8] =
+        include_bytes!("../../tether-probe/fixtures/probe/hevc_yuv420_10bit.idr");
+    let Some((bgra, w, h)) = render_nvdec_fixture(HEVC_MAIN10, FIXTURE) else {
+        return;
+    };
+    assert_neutral_grey_bgra("NVDEC HEVC Main10", &bgra, w, h);
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVDEC AV1 + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
+fn nvdec_av1_8bit_fixture_decode_render_roundtrip() {
+    const FIXTURE: &[u8] = include_bytes!("../../tether-probe/fixtures/probe/av1_yuv420_8bit.idr");
+    let Some((bgra, w, h)) = render_nvdec_fixture(AV1_8BIT_420, FIXTURE) else {
+        return;
+    };
+    assert_neutral_grey_bgra("NVDEC AV1 8-bit", &bgra, w, h);
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU + NVDEC AV1 10-bit + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
+fn nvdec_av1_10bit_fixture_decode_render_roundtrip() {
+    const FIXTURE: &[u8] = include_bytes!("../../tether-probe/fixtures/probe/av1_yuv420_10bit.idr");
+    let Some((bgra, w, h)) = render_nvdec_fixture(AV1_10BIT_420, FIXTURE) else {
+        return;
+    };
+    assert_neutral_grey_bgra("NVDEC AV1 10-bit", &bgra, w, h);
+}
+
 // =====================================================================
 // Renderer-only DMA-BUF colour cells
 //
@@ -395,7 +545,7 @@ fn decode_reference_colorbars_hevc_main444_8bit() {
 const SYNTHETIC_DMABUF_DIMS: (u32, u32) = (640, 360);
 
 #[test]
-#[ignore = "requires Vulkan DMA-BUF import + NV12 storage"]
+#[ignore = "requires Vulkan DMA-BUF import + NV12 storage; run with: cargo test -p tether-render -- --ignored"]
 fn renderer_import_colorbars_nv12_dmabuf() {
     let _ = tracing_subscriber::fmt::try_init();
     let (width, height) = SYNTHETIC_DMABUF_DIMS;
@@ -448,7 +598,7 @@ fn renderer_import_colorbars_nv12_dmabuf() {
 }
 
 #[test]
-#[ignore = "requires Vulkan DMA-BUF import + storage R16/Rg16"]
+#[ignore = "requires Vulkan DMA-BUF import + storage R16/Rg16; run with: cargo test -p tether-render -- --ignored"]
 fn renderer_import_colorbars_p010_dmabuf() {
     let _ = tracing_subscriber::fmt::try_init();
     let (width, height) = SYNTHETIC_DMABUF_DIMS;
@@ -651,7 +801,7 @@ const FIXTURE_PNG: &str = "test-pattern-3360x2100.png";
 /// supports it. Catches encoder/decoder/Biplanar8-import regressions
 /// without engaging either scaler stage.
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_h264_8bit_identity() {
     let case = RoundtripCase {
         name: "h264_8bit_identity",
@@ -675,7 +825,7 @@ fn roundtrip_h264_8bit_identity() {
 /// uniform-grey codec-level `av1_main_dmabuf_roundtrip` can't see.
 /// SKIPs on drivers without AV1 encode.
 #[test]
-#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA3+) + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI AV1 encode (Intel Arc / AMD RDNA3+) + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_av1_8bit_identity() {
     let case = RoundtripCase {
         name: "av1_8bit_identity",
@@ -698,7 +848,7 @@ fn roundtrip_av1_8bit_identity() {
 /// and the only AV1 10-bit geometry coverage anywhere. Verified green on
 /// Lunar Lake after the P010 UV-plane fourcc fix.
 #[test]
-#[ignore = "requires VAAPI AV1 10-bit encode + storage R16/Rg16 + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI AV1 10-bit encode + storage R16/Rg16 + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_av1_10bit_identity() {
     let case = RoundtripCase {
         name: "av1_10bit_identity",
@@ -723,7 +873,7 @@ fn roundtrip_av1_10bit_identity() {
 /// HEVC Main 4:2:0 8-bit identity. Same shape as H.264 above but
 /// through the HEVC encoder/decoder pair.
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_hevc_main_8bit_identity() {
     let case = RoundtripCase {
         name: "hevc_main_8bit_identity",
@@ -745,7 +895,7 @@ fn roundtrip_hevc_main_8bit_identity() {
 /// `shader_yuv444.wgsl`. SKIPs cleanly on drivers without HEVC 4:4:4
 /// encode support (pre-Tiger Lake Intel / pre-VCN3 AMD).
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 (Intel Tiger Lake+ / AMD VCN3+)"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 (Intel Tiger Lake+ / AMD VCN3+); run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_hevc_main444_8bit_identity() {
     let case = RoundtripCase {
         name: "hevc_main444_8bit_identity",
@@ -770,15 +920,15 @@ fn roundtrip_hevc_main444_8bit_identity() {
 /// UV-plane fourcc (`GR32` vs FFmpeg's `RG1616`), fixed in
 /// `build_p010_dmabuf_frame`. Now runs; verified green on Lunar Lake.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16"]
+#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_hevc_main10_identity() {
     let case = RoundtripCase {
         name: "hevc_main10_identity",
         profile: HEVC_MAIN10,
         fixture: Fixture::CoordEncoded,
-        capture_dims: (1920, 1200),
-        encode_dims: (1920, 1200),
-        surface_dims: (1920, 1200),
+        capture_dims: (640, 480),
+        encode_dims: (640, 480),
+        surface_dims: (640, 480),
         frames_encoded: 6,
         assert_steady_state_eps: None,
         color_space: VideoColorSpec::sdr_desktop(),
@@ -806,7 +956,7 @@ fn roundtrip_hevc_main10_identity() {
 /// and runs green on Lunar Lake. SKIPs only where the driver lacks HEVC
 /// 4:4:4 10-bit encode.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Rgb10a2Unorm storage"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4 10-bit + Rgb10a2Unorm storage; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_hevc_main444_10bit_identity() {
     let case = RoundtripCase {
         name: "hevc_main444_10bit_identity",
@@ -834,7 +984,7 @@ fn roundtrip_hevc_main444_10bit_identity() {
 /// post-downscale check). Uses the PNG fixture so the photometric
 /// metrics have meaningful content to measure.
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_h264_8bit_host_scaler() {
     let case = RoundtripCase {
         name: "h264_8bit_host_scaler",
@@ -856,7 +1006,7 @@ fn roundtrip_h264_8bit_host_scaler() {
 /// `letterbox_scale` branch (gpu/mod.rs:1141) without engaging
 /// `need_upscale`. Separate arithmetic from the upscale branch.
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_h264_8bit_surface_below_video() {
     let case = RoundtripCase {
         name: "h264_8bit_surface_below_video",
@@ -887,7 +1037,7 @@ fn roundtrip_h264_8bit_surface_below_video() {
 /// manual sessions — geometric residual on the broken code goes to
 /// hundreds of pixels.
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import (Intel Mesa is a target — load-bearing queue.submit fix lives in render_to_view)"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import (Intel Mesa is a target — load-bearing queue.submit fix lives in render_to_view); run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_h264_8bit_client_upscale() {
     let case = RoundtripCase {
         name: "h264_8bit_client_upscale",
@@ -926,7 +1076,7 @@ fn roundtrip_h264_8bit_client_upscale() {
 /// (back-buffer rotation, present-time sync), this cell still passes
 /// and that tells us where to look next.
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_h264_8bit_upscale_no_scaler_branch() {
     let case = RoundtripCase {
         name: "h264_8bit_upscale_no_scaler_branch",
@@ -965,7 +1115,7 @@ fn roundtrip_h264_8bit_upscale_no_scaler_branch() {
 /// Post-integration sessions hit this exact path on the user's 2×
 /// HiDPI display.
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_h264_8bit_repro_shape() {
     let case = RoundtripCase {
         name: "h264_8bit_repro_shape",
@@ -992,7 +1142,7 @@ fn roundtrip_h264_8bit_repro_shape() {
 /// 1.6) → 2240×1400 (aspect 1.6, host scaler preserves aspect) →
 /// 2560×1440 (aspect 16:9, letterbox bars top+bottom).
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import (Intel Mesa is a target)"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import (Intel Mesa is a target); run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_h264_8bit_full_chain() {
     let case = RoundtripCase {
         name: "h264_8bit_full_chain",
@@ -1014,7 +1164,7 @@ fn roundtrip_h264_8bit_full_chain() {
 /// HEVC encoder/decoder pair. Catches HEVC-specific regressions in the
 /// full-chain path that the identity row wouldn't surface.
 #[test]
-#[ignore = "requires VAAPI HW + Vulkan dma-buf import"]
+#[ignore = "requires VAAPI HW + Vulkan dma-buf import; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_hevc_main_8bit_full_chain() {
     let case = RoundtripCase {
         name: "hevc_main_8bit_full_chain",
@@ -1035,7 +1185,7 @@ fn roundtrip_hevc_main_8bit_full_chain() {
 /// HEVC Main 4:4:4 full chain. Exercises PackedXYUV import +
 /// `shader_yuv444.wgsl` through the full scaler-and-upscaler chain.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 4:4:4"]
+#[ignore = "requires VAAPI HEVC Main 4:4:4; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_hevc_main444_8bit_full_chain() {
     let case = RoundtripCase {
         name: "hevc_main444_8bit_full_chain",
@@ -1061,15 +1211,15 @@ fn roundtrip_hevc_main444_8bit_full_chain() {
 /// > since the P010 UV-plane fourcc fix; SKIPs only where the driver
 /// > lacks HEVC Main 10 encode or R16/Rg16 storage.
 #[test]
-#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16"]
+#[ignore = "requires VAAPI HEVC Main 10 + storage R16/Rg16; run with: cargo test -p tether-render -- --ignored"]
 fn roundtrip_hevc_main10_client_upscale() {
     let case = RoundtripCase {
         name: "hevc_main10_client_upscale",
         profile: HEVC_MAIN10,
         fixture: Fixture::CoordEncoded,
-        capture_dims: (1920, 1200),
-        encode_dims: (1920, 1200),
-        surface_dims: (2560, 1440),
+        capture_dims: (640, 480),
+        encode_dims: (640, 480),
+        surface_dims: (960, 720),
         frames_encoded: 6,
         assert_steady_state_eps: Some(2.0),
         color_space: VideoColorSpec::sdr_desktop(),
@@ -1122,7 +1272,7 @@ fn bench_encode_one_resolution(profile: VideoProfile, w: u32, h: u32, iters: usi
 }
 
 #[test]
-#[ignore = "perf microbenchmark; prints encode timings, no assertions"]
+#[ignore = "perf: VAAPI encode benchmark (H.264); prints encode timings, no assertions; run with: cargo test -p tether-render -- --ignored --nocapture bench_encode_by_resolution_h264"]
 fn bench_encode_by_resolution_h264() {
     let _ = tracing_subscriber::fmt::try_init();
     let profile = H264_8BIT_420;

@@ -55,10 +55,12 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Test-support gating check
+      - name: Static gating checks
         if: runner.os == 'Linux'
         shell: bash
-        run: scripts/check_test_support_gating.sh
+        run: |
+          scripts/check_test_support_gating.sh
+          scripts/check_hardware_test_metadata.sh --strict --summary-only
 
       - name: Build workspace
         run: cargo build --workspace --all-targets

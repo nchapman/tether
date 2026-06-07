@@ -1016,13 +1016,14 @@ impl SCStreamOutputTrait for ProbeFrameSink {
 #[cfg(test)]
 mod sck_tests {
     use super::*;
+    use std::time::Duration;
 
     /// Hardware probe — runs SCK and records what this Mac accepts.
     /// 4:2:0 video range should always come back true; the higher
     /// chroma / 10-bit results are the interesting ones to log.
     /// Triggers the ScreenRecording TCC prompt on first run.
     #[tokio::test]
-    #[ignore = "requires macOS + ScreenRecording permission"]
+    #[ignore = "requires macOS + ScreenRecording permission; run with: cargo test -p tether-capture -- --ignored"]
     async fn probe_capture_pixel_formats_reports_baseline() {
         let caps = probe_capture_pixel_formats()
             .await
@@ -1037,6 +1038,63 @@ mod sck_tests {
         // Print everything else for the operator running the probe to
         // record on a new Mac model.
         eprintln!("SCK probe matrix: {caps:#?}");
+    }
+
+    /// Real ScreenCaptureKit smoke test for the production capture start path.
+    /// The pixel-format probe above proves SCK accepts configurations; this
+    /// verifies `start(BGRA)` actually delivers a GPU IOSurface frame through
+    /// `CaptureHandle`.
+    #[tokio::test]
+    #[ignore = "requires macOS + ScreenRecording permission + active display; run with: cargo test -p tether-capture -- --ignored"]
+    async fn sck_capture_start_delivers_one_frame() {
+        // Anchor `MonoNanos`' lazily-initialised process-start epoch before
+        // capture begins. The epoch is set on the first `now()` call ever made
+        // in the process, so without this a capture stamp that happens to be
+        // that first call reads exactly 0 — a real value, but indistinguishable
+        // from "unpopulated". With the epoch anchored here, SCK startup burns
+        // real time and the delivered frame's stamp is reliably later.
+        let before = MonoNanos::now();
+
+        let handle = start(sck_bgra_pixel_format())
+            .await
+            .expect("start ScreenCaptureKit BGRA capture");
+        let rx = handle.into_rx();
+        let frame = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("receive first ScreenCaptureKit frame within 10s");
+
+        assert!(frame.width() > 0, "captured frame width must be non-zero");
+        assert!(frame.height() > 0, "captured frame height must be non-zero");
+        let (t_kernel, t_userspace) = frame.timestamps();
+        assert!(
+            t_userspace >= before,
+            "userspace timestamp should be stamped at/after capture start ({before:?})"
+        );
+        // macOS has no separate kernel capture clock, so the capture path
+        // mirrors the userspace stamp into the kernel slot (see `build_frame`).
+        assert_eq!(
+            t_kernel, t_userspace,
+            "macOS capture mirrors the userspace stamp into the kernel slot"
+        );
+
+        let CapturedFrame::Gpu(gpu) = frame else {
+            panic!("ScreenCaptureKit should deliver GPU IOSurface frames");
+        };
+        let GpuCapturedSource::IOSurface(surface) = gpu.source;
+        assert!(!surface.surface.is_null(), "IOSurfaceRef must be non-null");
+        assert_eq!(surface.width, gpu.width);
+        assert_eq!(surface.height, gpu.height);
+        assert_eq!(
+            surface.pixel_format,
+            u32::from_be_bytes(*b"BGRA"),
+            "BGRA smoke test should receive BGRA IOSurfaces"
+        );
+        // `native_damage` is intentionally not asserted here: SCK does not
+        // attach an `SCStreamFrameInfo.status` to every sample (the first
+        // frame frequently arrives without one), so it is legitimately
+        // `None` for a delivered frame. The status→damage mapping is unit-
+        // tested directly in `native_damage_for_frame_status`'s tests; this
+        // smoke test only verifies one real delivered resource shape.
     }
 
     #[test]

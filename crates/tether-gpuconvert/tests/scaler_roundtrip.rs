@@ -105,7 +105,7 @@ fn run_scaler_to_nv12_chain(capture: (u32, u32), encode: (u32, u32)) {
 /// smoke test for the host's encode path: BGRA dma-buf → scaler
 /// Rgba8Unorm → chroma bridge accepts the Rgba8Unorm input.
 #[test]
-#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
     run_scaler_to_nv12_chain((64, 64), (32, 32));
 }
@@ -117,7 +117,7 @@ fn scaler_downscale_then_nv12_bridge_produces_correct_chroma() {
 /// and a backend that validated the binding more strictly than
 /// the dev machine would silently fail in production.
 #[test]
-#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn scaler_heavy_downscale_through_mip_prefilter_into_bridge() {
     run_scaler_to_nv12_chain((256, 256), (64, 64));
 }
@@ -265,7 +265,7 @@ fn fill_solid_red(
 /// `convert()` so the Rgba8Unorm acceptance change has to be
 /// validated separately.
 #[test]
-#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn scaler_downscale_then_yuv444_bridge() {
     run_scaler_to_yuv444_chain((64, 64), (32, 32));
 }
@@ -594,7 +594,7 @@ fn bgra_dmabuf_roundtrip_preserves_left_edge(dims: (u32, u32)) {
 }
 
 #[test]
-#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn bgra_dmabuf_roundtrip_2880x1920() {
     bgra_dmabuf_roundtrip_preserves_left_edge((2880, 1920));
 }
@@ -774,19 +774,19 @@ fn imported_bgra_then_scaler_preserves_left_edge(capture: (u32, u32), encode: (u
 }
 
 #[test]
-#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn imported_bgra_then_scaler_2880x1920_to_2160x1440() {
     imported_bgra_then_scaler_preserves_left_edge((2880, 1920), (2160, 1440));
 }
 
 #[test]
-#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF"]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn bgra_dmabuf_roundtrip_1920x1200() {
     bgra_dmabuf_roundtrip_preserves_left_edge((1920, 1200));
 }
 
 #[test]
-#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF + 16-bit storage"]
+#[ignore = "requires a Vulkan-backed wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF + 16-bit storage; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn scaler_downscale_then_p010_bridge() {
     run_scaler_to_p010_chain((64, 64), (32, 32));
 }

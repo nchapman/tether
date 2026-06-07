@@ -25,14 +25,13 @@
 //!   `cargo test -p tether-render --release -- --ignored iosurface`
 //!
 //! Coverage today: HEVC 4:2:0 8-bit, HEVC 4:2:0 10-bit (encode →
-//! decode → render), and HEVC 4:4:4 8-bit + 10-bit (fixture-decode →
-//! render). VideoToolbox has no Main444 encode path so the 4:4:4
-//! cells can't go through the local encoder, but a Linux→Mac session
-//! *does* negotiate 4:4:4 (M-series VT decodes Main444 to a `'444v'`
-//! / `'xf44'` NV24 IOSurface) — the import side is real production
-//! code that the 4:2:0 cells don't reach because NV24 has full-res UV
-//! stride. We drive the import path from a bundled HEVC 4:4:4 IDR
-//! fixture (128×128 grey from `tether-probe`).
+//! decode → render), HEVC 4:4:4 8-bit + 10-bit (fixture-decode →
+//! render), and AV1 4:2:0 8/10-bit fixture-decode → render. VideoToolbox
+//! has no Main444 encode path so the 4:4:4 cells can't go through the
+//! local encoder, but a Linux→Mac session *does* negotiate 4:4:4
+//! (M-series VT decodes Main444 to a `'444v'` / `'xf44'` NV24 IOSurface)
+//! — the import side is real production code that the 4:2:0 cells don't
+//! reach because NV24 has full-res UV stride.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
@@ -43,7 +42,7 @@ use tether_codec::videotoolbox::{VideoToolboxDecoder, VideoToolboxEncoder};
 use tether_codec::{Decoder, Encoder, Frame as CodecFrame, GpuFrameSource};
 use tether_protocol::control::{ChromaSubsampling, VideoProfile};
 
-use crate::color_fixture::{assert_colorbars, ChannelOrder};
+use crate::color_fixture::{assert_colorbars, region_average_rgb, ChannelOrder};
 use crate::gpu;
 
 /// Reconstructed RGB of the two source regions (left, right) read back from the
@@ -82,25 +81,6 @@ fn make_chroma_detail_bgra(width: u32, height: u32) -> Vec<u8> {
         }
     }
     data
-}
-
-fn region_average_rgb(rgba: &[u8], w: u32, x0: u32, y0: u32, rw: u32, rh: u32) -> (u8, u8, u8) {
-    let mut sum = [0u64; 3];
-    let mut count = 0u64;
-    for y in y0..y0 + rh {
-        for x in x0..x0 + rw {
-            let idx = ((y * w + x) * 4) as usize;
-            sum[0] += u64::from(rgba[idx]);
-            sum[1] += u64::from(rgba[idx + 1]);
-            sum[2] += u64::from(rgba[idx + 2]);
-            count += 1;
-        }
-    }
-    (
-        (sum[0] / count) as u8,
-        (sum[1] / count) as u8,
-        (sum[2] / count) as u8,
-    )
 }
 
 /// Initialise wgpu headless for the IOSurface import path. Returns
@@ -372,7 +352,13 @@ fn run_roundtrip(
     // VT happened to emit during the encode loop.
     packets.extend(enc.flush().expect("encoder flush"));
 
-    let mut dec = VideoToolboxDecoder::new(profile.codec).expect("VT decoder construction");
+    let mut dec = match VideoToolboxDecoder::new(profile.codec) {
+        Ok(dec) => dec,
+        Err(e) => {
+            eprintln!("SKIPPED: no VideoToolbox decoder for {profile:?}: {e}");
+            return None;
+        }
+    };
     let mut codec_gpu: Option<tether_codec::GpuFrame> = None;
     for pkt in &packets {
         dec.submit(&pkt.data).expect("decoder submit");
@@ -737,6 +723,62 @@ fn render_fixture_to_rgba(profile: VideoProfile, bitstream: &[u8]) -> Option<(Ve
     readback.unmap();
 
     Some((rgba, w, h))
+}
+
+fn assert_neutral_grey_fixture(label: &str, rgba: &[u8], w: u32, h: u32) {
+    for (x0, y0) in [(w / 4, h / 4), (w / 2, h / 2), (w * 3 / 4, h * 3 / 4)] {
+        let sample_w = (w / 16).max(8).min(w - x0);
+        let sample_h = (h / 16).max(8).min(h - y0);
+        let rgb = region_average_rgb(rgba, w, ChannelOrder::Rgba, x0, y0, sample_w, sample_h);
+        let (r, g, b) = rgb;
+        let min = r.min(g).min(b);
+        let spread = r.max(g).max(b) - min;
+        eprintln!("{label}: sample ({x0},{y0}) rgb={rgb:?}");
+        assert!(
+            min > 40 && spread < 48,
+            "{label}: expected neutral non-black grey at ({x0},{y0}), got {rgb:?}"
+        );
+    }
+}
+
+/// AV1 4:2:0 8-bit decode → IOSurface import → Metal render. Probe coverage
+/// proves VT can decode the fixture; this cell proves the client render path
+/// accepts the emitted IOSurface family and samples it coherently.
+#[test]
+#[ignore = "requires macOS + VideoToolbox AV1 decode + Metal; run with: cargo test -p tether-render --release -- --ignored iosurface"]
+fn iosurface_zero_copy_roundtrip_av1_main_8bit() {
+    const FIXTURE: &[u8] = include_bytes!("../../tether-probe/fixtures/probe/av1_yuv420_8bit.idr");
+    let Some((rgba, w, h)) = render_fixture_to_rgba(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Av1,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+        },
+        FIXTURE,
+    ) else {
+        return;
+    };
+    assert_neutral_grey_fixture("AV1 4:2:0 8-bit", &rgba, w, h);
+}
+
+/// AV1 4:2:0 10-bit decode → IOSurface import → Metal render. This is the
+/// AV1 analogue of the HEVC Main10 IOSurface cell and exercises the
+/// biplanar-16 shader branch with VT's AV1 output.
+#[test]
+#[ignore = "requires macOS + VideoToolbox AV1 10-bit decode + Metal 16-bit storage; run with: cargo test -p tether-render --release -- --ignored iosurface"]
+fn iosurface_zero_copy_roundtrip_av1_main10() {
+    const FIXTURE: &[u8] = include_bytes!("../../tether-probe/fixtures/probe/av1_yuv420_10bit.idr");
+    let Some((rgba, w, h)) = render_fixture_to_rgba(
+        VideoProfile {
+            codec: tether_protocol::control::CodecKind::Av1,
+            chroma: ChromaSubsampling::Yuv420,
+            bit_depth: 10,
+        },
+        FIXTURE,
+    ) else {
+        return;
+    };
+    assert_neutral_grey_fixture("AV1 4:2:0 10-bit", &rgba, w, h);
 }
 
 /// HEVC 4:4:4 8-bit (Main 4:4:4). Renderer-side colour coverage for the
@@ -1212,8 +1254,16 @@ struct HostScalerArtifacts {
 /// shape as the existing no-scaling cells' return type.
 #[cfg(target_os = "macos")]
 fn host_scaler_wide_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let left = region_average_rgb(rgba, dw, dw / 8, dh / 4, dw / 4, dh / 2);
-    let right = region_average_rgb(rgba, dw, 5 * dw / 8, dh / 4, dw / 4, dh / 2);
+    let left = region_average_rgb(rgba, dw, ChannelOrder::Rgba, dw / 8, dh / 4, dw / 4, dh / 2);
+    let right = region_average_rgb(
+        rgba,
+        dw,
+        ChannelOrder::Rgba,
+        5 * dw / 8,
+        dh / 4,
+        dw / 4,
+        dh / 2,
+    );
     (left, right)
 }
 
@@ -1229,8 +1279,8 @@ fn host_scaler_wide_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8
 /// the seam shifts.
 #[cfg(target_os = "macos")]
 fn host_scaler_seam_regions(rgba: &[u8], dw: u32, dh: u32) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let seam_left = region_average_rgb(rgba, dw, dw / 2 - 4, dh / 4, 4, dh / 2);
-    let seam_right = region_average_rgb(rgba, dw, dw / 2, dh / 4, 4, dh / 2);
+    let seam_left = region_average_rgb(rgba, dw, ChannelOrder::Rgba, dw / 2 - 4, dh / 4, 4, dh / 2);
+    let seam_right = region_average_rgb(rgba, dw, ChannelOrder::Rgba, dw / 2, dh / 4, 4, dh / 2);
     (seam_left, seam_right)
 }
 

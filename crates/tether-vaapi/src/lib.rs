@@ -25,9 +25,11 @@ use std::ffi::CStr;
 use std::os::fd::{FromRawFd, OwnedFd};
 
 pub use ffi::{
-    VADisplay, VAGenericID, VASurfaceID, VA_EXPORT_SURFACE_READ_ONLY,
-    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_EXPORT_SURFACE_WRITE_ONLY,
-    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+    VADisplay, VAEntrypoint, VAGenericID, VAProfile, VASurfaceID, VA_ENTRYPOINT_ENC_SLICE,
+    VA_ENTRYPOINT_ENC_SLICE_LP, VA_EXPORT_SURFACE_READ_ONLY, VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+    VA_EXPORT_SURFACE_WRITE_ONLY, VA_PROFILE_AV1_PROFILE0, VA_PROFILE_H264_MAIN,
+    VA_PROFILE_HEVC_MAIN, VA_PROFILE_HEVC_MAIN10, VA_PROFILE_HEVC_MAIN444,
+    VA_PROFILE_HEVC_MAIN444_10, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
 };
 
 /// `VA_STATUS_SUCCESS` is 0; anything else is an error code reportable by
@@ -69,6 +71,62 @@ impl VaError {
             message: message.into(),
         }
     }
+}
+
+/// Return whether `display` advertises the standard slice-encode entrypoint for
+/// `profile`.
+///
+/// # Safety
+/// `display` must be a live `VADisplay`.
+pub unsafe fn supports_encode_entrypoint(
+    display: VADisplay,
+    profile: VAProfile,
+) -> Result<bool, VaError> {
+    // SAFETY: forwarding the caller's live-display invariant.
+    let max_profiles = unsafe { ffi::vaMaxNumProfiles(display) };
+    if max_profiles <= 0 {
+        return Ok(false);
+    }
+    let max_profiles = usize::try_from(max_profiles).expect("positive vaMaxNumProfiles fits usize");
+    let mut profiles = vec![0; max_profiles];
+    let mut num_profiles = 0;
+    // SAFETY: `profiles` has room for vaMaxNumProfiles entries and
+    // `num_profiles` is a valid out pointer.
+    let status =
+        unsafe { ffi::vaQueryConfigProfiles(display, profiles.as_mut_ptr(), &mut num_profiles) };
+    if status != VA_STATUS_SUCCESS {
+        return Err(VaError::from_status(status));
+    }
+    let profile_count = usize::try_from(num_profiles.max(0)).unwrap_or(0);
+    if !profiles[..profile_count.min(profiles.len())].contains(&profile) {
+        return Ok(false);
+    }
+
+    // SAFETY: forwarding the caller's live-display invariant.
+    let max_entrypoints = unsafe { ffi::vaMaxNumEntrypoints(display) };
+    if max_entrypoints <= 0 {
+        return Ok(false);
+    }
+    let max_entrypoints =
+        usize::try_from(max_entrypoints).expect("positive vaMaxNumEntrypoints fits usize");
+    let mut entrypoints = vec![0; max_entrypoints];
+    let mut num_entrypoints = 0;
+    // SAFETY: `entrypoints` has room for vaMaxNumEntrypoints entries and
+    // `num_entrypoints` is a valid out pointer.
+    let status = unsafe {
+        ffi::vaQueryConfigEntrypoints(
+            display,
+            profile,
+            entrypoints.as_mut_ptr(),
+            &mut num_entrypoints,
+        )
+    };
+    if status != VA_STATUS_SUCCESS {
+        return Err(VaError::from_status(status));
+    }
+    let entrypoint_count = usize::try_from(num_entrypoints.max(0)).unwrap_or(0);
+    Ok(entrypoints[..entrypoint_count.min(entrypoints.len())]
+        .contains(&ffi::VA_ENTRYPOINT_ENC_SLICE))
 }
 
 /// One DMA-BUF object backing (part of) a VA surface. The fd is `OwnedFd`

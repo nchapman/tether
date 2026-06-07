@@ -61,20 +61,35 @@ depends = ["ffmpeg"]
 run = "cargo build --release -p tether-host -p tether-client"
 
 [tasks.test]
-description = "Fast unit tests (no hardware required)"
+description = "Fast library unit tests (no hardware required)"
 depends = ["ffmpeg"]
 run = "cargo test --workspace --lib"
 
-# Every `#[ignore]` hardware test for the CURRENT platform, no matter which
-# crate it lives in. The per-platform backends are cfg-gated (vaapi=Linux,
-# videotoolbox=macOS, d3d11=Windows) and the cross-platform GPU tests
-# (tether-scaler, tether-probe) run everywhere, so `--workspace ... --ignored`
-# runs exactly the present host's hardware suite with no platform-shaped crate
-# list — codec + render + gpuconvert + scaler + probe alike. Run it on Linux,
-# macOS, or Windows and it covers that host's full backend; no platform is
-# privileged. (`--exclude tether-audio`: the audio round-trips need an audio
-# device with sound actively playing and hard-fail otherwise — they have their
-# own `test-audio` task. `--skip bench`: benchmarks live in `bench`.)
+[tasks.test-all]
+description = "Full no-hardware workspace test suite (matches CI's cargo test step)"
+depends = ["ffmpeg"]
+run = "cargo test --workspace"
+
+[tasks.coverage]
+description = "Local no-hardware coverage report (terminal summary + target/llvm-cov/html)"
+depends = ["ffmpeg"]
+shell = "sh -c"
+run = [
+  "cargo llvm-cov --version >/dev/null 2>&1 || { echo 'cargo-llvm-cov is required for mise run coverage.' >&2; echo 'Install it with: cargo install cargo-llvm-cov' >&2; exit 127; }",
+  "cargo llvm-cov clean --workspace",
+  "cargo llvm-cov --workspace --all-targets --ignore-filename-regex '(^|/)(target|vendor)/|/build.rs$' --html",
+  "cargo llvm-cov report --ignore-filename-regex '(^|/)(target|vendor)/|/build.rs$'",
+]
+
+# Every unattended GPU/video `#[ignore]` hardware test for the CURRENT platform.
+# The per-platform backends are cfg-gated (vaapi=Linux, videotoolbox=macOS,
+# d3d11=Windows) and the cross-platform GPU tests (tether-scaler, tether-probe)
+# run everywhere, so this covers codec + render + gpuconvert + scaler + probe
+# without a platform-shaped crate list. It deliberately excludes capture and
+# audio: real screen capture may open an OS permission/share prompt, and audio
+# needs a live output device with sound actively playing. Those interactive
+# tests have explicit opt-in tasks. (`--skip bench`: benchmarks live in
+# `bench`.)
 # `--test-threads=1`: hardware tests share one GPU; serial avoids device
 # contention (the VAAPI bench serialization + Windows single-iGPU flakiness).
 # macOS adds `--release`: the IOSurface/Metal round-trips are too slow in debug
@@ -87,7 +102,44 @@ run = "cargo test --workspace --lib"
 [tasks.test-hw]
 description = "All hardware tests for the current platform (codec + render + gpuconvert + scaler + probe)"
 depends = ["ffmpeg"]
-run = "cargo test --workspace --exclude tether-audio --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+run = "cargo test --workspace --exclude tether-audio --exclude tether-capture --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+# Focused hardware sweeps by family. These mirror the top-level hardware sweep:
+# serial, no benchmark cells, and release-mode on macOS for the IOSurface/Metal
+# threshold-sensitive paths.
+[tasks.test-hw-codec]
+description = "Codec-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-codec --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+[tasks.test-hw-render]
+description = "Render-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-render --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+[tasks.test-hw-gpuconvert]
+description = "Gpuconvert-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-gpuconvert --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+[tasks.test-hw-scaler]
+description = "Scaler-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-scaler --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+[tasks.test-hw-probe]
+description = "Probe-level hardware tests for current platform"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-probe --tests --no-fail-fast {% if os() == 'macos' %}--release {% endif %}-- --ignored --test-threads=1 --skip bench"
+
+# Real screen-capture smoke tests for the current platform (PipeWire portal on
+# Linux, ScreenCaptureKit on macOS, DXGI Desktop Duplication on Windows).
+# Separate from `test-hw` because Linux/macOS can require an interactive
+# permission/share prompt. `--nocapture` surfaces the delivered frame shape.
+[tasks.test-hw-capture]
+description = "Screen-capture hardware smoke test (may prompt for capture permission/share)"
+depends = ["ffmpeg"]
+run = "cargo test -p tether-capture -- --ignored --test-threads=1 --nocapture"
 
 # System-audio capture → Opus → playback round-trip for the current platform
 # (PipeWire monitor on Linux, ScreenCaptureKit on macOS, WASAPI loopback on
@@ -116,7 +168,14 @@ run = "cargo test -p tether-probe --lib print_host_supported_profiles -- --ignor
 [tasks.check]
 description = "Static workspace hygiene checks (no compile / no codegen)"
 shell = "sh -c"
-run = "scripts/check_test_support_gating.sh"
+run = [
+  "scripts/check_test_support_gating.sh",
+  "scripts/check_hardware_test_metadata.sh --strict --summary-only",
+]
+
+[tasks.hwtag-audit]
+description = "Audit #[ignore] hardware-test skip messages and print consistency report"
+run = "scripts/check_hardware_test_metadata.sh"
 
 [tasks.clippy]
 description = "Lint the workspace + shell, warnings-as-errors (CI gate)"
@@ -145,6 +204,7 @@ run = [
   "cargo fmt --all --check",
   "cargo fmt --manifest-path apps/tether-shell/src-tauri/Cargo.toml --check",
   "scripts/check_test_support_gating.sh",
+  "scripts/check_hardware_test_metadata.sh --strict --summary-only",
   "cargo build --workspace --all-targets",
   "cargo test --workspace",
   "cargo clippy --workspace --all-targets -- -D warnings",

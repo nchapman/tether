@@ -261,6 +261,21 @@ impl D3D11Encoder {
         device_ctx_ptr: *mut std::ffi::c_void,
     ) -> Result<Self> {
         let kind = profile.codec;
+
+        // AV1 hardware encode needs NVIDIA Ada (compute capability 8.9+). On an
+        // older NVIDIA GPU `av1_nvenc`'s `avcodec_open2` does not fail cleanly:
+        // NVENC reports "Codec not supported", then FFmpeg faults
+        // (STATUS_ACCESS_VIOLATION) in its nvenc failure-cleanup. Refuse here so
+        // `new` falls through to `av1_mf` instead of crashing the process — both
+        // the live host encoder and the hardware test. See `nvenc_caps`.
+        if backend_name == "av1_nvenc"
+            && !super::nvenc_caps::nvidia_gpu_supports_av1_encode(device_ptr)
+        {
+            return Err(CodecError::CodecNotFound(
+                "av1_nvenc: NVIDIA GPU has no AV1 hardware encoder (needs Ada / RTX 40-series+)",
+            ));
+        }
+
         let codec_cname = std::ffi::CString::new(backend_name)
             .map_err(|_| CodecError::CodecNotFound(backend_name))?;
         let codec = AVCodec::find_encoder_by_name(&codec_cname)

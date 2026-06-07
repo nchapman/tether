@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tether_audio::{capture, AudioPlayer, OpusConfig, OpusDecoder, OpusEncoder};
 
 #[test]
-#[ignore = "requires a running PipeWire daemon with an active default sink + audio output device"]
+#[ignore = "requires a running PipeWire daemon with an active default sink + audio output device; run with: cargo test -p tether-audio -- --ignored"]
 fn linux_capture_encode_decode_playback_roundtrip() {
     let cfg = OpusConfig::default();
 

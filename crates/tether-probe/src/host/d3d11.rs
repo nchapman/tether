@@ -155,7 +155,7 @@ mod decode_pixel_tests {
     /// plain probe accepted) reach negotiation. Runs on any D3D11VA GPU,
     /// including AMD, where the Intel-QSV-gated render roundtrips skip.
     #[test]
-    #[ignore = "requires D3D11VA-capable GPU (Windows)"]
+    #[ignore = "requires D3D11VA-capable GPU (Windows); run with: cargo test -p tether-probe -- --ignored"]
     fn fixtures_decode_to_coherent_grey() {
         let profiles = [
             (CodecKind::H264, 8),

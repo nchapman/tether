@@ -461,7 +461,7 @@ mod tests {
     /// loadable from this crate. `#[ignore]` — needs an NVIDIA GPU + an FFmpeg
     /// with NVDEC + a Vulkan dma-buf device.
     #[test]
-    #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf"]
+    #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf; run with: cargo test -p tether-codec -- --ignored"]
     fn decodes_committed_h264_fixture_via_nvdec() {
         if !require_nvidia_gpu("decodes_committed_h264_fixture_via_nvdec") {
             return;
@@ -541,7 +541,7 @@ mod tests {
     /// or wrong dims. `#[ignore]` — needs an NVIDIA GPU + NVENC/NVDEC FFmpeg +
     /// Vulkan dma-buf.
     #[test]
-    #[ignore = "requires NVIDIA GPU + NVENC/NVDEC FFmpeg + Vulkan dma-buf"]
+    #[ignore = "requires NVIDIA GPU + NVENC/NVDEC FFmpeg + Vulkan dma-buf; run with: cargo test -p tether-codec -- --ignored"]
     fn decodes_our_hevc_main10_via_nvdec_p010() {
         use crate::nvenc::NvencEncoder;
         use tether_gpuconvert::Bgra2P010DmaBuf;
@@ -635,7 +635,7 @@ mod tests {
     /// accepting that path, the rest of the test proves NVDEC exports a planar
     /// `YU24` renderer surface with three full-height planes.
     #[test]
-    #[ignore = "requires NVIDIA GPU + NVENC/NVDEC FFmpeg + Vulkan dma-buf"]
+    #[ignore = "requires NVIDIA GPU + NVENC/NVDEC FFmpeg + Vulkan dma-buf; run with: cargo test -p tether-codec -- --ignored"]
     fn decodes_our_hevc_main444_via_nvdec_yuv444p() {
         use crate::nvenc::NvencEncoder;
         use tether_gpuconvert::Yuv444pDmaBuf;

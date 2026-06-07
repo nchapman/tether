@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tether_audio::{capture, AudioPlayer, OpusConfig, OpusDecoder, OpusEncoder};
 
 #[test]
-#[ignore = "requires Windows audio output device with audio actively playing (WASAPI loopback is silent-gated)"]
+#[ignore = "requires Windows audio output device with audio actively playing (WASAPI loopback is silent-gated); run with: cargo test -p tether-audio -- --ignored"]
 fn windows_capture_encode_decode_playback_roundtrip() {
     let cfg = OpusConfig::default();
 

@@ -2310,6 +2310,15 @@ mod arg_tests {
     }
 
     #[test]
+    fn no_audio_flag_disables_playback_request() {
+        let parsed = parse_cli_args(&args(&["--no-audio", "127.0.0.1:7654"])).expect("valid args");
+        assert!(!parsed.audio);
+
+        let parsed = parse_cli_args(&args(&["127.0.0.1:7654"])).expect("valid args");
+        assert!(parsed.audio);
+    }
+
+    #[test]
     fn flag_as_pin_value_is_rejected() {
         // `--pin --label x` must not swallow `--label` as the PIN.
         let err = parse_cli_args(&args(&["--pin", "--label", "x", "127.0.0.1:7654"]))
@@ -2362,6 +2371,31 @@ mod arg_tests {
             rx.try_recv().is_err(),
             "queued resize events should be drained"
         );
+    }
+
+    #[test]
+    fn hex_decode_accepts_exact_32_byte_lowercase_fingerprint() {
+        let decoded =
+            hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("valid fingerprint");
+        assert_eq!(
+            decoded,
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31,
+            ]
+        );
+    }
+
+    #[test]
+    fn hex_decode_rejects_bad_length_and_bad_digits() {
+        let short = hex_decode("00").expect_err("short fingerprint must fail");
+        assert!(short.to_string().contains("64 hex chars"));
+
+        let bad_digit =
+            hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1g")
+                .expect_err("non-hex digit must fail");
+        assert!(bad_digit.to_string().contains("bad hex at byte 31"));
     }
 
     #[test]

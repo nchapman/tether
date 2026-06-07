@@ -99,7 +99,7 @@ mod tests {
     /// smaller, so its fixture is fine at any of these sizes — HEVC is the one
     /// that breaks. `#[ignore]` — needs an NVIDIA GPU + an NVDEC FFmpeg.
     #[test]
-    #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf"]
+    #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf; run with: cargo test -p tether-probe -- --ignored"]
     fn hevc_main_fixture_decodes_via_nvdec_probe() {
         if !require_nvidia_gpu("hevc_main_fixture_decodes_via_nvdec_probe") {
             return;
@@ -118,7 +118,7 @@ mod tests {
     /// 8-bit (NV12) and 10-bit (P010) AV1 4:2:0 fixtures must decode through the
     /// live NVDEC probe. `#[ignore]` — needs an NVIDIA GPU + an NVDEC FFmpeg.
     #[test]
-    #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf"]
+    #[ignore = "requires NVIDIA GPU + NVDEC FFmpeg + Vulkan dma-buf; run with: cargo test -p tether-probe -- --ignored"]
     fn av1_fixtures_decode_via_nvdec_probe() {
         if !require_nvidia_gpu("av1_fixtures_decode_via_nvdec_probe") {
             return;

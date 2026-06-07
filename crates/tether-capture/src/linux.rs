@@ -1333,6 +1333,50 @@ fn build_video_damage_meta_pod() -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use pw::spa::pod::{ChoiceValue, Value};
+    use std::time::Duration;
+
+    /// Real PipeWire/portal smoke test. Forces the SHM fallback by
+    /// advertising no DMA-BUF modifiers so the test isolates "desktop capture
+    /// delivers a frame" from the GPU-import path covered in gpuconvert/render.
+    #[tokio::test]
+    #[ignore = "requires Linux desktop session + xdg-desktop-portal ScreenCast permission + PipeWire; run with: cargo test -p tether-capture -- --ignored"]
+    async fn pipewire_capture_delivers_one_frame() {
+        let handle = start(Vec::new())
+            .await
+            .expect("start PipeWire screen capture via portal");
+        let rx = handle.into_rx();
+        let frame = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("receive first PipeWire frame within 10s");
+
+        assert!(frame.width() > 0, "captured frame width must be non-zero");
+        assert!(frame.height() > 0, "captured frame height must be non-zero");
+        let (t_kernel, t_userspace) = frame.timestamps();
+        assert!(t_kernel.0 > 0, "kernel timestamp should be populated");
+        assert!(t_userspace.0 > 0, "userspace timestamp should be populated");
+
+        match frame {
+            CapturedFrame::Cpu(cpu) => {
+                assert!(
+                    matches!(cpu.format, PixelFormat::Bgra8 | PixelFormat::Rgba8),
+                    "PipeWire SHM smoke test should deliver BGRA/RGBA-compatible CPU frames, got {:?}",
+                    cpu.format
+                );
+                assert_eq!(
+                    cpu.data.len(),
+                    (cpu.width * cpu.height * 4) as usize,
+                    "CPU frame should be tightly packed 4 bytes/pixel"
+                );
+                assert_eq!(
+                    cpu.native_damage, None,
+                    "SHM fallback intentionally leaves native damage to hash classification"
+                );
+            }
+            CapturedFrame::Gpu(_) => {
+                panic!("empty modifier list should disable DMA-BUF and deliver a CPU frame");
+            }
+        }
+    }
 
     #[test]
     fn region_count_zero_is_idle() {

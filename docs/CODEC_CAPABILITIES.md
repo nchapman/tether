@@ -509,10 +509,13 @@ Uses FFmpeg's generic `h264` / `hevc` / `av1` decoder with a CUDA
 - **Verified** on RTX 3090 Ti: `decodes_committed_h264_fixture_via_nvdec`
   (NV12, pixel-exact vs software decode) and
   `decodes_our_hevc_main10_via_nvdec_p010` (P010 round trip from our own
-  NVENC Main10 output, uniform mid-range 10-bit luma readback). The
-  diagnostic `decodes_our_hevc_main444_via_nvdec_yuv444p` test currently
-  SKIPs on this driver because `eglCreateImage(YU24)` returns
-  `EGL_BAD_MATCH`.
+  NVENC Main10 output, uniform mid-range 10-bit luma readback). Renderer-side
+  fixture cells in `tether-render` (`nvdec_h264_fixture_decode_render_roundtrip`,
+  `nvdec_hevc_main10_fixture_decode_render_roundtrip`, and the AV1 8/10-bit
+  siblings) decode through NVDEC, export the resulting dma-buf, import it into
+  the production wgpu renderer, and assert coherent non-black neutral output.
+  The diagnostic `decodes_our_hevc_main444_via_nvdec_yuv444p` test currently
+  SKIPs on this driver because `eglCreateImage(YU24)` returns `EGL_BAD_MATCH`.
 
 ### What's probed
 
@@ -724,15 +727,19 @@ gates AV1 on a GPU older than RDNA 3 / Ada / Arc). The QSV/AMF/NVENC GPU
 round-trip *is* covered by hardware tests
 (`d3d11_{qsv,amf,nvenc}_gpu_encode_decode_roundtrip`), each gated on the
 present GPU vendor so it asserts on matching hardware and SKIPs elsewhere.
-The AMF backend (first developed on AMD, then largely unexercised while the
-pipeline matured on Intel QSV) has the broadest coverage, all verified on a
-Radeon 8060S / RDNA 4: HEVC Main 8-bit, **HEVC Main10**, and H.264 round
-trips; encoder rebuild on the same device (the single-session `Drop` flush);
-mid-stream forced-IDR; VPS-first extradata (the AMF-specific reorder, which
-the vendor-0 test only ever drove through MF); and an `async_depth=1`
-output-delay diagnostic (first packet within ~2 frames, not amfenc's
-default 16). Constructing all of these AMF sessions serially in one process
-is fine — AMF's single-session limit releases cleanly on the `Drop` flush.
+The render suite also binds to vendor-specific adapters before constructing
+the encoder and covers QSV, AMF, and NVENC through encode → D3D11VA decode →
+shared-handle export → native D3D11 render for HEVC/H.264 plus AV1 where the
+GPU generation supports hardware AV1 encode. The AMF backend (first developed
+on AMD, then largely unexercised while the pipeline matured on Intel QSV) has
+the broadest codec-side coverage, all verified on a Radeon 8060S / RDNA 4:
+HEVC Main 8-bit, **HEVC Main10**, and H.264 round trips; encoder rebuild on
+the same device (the single-session `Drop` flush); mid-stream forced-IDR;
+VPS-first extradata (the AMF-specific reorder, which the vendor-0 test only
+ever drove through MF); and an `async_depth=1` output-delay diagnostic (first
+packet within ~2 frames, not amfenc's default 16). Constructing all of these
+AMF sessions serially in one process is fine — AMF's single-session limit
+releases cleanly on the `Drop` flush.
 NOTE: **Media Foundation HEVC Main10 hangs** the `encode_bgra` MFT on AMD
 Radeon 8060S / RDNA 4, driver 32.0.23033.1002: the encode call blocks
 indefinitely (no error, no timeout) — observed only on this AMD MF path, not
@@ -778,7 +785,9 @@ export path, so a Main10 fixture decodes to P010 and comes back as
 10-bit decode advert (R16/R16G16 plane sampling is an FL11.0 baseline, so
 P010 texture support is the only real variable). Both 8-bit and 10-bit
 are exercised end-to-end by `d3d11_coord_fixture_decode_render_roundtrip_8bit`
-/ `_10bit` in `tether-render/src/d3d11/mod.rs`.
+/ `_10bit` in `tether-render/src/d3d11/mod.rs`, with AMD/NVIDIA siblings
+covering AMF/NVENC-backed render round trips instead of only the default
+Intel/QSV path.
 
 ---
 
@@ -847,10 +856,13 @@ encode at all is independently unconfirmed in public sources.
 On the decode side, VideoToolbox AV1 is wired through the same
 fixture-driven probe shape as HEVC. M3/M4-class hardware may advertise
 AV1 decode when `probe_decode` feeds the checked-in AV1 fixture, receives
-a GPU IOSurface, and the renderer accepts the output family. Older Macs
-or OS/FFmpeg combinations without the AV1 hwaccel report Unsupported at
-the construction or decode stage and simply omit AV1 from the client's
-decode advert.
+a GPU IOSurface, and the renderer accepts the output family. The render
+suite now has AV1 4:2:0 8/10-bit fixture cells
+(`iosurface_zero_copy_roundtrip_av1_main_8bit` / `..._main10`) that decode
+through VideoToolbox, import the IOSurface into Metal/wgpu, and assert
+coherent neutral output. Older Macs or OS/FFmpeg combinations without the
+AV1 hwaccel report Unsupported at the construction or decode stage and
+simply omit AV1 from the client's decode advert.
 
 ---
 

@@ -41,7 +41,7 @@ async fn make_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 /// validates the call returns a plausible descriptor (fd > 0,
 /// stride >= row size, modifier as requested).
 #[test]
-#[ignore = "requires VK_EXT_external_memory_dma_buf (run on a real Linux GPU adapter)"]
+#[ignore = "requires VK_EXT_external_memory_dma_buf (run on a real Linux GPU adapter); run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn export_r8unorm_smoke() {
     let Some((device, _queue)) = pollster::block_on(make_device()) else {
         eprintln!("SKIP: no wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF");
@@ -92,7 +92,7 @@ fn export_r8unorm_smoke() {
 /// the smallest test that validates the end-to-end export
 /// contract without requiring VAAPI.
 #[test]
-#[ignore = "requires VK_EXT_external_memory_dma_buf"]
+#[ignore = "requires VK_EXT_external_memory_dma_buf; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn export_then_reimport_roundtrip() {
     let Some((device, queue)) = pollster::block_on(make_device()) else {
         eprintln!("SKIP: no wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF");
@@ -268,7 +268,7 @@ fn export_then_reimport_roundtrip() {
 /// path's `vkGetImageSubresourceLayout` should report a stride
 /// that the importer's per-row math respects.
 #[test]
-#[ignore = "requires VK_EXT_external_memory_dma_buf"]
+#[ignore = "requires VK_EXT_external_memory_dma_buf; run with: cargo test -p tether-gpuconvert -- --ignored"]
 fn export_rg8unorm_odd_width_roundtrip() {
     let Some((device, queue)) = pollster::block_on(make_device()) else {
         eprintln!("SKIP: no wgpu adapter with VULKAN_EXTERNAL_MEMORY_DMA_BUF");

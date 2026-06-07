@@ -18,7 +18,7 @@
 mod cursor;
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::core::{s, Interface, PCSTR};
@@ -117,7 +117,7 @@ fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
 /// this just keeps the renderer from advertising a format it can't open
 /// (and returns `false` if no D3D11 device can be created — negotiation
 /// then settles on an 8-bit profile).
-pub async fn supports_10bit_render() -> bool {
+fn probe_10bit_render() -> bool {
     unsafe {
         // Throwaway device: the renderer's own device isn't created until
         // `D3D11RenderState::new`, well after this startup-time probe.
@@ -149,6 +149,11 @@ pub async fn supports_10bit_render() -> bool {
             Err(_) => false,
         }
     }
+}
+
+pub async fn supports_10bit_render() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(probe_10bit_render)
 }
 
 /// Whether the D3D11 renderer can render a negotiated video profile.

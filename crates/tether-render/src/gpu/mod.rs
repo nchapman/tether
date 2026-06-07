@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
 use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec, VideoProfile};
@@ -440,22 +440,25 @@ fn transfer_kind_for(spec: VideoColorSpec) -> u32 {
 /// mean sharing one adapter handle between this probe and
 /// `GpuState::new`, which is more plumbing than the residual risk
 /// justifies today.
-pub async fn supports_10bit_render() -> bool {
+fn probe_10bit_render() -> bool {
     let instance = wgpu::Instance::default();
-    let Ok(adapter) = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        })
-        .await
-    else {
+    let options = wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    };
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&options)) else {
         return false;
     };
     adapter
         .features()
         .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+}
+
+pub async fn supports_10bit_render() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(probe_10bit_render)
 }
 
 /// Whether this backend can render a negotiated video profile.

@@ -327,10 +327,10 @@ mod tests {
     /// Every wire type round-trips through JSON — the shell parses
     /// exactly what the engine serializes.
     fn assert_event_roundtrip(event: &EngineEvent) {
-        let line = serde_json::to_string(&event).expect("serialize");
+        let line = serde_json::to_string(event).expect("serialize");
         assert!(!line.contains('\n'), "events must serialize to one line");
         let back: EngineEvent = serde_json::from_str(&line).expect("deserialize");
-        assert_eq!(*event, back);
+        assert_eq!(event, &back);
     }
 
     #[test]

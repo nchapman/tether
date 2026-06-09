@@ -47,6 +47,28 @@ use client_pairing::HostAuth;
 const FALLBACK_INITIAL_WIDTH: u32 = 1280;
 const FALLBACK_INITIAL_HEIGHT: u32 = 720;
 const CLOCK_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const ORIGINAL_VIEWPORT_NO_CAP: Viewport = Viewport {
+    width: u32::MAX,
+    height: u32::MAX,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewMode {
+    FitNoUpscale,
+    Original,
+}
+
+impl ViewMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "fit-no-upscale" => Ok(Self::FitNoUpscale),
+            "original" => Ok(Self::Original),
+            _ => {
+                anyhow::bail!("--view-mode must be one of: fit-no-upscale, original; got '{value}'")
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct ClockResyncState {
@@ -123,6 +145,59 @@ fn initial_video_size_px_from_displays(displays: &[DisplayDescriptor]) -> (u32, 
 
 fn should_send_viewport(last_sent: Option<Viewport>, next: Viewport) -> bool {
     next.is_valid() && last_sent != Some(next)
+}
+
+fn viewport_hint_for_view_mode(view_mode: ViewMode, client_viewport: Viewport) -> Option<Viewport> {
+    if !client_viewport.is_valid() {
+        return None;
+    }
+    match view_mode {
+        ViewMode::FitNoUpscale => Some(client_viewport),
+        ViewMode::Original => Some(ORIGINAL_VIEWPORT_NO_CAP),
+    }
+}
+
+struct InitialViewportControls {
+    viewport_hint: Viewport,
+    viewport_message: ControlMessage,
+    ready_message: ControlMessage,
+}
+
+fn initial_viewport_controls(
+    view_mode: ViewMode,
+    client_viewport: Viewport,
+    audio_active: bool,
+) -> Option<InitialViewportControls> {
+    let viewport_hint = viewport_hint_for_view_mode(view_mode, client_viewport)?;
+    Some(InitialViewportControls {
+        viewport_hint,
+        viewport_message: ControlMessage::SetViewportHint {
+            stream_id: VideoStreamId(0),
+            viewport: viewport_hint,
+        },
+        ready_message: ControlMessage::StreamReady {
+            video: true,
+            audio: audio_active,
+        },
+    })
+}
+
+fn viewport_resize_control(
+    view_mode: ViewMode,
+    last_sent: Option<Viewport>,
+    client_viewport: Viewport,
+) -> Option<(Viewport, ControlMessage)> {
+    let viewport_hint = viewport_hint_for_view_mode(view_mode, client_viewport)?;
+    if !should_send_viewport(last_sent, viewport_hint) {
+        return None;
+    }
+    Some((
+        viewport_hint,
+        ControlMessage::SetViewportHint {
+            stream_id: VideoStreamId(0),
+            viewport: viewport_hint,
+        },
+    ))
 }
 
 fn should_send_client_display_metrics(
@@ -247,14 +322,14 @@ async fn main() -> anyhow::Result<()> {
     let stdin_stop = spawn_stdin_stop_signal(reporter.is_json());
 
     // Parse args: positional host addr (and optional explicit fingerprint),
-    // plus `--pin <PIN>` (first-contact pairing) and `--label <name>` (display
-    // name to record for the host). `--ipc` was already consumed above.
+    // plus pairing/audio/view flags. `--ipc` was already consumed above.
     let CliArgs {
         addr,
         fingerprint_hex,
         pin,
         label,
         audio: audio_enabled,
+        view_mode,
     } = parse_cli_args(&raw_args)?;
 
     // Decide how to authenticate the host. Precedence: an explicit `--pin`
@@ -1460,7 +1535,9 @@ async fn main() -> anyhow::Result<()> {
     // enough to feel live, slow enough to filter drag noise. Zero-dim
     // sizes (minimised window) are dropped — encoding at 0×0 would
     // panic, and the host's current dims are still appropriate for
-    // when the window comes back.
+    // when the window comes back. `Original` mode still sends a startup
+    // no-cap hint so the host can open the stream gate, then duplicate
+    // suppression filters later window resizes.
     let conn_viewport = conn.clone();
     tokio::spawn(async move {
         use std::time::Duration;
@@ -1493,13 +1570,14 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         let viewport = drain_latest_valid_viewport(viewport, &mut viewport_rx);
-                        if should_send_viewport(last_sent_viewport, viewport) {
-                            if let Err(e) = conn_viewport
-                                .send_control(&ControlMessage::SetViewportHint {
-                                    stream_id: VideoStreamId(0),
-                                    viewport,
-                                })
-                                .await
+                        let Some(controls) =
+                            initial_viewport_controls(view_mode, viewport, audio_active)
+                        else {
+                            continue;
+                        };
+                        if should_send_viewport(last_sent_viewport, controls.viewport_hint) {
+                            if let Err(e) =
+                                conn_viewport.send_control(&controls.viewport_message).await
                             {
                                 warn!(
                                     error = ?e,
@@ -1507,20 +1585,15 @@ async fn main() -> anyhow::Result<()> {
                                 );
                                 return;
                             }
-                            last_sent_viewport = Some(viewport);
+                            last_sent_viewport = Some(controls.viewport_hint);
                             info!(
-                                width = viewport.width,
-                                height = viewport.height,
+                                view_mode = ?view_mode,
+                                width = controls.viewport_hint.width,
+                                height = controls.viewport_hint.height,
                                 "sent initial SetViewportHint to host"
                             );
                         }
-                        if let Err(e) = conn_viewport
-                            .send_control(&ControlMessage::StreamReady {
-                                video: true,
-                                audio: audio_active,
-                            })
-                            .await
-                        {
+                        if let Err(e) = conn_viewport.send_control(&controls.ready_message).await {
                             warn!(error = ?e, "StreamReady send failed; host will not emit video");
                             return;
                         }
@@ -1542,13 +1615,10 @@ async fn main() -> anyhow::Result<()> {
                     if startup_sent {
                         if let Some((w, h)) = pending {
                             let viewport = Viewport::new(w, h);
-                            if should_send_viewport(last_sent_viewport, viewport) {
-                                let _ = conn_viewport
-                                    .send_control(&ControlMessage::SetViewportHint {
-                                        stream_id: VideoStreamId(0),
-                                        viewport,
-                                    })
-                                    .await;
+                            if let Some((_, msg)) =
+                                viewport_resize_control(view_mode, last_sent_viewport, viewport)
+                            {
+                                let _ = conn_viewport.send_control(&msg).await;
                             }
                         }
                     }
@@ -1557,21 +1627,24 @@ async fn main() -> anyhow::Result<()> {
                 Err(_) => {
                     if let Some((w, h)) = pending.take() {
                         let viewport = Viewport::new(w, h);
-                        if !should_send_viewport(last_sent_viewport, viewport) {
+                        let Some((viewport_hint, msg)) =
+                            viewport_resize_control(view_mode, last_sent_viewport, viewport)
+                        else {
                             continue;
-                        }
-                        if let Err(e) = conn_viewport
-                            .send_control(&ControlMessage::SetViewportHint {
-                                stream_id: VideoStreamId(0),
-                                viewport,
-                            })
-                            .await
-                        {
+                        };
+                        if let Err(e) = conn_viewport.send_control(&msg).await {
                             warn!(error = ?e, "SetViewportHint send failed; viewport task exiting");
                             return;
                         }
-                        last_sent_viewport = Some(viewport);
-                        info!(width = w, height = h, "sent SetViewportHint to host");
+                        last_sent_viewport = Some(viewport_hint);
+                        info!(
+                            view_mode = ?view_mode,
+                            width = viewport_hint.width,
+                            height = viewport_hint.height,
+                            client_viewport_width = w,
+                            client_viewport_height = h,
+                            "sent SetViewportHint to host"
+                        );
                     }
                 }
             }
@@ -1898,17 +1971,21 @@ struct CliArgs {
     /// Play host audio when the host advertises it. On by default; `--no-audio`
     /// disables the client's playback path entirely.
     audio: bool,
+    /// Client view/stream-sizing policy. `FitNoUpscale` forwards physical
+    /// viewport hints; `Original` keeps host-native stream sizing.
+    view_mode: ViewMode,
 }
 
 /// Parse the client CLI. Positional[0] is the host address (required);
-/// positional[1] is an optional explicit fingerprint. `--pin`/`--label` consume
-/// the following token as their value; `--ipc` is handled earlier and ignored
-/// here; other `--flags` are ignored with a warning.
+/// positional[1] is an optional explicit fingerprint. Value flags consume the
+/// following token; `--ipc` is handled earlier and ignored here; other `--flags`
+/// are ignored with a warning.
 fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
     let mut positional: Vec<&str> = Vec::new();
     let mut pin = None;
     let mut label = None;
     let mut audio = true;
+    let mut view_mode = ViewMode::FitNoUpscale;
     let mut it = raw_args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1916,6 +1993,9 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
             "--no-audio" => audio = false,
             "--pin" => pin = Some(take_flag_value(&mut it, "--pin")?),
             "--label" => label = Some(take_flag_value(&mut it, "--label")?),
+            "--view-mode" => {
+                view_mode = ViewMode::parse(&take_flag_value(&mut it, "--view-mode")?)?
+            }
             other if other.starts_with("--") => {
                 warn!(flag = other, "ignoring unknown flag");
             }
@@ -1936,6 +2016,7 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
         pin,
         label,
         audio,
+        view_mode,
     })
 }
 
@@ -2410,6 +2491,61 @@ mod arg_tests {
             Viewport::new(1280, 720)
         ));
         assert!(!should_send_viewport(None, Viewport::new(0, 720)));
+    }
+
+    #[test]
+    fn view_mode_defaults_to_fit_no_upscale_and_parses_original() {
+        let parsed = parse_cli_args(&args(&["127.0.0.1:7654"])).expect("valid args");
+        assert_eq!(parsed.view_mode, ViewMode::FitNoUpscale);
+
+        let parsed = parse_cli_args(&args(&["--view-mode", "original", "127.0.0.1:7654"]))
+            .expect("valid args");
+        assert_eq!(parsed.view_mode, ViewMode::Original);
+
+        let err = parse_cli_args(&args(&["--view-mode", "stretch", "127.0.0.1:7654"]))
+            .expect_err("unknown view mode errors");
+        assert!(err.to_string().contains("--view-mode"));
+    }
+
+    #[test]
+    fn view_mode_controls_viewport_hint_without_display_mode_request() {
+        let fit = initial_viewport_controls(ViewMode::FitNoUpscale, Viewport::new(1280, 720), true)
+            .expect("valid viewport");
+        assert_eq!(fit.viewport_hint, Viewport::new(1280, 720));
+
+        let original =
+            initial_viewport_controls(ViewMode::Original, Viewport::new(1280, 720), true)
+                .expect("valid viewport");
+        assert_eq!(original.viewport_hint, ORIGINAL_VIEWPORT_NO_CAP);
+
+        for msg in [
+            &fit.viewport_message,
+            &fit.ready_message,
+            &original.viewport_message,
+            &original.ready_message,
+        ] {
+            assert!(
+                !matches!(msg, ControlMessage::SetDisplayMode { .. }),
+                "view mode policy must not request a host display mode change"
+            );
+        }
+    }
+
+    #[test]
+    fn original_view_mode_ignores_post_startup_resizes() {
+        let first = viewport_resize_control(ViewMode::Original, None, Viewport::new(1280, 720))
+            .expect("first valid viewport sends no-cap hint");
+        assert_eq!(first.0, ORIGINAL_VIEWPORT_NO_CAP);
+
+        assert!(
+            viewport_resize_control(
+                ViewMode::Original,
+                Some(ORIGINAL_VIEWPORT_NO_CAP),
+                Viewport::new(640, 360),
+            )
+            .is_none(),
+            "Original mode should not retarget the host stream on window resize"
+        );
     }
 
     #[test]

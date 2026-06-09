@@ -93,7 +93,10 @@ reveals a more exact primary capture mode, the host sends a fresh
 in client render-surface physical pixels. It does not change host resolution and
 does not require an acknowledgement. For the initial stream, it is also part of
 startup readiness: production clients send the first viewport hint before
-`StreamReady`, and hosts wait for both.
+`StreamReady`, and hosts wait for both. A client running in `Original` view mode
+uses a max-sized viewport hint (`u32::MAX × u32::MAX`) as an explicit no-cap
+startup hint; the host's no-upscale fit rule resolves that to native capture
+pixels.
 
 `ClientDisplayMetrics` reports the client output hosting the render surface:
 session-local display id, physical `DisplayMode`, logical-to-physical scale

@@ -4561,6 +4561,17 @@ mod tests {
     }
 
     #[test]
+    fn encode_dims_max_viewport_is_no_cap_hint() {
+        // Client `Original` view mode sends this max-sized viewport as
+        // a startup no-cap hint so the host opens the video gate while
+        // keeping the stream at native capture dims.
+        assert_eq!(
+            encode_dims_for_viewport(3024, 1952, Some(Viewport::new(u32::MAX, u32::MAX))),
+            (3024, 1952)
+        );
+    }
+
+    #[test]
     fn encode_dims_invalid_viewport_falls_back() {
         // A peer that sends (0, 0) is explicitly opting out. Same
         // behaviour as `None`: capture dims passed through, no

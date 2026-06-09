@@ -115,9 +115,12 @@ display-mode behavior:
 - `Fill`: crop-preserving fill for users who prefer no letterbox. This is also a
   presentation choice only.
 
-Only `FitNoUpscale` and `Original` need to exist for the first implementation.
-The key invariant is that none of these view modes changes the host OS display
-mode.
+Only `FitNoUpscale` and `Original` exist in the first implementation, exposed
+by the client as `--view-mode fit-no-upscale|original`. `Original` still sends
+one startup viewport hint so the host can open the video gate, but uses a
+no-cap viewport (`u32::MAX × u32::MAX`) and ignores subsequent window resizes
+for stream sizing. The key invariant is that none of these view modes changes
+the host OS display mode.
 
 ## Host Display-Mode Matching
 

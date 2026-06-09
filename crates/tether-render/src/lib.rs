@@ -634,12 +634,20 @@ impl App {
     }
 
     fn apply_window_resize(&mut self, size: PhysicalSize<u32>) {
+        self.apply_window_resize_with_viewport(size, size);
+    }
+
+    fn apply_window_resize_with_viewport(
+        &mut self,
+        surface_size: PhysicalSize<u32>,
+        viewport_size: PhysicalSize<u32>,
+    ) {
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.resize(size.width, size.height);
+            gpu.resize(surface_size.width, surface_size.height);
         }
         self.emit(RenderEvent::Resized {
-            width: size.width,
-            height: size.height,
+            width: viewport_size.width,
+            height: viewport_size.height,
         });
         self.refresh_client_display_metrics();
     }
@@ -808,8 +816,10 @@ impl ApplicationHandler for App {
                     if let Some(window) = self.window.as_ref() {
                         if let Some(applied) = window.request_inner_size(corrected) {
                             self.apply_window_resize(applied);
+                            return;
                         }
                     }
+                    self.apply_window_resize_with_viewport(size, corrected);
                     return;
                 }
                 self.apply_window_resize(size);
@@ -1237,24 +1247,23 @@ pub(crate) fn presentation_scale(
 /// Aspect-preserving fit rect in pixels, centered by callers. This may shrink
 /// or upscale; [`presentation_rect_dims`] applies the no-upscale policy.
 #[must_use]
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
 pub(crate) fn fit_rect_dims(src: (u32, u32), dst: (u32, u32)) -> (u32, u32) {
     if src.0 == 0 || src.1 == 0 || dst.0 == 0 || dst.1 == 0 {
         return (0, 0);
     }
-    let src_aspect = src.0 as f32 / src.1 as f32;
-    let dst_aspect = dst.0 as f32 / dst.1 as f32;
-    if src_aspect > dst_aspect {
+    let src_w = u64::from(src.0);
+    let src_h = u64::from(src.1);
+    let dst_w = u64::from(dst.0);
+    let dst_h = u64::from(dst.1);
+    if src_w * dst_h > dst_w * src_h {
         let w = dst.0;
-        let h = (w as f32 / src_aspect).round().max(1.0) as u32;
+        let h = u32::try_from(((dst_w * src_h) / src_w).clamp(1, dst_h))
+            .expect("fit height is clamped to the u32 destination height");
         (w, h)
     } else {
         let h = dst.1;
-        let w = (h as f32 * src_aspect).round().max(1.0) as u32;
+        let w = u32::try_from(((dst_h * src_w) / src_h).clamp(1, dst_w))
+            .expect("fit width is clamped to the u32 destination width");
         (w, h)
     }
 }
@@ -1439,6 +1448,30 @@ mod tests {
             presentation_rect_dims(PresentationMode::FitNoUpscale, (3840, 2160), (1280, 1024)),
             (1280, 720)
         );
+    }
+
+    #[test]
+    fn fit_rect_never_exceeds_destination() {
+        let cases = [
+            ((1920, 1080), (1000, 1000)),
+            ((1920, 1080), (1280, 600)),
+            ((3024, 1964), (1512, 982)),
+            ((u32::MAX, u32::MAX - 1), (u32::MAX - 3, u32::MAX - 7)),
+            ((u32::MAX - 1, u32::MAX), (u32::MAX - 7, u32::MAX - 3)),
+        ];
+        for (src, dst) in cases {
+            let fit = fit_rect_dims(src, dst);
+            assert!(fit.0 <= dst.0, "fit width {fit:?} exceeds {dst:?}");
+            assert!(fit.1 <= dst.1, "fit height {fit:?} exceeds {dst:?}");
+            assert!(
+                fit.0 > 0,
+                "fit width should stay nonzero for {src:?} in {dst:?}"
+            );
+            assert!(
+                fit.1 > 0,
+                "fit height should stay nonzero for {src:?} in {dst:?}"
+            );
+        }
     }
 
     #[test]

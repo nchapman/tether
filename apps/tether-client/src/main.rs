@@ -889,7 +889,7 @@ async fn main() -> anyhow::Result<()> {
                         | ControlMessage::ClientStats { .. }
                         | ControlMessage::SetViewportHint { .. }
                         | ControlMessage::SetDisplayMode { .. }
-                        | ControlMessage::ClientDisplayMetrics { .. },
+                        | ControlMessage::ClientDisplayMetrics(..),
                     ) => {
                         // Client-originated; misrouted if seen on the client side.
                         tracing::debug!(

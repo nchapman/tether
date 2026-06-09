@@ -178,12 +178,14 @@ impl WinitTranslator {
                     modifiers: self.modifiers,
                 }]
             }
-            // Resize + CursorModeChanged flow on separate channels
-            // in the client binary (viewport on a watch; cursor
-            // mode goes to ControlMessage::SetCursorMode). Keep
-            // these arms exhaustive so a future variant addition
-            // is a compile error here rather than a silent ignore.
-            RenderEvent::Resized { .. } | RenderEvent::CursorModeChanged(_) => Vec::new(),
+            // Resize, display metrics, and CursorModeChanged flow on separate
+            // channels in the client binary (viewport/display metrics on
+            // control; cursor mode goes to ControlMessage::SetCursorMode).
+            // Keep these arms exhaustive so a future variant addition is a
+            // compile error here rather than a silent ignore.
+            RenderEvent::Resized { .. }
+            | RenderEvent::ClientDisplayMetrics(_)
+            | RenderEvent::CursorModeChanged(_) => Vec::new(),
         };
         self.wrap(kinds)
     }

@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
-use tether_protocol::control::CursorMode;
+use tether_protocol::control::{ClientDisplayMetrics, CursorMode, DisplayMode};
 use tether_protocol::MonoNanos;
 use tracing::warn;
 use winit::application::ApplicationHandler;
@@ -238,6 +238,10 @@ pub enum RenderEvent {
         width: u32,
         height: u32,
     },
+    /// Physical metrics for the client output hosting the renderer. The client
+    /// forwards this to the host as display-mode-matching input; it is not a
+    /// host mode-change request.
+    ClientDisplayMetrics(ClientDisplayMetrics),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -668,13 +672,13 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let monitor_size = event_loop
+        let monitor = event_loop
             .primary_monitor()
-            .or_else(|| event_loop.available_monitors().next())
-            .map(|monitor| {
-                let size = monitor.size();
-                (size.width, size.height)
-            });
+            .or_else(|| event_loop.available_monitors().next());
+        let monitor_size = monitor.as_ref().map(|monitor| {
+            let size = monitor.size();
+            (size.width, size.height)
+        });
         let initial_size =
             initial_window_size_for_monitor(self.initial_video_size_px, monitor_size);
         let attrs = WindowAttributes::default()
@@ -707,6 +711,9 @@ impl ApplicationHandler for App {
             width: size.width,
             height: size.height,
         });
+        if let Some(metrics) = monitor.as_ref().map(client_display_metrics_for_monitor) {
+            self.emit(RenderEvent::ClientDisplayMetrics(metrics));
+        }
         // Cache the monitor refresh rate. Winit returns an
         // `Option<u32>` in millihertz; fall back to 60 Hz when
         // it's unavailable (some Wayland compositors don't expose
@@ -960,6 +967,51 @@ fn initial_window_size_for_monitor(
     (width.max(1), height.max(1))
 }
 
+fn client_display_metrics_for_monitor(
+    monitor: &winit::monitor::MonitorHandle,
+) -> ClientDisplayMetrics {
+    let size = monitor.size();
+    let refresh_millihz = monitor.refresh_rate_millihertz().unwrap_or(60_000);
+    let (scale_num, scale_den) = scale_to_ratio(monitor.scale_factor());
+    ClientDisplayMetrics {
+        display_id: 0,
+        mode: DisplayMode::new(size.width, size.height, refresh_millihz),
+        scale_num,
+        scale_den,
+        safe_area: None,
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn scale_to_ratio(scale: f64) -> (u16, u16) {
+    if !scale.is_finite() || scale <= 0.0 {
+        return (1, 1);
+    }
+
+    const DEN: u32 = 1000;
+    let num = (scale * f64::from(DEN))
+        .round()
+        .clamp(1.0, f64::from(u16::MAX)) as u32;
+    let gcd = gcd_u32(num, DEN);
+    (
+        u16::try_from(num / gcd).unwrap_or(u16::MAX),
+        u16::try_from(DEN / gcd).unwrap_or(u16::MAX),
+    )
+}
+
+const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    if a == 0 {
+        1
+    } else {
+        a
+    }
+}
+
 /// Single-slot, latest-wins frame channel between the decoder thread
 /// and the renderer. Replaces a bounded queue: a remote-desktop
 /// viewer never benefits from rendering a stale frame when a newer
@@ -1090,6 +1142,13 @@ mod tests {
             (1280, 720)
         );
         assert_eq!(initial_window_size_for_monitor((0, 0), None), (1280, 720));
+    }
+
+    #[test]
+    fn scale_to_ratio_reduces_common_hidpi_values() {
+        assert_eq!(scale_to_ratio(1.5), (3, 2));
+        assert_eq!(scale_to_ratio(2.0), (2, 1));
+        assert_eq!(scale_to_ratio(0.0), (1, 1));
     }
 
     #[test]

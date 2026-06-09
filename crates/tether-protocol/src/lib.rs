@@ -583,6 +583,27 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_client_display_metrics() {
+        use crate::control::{ClientDisplayMetrics, ClientSafeArea, ControlMessage, DisplayMode};
+        let metrics = ClientDisplayMetrics {
+            display_id: 7,
+            mode: DisplayMode::new(3024, 1964, 120_000),
+            scale_num: 2,
+            scale_den: 1,
+            safe_area: Some(ClientSafeArea {
+                x: 0,
+                y: 24,
+                width: 3024,
+                height: 1940,
+            }),
+        };
+        let msg = ControlMessage::ClientDisplayMetrics(metrics.clone());
+        let bytes = encode_reliable(&msg).unwrap();
+        let decoded: ControlMessage = decode_reliable(&bytes).unwrap();
+        assert_eq!(decoded, ControlMessage::ClientDisplayMetrics(metrics));
+    }
+
+    #[test]
     fn round_trip_cursor_shape_control() {
         // CursorShape rides the reliable control stream (sprite payloads
         // are too large for the 1200-byte cursor datagram budget).

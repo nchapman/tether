@@ -400,6 +400,29 @@ pub struct DisplayDescriptor {
     pub can_set_mode: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientSafeArea {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDisplayMetrics {
+    /// Session-local client output id. Stable only for this connection.
+    pub display_id: u32,
+    /// Client output physical/backing-pixel mode.
+    pub mode: DisplayMode,
+    /// Client output logical-to-physical scale ratio. UI/input diagnostics only;
+    /// stream sizing uses physical pixels.
+    pub scale_num: u16,
+    pub scale_den: u16,
+    /// Optional usable physical-pixel area when platform chrome/notches reserve
+    /// part of the output.
+    pub safe_area: Option<ClientSafeArea>,
+}
+
 /// NTP-style three-way clock probe. The receiver records `t3` locally on
 /// arrival; the offset between the two monotonic clocks is then
 /// `((t1 - t0) + (t2 - t3)) / 2`.
@@ -749,6 +772,10 @@ pub enum ControlMessage {
         status: DisplayModeStatus,
         actual_mode: Option<DisplayMode>,
     },
+    /// Client → host. Describes the client output hosting the render surface.
+    /// This is display-mode matching input only; it does not request a host
+    /// mode change.
+    ClientDisplayMetrics(ClientDisplayMetrics),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1077,6 +1104,48 @@ fn display_from_pb(value: pb::DisplayDescriptor) -> Result<DisplayDescriptor, Co
             .map(|m| display_mode_from_pb(Some(m)))
             .collect::<Result<_, _>>()?,
         can_set_mode: value.can_set_mode,
+    })
+}
+
+fn client_safe_area_to_pb(value: ClientSafeArea) -> pb::ClientSafeArea {
+    pb::ClientSafeArea {
+        x: value.x,
+        y: value.y,
+        width: value.width,
+        height: value.height,
+    }
+}
+
+fn client_safe_area_from_pb(value: pb::ClientSafeArea) -> ClientSafeArea {
+    ClientSafeArea {
+        x: value.x,
+        y: value.y,
+        width: value.width,
+        height: value.height,
+    }
+}
+
+fn client_display_metrics_to_pb(value: ClientDisplayMetrics) -> pb::ClientDisplayMetrics {
+    pb::ClientDisplayMetrics {
+        display_id: value.display_id,
+        mode: Some(display_mode_to_pb(value.mode)),
+        scale_num: u32::from(value.scale_num),
+        scale_den: u32::from(value.scale_den),
+        safe_area: value.safe_area.map(client_safe_area_to_pb),
+    }
+}
+
+fn client_display_metrics_from_pb(
+    value: pb::ClientDisplayMetrics,
+) -> Result<ClientDisplayMetrics, CodecError> {
+    Ok(ClientDisplayMetrics {
+        display_id: value.display_id,
+        mode: display_mode_from_pb(value.mode)?,
+        scale_num: u16::try_from(value.scale_num)
+            .map_err(|_| CodecError::Wire("client scale numerator > u16"))?,
+        scale_den: u16::try_from(value.scale_den)
+            .map_err(|_| CodecError::Wire("client scale denominator > u16"))?,
+        safe_area: value.safe_area.map(client_safe_area_from_pb),
     })
 }
 
@@ -1650,6 +1719,9 @@ impl ReliableMessage for ControlMessage {
                 status: status_to_pb(status),
                 actual_mode: actual_mode.map(display_mode_to_pb),
             }),
+            ControlMessage::ClientDisplayMetrics(metrics) => {
+                Kind::ClientDisplayMetrics(client_display_metrics_to_pb(metrics))
+            }
         };
         pb::ControlMessage { kind: Some(kind) }.encode_to_vec()
     }
@@ -1770,6 +1842,9 @@ impl ReliableMessage for ControlMessage {
                     .map(|m| display_mode_from_pb(Some(m)))
                     .transpose()?,
             }),
+            Kind::ClientDisplayMetrics(v) => Ok(ControlMessage::ClientDisplayMetrics(
+                client_display_metrics_from_pb(v)?,
+            )),
         }
     }
 }

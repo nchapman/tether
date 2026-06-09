@@ -1110,6 +1110,17 @@ async fn handle_client(
                         );
                         force_idr_for_viewport.raise();
                     }
+                    Ok(ControlMessage::ClientDisplayMetrics(metrics)) => {
+                        info!(
+                            client_display_id = metrics.display_id,
+                            width = metrics.mode.width,
+                            height = metrics.mode.height,
+                            refresh_millihz = metrics.mode.refresh_millihz,
+                            scale = format!("{}/{}", metrics.scale_num, metrics.scale_den),
+                            safe_area = ?metrics.safe_area,
+                            "client display metrics"
+                        );
+                    }
                     Ok(ControlMessage::SetDisplayMode {
                         request_id,
                         display_id,

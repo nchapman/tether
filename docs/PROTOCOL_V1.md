@@ -95,6 +95,11 @@ does not require an acknowledgement. For the initial stream, it is also part of
 startup readiness: production clients send the first viewport hint before
 `StreamReady`, and hosts wait for both.
 
+`ClientDisplayMetrics` reports the client output hosting the render surface:
+session-local display id, physical `DisplayMode`, logical-to-physical scale
+ratio, and optional physical safe area. It is display-mode-matching input only;
+it does not request a host display-mode change.
+
 `SetDisplayMode` is the real host display-mode request:
 
 - `request_id`

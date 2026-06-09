@@ -534,6 +534,8 @@ async fn main() -> anyhow::Result<()> {
     // begin streaming until it has the client's real physical viewport, so the
     // viewport task sends SetViewportHint before StreamReady.
     let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
+    let (display_metrics_tx, mut display_metrics_rx) =
+        mpsc::unbounded_channel::<tether_protocol::control::ClientDisplayMetrics>();
     let (decoder_ready_for_startup_tx, decoder_ready_for_startup_rx) = watch::channel(false);
     let (decode_event_tx, decode_event_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
     let decode_event_rx = Arc::new(decode_event_rx);
@@ -796,7 +798,8 @@ async fn main() -> anyhow::Result<()> {
                         | ControlMessage::StreamResume { .. }
                         | ControlMessage::ClientStats { .. }
                         | ControlMessage::SetViewportHint { .. }
-                        | ControlMessage::SetDisplayMode { .. },
+                        | ControlMessage::SetDisplayMode { .. }
+                        | ControlMessage::ClientDisplayMetrics { .. },
                     ) => {
                         // Client-originated; misrouted if seen on the client side.
                         tracing::debug!(
@@ -1407,6 +1410,38 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let mut last_sent = None;
+            while let Some(metrics) = display_metrics_rx.recv().await {
+                if last_sent.as_ref() == Some(&metrics) {
+                    continue;
+                }
+                if let Err(e) = conn
+                    .send_control(&ControlMessage::ClientDisplayMetrics(metrics.clone()))
+                    .await
+                {
+                    warn!(
+                        error = ?e,
+                        "ClientDisplayMetrics send failed; display metrics task exiting"
+                    );
+                    return;
+                }
+                info!(
+                    client_display_id = metrics.display_id,
+                    width = metrics.mode.width,
+                    height = metrics.mode.height,
+                    refresh_millihz = metrics.mode.refresh_millihz,
+                    scale = format!("{}/{}", metrics.scale_num, metrics.scale_den),
+                    safe_area = ?metrics.safe_area,
+                    "sent client display metrics to host"
+                );
+                last_sent = Some(metrics);
+            }
+        });
+    }
+
     // Viewport debouncer task. Drag-resizing fires
     // `WindowEvent::Resized` continuously (often >100 events/second);
     // sending a `SetViewportHint` per event would have the host
@@ -1544,6 +1579,10 @@ async fn main() -> anyhow::Result<()> {
         // consumer task has exited.
         if let RenderEvent::Resized { width, height } = evt {
             let _ = viewport_tx.send((width, height));
+            return;
+        }
+        if let RenderEvent::ClientDisplayMetrics(metrics) = evt {
+            let _ = display_metrics_tx.send(metrics);
             return;
         }
         let _ = events_tx.send(evt);

@@ -115,12 +115,32 @@ fn recovery_warranted(before: (u64, u64), after: (u64, u64)) -> bool {
     after.0 > before.0
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ViewportObservation {
+    surface_width: u32,
+    surface_height: u32,
+    viewport: Viewport,
+    presentation_width: u32,
+    presentation_height: u32,
+    host_width: u32,
+    host_height: u32,
+    host_scale_num: u16,
+    host_scale_den: u16,
+    client_scale_factor: f64,
+    presentation_mode: PresentationMode,
+}
+
+impl ViewportObservation {
+    fn is_valid(self) -> bool {
+        self.viewport.is_valid()
+    }
+}
+
 fn drain_latest_valid_viewport(
-    mut latest: Viewport,
-    rx: &mut mpsc::UnboundedReceiver<(u32, u32)>,
-) -> Viewport {
-    while let Ok((width, height)) = rx.try_recv() {
-        let candidate = Viewport::new(width, height);
+    mut latest: ViewportObservation,
+    rx: &mut mpsc::UnboundedReceiver<ViewportObservation>,
+) -> ViewportObservation {
+    while let Ok(candidate) = rx.try_recv() {
         if candidate.is_valid() {
             latest = candidate;
         }
@@ -633,7 +653,7 @@ async fn main() -> anyhow::Result<()> {
     // Renderer resize events drive startup video readiness. The host must not
     // begin streaming until it has the client's real physical viewport, so the
     // viewport task sends SetViewportHint before StreamReady.
-    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
+    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<ViewportObservation>();
     let (display_metrics_tx, mut display_metrics_rx) =
         mpsc::unbounded_channel::<tether_protocol::control::ClientDisplayMetrics>();
     let (decoder_ready_for_startup_tx, decoder_ready_for_startup_rx) = watch::channel(false);
@@ -1590,7 +1610,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         use std::time::Duration;
         let debounce = Duration::from_millis(150);
-        let mut pending: Option<(u32, u32)> = None;
+        let mut pending: Option<ViewportObservation> = None;
         let mut startup_sent = false;
         let mut last_sent_viewport: Option<Viewport> = None;
         let mut decoder_ready_for_startup_rx = decoder_ready_for_startup_rx;
@@ -1602,9 +1622,8 @@ async fn main() -> anyhow::Result<()> {
                 None => Ok(viewport_rx.recv().await),
             };
             match next {
-                Ok(Some(size)) => {
-                    let viewport = Viewport::new(size.0, size.1);
-                    if !viewport.is_valid() {
+                Ok(Some(observation)) => {
+                    if !observation.is_valid() {
                         continue;
                     }
                     if !startup_sent {
@@ -1617,8 +1636,10 @@ async fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         }
-                        let viewport = drain_latest_valid_viewport(viewport, &mut viewport_rx);
-                        let Some(controls) = initial_viewport_controls(viewport, audio_active)
+                        let observation =
+                            drain_latest_valid_viewport(observation, &mut viewport_rx);
+                        let Some(controls) =
+                            initial_viewport_controls(observation.viewport, audio_active)
                         else {
                             continue;
                         };
@@ -1634,9 +1655,20 @@ async fn main() -> anyhow::Result<()> {
                             }
                             last_sent_viewport = Some(controls.viewport_hint);
                             info!(
-                                view_mode = ?view_mode,
-                                width = controls.viewport_hint.width,
-                                height = controls.viewport_hint.height,
+                                view_mode = ?observation.presentation_mode,
+                                surface_width = observation.surface_width,
+                                surface_height = observation.surface_height,
+                                presentation_width = observation.presentation_width,
+                                presentation_height = observation.presentation_height,
+                                host_width = observation.host_width,
+                                host_height = observation.host_height,
+                                host_scale = format!(
+                                    "{}/{}",
+                                    observation.host_scale_num, observation.host_scale_den
+                                ),
+                                client_scale_factor = observation.client_scale_factor,
+                                viewport_width = controls.viewport_hint.width,
+                                viewport_height = controls.viewport_hint.height,
                                 "sent initial SetViewportHint to host"
                             );
                         }
@@ -1654,16 +1686,15 @@ async fn main() -> anyhow::Result<()> {
                         pending = None;
                         continue;
                     }
-                    pending = Some(size);
+                    pending = Some(observation);
                 }
                 Ok(None) => {
                     // Sender dropped. Fire any pending before exiting
                     // so the last resize event still makes it.
                     if startup_sent {
-                        if let Some((w, h)) = pending {
-                            let viewport = Viewport::new(w, h);
+                        if let Some(observation) = pending {
                             if let Some((_, msg)) =
-                                viewport_resize_control(last_sent_viewport, viewport)
+                                viewport_resize_control(last_sent_viewport, observation.viewport)
                             {
                                 let _ = conn_viewport.send_control(&msg).await;
                             }
@@ -1672,10 +1703,9 @@ async fn main() -> anyhow::Result<()> {
                     return;
                 }
                 Err(_) => {
-                    if let Some((w, h)) = pending.take() {
-                        let viewport = Viewport::new(w, h);
+                    if let Some(observation) = pending.take() {
                         let Some((viewport_hint, msg)) =
-                            viewport_resize_control(last_sent_viewport, viewport)
+                            viewport_resize_control(last_sent_viewport, observation.viewport)
                         else {
                             continue;
                         };
@@ -1685,11 +1715,20 @@ async fn main() -> anyhow::Result<()> {
                         }
                         last_sent_viewport = Some(viewport_hint);
                         info!(
-                            view_mode = ?view_mode,
-                            width = viewport_hint.width,
-                            height = viewport_hint.height,
-                            client_viewport_width = w,
-                            client_viewport_height = h,
+                            view_mode = ?observation.presentation_mode,
+                            surface_width = observation.surface_width,
+                            surface_height = observation.surface_height,
+                            presentation_width = observation.presentation_width,
+                            presentation_height = observation.presentation_height,
+                            host_width = observation.host_width,
+                            host_height = observation.host_height,
+                            host_scale = format!(
+                                "{}/{}",
+                                observation.host_scale_num, observation.host_scale_den
+                            ),
+                            client_scale_factor = observation.client_scale_factor,
+                            viewport_width = viewport_hint.width,
+                            viewport_height = viewport_hint.height,
                             "sent SetViewportHint to host"
                         );
                     }
@@ -1704,8 +1743,34 @@ async fn main() -> anyhow::Result<()> {
         // Render must not block on a slow consumer — UnboundedSender
         // drops on send-after-close, which is what we want when either
         // consumer task has exited.
-        if let RenderEvent::Resized { width, height } = evt {
-            let _ = viewport_tx.send((width, height));
+        if let RenderEvent::Resized {
+            surface_width,
+            surface_height,
+            viewport_width,
+            viewport_height,
+            presentation_width,
+            presentation_height,
+            host_width,
+            host_height,
+            host_scale_num,
+            host_scale_den,
+            client_scale_factor,
+            presentation_mode,
+        } = evt
+        {
+            let _ = viewport_tx.send(ViewportObservation {
+                surface_width,
+                surface_height,
+                viewport: Viewport::new(viewport_width, viewport_height),
+                presentation_width,
+                presentation_height,
+                host_width,
+                host_height,
+                host_scale_num,
+                host_scale_den,
+                client_scale_factor,
+                presentation_mode,
+            });
             return;
         }
         if let RenderEvent::ClientDisplayMetrics(metrics) = evt {
@@ -2719,14 +2784,30 @@ mod arg_tests {
 
     #[test]
     fn startup_viewport_drain_uses_newest_queued_valid_size() {
+        fn observation(width: u32, height: u32) -> ViewportObservation {
+            ViewportObservation {
+                surface_width: width,
+                surface_height: height,
+                viewport: Viewport::new(width, height),
+                presentation_width: width,
+                presentation_height: height,
+                host_width: 1920,
+                host_height: 1080,
+                host_scale_num: 1,
+                host_scale_den: 1,
+                client_scale_factor: 1.0,
+                presentation_mode: PresentationMode::Fit,
+            }
+        }
+
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send((1600, 900)).unwrap();
-        tx.send((0, 0)).unwrap();
-        tx.send((1920, 1080)).unwrap();
+        tx.send(observation(1600, 900)).unwrap();
+        tx.send(observation(0, 0)).unwrap();
+        tx.send(observation(1920, 1080)).unwrap();
 
-        let selected = drain_latest_valid_viewport(Viewport::new(1280, 720), &mut rx);
+        let selected = drain_latest_valid_viewport(observation(1280, 720), &mut rx);
 
-        assert_eq!(selected, Viewport::new(1920, 1080));
+        assert_eq!(selected.viewport, Viewport::new(1920, 1080));
         assert!(
             rx.try_recv().is_err(),
             "queued resize events should be drained"

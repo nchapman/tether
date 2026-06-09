@@ -788,8 +788,10 @@ pub enum DisplayModeStatus {
     Unknown(i32),
 }
 
-/// Physical-pixel dimensions of the client's rendering surface. Used to size
-/// the encoder so we don't ship more pixels than the client will display.
+/// Physical-pixel dimensions of the client's video presentation viewport. Used
+/// to size the encoder so we don't ship more pixels than the client will
+/// display; this may be smaller than the raw window surface when letterboxed
+/// and may be the logical-100% presentation size in actual-size mode.
 /// Width and height are positive integers — `0` in either is treated by the
 /// host as "ignore this viewport, use native."
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

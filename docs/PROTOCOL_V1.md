@@ -87,7 +87,9 @@ The host sends the best topology it can observe in `ServerHandshake`.
 Production hosts enumerate the local display system; explicit test-pattern
 sessions advertise a synthetic primary display. If the capture backend later
 reveals a more exact captured display/source mode or scale, the host sends a
-fresh `DisplayList`.
+fresh `DisplayList`. On Linux portal capture, the refreshed mode is the
+PipeWire frame pixel grid and the refreshed scale is derived from portal
+compositor-space bounds when available.
 
 `SetViewportHint { stream_id, viewport }` is a best-effort encoder sizing hint
 in physical pixels. It does not change host resolution and does not require an

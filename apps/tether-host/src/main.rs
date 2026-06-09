@@ -745,6 +745,7 @@ async fn handle_client(
     let cursor_source: Box<dyn CursorSource> = capture_handle
         .take_cursor_source()
         .unwrap_or_else(|| Box::new(PlaceholderCursorSource::new()));
+    let display_hints = capture_handle.display_hints();
     let frames = capture_handle.into_rx();
 
     // Force-IDR signal + stream-readiness gate were created by
@@ -754,13 +755,13 @@ async fn handle_client(
     // each frame. Coalescing comes for free — N raises between two
     // takes produce one keyframe. See `tether_session::IdrSignal`.
 
-    // Shared display-dimensions channel: the capture thread learns the
-    // real host display size on the first frame and posts (w, h) here;
-    // the dims-follower task reads it and feeds the injector via
-    // set_display_size. We use a single-slot watch so the injector
-    // always reads the latest known dims even if it polls late.
+    // Shared display-geometry channel: the capture thread learns the real
+    // frame pixel grid on the first frame and combines it with any
+    // backend-reported host logical/compositor geometry. The follower feeds
+    // the injector with capture pixels and refreshes DisplayList with the
+    // scale that belongs to those pixels.
     let (display_dims_tx, display_dims_rx) =
-        tokio::sync::watch::channel::<Option<(u32, u32)>>(None);
+        tokio::sync::watch::channel::<Option<tether_capture::CaptureDisplayGeometry>>(None);
 
     // Cursor coordinate-frame watch: the encode loop posts
     // `(capture_w, capture_h, encode_w, encode_h)` on every encoder
@@ -838,6 +839,7 @@ async fn handle_client(
                 frames,
                 force_idr_for_send,
                 display_dims_tx,
+                display_hints,
                 cursor_frame_tx,
                 send_shutdown_for_thread,
                 chosen_profile,
@@ -1286,17 +1288,18 @@ async fn handle_client(
                 // Copy the value out and drop the borrow guard before
                 // awaiting on the injector lock — `watch::Ref` is not Send,
                 // so holding it across an .await fails the Send bound.
-                let dims = *rx.borrow();
-                if let Some((w, h)) = dims {
-                    injector.lock().await.set_display_size(w, h);
+                let geometry = *rx.borrow();
+                if let Some(geometry) = geometry {
+                    injector
+                        .lock()
+                        .await
+                        .set_display_size(geometry.capture_width, geometry.capture_height);
                     let next = {
                         let mut guard =
                             lock_host_state(&display_descriptors, "display descriptors");
-                        let next = tether_capture::display_list_with_primary_mode(
+                        let next = tether_capture::display_list_with_capture_geometry(
                             guard.clone(),
-                            w,
-                            h,
-                            ENCODER_FPS.saturating_mul(1000),
+                            geometry,
                         );
                         if *guard == next {
                             None
@@ -1306,6 +1309,13 @@ async fn handle_client(
                         }
                     };
                     if let Some(displays) = next {
+                        info!(
+                            capture_width = geometry.capture_width,
+                            capture_height = geometry.capture_height,
+                            host_logical_position = ?geometry.host_logical_position,
+                            host_logical_size = ?geometry.host_logical_size,
+                            "display list update from capture geometry"
+                        );
                         if let Err(e) = conn
                             .send_control(&ControlMessage::DisplayList { displays })
                             .await
@@ -3231,7 +3241,8 @@ fn run_capture_and_send(
     conn: Arc<Connection>,
     frames: FrameReceiver,
     force_idr: tether_session::IdrSignal,
-    display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
+    display_dims_tx: tokio::sync::watch::Sender<Option<tether_capture::CaptureDisplayGeometry>>,
+    display_hints: tether_capture::CaptureDisplayHints,
     cursor_frame_tx: tokio::sync::watch::Sender<Option<CursorFrameDims>>,
     shutdown: Arc<AtomicBool>,
     chosen_profile: VideoProfile,
@@ -3398,6 +3409,21 @@ fn run_capture_and_send(
             encode_changed,
             Instant::now().duration_since(last_encoder_rebuild),
         );
+        if viewport_changed {
+            info!(
+                viewport_seq = current_viewport_seq,
+                viewport = ?current_viewport,
+                capture_width = frame_width,
+                capture_height = frame_height,
+                encode_width,
+                encode_height,
+                first_build,
+                capture_changed,
+                encode_changed,
+                will_recreate_encoder = needs_recreate,
+                "viewport sizing decision"
+            );
+        }
 
         // Damage-skip gate. If the classifier says the frame is bit-identical
         // to the previous one AND nobody is waiting on a forced IDR or an
@@ -3452,7 +3478,13 @@ fn run_capture_and_send(
                 );
                 fragmenter.bump_epoch();
             }
-            let _ = display_dims_tx.send(Some((frame_width, frame_height)));
+            let display_geometry = tether_capture::CaptureDisplayGeometry::new(
+                frame_width,
+                frame_height,
+                ENCODER_FPS.saturating_mul(1000),
+            )
+            .with_hints(display_hints);
+            let _ = display_dims_tx.send(Some(display_geometry));
             let _ = cursor_frame_tx.send(Some(CursorFrameDims {
                 capture_w: frame_width,
                 capture_h: frame_height,

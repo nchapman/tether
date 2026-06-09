@@ -311,15 +311,23 @@ pub enum RenderEvent {
     /// `ControlMessage::SetCursorMode`; consumer-side decision to
     /// actually grab the pointer happens inside the renderer.
     CursorModeChanged(CursorMode),
-    /// Window resized to `(width, height)` physical pixels. The client
-    /// binary forwards this to the host as `ControlMessage::SetViewportHint`
-    /// (after debouncing) so the host can re-encode at the new dims —
-    /// without this hook, the host stays at the original capture
-    /// resolution regardless of how small the client window is, wasting
-    /// encode time and bandwidth.
+    /// Window resized. `surface_*` is the winit physical-pixel window size;
+    /// `viewport_*` is the density/presentation-mode-corrected rectangle the
+    /// client forwards to the host as `ControlMessage::SetViewportHint` after
+    /// debouncing.
     Resized {
-        width: u32,
-        height: u32,
+        surface_width: u32,
+        surface_height: u32,
+        viewport_width: u32,
+        viewport_height: u32,
+        presentation_width: u32,
+        presentation_height: u32,
+        host_width: u32,
+        host_height: u32,
+        host_scale_num: u16,
+        host_scale_den: u16,
+        client_scale_factor: f64,
+        presentation_mode: PresentationMode,
     },
     /// Physical metrics for the client output hosting the renderer. The client
     /// forwards this to the host as display-mode-matching input; it is not a
@@ -750,9 +758,21 @@ impl App {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.resize(surface_size.width, surface_size.height);
         }
+        let presentation_size_px = self.presentation_size_px();
+        let host_display = self.host_display.get();
         self.emit(RenderEvent::Resized {
-            width: viewport_size.width,
-            height: viewport_size.height,
+            surface_width: surface_size.width,
+            surface_height: surface_size.height,
+            viewport_width: viewport_size.width,
+            viewport_height: viewport_size.height,
+            presentation_width: presentation_size_px.0,
+            presentation_height: presentation_size_px.1,
+            host_width: host_display.size_px.0,
+            host_height: host_display.size_px.1,
+            host_scale_num: host_display.scale.num,
+            host_scale_den: host_display.scale.den,
+            client_scale_factor: self.client_scale_factor,
+            presentation_mode: self.presentation_mode,
         });
         self.refresh_client_display_metrics();
     }
@@ -788,9 +808,30 @@ impl App {
         if geometry == self.last_host_display {
             return;
         }
+        let old_presentation_size_px = self.presentation_size_px();
+        let pending_window_resize = self.window.as_ref().and_then(|window| {
+            let current_size = window.inner_size();
+            let monitor_size = window.current_monitor().map(|monitor| {
+                let size = monitor.size();
+                (size.width, size.height)
+            });
+            corrected_window_size_for_host_geometry_update(
+                current_size,
+                old_presentation_size_px,
+                logical_actual_size_px(geometry.size_px, geometry.scale, self.client_scale_factor),
+                monitor_size,
+            )
+        });
         self.last_host_display = geometry;
         self.update_presentation_size();
-        if let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
+        if let Some(window) = self.window.as_ref() {
+            let size = if let Some(size) = pending_window_resize {
+                window
+                    .request_inner_size(size)
+                    .unwrap_or_else(|| window.inner_size())
+            } else {
+                window.inner_size()
+            };
             self.apply_window_resize(size);
         }
     }
@@ -1191,6 +1232,28 @@ fn initial_window_size_for_monitor(
 }
 
 #[must_use]
+fn corrected_window_size_for_host_geometry_update(
+    current_surface_px: PhysicalSize<u32>,
+    old_presentation_px: (u32, u32),
+    new_presentation_px: (u32, u32),
+    monitor_px: Option<(u32, u32)>,
+) -> Option<PhysicalSize<u32>> {
+    let old_initial = initial_window_size_for_monitor(old_presentation_px, monitor_px);
+    if !approx_size(current_surface_px, old_initial, 1) {
+        return None;
+    }
+    let new_initial = initial_window_size_for_monitor(new_presentation_px, monitor_px);
+    if approx_size(current_surface_px, new_initial, 1) {
+        return None;
+    }
+    Some(PhysicalSize::new(new_initial.0, new_initial.1))
+}
+
+fn approx_size(size: PhysicalSize<u32>, expected: (u32, u32), tolerance: u32) -> bool {
+    size.width.abs_diff(expected.0) <= tolerance && size.height.abs_diff(expected.1) <= tolerance
+}
+
+#[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn logical_actual_size_px(
     host_physical_px: (u32, u32),
@@ -1472,6 +1535,45 @@ mod tests {
             (1280, 720)
         );
         assert_eq!(initial_window_size_for_monitor((0, 0), None), (1280, 720));
+    }
+
+    #[test]
+    fn host_geometry_update_resizes_window_still_at_bootstrap_size() {
+        assert_eq!(
+            corrected_window_size_for_host_geometry_update(
+                PhysicalSize::new(1920, 1200),
+                (1920, 1200),
+                (3840, 2400),
+                Some((6720, 2836)),
+            ),
+            Some(PhysicalSize::new(3840, 2400))
+        );
+    }
+
+    #[test]
+    fn host_geometry_update_caps_corrected_window_to_monitor() {
+        assert_eq!(
+            corrected_window_size_for_host_geometry_update(
+                PhysicalSize::new(1920, 1200),
+                (1920, 1200),
+                (3840, 2400),
+                Some((2560, 1440)),
+            ),
+            Some(PhysicalSize::new(2304, 1440))
+        );
+    }
+
+    #[test]
+    fn host_geometry_update_does_not_resize_after_user_resize() {
+        assert_eq!(
+            corrected_window_size_for_host_geometry_update(
+                PhysicalSize::new(1800, 1000),
+                (1920, 1200),
+                (3840, 2400),
+                Some((6720, 2836)),
+            ),
+            None
+        );
     }
 
     #[test]

@@ -72,7 +72,12 @@ contains the coordinate space.
 4. macOS capture/display enumeration must use backing-pixel APIs for
    `host_mode_px`/`host_capture_px`. Point-space APIs are only for input
    injection and cursor mapping.
-5. Client-side "native" means the selected client output's physical pixel mode,
+5. Linux portal capture must not assume the portal stream bounds are pixels.
+   `Stream::size`/`position` are compositor coordinates; pair them with the
+   PipeWire negotiated frame size to derive the scale that belongs to the live
+   `host_capture_px`. If the two sizes are equal, the captured stream is already
+   compositor-sized and the live display scale for presentation is `1/1`.
+6. Client-side "native" means the selected client output's physical pixel mode,
    optionally minus a platform safe area. It does not mean the current Tether
    window size.
 
@@ -86,8 +91,9 @@ The default should be `Fit to Window` using logical-pixel 100% as its cap:
    `host_scale` comes from the selected captured display's
    `DisplayDescriptor`. The `ServerHello` value is a bootstrap; if the host
    later learns the actual captured source differs from the initial topology
-   guess, it sends a fresh `DisplayList` and the client updates the renderer's
-   host scale without rebuilding the video stream.
+   guess, it sends a fresh `DisplayList` whose mode and scale describe the live
+   captured pixel grid, and the client updates the renderer's host scale without
+   rebuilding the video stream.
 3. `Fit to Window` reports the largest aspect-preserving rectangle that fits
    `logical_100_px` inside the client render surface, capped at
    `logical_100_px`.

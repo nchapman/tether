@@ -13,9 +13,10 @@
 use std::sync::Arc;
 
 use tether_protocol::control::{
-    ChromaSubsampling, ClientHello, CodecKind, ControlMessage, DisplayDescriptor, DisplayId,
-    DisplayMode, DisplayModeStatus, NegotiatedVideo, PixelFormat, RequestId, ServerHello,
-    VideoColorSpec, VideoProfile, VideoStreamId, Viewport, CLOCK_SYNC_PROBE_SAMPLES,
+    ChromaSubsampling, ClientDisplayMetrics, ClientHello, CodecKind, ControlMessage,
+    DisplayDescriptor, DisplayId, DisplayMode, DisplayModeStatus, NegotiatedVideo, PixelFormat,
+    RequestId, ServerHello, VideoColorSpec, VideoProfile, VideoStreamId, Viewport,
+    CLOCK_SYNC_PROBE_SAMPLES,
 };
 use tether_protocol::MonoNanos;
 use tether_session::{
@@ -721,6 +722,68 @@ async fn mid_session_set_viewport_round_trips_on_control_stream() {
             assert_eq!(v, Viewport::new(640, 480));
         }
         other => panic!("expected SetViewportHint, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mid_session_client_display_metrics_round_trips_on_control_stream() {
+    // ClientDisplayMetrics is display-mode-matching input, not a mode-change
+    // request. Loopback pins that it rides the same post-handshake control
+    // stream as SetViewportHint without being dropped by session plumbing.
+    let (host_chan, client_chan) = duplex_pair();
+    let (host_cfg, client_cfg) = cfgs();
+
+    let host_chan_for_session: Arc<dyn ControlChannel> = host_chan.clone();
+    let client_chan_for_session: Arc<dyn ControlChannel> = client_chan.clone();
+    let host_chan_for_probe = host_chan_for_session.clone();
+
+    let host_task = tokio::spawn(async move {
+        let session = HostSession::accept(host_chan_for_session, host_cfg, |client_caps| {
+            client_caps.iter().copied().next()
+        })
+        .await
+        .unwrap();
+        answer_clock_probe(host_chan_for_probe.as_ref()).await;
+        session
+    });
+    let client_task = tokio::spawn(async move {
+        ClientSession::connect(client_chan_for_session, client_cfg)
+            .await
+            .unwrap()
+    });
+    let _host = host_task.await.unwrap();
+    let _client = client_task.await.unwrap();
+
+    let metrics = ClientDisplayMetrics {
+        display_id: 3,
+        mode: DisplayMode::new(2560, 1440, 144_000),
+        scale_num: 3,
+        scale_den: 2,
+        safe_area: None,
+    };
+
+    let host_chan_recv: Arc<dyn ControlChannel> = host_chan;
+    let client_chan_send: Arc<dyn ControlChannel> = client_chan;
+    let expected = metrics.clone();
+    let send_task = tokio::spawn(async move {
+        client_chan_send
+            .send_control(&ControlMessage::ClientDisplayMetrics(metrics))
+            .await
+            .unwrap();
+    });
+    let recv_task = tokio::spawn(async move {
+        loop {
+            match host_chan_recv.recv_control().await.unwrap() {
+                ControlMessage::ForceIdr => continue,
+                other => return other,
+            }
+        }
+    });
+    send_task.await.unwrap();
+    let msg = recv_task.await.unwrap();
+    match msg {
+        ControlMessage::ClientDisplayMetrics(metrics) => assert_eq!(metrics, expected),
+        other => panic!("expected ClientDisplayMetrics, got {other:?}"),
     }
 }
 

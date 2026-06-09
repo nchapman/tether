@@ -904,7 +904,6 @@ async fn handle_client(
         let host_audio_available_ctl = audio_active;
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
-        let force_idr_for_viewport = force_idr.clone();
         let shutdown_notice_for_ctl = shutdown_notice_sent.clone();
         let session_summary_for_ctl = session_summary.clone();
         tasks.spawn(async move {
@@ -1063,12 +1062,11 @@ async fn handle_client(
                             height = v.height,
                             "client viewport changed"
                         );
-                        // Latch the new viewport. The send thread
-                        // notices the seq bump on its next iteration
-                        // and rebuilds the encoder only if encode dims
-                        // actually change. We force an IDR regardless
-                        // so the client sees a clean cut on whatever
-                        // dimensions the backend chooses.
+                        // Latch the new viewport. The send thread notices the
+                        // seq bump on its next iteration and decides whether
+                        // the effective encode dims changed. Viewport changes
+                        // that still resolve to the current stream size are
+                        // pure presentation updates on the client.
                         let next = if v.is_valid() {
                             Some(v)
                         } else {
@@ -1102,13 +1100,11 @@ async fn handle_client(
                             );
                             stream_ready_ctl.store(true, Ordering::Release);
                         }
-                        tracing::debug!(
+                        tracing::trace!(
                             width = v.width,
                             height = v.height,
-                            "SetViewportHint: forcing IDR; encoder rebuild fires only if \
-                             encode dims change"
+                            "SetViewportHint latched; send thread will decide effective resize"
                         );
-                        force_idr_for_viewport.raise();
                     }
                     Ok(ControlMessage::ClientDisplayMetrics(metrics)) => {
                         info!(
@@ -2831,6 +2827,16 @@ fn should_recreate_encoder(
     encode_changed && elapsed_since_rebuild >= VIEWPORT_REBUILD_THROTTLE
 }
 
+fn should_skip_unchanged_frame(
+    damage_unchanged: bool,
+    force_idr_pending: bool,
+    first_build: bool,
+    capture_changed: bool,
+    encode_changed: bool,
+) -> bool {
+    damage_unchanged && !force_idr_pending && !first_build && !capture_changed && !encode_changed
+}
+
 /// Compute the encoder-output dimensions for a given capture size
 /// and client viewport. The viewport bounds the longest edge; we
 /// preserve aspect ratio (letterbox at the client; never stretch)
@@ -3257,6 +3263,7 @@ fn run_capture_and_send(
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
     let mut slot: Option<EncoderSlot> = None;
+    let mut last_handled_viewport_seq = 0u64;
     // When the encoder was last rebuilt, for the viewport-rebuild throttle
     // (`VIEWPORT_REBUILD_THROTTLE`). Seeded in the past so the first
     // viewport-driven rebuild after startup is never throttled.
@@ -3317,18 +3324,6 @@ fn run_capture_and_send(
             }
         }
 
-        // Damage-skip gate. If the classifier says the frame is
-        // bit-identical to the previous one AND nobody is waiting on
-        // a forced IDR, drop it on the floor — the client's
-        // renderer is already showing this image. The IdrSignal peek
-        // here is non-consuming; the take() further down still owns
-        // the clear. Forced IDRs win over the damage skip
-        // unconditionally: a client mid-reconnect requests an IDR to
-        // bootstrap, and swallowing it would deadlock the session.
-        if matches!(damage.classify(&frame), DamageHint::Unchanged) && !force_idr.peek() {
-            continue;
-        }
-
         // Encoder is lazily created on the first frame (we don't know
         // capture resolution at startup) and recreated whenever the
         // capture source changes resolution mid-stream (Linux portal
@@ -3342,6 +3337,7 @@ fn run_capture_and_send(
             let g = lock_host_state(&latest_viewport, "latest viewport");
             (g.viewport, g.seq)
         };
+        let viewport_changed = current_viewport_seq != last_handled_viewport_seq;
         // Viewport-driven downscale applies per frame source:
         //   - CPU frames: `resize_bgra_bilinear` does the work below.
         //   - Linux GPU dma-buf: `tether-scaler` (Mitchell-Netravali
@@ -3366,6 +3362,32 @@ fn run_capture_and_send(
         let encode_changed = slot
             .as_ref()
             .is_some_and(|s| s.width != encode_width || s.height != encode_height);
+
+        // Damage-skip gate. If the classifier says the frame is bit-identical
+        // to the previous one AND nobody is waiting on a forced IDR or an
+        // effective dimension change, drop it on the floor — the client's
+        // renderer is already showing this image. Viewport updates that resolve
+        // to the current encode dims are handled by recording the seq; they do
+        // not need a host frame or keyframe.
+        let damage_unchanged = matches!(damage.classify(&frame), DamageHint::Unchanged);
+        if should_skip_unchanged_frame(
+            damage_unchanged,
+            force_idr.peek(),
+            first_build,
+            capture_changed,
+            encode_changed,
+        ) {
+            if viewport_changed {
+                last_handled_viewport_seq = current_viewport_seq;
+                tracing::trace!(
+                    viewport_seq = current_viewport_seq,
+                    encode_width,
+                    encode_height,
+                    "viewport update did not change encode dims; skipping unchanged frame"
+                );
+            }
+            continue;
+        }
         // Throttle viewport-driven rebuilds (server-side defense); while
         // deferred, encoding continues at the current dims (the client
         // letterboxes) and a later iteration rebuilds to the newest viewport.
@@ -3376,6 +3398,7 @@ fn run_capture_and_send(
             Instant::now().duration_since(last_encoder_rebuild),
         );
 
+        let mut rebuilt_encoder = false;
         if needs_recreate {
             last_encoder_rebuild = Instant::now();
             // Drop the previous encoder BEFORE constructing its
@@ -3486,6 +3509,10 @@ fn run_capture_and_send(
                              (encode dims too small for the configured floor)"
                         );
                     }
+                    rebuilt_encoder = true;
+                    if viewport_changed {
+                        last_handled_viewport_seq = current_viewport_seq;
+                    }
                     #[cfg(target_os = "macos")]
                     let iosurface_encode_fourcc =
                         macos_iosurface_encode_fourcc(chosen_profile).unwrap_or(0);
@@ -3542,6 +3569,8 @@ fn run_capture_and_send(
                     return;
                 }
             };
+        } else if viewport_changed && !encode_changed {
+            last_handled_viewport_seq = current_viewport_seq;
         }
         let slot_mut = slot.as_mut().expect("slot populated above");
 
@@ -3556,7 +3585,7 @@ fn run_capture_and_send(
 
         // Swap-and-zero: at most one forced keyframe per request, even
         // if multiple ForceIdr messages arrive between encode calls.
-        let force_kf = force_idr.take();
+        let force_kf = force_idr.take() || rebuilt_encoder;
         timing.encode_submit();
         let encoded = match frame {
             CapturedFrame::Cpu(ref cpu) => {
@@ -4380,6 +4409,34 @@ mod tests {
         // A capture change is never throttled even if an encode change rode
         // along inside the window (real source change wins).
         assert!(should_recreate_encoder(false, true, true, under));
+    }
+
+    #[test]
+    fn unchanged_frame_skip_allows_only_effective_resize_or_idr_work() {
+        assert!(
+            should_skip_unchanged_frame(true, false, false, false, false),
+            "unchanged frame with no pending work should skip"
+        );
+        assert!(
+            !should_skip_unchanged_frame(true, false, false, false, true),
+            "effective encode-size change must not be skipped"
+        );
+        assert!(
+            !should_skip_unchanged_frame(true, true, false, false, false),
+            "pending IDR must not be skipped"
+        );
+        assert!(
+            !should_skip_unchanged_frame(true, false, true, false, false),
+            "first encoder build must not be skipped"
+        );
+        assert!(
+            !should_skip_unchanged_frame(true, false, false, true, false),
+            "capture-source resize must not be skipped"
+        );
+        assert!(
+            !should_skip_unchanged_frame(false, false, false, false, false),
+            "changed content must not be skipped"
+        );
     }
 
     #[test]

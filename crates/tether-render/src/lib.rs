@@ -38,7 +38,7 @@ use tether_protocol::control::CursorMode;
 use tether_protocol::MonoNanos;
 use tracing::warn;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
@@ -289,7 +289,7 @@ pub type EventSink = Box<dyn Fn(RenderEvent) + Send>;
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     title: &str,
-    initial_size: (u32, u32),
+    initial_video_size_px: (u32, u32),
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
@@ -300,7 +300,7 @@ pub fn run(
     let event_loop = EventLoop::new()?;
     let mut app = App {
         title: title.to_string(),
-        initial_size,
+        initial_video_size_px,
         color_space,
         chroma,
         bit_depth,
@@ -327,7 +327,7 @@ pub fn run(
 
 struct App {
     title: String,
-    initial_size: (u32, u32),
+    initial_video_size_px: (u32, u32),
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
@@ -668,9 +668,18 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        let monitor_size = event_loop
+            .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next())
+            .map(|monitor| {
+                let size = monitor.size();
+                (size.width, size.height)
+            });
+        let initial_size =
+            initial_window_size_for_monitor(self.initial_video_size_px, monitor_size);
         let attrs = WindowAttributes::default()
             .with_title(&self.title)
-            .with_inner_size(LogicalSize::new(self.initial_size.0, self.initial_size.1));
+            .with_inner_size(PhysicalSize::new(initial_size.0, initial_size.1));
         let win = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -693,6 +702,11 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        let size = win.inner_size();
+        self.emit(RenderEvent::Resized {
+            width: size.width,
+            height: size.height,
+        });
         // Cache the monitor refresh rate. Winit returns an
         // `Option<u32>` in millihertz; fall back to 60 Hz when
         // it's unavailable (some Wayland compositors don't expose
@@ -917,6 +931,35 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Pick the physical-pixel startup window size from the host's advertised
+/// capture/display size and the client monitor. The host size is the target for
+/// 1:1 presentation; the monitor only caps it when the host would not fit.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn initial_window_size_for_monitor(
+    host_px: (u32, u32),
+    monitor_px: Option<(u32, u32)>,
+) -> (u32, u32) {
+    const FALLBACK: (u32, u32) = (1280, 720);
+    let (host_w, host_h) = host_px;
+    if host_w == 0 || host_h == 0 {
+        return FALLBACK;
+    }
+    let Some((monitor_w, monitor_h)) = monitor_px.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return (host_w, host_h);
+    };
+    if host_w <= monitor_w && host_h <= monitor_h {
+        return (host_w, host_h);
+    }
+
+    let scale_w = f64::from(monitor_w) / f64::from(host_w);
+    let scale_h = f64::from(monitor_h) / f64::from(host_h);
+    let scale = scale_w.min(scale_h).min(1.0);
+    let width = (f64::from(host_w) * scale).floor() as u32;
+    let height = (f64::from(host_h) * scale).floor() as u32;
+    (width.max(1), height.max(1))
+}
+
 /// Single-slot, latest-wins frame channel between the decoder thread
 /// and the renderer. Replaces a bounded queue: a remote-desktop
 /// viewer never benefits from rendering a stale frame when a newer
@@ -1011,6 +1054,43 @@ pub(crate) fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn initial_window_uses_host_size_when_it_fits_client_monitor() {
+        assert_eq!(
+            initial_window_size_for_monitor((1920, 1080), Some((2560, 1440))),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn initial_window_fits_host_inside_smaller_client_monitor() {
+        assert_eq!(
+            initial_window_size_for_monitor((3840, 2160), Some((2560, 1440))),
+            (2560, 1440)
+        );
+        assert_eq!(
+            initial_window_size_for_monitor((3840, 2160), Some((1920, 1200))),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn initial_window_without_monitor_uses_host_size() {
+        assert_eq!(
+            initial_window_size_for_monitor((3024, 1952), None),
+            (3024, 1952)
+        );
+    }
+
+    #[test]
+    fn initial_window_invalid_host_size_uses_fallback() {
+        assert_eq!(
+            initial_window_size_for_monitor((0, 1080), Some((2560, 1440))),
+            (1280, 720)
+        );
+        assert_eq!(initial_window_size_for_monitor((0, 0), None), (1280, 720));
+    }
 
     #[test]
     fn cursor_centre_maps_to_centre() {

@@ -25,9 +25,9 @@ The client sends `ClientHello`:
 
 `initial_viewport` is a wire field, but production clients do not rely on a
 guessed size to start video. The real startup gate is a post-handshake
-`SetViewportHint` carrying the renderer's measured viewport followed by
-`StreamReady { video: true, ... }`; the host must not emit video for a stream
-until both the video-ready flag and a valid viewport are present.
+`SetViewportHint` carrying the renderer's measured physical-pixel viewport
+followed by `StreamReady { video: true, ... }`; the host must not emit video
+for a stream until both the video-ready flag and a valid viewport are present.
 
 The host replies with `ServerHandshake`:
 
@@ -80,7 +80,8 @@ displays/sources through `NegotiatedVideo` and future stream descriptors.
 - `available_modes`
 - `can_set_mode`
 
-`DisplayMode` is `{ width, height, refresh_millihz }`.
+`DisplayMode` is `{ width, height, refresh_millihz }`; width and height are
+physical/backing pixels.
 
 The host sends the best topology it can observe in `ServerHandshake`.
 Production hosts enumerate the local display system; test-pattern/headless
@@ -88,10 +89,11 @@ fallbacks advertise a synthetic primary display. If the capture backend later
 reveals a more exact primary capture mode, the host sends a fresh
 `DisplayList`.
 
-`SetViewportHint { stream_id, viewport }` is a best-effort encoder sizing hint.
-It does not change host resolution and does not require an acknowledgement. For
-the initial stream, it is also part of startup readiness: production clients
-send the first viewport hint before `StreamReady`, and hosts wait for both.
+`SetViewportHint { stream_id, viewport }` is a best-effort encoder sizing hint
+in client render-surface physical pixels. It does not change host resolution and
+does not require an acknowledgement. For the initial stream, it is also part of
+startup readiness: production clients send the first viewport hint before
+`StreamReady`, and hosts wait for both.
 
 `SetDisplayMode` is the real host display-mode request:
 

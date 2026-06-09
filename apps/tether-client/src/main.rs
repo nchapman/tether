@@ -24,8 +24,8 @@ use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
-    ClockSync, ControlMessage, GoodbyeCode, ServerHello, VideoStreamId, Viewport,
-    CLOCK_SYNC_PROBE_SAMPLES,
+    ClockSync, ControlMessage, DisplayDescriptor, GoodbyeCode, ServerHello, VideoStreamId,
+    Viewport, CLOCK_SYNC_PROBE_SAMPLES,
 };
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
@@ -41,12 +41,11 @@ use tracing::{debug, error, info, warn};
 mod client_pairing;
 use client_pairing::HostAuth;
 
-// Initial window size — the actual frame dimensions come from
-// `VideoFrameMeta::dimensions` once frames start arriving and the window
-// will pick them up automatically because tether-render reallocates its
-// texture on dimension change.
-const INITIAL_WIDTH: u32 = 1280;
-const INITIAL_HEIGHT: u32 = 720;
+// Fallback startup window size when the host cannot advertise a valid display.
+// Normal sessions use the host primary display's physical mode and let
+// tether-render cap that to the client monitor for FitNoUpscale startup.
+const FALLBACK_INITIAL_WIDTH: u32 = 1280;
+const FALLBACK_INITIAL_HEIGHT: u32 = 720;
 const CLOCK_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Default)]
@@ -105,6 +104,21 @@ fn drain_latest_valid_viewport(
         }
     }
     latest
+}
+
+fn initial_video_size_px_from_displays(displays: &[DisplayDescriptor]) -> (u32, u32) {
+    displays
+        .iter()
+        .find(|display| {
+            display.primary && display.current_mode.width > 0 && display.current_mode.height > 0
+        })
+        .or_else(|| {
+            displays
+                .iter()
+                .find(|display| display.current_mode.width > 0 && display.current_mode.height > 0)
+        })
+        .map(|display| (display.current_mode.width, display.current_mode.height))
+        .unwrap_or((FALLBACK_INITIAL_WIDTH, FALLBACK_INITIAL_HEIGHT))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1587,6 +1601,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let initial_video_size_px = initial_video_size_px_from_displays(&server_hello.displays);
+    info!(
+        host_mode_px_width = initial_video_size_px.0,
+        host_mode_px_height = initial_video_size_px.1,
+        "selected host display mode as initial render target"
+    );
+
     // Render loop blocks until the user closes the window. The
     // host's advertised color spec drives the renderer's EOTF
     // dispatch — for desktop captures (`sdr_desktop`) this is the
@@ -1594,7 +1615,7 @@ async fn main() -> anyhow::Result<()> {
     // mismatch the spec-blind chain previously had to absorb.
     let render_result = tether_render::run(
         "tether-client",
-        (INITIAL_WIDTH, INITIAL_HEIGHT),
+        initial_video_size_px,
         server_hello.video.color_space,
         negotiated_profile.chroma,
         negotiated_profile.bit_depth,
@@ -2278,9 +2299,46 @@ mod windows_format_tables {
 #[cfg(test)]
 mod arg_tests {
     use super::*;
+    use tether_protocol::control::{DisplayId, DisplayMode};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn display(id: u32, width: u32, height: u32, primary: bool) -> DisplayDescriptor {
+        let mode = DisplayMode::new(width, height, 60_000);
+        DisplayDescriptor {
+            id: DisplayId(id),
+            name: format!("display-{id}"),
+            scale_num: 1,
+            scale_den: 1,
+            primary,
+            position: (0, 0),
+            current_mode: mode,
+            available_modes: vec![mode],
+            can_set_mode: false,
+        }
+    }
+
+    #[test]
+    fn initial_video_size_prefers_valid_primary_display() {
+        let displays = vec![display(0, 1920, 1080, false), display(1, 3024, 1952, true)];
+        assert_eq!(initial_video_size_px_from_displays(&displays), (3024, 1952));
+    }
+
+    #[test]
+    fn initial_video_size_falls_back_to_first_valid_display() {
+        let displays = vec![display(0, 0, 1080, true), display(1, 1920, 1200, false)];
+        assert_eq!(initial_video_size_px_from_displays(&displays), (1920, 1200));
+    }
+
+    #[test]
+    fn initial_video_size_uses_fallback_when_displays_are_invalid() {
+        assert_eq!(initial_video_size_px_from_displays(&[]), (1280, 720));
+        assert_eq!(
+            initial_video_size_px_from_displays(&[display(0, 0, 1080, true)]),
+            (1280, 720)
+        );
     }
 
     #[test]

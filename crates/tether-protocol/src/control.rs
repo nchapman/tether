@@ -353,7 +353,8 @@ pub enum PixelFormat {
     P410,
 }
 
-/// One concrete display mode the host can report or apply.
+/// One concrete physical/backing-pixel display mode the host can report or
+/// apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayMode {
     pub width: u32,
@@ -760,10 +761,10 @@ pub enum DisplayModeStatus {
     Unknown(i32),
 }
 
-/// Pixel dimensions of the client's rendering surface. Used to size
-/// the encoder so we don't ship more pixels than the client will
-/// display. Width and height are positive integers — `0` in either
-/// is treated by the host as "ignore this viewport, use native."
+/// Physical-pixel dimensions of the client's rendering surface. Used to size
+/// the encoder so we don't ship more pixels than the client will display.
+/// Width and height are positive integers — `0` in either is treated by the
+/// host as "ignore this viewport, use native."
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Viewport {
     pub width: u32,

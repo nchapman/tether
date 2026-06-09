@@ -633,6 +633,29 @@ impl App {
         self.emit(RenderEvent::CursorModeChanged(new_mode));
     }
 
+    fn apply_window_resize(&mut self, size: PhysicalSize<u32>) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.resize(size.width, size.height);
+        }
+        self.emit(RenderEvent::Resized {
+            width: size.width,
+            height: size.height,
+        });
+        self.refresh_client_display_metrics();
+    }
+
+    fn corrected_window_resize(&self, size: PhysicalSize<u32>) -> Option<PhysicalSize<u32>> {
+        let window = self.window.as_ref()?;
+        let unconstrained = window.fullscreen().is_some() || window.is_maximized();
+        fit_no_upscale_window_resize_correction(
+            self.presentation_mode,
+            unconstrained,
+            (size.width, size.height),
+            self.initial_video_size_px,
+        )
+        .map(|(width, height)| PhysicalSize::new(width, height))
+    }
+
     /// Apply the freshest pending frame (if any) and present.
     ///
     /// Driven from two places: `about_to_wait` calls this directly the
@@ -781,14 +804,15 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.resize(size.width, size.height);
+                if let Some(corrected) = self.corrected_window_resize(size) {
+                    if let Some(window) = self.window.as_ref() {
+                        if let Some(applied) = window.request_inner_size(corrected) {
+                            self.apply_window_resize(applied);
+                        }
+                    }
+                    return;
                 }
-                self.emit(RenderEvent::Resized {
-                    width: size.width,
-                    height: size.height,
-                });
-                self.refresh_client_display_metrics();
+                self.apply_window_resize(size);
             }
             WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.refresh_client_display_metrics();
@@ -1012,6 +1036,33 @@ fn initial_window_size_for_monitor(
     let width = (f64::from(host_w) * scale).floor() as u32;
     let height = (f64::from(host_h) * scale).floor() as u32;
     (width.max(1), height.max(1))
+}
+
+/// Soft-constrain normal FitNoUpscale window resizes to the feed aspect and
+/// native size. Fullscreen/maximized are intentionally left unconstrained.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn fit_no_upscale_window_resize_correction(
+    mode: PresentationMode,
+    unconstrained: bool,
+    requested: (u32, u32),
+    video: (u32, u32),
+) -> Option<(u32, u32)> {
+    if mode != PresentationMode::FitNoUpscale || unconstrained {
+        return None;
+    }
+    if requested.0 == 0 || requested.1 == 0 || video.0 == 0 || video.1 == 0 {
+        return None;
+    }
+
+    let scale_w = f64::from(requested.0) / f64::from(video.0);
+    let scale_h = f64::from(requested.1) / f64::from(video.1);
+    let scale = scale_w.min(scale_h).min(1.0);
+    let corrected = (
+        (f64::from(video.0) * scale).floor().max(1.0) as u32,
+        (f64::from(video.1) * scale).floor().max(1.0) as u32,
+    );
+    (corrected != requested).then_some(corrected)
 }
 
 fn client_display_metrics_for_monitor(
@@ -1248,6 +1299,89 @@ mod tests {
             (1280, 720)
         );
         assert_eq!(initial_window_size_for_monitor((0, 0), None), (1280, 720));
+    }
+
+    #[test]
+    fn fit_no_upscale_window_resize_caps_to_video_size() {
+        assert_eq!(
+            fit_no_upscale_window_resize_correction(
+                PresentationMode::FitNoUpscale,
+                false,
+                (2560, 1440),
+                (1920, 1080),
+            ),
+            Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn fit_no_upscale_window_resize_preserves_video_aspect() {
+        assert_eq!(
+            fit_no_upscale_window_resize_correction(
+                PresentationMode::FitNoUpscale,
+                false,
+                (1000, 1000),
+                (1920, 1080),
+            ),
+            Some((1000, 562))
+        );
+        assert_eq!(
+            fit_no_upscale_window_resize_correction(
+                PresentationMode::FitNoUpscale,
+                false,
+                (1280, 600),
+                (1920, 1080),
+            ),
+            Some((1066, 600))
+        );
+    }
+
+    #[test]
+    fn fit_no_upscale_window_resize_accepts_already_constrained_size() {
+        assert_eq!(
+            fit_no_upscale_window_resize_correction(
+                PresentationMode::FitNoUpscale,
+                false,
+                (1280, 720),
+                (1920, 1080),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn fit_no_upscale_window_resize_leaves_maximized_or_fullscreen_unconstrained() {
+        assert_eq!(
+            fit_no_upscale_window_resize_correction(
+                PresentationMode::FitNoUpscale,
+                true,
+                (2560, 1440),
+                (1920, 1080),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn window_resize_correction_is_fit_no_upscale_only() {
+        assert_eq!(
+            fit_no_upscale_window_resize_correction(
+                PresentationMode::Original,
+                false,
+                (2560, 1440),
+                (1920, 1080),
+            ),
+            None
+        );
+        assert_eq!(
+            fit_no_upscale_window_resize_correction(
+                PresentationMode::Fit,
+                false,
+                (2560, 1440),
+                (1920, 1080),
+            ),
+            None
+        );
     }
 
     #[test]

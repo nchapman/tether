@@ -96,6 +96,10 @@ The default should be `FitNoUpscale`:
    thin margin.
 7. Bitrate and encoder rebuild decisions are based on `stream_px`, not raw
    `client_viewport_px`.
+8. Normal, non-maximized client windows should stay at the stream aspect and
+   should not grow beyond the native stream size. Fullscreen and maximized
+   windows are allowed to be larger; the decoded image remains centered and
+   un-upscaled.
 
 This directly fixes the uncomfortable case: if the client display is larger and
 the host display fits, the host streams native pixels and the client shows them
@@ -118,12 +122,13 @@ display-mode behavior:
 
 Only `FitNoUpscale` and `Original` exist in the first implementation, exposed
 by the client as `--view-mode fit-no-upscale|original`. `FitNoUpscale` presents
-1:1 when the stream fits and fits down only when needed. `Original` still sends
-one startup viewport hint so the host can open the video gate, but uses a
-no-cap viewport (`u32::MAX × u32::MAX`) and ignores subsequent window resizes
-for stream sizing; presentation remains 1:1 and clips when the surface is
-smaller. The key invariant is that none of these view modes changes the host OS
-display mode.
+1:1 when the stream fits and fits down only when needed; normal window resizes
+are corrected back to the feed aspect and capped at the feed size on the client
+before the settled window size is emitted. `Original` still sends one startup
+viewport hint so the host can open the video gate, but uses a no-cap viewport
+(`u32::MAX × u32::MAX`) and ignores subsequent window resizes for stream sizing;
+presentation remains 1:1 and clips when the surface is smaller. The key
+invariant is that none of these view modes changes the host OS display mode.
 
 ## Host Display-Mode Matching
 

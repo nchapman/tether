@@ -267,6 +267,7 @@ pub(crate) struct D3D11RenderState {
     /// shared `App`); falls back to the surface size until a frame lands.
     video_size: (u32, u32),
     presentation_mode: PresentationMode,
+    presentation_size_px: (u32, u32),
     /// EOTF + range tags baked into the per-frame cbuffer.
     transfer_kind: u32,
     range_kind: u32,
@@ -287,6 +288,7 @@ impl D3D11RenderState {
         chroma: ChromaSubsampling,
         bit_depth: u8,
         presentation_mode: PresentationMode,
+        presentation_size_px: (u32, u32),
         cursor_channel: CursorChannel,
     ) -> Result<Self> {
         // Windows is 4:2:0-only today; 4:4:4 has no D3D11 sample path and
@@ -397,6 +399,7 @@ impl D3D11RenderState {
             imported: None,
             video_size: surface_size,
             presentation_mode,
+            presentation_size_px,
             transfer_kind,
             range_kind,
             cursor,
@@ -428,6 +431,10 @@ impl D3D11RenderState {
             }
             Err(e) => tracing::error!(error = %e, "D3D11 swapchain resize failed"),
         }
+    }
+
+    pub(crate) fn set_presentation_size_px(&mut self, presentation_size_px: (u32, u32)) {
+        self.presentation_size_px = presentation_size_px;
     }
 
     pub(crate) fn apply_frame(&mut self, frame: Frame) -> Result<()> {
@@ -573,8 +580,11 @@ impl D3D11RenderState {
             // Draw the video only once a frame has been imported; until
             // then the cleared black backbuffer is presented.
             if let Some(imported) = self.imported.as_ref() {
-                let (sx, sy) =
-                    presentation_scale(self.presentation_mode, self.video_size, self.surface_size);
+                let (sx, sy) = presentation_scale(
+                    self.presentation_mode,
+                    self.presentation_size_px,
+                    self.surface_size,
+                );
                 let params = ShaderParams {
                     scale: [sx, sy, 0.0, 0.0],
                     color_params: [self.transfer_kind, self.range_kind, 0, 0],
@@ -621,7 +631,7 @@ impl D3D11RenderState {
                 // RTV + viewport set above stay bound for this pass.
                 let fit_dims = presentation_rect_dims(
                     self.presentation_mode,
-                    self.video_size,
+                    self.presentation_size_px,
                     self.surface_size,
                 );
                 self.cursor.render(
@@ -728,6 +738,7 @@ impl D3D11RenderState {
             imported: None,
             video_size: (width, height),
             presentation_mode: PresentationMode::Fit,
+            presentation_size_px: (width, height),
             transfer_kind: transfer_kind_for(color_space),
             range_kind: if bit_depth == 10 {
                 RANGE_KIND_LIMITED_10

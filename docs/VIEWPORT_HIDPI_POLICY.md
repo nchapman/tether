@@ -63,8 +63,8 @@ contains the coordinate space.
 1. Stream sizing uses physical/backing pixels only. `SetViewportHint` must mean
    `client_viewport_px`, not logical window size.
 2. `DisplayMode` dimensions are physical/backing pixels. `DisplayDescriptor`
-   scale is metadata for UI and input mapping, not a way to reconstruct the
-   display mode.
+   scale is the host logical-to-physical ratio used for density-correct
+   presentation; it is not a way to reconstruct the display mode.
 3. Prefer directly observed dimensions over derived dimensions. If a platform can
    report both physical and logical sizes, carry both. Do not compute
    `logical = physical / scale` as the authoritative value on fractional-scale
@@ -78,57 +78,53 @@ contains the coordinate space.
 
 ## Default Presentation Policy
 
-The default should be `FitNoUpscale`:
+The default should be `Fit to Window` using logical-pixel 100% as its cap:
 
 1. The host captures the selected display at `host_capture_px`.
-2. The client reports `client_viewport_px` whenever the render surface changes.
-3. The host computes the largest aspect-preserving rectangle that fits
-   `host_capture_px` inside `client_viewport_px`.
-4. If that fit scale is less than `1.0`, the host may downscale and encode at the
-   aligned fit size. The client presents the decoded frame 1:1 in
-   `client_viewport_px`, centered with letterbox/pillarbox margins.
-5. If that fit scale is greater than or equal to `1.0`, the host encodes
-   `host_capture_px`. The client presents the decoded frame 1:1, centered. A
-   larger client viewport does not cause host-side upscaling and does not change
-   the host display mode.
+2. The client computes logical 100% in physical client pixels:
+   `logical_100_px = host_capture_px * client_scale / host_scale`.
+   `host_scale` comes from the selected captured display's
+   `DisplayDescriptor`. The `ServerHello` value is a bootstrap; if the host
+   later learns the actual captured source differs from the initial topology
+   guess, it sends a fresh `DisplayList` and the client updates the renderer's
+   host scale without rebuilding the video stream.
+3. `Fit to Window` reports the largest aspect-preserving rectangle that fits
+   `logical_100_px` inside the client render surface, capped at
+   `logical_100_px`.
+4. `Actual Size` reports `logical_100_px` directly. If the client surface is
+   smaller, the decoded image is centered and clipped.
+5. The host computes the largest aspect-preserving no-upscale encode rectangle
+   that fits `host_capture_px` inside the reported viewport hint. If the hint is
+   larger than native capture, the host streams native pixels and the client
+   performs the density-correct presentation upscale.
 6. Alignment can shrink the stream a few pixels below the mathematical fit. Keep
-   presentation 1:1 by default; do not blur the result back up just to remove a
-   thin margin.
+   presentation stable; do not chase a thin margin with extra resize churn.
 7. Bitrate and encoder rebuild decisions are based on `stream_px`, not raw
    `client_viewport_px`.
-8. Normal, non-maximized client windows should stay at the stream aspect and
-   should not grow beyond the native stream size. Fullscreen and maximized
-   windows are allowed to be larger; the decoded image remains centered and
-   un-upscaled.
+8. Client window size is an OS/window-manager concern. The renderer may emit a
+   smaller density-correct viewport hint than the actual window surface to avoid
+   unnecessary host resizing, but it should not synchronously fight interactive
+   window resizes.
 
 This directly fixes the uncomfortable case: if the client display is larger and
-the host display fits, the host streams native pixels and the client shows them
-1:1 instead of treating the oversized viewport as a new target resolution.
+denser and the host display fits logically, the host streams native pixels and
+the client presents them at logical 100% instead of raw physical-pixel 1:1.
 
 ## View Modes
 
 Tether should expose view behavior as a client preference, independent of host
 display-mode behavior:
 
-- `FitNoUpscale` default: downscale on the host when needed; otherwise 1:1.
-- `Original`: always request `stream_px = host_capture_px`; if the viewport is
-  smaller, the client presents the native stream 1:1 centered and clipped rather
-  than resizing the host stream. Scroll/pan controls can refine this later
-  without changing the stream-sizing contract.
-- `Fit`: fit the video into the viewport and allow client-side upscale when the
-  viewport is larger than `stream_px`. This is a presentation choice only.
+- `Fit to Window` default: fit inside the client window, capped at logical 100%.
+- `Actual Size` / `100%`: present at logical 100%, clipping when the client
+  surface is smaller.
 - `Fill`: crop-preserving fill for users who prefer no letterbox. This is also a
-  presentation choice only.
+  presentation choice only and is not part of the first implementation.
 
-Only `FitNoUpscale` and `Original` exist in the first implementation, exposed
-by the client as `--view-mode fit-no-upscale|original`. `FitNoUpscale` presents
-1:1 when the stream fits and fits down only when needed; normal window resizes
-are corrected back to the feed aspect and capped at the feed size on the client
-before the settled window size is emitted. `Original` still sends one startup
-viewport hint so the host can open the video gate, but uses a no-cap viewport
-(`u32::MAX × u32::MAX`) and ignores subsequent window resizes for stream sizing;
-presentation remains 1:1 and clips when the surface is smaller. The key
-invariant is that none of these view modes changes the host OS display mode.
+Only `Fit to Window` and `Actual Size` exist in the first implementation,
+exposed by the client as `--view-mode fit|actual-size` (with legacy aliases for
+the old branch names while this settles). The key invariant is that none of
+these view modes changes the host OS display mode.
 
 ## Host Display-Mode Matching
 
@@ -177,7 +173,7 @@ typed control or negotiated extension carrying at least:
 - `client_display_px`;
 - refresh rate in millihertz;
 - optional safe-area rect in physical pixels;
-- scale ratio for UI/input diagnostics only.
+- client scale ratio for display-mode matching and diagnostics.
 
 `SetDisplayMode` remains the only message that can change the host display mode.
 `SetViewportHint` remains best-effort stream sizing input.
@@ -186,13 +182,14 @@ typed control or negotiated extension carrying at least:
 
 The policy should be enforced with pure tests before platform work:
 
-- Host smaller than client viewport: `FitNoUpscale` returns `stream_px =
-  host_capture_px`.
+- Host smaller than logical 100% viewport: `Fit` returns a viewport hint at
+  logical 100%; the host no-upscale rule resolves stream dims to
+  `host_capture_px`.
 - Host larger than client viewport: returns the largest aligned fit, preserving
   aspect ratio and never exceeding either source or viewport.
 - Aspect mismatch: returns centered letterbox/pillarbox dimensions, no stretch.
-- Fractional scale case: physical mode, logical size, and scale are carried as
-  separate values; no policy test derives one as authoritative from the others.
+- Fractional scale case: `logical_100_px = host_capture_px * client_scale /
+  host_scale` is rounded only at the final physical dimensions.
 - macOS Retina case: backing-pixel capture can still map input through
   point-space injection.
 - View-mode tests prove presentation choices do not emit `SetDisplayMode`.

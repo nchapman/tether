@@ -58,7 +58,7 @@ use tether_session::{
 use tether_transport::{AbrSnapshot, Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod pairing;
 use pairing::{ActiveSession, Authorized, PairingState, RefusedReason};
@@ -132,25 +132,16 @@ const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
 const TEST_PATTERN_FPS: u32 = 60;
 
-fn initial_display_descriptors(use_test_pattern: bool) -> Vec<DisplayDescriptor> {
+fn initial_display_descriptors(use_test_pattern: bool) -> anyhow::Result<Vec<DisplayDescriptor>> {
     if use_test_pattern {
-        return vec![tether_capture::test_pattern_display(
+        return Ok(vec![tether_capture::test_pattern_display(
             TEST_PATTERN_WIDTH,
             TEST_PATTERN_HEIGHT,
             TEST_PATTERN_FPS.saturating_mul(1000),
-        )];
+        )]);
     }
 
-    match tether_capture::display_list() {
-        Ok(displays) => displays,
-        Err(e) => {
-            warn!(
-                error = %e,
-                "display topology enumeration failed; advertising synthetic primary display"
-            );
-            vec![tether_capture::test_pattern_display(1280, 720, 60_000)]
-        }
-    }
+    tether_capture::display_list().map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Upper bound on the per-connection authorization exchange (allowlist resume
@@ -548,8 +539,17 @@ async fn main() -> anyhow::Result<()> {
         // ends use the fixed default Opus config (48 kHz stereo).
         let audio_config = (audio_enabled && tether_audio::capture::is_supported())
             .then(|| tether_audio::OpusConfig::default().wire_config());
-        let display_descriptors =
-            Arc::new(StdMutex::new(initial_display_descriptors(use_test_pattern)));
+        let initial_displays = match initial_display_descriptors(use_test_pattern) {
+            Ok(displays) => displays,
+            Err(e) => {
+                error!(error = ?e, "display topology enumeration failed");
+                reporter.emit(&EngineEvent::Error {
+                    message: format!("display topology enumeration failed: {e}"),
+                });
+                continue;
+            }
+        };
+        let display_descriptors = Arc::new(StdMutex::new(initial_displays));
         let cfg = HostSessionConfig {
             server_name: "tether-host".to_string(),
             audio_config,
@@ -4561,10 +4561,19 @@ mod tests {
     }
 
     #[test]
-    fn encode_dims_max_viewport_is_no_cap_hint() {
-        // Client `Original` view mode sends this max-sized viewport as
-        // a startup no-cap hint so the host opens the video gate while
-        // keeping the stream at native capture dims.
+    fn encode_dims_logical_hidpi_viewport_does_not_upscale() {
+        // A 1x 1080p host shown at logical 100% on a 2x client reports
+        // a 3840x2160 density-correct viewport. The host still encodes
+        // native capture pixels; the client performs the presentation upscale.
+        assert_eq!(
+            encode_dims_for_viewport(1920, 1080, Some(Viewport::new(3840, 2160))),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn encode_dims_extremely_large_viewport_does_not_upscale() {
+        // Any overlarge viewport hint is capped by native capture dims.
         assert_eq!(
             encode_dims_for_viewport(3024, 1952, Some(Viewport::new(u32::MAX, u32::MAX))),
             (3024, 1952)

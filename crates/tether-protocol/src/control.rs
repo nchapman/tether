@@ -1088,13 +1088,21 @@ fn display_to_pb(value: DisplayDescriptor) -> pb::DisplayDescriptor {
 }
 
 fn display_from_pb(value: pb::DisplayDescriptor) -> Result<DisplayDescriptor, CodecError> {
+    let scale_num = nonzero_u16(
+        value.scale_num,
+        "display scale numerator is zero",
+        "display scale numerator > u16",
+    )?;
+    let scale_den = nonzero_u16(
+        value.scale_den,
+        "display scale denominator is zero",
+        "display scale denominator > u16",
+    )?;
     Ok(DisplayDescriptor {
         id: DisplayId(value.id),
         name: value.name,
-        scale_num: u16::try_from(value.scale_num)
-            .map_err(|_| CodecError::Wire("display scale numerator > u16"))?,
-        scale_den: u16::try_from(value.scale_den)
-            .map_err(|_| CodecError::Wire("display scale denominator > u16"))?,
+        scale_num,
+        scale_den,
         primary: value.primary,
         position: (value.position_x, value.position_y),
         current_mode: display_mode_from_pb(value.current_mode)?,
@@ -1138,15 +1146,35 @@ fn client_display_metrics_to_pb(value: ClientDisplayMetrics) -> pb::ClientDispla
 fn client_display_metrics_from_pb(
     value: pb::ClientDisplayMetrics,
 ) -> Result<ClientDisplayMetrics, CodecError> {
+    let scale_num = nonzero_u16(
+        value.scale_num,
+        "client scale numerator is zero",
+        "client scale numerator > u16",
+    )?;
+    let scale_den = nonzero_u16(
+        value.scale_den,
+        "client scale denominator is zero",
+        "client scale denominator > u16",
+    )?;
     Ok(ClientDisplayMetrics {
         display_id: value.display_id,
         mode: display_mode_from_pb(value.mode)?,
-        scale_num: u16::try_from(value.scale_num)
-            .map_err(|_| CodecError::Wire("client scale numerator > u16"))?,
-        scale_den: u16::try_from(value.scale_den)
-            .map_err(|_| CodecError::Wire("client scale denominator > u16"))?,
+        scale_num,
+        scale_den,
         safe_area: value.safe_area.map(client_safe_area_from_pb),
     })
+}
+
+fn nonzero_u16(
+    value: u32,
+    zero_error: &'static str,
+    overflow_error: &'static str,
+) -> Result<u16, CodecError> {
+    let value = u16::try_from(value).map_err(|_| CodecError::Wire(overflow_error))?;
+    if value == 0 {
+        return Err(CodecError::Wire(zero_error));
+    }
+    Ok(value)
 }
 
 fn feature_advert_to_pb(value: FeatureAdvert) -> pb::FeatureAdvert {

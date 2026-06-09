@@ -74,7 +74,7 @@ displays/sources through `NegotiatedVideo` and future stream descriptors.
 - `id`
 - `name`
 - `position`
-- `scale_num` / `scale_den`
+- `scale_num` / `scale_den` (nonzero rational logical-to-physical scale)
 - `primary`
 - `current_mode`
 - `available_modes`
@@ -84,24 +84,24 @@ displays/sources through `NegotiatedVideo` and future stream descriptors.
 physical/backing pixels.
 
 The host sends the best topology it can observe in `ServerHandshake`.
-Production hosts enumerate the local display system; test-pattern/headless
-fallbacks advertise a synthetic primary display. If the capture backend later
-reveals a more exact primary capture mode, the host sends a fresh
-`DisplayList`.
+Production hosts enumerate the local display system; explicit test-pattern
+sessions advertise a synthetic primary display. If the capture backend later
+reveals a more exact captured display/source mode or scale, the host sends a
+fresh `DisplayList`.
 
 `SetViewportHint { stream_id, viewport }` is a best-effort encoder sizing hint
-in client render-surface physical pixels. It does not change host resolution and
-does not require an acknowledgement. For the initial stream, it is also part of
-startup readiness: production clients send the first viewport hint before
-`StreamReady`, and hosts wait for both. A client running in `Original` view mode
-uses a max-sized viewport hint (`u32::MAX × u32::MAX`) as an explicit no-cap
-startup hint; the host's no-upscale fit rule resolves that to native capture
-pixels.
+in physical pixels. It does not change host resolution and does not require an
+acknowledgement. For the initial stream, it is also part of startup readiness:
+production clients send the first viewport hint before `StreamReady`, and hosts
+wait for both. The hint is the density-correct presentation target, not
+necessarily the OS window surface size: `Fit` caps it at logical 100%, while
+`Actual Size` reports logical 100% directly. The host's no-upscale fit rule
+still resolves overlarge hints to native capture pixels.
 
 `ClientDisplayMetrics` reports the client output hosting the render surface:
 session-local display id, physical `DisplayMode`, logical-to-physical scale
-ratio, and optional physical safe area. It is display-mode-matching input only;
-it does not request a host display-mode change.
+ratio, and optional physical safe area. It is display-mode-matching and
+diagnostic input only; it does not request a host display-mode change.
 
 `SetDisplayMode` is the real host display-mode request:
 

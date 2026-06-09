@@ -691,6 +691,64 @@ mod tests {
     }
 
     #[test]
+    fn display_scale_ratio_must_be_nonzero() {
+        let display = crate::pb::DisplayDescriptor {
+            id: 1,
+            name: "display".into(),
+            position_x: 0,
+            position_y: 0,
+            scale_num: 0,
+            scale_den: 1,
+            primary: true,
+            current_mode: Some(crate::pb::DisplayMode {
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60_000,
+            }),
+            available_modes: vec![],
+            can_set_mode: false,
+        };
+        let msg = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::DisplayList(
+                crate::pb::DisplayList {
+                    displays: vec![display],
+                },
+            )),
+        };
+
+        let err = decode_reliable::<ControlMessage>(&msg.encode_to_vec()).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::Wire("display scale numerator is zero")
+        ));
+    }
+
+    #[test]
+    fn client_display_scale_ratio_must_be_nonzero() {
+        let msg = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::ClientDisplayMetrics(
+                crate::pb::ClientDisplayMetrics {
+                    display_id: 0,
+                    mode: Some(crate::pb::DisplayMode {
+                        width: 3024,
+                        height: 1964,
+                        refresh_millihz: 120_000,
+                    }),
+                    scale_num: 2,
+                    scale_den: 0,
+                    safe_area: None,
+                },
+            )),
+        };
+
+        let err = decode_reliable::<ControlMessage>(&msg.encode_to_vec()).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::Wire("client scale denominator is zero")
+        ));
+    }
+
+    #[test]
     fn round_trip_set_active_displays() {
         let msg = ControlMessage::SetActiveDisplays {
             displays: vec![DisplayId(0), DisplayId(2), DisplayId(5)],

@@ -18,7 +18,7 @@
 //! eviction, which keeps the channel connected.)
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Once, Weak};
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -38,6 +38,11 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetDpiForMonitor, GetThreadDpiAwarenessContext,
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE, MDT_EFFECTIVE_DPI,
+};
 
 use crate::cursor_windows::DxgiCursorState;
 use crate::damage::NativeDamage;
@@ -63,6 +68,8 @@ const CAPTURE_FPS: u32 = 60;
 const TEXTURE_POOL_SIZE: usize = 3;
 
 pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
+    ensure_per_monitor_dpi_awareness()?;
+
     let factory: IDXGIFactory1 =
         unsafe { CreateDXGIFactory1() }.map_err(|e| CaptureError::Io(hresult_io(e)))?;
     let mut displays = Vec::new();
@@ -71,7 +78,7 @@ pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
     while let Ok(adapter) = unsafe { factory.EnumAdapters1(adapter_idx) } {
         let mut output_idx = 0u32;
         while let Ok(output) = unsafe { adapter.EnumOutputs(output_idx) } {
-            if let Some(display) = dxgi_output_descriptor(displays.len(), &output) {
+            if let Some(display) = dxgi_output_descriptor(displays.len(), &output)? {
                 displays.push(display);
             }
             output_idx += 1;
@@ -92,35 +99,100 @@ pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
     Ok(displays)
 }
 
+fn ensure_per_monitor_dpi_awareness() -> Result<()> {
+    static DPI_AWARENESS: Once = Once::new();
+    DPI_AWARENESS.call_once(|| {
+        if unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+            .is_err()
+        {
+            let _ =
+                unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE) };
+        }
+
+        let context = unsafe { GetThreadDpiAwarenessContext() };
+        let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(context) };
+        if awareness != DPI_AWARENESS_PER_MONITOR_AWARE {
+            tracing::warn!(
+                ?awareness,
+                "Windows host process is not per-monitor DPI aware; display scale may be virtualized"
+            );
+        }
+    });
+    let context = unsafe { GetThreadDpiAwarenessContext() };
+    let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(context) };
+    if awareness != DPI_AWARENESS_PER_MONITOR_AWARE {
+        return Err(CaptureError::Display(format!(
+            "Windows host process is not per-monitor DPI aware ({awareness:?})"
+        )));
+    }
+    Ok(())
+}
+
 fn dxgi_output_descriptor(
     idx: usize,
     output: &windows::Win32::Graphics::Dxgi::IDXGIOutput,
-) -> Option<DisplayDescriptor> {
-    let desc = unsafe { output.GetDesc().ok()? };
+) -> Result<Option<DisplayDescriptor>> {
+    let desc = unsafe { output.GetDesc() }
+        .map_err(|e| CaptureError::Display(format!("DXGI output descriptor query failed: {e}")))?;
     if !desc.AttachedToDesktop.as_bool() {
-        return None;
+        return Ok(None);
     }
 
     let left = desc.DesktopCoordinates.left;
     let top = desc.DesktopCoordinates.top;
-    let width = u32::try_from(desc.DesktopCoordinates.right.saturating_sub(left)).ok()?;
-    let height = u32::try_from(desc.DesktopCoordinates.bottom.saturating_sub(top)).ok()?;
+    let width = u32::try_from(desc.DesktopCoordinates.right.saturating_sub(left))
+        .map_err(|_| CaptureError::Display("DXGI output width overflows u32".into()))?;
+    let height = u32::try_from(desc.DesktopCoordinates.bottom.saturating_sub(top))
+        .map_err(|_| CaptureError::Display("DXGI output height overflows u32".into()))?;
     if width == 0 || height == 0 {
-        return None;
+        return Ok(None);
     }
 
     let mode = DisplayMode::new(width, height, 60_000);
-    Some(DisplayDescriptor {
-        id: DisplayId(u32::try_from(idx).unwrap_or(u32::MAX)),
+    let (scale_num, scale_den) = monitor_scale_ratio(desc.Monitor, &desc.DeviceName)?;
+    Ok(Some(DisplayDescriptor {
+        id: DisplayId(
+            u32::try_from(idx)
+                .map_err(|_| CaptureError::Display("DXGI output index overflows u32".into()))?,
+        ),
         name: utf16_name(&desc.DeviceName).unwrap_or_else(|| format!("display-{idx}")),
-        scale_num: 1,
-        scale_den: 1,
+        scale_num,
+        scale_den,
         primary: left == 0 && top == 0,
         position: (left, top),
         current_mode: mode,
         available_modes: vec![mode],
         can_set_mode: false,
-    })
+    }))
+}
+
+fn monitor_scale_ratio(
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    device_name: &[u16],
+) -> Result<(u16, u16)> {
+    let mut dpi_x = 96u32;
+    let mut dpi_y = 96u32;
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.map_err(
+        |e| {
+            CaptureError::Display(format!(
+                "GetDpiForMonitor failed for {}: {e}",
+                utf16_name(device_name).unwrap_or_else(|| "<unnamed>".to_string())
+            ))
+        },
+    )?;
+    if dpi_x == 0 || dpi_y == 0 {
+        return Err(CaptureError::Display(format!(
+            "GetDpiForMonitor returned invalid DPI {dpi_x}x{dpi_y} for {}",
+            utf16_name(device_name).unwrap_or_else(|| "<unnamed>".to_string())
+        )));
+    }
+    if dpi_x != dpi_y {
+        return Err(CaptureError::Display(format!(
+            "GetDpiForMonitor returned non-square DPI {dpi_x}x{dpi_y} for {}",
+            utf16_name(device_name).unwrap_or_else(|| "<unnamed>".to_string())
+        )));
+    }
+    Ok(crate::scale_to_ratio(f64::from(dpi_x) / 96.0))
 }
 
 fn utf16_name(buf: &[u16]) -> Option<String> {

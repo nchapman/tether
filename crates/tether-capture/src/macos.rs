@@ -146,7 +146,7 @@ pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
         ));
     }
 
-    Ok(displays
+    displays
         .into_iter()
         .enumerate()
         .map(|(idx, display)| {
@@ -154,12 +154,19 @@ pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
             let frame = display.frame();
             let logical_w = display.width().max(1);
             let logical_h = display.height().max(1);
-            let (pixel_w, pixel_h, refresh_millihz) =
-                active_display_mode(display_id).unwrap_or((logical_w, logical_h, 60_000));
+            let (pixel_w, pixel_h, refresh_millihz) = active_display_mode(display_id)
+                .ok_or_else(|| CaptureError::Sck(format!("display {display_id} has no active backing-pixel mode")))?;
             let mode = DisplayMode::new(pixel_w, pixel_h, refresh_millihz);
-            let scale = f64::from(pixel_w) / f64::from(logical_w);
+            let scale_x = f64::from(pixel_w) / f64::from(logical_w);
+            let scale_y = f64::from(pixel_h) / f64::from(logical_h);
+            if (scale_x - scale_y).abs() > 0.01 {
+                return Err(CaptureError::Sck(format!(
+                    "display {display_id} has non-square display scale: logical {logical_w}x{logical_h}, backing {pixel_w}x{pixel_h}, scale {scale_x}x{scale_y}"
+                )));
+            }
+            let scale = scale_x;
             let (scale_num, scale_den) = scale_to_ratio(scale);
-            DisplayDescriptor {
+            Ok(DisplayDescriptor {
                 id: DisplayId(display_id),
                 name: format!("display-{display_id}"),
                 scale_num,
@@ -172,9 +179,9 @@ pub fn display_list() -> Result<Vec<DisplayDescriptor>> {
                 current_mode: mode,
                 available_modes: vec![mode],
                 can_set_mode: false,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Geometry of the live capture stream, plumbed from the capture

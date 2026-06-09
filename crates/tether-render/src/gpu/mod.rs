@@ -232,6 +232,7 @@ pub(crate) struct GpuState {
     cursor_overlay: crate::cursor_overlay::CursorOverlay,
     cursor_channel: crate::cursor_overlay::CursorChannel,
     presentation_mode: PresentationMode,
+    presentation_size_px: (u32, u32),
 }
 
 /// Holds the resources for the multi-pass present pipeline.
@@ -488,6 +489,7 @@ impl GpuState {
         chroma: ChromaSubsampling,
         bit_depth: u8,
         presentation_mode: PresentationMode,
+        presentation_size_px: (u32, u32),
         cursor_channel: crate::cursor_overlay::CursorChannel,
     ) -> Result<Self> {
         let size = window.inner_size();
@@ -655,6 +657,7 @@ impl GpuState {
             chroma,
             bit_depth,
             presentation_mode,
+            presentation_size_px,
             cursor_channel,
             #[cfg(target_os = "linux")]
             dmabuf_import_supported,
@@ -744,6 +747,7 @@ impl GpuState {
             chroma,
             bit_depth,
             PresentationMode::Fit,
+            target_dims,
             cursor_channel,
             #[cfg(target_os = "linux")]
             dmabuf_import_supported,
@@ -766,6 +770,7 @@ impl GpuState {
         chroma: ChromaSubsampling,
         bit_depth: u8,
         presentation_mode: PresentationMode,
+        presentation_size_px: (u32, u32),
         cursor_channel: crate::cursor_overlay::CursorChannel,
         #[cfg(target_os = "linux")] dmabuf_import_supported: bool,
         #[cfg(target_os = "macos")] metal_import_supported: bool,
@@ -1121,6 +1126,7 @@ impl GpuState {
             cursor_overlay,
             cursor_channel,
             presentation_mode,
+            presentation_size_px,
         })
     }
 
@@ -1128,6 +1134,10 @@ impl GpuState {
     /// because the cursor-normalisation math in `lib.rs` needs both.
     pub(crate) fn dimensions(&self) -> ((u32, u32), (u32, u32)) {
         (self.textures.size, self.target.dimensions())
+    }
+
+    pub(crate) fn set_presentation_size_px(&mut self, presentation_size_px: (u32, u32)) {
+        self.presentation_size_px = presentation_size_px;
     }
 
     /// Borrow the offscreen target so the round-trip harness can copy
@@ -1402,8 +1412,11 @@ impl GpuState {
         // scaler then is the previous-behaviour single-pass bilinear
         // (now spread across two passes — YUV→intermediate then
         // sampled blit).
-        let presentation_dims =
-            presentation_rect_dims(self.presentation_mode, video_dims, surface_dims);
+        let presentation_dims = presentation_rect_dims(
+            self.presentation_mode,
+            self.presentation_size_px,
+            surface_dims,
+        );
         let need_upscale = presentation_dims.0 > video_dims.0 || presentation_dims.1 > video_dims.1;
         let upscale_dims = if need_upscale {
             presentation_dims
@@ -1453,12 +1466,15 @@ impl GpuState {
             Some(s) => s.dst_dims(),
             None => video_dims,
         };
-        let blit_mode = if self.upscale.scaler.is_some() {
-            PresentationMode::FitNoUpscale
+        let (sx, sy) = if self.upscale.scaler.is_some() {
+            presentation_scale(PresentationMode::Fit, blit_source_dims, surface_dims)
         } else {
-            self.presentation_mode
+            presentation_scale(
+                PresentationMode::ActualSize,
+                presentation_dims,
+                surface_dims,
+            )
         };
-        let (sx, sy) = presentation_scale(blit_mode, blit_source_dims, surface_dims);
         self.queue
             .write_buffer(&self.scale_buffer, 0, &bytes_of_f32x4(&[sx, sy, 0.0, 0.0]));
 
@@ -1571,7 +1587,11 @@ impl GpuState {
         // Presentation rect inside the window is computed from the same mode
         // the blit pass used so the sprite lands in the exact pixel rect
         // covered by the video.
-        let fit_dims = presentation_rect_dims(self.presentation_mode, video_dims, surface_dims);
+        let fit_dims = presentation_rect_dims(
+            self.presentation_mode,
+            self.presentation_size_px,
+            surface_dims,
+        );
         self.cursor_overlay.render(
             &mut encoder,
             &self.device,

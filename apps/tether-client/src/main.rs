@@ -29,9 +29,8 @@ use tether_protocol::control::{
 };
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
-use tether_render::LatestFrame;
-use tether_render::PresentationMode;
 use tether_render::RenderEvent;
+use tether_render::{DisplayScale, DisplayScaleHandle, LatestFrame, PresentationMode};
 use tether_session::{
     log_peer_session_summary, ClientSession, ClientSessionConfig, ConnectError, SessionSummaryState,
 };
@@ -42,38 +41,29 @@ use tracing::{debug, error, info, warn};
 mod client_pairing;
 use client_pairing::HostAuth;
 
-// Fallback startup window size when the host cannot advertise a valid display.
-// Normal sessions use the host primary display's physical mode and let
-// tether-render cap that to the client monitor for FitNoUpscale startup.
-const FALLBACK_INITIAL_WIDTH: u32 = 1280;
-const FALLBACK_INITIAL_HEIGHT: u32 = 720;
 const CLOCK_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-const ORIGINAL_VIEWPORT_NO_CAP: Viewport = Viewport {
-    width: u32::MAX,
-    height: u32::MAX,
-};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
-    FitNoUpscale,
-    Original,
+    Fit,
+    ActualSize,
 }
 
 impl ViewMode {
     fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
-            "fit-no-upscale" => Ok(Self::FitNoUpscale),
-            "original" => Ok(Self::Original),
+            "fit" | "fit-to-window" => Ok(Self::Fit),
+            "actual-size" | "actual" | "100%" => Ok(Self::ActualSize),
             _ => {
-                anyhow::bail!("--view-mode must be one of: fit-no-upscale, original; got '{value}'")
+                anyhow::bail!("--view-mode must be one of: fit, actual-size; got '{value}'")
             }
         }
     }
 
     fn presentation_mode(self) -> PresentationMode {
         match self {
-            Self::FitNoUpscale => PresentationMode::FitNoUpscale,
-            Self::Original => PresentationMode::Original,
+            Self::Fit => PresentationMode::Fit,
+            Self::ActualSize => PresentationMode::ActualSize,
         }
     }
 }
@@ -136,8 +126,16 @@ fn drain_latest_valid_viewport(
     latest
 }
 
-fn initial_video_size_px_from_displays(displays: &[DisplayDescriptor]) -> (u32, u32) {
-    displays
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InitialHostDisplay {
+    size_px: (u32, u32),
+    scale: DisplayScale,
+}
+
+fn initial_host_display_from_displays(
+    displays: &[DisplayDescriptor],
+) -> anyhow::Result<InitialHostDisplay> {
+    let display = displays
         .iter()
         .find(|display| {
             display.primary && display.current_mode.width > 0 && display.current_mode.height > 0
@@ -147,22 +145,29 @@ fn initial_video_size_px_from_displays(displays: &[DisplayDescriptor]) -> (u32, 
                 .iter()
                 .find(|display| display.current_mode.width > 0 && display.current_mode.height > 0)
         })
-        .map(|display| (display.current_mode.width, display.current_mode.height))
-        .unwrap_or((FALLBACK_INITIAL_WIDTH, FALLBACK_INITIAL_HEIGHT))
+        .ok_or_else(|| anyhow::anyhow!("host did not advertise a valid display mode"))?;
+    let scale = DisplayScale::new(display.scale_num, display.scale_den).ok_or_else(|| {
+        anyhow::anyhow!(
+            "host advertised invalid display scale {}/{}",
+            display.scale_num,
+            display.scale_den
+        )
+    })?;
+    Ok(InitialHostDisplay {
+        size_px: (display.current_mode.width, display.current_mode.height),
+        scale,
+    })
 }
 
 fn should_send_viewport(last_sent: Option<Viewport>, next: Viewport) -> bool {
     next.is_valid() && last_sent != Some(next)
 }
 
-fn viewport_hint_for_view_mode(view_mode: ViewMode, client_viewport: Viewport) -> Option<Viewport> {
+fn viewport_hint_from_renderer_viewport(client_viewport: Viewport) -> Option<Viewport> {
     if !client_viewport.is_valid() {
         return None;
     }
-    match view_mode {
-        ViewMode::FitNoUpscale => Some(client_viewport),
-        ViewMode::Original => Some(ORIGINAL_VIEWPORT_NO_CAP),
-    }
+    Some(client_viewport)
 }
 
 struct InitialViewportControls {
@@ -172,11 +177,10 @@ struct InitialViewportControls {
 }
 
 fn initial_viewport_controls(
-    view_mode: ViewMode,
     client_viewport: Viewport,
     audio_active: bool,
 ) -> Option<InitialViewportControls> {
-    let viewport_hint = viewport_hint_for_view_mode(view_mode, client_viewport)?;
+    let viewport_hint = viewport_hint_from_renderer_viewport(client_viewport)?;
     Some(InitialViewportControls {
         viewport_hint,
         viewport_message: ControlMessage::SetViewportHint {
@@ -191,11 +195,10 @@ fn initial_viewport_controls(
 }
 
 fn viewport_resize_control(
-    view_mode: ViewMode,
     last_sent: Option<Viewport>,
     client_viewport: Viewport,
 ) -> Option<(Viewport, ControlMessage)> {
-    let viewport_hint = viewport_hint_for_view_mode(view_mode, client_viewport)?;
+    let viewport_hint = viewport_hint_from_renderer_viewport(client_viewport)?;
     if !should_send_viewport(last_sent, viewport_hint) {
         return None;
     }
@@ -607,6 +610,8 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_notice_sent = Arc::new(AtomicBool::new(false));
     let clock_sync_state = Arc::new(RwLock::new(clock_sync));
     let clock_resync_state = Arc::new(Mutex::new(ClockResyncState::default()));
+    let initial_host_display = initial_host_display_from_displays(&server_hello.displays)?;
+    let host_display_scale = DisplayScaleHandle::new(initial_host_display.scale);
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -681,6 +686,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let conn = conn.clone();
         let cursor_channel_ctrl = cursor_channel.clone();
+        let host_display_scale = host_display_scale.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
         let decode_event_rx = decode_event_rx.clone();
@@ -875,6 +881,25 @@ async fn main() -> anyhow::Result<()> {
                                 "  display"
                             );
                         }
+                        let selected_display = match initial_host_display_from_displays(&displays) {
+                            Ok(display) => display,
+                            Err(e) => {
+                                error!(error = ?e, "host sent invalid display topology; ending control loop");
+                                return;
+                            }
+                        };
+                        if host_display_scale.get() != selected_display.scale {
+                            info!(
+                                scale = format!(
+                                    "{}/{}",
+                                    selected_display.scale.num, selected_display.scale.den
+                                ),
+                                width = selected_display.size_px.0,
+                                height = selected_display.size_px.1,
+                                "updated host display scale from live display topology"
+                            );
+                            host_display_scale.set(selected_display.scale);
+                        }
                     }
                     Ok(ControlMessage::SetActiveDisplays { .. }) => {
                         // Client-originated; misrouted if seen on the client side.
@@ -1010,9 +1035,9 @@ async fn main() -> anyhow::Result<()> {
             return;
         }
         // Decoder is up, but video startup still waits for the renderer's real
-        // physical viewport. The viewport task sends SetViewportHint and then
-        // StreamReady on the same control stream so the host opens the gate only
-        // after it has the dimensions it will encode for.
+        // density-correct physical viewport. The viewport task sends
+        // SetViewportHint and then StreamReady on the same control stream so the
+        // host opens the gate only after it has the dimensions it will encode for.
         let _ = decoder_ready_for_startup_tx.send(true);
         info!("client decoder ready; waiting for first viewport before StreamReady");
         let mut frame_count: u64 = 0;
@@ -1543,9 +1568,9 @@ async fn main() -> anyhow::Result<()> {
     // enough to feel live, slow enough to filter drag noise. Zero-dim
     // sizes (minimised window) are dropped — encoding at 0×0 would
     // panic, and the host's current dims are still appropriate for
-    // when the window comes back. `Original` mode still sends a startup
-    // no-cap hint so the host can open the stream gate, then duplicate
-    // suppression filters later window resizes.
+    // when the window comes back. `ActualSize` emits logical-100% viewport
+    // hints across ordinary window resizes, so duplicate suppression filters
+    // later window resizes.
     let conn_viewport = conn.clone();
     tokio::spawn(async move {
         use std::time::Duration;
@@ -1578,8 +1603,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         let viewport = drain_latest_valid_viewport(viewport, &mut viewport_rx);
-                        let Some(controls) =
-                            initial_viewport_controls(view_mode, viewport, audio_active)
+                        let Some(controls) = initial_viewport_controls(viewport, audio_active)
                         else {
                             continue;
                         };
@@ -1624,7 +1648,7 @@ async fn main() -> anyhow::Result<()> {
                         if let Some((w, h)) = pending {
                             let viewport = Viewport::new(w, h);
                             if let Some((_, msg)) =
-                                viewport_resize_control(view_mode, last_sent_viewport, viewport)
+                                viewport_resize_control(last_sent_viewport, viewport)
                             {
                                 let _ = conn_viewport.send_control(&msg).await;
                             }
@@ -1636,7 +1660,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Some((w, h)) = pending.take() {
                         let viewport = Viewport::new(w, h);
                         let Some((viewport_hint, msg)) =
-                            viewport_resize_control(view_mode, last_sent_viewport, viewport)
+                            viewport_resize_control(last_sent_viewport, viewport)
                         else {
                             continue;
                         };
@@ -1740,10 +1764,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let initial_video_size_px = initial_video_size_px_from_displays(&server_hello.displays);
+    let initial_video_size_px = initial_host_display.size_px;
     info!(
         host_mode_px_width = initial_video_size_px.0,
         host_mode_px_height = initial_video_size_px.1,
+        host_scale = format!(
+            "{}/{}",
+            initial_host_display.scale.num, initial_host_display.scale.den
+        ),
         "selected host display mode as initial render target"
     );
 
@@ -1752,9 +1780,10 @@ async fn main() -> anyhow::Result<()> {
     // dispatch — for desktop captures (`sdr_desktop`) this is the
     // sRGB path, eliminating the BT.709-vs-sRGB transfer-curve
     // mismatch the spec-blind chain previously had to absorb.
-    let render_result = tether_render::run(
+    let render_result = tether_render::run_with_display_scale_handle(
         "tether-client",
         initial_video_size_px,
+        host_display_scale,
         server_hello.video.color_space,
         negotiated_profile.chroma,
         negotiated_profile.bit_depth,
@@ -1980,8 +2009,8 @@ struct CliArgs {
     /// Play host audio when the host advertises it. On by default; `--no-audio`
     /// disables the client's playback path entirely.
     audio: bool,
-    /// Client view/stream-sizing policy. `FitNoUpscale` forwards physical
-    /// viewport hints; `Original` keeps host-native stream sizing.
+    /// Client view/stream-sizing policy. `Fit` forwards density-correct
+    /// fit-to-window hints; `ActualSize` forwards logical-100% hints.
     view_mode: ViewMode,
 }
 
@@ -1994,7 +2023,7 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
     let mut pin = None;
     let mut label = None;
     let mut audio = true;
-    let mut view_mode = ViewMode::FitNoUpscale;
+    let mut view_mode = ViewMode::Fit;
     let mut it = raw_args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -2470,23 +2499,37 @@ mod arg_tests {
 
     #[test]
     fn initial_video_size_prefers_valid_primary_display() {
-        let displays = vec![display(0, 1920, 1080, false), display(1, 3024, 1952, true)];
-        assert_eq!(initial_video_size_px_from_displays(&displays), (3024, 1952));
-    }
-
-    #[test]
-    fn initial_video_size_falls_back_to_first_valid_display() {
-        let displays = vec![display(0, 0, 1080, true), display(1, 1920, 1200, false)];
-        assert_eq!(initial_video_size_px_from_displays(&displays), (1920, 1200));
-    }
-
-    #[test]
-    fn initial_video_size_uses_fallback_when_displays_are_invalid() {
-        assert_eq!(initial_video_size_px_from_displays(&[]), (1280, 720));
+        let mut displays = vec![display(0, 1920, 1080, false), display(1, 3024, 1952, true)];
+        displays[1].scale_num = 2;
+        displays[1].scale_den = 1;
         assert_eq!(
-            initial_video_size_px_from_displays(&[display(0, 0, 1080, true)]),
-            (1280, 720)
+            initial_host_display_from_displays(&displays).unwrap(),
+            InitialHostDisplay {
+                size_px: (3024, 1952),
+                scale: DisplayScale::new(2, 1).unwrap(),
+            }
         );
+    }
+
+    #[test]
+    fn initial_video_size_uses_first_valid_display_when_primary_is_invalid() {
+        let displays = vec![display(0, 0, 1080, true), display(1, 1920, 1200, false)];
+        assert_eq!(
+            initial_host_display_from_displays(&displays)
+                .unwrap()
+                .size_px,
+            (1920, 1200)
+        );
+    }
+
+    #[test]
+    fn initial_video_size_rejects_invalid_displays() {
+        assert!(initial_host_display_from_displays(&[]).is_err());
+        assert!(initial_host_display_from_displays(&[display(0, 0, 1080, true)]).is_err());
+
+        let mut invalid_scale = display(0, 1920, 1080, true);
+        invalid_scale.scale_den = 0;
+        assert!(initial_host_display_from_displays(&[invalid_scale]).is_err());
     }
 
     #[test]
@@ -2503,17 +2546,21 @@ mod arg_tests {
     }
 
     #[test]
-    fn view_mode_defaults_to_fit_no_upscale_and_parses_original() {
+    fn view_mode_defaults_to_fit_and_parses_actual_size() {
         let parsed = parse_cli_args(&args(&["127.0.0.1:7654"])).expect("valid args");
-        assert_eq!(parsed.view_mode, ViewMode::FitNoUpscale);
+        assert_eq!(parsed.view_mode, ViewMode::Fit);
 
-        let parsed = parse_cli_args(&args(&["--view-mode", "original", "127.0.0.1:7654"]))
+        let parsed = parse_cli_args(&args(&["--view-mode", "actual-size", "127.0.0.1:7654"]))
             .expect("valid args");
-        assert_eq!(parsed.view_mode, ViewMode::Original);
+        assert_eq!(parsed.view_mode, ViewMode::ActualSize);
         assert_eq!(
             parsed.view_mode.presentation_mode(),
-            PresentationMode::Original
+            PresentationMode::ActualSize
         );
+
+        let err = parse_cli_args(&args(&["--view-mode", "original", "127.0.0.1:7654"]))
+            .expect_err("legacy original alias is not accepted");
+        assert!(err.to_string().contains("--view-mode"));
 
         let err = parse_cli_args(&args(&["--view-mode", "stretch", "127.0.0.1:7654"]))
             .expect_err("unknown view mode errors");
@@ -2522,20 +2569,19 @@ mod arg_tests {
 
     #[test]
     fn view_mode_controls_viewport_hint_without_display_mode_request() {
-        let fit = initial_viewport_controls(ViewMode::FitNoUpscale, Viewport::new(1280, 720), true)
-            .expect("valid viewport");
+        let fit =
+            initial_viewport_controls(Viewport::new(1280, 720), true).expect("valid viewport");
         assert_eq!(fit.viewport_hint, Viewport::new(1280, 720));
 
-        let original =
-            initial_viewport_controls(ViewMode::Original, Viewport::new(1280, 720), true)
-                .expect("valid viewport");
-        assert_eq!(original.viewport_hint, ORIGINAL_VIEWPORT_NO_CAP);
+        let actual =
+            initial_viewport_controls(Viewport::new(1920, 1080), true).expect("valid viewport");
+        assert_eq!(actual.viewport_hint, Viewport::new(1920, 1080));
 
         for msg in [
             &fit.viewport_message,
             &fit.ready_message,
-            &original.viewport_message,
-            &original.ready_message,
+            &actual.viewport_message,
+            &actual.ready_message,
         ] {
             assert!(
                 !matches!(msg, ControlMessage::SetDisplayMode { .. }),
@@ -2545,19 +2591,15 @@ mod arg_tests {
     }
 
     #[test]
-    fn original_view_mode_ignores_post_startup_resizes() {
-        let first = viewport_resize_control(ViewMode::Original, None, Viewport::new(1280, 720))
-            .expect("first valid viewport sends no-cap hint");
-        assert_eq!(first.0, ORIGINAL_VIEWPORT_NO_CAP);
+    fn actual_size_view_mode_dedupes_unchanged_logical_viewport() {
+        let first = viewport_resize_control(None, Viewport::new(1920, 1080))
+            .expect("first valid viewport sends actual-size hint");
+        assert_eq!(first.0, Viewport::new(1920, 1080));
 
         assert!(
-            viewport_resize_control(
-                ViewMode::Original,
-                Some(ORIGINAL_VIEWPORT_NO_CAP),
-                Viewport::new(640, 360),
-            )
-            .is_none(),
-            "Original mode should not retarget the host stream on window resize"
+            viewport_resize_control(Some(Viewport::new(1920, 1080)), Viewport::new(1920, 1080))
+                .is_none(),
+            "Actual Size should not resend unchanged logical viewport hints"
         );
     }
 

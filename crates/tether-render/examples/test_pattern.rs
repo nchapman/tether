@@ -30,10 +30,11 @@ fn main() -> anyhow::Result<()> {
     tether_render::run(
         "tether-render test pattern",
         (800, 600),
+        tether_render::DisplayScale::one(),
         VideoColorSpec::sdr_desktop(),
         ChromaSubsampling::Yuv420,
         8,
-        tether_render::PresentationMode::FitNoUpscale,
+        tether_render::PresentationMode::Fit,
         frames,
         tether_render::CursorChannel::new(),
         None,

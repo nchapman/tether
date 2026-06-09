@@ -238,9 +238,11 @@ pub fn test_pattern_display(width: u32, height: u32, refresh_millihz: u32) -> Di
     }
 }
 
-/// Update the primary display's current mode from the capture stream's actual
-/// frame dimensions. This corrects Linux portal/ScreenCaptureKit negotiation
-/// details that are only known after the capture stream starts.
+/// Update the display that matches the capture stream's actual frame
+/// dimensions, falling back to the primary display when no descriptor matches.
+/// This corrects portal/ScreenCaptureKit negotiation details that are only
+/// known after the capture stream starts, and lets a user-selected non-primary
+/// monitor carry its own density metadata into the live display list.
 #[must_use]
 pub fn display_list_with_primary_mode(
     mut displays: Vec<DisplayDescriptor>,
@@ -250,8 +252,15 @@ pub fn display_list_with_primary_mode(
 ) -> Vec<DisplayDescriptor> {
     let idx = displays
         .iter()
-        .position(|display| display.primary)
+        .position(|display| {
+            display.current_mode.width == width && display.current_mode.height == height
+        })
+        .or_else(|| displays.iter().position(|display| display.primary))
         .unwrap_or(0);
+    for (display_idx, display) in displays.iter_mut().enumerate() {
+        display.primary = display_idx == idx;
+    }
+
     let Some(display) = displays.get_mut(idx) else {
         return vec![test_pattern_display(width, height, refresh_millihz)];
     };
@@ -266,7 +275,7 @@ pub fn display_list_with_primary_mode(
     displays
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn scale_to_ratio(scale: f64) -> (u16, u16) {
     if !scale.is_finite() || scale <= 0.0 {
         return (1, 1);
@@ -281,7 +290,7 @@ fn scale_to_ratio(scale: f64) -> (u16, u16) {
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn f64_to_u32_clamped(value: f64, min: u32, max: u32) -> u32 {
     if !value.is_finite() {
         return min;
@@ -293,7 +302,7 @@ fn f64_to_u32_clamped(value: f64, min: u32, max: u32) -> u32 {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
     while b != 0 {
         let r = a % b;
@@ -649,6 +658,46 @@ mod display_tests {
             DisplayMode::new(2560, 1440, 144_000)
         );
         assert_eq!(updated[0].available_modes, vec![updated[0].current_mode]);
+    }
+
+    #[test]
+    fn primary_mode_update_selects_matching_display_scale() {
+        let primary_mode = DisplayMode::new(1920, 1080, 60_000);
+        let secondary_mode = DisplayMode::new(3840, 2160, 60_000);
+        let displays = vec![
+            DisplayDescriptor {
+                id: DisplayId(0),
+                name: "DP-1".into(),
+                scale_num: 1,
+                scale_den: 1,
+                primary: true,
+                position: (0, 0),
+                current_mode: primary_mode,
+                available_modes: vec![primary_mode],
+                can_set_mode: false,
+            },
+            DisplayDescriptor {
+                id: DisplayId(1),
+                name: "DP-2".into(),
+                scale_num: 2,
+                scale_den: 1,
+                primary: false,
+                position: (1920, 0),
+                current_mode: secondary_mode,
+                available_modes: vec![secondary_mode],
+                can_set_mode: false,
+            },
+        ];
+
+        let updated = display_list_with_primary_mode(displays, 3840, 2160, 120_000);
+        assert!(!updated[0].primary);
+        assert!(updated[1].primary);
+        assert_eq!(updated[1].scale_num, 2);
+        assert_eq!(updated[1].scale_den, 1);
+        assert_eq!(
+            updated[1].current_mode,
+            DisplayMode::new(3840, 2160, 120_000)
+        );
     }
 
     #[test]

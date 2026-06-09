@@ -58,6 +58,20 @@ use gpu::GpuState as Backend;
 pub use winit::event::MouseButton;
 pub use winit::keyboard::{KeyCode, ModifiersState};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentationMode {
+    /// Present the decoded stream 1:1 when it fits the client surface;
+    /// otherwise fit it down inside the surface without changing aspect.
+    FitNoUpscale,
+    /// Present the decoded stream fitted to the client surface, allowing
+    /// client-side upscale. Kept as a renderer mode because the hardware
+    /// render harness exercises the Mitchell upscale path directly.
+    Fit,
+    /// Present the decoded stream 1:1 regardless of client surface size.
+    /// A smaller surface clips the centered image.
+    Original,
+}
+
 /// macOS-only — whether the renderer's IOSurface import path accepts
 /// the given `(chroma, bit_depth, fourcc)` triple. The predicate itself
 /// lives in `tether_codec::macos_interop` (so the probe can consult it
@@ -297,6 +311,7 @@ pub fn run(
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
+    presentation_mode: PresentationMode,
     frames: LatestFrame,
     cursor_channel: CursorChannel,
     on_event: Option<EventSink>,
@@ -308,6 +323,7 @@ pub fn run(
         color_space,
         chroma,
         bit_depth,
+        presentation_mode,
         window: None,
         gpu: None,
         frames,
@@ -336,6 +352,7 @@ struct App {
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
+    presentation_mode: PresentationMode,
     window: Option<Arc<Window>>,
     gpu: Option<Backend>,
     frames: LatestFrame,
@@ -729,6 +746,7 @@ impl ApplicationHandler for App {
             self.color_space,
             self.chroma,
             self.bit_depth,
+            self.presentation_mode,
             self.cursor_channel.clone(),
         )) {
             Ok(g) => g,
@@ -822,7 +840,8 @@ impl ApplicationHandler for App {
                     return;
                 };
                 let (texture, surface) = gpu.dimensions();
-                let video_normalized = cursor_to_video_normalized(position, surface, texture);
+                let video_normalized =
+                    cursor_to_video_normalized(position, surface, texture, self.presentation_mode);
                 // Anchor the host-cursor overlay to the local pointer for
                 // zero-latency motion (the host still gets the absolute
                 // position below, to move its real cursor). Convert the
@@ -1089,24 +1108,27 @@ impl LatestFrame {
 /// applies. Returns `None` when the cursor sits in a letterbox bar
 /// (outside the video region) or when either size is degenerate.
 ///
-/// Mirrors `gpu::letterbox_scale`: when source and surface aspect ratios
-/// match, the whole window is the video region; otherwise the video is
-/// centered and one axis is shrunk by `min_aspect / max_aspect`.
+/// Mirrors the active presentation rectangle: `FitNoUpscale` maps through the
+/// 1:1-or-fit-down video rect, while `Original` maps through a centered native
+/// video rect that may extend beyond the surface.
 #[allow(clippy::cast_precision_loss)]
 fn cursor_to_video_normalized(
     pos: PhysicalPosition<f64>,
     surface: (u32, u32),
     texture: (u32, u32),
+    presentation_mode: PresentationMode,
 ) -> Option<(f32, f32)> {
     if surface.0 == 0 || surface.1 == 0 || texture.0 == 0 || texture.1 == 0 {
         return None;
     }
-    let (sx, sy) = letterbox_scale(texture, surface);
+    let (video_w_px, video_h_px) = presentation_rect_dims(presentation_mode, texture, surface);
+    if video_w_px == 0 || video_h_px == 0 {
+        return None;
+    }
     let sw = f64::from(surface.0);
     let sh = f64::from(surface.1);
-    let (sx, sy) = (f64::from(sx), f64::from(sy));
-    let video_w = sw * sx;
-    let video_h = sh * sy;
+    let video_w = f64::from(video_w_px);
+    let video_h = f64::from(video_h_px);
     let offset_x = (sw - video_w) * 0.5;
     let offset_y = (sh - video_h) * 0.5;
     let nx = (pos.x - offset_x) / video_w;
@@ -1118,22 +1140,71 @@ fn cursor_to_video_normalized(
     Some((nx as f32, ny as f32))
 }
 
-/// Aspect-preserving letterbox / pillarbox scale: the `(x, y)` NDC scale
-/// that fits a `src`-sized image inside a `dst`-sized surface centered,
-/// shrinking one axis by `min_aspect / max_aspect`. Shared by the cursor
-/// mapping above and the Windows D3D11 backend's vertex scale so the two
-/// can't drift; the wgpu backend keeps its own private copy (it's cfg'd
-/// out on Windows, and widening its visibility buys nothing there).
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
+#[must_use]
+pub(crate) fn presentation_rect_dims(
+    mode: PresentationMode,
+    video: (u32, u32),
+    surface: (u32, u32),
+) -> (u32, u32) {
+    if video.0 == 0 || video.1 == 0 || surface.0 == 0 || surface.1 == 0 {
+        return (0, 0);
+    }
+    match mode {
+        PresentationMode::Original => video,
+        PresentationMode::Fit => fit_rect_dims(video, surface),
+        PresentationMode::FitNoUpscale => {
+            if video.0 <= surface.0 && video.1 <= surface.1 {
+                video
+            } else {
+                fit_rect_dims(video, surface)
+            }
+        }
+    }
+}
+
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+pub(crate) fn presentation_scale(
+    mode: PresentationMode,
+    video: (u32, u32),
+    surface: (u32, u32),
+) -> (f32, f32) {
+    if surface.0 == 0 || surface.1 == 0 {
+        return (1.0, 1.0);
+    }
+    let (w, h) = presentation_rect_dims(mode, video, surface);
+    if w == 0 || h == 0 {
+        return (1.0, 1.0);
+    }
+    (w as f32 / surface.0 as f32, h as f32 / surface.1 as f32)
+}
+
+/// Aspect-preserving fit rect in pixels, centered by callers. This may shrink
+/// or upscale; [`presentation_rect_dims`] applies the no-upscale policy.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+pub(crate) fn fit_rect_dims(src: (u32, u32), dst: (u32, u32)) -> (u32, u32) {
+    if src.0 == 0 || src.1 == 0 || dst.0 == 0 || dst.1 == 0 {
+        return (0, 0);
+    }
     let src_aspect = src.0 as f32 / src.1 as f32;
     let dst_aspect = dst.0 as f32 / dst.1 as f32;
-    if (src_aspect - dst_aspect).abs() < f32::EPSILON {
-        (1.0, 1.0)
-    } else if src_aspect > dst_aspect {
-        (1.0, dst_aspect / src_aspect)
+    if src_aspect > dst_aspect {
+        let w = dst.0;
+        let h = (w as f32 / src_aspect).round().max(1.0) as u32;
+        (w, h)
     } else {
-        (src_aspect / dst_aspect, 1.0)
+        let h = dst.1;
+        let w = (h as f32 * src_aspect).round().max(1.0) as u32;
+        (w, h)
     }
 }
 
@@ -1209,11 +1280,52 @@ mod tests {
     }
 
     #[test]
+    fn fit_no_upscale_presents_one_to_one_when_video_fits() {
+        assert_eq!(
+            presentation_rect_dims(PresentationMode::FitNoUpscale, (1920, 1080), (2560, 1440)),
+            (1920, 1080)
+        );
+        assert_eq!(
+            presentation_scale(PresentationMode::FitNoUpscale, (1920, 1080), (2560, 1440)),
+            (0.75, 0.75)
+        );
+    }
+
+    #[test]
+    fn fit_mode_allows_client_side_upscale() {
+        assert_eq!(
+            presentation_rect_dims(PresentationMode::Fit, (1920, 1080), (2560, 1440)),
+            (2560, 1440)
+        );
+    }
+
+    #[test]
+    fn fit_no_upscale_fits_down_when_surface_is_smaller() {
+        assert_eq!(
+            presentation_rect_dims(PresentationMode::FitNoUpscale, (3840, 2160), (1280, 1024)),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn original_presents_one_to_one_even_when_clipped() {
+        assert_eq!(
+            presentation_rect_dims(PresentationMode::Original, (1920, 1080), (1280, 720)),
+            (1920, 1080)
+        );
+        assert_eq!(
+            presentation_scale(PresentationMode::Original, (1920, 1080), (1280, 720)),
+            (1.5, 1.5)
+        );
+    }
+
+    #[test]
     fn cursor_centre_maps_to_centre() {
         let n = cursor_to_video_normalized(
             PhysicalPosition::new(640.0, 360.0),
             (1280, 720),
             (1920, 1080),
+            PresentationMode::FitNoUpscale,
         )
         .expect("centre is inside the video region");
         assert!((n.0 - 0.5).abs() < 1e-4);
@@ -1229,6 +1341,7 @@ mod tests {
             PhysicalPosition::new(500.0, 10.0),
             (1000, 1000),
             (1920, 1080),
+            PresentationMode::FitNoUpscale,
         )
         .is_none());
         // 1000x1000 window, 1080x1920 source -> left/right pillarbox.
@@ -1237,8 +1350,22 @@ mod tests {
             PhysicalPosition::new(10.0, 500.0),
             (1000, 1000),
             (1080, 1920),
+            PresentationMode::FitNoUpscale,
         )
         .is_none());
+    }
+
+    #[test]
+    fn original_cursor_maps_through_clipped_native_rect() {
+        let n = cursor_to_video_normalized(
+            PhysicalPosition::new(0.0, 0.0),
+            (1280, 720),
+            (1920, 1080),
+            PresentationMode::Original,
+        )
+        .expect("surface centre area is inside the clipped video");
+        assert!((n.0 - (320.0 / 1920.0)).abs() < 1e-4);
+        assert!((n.1 - (180.0 / 1080.0)).abs() < 1e-4);
     }
 
     #[test]
@@ -1247,6 +1374,7 @@ mod tests {
             PhysicalPosition::new(-5.0, 100.0),
             (1280, 720),
             (1280, 720),
+            PresentationMode::FitNoUpscale,
         )
         .is_none());
     }
@@ -1257,6 +1385,7 @@ mod tests {
             PhysicalPosition::new(128.0, 72.0),
             (1280, 720),
             (1920, 1080),
+            PresentationMode::FitNoUpscale,
         )
         .expect("inside");
         assert!((n.0 - 0.1).abs() < 1e-4);

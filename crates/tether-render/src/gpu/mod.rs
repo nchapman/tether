@@ -4,7 +4,10 @@ use tether_codec::{GpuFrameGuard, GpuFrameSource};
 use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec, VideoProfile};
 use winit::window::Window;
 
-use crate::{CpuFrame, Frame, GpuFrame, RenderError, Result};
+use crate::{
+    presentation_rect_dims, presentation_scale, CpuFrame, Frame, GpuFrame, PresentationMode,
+    RenderError, Result,
+};
 
 #[cfg(target_os = "linux")]
 mod import;
@@ -228,6 +231,7 @@ pub(crate) struct GpuState {
     /// frame.
     cursor_overlay: crate::cursor_overlay::CursorOverlay,
     cursor_channel: crate::cursor_overlay::CursorChannel,
+    presentation_mode: PresentationMode,
 }
 
 /// Holds the resources for the multi-pass present pipeline.
@@ -483,6 +487,7 @@ impl GpuState {
         color_space: VideoColorSpec,
         chroma: ChromaSubsampling,
         bit_depth: u8,
+        presentation_mode: PresentationMode,
         cursor_channel: crate::cursor_overlay::CursorChannel,
     ) -> Result<Self> {
         let size = window.inner_size();
@@ -649,6 +654,7 @@ impl GpuState {
             color_space,
             chroma,
             bit_depth,
+            presentation_mode,
             cursor_channel,
             #[cfg(target_os = "linux")]
             dmabuf_import_supported,
@@ -737,6 +743,7 @@ impl GpuState {
             color_space,
             chroma,
             bit_depth,
+            PresentationMode::Fit,
             cursor_channel,
             #[cfg(target_os = "linux")]
             dmabuf_import_supported,
@@ -758,6 +765,7 @@ impl GpuState {
         color_space: VideoColorSpec,
         chroma: ChromaSubsampling,
         bit_depth: u8,
+        presentation_mode: PresentationMode,
         cursor_channel: crate::cursor_overlay::CursorChannel,
         #[cfg(target_os = "linux")] dmabuf_import_supported: bool,
         #[cfg(target_os = "macos")] metal_import_supported: bool,
@@ -1112,6 +1120,7 @@ impl GpuState {
             upscale,
             cursor_overlay,
             cursor_channel,
+            presentation_mode,
         })
     }
 
@@ -1393,9 +1402,11 @@ impl GpuState {
         // scaler then is the previous-behaviour single-pass bilinear
         // (now spread across two passes — YUV→intermediate then
         // sampled blit).
-        let need_upscale = surface_dims.0 > video_dims.0 || surface_dims.1 > video_dims.1;
+        let presentation_dims =
+            presentation_rect_dims(self.presentation_mode, video_dims, surface_dims);
+        let need_upscale = presentation_dims.0 > video_dims.0 || presentation_dims.1 > video_dims.1;
         let upscale_dims = if need_upscale {
-            letterbox_fit_dims(video_dims, surface_dims)
+            presentation_dims
         } else {
             video_dims
         };
@@ -1430,19 +1441,24 @@ impl GpuState {
             self.upscale.scaler = None;
         }
 
-        // Letterbox scale for the blit pass — computed from the
+        // Presentation scale for the blit pass — computed from the
         // *blit source's* dims, not the original video dims. When
-        // Mitchell ran, the source is its output at `letterbox_fit_dims`
+        // Mitchell ran, the source is its output at `presentation_dims`
         // (already aspect-matched); the blit scale is then (1, 1) or
         // very close. When Mitchell didn't run, the source is the
-        // intermediate at video dims and the blit scale does the
-        // aspect correction. Using the source's actual dims here
-        // avoids sub-pixel aspect drift on unusual ratios.
+        // intermediate at video dims and the presentation scale does
+        // the aspect / clipping correction. Using the source's actual
+        // dims here avoids sub-pixel aspect drift on unusual ratios.
         let blit_source_dims = match self.upscale.scaler.as_ref() {
             Some(s) => s.dst_dims(),
             None => video_dims,
         };
-        let (sx, sy) = letterbox_scale(blit_source_dims, surface_dims);
+        let blit_mode = if self.upscale.scaler.is_some() {
+            PresentationMode::FitNoUpscale
+        } else {
+            self.presentation_mode
+        };
+        let (sx, sy) = presentation_scale(blit_mode, blit_source_dims, surface_dims);
         self.queue
             .write_buffer(&self.scale_buffer, 0, &bytes_of_f32x4(&[sx, sy, 0.0, 0.0]));
 
@@ -1552,18 +1568,10 @@ impl GpuState {
         // is a no-op when no sprite is active, the cursor is hidden,
         // or relative-locked mode is on — `CursorOverlay::render`
         // bails before touching the encoder in those cases. The
-        // letterbox-fit rect inside the window is computed from the
-        // same `(sx, sy)` the blit pass used so the sprite lands in
-        // the exact pixel rect covered by the video.
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation
-        )]
-        let fit_dims = (
-            ((surface_dims.0 as f32) * sx).round() as u32,
-            ((surface_dims.1 as f32) * sy).round() as u32,
-        );
+        // Presentation rect inside the window is computed from the same mode
+        // the blit pass used so the sprite lands in the exact pixel rect
+        // covered by the video.
+        let fit_dims = presentation_rect_dims(self.presentation_mode, video_dims, surface_dims);
         self.cursor_overlay.render(
             &mut encoder,
             &self.device,
@@ -1636,34 +1644,6 @@ fn make_rgb_intermediate(device: &wgpu::Device, dims: (u32, u32)) -> wgpu::Textu
     })
 }
 
-/// Compute the *target* dimensions for the Mitchell upscale: the
-/// letterbox-fit rect inside the window. The Mitchell pass produces
-/// at this size and the blit pass stretches a centered quad at the
-/// same aspect ratio — the letterbox bars become the swapchain's
-/// cleared-black margin.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
-fn letterbox_fit_dims(video: (u32, u32), window: (u32, u32)) -> (u32, u32) {
-    if video.0 == 0 || video.1 == 0 || window.0 == 0 || window.1 == 0 {
-        return video;
-    }
-    let video_aspect = video.0 as f32 / video.1 as f32;
-    let window_aspect = window.0 as f32 / window.1 as f32;
-    if video_aspect > window_aspect {
-        // Width-bound: fit to window width, derive height.
-        let w = window.0;
-        let h = (w as f32 / video_aspect).round().max(1.0) as u32;
-        (w, h)
-    } else {
-        let h = window.1;
-        let w = (h as f32 * video_aspect).round().max(1.0) as u32;
-        (w, h)
-    }
-}
-
 /// Build (or lazily compile) the Mitchell scaler pipelines and a
 /// scaler instance for the given dims.
 ///
@@ -1695,26 +1675,6 @@ fn build_upscale_scaler(
         tether_scaler::ColorSpace::LinearF16,
     )
     .map(Some)
-}
-
-/// Compute the (x, y) NDC scale factors that letterbox / pillarbox the
-/// source texture inside the surface while preserving its aspect ratio.
-/// Returns (1.0, 1.0) for matching aspect ratios. The unused axis gets
-/// the proportional shrink; the dominant axis stays at 1.0.
-#[allow(clippy::cast_precision_loss)]
-fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
-    if src.0 == 0 || src.1 == 0 || dst.0 == 0 || dst.1 == 0 {
-        return (1.0, 1.0);
-    }
-    let src_aspect = src.0 as f32 / src.1 as f32;
-    let dst_aspect = dst.0 as f32 / dst.1 as f32;
-    if (src_aspect - dst_aspect).abs() < f32::EPSILON {
-        (1.0, 1.0)
-    } else if src_aspect > dst_aspect {
-        (1.0, dst_aspect / src_aspect)
-    } else {
-        (src_aspect / dst_aspect, 1.0)
-    }
 }
 
 fn bytes_of_f32x4(v: &[f32; 4]) -> [u8; 16] {
@@ -2020,23 +1980,24 @@ fn write_plane(
 #[cfg(test)]
 mod tests {
     use super::{
-        letterbox_fit_dims, range_kind_for, render_layout_for, transfer_kind_for, RenderLayout,
-        RANGE_KIND_LIMITED_10, RANGE_KIND_LIMITED_8, TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB,
+        range_kind_for, render_layout_for, transfer_kind_for, RenderLayout, RANGE_KIND_LIMITED_10,
+        RANGE_KIND_LIMITED_8, TRANSFER_KIND_BT709, TRANSFER_KIND_SRGB,
     };
+    use crate::fit_rect_dims;
     use tether_protocol::control::{ChromaSubsampling, ColorTransfer, VideoColorSpec};
 
     /// 16:9 video in a 4:3 window: width-bound. Mitchell upscale
     /// produces 800×450 with letterbox bars top and bottom.
     #[test]
     fn letterbox_fit_landscape_in_landscape_window() {
-        assert_eq!(letterbox_fit_dims((1920, 1080), (800, 600)), (800, 450));
+        assert_eq!(fit_rect_dims((1920, 1080), (800, 600)), (800, 450));
     }
 
     /// 9:16 video in a 16:9 window: height-bound. Pillarbox bars
     /// left and right, content fills the height.
     #[test]
     fn letterbox_fit_portrait_in_landscape_window() {
-        let (w, h) = letterbox_fit_dims((1080, 1920), (1920, 1080));
+        let (w, h) = fit_rect_dims((1080, 1920), (1920, 1080));
         assert_eq!(h, 1080);
         // Aspect preserved to within rounding.
         assert!((w as f32 / h as f32 - 1080.0 / 1920.0).abs() < 0.01);
@@ -2045,17 +2006,16 @@ mod tests {
     #[test]
     fn letterbox_fit_matching_aspect_is_full_window() {
         // 16:9 video in 16:9 window: scaler output exactly fills.
-        assert_eq!(letterbox_fit_dims((1920, 1080), (1280, 720)), (1280, 720));
+        assert_eq!(fit_rect_dims((1920, 1080), (1280, 720)), (1280, 720));
     }
 
     #[test]
-    fn letterbox_fit_zero_dim_returns_video() {
+    fn letterbox_fit_zero_dim_returns_zero_rect() {
         // Defensive: window zero in either axis (transient on resize)
-        // shouldn't divide-by-zero. Returning the source dims is a
-        // safe pass-through.
-        assert_eq!(letterbox_fit_dims((1920, 1080), (0, 600)), (1920, 1080));
-        assert_eq!(letterbox_fit_dims((1920, 1080), (800, 0)), (1920, 1080));
-        assert_eq!(letterbox_fit_dims((0, 1080), (800, 600)), (0, 1080));
+        // shouldn't divide-by-zero.
+        assert_eq!(fit_rect_dims((1920, 1080), (0, 600)), (0, 0));
+        assert_eq!(fit_rect_dims((1920, 1080), (800, 0)), (0, 0));
+        assert_eq!(fit_rect_dims((0, 1080), (800, 600)), (0, 0));
     }
 
     /// Pin the Rust → shader range-kind constants so a renumber in

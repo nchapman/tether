@@ -33,6 +33,7 @@ fn main() -> anyhow::Result<()> {
         VideoColorSpec::sdr_desktop(),
         ChromaSubsampling::Yuv420,
         8,
+        tether_render::PresentationMode::FitNoUpscale,
         frames,
         tether_render::CursorChannel::new(),
         None,

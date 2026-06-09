@@ -30,6 +30,7 @@ use tether_protocol::control::{
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::LatestFrame;
+use tether_render::PresentationMode;
 use tether_render::RenderEvent;
 use tether_session::{
     log_peer_session_summary, ClientSession, ClientSessionConfig, ConnectError, SessionSummaryState,
@@ -66,6 +67,13 @@ impl ViewMode {
             _ => {
                 anyhow::bail!("--view-mode must be one of: fit-no-upscale, original; got '{value}'")
             }
+        }
+    }
+
+    fn presentation_mode(self) -> PresentationMode {
+        match self {
+            Self::FitNoUpscale => PresentationMode::FitNoUpscale,
+            Self::Original => PresentationMode::Original,
         }
     }
 }
@@ -1750,6 +1758,7 @@ async fn main() -> anyhow::Result<()> {
         server_hello.video.color_space,
         negotiated_profile.chroma,
         negotiated_profile.bit_depth,
+        view_mode.presentation_mode(),
         frames,
         cursor_channel,
         Some(on_event),
@@ -2501,6 +2510,10 @@ mod arg_tests {
         let parsed = parse_cli_args(&args(&["--view-mode", "original", "127.0.0.1:7654"]))
             .expect("valid args");
         assert_eq!(parsed.view_mode, ViewMode::Original);
+        assert_eq!(
+            parsed.view_mode.presentation_mode(),
+            PresentationMode::Original
+        );
 
         let err = parse_cli_args(&args(&["--view-mode", "stretch", "127.0.0.1:7654"]))
             .expect_err("unknown view mode errors");

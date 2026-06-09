@@ -108,19 +108,22 @@ display-mode behavior:
 
 - `FitNoUpscale` default: downscale on the host when needed; otherwise 1:1.
 - `Original`: always request `stream_px = host_capture_px`; if the viewport is
-  smaller, the client uses scroll/pan/crop UI rather than resizing the host
-  stream.
+  smaller, the client presents the native stream 1:1 centered and clipped rather
+  than resizing the host stream. Scroll/pan controls can refine this later
+  without changing the stream-sizing contract.
 - `Fit`: fit the video into the viewport and allow client-side upscale when the
   viewport is larger than `stream_px`. This is a presentation choice only.
 - `Fill`: crop-preserving fill for users who prefer no letterbox. This is also a
   presentation choice only.
 
 Only `FitNoUpscale` and `Original` exist in the first implementation, exposed
-by the client as `--view-mode fit-no-upscale|original`. `Original` still sends
+by the client as `--view-mode fit-no-upscale|original`. `FitNoUpscale` presents
+1:1 when the stream fits and fits down only when needed. `Original` still sends
 one startup viewport hint so the host can open the video gate, but uses a
 no-cap viewport (`u32::MAX × u32::MAX`) and ignores subsequent window resizes
-for stream sizing. The key invariant is that none of these view modes changes
-the host OS display mode.
+for stream sizing; presentation remains 1:1 and clips when the surface is
+smaller. The key invariant is that none of these view modes changes the host OS
+display mode.
 
 ## Host Display-Mode Matching
 

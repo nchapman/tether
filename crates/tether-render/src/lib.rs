@@ -813,12 +813,6 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 if let Some(corrected) = self.corrected_window_resize(size) {
-                    if let Some(window) = self.window.as_ref() {
-                        if let Some(applied) = window.request_inner_size(corrected) {
-                            self.apply_window_resize(applied);
-                            return;
-                        }
-                    }
                     self.apply_window_resize_with_viewport(size, corrected);
                     return;
                 }

@@ -808,7 +808,11 @@ impl App {
         if geometry == self.last_host_display {
             return;
         }
-        let old_presentation_size_px = self.presentation_size_px();
+        let old_presentation_size_px = logical_actual_size_px(
+            self.last_host_display.size_px,
+            self.last_host_display.scale,
+            self.client_scale_factor,
+        );
         let pending_window_resize = self.window.as_ref().and_then(|window| {
             let current_size = window.inner_size();
             let monitor_size = window.current_monitor().map(|monitor| {
@@ -826,6 +830,15 @@ impl App {
         self.update_presentation_size();
         if let Some(window) = self.window.as_ref() {
             let size = if let Some(size) = pending_window_resize {
+                tracing::info!(
+                    old_presentation_width = old_presentation_size_px.0,
+                    old_presentation_height = old_presentation_size_px.1,
+                    new_presentation_width = self.presentation_size_px().0,
+                    new_presentation_height = self.presentation_size_px().1,
+                    requested_surface_width = size.width,
+                    requested_surface_height = size.height,
+                    "requesting initial window resize after host display geometry update"
+                );
                 window
                     .request_inner_size(size)
                     .unwrap_or_else(|| window.inner_size())

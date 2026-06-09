@@ -42,8 +42,8 @@ use tether_gpuconvert::{
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
-    ChromaSubsampling, CodecKind, ControlMessage, DisplayDescriptor, DisplayModeStatus,
-    GoodbyeCode, VideoProfile, VideoStreamId, Viewport,
+    ChromaSubsampling, ClientDisplayMetrics, CodecKind, ControlMessage, DisplayDescriptor,
+    DisplayModeStatus, GoodbyeCode, VideoProfile, VideoStreamId, Viewport,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta, VideoPacket,
@@ -202,6 +202,13 @@ impl ViewportState {
         self.seq = self.seq.wrapping_add(1);
         true
     }
+}
+
+fn client_display_metrics_changed(
+    last: Option<&ClientDisplayMetrics>,
+    next: &ClientDisplayMetrics,
+) -> bool {
+    last != Some(next)
 }
 
 /// One window of client-side telemetry. Mirrors the fields in
@@ -916,6 +923,7 @@ async fn handle_client(
             // are coalesced through IdrSignal anyway, so the cap
             // costs nothing in normal operation.
             let mut last_idr_request: Option<std::time::Instant> = None;
+            let mut last_client_display_metrics: Option<ClientDisplayMetrics> = None;
             const IDR_REQUEST_MIN_INTERVAL: std::time::Duration =
                 std::time::Duration::from_millis(250);
             loop {
@@ -1107,6 +1115,19 @@ async fn handle_client(
                         );
                     }
                     Ok(ControlMessage::ClientDisplayMetrics(metrics)) => {
+                        if !client_display_metrics_changed(
+                            last_client_display_metrics.as_ref(),
+                            &metrics,
+                        ) {
+                            tracing::trace!(
+                                client_display_id = metrics.display_id,
+                                width = metrics.mode.width,
+                                height = metrics.mode.height,
+                                refresh_millihz = metrics.mode.refresh_millihz,
+                                "duplicate client display metrics; ignoring"
+                            );
+                            continue;
+                        }
                         info!(
                             client_display_id = metrics.display_id,
                             width = metrics.mode.width,
@@ -1116,6 +1137,7 @@ async fn handle_client(
                             safe_area = ?metrics.safe_area,
                             "client display metrics"
                         );
+                        last_client_display_metrics = Some(metrics);
                     }
                     Ok(ControlMessage::SetDisplayMode {
                         request_id,
@@ -4379,6 +4401,35 @@ mod tests {
         assert_eq!(state.seq, 3);
         assert!(!state.update_if_changed(None));
         assert_eq!(state.seq, 3);
+    }
+
+    #[test]
+    fn client_display_metrics_changed_skips_exact_duplicates() {
+        let base = ClientDisplayMetrics {
+            display_id: 0,
+            mode: tether_protocol::control::DisplayMode::new(2560, 1440, 60_000),
+            scale_num: 2,
+            scale_den: 1,
+            safe_area: None,
+        };
+        assert!(client_display_metrics_changed(None, &base));
+        assert!(!client_display_metrics_changed(Some(&base), &base));
+
+        let mut display_changed = base.clone();
+        display_changed.display_id = 1;
+        assert!(client_display_metrics_changed(
+            Some(&base),
+            &display_changed
+        ));
+
+        let mut mode_changed = base.clone();
+        mode_changed.mode = tether_protocol::control::DisplayMode::new(1920, 1080, 60_000);
+        assert!(client_display_metrics_changed(Some(&base), &mode_changed));
+
+        let mut scale_changed = base.clone();
+        scale_changed.scale_num = 3;
+        scale_changed.scale_den = 2;
+        assert!(client_display_metrics_changed(Some(&base), &scale_changed));
     }
 
     #[test]

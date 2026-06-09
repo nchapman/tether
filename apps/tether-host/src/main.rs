@@ -193,6 +193,17 @@ struct ViewportState {
     seq: u64,
 }
 
+impl ViewportState {
+    fn update_if_changed(&mut self, next: Option<Viewport>) -> bool {
+        if self.viewport == next {
+            return false;
+        }
+        self.viewport = next;
+        self.seq = self.seq.wrapping_add(1);
+        true
+    }
+}
+
 /// One window of client-side telemetry. Mirrors the fields in
 /// [`ControlMessage::ClientStats`] that the ABR controller actually
 /// consumes; `window_ms` and `frames_received` are dropped at the
@@ -1070,9 +1081,16 @@ async fn handle_client(
                         };
                         let mut guard =
                             lock_host_state(&latest_viewport_for_ctl, "latest viewport");
-                        guard.viewport = next;
-                        guard.seq = guard.seq.wrapping_add(1);
+                        let changed = guard.update_if_changed(next);
                         drop(guard);
+                        if !changed {
+                            tracing::trace!(
+                                width = v.width,
+                                height = v.height,
+                                "duplicate viewport hint; skipping seq bump and IDR"
+                            );
+                            continue;
+                        }
                         if next.is_some()
                             && video_ready_requested_ctl.load(Ordering::Acquire)
                             && !stream_ready_ctl.load(Ordering::Acquire)
@@ -4300,6 +4318,27 @@ mod tests {
         drop(guard);
 
         assert_eq!(*lock_host_state(&lock, "test"), 13);
+    }
+
+    #[test]
+    fn viewport_state_skips_duplicate_updates() {
+        let mut state = ViewportState::default();
+        let viewport = Some(Viewport::new(1920, 1080));
+
+        assert!(state.update_if_changed(viewport));
+        assert_eq!(state.seq, 1);
+        assert_eq!(state.viewport, viewport);
+
+        assert!(!state.update_if_changed(viewport));
+        assert_eq!(state.seq, 1);
+
+        assert!(state.update_if_changed(Some(Viewport::new(1280, 720))));
+        assert_eq!(state.seq, 2);
+
+        assert!(state.update_if_changed(None));
+        assert_eq!(state.seq, 3);
+        assert!(!state.update_if_changed(None));
+        assert_eq!(state.seq, 3);
     }
 
     #[test]

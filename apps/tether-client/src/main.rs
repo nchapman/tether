@@ -121,6 +121,10 @@ fn initial_video_size_px_from_displays(displays: &[DisplayDescriptor]) -> (u32, 
         .unwrap_or((FALLBACK_INITIAL_WIDTH, FALLBACK_INITIAL_HEIGHT))
 }
 
+fn should_send_viewport(last_sent: Option<Viewport>, next: Viewport) -> bool {
+    next.is_valid() && last_sent != Some(next)
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn ns_to_ms(ns: u64, samples: u64) -> f64 {
     if samples == 0 {
@@ -1421,6 +1425,7 @@ async fn main() -> anyhow::Result<()> {
         let debounce = Duration::from_millis(150);
         let mut pending: Option<(u32, u32)> = None;
         let mut startup_sent = false;
+        let mut last_sent_viewport: Option<Viewport> = None;
         let mut decoder_ready_for_startup_rx = decoder_ready_for_startup_rx;
         loop {
             // Either receive a new size, or fire the pending one after
@@ -1446,24 +1451,27 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         let viewport = drain_latest_valid_viewport(viewport, &mut viewport_rx);
-                        if let Err(e) = conn_viewport
-                            .send_control(&ControlMessage::SetViewportHint {
-                                stream_id: VideoStreamId(0),
-                                viewport,
-                            })
-                            .await
-                        {
-                            warn!(
-                                error = ?e,
-                                "initial SetViewportHint send failed; viewport task exiting"
+                        if should_send_viewport(last_sent_viewport, viewport) {
+                            if let Err(e) = conn_viewport
+                                .send_control(&ControlMessage::SetViewportHint {
+                                    stream_id: VideoStreamId(0),
+                                    viewport,
+                                })
+                                .await
+                            {
+                                warn!(
+                                    error = ?e,
+                                    "initial SetViewportHint send failed; viewport task exiting"
+                                );
+                                return;
+                            }
+                            last_sent_viewport = Some(viewport);
+                            info!(
+                                width = viewport.width,
+                                height = viewport.height,
+                                "sent initial SetViewportHint to host"
                             );
-                            return;
                         }
-                        info!(
-                            width = viewport.width,
-                            height = viewport.height,
-                            "sent initial SetViewportHint to host"
-                        );
                         if let Err(e) = conn_viewport
                             .send_control(&ControlMessage::StreamReady {
                                 video: true,
@@ -1492,7 +1500,7 @@ async fn main() -> anyhow::Result<()> {
                     if startup_sent {
                         if let Some((w, h)) = pending {
                             let viewport = Viewport::new(w, h);
-                            if viewport.is_valid() {
+                            if should_send_viewport(last_sent_viewport, viewport) {
                                 let _ = conn_viewport
                                     .send_control(&ControlMessage::SetViewportHint {
                                         stream_id: VideoStreamId(0),
@@ -1507,6 +1515,9 @@ async fn main() -> anyhow::Result<()> {
                 Err(_) => {
                     if let Some((w, h)) = pending.take() {
                         let viewport = Viewport::new(w, h);
+                        if !should_send_viewport(last_sent_viewport, viewport) {
+                            continue;
+                        }
                         if let Err(e) = conn_viewport
                             .send_control(&ControlMessage::SetViewportHint {
                                 stream_id: VideoStreamId(0),
@@ -1517,6 +1528,7 @@ async fn main() -> anyhow::Result<()> {
                             warn!(error = ?e, "SetViewportHint send failed; viewport task exiting");
                             return;
                         }
+                        last_sent_viewport = Some(viewport);
                         info!(width = w, height = h, "sent SetViewportHint to host");
                     }
                 }
@@ -2339,6 +2351,19 @@ mod arg_tests {
             initial_video_size_px_from_displays(&[display(0, 0, 1080, true)]),
             (1280, 720)
         );
+    }
+
+    #[test]
+    fn should_send_viewport_rejects_invalid_and_duplicate_sizes() {
+        let viewport = Viewport::new(1920, 1080);
+
+        assert!(should_send_viewport(None, viewport));
+        assert!(!should_send_viewport(Some(viewport), viewport));
+        assert!(should_send_viewport(
+            Some(viewport),
+            Viewport::new(1280, 720)
+        ));
+        assert!(!should_send_viewport(None, Viewport::new(0, 720)));
     }
 
     #[test]

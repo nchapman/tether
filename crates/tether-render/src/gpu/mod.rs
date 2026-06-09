@@ -136,6 +136,9 @@ impl RenderTarget {
         if width == 0 || height == 0 {
             return;
         }
+        if self.dimensions() == (width, height) {
+            return;
+        }
         match self {
             RenderTarget::Swapchain { surface, config } => {
                 config.width = width;

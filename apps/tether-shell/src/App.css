@@ -608,6 +608,11 @@ input::placeholder {
   align-items: center;
   justify-content: space-between;
 }
+.switch-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
 .switch {
   width: 42px;
   height: 24px;
@@ -620,6 +625,10 @@ input::placeholder {
 }
 .switch.on {
   background: var(--accent);
+}
+.switch:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 .switch-knob {
   position: absolute;

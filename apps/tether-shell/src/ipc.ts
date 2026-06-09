@@ -88,6 +88,12 @@ export const listPeers = () => invokeVoid("list_peers");
 /// whether to auto-start hosting.
 export const getPrefs = () => invoke<ShellPrefs>("get_prefs");
 
+export const getLoginStartEnabled = () =>
+  invoke<boolean>("get_login_start_enabled");
+
+export const setLoginStartEnabled = (enabled: boolean) =>
+  invoke<boolean>("set_login_start_enabled", { enabled });
+
 // --- Window chrome -----------------------------------------------------------
 
 export const hideWindow = () => invokeVoid("hide_window");

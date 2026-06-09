@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { PairedPeer } from "../ipc";
+import { getLoginStartEnabled, setLoginStartEnabled } from "../ipc";
 import type { HostState } from "../state";
 import { Sheet } from "./Sheet";
 import { OverflowMenu } from "./OverflowMenu";
@@ -26,11 +27,50 @@ export function SharingSheet({
   onClose: () => void;
 }) {
   const [newLabel, setNewLabel] = useState("");
+  const [loginStartEnabled, setLoginStartEnabledState] = useState(false);
+  const [loginStartBusy, setLoginStartBusy] = useState(true);
+  const [loginStartError, setLoginStartError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getLoginStartEnabled()
+      .then((enabled) => {
+        if (!cancelled) {
+          setLoginStartEnabledState(enabled);
+          setLoginStartError(null);
+        }
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setLoginStartError(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoginStartBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function onToggleLoginStart() {
+    const next = !loginStartEnabled;
+    setLoginStartBusy(true);
+    setLoginStartError(null);
+    void setLoginStartEnabled(next)
+      .then(setLoginStartEnabledState)
+      .catch((e: unknown) => setLoginStartError(String(e)))
+      .finally(() => setLoginStartBusy(false));
+  }
 
   return (
     <Sheet title="Sharing" onClose={onClose}>
       <div className="sharing">
         <SharingToggle running={host.running} onStart={onStart} onStop={onStop} />
+        <LoginStartToggle
+          enabled={loginStartEnabled}
+          busy={loginStartBusy}
+          error={loginStartError}
+          onToggle={onToggleLoginStart}
+        />
 
         {host.error && <p className="form-error">{host.error}</p>}
 
@@ -67,13 +107,59 @@ function SharingToggle({
   onStop: () => void;
 }) {
   return (
+    <SwitchRow
+      label="Allow remote connections"
+      checked={running}
+      onToggle={() => (running ? onStop() : onStart())}
+    />
+  );
+}
+
+function LoginStartToggle({
+  enabled,
+  busy,
+  error,
+  onToggle,
+}: {
+  enabled: boolean;
+  busy: boolean;
+  error: string | null;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="switch-stack">
+      <SwitchRow
+        label="Start Tether at login"
+        checked={enabled}
+        disabled={busy}
+        onToggle={onToggle}
+      />
+      {error && <p className="form-error">{error}</p>}
+    </div>
+  );
+}
+
+function SwitchRow({
+  label,
+  checked,
+  disabled = false,
+  onToggle,
+}: {
+  label: string;
+  checked: boolean;
+  disabled?: boolean;
+  onToggle: () => void;
+}) {
+  return (
     <div className="switch-row">
-      <span className="field-label">Allow remote connections</span>
+      <span className="field-label">{label}</span>
       <button
         role="switch"
-        aria-checked={running}
-        className={"switch" + (running ? " on" : "")}
-        onClick={() => (running ? onStop() : onStart())}
+        aria-checked={checked}
+        aria-label={label}
+        className={"switch" + (checked ? " on" : "")}
+        disabled={disabled}
+        onClick={onToggle}
       >
         <span className="switch-knob" />
       </button>

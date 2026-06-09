@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Tether Dev",
+  "identifier": "app.tether.shell.dev",
+  "build": {
+    "beforeDevCommand": "pnpm vite --mode dev",
+    "beforeBuildCommand": "pnpm run typecheck && pnpm vite build --mode dev"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tether Dev"
+      }
+    ]
+  }
+}

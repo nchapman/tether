@@ -1,4 +1,5 @@
-const DEFAULT_PORT = "7654";
+import { DEFAULT_PORT } from "./appChannel";
+
 const PORT_RE = /^\d{1,5}$/;
 const IPV4_PART_RE = /^\d{1,3}$/;
 const BRACKETED_IPV6_SOCKET_RE = /^\[([0-9a-fA-F:.]+)\]:(\d{1,5})$/;
@@ -7,20 +8,20 @@ const IPV4_SOCKET_RE = /^(.+):(\d{1,5})$/;
 export { DEFAULT_PORT };
 
 // Append the default port unless the address already has one. Handles IPv6:
-// a bare literal (`fe80::1`) is bracketed (`[fe80::1]:7654`) so it parses as a
-// SocketAddr, and an already-bracketed address keeps its port if present.
-function withDefaultPort(addr: string): string {
+// a bare literal (`fe80::1`) is bracketed with the current default port so it
+// parses as a SocketAddr, and an already-bracketed address keeps its port.
+function withDefaultPort(addr: string, defaultPort: string): string {
   if (addr.startsWith("[")) {
     // Bracketed IPv6, with or without a trailing `:port`.
-    return addr.includes("]:") ? addr : `${addr}:${DEFAULT_PORT}`;
+    return addr.includes("]:") ? addr : `${addr}:${defaultPort}`;
   }
   let colons = 0;
   for (const char of addr) {
     if (char === ":") colons += 1;
   }
   if (colons === 1) return addr; // host:port or IPv4:port
-  if (colons > 1) return `[${addr}]:${DEFAULT_PORT}`; // bare IPv6 literal
-  return `${addr}:${DEFAULT_PORT}`; // bare IPv4 or unsupported hostname
+  if (colons > 1) return `[${addr}]:${defaultPort}`; // bare IPv6 literal
+  return `${addr}:${defaultPort}`; // bare IPv4 or unsupported hostname
 }
 
 function validPort(raw: string): boolean {
@@ -42,8 +43,8 @@ function validBracketedIpv6Socket(raw: string): boolean {
   return match !== null && match[1].includes(":") && validPort(match[2]);
 }
 
-export function normalizeSocketAddr(raw: string): string | null {
-  const candidate = withDefaultPort(raw);
+export function normalizeSocketAddr(raw: string, defaultPort = DEFAULT_PORT): string | null {
+  const candidate = withDefaultPort(raw, defaultPort);
   const ipv4 = IPV4_SOCKET_RE.exec(candidate);
   if (ipv4 !== null && validIpv4(ipv4[1]) && validPort(ipv4[2])) {
     return candidate;

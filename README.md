@@ -85,7 +85,7 @@ mise tasks          # list all tasks
 
 Linux screen capture uses the desktop portal. The first connection may show the
 standard screen-share dialog; Tether stores the portal restore token under
-`~/.tether/`.
+`~/.tether/` for release builds and `~/.tether-dev/` for `mise run shell`.
 
 Linux input injection uses `/dev/uinput`. Deb/rpm packages install the udev rule
 at install time. The AppImage and source builds can request the one-time setup

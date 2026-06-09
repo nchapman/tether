@@ -23,7 +23,7 @@ below are settled.
 The 0.2 shell renders both roles at once in a single window: a "Host this
 machine" panel stacked on a "Connect to a host" panel. That conflates two
 jobs with opposite rhythms and leaks developer vocabulary ("host", "client",
-"fingerprint", "test pattern", `127.0.0.1:7654`). Three concrete gaps:
+"fingerprint", "test pattern", `127.0.0.1:7374`). Three concrete gaps:
 
 1. **The client has no visible memory.** `known_hosts.json` already persists
    every host the client has paired with (address, cert fingerprint, label,
@@ -146,7 +146,7 @@ trust ceremony, so neither the fingerprint nor any debug knob is surfaced here.
    ┌─ Sharing ─────────────────────────────────┐
    │  Allow remote connections      [ ●═══ ON ] │
    │                                            │
-   │  Address:        192.168.1.42:7654  [Copy] │
+   │  Address:        192.168.1.42:7374  [Copy] │
    │  ● Waiting for someone to connect…         │  ← live status
    │                                            │
    │  Paired devices                  [+ Add]   │
@@ -177,7 +177,7 @@ focused sheet, single screen (not a wizard), that frames the trust ceremony.
 ┌─ Add a computer ─────────────────────────┐
 │  Address                                  │
 │  ┌──────────────────────────┬─────────┐  │
-│  │ 192.168.1.10             │ :7654   │  │  ← port pre-filled + dimmed
+│  │ 192.168.1.10             │ :7374   │  │  ← port pre-filled + dimmed
 │  └──────────────────────────┴─────────┘  │
 │                                           │
 │  Pairing PIN                              │
@@ -197,7 +197,7 @@ focused sheet, single screen (not a wizard), that frames the trust ceremony.
 - Segmented PIN field signals "one-time code / ceremony." `PIN_DIGITS = 8`
   (see `tether_pairing`).
 - Never show `127.0.0.1` as the example in a shipped build — use
-  `192.168.1.10`. Pre-fill `:7654` dimmed so users type just the address.
+  `192.168.1.10`. Pre-fill `:7374` dimmed so users type just the address.
 - The sheet shows its **own** connecting/error state in place (don't dismiss
   and hope). On success it dismisses and the new row appears in the address
   book in its connecting→connected beat. On failure the error appears in the

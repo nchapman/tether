@@ -76,7 +76,7 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     )?;
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(app.default_window_icon().unwrap().clone())
-        .tooltip("Tether")
+        .tooltip(crate::app_display_name())
         .menu(&menu)
         .on_menu_event(|app, event| handle_menu_event(app, event.id().as_ref()))
         .build(app)?;
@@ -196,7 +196,11 @@ fn status_line(status: &TrayStatus, recents: &[SavedHost]) -> String {
 }
 
 fn tooltip(status: &TrayStatus, recents: &[SavedHost]) -> String {
-    format!("Tether — {}", status_line(status, recents))
+    format!(
+        "{} — {}",
+        crate::app_display_name(),
+        status_line(status, recents)
+    )
 }
 
 /// Resolve a saved host's display label from the recents, falling back to the
@@ -239,7 +243,8 @@ fn build_menu(
         .checked(status.sharing)
         .build(app)?;
     let add_device = MenuItemBuilder::with_id(ID_ADD_DEVICE, "Pair a device…").build(app)?;
-    let show = MenuItemBuilder::with_id(ID_SHOW, "Show Tether").build(app)?;
+    let show = MenuItemBuilder::with_id(ID_SHOW, format!("Show {}", crate::app_display_name()))
+        .build(app)?;
     let quit = MenuItemBuilder::with_id(ID_QUIT, "Quit").build(app)?;
 
     let mut builder = MenuBuilder::new(app)
@@ -296,15 +301,22 @@ fn toggle_sharing(app: &AppHandle) {
         let supervisor = app.state::<Supervisor>();
         if sharing {
             crate::stop_role(&app, supervisor.inner(), ROLE_HOST).await;
-        } else if let Err(e) = supervisor
-            .spawn(
-                &app,
-                ROLE_HOST,
-                &["--ipc".to_string(), crate::HOST_BIND_ADDR.to_string()],
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "tray: start sharing failed");
+        } else {
+            match crate::host_bind_addr() {
+                Ok(bind_addr) => {
+                    if let Err(e) = supervisor
+                        .spawn(
+                            &app,
+                            ROLE_HOST,
+                            &["--ipc".to_string(), bind_addr.to_string()],
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "tray: start sharing failed");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "tray: resolve host bind failed"),
+            }
         }
     });
 }

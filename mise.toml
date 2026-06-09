@@ -265,7 +265,7 @@ depends = ["engines"]
 shell = "sh -c"
 run = [
   "scripts/stage-windows-runtime.sh",
-  "mise exec -- pnpm --dir apps/tether-shell tauri dev",
+  "mise exec -- pnpm --dir apps/tether-shell tauri dev --config src-tauri/tauri.dev.conf.json -- -- --channel dev",
 ]
 
 [tasks.shell-check]

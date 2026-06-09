@@ -3388,20 +3388,33 @@ fn run_capture_and_send(
         let encode_changed = slot
             .as_ref()
             .is_some_and(|s| s.width != encode_width || s.height != encode_height);
+        // Throttle viewport-driven rebuilds (server-side defense); while
+        // deferred, an unchanged static desktop can still be damage-skipped.
+        // A later iteration rebuilds to the newest viewport once the throttle
+        // window passes.
+        let needs_recreate = should_recreate_encoder(
+            first_build,
+            capture_changed,
+            encode_changed,
+            Instant::now().duration_since(last_encoder_rebuild),
+        );
 
         // Damage-skip gate. If the classifier says the frame is bit-identical
         // to the previous one AND nobody is waiting on a forced IDR or an
         // effective dimension change, drop it on the floor — the client's
         // renderer is already showing this image. Viewport updates that resolve
         // to the current encode dims are handled by recording the seq; they do
-        // not need a host frame or keyframe.
+        // not need a host frame or keyframe. Viewport-driven encode changes only
+        // bypass damage-skip on the iteration that actually rebuilds; while
+        // throttled, static content stays skipped.
+        let rebuild_encode_changed = encode_changed && needs_recreate;
         let damage_unchanged = matches!(damage.classify(&frame), DamageHint::Unchanged);
         if should_skip_unchanged_frame(
             damage_unchanged,
             force_idr.peek(),
             first_build,
             capture_changed,
-            encode_changed,
+            rebuild_encode_changed,
         ) {
             if viewport_changed {
                 last_handled_viewport_seq = current_viewport_seq;
@@ -3409,20 +3422,12 @@ fn run_capture_and_send(
                     viewport_seq = current_viewport_seq,
                     encode_width,
                     encode_height,
-                    "viewport update did not change encode dims; skipping unchanged frame"
+                    encode_changed,
+                    "viewport update deferred or did not require an encoded frame"
                 );
             }
             continue;
         }
-        // Throttle viewport-driven rebuilds (server-side defense); while
-        // deferred, encoding continues at the current dims (the client
-        // letterboxes) and a later iteration rebuilds to the newest viewport.
-        let needs_recreate = should_recreate_encoder(
-            first_build,
-            capture_changed,
-            encode_changed,
-            Instant::now().duration_since(last_encoder_rebuild),
-        );
 
         let mut rebuilt_encoder = false;
         if needs_recreate {
@@ -4464,6 +4469,17 @@ mod tests {
         // A capture change is never throttled even if an encode change rode
         // along inside the window (real source change wins).
         assert!(should_recreate_encoder(false, true, true, under));
+    }
+
+    #[test]
+    fn throttled_viewport_resize_does_not_force_static_frame_encode() {
+        let needs_recreate =
+            should_recreate_encoder(false, false, true, VIEWPORT_REBUILD_THROTTLE / 2);
+        let rebuild_encode_changed = needs_recreate;
+        assert!(
+            should_skip_unchanged_frame(true, false, false, false, rebuild_encode_changed),
+            "throttled viewport-only encode change should still damage-skip unchanged content"
+        );
     }
 
     #[test]

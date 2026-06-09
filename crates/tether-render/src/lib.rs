@@ -30,7 +30,6 @@ mod iosurface_test;
 #[cfg(all(test, target_os = "linux"))]
 mod test_harness;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
@@ -96,43 +95,50 @@ impl DisplayScale {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct DisplayScaleHandle {
-    packed: Arc<AtomicU32>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDisplayGeometry {
+    pub size_px: (u32, u32),
+    pub scale: DisplayScale,
 }
 
-impl DisplayScaleHandle {
+impl HostDisplayGeometry {
     #[must_use]
-    pub fn new(scale: DisplayScale) -> Self {
+    pub const fn new(size_px: (u32, u32), scale: DisplayScale) -> Option<Self> {
+        if size_px.0 == 0 || size_px.1 == 0 || scale.num == 0 || scale.den == 0 {
+            None
+        } else {
+            Some(Self { size_px, scale })
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HostDisplayHandle {
+    geometry: Arc<Mutex<HostDisplayGeometry>>,
+}
+
+impl HostDisplayHandle {
+    #[must_use]
+    pub fn new(geometry: HostDisplayGeometry) -> Self {
         Self {
-            packed: Arc::new(AtomicU32::new(pack_display_scale(scale))),
+            geometry: Arc::new(Mutex::new(geometry)),
         }
     }
 
     #[must_use]
-    pub fn get(&self) -> DisplayScale {
-        unpack_display_scale(self.packed.load(Ordering::Relaxed))
+    pub fn get(&self) -> HostDisplayGeometry {
+        *self
+            .geometry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn set(&self, scale: DisplayScale) {
-        self.packed
-            .store(pack_display_scale(scale), Ordering::Relaxed);
+    pub fn set(&self, geometry: HostDisplayGeometry) {
+        *self
+            .geometry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = geometry;
     }
-}
-
-fn pack_display_scale(scale: DisplayScale) -> u32 {
-    assert!(
-        scale.num > 0 && scale.den > 0,
-        "DisplayScaleHandle requires a nonzero display scale"
-    );
-    (u32::from(scale.num) << 16) | u32::from(scale.den)
-}
-
-fn unpack_display_scale(packed: u32) -> DisplayScale {
-    let num = (packed >> 16) as u16;
-    let den = (packed & 0xFFFF) as u16;
-    debug_assert!(num > 0 && den > 0);
-    DisplayScale { num, den }
 }
 
 /// macOS-only — whether the renderer's IOSurface import path accepts
@@ -380,10 +386,11 @@ pub fn run(
     cursor_channel: CursorChannel,
     on_event: Option<EventSink>,
 ) -> Result<()> {
-    run_with_display_scale_handle(
+    let geometry = HostDisplayGeometry::new(initial_video_size_px, host_display_scale)
+        .expect("tether_render::run requires nonzero host display size and display scale");
+    run_with_host_display_handle(
         title,
-        initial_video_size_px,
-        DisplayScaleHandle::new(host_display_scale),
+        HostDisplayHandle::new(geometry),
         color_space,
         chroma,
         bit_depth,
@@ -395,10 +402,9 @@ pub fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_with_display_scale_handle(
+pub fn run_with_host_display_handle(
     title: &str,
-    initial_video_size_px: (u32, u32),
-    host_display_scale: DisplayScaleHandle,
+    host_display: HostDisplayHandle,
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
@@ -408,12 +414,11 @@ pub fn run_with_display_scale_handle(
     on_event: Option<EventSink>,
 ) -> Result<()> {
     let event_loop = EventLoop::new()?;
-    let last_host_display_scale = host_display_scale.get();
+    let last_host_display = host_display.get();
     let mut app = App {
         title: title.to_string(),
-        initial_video_size_px,
-        host_display_scale,
-        last_host_display_scale,
+        host_display,
+        last_host_display,
         client_scale_factor: 1.0,
         color_space,
         chroma,
@@ -443,9 +448,8 @@ pub fn run_with_display_scale_handle(
 
 struct App {
     title: String,
-    initial_video_size_px: (u32, u32),
-    host_display_scale: DisplayScaleHandle,
-    last_host_display_scale: DisplayScale,
+    host_display: HostDisplayHandle,
+    last_host_display: HostDisplayGeometry,
     client_scale_factor: f64,
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
@@ -771,19 +775,20 @@ impl App {
     }
 
     fn presentation_size_px(&self) -> (u32, u32) {
+        let host_display = self.host_display.get();
         logical_actual_size_px(
-            self.initial_video_size_px,
-            self.host_display_scale.get(),
+            host_display.size_px,
+            host_display.scale,
             self.client_scale_factor,
         )
     }
 
-    fn refresh_host_display_scale(&mut self) {
-        let scale = self.host_display_scale.get();
-        if scale == self.last_host_display_scale {
+    fn refresh_host_display_geometry(&mut self) {
+        let geometry = self.host_display.get();
+        if geometry == self.last_host_display {
             return;
         }
-        self.last_host_display_scale = scale;
+        self.last_host_display = geometry;
         self.update_presentation_size();
         if let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
             self.apply_window_resize(size);
@@ -1128,7 +1133,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        self.refresh_host_display_scale();
+        self.refresh_host_display_geometry();
         // LatestFrame holds at most one frame — if the producer wrote
         // multiple times since we last polled, only the newest is
         // visible. That's the intended drop-oldest semantics: a
@@ -1525,9 +1530,10 @@ mod tests {
     fn viewport_override_reports_density_correct_fit_delta() {
         let app = App {
             title: "test".to_string(),
-            initial_video_size_px: (1920, 1080),
-            host_display_scale: DisplayScaleHandle::new(DisplayScale::one()),
-            last_host_display_scale: DisplayScale::one(),
+            host_display: HostDisplayHandle::new(
+                HostDisplayGeometry::new((1920, 1080), DisplayScale::one()).unwrap(),
+            ),
+            last_host_display: HostDisplayGeometry::new((1920, 1080), DisplayScale::one()).unwrap(),
             client_scale_factor: 1.0,
             color_space: tether_protocol::control::VideoColorSpec::sdr_desktop(),
             chroma: tether_protocol::control::ChromaSubsampling::Yuv420,

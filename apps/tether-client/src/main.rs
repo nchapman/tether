@@ -30,7 +30,9 @@ use tether_protocol::control::{
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
 use tether_render::RenderEvent;
-use tether_render::{DisplayScale, DisplayScaleHandle, LatestFrame, PresentationMode};
+use tether_render::{
+    DisplayScale, HostDisplayGeometry, HostDisplayHandle, LatestFrame, PresentationMode,
+};
 use tether_session::{
     log_peer_session_summary, ClientSession, ClientSessionConfig, ConnectError, SessionSummaryState,
 };
@@ -611,7 +613,10 @@ async fn main() -> anyhow::Result<()> {
     let clock_sync_state = Arc::new(RwLock::new(clock_sync));
     let clock_resync_state = Arc::new(Mutex::new(ClockResyncState::default()));
     let initial_host_display = initial_host_display_from_displays(&server_hello.displays)?;
-    let host_display_scale = DisplayScaleHandle::new(initial_host_display.scale);
+    let host_display = HostDisplayHandle::new(
+        HostDisplayGeometry::new(initial_host_display.size_px, initial_host_display.scale)
+            .expect("validated initial host display geometry"),
+    );
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -686,7 +691,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let conn = conn.clone();
         let cursor_channel_ctrl = cursor_channel.clone();
-        let host_display_scale = host_display_scale.clone();
+        let host_display = host_display.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
         let decode_event_rx = decode_event_rx.clone();
@@ -888,7 +893,17 @@ async fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         };
-                        if host_display_scale.get() != selected_display.scale {
+                        let geometry = match HostDisplayGeometry::new(
+                            selected_display.size_px,
+                            selected_display.scale,
+                        ) {
+                            Some(geometry) => geometry,
+                            None => {
+                                error!("host sent invalid display geometry; ending control loop");
+                                return;
+                            }
+                        };
+                        if host_display.get() != geometry {
                             info!(
                                 scale = format!(
                                     "{}/{}",
@@ -896,9 +911,9 @@ async fn main() -> anyhow::Result<()> {
                                 ),
                                 width = selected_display.size_px.0,
                                 height = selected_display.size_px.1,
-                                "updated host display scale from live display topology"
+                                "updated host display geometry from live display topology"
                             );
-                            host_display_scale.set(selected_display.scale);
+                            host_display.set(geometry);
                         }
                     }
                     Ok(ControlMessage::SetActiveDisplays { .. }) => {
@@ -1780,10 +1795,9 @@ async fn main() -> anyhow::Result<()> {
     // dispatch — for desktop captures (`sdr_desktop`) this is the
     // sRGB path, eliminating the BT.709-vs-sRGB transfer-curve
     // mismatch the spec-blind chain previously had to absorb.
-    let render_result = tether_render::run_with_display_scale_handle(
+    let render_result = tether_render::run_with_host_display_handle(
         "tether-client",
-        initial_video_size_px,
-        host_display_scale,
+        host_display,
         server_hello.video.color_space,
         negotiated_profile.chroma,
         negotiated_profile.bit_depth,

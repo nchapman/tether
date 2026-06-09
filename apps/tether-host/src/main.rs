@@ -1064,12 +1064,6 @@ async fn handle_client(
                         stream_id,
                         viewport: v,
                     }) => {
-                        info!(
-                            %stream_id,
-                            width = v.width,
-                            height = v.height,
-                            "client viewport changed"
-                        );
                         // Latch the new viewport. The send thread notices the
                         // seq bump on its next iteration and decides whether
                         // the effective encode dims changed. Viewport changes
@@ -1091,6 +1085,7 @@ async fn handle_client(
                         drop(guard);
                         if !changed {
                             tracing::trace!(
+                                %stream_id,
                                 width = v.width,
                                 height = v.height,
                                 "duplicate viewport hint; skipping seq bump and IDR"
@@ -1108,7 +1103,16 @@ async fn handle_client(
                             );
                             stream_ready_ctl.store(true, Ordering::Release);
                         }
+                        if next.is_some() {
+                            info!(
+                                %stream_id,
+                                width = v.width,
+                                height = v.height,
+                                "client viewport changed"
+                            );
+                        }
                         tracing::trace!(
+                            %stream_id,
                             width = v.width,
                             height = v.height,
                             "SetViewportHint latched; send thread will decide effective resize"

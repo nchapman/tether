@@ -73,7 +73,7 @@ Look at `RcvbufErrors` and `InErrors`. If either climbs significantly (more than
 
 Also useful:
 ```bash
-ss -unmp 'sport = :7654 or dport = :7654'   # while session is live
+ss -unmp 'sport = :7374 or dport = :7374'   # while session is live
 ```
 Look at the `Recv-Q` column — non-zero means the userspace is behind on draining.
 
@@ -151,8 +151,8 @@ These are real improvements regardless of what we find above, but should be info
 
 ## Reproduction
 
-1. On Mac: `mise run release && ./target/release/tether-host 0.0.0.0:7654`
-2. On Linux: `git pull && mise run release && ./target/release/tether-client <mac-ip>:7654 <fingerprint>`
+1. On Mac: `mise run release && ./target/release/tether-host 0.0.0.0:7374`
+2. On Linux: `git pull && mise run release && ./target/release/tether-client <mac-ip>:7374 <fingerprint>`
 3. Move the mouse around, type in some windows on the Mac to drive bitrate up. Freezes typically appear within ~30s.
 
 The freeze windows are 1–10 seconds long. They correlate with bitrate spikes in the host's `send stats` log lines (`kbps_out=7000+`).

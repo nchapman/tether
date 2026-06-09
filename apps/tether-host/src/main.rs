@@ -7,7 +7,7 @@
 //! when the portal isn't available).
 //!
 //! Usage: `tether-host [--test-pattern] [bind_addr]`
-//! (`bind_addr` defaults to `127.0.0.1:7654`).
+//! (`bind_addr` defaults to `127.0.0.1:7374`).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -3890,12 +3890,12 @@ fn run_capture_and_send(
     info!("send loop exiting");
 }
 
-/// Directory the host caches its self-signed cert + key in. Default
-/// is `$HOME/.tether/`; override with `$TETHER_CERT_DIR` for testing
-/// or sharing between host instances. We deliberately don't follow
-/// XDG paths — the file pair is small and operationally important,
-/// and a single well-known location ("look under ~/.tether") is
-/// easier to talk about in docs than "wherever XDG_DATA_HOME points".
+/// Directory the host caches its self-signed cert + key in. Default is
+/// `$HOME/.tether/` for release and `$HOME/.tether-dev/` for the dev channel;
+/// override with `$TETHER_CERT_DIR` for testing or sharing between host
+/// instances. We deliberately don't follow XDG paths — the file pair is small
+/// and operationally important, and a single well-known per-channel location
+/// is easier to talk about in docs than "wherever XDG_DATA_HOME points".
 /// Delegates to the shared [`tether_pairing::config_dir`] so the host, the
 /// client, and the Tauri shell all resolve the same location.
 fn persistent_cert_dir() -> anyhow::Result<PathBuf> {
@@ -3916,7 +3916,7 @@ struct Args {
 }
 
 fn parse_args() -> anyhow::Result<Args> {
-    let mut bind: SocketAddr = "127.0.0.1:7654".parse().expect("static literal");
+    let mut bind: SocketAddr = "127.0.0.1:7374".parse().expect("static literal");
     let mut use_test_pattern = false;
     let mut ipc = false;
     let mut setup_input = false;

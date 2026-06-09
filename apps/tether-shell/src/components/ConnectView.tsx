@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { SavedHost } from "../ipc";
 import type { ClientState, RowError } from "../state";
+import { APP_TITLE } from "../appChannel";
 import { PlusIcon, SettingsIcon, MonitorIcon } from "../icons";
 import { HostRow } from "./HostRow";
 
@@ -66,7 +67,7 @@ export function ConnectView({
   return (
     <div className="connect-view">
       <header className="titlebar">
-        <h1>Tether</h1>
+        <h1>{APP_TITLE}</h1>
         <div className="titlebar-actions">
           <button className="icon-btn" aria-label="Sharing settings" onClick={onOpenSharing}>
             <SettingsIcon />

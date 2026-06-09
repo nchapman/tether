@@ -64,31 +64,92 @@ pub use store::{
     parse_tagged_fingerprint, tag_fingerprint, HostEntry, KnownHosts, PairedStore, PeerEntry,
 };
 
+use std::ffi::OsString;
 use std::path::PathBuf;
+
+pub const CERT_DIR_ENV: &str = "TETHER_CERT_DIR";
+pub const CHANNEL_ENV: &str = "TETHER_CHANNEL";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppChannel {
+    Release,
+    Dev,
+}
+
+impl AppChannel {
+    fn config_dir_name(self) -> &'static str {
+        match self {
+            Self::Release => ".tether",
+            Self::Dev => ".tether-dev",
+        }
+    }
+}
+
+fn parse_app_channel(value: Option<OsString>) -> std::io::Result<AppChannel> {
+    let Some(value) = value else {
+        return Ok(AppChannel::Release);
+    };
+    if value.is_empty() {
+        return Ok(AppChannel::Release);
+    }
+    let Some(value) = value.to_str() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("${CHANNEL_ENV} must be valid UTF-8"),
+        ));
+    };
+    match value {
+        "release" => Ok(AppChannel::Release),
+        "dev" => Ok(AppChannel::Dev),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown ${CHANNEL_ENV} value {other:?}; expected \"release\" or \"dev\""),
+        )),
+    }
+}
+
+pub fn app_channel() -> std::io::Result<AppChannel> {
+    parse_app_channel(std::env::var_os(CHANNEL_ENV))
+}
 
 /// The directory Tether keeps its persistent identity and trust files in:
 /// the cert/key pair, the client's `known_hosts.json`, and the host's
 /// `paired_clients.json`. `$TETHER_CERT_DIR` overrides it (for tests or for
-/// sharing one identity between instances); otherwise it's `$HOME/.tether`
-/// (`%USERPROFILE%\.tether` on Windows).
+/// sharing one identity between instances); otherwise the selected app channel
+/// picks `$HOME/.tether` for release or `$HOME/.tether-dev` for dev
+/// (`%USERPROFILE%\.tether[-dev]` on Windows). `$TETHER_CHANNEL` accepts
+/// `release` or `dev` and defaults to `release` when unset.
 ///
 /// Shared by `tether-host`, `tether-client`, and the Tauri shell so all three
 /// agree on where these files live — the shell reads/writes the same
 /// `known_hosts.json` the client engine uses.
 pub fn config_dir() -> std::io::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("TETHER_CERT_DIR") {
+    config_dir_from_env(
+        std::env::var_os(CERT_DIR_ENV),
+        std::env::var_os(CHANNEL_ENV),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    )
+}
+
+fn config_dir_from_env(
+    cert_dir: Option<OsString>,
+    channel: Option<OsString>,
+    home: Option<OsString>,
+) -> std::io::Result<PathBuf> {
+    if let Some(dir) = cert_dir {
         return Ok(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "neither $TETHER_CERT_DIR nor $HOME/$USERPROFILE is set; \
+    let channel = parse_app_channel(channel)?;
+    let home = home.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "neither ${CERT_DIR_ENV} nor $HOME/$USERPROFILE is set; \
                  can't choose a config directory",
-            )
-        })?;
-    Ok(PathBuf::from(home).join(".tether"))
+            ),
+        )
+    })?;
+    Ok(PathBuf::from(home).join(channel.config_dir_name()))
 }
 
 /// The client's known-hosts file path under [`config_dir`].
@@ -333,6 +394,45 @@ mod tests {
             a.into_keyed(&b_msg).expect("a finishes"),
             b.into_keyed(&a_msg).expect("b finishes"),
         )
+    }
+
+    #[test]
+    fn config_dir_defaults_to_release_channel() {
+        let dir = config_dir_from_env(None, None, Some(OsString::from("/home/alice"))).unwrap();
+        assert_eq!(dir, PathBuf::from("/home/alice/.tether"));
+    }
+
+    #[test]
+    fn config_dir_uses_dev_channel_suffix() {
+        let dir = config_dir_from_env(
+            None,
+            Some(OsString::from("dev")),
+            Some(OsString::from("/home/alice")),
+        )
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/home/alice/.tether-dev"));
+    }
+
+    #[test]
+    fn explicit_cert_dir_overrides_channel() {
+        let dir = config_dir_from_env(
+            Some(OsString::from("/tmp/tether-shared")),
+            Some(OsString::from("dev")),
+            Some(OsString::from("/home/alice")),
+        )
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/tmp/tether-shared"));
+    }
+
+    #[test]
+    fn unknown_app_channel_is_rejected() {
+        let err = config_dir_from_env(
+            None,
+            Some(OsString::from("staging")),
+            Some(OsString::from("/home/alice")),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

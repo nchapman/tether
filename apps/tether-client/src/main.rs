@@ -2188,7 +2188,7 @@ fn record_audio_playback_summary_delta(
 /// Directory the client caches its identity (`client_cert.der`/`client_key.der`)
 /// and `known_hosts.json` in. Delegates to the shared
 /// [`tether_pairing::config_dir`] so the host, the client, and the Tauri shell
-/// all resolve the same location.
+/// all resolve the same release/dev channel location.
 fn client_config_dir() -> anyhow::Result<PathBuf> {
     Ok(tether_pairing::config_dir()?)
 }

@@ -2,6 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
+import { DEFAULT_PORT } from "../socketAddress";
 import { AddComputerSheet } from "./AddComputerSheet";
 
 async function enterPin(user: ReturnType<typeof userEvent.setup>) {
@@ -25,7 +26,7 @@ describe("AddComputerSheet", () => {
     await enterPin(user);
     await user.click(screen.getByRole("button", { name: /pair/i }));
 
-    expect(onSubmit).toHaveBeenCalledWith("192.168.1.20:7654", "12345678", "");
+    expect(onSubmit).toHaveBeenCalledWith(`192.168.1.20:${DEFAULT_PORT}`, "12345678", "");
   });
 
   it("brackets bare IPv6 literals before submitting", async () => {
@@ -43,7 +44,7 @@ describe("AddComputerSheet", () => {
     await enterPin(user);
     await user.click(screen.getByRole("button", { name: /pair/i }));
 
-    expect(onSubmit).toHaveBeenCalledWith("[fe80::1]:7654", "12345678", "");
+    expect(onSubmit).toHaveBeenCalledWith(`[fe80::1]:${DEFAULT_PORT}`, "12345678", "");
   });
 
   it("does not submit invalid socket addresses", async () => {
@@ -57,7 +58,7 @@ describe("AddComputerSheet", () => {
       />,
     );
 
-    await user.type(screen.getByPlaceholderText("192.168.1.10"), "999.1.1.1:7654");
+    await user.type(screen.getByPlaceholderText("192.168.1.10"), "999.1.1.1:7374");
     await enterPin(user);
 
     expect(screen.getByRole("button", { name: /pair/i })).toBeDisabled();

@@ -11,6 +11,8 @@ mod prefs;
 mod supervisor;
 mod tray;
 
+use std::ffi::OsString;
+
 use supervisor::{ExitedPayload, Supervisor, ROLE_CLIENT, ROLE_HOST};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
@@ -21,11 +23,69 @@ use tether_ipc::ShellCommand;
 /// the engine's loopback CLI default, so a paired device on the LAN can actually
 /// reach it — sharing across machines is the whole point. This is not a security
 /// downgrade: access is gated by pairing (PIN first-contact + TLS cert pinning),
-/// not by bind scope. Port matches the engine default.
-pub(crate) const HOST_BIND_ADDR: &str = "0.0.0.0:7654";
+/// not by bind scope. Release uses the production port; dev uses a non-conflicting
+/// port so `mise run shell` can coexist with an installed release host.
+const RELEASE_HOST_BIND_ADDR: &str = "0.0.0.0:7374";
+const DEV_HOST_BIND_ADDR: &str = "0.0.0.0:7384";
+
+pub(crate) fn host_bind_addr() -> Result<&'static str, String> {
+    Ok(host_bind_addr_for_channel(
+        tether_pairing::app_channel().map_err(|e| e.to_string())?,
+    ))
+}
+
+fn host_bind_addr_for_channel(channel: tether_pairing::AppChannel) -> &'static str {
+    match channel {
+        tether_pairing::AppChannel::Release => RELEASE_HOST_BIND_ADDR,
+        tether_pairing::AppChannel::Dev => DEV_HOST_BIND_ADDR,
+    }
+}
+
+pub(crate) fn app_display_name() -> &'static str {
+    tether_pairing::app_channel()
+        .map(app_display_name_for_channel)
+        .unwrap_or("Tether")
+}
+
+fn app_display_name_for_channel(channel: tether_pairing::AppChannel) -> &'static str {
+    match channel {
+        tether_pairing::AppChannel::Release => "Tether",
+        tether_pairing::AppChannel::Dev => "Tether Dev",
+    }
+}
+
+fn channel_arg_from_args(args: impl IntoIterator<Item = OsString>) -> Option<OsString> {
+    let mut args = args.into_iter();
+    let _program = args.next();
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if arg == "--channel" {
+            return args.next();
+        }
+        if let Some(value) = arg.strip_prefix("--channel=") {
+            return Some(OsString::from(value));
+        }
+    }
+    None
+}
+
+fn apply_channel_arg() {
+    if let Some(channel) = channel_arg_from_args(std::env::args_os()) {
+        std::env::set_var(tether_pairing::CHANNEL_ENV, channel);
+    }
+}
+
+fn autostart_args() -> Option<Vec<&'static str>> {
+    match tether_pairing::app_channel() {
+        Ok(tether_pairing::AppChannel::Dev) => Some(vec!["--channel", "dev"]),
+        Ok(tether_pairing::AppChannel::Release) | Err(_) => None,
+    }
+}
 
 /// Start hosting: spawn `tether-host --ipc` with real screen capture, bound to
-/// [`HOST_BIND_ADDR`]. (The engine's `--test-pattern` dev fallback is reachable
+/// [`host_bind_addr`]. (The engine's `--test-pattern` dev fallback is reachable
 /// only from the CLI, not the UI.)
 ///
 /// The sharing posture is persisted as on only once the host actually reaches
@@ -34,12 +94,9 @@ pub(crate) const HOST_BIND_ADDR: &str = "0.0.0.0:7654";
 /// that would auto-restart and fail every launch.
 #[tauri::command]
 async fn start_host(app: AppHandle, supervisor: State<'_, Supervisor>) -> Result<(), String> {
+    let bind_addr = host_bind_addr()?.to_string();
     supervisor
-        .spawn(
-            &app,
-            ROLE_HOST,
-            &["--ipc".to_string(), HOST_BIND_ADDR.to_string()],
-        )
+        .spawn(&app, ROLE_HOST, &["--ipc".to_string(), bind_addr])
         .await
 }
 
@@ -146,6 +203,10 @@ async fn list_peers(supervisor: State<'_, Supervisor>) -> Result<(), String> {
 /// restarts — so on success this never returns.
 #[tauri::command]
 async fn install_update(app: AppHandle) -> Result<(), String> {
+    if tether_pairing::app_channel().map_err(|e| e.to_string())? == tether_pairing::AppChannel::Dev
+    {
+        return Err("updates are disabled for dev builds".to_string());
+    }
     let updater = app.updater().map_err(|e| e.to_string())?;
     let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
         return Err("no update is available".to_string());
@@ -186,6 +247,8 @@ fn set_login_start_enabled(app: AppHandle, enabled: bool) -> Result<bool, String
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    apply_channel_arg();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -196,7 +259,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            None,
+            autostart_args(),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Remember the window's position/size between launches.
@@ -211,7 +274,7 @@ pub fn run() {
         })
         // Closing the window hides it to the tray instead of quitting — the
         // shell must keep running so a host can stay reachable headless. The
-        // window comes back via the tray's "Show Tether"; the only real quit is
+        // window comes back via the tray's Show item; the only real quit is
         // the tray's "Quit" (app.exit). Without this, closing the last window
         // would exit the whole app.
         .on_window_event(|window, event| {
@@ -264,6 +327,11 @@ pub fn run() {
 /// which logs and swallows it; a failed check must never block the shell.
 #[tauri::command]
 async fn check_for_updates(app: AppHandle) -> Result<Option<String>, String> {
+    if tether_pairing::app_channel().map_err(|e| e.to_string())? == tether_pairing::AppChannel::Dev
+    {
+        tracing::info!("skipping update check for dev channel");
+        return Ok(None);
+    }
     let updater = app.updater().map_err(|e| e.to_string())?;
     match updater.check().await.map_err(|e| e.to_string())? {
         Some(update) => {
@@ -281,7 +349,7 @@ async fn check_for_updates(app: AppHandle) -> Result<Option<String>, String> {
 /// live: the engine's native video window is what the user wants in front, so
 /// the control-plane chrome gets out of the way (see the hide-on-Connected
 /// handoff in `docs/UX.md`). The window is re-shown via [`show_window`] when
-/// the session ends, or from the tray's "Show Tether".
+/// the session ends, or from the tray's Show item.
 #[tauri::command]
 fn hide_window(app: AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -301,5 +369,58 @@ pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_channel_uses_production_port() {
+        assert_eq!(
+            host_bind_addr_for_channel(tether_pairing::AppChannel::Release),
+            "0.0.0.0:7374"
+        );
+    }
+
+    #[test]
+    fn dev_channel_uses_non_conflicting_port() {
+        assert_eq!(
+            host_bind_addr_for_channel(tether_pairing::AppChannel::Dev),
+            "0.0.0.0:7384"
+        );
+    }
+
+    #[test]
+    fn app_display_name_follows_channel() {
+        assert_eq!(
+            app_display_name_for_channel(tether_pairing::AppChannel::Release),
+            "Tether"
+        );
+        assert_eq!(
+            app_display_name_for_channel(tether_pairing::AppChannel::Dev),
+            "Tether Dev"
+        );
+    }
+
+    #[test]
+    fn channel_arg_parser_accepts_space_and_equals_forms() {
+        assert_eq!(
+            channel_arg_from_args(["tether-shell", "--channel", "dev"].map(OsString::from)),
+            Some(OsString::from("dev"))
+        );
+        assert_eq!(
+            channel_arg_from_args(["tether-shell", "--channel=release"].map(OsString::from)),
+            Some(OsString::from("release"))
+        );
+    }
+
+    #[test]
+    fn channel_arg_parser_ignores_missing_value() {
+        assert_eq!(
+            channel_arg_from_args(["tether-shell", "--channel"].map(OsString::from)),
+            None
+        );
     }
 }

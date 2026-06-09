@@ -34,15 +34,17 @@ Win11. Then `pnpm install` in this directory.
 ## Run (dev, Windows loopback)
 
 ```sh
-# 1. Build the engine binaries the shell will spawn.
-cargo build -p tether-host -p tether-client
-
-# 2. Launch the shell (Vite dev server + Tauri window).
-cd apps/tether-shell && pnpm tauri dev
+# Build the engine binaries, then launch the dev-channel shell.
+mise run shell
 ```
 
-The supervisor finds the engines in the workspace `target/debug` (override with
-`TETHER_ENGINE_DIR`). To exercise the full loopback on one machine:
+`mise run shell` runs the shell as **Tether Dev** (`app.tether.shell.dev`), uses
+the dev trust store (`~/.tether-dev` unless `TETHER_CERT_DIR` overrides it), and
+starts the host on `0.0.0.0:7384` so it can coexist with an installed release
+host on `7374`. Bare addresses in the dev shell also default to `:7384`; release
+builds default to `:7374`. The supervisor finds the engines in the workspace
+`target/debug` (override with `TETHER_ENGINE_DIR`). To exercise the full
+loopback on one machine:
 
 1. **Start hosting** (leave "Test pattern" **off** — real capture negotiates
    HEVC, which works on the Windows/QSV path; the test pattern forces the H.264

@@ -24,8 +24,8 @@ use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
-    ClockSync, ControlMessage, DisplayDescriptor, GoodbyeCode, ServerHello, VideoStreamId,
-    Viewport, CLOCK_SYNC_PROBE_SAMPLES,
+    ClientDisplayMetrics, ClockSync, ControlMessage, DisplayDescriptor, GoodbyeCode, ServerHello,
+    VideoStreamId, Viewport, CLOCK_SYNC_PROBE_SAMPLES,
 };
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
@@ -123,6 +123,13 @@ fn initial_video_size_px_from_displays(displays: &[DisplayDescriptor]) -> (u32, 
 
 fn should_send_viewport(last_sent: Option<Viewport>, next: Viewport) -> bool {
     next.is_valid() && last_sent != Some(next)
+}
+
+fn should_send_client_display_metrics(
+    last_sent: Option<&ClientDisplayMetrics>,
+    next: &ClientDisplayMetrics,
+) -> bool {
+    last_sent != Some(next)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1415,7 +1422,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let mut last_sent = None;
             while let Some(metrics) = display_metrics_rx.recv().await {
-                if last_sent.as_ref() == Some(&metrics) {
+                if !should_send_client_display_metrics(last_sent.as_ref(), &metrics) {
                     continue;
                 }
                 if let Err(e) = conn
@@ -2403,6 +2410,32 @@ mod arg_tests {
             Viewport::new(1280, 720)
         ));
         assert!(!should_send_viewport(None, Viewport::new(0, 720)));
+    }
+
+    #[test]
+    fn should_send_client_display_metrics_rejects_duplicates() {
+        let metrics = ClientDisplayMetrics {
+            display_id: 0,
+            mode: DisplayMode::new(2560, 1440, 60_000),
+            scale_num: 2,
+            scale_den: 1,
+            safe_area: None,
+        };
+
+        assert!(should_send_client_display_metrics(None, &metrics));
+        assert!(!should_send_client_display_metrics(
+            Some(&metrics),
+            &metrics
+        ));
+
+        let mut moved = metrics.clone();
+        moved.display_id = 1;
+        assert!(should_send_client_display_metrics(Some(&metrics), &moved));
+
+        let mut scaled = metrics.clone();
+        scaled.scale_num = 3;
+        scaled.scale_den = 2;
+        assert!(should_send_client_display_metrics(Some(&metrics), &scaled));
     }
 
     #[test]

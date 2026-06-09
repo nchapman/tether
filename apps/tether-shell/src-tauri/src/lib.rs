@@ -13,6 +13,7 @@ mod tray;
 
 use supervisor::{ExitedPayload, Supervisor, ROLE_CLIENT, ROLE_HOST};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_updater::UpdaterExt;
 use tether_ipc::ShellCommand;
 
@@ -164,6 +165,25 @@ fn get_prefs() -> prefs::ShellPrefs {
     prefs::load()
 }
 
+/// Return whether the shell is registered to launch when this user logs in.
+#[tauri::command]
+fn get_login_start_enabled(app: AppHandle) -> Result<bool, String> {
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+/// Enable or disable launching the shell when this user logs in. Returns the
+/// OS-reported state after the change so the UI mirrors the source of truth.
+#[tauri::command]
+fn set_login_start_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch.enable().map_err(|e| e.to_string())?;
+    } else {
+        autolaunch.disable().map_err(|e| e.to_string())?;
+    }
+    autolaunch.is_enabled().map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -174,6 +194,10 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Remember the window's position/size between launches.
         .plugin(tauri_plugin_window_state::Builder::default().build())
@@ -211,6 +235,8 @@ pub fn run() {
             hide_window,
             show_window,
             get_prefs,
+            get_login_start_enabled,
+            set_login_start_enabled,
             check_for_updates,
             install_update
         ])

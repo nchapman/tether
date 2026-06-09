@@ -315,6 +315,7 @@ pub fn run(
         on_event,
         present_stats: PresentStats::default(),
         last_recorded_t_cap: None,
+        last_display_metrics: None,
         refresh_rate_mhz: present_policy::REFRESH_RATE_FALLBACK_HZ.saturating_mul(1000),
         age_tracker: present_policy::FrameAgeTracker::default(),
         health: RenderHealth::default(),
@@ -352,6 +353,11 @@ struct App {
     /// redraw would record the same age again, inflating the sample
     /// count and pulling the average up.
     last_recorded_t_cap: Option<MonoNanos>,
+    /// Last client-display metrics emitted to the session. Monitor
+    /// changes can arrive as resize, move, scale, or focus events
+    /// depending on the window system; dedup here so all of those hooks
+    /// can cheaply refresh without spamming control messages.
+    last_display_metrics: Option<ClientDisplayMetrics>,
     /// Cached monitor refresh rate, in millihertz. Queried on
     /// resume + monitor change. Falls back to 60 Hz when winit
     /// can't report a real value.
@@ -520,6 +526,32 @@ impl App {
         if let Some(cb) = &self.on_event {
             cb(event);
         }
+    }
+
+    fn refresh_client_display_metrics(&mut self) {
+        let Some(monitor) = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor())
+        else {
+            return;
+        };
+        self.refresh_client_display_metrics_for_monitor(&monitor);
+    }
+
+    fn refresh_client_display_metrics_for_monitor(
+        &mut self,
+        monitor: &winit::monitor::MonitorHandle,
+    ) {
+        if let Some(mhz) = monitor.refresh_rate_millihertz() {
+            self.refresh_rate_mhz = mhz;
+        }
+        let metrics = client_display_metrics_for_monitor(monitor);
+        if !client_display_metrics_changed(self.last_display_metrics.as_ref(), &metrics) {
+            return;
+        }
+        self.last_display_metrics = Some(metrics.clone());
+        self.emit(RenderEvent::ClientDisplayMetrics(metrics));
     }
 
     /// Try `Locked` first (true pointer-lock, supported on most
@@ -707,29 +739,18 @@ impl ApplicationHandler for App {
             }
         };
         let size = win.inner_size();
+        self.window = Some(win);
+        self.gpu = Some(gpu);
         self.emit(RenderEvent::Resized {
             width: size.width,
             height: size.height,
         });
-        if let Some(metrics) = monitor.as_ref().map(client_display_metrics_for_monitor) {
-            self.emit(RenderEvent::ClientDisplayMetrics(metrics));
-        }
-        // Cache the monitor refresh rate. Winit returns an
-        // `Option<u32>` in millihertz; fall back to 60 Hz when
-        // it's unavailable (some Wayland compositors don't expose
-        // it on every monitor).
-        if let Some(monitor) = self.window.as_ref().and_then(|_| win.current_monitor()) {
-            if let Some(mhz) = monitor.refresh_rate_millihertz() {
-                self.refresh_rate_mhz = mhz;
+        self.refresh_client_display_metrics();
+        if self.last_display_metrics.is_none() {
+            if let Some(monitor) = monitor.as_ref() {
+                self.refresh_client_display_metrics_for_monitor(monitor);
             }
-        } else if let Some(mhz) = win
-            .current_monitor()
-            .and_then(|m| m.refresh_rate_millihertz())
-        {
-            self.refresh_rate_mhz = mhz;
         }
-        self.window = Some(win);
-        self.gpu = Some(gpu);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -749,6 +770,10 @@ impl ApplicationHandler for App {
                     width: size.width,
                     height: size.height,
                 });
+                self.refresh_client_display_metrics();
+            }
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.refresh_client_display_metrics();
             }
             WindowEvent::RedrawRequested => {
                 // OS-initiated repaint (expose/resize). Re-present the
@@ -888,6 +913,9 @@ impl ApplicationHandler for App {
                 } else if matches!(self.cursor_mode, CursorMode::Relative) {
                     self.set_local_cursor_hidden(true);
                 }
+                if b {
+                    self.refresh_client_display_metrics();
+                }
                 self.emit(RenderEvent::Focused(b));
             }
             _ => {}
@@ -980,6 +1008,13 @@ fn client_display_metrics_for_monitor(
         scale_den,
         safe_area: None,
     }
+}
+
+fn client_display_metrics_changed(
+    last: Option<&ClientDisplayMetrics>,
+    next: &ClientDisplayMetrics,
+) -> bool {
+    last != Some(next)
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1149,6 +1184,28 @@ mod tests {
         assert_eq!(scale_to_ratio(1.5), (3, 2));
         assert_eq!(scale_to_ratio(2.0), (2, 1));
         assert_eq!(scale_to_ratio(0.0), (1, 1));
+    }
+
+    #[test]
+    fn client_display_metrics_changed_dedups_identical_metrics() {
+        let base = ClientDisplayMetrics {
+            display_id: 0,
+            mode: DisplayMode::new(2560, 1440, 60_000),
+            scale_num: 2,
+            scale_den: 1,
+            safe_area: None,
+        };
+        assert!(client_display_metrics_changed(None, &base));
+        assert!(!client_display_metrics_changed(Some(&base), &base));
+
+        let mut scaled = base.clone();
+        scaled.scale_num = 3;
+        scaled.scale_den = 2;
+        assert!(client_display_metrics_changed(Some(&base), &scaled));
+
+        let mut resized = base.clone();
+        resized.mode = DisplayMode::new(1920, 1080, 60_000);
+        assert!(client_display_metrics_changed(Some(&base), &resized));
     }
 
     #[test]

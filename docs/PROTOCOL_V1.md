@@ -25,9 +25,9 @@ The client sends `ClientHello`:
 
 `initial_viewport` is a wire field, but production clients do not rely on a
 guessed size to start video. The real startup gate is a post-handshake
-`SetViewportHint` carrying the renderer's measured viewport followed by
-`StreamReady { video: true, ... }`; the host must not emit video for a stream
-until both the video-ready flag and a valid viewport are present.
+`SetViewportHint` carrying the renderer's measured physical-pixel viewport
+followed by `StreamReady { video: true, ... }`; the host must not emit video
+for a stream until both the video-ready flag and a valid viewport are present.
 
 The host replies with `ServerHandshake`:
 
@@ -74,24 +74,38 @@ displays/sources through `NegotiatedVideo` and future stream descriptors.
 - `id`
 - `name`
 - `position`
-- `scale_num` / `scale_den`
+- `scale_num` / `scale_den` (nonzero rational logical-to-physical scale)
 - `primary`
 - `current_mode`
 - `available_modes`
 - `can_set_mode`
 
-`DisplayMode` is `{ width, height, refresh_millihz }`.
+`DisplayMode` is `{ width, height, refresh_millihz }`; width and height are
+physical/backing pixels.
 
 The host sends the best topology it can observe in `ServerHandshake`.
-Production hosts enumerate the local display system; test-pattern/headless
-fallbacks advertise a synthetic primary display. If the capture backend later
-reveals a more exact primary capture mode, the host sends a fresh
-`DisplayList`.
+Production hosts enumerate the local display system; explicit test-pattern
+sessions advertise a synthetic primary display. On Linux Wayland, handshake-time
+topology prefers `xdg-output` logical size to derive fractional display scale,
+falling back to winit monitor enumeration when direct Wayland topology is not
+available. If the capture backend later reveals a more exact captured
+display/source mode or scale, the host sends a fresh `DisplayList`. On Linux
+portal capture, the refreshed mode is the PipeWire frame pixel grid and the
+refreshed scale is derived from portal compositor-space bounds when available.
 
-`SetViewportHint { stream_id, viewport }` is a best-effort encoder sizing hint.
-It does not change host resolution and does not require an acknowledgement. For
-the initial stream, it is also part of startup readiness: production clients
-send the first viewport hint before `StreamReady`, and hosts wait for both.
+`SetViewportHint { stream_id, viewport }` is a best-effort encoder sizing hint
+in physical pixels. It does not change host resolution and does not require an
+acknowledgement. For the initial stream, it is also part of startup readiness:
+production clients send the first viewport hint before `StreamReady`, and hosts
+wait for both. The hint is the density-correct presentation target, not
+necessarily the OS window surface size: `Fit` caps it at logical 100%, while
+`Actual Size` reports logical 100% directly. The host's no-upscale fit rule
+still resolves overlarge hints to native capture pixels.
+
+`ClientDisplayMetrics` reports the client output hosting the render surface:
+session-local display id, physical `DisplayMode`, logical-to-physical scale
+ratio, and optional physical safe area. It is display-mode-matching and
+diagnostic input only; it does not request a host display-mode change.
 
 `SetDisplayMode` is the real host display-mode request:
 

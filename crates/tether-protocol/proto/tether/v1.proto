@@ -93,6 +93,21 @@ message DisplayDescriptor {
   bool can_set_mode = 10;
 }
 
+message ClientSafeArea {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+message ClientDisplayMetrics {
+  uint32 display_id = 1;
+  DisplayMode mode = 2;
+  uint32 scale_num = 3;
+  uint32 scale_den = 4;
+  ClientSafeArea safe_area = 5;
+}
+
 message FeatureAdvert {
   string key = 1;
   uint32 min_version = 2;
@@ -247,6 +262,7 @@ message ControlMessage {
     SetViewportHint set_viewport_hint = 16;
     SetDisplayMode set_display_mode = 17;
     DisplayModeResult display_mode_result = 18;
+    ClientDisplayMetrics client_display_metrics = 19;
   }
 }
 

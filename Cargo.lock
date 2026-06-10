@@ -3824,10 +3824,12 @@ dependencies = [
  "objc2 0.6.4",
  "pipewire",
  "screencapturekit",
+ "smithay-client-toolkit",
  "tether-protocol",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wayland-client",
  "windows 0.61.3",
  "winit",
 ]

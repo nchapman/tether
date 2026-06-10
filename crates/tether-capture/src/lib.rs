@@ -34,6 +34,16 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use tether_protocol::control::{DisplayDescriptor, DisplayId, DisplayMode};
 
+#[cfg(target_os = "linux")]
+use smithay_client_toolkit::{
+    delegate_output, delegate_registry,
+    output::{OutputHandler, OutputInfo, OutputState},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+};
+#[cfg(target_os = "linux")]
+use wayland_client::{globals::registry_queue_init, protocol::wl_output, Connection, QueueHandle};
+
 /// Capture-source handle returned by every backend's `start()`. Bundles
 /// the [`CapturedFrame`] receiver with a runtime-mutable target-FPS
 /// atomic so the ABR / quality-tier controller can throttle capture
@@ -63,6 +73,10 @@ pub struct CaptureHandle {
     /// an `NSCursor` poller; the test pattern leaves it `None` and
     /// the host falls back to [`PlaceholderCursorSource`].
     cursor_source: Option<Box<dyn CursorSource>>,
+    /// Optional display-coordinate metadata for the capture source.
+    /// Linux portals can report monitor stream bounds in compositor
+    /// coordinates before PipeWire reports the actual frame pixel grid.
+    display_hints: CaptureDisplayHints,
     /// Consumer-liveness token. Moves into the [`FrameReceiver`] on
     /// [`Self::into_rx`] so its strong count tracks whether the consumer
     /// still holds the receiver. A backend producer that keeps its own
@@ -82,6 +96,7 @@ impl CaptureHandle {
             rx,
             target_fps,
             cursor_source: None,
+            display_hints: CaptureDisplayHints::default(),
             alive: Arc::new(()),
         }
     }
@@ -102,6 +117,19 @@ impl CaptureHandle {
     pub fn with_cursor_source(mut self, src: Box<dyn CursorSource>) -> Self {
         self.cursor_source = Some(src);
         self
+    }
+
+    /// Attach display-coordinate hints observed by the capture backend.
+    #[must_use]
+    pub fn with_display_hints(mut self, hints: CaptureDisplayHints) -> Self {
+        self.display_hints = hints;
+        self
+    }
+
+    /// Display-coordinate hints observed by the capture backend.
+    #[must_use]
+    pub fn display_hints(&self) -> CaptureDisplayHints {
+        self.display_hints
     }
 
     /// Take the cursor source out, leaving `None`. The host pump
@@ -164,6 +192,46 @@ impl CaptureHandle {
 pub struct FrameReceiver {
     rx: Receiver<CapturedFrame>,
     _alive: Arc<()>,
+}
+
+/// Optional source geometry reported by a capture backend before or alongside
+/// frames. The size/position are in host logical or compositor coordinates, not
+/// in captured frame pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureDisplayHints {
+    pub host_logical_size: Option<(u32, u32)>,
+    pub host_logical_position: Option<(i32, i32)>,
+}
+
+/// Live capture geometry used to refresh `DisplayList` after the capture
+/// backend reveals the actual frame pixel grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureDisplayGeometry {
+    pub capture_width: u32,
+    pub capture_height: u32,
+    pub refresh_millihz: u32,
+    pub host_logical_size: Option<(u32, u32)>,
+    pub host_logical_position: Option<(i32, i32)>,
+}
+
+impl CaptureDisplayGeometry {
+    #[must_use]
+    pub fn new(capture_width: u32, capture_height: u32, refresh_millihz: u32) -> Self {
+        Self {
+            capture_width,
+            capture_height,
+            refresh_millihz,
+            host_logical_size: None,
+            host_logical_position: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_hints(mut self, hints: CaptureDisplayHints) -> Self {
+        self.host_logical_size = hints.host_logical_size;
+        self.host_logical_position = hints.host_logical_position;
+        self
+    }
 }
 
 impl FrameReceiver {
@@ -238,26 +306,72 @@ pub fn test_pattern_display(width: u32, height: u32, refresh_millihz: u32) -> Di
     }
 }
 
-/// Update the primary display's current mode from the capture stream's actual
-/// frame dimensions. This corrects Linux portal/ScreenCaptureKit negotiation
-/// details that are only known after the capture stream starts.
+/// Update the display that matches the capture stream's actual frame
+/// dimensions, falling back to the primary display when no descriptor matches.
+/// This corrects portal/ScreenCaptureKit negotiation details that are only
+/// known after the capture stream starts, and lets a user-selected non-primary
+/// monitor carry its own density metadata into the live display list.
 #[must_use]
 pub fn display_list_with_primary_mode(
-    mut displays: Vec<DisplayDescriptor>,
+    displays: Vec<DisplayDescriptor>,
     width: u32,
     height: u32,
     refresh_millihz: u32,
 ) -> Vec<DisplayDescriptor> {
+    display_list_with_capture_geometry(
+        displays,
+        CaptureDisplayGeometry::new(width, height, refresh_millihz),
+    )
+}
+
+/// Update the display descriptor that corresponds to the live capture source.
+/// If the backend reports host logical/compositor geometry for that source, use
+/// it to derive the display scale that belongs to the captured frame pixels.
+#[must_use]
+pub fn display_list_with_capture_geometry(
+    mut displays: Vec<DisplayDescriptor>,
+    geometry: CaptureDisplayGeometry,
+) -> Vec<DisplayDescriptor> {
     let idx = displays
         .iter()
-        .position(|display| display.primary)
+        .position(|display| {
+            display.current_mode.width == geometry.capture_width
+                && display.current_mode.height == geometry.capture_height
+        })
+        .or_else(|| {
+            let (pos, size) = (geometry.host_logical_position?, geometry.host_logical_size?);
+            displays
+                .iter()
+                .position(|display| display_matches_host_logical_geometry(display, pos, size))
+        })
+        .or_else(|| displays.iter().position(|display| display.primary))
         .unwrap_or(0);
+    for (display_idx, display) in displays.iter_mut().enumerate() {
+        display.primary = display_idx == idx;
+    }
+
     let Some(display) = displays.get_mut(idx) else {
-        return vec![test_pattern_display(width, height, refresh_millihz)];
+        return vec![test_pattern_display(
+            geometry.capture_width,
+            geometry.capture_height,
+            geometry.refresh_millihz,
+        )];
     };
 
-    let mode = DisplayMode::new(width, height, refresh_millihz);
+    let mode = DisplayMode::new(
+        geometry.capture_width,
+        geometry.capture_height,
+        geometry.refresh_millihz,
+    );
     display.current_mode = mode;
+    if let Some((scale_num, scale_den)) = scale_from_capture_and_host_logical(
+        geometry.capture_width,
+        geometry.capture_height,
+        geometry.host_logical_size,
+    ) {
+        display.scale_num = scale_num;
+        display.scale_den = scale_den;
+    }
     if display.available_modes.is_empty() {
         display.available_modes.push(mode);
     } else {
@@ -266,7 +380,177 @@ pub fn display_list_with_primary_mode(
     displays
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn scale_from_capture_and_host_logical(
+    capture_width: u32,
+    capture_height: u32,
+    host_logical_size: Option<(u32, u32)>,
+) -> Option<(u16, u16)> {
+    let (logical_width, logical_height) = host_logical_size?;
+    if capture_width == 0 || capture_height == 0 || logical_width == 0 || logical_height == 0 {
+        return None;
+    }
+    let scale_x = f64::from(capture_width) / f64::from(logical_width);
+    let scale_y = f64::from(capture_height) / f64::from(logical_height);
+    let rel_delta = (scale_x - scale_y).abs() / scale_x.max(scale_y);
+    (rel_delta <= 0.01).then(|| scale_to_ratio((scale_x + scale_y) * 0.5))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn scale_from_mode_and_logical_size(
+    mode_size: (u32, u32),
+    logical_size: Option<(u32, u32)>,
+    fallback_scale: f64,
+) -> (u16, u16) {
+    scale_from_capture_and_host_logical(mode_size.0, mode_size.1, logical_size)
+        .unwrap_or_else(|| scale_to_ratio(fallback_scale))
+}
+
+fn display_matches_host_logical_geometry(
+    display: &DisplayDescriptor,
+    host_logical_position: (i32, i32),
+    host_logical_size: (u32, u32),
+) -> bool {
+    let Some((x, y)) =
+        scaled_i32_pair_to_logical(display.position, display.scale_num, display.scale_den)
+    else {
+        return false;
+    };
+    let Some((width, height)) = scaled_u32_pair_to_logical(
+        (display.current_mode.width, display.current_mode.height),
+        display.scale_num,
+        display.scale_den,
+    ) else {
+        return false;
+    };
+
+    approx_i32(x, host_logical_position.0, 1)
+        && approx_i32(y, host_logical_position.1, 1)
+        && approx_u32(width, host_logical_size.0, 1)
+        && approx_u32(height, host_logical_size.1, 1)
+}
+
+fn scaled_u32_pair_to_logical(
+    value: (u32, u32),
+    scale_num: u16,
+    scale_den: u16,
+) -> Option<(u32, u32)> {
+    if scale_num == 0 || scale_den == 0 {
+        return None;
+    }
+    Some((
+        u32::try_from(
+            div_round_u64(
+                u64::from(value.0) * u64::from(scale_den),
+                u64::from(scale_num),
+            )
+            .min(u64::from(u32::MAX)),
+        )
+        .unwrap_or(u32::MAX),
+        u32::try_from(
+            div_round_u64(
+                u64::from(value.1) * u64::from(scale_den),
+                u64::from(scale_num),
+            )
+            .min(u64::from(u32::MAX)),
+        )
+        .unwrap_or(u32::MAX),
+    ))
+}
+
+fn scaled_i32_pair_to_logical(
+    value: (i32, i32),
+    scale_num: u16,
+    scale_den: u16,
+) -> Option<(i32, i32)> {
+    if scale_num == 0 || scale_den == 0 {
+        return None;
+    }
+    Some((
+        i32::try_from(
+            div_round_i64(
+                i64::from(value.0) * i64::from(scale_den),
+                i64::from(scale_num),
+            )
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+        )
+        .unwrap_or(if value.0.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }),
+        i32::try_from(
+            div_round_i64(
+                i64::from(value.1) * i64::from(scale_den),
+                i64::from(scale_num),
+            )
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+        )
+        .unwrap_or(if value.1.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }),
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn scaled_i32_pair_from_logical(
+    value: (i32, i32),
+    scale_num: u16,
+    scale_den: u16,
+) -> Option<(i32, i32)> {
+    if scale_num == 0 || scale_den == 0 {
+        return None;
+    }
+    Some((
+        i32::try_from(
+            div_round_i64(
+                i64::from(value.0) * i64::from(scale_num),
+                i64::from(scale_den),
+            )
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+        )
+        .unwrap_or(if value.0.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }),
+        i32::try_from(
+            div_round_i64(
+                i64::from(value.1) * i64::from(scale_num),
+                i64::from(scale_den),
+            )
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+        )
+        .unwrap_or(if value.1.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }),
+    ))
+}
+
+const fn div_round_u64(value: u64, divisor: u64) -> u64 {
+    (value + (divisor / 2)) / divisor
+}
+
+const fn div_round_i64(value: i64, divisor: i64) -> i64 {
+    if value >= 0 {
+        (value + (divisor / 2)) / divisor
+    } else {
+        (value - (divisor / 2)) / divisor
+    }
+}
+
+fn approx_u32(a: u32, b: u32, tolerance: u32) -> bool {
+    a.abs_diff(b) <= tolerance
+}
+
+fn approx_i32(a: i32, b: i32, tolerance: i32) -> bool {
+    a.abs_diff(b) <= u32::try_from(tolerance).unwrap_or(0)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn scale_to_ratio(scale: f64) -> (u16, u16) {
     if !scale.is_finite() || scale <= 0.0 {
         return (1, 1);
@@ -281,7 +565,7 @@ fn scale_to_ratio(scale: f64) -> (u16, u16) {
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 fn f64_to_u32_clamped(value: f64, min: u32, max: u32) -> u32 {
     if !value.is_finite() {
         return min;
@@ -293,7 +577,7 @@ fn f64_to_u32_clamped(value: f64, min: u32, max: u32) -> u32 {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
     while b != 0 {
         let r = a % b;
@@ -310,13 +594,203 @@ const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
 #[cfg(target_os = "linux")]
 fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
     use std::sync::OnceLock;
+
+    static DISPLAY_LIST: OnceLock<Vec<DisplayDescriptor>> = OnceLock::new();
+    if let Some(displays) = DISPLAY_LIST.get() {
+        return Ok(displays.clone());
+    }
+
+    let displays = wayland_display_list()
+        .inspect_err(|e| {
+            tracing::debug!(
+                error = %e,
+                "wayland output topology unavailable; falling back to winit monitor topology"
+            );
+        })
+        .or_else(|_| winit_display_list())?;
+    Ok(DISPLAY_LIST.get_or_init(|| displays).clone())
+}
+
+#[cfg(target_os = "linux")]
+struct WaylandOutputCollector {
+    registry_state: RegistryState,
+    output_state: OutputState,
+}
+
+#[cfg(target_os = "linux")]
+impl OutputHandler for WaylandOutputCollector {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+#[cfg(target_os = "linux")]
+delegate_output!(WaylandOutputCollector);
+
+#[cfg(target_os = "linux")]
+delegate_registry!(WaylandOutputCollector);
+
+#[cfg(target_os = "linux")]
+impl ProvidesRegistryState for WaylandOutputCollector {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+
+    registry_handlers! {
+        OutputState,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_display_list() -> Result<Vec<DisplayDescriptor>> {
+    let conn = Connection::connect_to_env()
+        .map_err(|e| CaptureError::Display(format!("wayland connect: {e}")))?;
+    let (globals, mut event_queue) = registry_queue_init(&conn)
+        .map_err(|e| CaptureError::Display(format!("wayland registry: {e}")))?;
+    let qh = event_queue.handle();
+    let registry_state = RegistryState::new(&globals);
+    let output_state = OutputState::new(&globals, &qh);
+    let mut collector = WaylandOutputCollector {
+        registry_state,
+        output_state,
+    };
+    event_queue
+        .roundtrip(&mut collector)
+        .map_err(|e| CaptureError::Display(format!("wayland output roundtrip: {e}")))?;
+
+    let mut displays = Vec::new();
+    for (idx, output) in collector.output_state.outputs().enumerate() {
+        let info = collector
+            .output_state
+            .info(&output)
+            .ok_or_else(|| CaptureError::Display("wayland output has no info".into()))?;
+        displays.push(wayland_output_to_descriptor(idx, &info)?);
+    }
+
+    if displays.is_empty() {
+        return Err(CaptureError::Display(
+            "no monitors reported by wayland".into(),
+        ));
+    }
+    Ok(displays)
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_output_to_descriptor(idx: usize, info: &OutputInfo) -> Result<DisplayDescriptor> {
+    let mode = info
+        .modes
+        .iter()
+        .find(|mode| mode.current)
+        .or_else(|| info.modes.iter().find(|mode| mode.preferred))
+        .or_else(|| info.modes.first())
+        .ok_or_else(|| CaptureError::Display("wayland output has no modes".into()))?;
+    let mode_size = positive_u32_pair(mode.dimensions)
+        .ok_or_else(|| CaptureError::Display("wayland output mode has invalid size".into()))?;
+    let logical_size = positive_u32_pair(
+        info.logical_size
+            .ok_or_else(|| CaptureError::Display("wayland output has no logical size".into()))?,
+    )
+    .ok_or_else(|| CaptureError::Display("wayland output has invalid logical size".into()))?;
+    let logical_position = info
+        .logical_position
+        .ok_or_else(|| CaptureError::Display("wayland output has no logical position".into()))?;
+    let refresh_millihz = u32::try_from(mode.refresh_rate)
+        .ok()
+        .filter(|refresh| *refresh > 0)
+        .unwrap_or(60_000);
+    let (scale_num, scale_den) = scale_from_mode_and_logical_size(
+        mode_size,
+        Some(logical_size),
+        f64::from(info.scale_factor.max(1)),
+    );
+    let position =
+        scaled_i32_pair_from_logical(logical_position, scale_num, scale_den).unwrap_or((0, 0));
+    let current_mode = DisplayMode::new(mode_size.0, mode_size.1, refresh_millihz);
+    let name = info
+        .name
+        .clone()
+        .or_else(|| info.description.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            let label = [info.make.as_str(), info.model.as_str()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if label.is_empty() {
+                format!("display-{idx}")
+            } else {
+                label
+            }
+        });
+
+    tracing::debug!(
+        id = info.id,
+        name = %name,
+        mode_width_px = mode_size.0,
+        mode_height_px = mode_size.1,
+        logical_width = logical_size.0,
+        logical_height = logical_size.1,
+        logical_x = logical_position.0,
+        logical_y = logical_position.1,
+        scale_num,
+        scale_den,
+        "wayland output topology"
+    );
+
+    Ok(DisplayDescriptor {
+        id: DisplayId(u32::try_from(idx).unwrap_or(u32::MAX)),
+        primary: idx == 0,
+        name,
+        scale_num,
+        scale_den,
+        position,
+        current_mode,
+        available_modes: vec![current_mode],
+        can_set_mode: false,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn positive_u32_pair(value: (i32, i32)) -> Option<(u32, u32)> {
+    Some((u32::try_from(value.0).ok()?, u32::try_from(value.1).ok()?))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn winit_display_list() -> Result<Vec<DisplayDescriptor>> {
+    use std::sync::OnceLock;
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
     use winit::event_loop::{ActiveEventLoop, EventLoop};
     use winit::window::WindowId;
 
-    static DISPLAY_LIST: OnceLock<Vec<DisplayDescriptor>> = OnceLock::new();
-    if let Some(displays) = DISPLAY_LIST.get() {
+    static WINIT_DISPLAY_LIST: OnceLock<Vec<DisplayDescriptor>> = OnceLock::new();
+    if let Some(displays) = WINIT_DISPLAY_LIST.get() {
         return Ok(displays.clone());
     }
 
@@ -364,7 +838,9 @@ fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
             "no monitors reported by winit".into(),
         ));
     }
-    Ok(DISPLAY_LIST.get_or_init(|| collector.displays).clone())
+    Ok(WINIT_DISPLAY_LIST
+        .get_or_init(|| collector.displays)
+        .clone())
 }
 
 #[cfg(target_os = "linux")]
@@ -652,10 +1128,166 @@ mod display_tests {
     }
 
     #[test]
+    fn capture_geometry_derives_scale_from_host_logical_size() {
+        let mut display = test_pattern_display(3840, 2400, 60_000);
+        display.scale_num = 2;
+        display.scale_den = 1;
+
+        let updated = display_list_with_capture_geometry(
+            vec![display],
+            CaptureDisplayGeometry {
+                capture_width: 1920,
+                capture_height: 1200,
+                refresh_millihz: 60_000,
+                host_logical_size: Some((1920, 1200)),
+                host_logical_position: Some((0, 0)),
+            },
+        );
+
+        assert_eq!(
+            updated[0].current_mode,
+            DisplayMode::new(1920, 1200, 60_000)
+        );
+        assert_eq!(updated[0].scale_num, 1);
+        assert_eq!(updated[0].scale_den, 1);
+    }
+
+    #[test]
+    fn capture_geometry_keeps_hidpi_scale_when_framebuffer_is_backing_pixels() {
+        let mut display = test_pattern_display(3840, 2400, 60_000);
+        display.scale_num = 2;
+        display.scale_den = 1;
+
+        let updated = display_list_with_capture_geometry(
+            vec![display],
+            CaptureDisplayGeometry {
+                capture_width: 3840,
+                capture_height: 2400,
+                refresh_millihz: 60_000,
+                host_logical_size: Some((1920, 1200)),
+                host_logical_position: Some((0, 0)),
+            },
+        );
+
+        assert_eq!(updated[0].scale_num, 2);
+        assert_eq!(updated[0].scale_den, 1);
+    }
+
+    #[test]
+    fn capture_geometry_can_select_display_by_logical_portal_rect() {
+        let primary_mode = DisplayMode::new(3840, 2160, 60_000);
+        let secondary_mode = DisplayMode::new(3840, 2400, 60_000);
+        let displays = vec![
+            DisplayDescriptor {
+                id: DisplayId(0),
+                name: "DP-1".into(),
+                scale_num: 2,
+                scale_den: 1,
+                primary: true,
+                position: (0, 0),
+                current_mode: primary_mode,
+                available_modes: vec![primary_mode],
+                can_set_mode: false,
+            },
+            DisplayDescriptor {
+                id: DisplayId(1),
+                name: "DP-2".into(),
+                scale_num: 2,
+                scale_den: 1,
+                primary: false,
+                position: (3840, 0),
+                current_mode: secondary_mode,
+                available_modes: vec![secondary_mode],
+                can_set_mode: false,
+            },
+        ];
+
+        let updated = display_list_with_capture_geometry(
+            displays,
+            CaptureDisplayGeometry {
+                capture_width: 1920,
+                capture_height: 1200,
+                refresh_millihz: 60_000,
+                host_logical_size: Some((1920, 1200)),
+                host_logical_position: Some((1920, 0)),
+            },
+        );
+
+        assert!(!updated[0].primary);
+        assert!(updated[1].primary);
+        assert_eq!(updated[1].scale_num, 1);
+        assert_eq!(updated[1].scale_den, 1);
+    }
+
+    #[test]
+    fn primary_mode_update_selects_matching_display_scale() {
+        let primary_mode = DisplayMode::new(1920, 1080, 60_000);
+        let secondary_mode = DisplayMode::new(3840, 2160, 60_000);
+        let displays = vec![
+            DisplayDescriptor {
+                id: DisplayId(0),
+                name: "DP-1".into(),
+                scale_num: 1,
+                scale_den: 1,
+                primary: true,
+                position: (0, 0),
+                current_mode: primary_mode,
+                available_modes: vec![primary_mode],
+                can_set_mode: false,
+            },
+            DisplayDescriptor {
+                id: DisplayId(1),
+                name: "DP-2".into(),
+                scale_num: 2,
+                scale_den: 1,
+                primary: false,
+                position: (1920, 0),
+                current_mode: secondary_mode,
+                available_modes: vec![secondary_mode],
+                can_set_mode: false,
+            },
+        ];
+
+        let updated = display_list_with_primary_mode(displays, 3840, 2160, 120_000);
+        assert!(!updated[0].primary);
+        assert!(updated[1].primary);
+        assert_eq!(updated[1].scale_num, 2);
+        assert_eq!(updated[1].scale_den, 1);
+        assert_eq!(
+            updated[1].current_mode,
+            DisplayMode::new(3840, 2160, 120_000)
+        );
+    }
+
+    #[test]
     fn scale_factor_uses_reduced_rational() {
         assert_eq!(scale_to_ratio(1.5), (3, 2));
         assert_eq!(scale_to_ratio(2.0), (2, 1));
         assert_eq!(scale_to_ratio(0.0), (1, 1));
+    }
+
+    #[test]
+    fn scale_from_mode_and_logical_size_prefers_direct_logical_geometry() {
+        assert_eq!(
+            scale_from_mode_and_logical_size((1920, 1200), Some((1536, 960)), 2.0),
+            (5, 4)
+        );
+    }
+
+    #[test]
+    fn scale_from_mode_and_logical_size_falls_back_without_logical_geometry() {
+        assert_eq!(
+            scale_from_mode_and_logical_size((1920, 1200), None, 2.0),
+            (2, 1)
+        );
+    }
+
+    #[test]
+    fn logical_position_scales_to_physical_display_position() {
+        assert_eq!(
+            scaled_i32_pair_from_logical((1536, -960), 5, 4),
+            Some((1920, -1200))
+        );
     }
 }
 

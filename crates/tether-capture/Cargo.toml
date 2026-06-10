@@ -33,8 +33,10 @@ tokio = { workspace = true }
 # `BitFlags::from(SourceType::Monitor)` without the bitor-with-self hack.
 enumflags2 = "0.7"
 # Linux cannot ask the screen-cast portal for monitor topology before capture
-# permission, so use winit's compositor-native monitor snapshot as the
-# handshake-time best effort.
+# permission, so query Wayland xdg-output directly for logical geometry and use
+# winit's compositor-native monitor snapshot as the X11 / compatibility fallback.
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
 winit = { workspace = true }
 
 [features]
@@ -74,6 +76,7 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_System_Performance",
+    "Win32_UI_HiDpi",
 ] }
 
 [lints]

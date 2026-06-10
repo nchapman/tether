@@ -24,13 +24,15 @@ use tether_input::{WinitTranslator, WireEvent};
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
-    ClockSync, ControlMessage, GoodbyeCode, ServerHello, VideoStreamId, Viewport,
-    CLOCK_SYNC_PROBE_SAMPLES,
+    ClientDisplayMetrics, ClockSync, ControlMessage, DisplayDescriptor, GoodbyeCode, ServerHello,
+    VideoStreamId, Viewport, CLOCK_SYNC_PROBE_SAMPLES,
 };
 use tether_protocol::video::{FrameReassembler, VideoPacket};
 use tether_protocol::MonoNanos;
-use tether_render::LatestFrame;
 use tether_render::RenderEvent;
+use tether_render::{
+    DisplayScale, HostDisplayGeometry, HostDisplayHandle, LatestFrame, PresentationMode,
+};
 use tether_session::{
     log_peer_session_summary, ClientSession, ClientSessionConfig, ConnectError, SessionSummaryState,
 };
@@ -41,13 +43,32 @@ use tracing::{debug, error, info, warn};
 mod client_pairing;
 use client_pairing::HostAuth;
 
-// Initial window size — the actual frame dimensions come from
-// `VideoFrameMeta::dimensions` once frames start arriving and the window
-// will pick them up automatically because tether-render reallocates its
-// texture on dimension change.
-const INITIAL_WIDTH: u32 = 1280;
-const INITIAL_HEIGHT: u32 = 720;
 const CLOCK_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewMode {
+    Fit,
+    ActualSize,
+}
+
+impl ViewMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "fit" | "fit-to-window" => Ok(Self::Fit),
+            "actual-size" | "actual" | "100%" => Ok(Self::ActualSize),
+            _ => {
+                anyhow::bail!("--view-mode must be one of: fit, actual-size; got '{value}'")
+            }
+        }
+    }
+
+    fn presentation_mode(self) -> PresentationMode {
+        match self {
+            Self::Fit => PresentationMode::Fit,
+            Self::ActualSize => PresentationMode::ActualSize,
+        }
+    }
+}
 
 #[derive(Default)]
 struct ClockResyncState {
@@ -94,17 +115,129 @@ fn recovery_warranted(before: (u64, u64), after: (u64, u64)) -> bool {
     after.0 > before.0
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ViewportObservation {
+    surface_width: u32,
+    surface_height: u32,
+    viewport: Viewport,
+    presentation_width: u32,
+    presentation_height: u32,
+    host_width: u32,
+    host_height: u32,
+    host_scale_num: u16,
+    host_scale_den: u16,
+    client_scale_factor: f64,
+    presentation_mode: PresentationMode,
+}
+
+impl ViewportObservation {
+    fn is_valid(self) -> bool {
+        self.viewport.is_valid()
+    }
+}
+
 fn drain_latest_valid_viewport(
-    mut latest: Viewport,
-    rx: &mut mpsc::UnboundedReceiver<(u32, u32)>,
-) -> Viewport {
-    while let Ok((width, height)) = rx.try_recv() {
-        let candidate = Viewport::new(width, height);
+    mut latest: ViewportObservation,
+    rx: &mut mpsc::UnboundedReceiver<ViewportObservation>,
+) -> ViewportObservation {
+    while let Ok(candidate) = rx.try_recv() {
         if candidate.is_valid() {
             latest = candidate;
         }
     }
     latest
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InitialHostDisplay {
+    size_px: (u32, u32),
+    scale: DisplayScale,
+}
+
+fn initial_host_display_from_displays(
+    displays: &[DisplayDescriptor],
+) -> anyhow::Result<InitialHostDisplay> {
+    let display = displays
+        .iter()
+        .find(|display| {
+            display.primary && display.current_mode.width > 0 && display.current_mode.height > 0
+        })
+        .or_else(|| {
+            displays
+                .iter()
+                .find(|display| display.current_mode.width > 0 && display.current_mode.height > 0)
+        })
+        .ok_or_else(|| anyhow::anyhow!("host did not advertise a valid display mode"))?;
+    let scale = DisplayScale::new(display.scale_num, display.scale_den).ok_or_else(|| {
+        anyhow::anyhow!(
+            "host advertised invalid display scale {}/{}",
+            display.scale_num,
+            display.scale_den
+        )
+    })?;
+    Ok(InitialHostDisplay {
+        size_px: (display.current_mode.width, display.current_mode.height),
+        scale,
+    })
+}
+
+fn should_send_viewport(last_sent: Option<Viewport>, next: Viewport) -> bool {
+    next.is_valid() && last_sent != Some(next)
+}
+
+fn viewport_hint_from_renderer_viewport(client_viewport: Viewport) -> Option<Viewport> {
+    if !client_viewport.is_valid() {
+        return None;
+    }
+    Some(client_viewport)
+}
+
+struct InitialViewportControls {
+    viewport_hint: Viewport,
+    viewport_message: ControlMessage,
+    ready_message: ControlMessage,
+}
+
+fn initial_viewport_controls(
+    client_viewport: Viewport,
+    audio_active: bool,
+) -> Option<InitialViewportControls> {
+    let viewport_hint = viewport_hint_from_renderer_viewport(client_viewport)?;
+    Some(InitialViewportControls {
+        viewport_hint,
+        viewport_message: ControlMessage::SetViewportHint {
+            stream_id: VideoStreamId(0),
+            viewport: viewport_hint,
+        },
+        ready_message: ControlMessage::StreamReady {
+            video: true,
+            audio: audio_active,
+        },
+    })
+}
+
+fn viewport_resize_control(
+    last_sent: Option<Viewport>,
+    client_viewport: Viewport,
+) -> Option<(Viewport, ControlMessage)> {
+    let viewport_hint = viewport_hint_from_renderer_viewport(client_viewport)?;
+    if !should_send_viewport(last_sent, viewport_hint) {
+        return None;
+    }
+    Some((
+        viewport_hint,
+        ControlMessage::SetViewportHint {
+            stream_id: VideoStreamId(0),
+            viewport: viewport_hint,
+        },
+    ))
+}
+
+fn should_send_client_display_metrics(
+    last_sent: Option<&ClientDisplayMetrics>,
+    next: &ClientDisplayMetrics,
+) -> bool {
+    last_sent != Some(next)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -222,14 +355,14 @@ async fn main() -> anyhow::Result<()> {
     let stdin_stop = spawn_stdin_stop_signal(reporter.is_json());
 
     // Parse args: positional host addr (and optional explicit fingerprint),
-    // plus `--pin <PIN>` (first-contact pairing) and `--label <name>` (display
-    // name to record for the host). `--ipc` was already consumed above.
+    // plus pairing/audio/view flags. `--ipc` was already consumed above.
     let CliArgs {
         addr,
         fingerprint_hex,
         pin,
         label,
         audio: audio_enabled,
+        view_mode,
     } = parse_cli_args(&raw_args)?;
 
     // Decide how to authenticate the host. Precedence: an explicit `--pin`
@@ -499,6 +632,11 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_notice_sent = Arc::new(AtomicBool::new(false));
     let clock_sync_state = Arc::new(RwLock::new(clock_sync));
     let clock_resync_state = Arc::new(Mutex::new(ClockResyncState::default()));
+    let initial_host_display = initial_host_display_from_displays(&server_hello.displays)?;
+    let host_display = HostDisplayHandle::new(
+        HostDisplayGeometry::new(initial_host_display.size_px, initial_host_display.scale)
+            .expect("validated initial host display geometry"),
+    );
 
     // Single-slot drop-oldest channel: the renderer always wants the
     // freshest decoded frame, not a queued backlog. Cheap clone (Arc
@@ -515,7 +653,9 @@ async fn main() -> anyhow::Result<()> {
     // Renderer resize events drive startup video readiness. The host must not
     // begin streaming until it has the client's real physical viewport, so the
     // viewport task sends SetViewportHint before StreamReady.
-    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<(u32, u32)>();
+    let (viewport_tx, mut viewport_rx) = mpsc::unbounded_channel::<ViewportObservation>();
+    let (display_metrics_tx, mut display_metrics_rx) =
+        mpsc::unbounded_channel::<tether_protocol::control::ClientDisplayMetrics>();
     let (decoder_ready_for_startup_tx, decoder_ready_for_startup_rx) = watch::channel(false);
     let (decode_event_tx, decode_event_rx) = crossbeam_channel::unbounded::<DecodeEvent>();
     let decode_event_rx = Arc::new(decode_event_rx);
@@ -571,6 +711,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let conn = conn.clone();
         let cursor_channel_ctrl = cursor_channel.clone();
+        let host_display = host_display.clone();
         let session_summary = session_summary.clone();
         let shutdown_notice_sent = shutdown_notice_sent.clone();
         let decode_event_rx = decode_event_rx.clone();
@@ -765,6 +906,35 @@ async fn main() -> anyhow::Result<()> {
                                 "  display"
                             );
                         }
+                        let selected_display = match initial_host_display_from_displays(&displays) {
+                            Ok(display) => display,
+                            Err(e) => {
+                                error!(error = ?e, "host sent invalid display topology; ending control loop");
+                                return;
+                            }
+                        };
+                        let geometry = match HostDisplayGeometry::new(
+                            selected_display.size_px,
+                            selected_display.scale,
+                        ) {
+                            Some(geometry) => geometry,
+                            None => {
+                                error!("host sent invalid display geometry; ending control loop");
+                                return;
+                            }
+                        };
+                        if host_display.get() != geometry {
+                            info!(
+                                scale = format!(
+                                    "{}/{}",
+                                    selected_display.scale.num, selected_display.scale.den
+                                ),
+                                width = selected_display.size_px.0,
+                                height = selected_display.size_px.1,
+                                "updated host display geometry from live display topology"
+                            );
+                            host_display.set(geometry);
+                        }
                     }
                     Ok(ControlMessage::SetActiveDisplays { .. }) => {
                         // Client-originated; misrouted if seen on the client side.
@@ -778,7 +948,8 @@ async fn main() -> anyhow::Result<()> {
                         | ControlMessage::StreamResume { .. }
                         | ControlMessage::ClientStats { .. }
                         | ControlMessage::SetViewportHint { .. }
-                        | ControlMessage::SetDisplayMode { .. },
+                        | ControlMessage::SetDisplayMode { .. }
+                        | ControlMessage::ClientDisplayMetrics(..),
                     ) => {
                         // Client-originated; misrouted if seen on the client side.
                         tracing::debug!(
@@ -899,9 +1070,9 @@ async fn main() -> anyhow::Result<()> {
             return;
         }
         // Decoder is up, but video startup still waits for the renderer's real
-        // physical viewport. The viewport task sends SetViewportHint and then
-        // StreamReady on the same control stream so the host opens the gate only
-        // after it has the dimensions it will encode for.
+        // density-correct physical viewport. The viewport task sends
+        // SetViewportHint and then StreamReady on the same control stream so the
+        // host opens the gate only after it has the dimensions it will encode for.
         let _ = decoder_ready_for_startup_tx.send(true);
         info!("client decoder ready; waiting for first viewport before StreamReady");
         let mut frame_count: u64 = 0;
@@ -1389,6 +1560,38 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let mut last_sent = None;
+            while let Some(metrics) = display_metrics_rx.recv().await {
+                if !should_send_client_display_metrics(last_sent.as_ref(), &metrics) {
+                    continue;
+                }
+                if let Err(e) = conn
+                    .send_control(&ControlMessage::ClientDisplayMetrics(metrics.clone()))
+                    .await
+                {
+                    warn!(
+                        error = ?e,
+                        "ClientDisplayMetrics send failed; display metrics task exiting"
+                    );
+                    return;
+                }
+                info!(
+                    client_display_id = metrics.display_id,
+                    width = metrics.mode.width,
+                    height = metrics.mode.height,
+                    refresh_millihz = metrics.mode.refresh_millihz,
+                    scale = format!("{}/{}", metrics.scale_num, metrics.scale_den),
+                    safe_area = ?metrics.safe_area,
+                    "sent client display metrics to host"
+                );
+                last_sent = Some(metrics);
+            }
+        });
+    }
+
     // Viewport debouncer task. Drag-resizing fires
     // `WindowEvent::Resized` continuously (often >100 events/second);
     // sending a `SetViewportHint` per event would have the host
@@ -1400,13 +1603,16 @@ async fn main() -> anyhow::Result<()> {
     // enough to feel live, slow enough to filter drag noise. Zero-dim
     // sizes (minimised window) are dropped — encoding at 0×0 would
     // panic, and the host's current dims are still appropriate for
-    // when the window comes back.
+    // when the window comes back. `ActualSize` emits logical-100% viewport
+    // hints across ordinary window resizes, so duplicate suppression filters
+    // later window resizes.
     let conn_viewport = conn.clone();
     tokio::spawn(async move {
         use std::time::Duration;
         let debounce = Duration::from_millis(150);
-        let mut pending: Option<(u32, u32)> = None;
+        let mut pending: Option<ViewportObservation> = None;
         let mut startup_sent = false;
+        let mut last_sent_viewport: Option<Viewport> = None;
         let mut decoder_ready_for_startup_rx = decoder_ready_for_startup_rx;
         loop {
             // Either receive a new size, or fire the pending one after
@@ -1416,9 +1622,8 @@ async fn main() -> anyhow::Result<()> {
                 None => Ok(viewport_rx.recv().await),
             };
             match next {
-                Ok(Some(size)) => {
-                    let viewport = Viewport::new(size.0, size.1);
-                    if !viewport.is_valid() {
+                Ok(Some(observation)) => {
+                    if !observation.is_valid() {
                         continue;
                     }
                     if !startup_sent {
@@ -1431,32 +1636,43 @@ async fn main() -> anyhow::Result<()> {
                                 return;
                             }
                         }
-                        let viewport = drain_latest_valid_viewport(viewport, &mut viewport_rx);
-                        if let Err(e) = conn_viewport
-                            .send_control(&ControlMessage::SetViewportHint {
-                                stream_id: VideoStreamId(0),
-                                viewport,
-                            })
-                            .await
-                        {
-                            warn!(
-                                error = ?e,
-                                "initial SetViewportHint send failed; viewport task exiting"
+                        let observation =
+                            drain_latest_valid_viewport(observation, &mut viewport_rx);
+                        let Some(controls) =
+                            initial_viewport_controls(observation.viewport, audio_active)
+                        else {
+                            continue;
+                        };
+                        if should_send_viewport(last_sent_viewport, controls.viewport_hint) {
+                            if let Err(e) =
+                                conn_viewport.send_control(&controls.viewport_message).await
+                            {
+                                warn!(
+                                    error = ?e,
+                                    "initial SetViewportHint send failed; viewport task exiting"
+                                );
+                                return;
+                            }
+                            last_sent_viewport = Some(controls.viewport_hint);
+                            info!(
+                                view_mode = ?observation.presentation_mode,
+                                surface_width = observation.surface_width,
+                                surface_height = observation.surface_height,
+                                presentation_width = observation.presentation_width,
+                                presentation_height = observation.presentation_height,
+                                host_width = observation.host_width,
+                                host_height = observation.host_height,
+                                host_scale = format!(
+                                    "{}/{}",
+                                    observation.host_scale_num, observation.host_scale_den
+                                ),
+                                client_scale_factor = observation.client_scale_factor,
+                                viewport_width = controls.viewport_hint.width,
+                                viewport_height = controls.viewport_hint.height,
+                                "sent initial SetViewportHint to host"
                             );
-                            return;
                         }
-                        info!(
-                            width = viewport.width,
-                            height = viewport.height,
-                            "sent initial SetViewportHint to host"
-                        );
-                        if let Err(e) = conn_viewport
-                            .send_control(&ControlMessage::StreamReady {
-                                video: true,
-                                audio: audio_active,
-                            })
-                            .await
-                        {
+                        if let Err(e) = conn_viewport.send_control(&controls.ready_message).await {
                             warn!(error = ?e, "StreamReady send failed; host will not emit video");
                             return;
                         }
@@ -1470,40 +1686,51 @@ async fn main() -> anyhow::Result<()> {
                         pending = None;
                         continue;
                     }
-                    pending = Some(size);
+                    pending = Some(observation);
                 }
                 Ok(None) => {
                     // Sender dropped. Fire any pending before exiting
                     // so the last resize event still makes it.
                     if startup_sent {
-                        if let Some((w, h)) = pending {
-                            let viewport = Viewport::new(w, h);
-                            if viewport.is_valid() {
-                                let _ = conn_viewport
-                                    .send_control(&ControlMessage::SetViewportHint {
-                                        stream_id: VideoStreamId(0),
-                                        viewport,
-                                    })
-                                    .await;
+                        if let Some(observation) = pending {
+                            if let Some((_, msg)) =
+                                viewport_resize_control(last_sent_viewport, observation.viewport)
+                            {
+                                let _ = conn_viewport.send_control(&msg).await;
                             }
                         }
                     }
                     return;
                 }
                 Err(_) => {
-                    if let Some((w, h)) = pending.take() {
-                        let viewport = Viewport::new(w, h);
-                        if let Err(e) = conn_viewport
-                            .send_control(&ControlMessage::SetViewportHint {
-                                stream_id: VideoStreamId(0),
-                                viewport,
-                            })
-                            .await
-                        {
+                    if let Some(observation) = pending.take() {
+                        let Some((viewport_hint, msg)) =
+                            viewport_resize_control(last_sent_viewport, observation.viewport)
+                        else {
+                            continue;
+                        };
+                        if let Err(e) = conn_viewport.send_control(&msg).await {
                             warn!(error = ?e, "SetViewportHint send failed; viewport task exiting");
                             return;
                         }
-                        info!(width = w, height = h, "sent SetViewportHint to host");
+                        last_sent_viewport = Some(viewport_hint);
+                        info!(
+                            view_mode = ?observation.presentation_mode,
+                            surface_width = observation.surface_width,
+                            surface_height = observation.surface_height,
+                            presentation_width = observation.presentation_width,
+                            presentation_height = observation.presentation_height,
+                            host_width = observation.host_width,
+                            host_height = observation.host_height,
+                            host_scale = format!(
+                                "{}/{}",
+                                observation.host_scale_num, observation.host_scale_den
+                            ),
+                            client_scale_factor = observation.client_scale_factor,
+                            viewport_width = viewport_hint.width,
+                            viewport_height = viewport_hint.height,
+                            "sent SetViewportHint to host"
+                        );
                     }
                 }
             }
@@ -1516,8 +1743,38 @@ async fn main() -> anyhow::Result<()> {
         // Render must not block on a slow consumer — UnboundedSender
         // drops on send-after-close, which is what we want when either
         // consumer task has exited.
-        if let RenderEvent::Resized { width, height } = evt {
-            let _ = viewport_tx.send((width, height));
+        if let RenderEvent::Resized {
+            surface_width,
+            surface_height,
+            viewport_width,
+            viewport_height,
+            presentation_width,
+            presentation_height,
+            host_width,
+            host_height,
+            host_scale_num,
+            host_scale_den,
+            client_scale_factor,
+            presentation_mode,
+        } = evt
+        {
+            let _ = viewport_tx.send(ViewportObservation {
+                surface_width,
+                surface_height,
+                viewport: Viewport::new(viewport_width, viewport_height),
+                presentation_width,
+                presentation_height,
+                host_width,
+                host_height,
+                host_scale_num,
+                host_scale_den,
+                client_scale_factor,
+                presentation_mode,
+            });
+            return;
+        }
+        if let RenderEvent::ClientDisplayMetrics(metrics) = evt {
+            let _ = display_metrics_tx.send(metrics);
             return;
         }
         let _ = events_tx.send(evt);
@@ -1587,17 +1844,29 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let initial_video_size_px = initial_host_display.size_px;
+    info!(
+        host_mode_px_width = initial_video_size_px.0,
+        host_mode_px_height = initial_video_size_px.1,
+        host_scale = format!(
+            "{}/{}",
+            initial_host_display.scale.num, initial_host_display.scale.den
+        ),
+        "selected host display mode as initial render target"
+    );
+
     // Render loop blocks until the user closes the window. The
     // host's advertised color spec drives the renderer's EOTF
     // dispatch — for desktop captures (`sdr_desktop`) this is the
     // sRGB path, eliminating the BT.709-vs-sRGB transfer-curve
     // mismatch the spec-blind chain previously had to absorb.
-    let render_result = tether_render::run(
+    let render_result = tether_render::run_with_host_display_handle(
         "tether-client",
-        (INITIAL_WIDTH, INITIAL_HEIGHT),
+        host_display,
         server_hello.video.color_space,
         negotiated_profile.chroma,
         negotiated_profile.bit_depth,
+        view_mode.presentation_mode(),
         frames,
         cursor_channel,
         Some(on_event),
@@ -1819,17 +2088,21 @@ struct CliArgs {
     /// Play host audio when the host advertises it. On by default; `--no-audio`
     /// disables the client's playback path entirely.
     audio: bool,
+    /// Client view/stream-sizing policy. `Fit` forwards density-correct
+    /// fit-to-window hints; `ActualSize` forwards logical-100% hints.
+    view_mode: ViewMode,
 }
 
 /// Parse the client CLI. Positional[0] is the host address (required);
-/// positional[1] is an optional explicit fingerprint. `--pin`/`--label` consume
-/// the following token as their value; `--ipc` is handled earlier and ignored
-/// here; other `--flags` are ignored with a warning.
+/// positional[1] is an optional explicit fingerprint. Value flags consume the
+/// following token; `--ipc` is handled earlier and ignored here; other `--flags`
+/// are ignored with a warning.
 fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
     let mut positional: Vec<&str> = Vec::new();
     let mut pin = None;
     let mut label = None;
     let mut audio = true;
+    let mut view_mode = ViewMode::Fit;
     let mut it = raw_args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1837,6 +2110,9 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
             "--no-audio" => audio = false,
             "--pin" => pin = Some(take_flag_value(&mut it, "--pin")?),
             "--label" => label = Some(take_flag_value(&mut it, "--label")?),
+            "--view-mode" => {
+                view_mode = ViewMode::parse(&take_flag_value(&mut it, "--view-mode")?)?
+            }
             other if other.starts_with("--") => {
                 warn!(flag = other, "ignoring unknown flag");
             }
@@ -1857,6 +2133,7 @@ fn parse_cli_args(raw_args: &[String]) -> anyhow::Result<CliArgs> {
         pin,
         label,
         audio,
+        view_mode,
     })
 }
 
@@ -2278,9 +2555,157 @@ mod windows_format_tables {
 #[cfg(test)]
 mod arg_tests {
     use super::*;
+    use tether_protocol::control::{DisplayId, DisplayMode};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn display(id: u32, width: u32, height: u32, primary: bool) -> DisplayDescriptor {
+        let mode = DisplayMode::new(width, height, 60_000);
+        DisplayDescriptor {
+            id: DisplayId(id),
+            name: format!("display-{id}"),
+            scale_num: 1,
+            scale_den: 1,
+            primary,
+            position: (0, 0),
+            current_mode: mode,
+            available_modes: vec![mode],
+            can_set_mode: false,
+        }
+    }
+
+    #[test]
+    fn initial_video_size_prefers_valid_primary_display() {
+        let mut displays = vec![display(0, 1920, 1080, false), display(1, 3024, 1952, true)];
+        displays[1].scale_num = 2;
+        displays[1].scale_den = 1;
+        assert_eq!(
+            initial_host_display_from_displays(&displays).unwrap(),
+            InitialHostDisplay {
+                size_px: (3024, 1952),
+                scale: DisplayScale::new(2, 1).unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn initial_video_size_uses_first_valid_display_when_primary_is_invalid() {
+        let displays = vec![display(0, 0, 1080, true), display(1, 1920, 1200, false)];
+        assert_eq!(
+            initial_host_display_from_displays(&displays)
+                .unwrap()
+                .size_px,
+            (1920, 1200)
+        );
+    }
+
+    #[test]
+    fn initial_video_size_rejects_invalid_displays() {
+        assert!(initial_host_display_from_displays(&[]).is_err());
+        assert!(initial_host_display_from_displays(&[display(0, 0, 1080, true)]).is_err());
+
+        let mut invalid_scale = display(0, 1920, 1080, true);
+        invalid_scale.scale_den = 0;
+        assert!(initial_host_display_from_displays(&[invalid_scale]).is_err());
+    }
+
+    #[test]
+    fn should_send_viewport_rejects_invalid_and_duplicate_sizes() {
+        let viewport = Viewport::new(1920, 1080);
+
+        assert!(should_send_viewport(None, viewport));
+        assert!(!should_send_viewport(Some(viewport), viewport));
+        assert!(should_send_viewport(
+            Some(viewport),
+            Viewport::new(1280, 720)
+        ));
+        assert!(!should_send_viewport(None, Viewport::new(0, 720)));
+    }
+
+    #[test]
+    fn view_mode_defaults_to_fit_and_parses_actual_size() {
+        let parsed = parse_cli_args(&args(&["127.0.0.1:7654"])).expect("valid args");
+        assert_eq!(parsed.view_mode, ViewMode::Fit);
+
+        let parsed = parse_cli_args(&args(&["--view-mode", "actual-size", "127.0.0.1:7654"]))
+            .expect("valid args");
+        assert_eq!(parsed.view_mode, ViewMode::ActualSize);
+        assert_eq!(
+            parsed.view_mode.presentation_mode(),
+            PresentationMode::ActualSize
+        );
+
+        let err = parse_cli_args(&args(&["--view-mode", "original", "127.0.0.1:7654"]))
+            .expect_err("legacy original alias is not accepted");
+        assert!(err.to_string().contains("--view-mode"));
+
+        let err = parse_cli_args(&args(&["--view-mode", "stretch", "127.0.0.1:7654"]))
+            .expect_err("unknown view mode errors");
+        assert!(err.to_string().contains("--view-mode"));
+    }
+
+    #[test]
+    fn view_mode_controls_viewport_hint_without_display_mode_request() {
+        let fit =
+            initial_viewport_controls(Viewport::new(1280, 720), true).expect("valid viewport");
+        assert_eq!(fit.viewport_hint, Viewport::new(1280, 720));
+
+        let actual =
+            initial_viewport_controls(Viewport::new(1920, 1080), true).expect("valid viewport");
+        assert_eq!(actual.viewport_hint, Viewport::new(1920, 1080));
+
+        for msg in [
+            &fit.viewport_message,
+            &fit.ready_message,
+            &actual.viewport_message,
+            &actual.ready_message,
+        ] {
+            assert!(
+                !matches!(msg, ControlMessage::SetDisplayMode { .. }),
+                "view mode policy must not request a host display mode change"
+            );
+        }
+    }
+
+    #[test]
+    fn actual_size_view_mode_dedupes_unchanged_logical_viewport() {
+        let first = viewport_resize_control(None, Viewport::new(1920, 1080))
+            .expect("first valid viewport sends actual-size hint");
+        assert_eq!(first.0, Viewport::new(1920, 1080));
+
+        assert!(
+            viewport_resize_control(Some(Viewport::new(1920, 1080)), Viewport::new(1920, 1080))
+                .is_none(),
+            "Actual Size should not resend unchanged logical viewport hints"
+        );
+    }
+
+    #[test]
+    fn should_send_client_display_metrics_rejects_duplicates() {
+        let metrics = ClientDisplayMetrics {
+            display_id: 0,
+            mode: DisplayMode::new(2560, 1440, 60_000),
+            scale_num: 2,
+            scale_den: 1,
+            safe_area: None,
+        };
+
+        assert!(should_send_client_display_metrics(None, &metrics));
+        assert!(!should_send_client_display_metrics(
+            Some(&metrics),
+            &metrics
+        ));
+
+        let mut moved = metrics.clone();
+        moved.display_id = 1;
+        assert!(should_send_client_display_metrics(Some(&metrics), &moved));
+
+        let mut scaled = metrics.clone();
+        scaled.scale_num = 3;
+        scaled.scale_den = 2;
+        assert!(should_send_client_display_metrics(Some(&metrics), &scaled));
     }
 
     #[test]
@@ -2359,14 +2784,30 @@ mod arg_tests {
 
     #[test]
     fn startup_viewport_drain_uses_newest_queued_valid_size() {
+        fn observation(width: u32, height: u32) -> ViewportObservation {
+            ViewportObservation {
+                surface_width: width,
+                surface_height: height,
+                viewport: Viewport::new(width, height),
+                presentation_width: width,
+                presentation_height: height,
+                host_width: 1920,
+                host_height: 1080,
+                host_scale_num: 1,
+                host_scale_den: 1,
+                client_scale_factor: 1.0,
+                presentation_mode: PresentationMode::Fit,
+            }
+        }
+
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send((1600, 900)).unwrap();
-        tx.send((0, 0)).unwrap();
-        tx.send((1920, 1080)).unwrap();
+        tx.send(observation(1600, 900)).unwrap();
+        tx.send(observation(0, 0)).unwrap();
+        tx.send(observation(1920, 1080)).unwrap();
 
-        let selected = drain_latest_valid_viewport(Viewport::new(1280, 720), &mut rx);
+        let selected = drain_latest_valid_viewport(observation(1280, 720), &mut rx);
 
-        assert_eq!(selected, Viewport::new(1920, 1080));
+        assert_eq!(selected.viewport, Viewport::new(1920, 1080));
         assert!(
             rx.try_recv().is_err(),
             "queued resize events should be drained"

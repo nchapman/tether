@@ -34,11 +34,11 @@ use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
 use tether_codec::{GpuFrameGuard, GpuFrameSource};
-use tether_protocol::control::CursorMode;
+use tether_protocol::control::{ClientDisplayMetrics, CursorMode, DisplayMode};
 use tether_protocol::MonoNanos;
 use tracing::warn;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
@@ -57,6 +57,89 @@ use gpu::GpuState as Backend;
 // version. tether-render's version of winit is the workspace version.
 pub use winit::event::MouseButton;
 pub use winit::keyboard::{KeyCode, ModifiersState};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentationMode {
+    /// Fit inside the client surface without growing past logical 100%.
+    Fit,
+    /// Present at logical 100%. A smaller surface clips the centered image.
+    ActualSize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayScale {
+    pub num: u16,
+    pub den: u16,
+}
+
+impl DisplayScale {
+    #[must_use]
+    pub const fn one() -> Self {
+        Self { num: 1, den: 1 }
+    }
+
+    #[must_use]
+    pub const fn new(num: u16, den: u16) -> Option<Self> {
+        if num == 0 || den == 0 {
+            None
+        } else {
+            Some(Self { num, den })
+        }
+    }
+
+    #[must_use]
+    pub fn as_f64(self) -> f64 {
+        debug_assert!(self.num > 0);
+        debug_assert!(self.den > 0);
+        f64::from(self.num) / f64::from(self.den)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostDisplayGeometry {
+    pub size_px: (u32, u32),
+    pub scale: DisplayScale,
+}
+
+impl HostDisplayGeometry {
+    #[must_use]
+    pub const fn new(size_px: (u32, u32), scale: DisplayScale) -> Option<Self> {
+        if size_px.0 == 0 || size_px.1 == 0 || scale.num == 0 || scale.den == 0 {
+            None
+        } else {
+            Some(Self { size_px, scale })
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HostDisplayHandle {
+    geometry: Arc<Mutex<HostDisplayGeometry>>,
+}
+
+impl HostDisplayHandle {
+    #[must_use]
+    pub fn new(geometry: HostDisplayGeometry) -> Self {
+        Self {
+            geometry: Arc::new(Mutex::new(geometry)),
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self) -> HostDisplayGeometry {
+        *self
+            .geometry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn set(&self, geometry: HostDisplayGeometry) {
+        *self
+            .geometry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = geometry;
+    }
+}
 
 /// macOS-only — whether the renderer's IOSurface import path accepts
 /// the given `(chroma, bit_depth, fourcc)` triple. The predicate itself
@@ -228,16 +311,28 @@ pub enum RenderEvent {
     /// `ControlMessage::SetCursorMode`; consumer-side decision to
     /// actually grab the pointer happens inside the renderer.
     CursorModeChanged(CursorMode),
-    /// Window resized to `(width, height)` physical pixels. The client
-    /// binary forwards this to the host as `ControlMessage::SetViewportHint`
-    /// (after debouncing) so the host can re-encode at the new dims —
-    /// without this hook, the host stays at the original capture
-    /// resolution regardless of how small the client window is, wasting
-    /// encode time and bandwidth.
+    /// Window resized. `surface_*` is the winit physical-pixel window size;
+    /// `viewport_*` is the density/presentation-mode-corrected rectangle the
+    /// client forwards to the host as `ControlMessage::SetViewportHint` after
+    /// debouncing.
     Resized {
-        width: u32,
-        height: u32,
+        surface_width: u32,
+        surface_height: u32,
+        viewport_width: u32,
+        viewport_height: u32,
+        presentation_width: u32,
+        presentation_height: u32,
+        host_width: u32,
+        host_height: u32,
+        host_scale_num: u16,
+        host_scale_den: u16,
+        client_scale_factor: f64,
+        presentation_mode: PresentationMode,
     },
+    /// Physical metrics for the client output hosting the renderer. The client
+    /// forwards this to the host as display-mode-matching input; it is not a
+    /// host mode-change request.
+    ClientDisplayMetrics(ClientDisplayMetrics),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -289,21 +384,54 @@ pub type EventSink = Box<dyn Fn(RenderEvent) + Send>;
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     title: &str,
-    initial_size: (u32, u32),
+    initial_video_size_px: (u32, u32),
+    host_display_scale: DisplayScale,
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
+    presentation_mode: PresentationMode,
+    frames: LatestFrame,
+    cursor_channel: CursorChannel,
+    on_event: Option<EventSink>,
+) -> Result<()> {
+    let geometry = HostDisplayGeometry::new(initial_video_size_px, host_display_scale)
+        .expect("tether_render::run requires nonzero host display size and display scale");
+    run_with_host_display_handle(
+        title,
+        HostDisplayHandle::new(geometry),
+        color_space,
+        chroma,
+        bit_depth,
+        presentation_mode,
+        frames,
+        cursor_channel,
+        on_event,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_host_display_handle(
+    title: &str,
+    host_display: HostDisplayHandle,
+    color_space: tether_protocol::control::VideoColorSpec,
+    chroma: tether_protocol::control::ChromaSubsampling,
+    bit_depth: u8,
+    presentation_mode: PresentationMode,
     frames: LatestFrame,
     cursor_channel: CursorChannel,
     on_event: Option<EventSink>,
 ) -> Result<()> {
     let event_loop = EventLoop::new()?;
+    let last_host_display = host_display.get();
     let mut app = App {
         title: title.to_string(),
-        initial_size,
+        host_display,
+        last_host_display,
+        client_scale_factor: 1.0,
         color_space,
         chroma,
         bit_depth,
+        presentation_mode,
         window: None,
         gpu: None,
         frames,
@@ -311,6 +439,7 @@ pub fn run(
         on_event,
         present_stats: PresentStats::default(),
         last_recorded_t_cap: None,
+        last_display_metrics: None,
         refresh_rate_mhz: present_policy::REFRESH_RATE_FALLBACK_HZ.saturating_mul(1000),
         age_tracker: present_policy::FrameAgeTracker::default(),
         health: RenderHealth::default(),
@@ -327,10 +456,13 @@ pub fn run(
 
 struct App {
     title: String,
-    initial_size: (u32, u32),
+    host_display: HostDisplayHandle,
+    last_host_display: HostDisplayGeometry,
+    client_scale_factor: f64,
     color_space: tether_protocol::control::VideoColorSpec,
     chroma: tether_protocol::control::ChromaSubsampling,
     bit_depth: u8,
+    presentation_mode: PresentationMode,
     window: Option<Arc<Window>>,
     gpu: Option<Backend>,
     frames: LatestFrame,
@@ -348,6 +480,11 @@ struct App {
     /// redraw would record the same age again, inflating the sample
     /// count and pulling the average up.
     last_recorded_t_cap: Option<MonoNanos>,
+    /// Last client-display metrics emitted to the session. Monitor
+    /// changes can arrive as resize, move, scale, or focus events
+    /// depending on the window system; dedup here so all of those hooks
+    /// can cheaply refresh without spamming control messages.
+    last_display_metrics: Option<ClientDisplayMetrics>,
     /// Cached monitor refresh rate, in millihertz. Queried on
     /// resume + monitor change. Falls back to 60 Hz when winit
     /// can't report a real value.
@@ -518,6 +655,34 @@ impl App {
         }
     }
 
+    fn refresh_client_display_metrics(&mut self) {
+        let Some(monitor) = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor())
+        else {
+            return;
+        };
+        self.refresh_client_display_metrics_for_monitor(&monitor);
+    }
+
+    fn refresh_client_display_metrics_for_monitor(
+        &mut self,
+        monitor: &winit::monitor::MonitorHandle,
+    ) {
+        if let Some(mhz) = monitor.refresh_rate_millihertz() {
+            self.refresh_rate_mhz = mhz;
+        }
+        self.client_scale_factor = sanitize_scale_factor(monitor.scale_factor());
+        self.update_presentation_size();
+        let metrics = client_display_metrics_for_monitor(monitor);
+        if !client_display_metrics_changed(self.last_display_metrics.as_ref(), &metrics) {
+            return;
+        }
+        self.last_display_metrics = Some(metrics.clone());
+        self.emit(RenderEvent::ClientDisplayMetrics(metrics));
+    }
+
     /// Try `Locked` first (true pointer-lock, supported on most
     /// platforms in 2026), fall back to `Confined` on X11/Wayland
     /// combos that reject Locked. Cursor visibility is handled
@@ -578,6 +743,117 @@ impl App {
             CursorMode::Absolute | CursorMode::Unknown(_) => self.set_local_cursor_hidden(false),
         }
         self.emit(RenderEvent::CursorModeChanged(new_mode));
+    }
+
+    fn apply_window_resize(&mut self, size: PhysicalSize<u32>) {
+        let viewport_size = self.viewport_size_for_surface(size);
+        self.apply_window_resize_with_viewport(size, viewport_size);
+    }
+
+    fn apply_window_resize_with_viewport(
+        &mut self,
+        surface_size: PhysicalSize<u32>,
+        viewport_size: PhysicalSize<u32>,
+    ) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.resize(surface_size.width, surface_size.height);
+        }
+        let presentation_size_px = self.presentation_size_px();
+        let host_display = self.host_display.get();
+        self.emit(RenderEvent::Resized {
+            surface_width: surface_size.width,
+            surface_height: surface_size.height,
+            viewport_width: viewport_size.width,
+            viewport_height: viewport_size.height,
+            presentation_width: presentation_size_px.0,
+            presentation_height: presentation_size_px.1,
+            host_width: host_display.size_px.0,
+            host_height: host_display.size_px.1,
+            host_scale_num: host_display.scale.num,
+            host_scale_den: host_display.scale.den,
+            client_scale_factor: self.client_scale_factor,
+            presentation_mode: self.presentation_mode,
+        });
+        self.refresh_client_display_metrics();
+    }
+
+    fn viewport_override_for_surface(&self, size: PhysicalSize<u32>) -> Option<PhysicalSize<u32>> {
+        let viewport = viewport_size_for_surface(
+            self.presentation_mode,
+            (size.width, size.height),
+            self.presentation_size_px(),
+        );
+        (viewport.width != size.width || viewport.height != size.height).then_some(viewport)
+    }
+
+    fn viewport_size_for_surface(&self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
+        viewport_size_for_surface(
+            self.presentation_mode,
+            (size.width, size.height),
+            self.presentation_size_px(),
+        )
+    }
+
+    fn presentation_size_px(&self) -> (u32, u32) {
+        let host_display = self.host_display.get();
+        logical_actual_size_px(
+            host_display.size_px,
+            host_display.scale,
+            self.client_scale_factor,
+        )
+    }
+
+    fn refresh_host_display_geometry(&mut self) {
+        let geometry = self.host_display.get();
+        if geometry == self.last_host_display {
+            return;
+        }
+        let old_presentation_size_px = logical_actual_size_px(
+            self.last_host_display.size_px,
+            self.last_host_display.scale,
+            self.client_scale_factor,
+        );
+        let pending_window_resize = self.window.as_ref().and_then(|window| {
+            let current_size = window.inner_size();
+            let monitor_size = window.current_monitor().map(|monitor| {
+                let size = monitor.size();
+                (size.width, size.height)
+            });
+            corrected_window_size_for_host_geometry_update(
+                current_size,
+                old_presentation_size_px,
+                logical_actual_size_px(geometry.size_px, geometry.scale, self.client_scale_factor),
+                monitor_size,
+            )
+        });
+        self.last_host_display = geometry;
+        self.update_presentation_size();
+        if let Some(window) = self.window.as_ref() {
+            let size = if let Some(size) = pending_window_resize {
+                tracing::info!(
+                    old_presentation_width = old_presentation_size_px.0,
+                    old_presentation_height = old_presentation_size_px.1,
+                    new_presentation_width = self.presentation_size_px().0,
+                    new_presentation_height = self.presentation_size_px().1,
+                    requested_surface_width = size.width,
+                    requested_surface_height = size.height,
+                    "requesting initial window resize after host display geometry update"
+                );
+                window
+                    .request_inner_size(size)
+                    .unwrap_or_else(|| window.inner_size())
+            } else {
+                window.inner_size()
+            };
+            self.apply_window_resize(size);
+        }
+    }
+
+    fn update_presentation_size(&mut self) {
+        let presentation_size_px = self.presentation_size_px();
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_presentation_size_px(presentation_size_px);
+        }
     }
 
     /// Apply the freshest pending frame (if any) and present.
@@ -668,9 +944,21 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        let monitor = event_loop
+            .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next());
+        let monitor_size = monitor.as_ref().map(|monitor| {
+            let size = monitor.size();
+            (size.width, size.height)
+        });
+        self.client_scale_factor = monitor
+            .as_ref()
+            .map_or(1.0, |monitor| sanitize_scale_factor(monitor.scale_factor()));
+        let presentation_size_px = self.presentation_size_px();
+        let initial_size = initial_window_size_for_monitor(presentation_size_px, monitor_size);
         let attrs = WindowAttributes::default()
             .with_title(&self.title)
-            .with_inner_size(LogicalSize::new(self.initial_size.0, self.initial_size.1));
+            .with_inner_size(PhysicalSize::new(initial_size.0, initial_size.1));
         let win = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -684,6 +972,8 @@ impl ApplicationHandler for App {
             self.color_space,
             self.chroma,
             self.bit_depth,
+            self.presentation_mode,
+            presentation_size_px,
             self.cursor_channel.clone(),
         )) {
             Ok(g) => g,
@@ -693,22 +983,16 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        // Cache the monitor refresh rate. Winit returns an
-        // `Option<u32>` in millihertz; fall back to 60 Hz when
-        // it's unavailable (some Wayland compositors don't expose
-        // it on every monitor).
-        if let Some(monitor) = self.window.as_ref().and_then(|_| win.current_monitor()) {
-            if let Some(mhz) = monitor.refresh_rate_millihertz() {
-                self.refresh_rate_mhz = mhz;
-            }
-        } else if let Some(mhz) = win
-            .current_monitor()
-            .and_then(|m| m.refresh_rate_millihertz())
-        {
-            self.refresh_rate_mhz = mhz;
-        }
+        let size = win.inner_size();
         self.window = Some(win);
         self.gpu = Some(gpu);
+        self.apply_window_resize(size);
+        self.refresh_client_display_metrics();
+        if self.last_display_metrics.is_none() {
+            if let Some(monitor) = monitor.as_ref() {
+                self.refresh_client_display_metrics_for_monitor(monitor);
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -721,13 +1005,17 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.resize(size.width, size.height);
+                if let Some(viewport_size) = self.viewport_override_for_surface(size) {
+                    self.apply_window_resize_with_viewport(size, viewport_size);
+                    return;
                 }
-                self.emit(RenderEvent::Resized {
-                    width: size.width,
-                    height: size.height,
-                });
+                self.apply_window_resize(size);
+            }
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.refresh_client_display_metrics();
+                if let Some(window) = self.window.as_ref() {
+                    self.apply_window_resize(window.inner_size());
+                }
             }
             WindowEvent::RedrawRequested => {
                 // OS-initiated repaint (expose/resize). Re-present the
@@ -776,7 +1064,13 @@ impl ApplicationHandler for App {
                     return;
                 };
                 let (texture, surface) = gpu.dimensions();
-                let video_normalized = cursor_to_video_normalized(position, surface, texture);
+                let video_normalized = cursor_to_video_normalized(
+                    position,
+                    surface,
+                    texture,
+                    self.presentation_mode,
+                    self.presentation_size_px(),
+                );
                 // Anchor the host-cursor overlay to the local pointer for
                 // zero-latency motion (the host still gets the absolute
                 // position below, to move its real cursor). Convert the
@@ -867,6 +1161,9 @@ impl ApplicationHandler for App {
                 } else if matches!(self.cursor_mode, CursorMode::Relative) {
                     self.set_local_cursor_hidden(true);
                 }
+                if b {
+                    self.refresh_client_display_metrics();
+                }
                 self.emit(RenderEvent::Focused(b));
             }
             _ => {}
@@ -890,6 +1187,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        self.refresh_host_display_geometry();
         // LatestFrame holds at most one frame — if the producer wrote
         // multiple times since we last polled, only the newest is
         // visible. That's the intended drop-oldest semantics: a
@@ -914,6 +1212,151 @@ impl ApplicationHandler for App {
         // Ticked every turn — independent of whether anything was drawn —
         // so a present stall logs instead of going silent.
         self.health.maybe_log();
+    }
+}
+
+/// Pick the physical-pixel startup window size from the host's advertised
+/// capture/display size and the client monitor. The host size is the target for
+/// 1:1 presentation; the monitor only caps it when the host would not fit.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn initial_window_size_for_monitor(
+    host_px: (u32, u32),
+    monitor_px: Option<(u32, u32)>,
+) -> (u32, u32) {
+    const FALLBACK: (u32, u32) = (1280, 720);
+    let (host_w, host_h) = host_px;
+    if host_w == 0 || host_h == 0 {
+        return FALLBACK;
+    }
+    let Some((monitor_w, monitor_h)) = monitor_px.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return (host_w, host_h);
+    };
+    if host_w <= monitor_w && host_h <= monitor_h {
+        return (host_w, host_h);
+    }
+
+    let scale_w = f64::from(monitor_w) / f64::from(host_w);
+    let scale_h = f64::from(monitor_h) / f64::from(host_h);
+    let scale = scale_w.min(scale_h).min(1.0);
+    let width = (f64::from(host_w) * scale).floor() as u32;
+    let height = (f64::from(host_h) * scale).floor() as u32;
+    (width.max(1), height.max(1))
+}
+
+#[must_use]
+fn corrected_window_size_for_host_geometry_update(
+    current_surface_px: PhysicalSize<u32>,
+    old_presentation_px: (u32, u32),
+    new_presentation_px: (u32, u32),
+    monitor_px: Option<(u32, u32)>,
+) -> Option<PhysicalSize<u32>> {
+    let old_initial = initial_window_size_for_monitor(old_presentation_px, monitor_px);
+    if !approx_size(current_surface_px, old_initial, 1) {
+        return None;
+    }
+    let new_initial = initial_window_size_for_monitor(new_presentation_px, monitor_px);
+    if approx_size(current_surface_px, new_initial, 1) {
+        return None;
+    }
+    Some(PhysicalSize::new(new_initial.0, new_initial.1))
+}
+
+fn approx_size(size: PhysicalSize<u32>, expected: (u32, u32), tolerance: u32) -> bool {
+    size.width.abs_diff(expected.0) <= tolerance && size.height.abs_diff(expected.1) <= tolerance
+}
+
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn logical_actual_size_px(
+    host_physical_px: (u32, u32),
+    host_display_scale: DisplayScale,
+    client_scale_factor: f64,
+) -> (u32, u32) {
+    let client_scale_factor = sanitize_scale_factor(client_scale_factor);
+    let host_scale = host_display_scale.as_f64();
+    if host_physical_px.0 == 0 || host_physical_px.1 == 0 || host_scale <= 0.0 {
+        return (1, 1);
+    }
+    let scale = client_scale_factor / host_scale;
+    (
+        (f64::from(host_physical_px.0) * scale)
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32,
+        (f64::from(host_physical_px.1) * scale)
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32,
+    )
+}
+
+#[must_use]
+fn viewport_size_for_surface(
+    mode: PresentationMode,
+    surface: (u32, u32),
+    actual_size_px: (u32, u32),
+) -> PhysicalSize<u32> {
+    let dims = presentation_rect_dims(mode, actual_size_px, surface);
+    PhysicalSize::new(dims.0, dims.1)
+}
+
+#[must_use]
+fn sanitize_scale_factor(scale: f64) -> f64 {
+    if !scale.is_finite() || scale <= 0.0 {
+        1.0
+    } else {
+        scale
+    }
+}
+
+fn client_display_metrics_for_monitor(
+    monitor: &winit::monitor::MonitorHandle,
+) -> ClientDisplayMetrics {
+    let size = monitor.size();
+    let refresh_millihz = monitor.refresh_rate_millihertz().unwrap_or(60_000);
+    let (scale_num, scale_den) = scale_to_ratio(monitor.scale_factor());
+    ClientDisplayMetrics {
+        display_id: 0,
+        mode: DisplayMode::new(size.width, size.height, refresh_millihz),
+        scale_num,
+        scale_den,
+        safe_area: None,
+    }
+}
+
+fn client_display_metrics_changed(
+    last: Option<&ClientDisplayMetrics>,
+    next: &ClientDisplayMetrics,
+) -> bool {
+    last != Some(next)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn scale_to_ratio(scale: f64) -> (u16, u16) {
+    if !scale.is_finite() || scale <= 0.0 {
+        return (1, 1);
+    }
+
+    const DEN: u32 = 1000;
+    let num = (scale * f64::from(DEN))
+        .round()
+        .clamp(1.0, f64::from(u16::MAX)) as u32;
+    let gcd = gcd_u32(num, DEN);
+    (
+        u16::try_from(num / gcd).unwrap_or(u16::MAX),
+        u16::try_from(DEN / gcd).unwrap_or(u16::MAX),
+    )
+}
+
+const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    if a == 0 {
+        1
+    } else {
+        a
     }
 }
 
@@ -959,24 +1402,35 @@ impl LatestFrame {
 /// applies. Returns `None` when the cursor sits in a letterbox bar
 /// (outside the video region) or when either size is degenerate.
 ///
-/// Mirrors `gpu::letterbox_scale`: when source and surface aspect ratios
-/// match, the whole window is the video region; otherwise the video is
-/// centered and one axis is shrunk by `min_aspect / max_aspect`.
+/// Mirrors the active presentation rectangle: `Fit` maps through the
+/// fit-or-logical-100% rect, while `ActualSize` maps through a centered logical
+/// 100% rect that may extend beyond the surface.
 #[allow(clippy::cast_precision_loss)]
 fn cursor_to_video_normalized(
     pos: PhysicalPosition<f64>,
     surface: (u32, u32),
     texture: (u32, u32),
+    presentation_mode: PresentationMode,
+    presentation_size_px: (u32, u32),
 ) -> Option<(f32, f32)> {
-    if surface.0 == 0 || surface.1 == 0 || texture.0 == 0 || texture.1 == 0 {
+    if surface.0 == 0
+        || surface.1 == 0
+        || texture.0 == 0
+        || texture.1 == 0
+        || presentation_size_px.0 == 0
+        || presentation_size_px.1 == 0
+    {
         return None;
     }
-    let (sx, sy) = letterbox_scale(texture, surface);
+    let (video_w_px, video_h_px) =
+        presentation_rect_dims(presentation_mode, presentation_size_px, surface);
+    if video_w_px == 0 || video_h_px == 0 {
+        return None;
+    }
     let sw = f64::from(surface.0);
     let sh = f64::from(surface.1);
-    let (sx, sy) = (f64::from(sx), f64::from(sy));
-    let video_w = sw * sx;
-    let video_h = sh * sy;
+    let video_w = f64::from(video_w_px);
+    let video_h = f64::from(video_h_px);
     let offset_x = (sw - video_w) * 0.5;
     let offset_y = (sh - video_h) * 0.5;
     let nx = (pos.x - offset_x) / video_w;
@@ -988,22 +1442,69 @@ fn cursor_to_video_normalized(
     Some((nx as f32, ny as f32))
 }
 
-/// Aspect-preserving letterbox / pillarbox scale: the `(x, y)` NDC scale
-/// that fits a `src`-sized image inside a `dst`-sized surface centered,
-/// shrinking one axis by `min_aspect / max_aspect`. Shared by the cursor
-/// mapping above and the Windows D3D11 backend's vertex scale so the two
-/// can't drift; the wgpu backend keeps its own private copy (it's cfg'd
-/// out on Windows, and widening its visibility buys nothing there).
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn letterbox_scale(src: (u32, u32), dst: (u32, u32)) -> (f32, f32) {
-    let src_aspect = src.0 as f32 / src.1 as f32;
-    let dst_aspect = dst.0 as f32 / dst.1 as f32;
-    if (src_aspect - dst_aspect).abs() < f32::EPSILON {
-        (1.0, 1.0)
-    } else if src_aspect > dst_aspect {
-        (1.0, dst_aspect / src_aspect)
+#[must_use]
+pub(crate) fn presentation_rect_dims(
+    mode: PresentationMode,
+    actual_size_px: (u32, u32),
+    surface: (u32, u32),
+) -> (u32, u32) {
+    if actual_size_px.0 == 0 || actual_size_px.1 == 0 || surface.0 == 0 || surface.1 == 0 {
+        return (0, 0);
+    }
+    match mode {
+        PresentationMode::ActualSize => actual_size_px,
+        PresentationMode::Fit => {
+            if actual_size_px.0 <= surface.0 && actual_size_px.1 <= surface.1 {
+                actual_size_px
+            } else {
+                fit_rect_dims(actual_size_px, surface)
+            }
+        }
+    }
+}
+
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+pub(crate) fn presentation_scale(
+    mode: PresentationMode,
+    actual_size_px: (u32, u32),
+    surface: (u32, u32),
+) -> (f32, f32) {
+    if surface.0 == 0 || surface.1 == 0 {
+        return (1.0, 1.0);
+    }
+    let (w, h) = presentation_rect_dims(mode, actual_size_px, surface);
+    if w == 0 || h == 0 {
+        return (1.0, 1.0);
+    }
+    (w as f32 / surface.0 as f32, h as f32 / surface.1 as f32)
+}
+
+/// Aspect-preserving fit rect in pixels, centered by callers. This may shrink
+/// or upscale; [`presentation_rect_dims`] applies the no-upscale policy.
+#[must_use]
+pub(crate) fn fit_rect_dims(src: (u32, u32), dst: (u32, u32)) -> (u32, u32) {
+    if src.0 == 0 || src.1 == 0 || dst.0 == 0 || dst.1 == 0 {
+        return (0, 0);
+    }
+    let src_w = u64::from(src.0);
+    let src_h = u64::from(src.1);
+    let dst_w = u64::from(dst.0);
+    let dst_h = u64::from(dst.1);
+    if src_w * dst_h > dst_w * src_h {
+        let w = dst.0;
+        let h = u32::try_from(((dst_w * src_h) / src_w).clamp(1, dst_h))
+            .expect("fit height is clamped to the u32 destination height");
+        (w, h)
     } else {
-        (src_aspect / dst_aspect, 1.0)
+        let h = dst.1;
+        let w = u32::try_from(((dst_h * src_w) / src_h).clamp(1, dst_w))
+            .expect("fit width is clamped to the u32 destination width");
+        (w, h)
     }
 }
 
@@ -1013,10 +1514,270 @@ mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
+    fn initial_window_uses_host_size_when_it_fits_client_monitor() {
+        assert_eq!(
+            initial_window_size_for_monitor((1920, 1080), Some((2560, 1440))),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn initial_window_fits_host_inside_smaller_client_monitor() {
+        assert_eq!(
+            initial_window_size_for_monitor((3840, 2160), Some((2560, 1440))),
+            (2560, 1440)
+        );
+        assert_eq!(
+            initial_window_size_for_monitor((3840, 2160), Some((1920, 1200))),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn initial_window_without_monitor_uses_host_size() {
+        assert_eq!(
+            initial_window_size_for_monitor((3024, 1952), None),
+            (3024, 1952)
+        );
+    }
+
+    #[test]
+    fn initial_window_invalid_host_size_uses_fallback() {
+        assert_eq!(
+            initial_window_size_for_monitor((0, 1080), Some((2560, 1440))),
+            (1280, 720)
+        );
+        assert_eq!(initial_window_size_for_monitor((0, 0), None), (1280, 720));
+    }
+
+    #[test]
+    fn host_geometry_update_resizes_window_still_at_bootstrap_size() {
+        assert_eq!(
+            corrected_window_size_for_host_geometry_update(
+                PhysicalSize::new(1920, 1200),
+                (1920, 1200),
+                (3840, 2400),
+                Some((6720, 2836)),
+            ),
+            Some(PhysicalSize::new(3840, 2400))
+        );
+    }
+
+    #[test]
+    fn host_geometry_update_caps_corrected_window_to_monitor() {
+        assert_eq!(
+            corrected_window_size_for_host_geometry_update(
+                PhysicalSize::new(1920, 1200),
+                (1920, 1200),
+                (3840, 2400),
+                Some((2560, 1440)),
+            ),
+            Some(PhysicalSize::new(2304, 1440))
+        );
+    }
+
+    #[test]
+    fn host_geometry_update_does_not_resize_after_user_resize() {
+        assert_eq!(
+            corrected_window_size_for_host_geometry_update(
+                PhysicalSize::new(1800, 1000),
+                (1920, 1200),
+                (3840, 2400),
+                Some((6720, 2836)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn logical_actual_size_scales_between_display_densities() {
+        assert_eq!(
+            logical_actual_size_px((1920, 1080), DisplayScale::one(), 2.0),
+            (3840, 2160)
+        );
+        assert_eq!(
+            logical_actual_size_px((3840, 2160), DisplayScale::new(2, 1).unwrap(), 1.0),
+            (1920, 1080)
+        );
+        assert_eq!(
+            logical_actual_size_px((2560, 1440), DisplayScale::new(3, 2).unwrap(), 2.0),
+            (3413, 1920)
+        );
+    }
+
+    #[test]
+    fn fit_viewport_caps_to_logical_actual_size() {
+        assert_eq!(
+            viewport_size_for_surface(PresentationMode::Fit, (2560, 1440), (1920, 1080),),
+            PhysicalSize::new(1920, 1080)
+        );
+    }
+
+    #[test]
+    fn fit_viewport_preserves_actual_size_aspect() {
+        assert_eq!(
+            viewport_size_for_surface(PresentationMode::Fit, (1000, 1000), (1920, 1080)),
+            PhysicalSize::new(1000, 562)
+        );
+        assert_eq!(
+            viewport_size_for_surface(PresentationMode::Fit, (1280, 600), (1920, 1080)),
+            PhysicalSize::new(1066, 600)
+        );
+    }
+
+    #[test]
+    fn fit_viewport_accepts_already_constrained_size() {
+        assert_eq!(
+            viewport_size_for_surface(PresentationMode::Fit, (1920, 1080), (1920, 1080),),
+            PhysicalSize::new(1920, 1080)
+        );
+    }
+
+    #[test]
+    fn actual_size_viewport_ignores_surface_size() {
+        assert_eq!(
+            viewport_size_for_surface(PresentationMode::ActualSize, (640, 360), (1920, 1080),),
+            PhysicalSize::new(1920, 1080)
+        );
+    }
+
+    #[test]
+    fn viewport_override_reports_density_correct_fit_delta() {
+        let app = App {
+            title: "test".to_string(),
+            host_display: HostDisplayHandle::new(
+                HostDisplayGeometry::new((1920, 1080), DisplayScale::one()).unwrap(),
+            ),
+            last_host_display: HostDisplayGeometry::new((1920, 1080), DisplayScale::one()).unwrap(),
+            client_scale_factor: 1.0,
+            color_space: tether_protocol::control::VideoColorSpec::sdr_desktop(),
+            chroma: tether_protocol::control::ChromaSubsampling::Yuv420,
+            bit_depth: 8,
+            presentation_mode: PresentationMode::Fit,
+            window: None,
+            gpu: None,
+            frames: LatestFrame::new(),
+            latest: None,
+            on_event: None,
+            present_stats: PresentStats::default(),
+            last_recorded_t_cap: None,
+            last_display_metrics: None,
+            refresh_rate_mhz: present_policy::REFRESH_RATE_FALLBACK_HZ.saturating_mul(1000),
+            age_tracker: present_policy::FrameAgeTracker::default(),
+            health: RenderHealth::default(),
+            cursor_mode: CursorMode::Absolute,
+            relative_accum: relative_mouse::SubPixelAccum::default(),
+            local_cursor_hidden: false,
+            ctrl_held: false,
+            alt_held: false,
+            cursor_channel: CursorChannel::new(),
+        };
+        assert_eq!(
+            app.viewport_override_for_surface(PhysicalSize::new(2560, 1440)),
+            Some(PhysicalSize::new(1920, 1080))
+        );
+    }
+
+    #[test]
+    fn scale_to_ratio_reduces_common_hidpi_values() {
+        assert_eq!(scale_to_ratio(1.5), (3, 2));
+        assert_eq!(scale_to_ratio(2.0), (2, 1));
+        assert_eq!(scale_to_ratio(0.0), (1, 1));
+    }
+
+    #[test]
+    fn client_display_metrics_changed_dedups_identical_metrics() {
+        let base = ClientDisplayMetrics {
+            display_id: 0,
+            mode: DisplayMode::new(2560, 1440, 60_000),
+            scale_num: 2,
+            scale_den: 1,
+            safe_area: None,
+        };
+        assert!(client_display_metrics_changed(None, &base));
+        assert!(!client_display_metrics_changed(Some(&base), &base));
+
+        let mut scaled = base.clone();
+        scaled.scale_num = 3;
+        scaled.scale_den = 2;
+        assert!(client_display_metrics_changed(Some(&base), &scaled));
+
+        let mut resized = base.clone();
+        resized.mode = DisplayMode::new(1920, 1080, 60_000);
+        assert!(client_display_metrics_changed(Some(&base), &resized));
+    }
+
+    #[test]
+    fn fit_presents_at_logical_actual_size_when_it_fits() {
+        assert_eq!(
+            presentation_rect_dims(PresentationMode::Fit, (1920, 1080), (2560, 1440)),
+            (1920, 1080)
+        );
+        assert_eq!(
+            presentation_scale(PresentationMode::Fit, (1920, 1080), (2560, 1440)),
+            (0.75, 0.75)
+        );
+    }
+
+    #[test]
+    fn fit_can_scale_up_to_logical_actual_size() {
+        assert_eq!(
+            presentation_rect_dims(PresentationMode::Fit, (3840, 2160), (2560, 1440)),
+            (2560, 1440)
+        );
+    }
+
+    #[test]
+    fn fit_fits_down_when_surface_is_smaller() {
+        assert_eq!(
+            presentation_rect_dims(PresentationMode::Fit, (3840, 2160), (1280, 1024)),
+            (1280, 720)
+        );
+    }
+
+    #[test]
+    fn fit_rect_never_exceeds_destination() {
+        let cases = [
+            ((1920, 1080), (1000, 1000)),
+            ((1920, 1080), (1280, 600)),
+            ((3024, 1964), (1512, 982)),
+            ((u32::MAX, u32::MAX - 1), (u32::MAX - 3, u32::MAX - 7)),
+            ((u32::MAX - 1, u32::MAX), (u32::MAX - 7, u32::MAX - 3)),
+        ];
+        for (src, dst) in cases {
+            let fit = fit_rect_dims(src, dst);
+            assert!(fit.0 <= dst.0, "fit width {fit:?} exceeds {dst:?}");
+            assert!(fit.1 <= dst.1, "fit height {fit:?} exceeds {dst:?}");
+            assert!(
+                fit.0 > 0,
+                "fit width should stay nonzero for {src:?} in {dst:?}"
+            );
+            assert!(
+                fit.1 > 0,
+                "fit height should stay nonzero for {src:?} in {dst:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn actual_size_presents_logical_size_even_when_clipped() {
+        assert_eq!(
+            presentation_rect_dims(PresentationMode::ActualSize, (1920, 1080), (1280, 720)),
+            (1920, 1080)
+        );
+        assert_eq!(
+            presentation_scale(PresentationMode::ActualSize, (1920, 1080), (1280, 720)),
+            (1.5, 1.5)
+        );
+    }
+
+    #[test]
     fn cursor_centre_maps_to_centre() {
         let n = cursor_to_video_normalized(
             PhysicalPosition::new(640.0, 360.0),
             (1280, 720),
+            (1920, 1080),
+            PresentationMode::Fit,
             (1920, 1080),
         )
         .expect("centre is inside the video region");
@@ -1033,6 +1794,8 @@ mod tests {
             PhysicalPosition::new(500.0, 10.0),
             (1000, 1000),
             (1920, 1080),
+            PresentationMode::Fit,
+            (1920, 1080),
         )
         .is_none());
         // 1000x1000 window, 1080x1920 source -> left/right pillarbox.
@@ -1041,8 +1804,24 @@ mod tests {
             PhysicalPosition::new(10.0, 500.0),
             (1000, 1000),
             (1080, 1920),
+            PresentationMode::Fit,
+            (1080, 1920),
         )
         .is_none());
+    }
+
+    #[test]
+    fn actual_size_cursor_maps_through_clipped_logical_rect() {
+        let n = cursor_to_video_normalized(
+            PhysicalPosition::new(0.0, 0.0),
+            (1280, 720),
+            (1920, 1080),
+            PresentationMode::ActualSize,
+            (1920, 1080),
+        )
+        .expect("surface centre area is inside the clipped video");
+        assert!((n.0 - (320.0 / 1920.0)).abs() < 1e-4);
+        assert!((n.1 - (180.0 / 1080.0)).abs() < 1e-4);
     }
 
     #[test]
@@ -1050,6 +1829,8 @@ mod tests {
         assert!(cursor_to_video_normalized(
             PhysicalPosition::new(-5.0, 100.0),
             (1280, 720),
+            (1280, 720),
+            PresentationMode::Fit,
             (1280, 720),
         )
         .is_none());
@@ -1060,6 +1841,8 @@ mod tests {
         let n = cursor_to_video_normalized(
             PhysicalPosition::new(128.0, 72.0),
             (1280, 720),
+            (1920, 1080),
+            PresentationMode::Fit,
             (1920, 1080),
         )
         .expect("inside");

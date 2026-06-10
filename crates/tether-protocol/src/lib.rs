@@ -583,6 +583,27 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_client_display_metrics() {
+        use crate::control::{ClientDisplayMetrics, ClientSafeArea, ControlMessage, DisplayMode};
+        let metrics = ClientDisplayMetrics {
+            display_id: 7,
+            mode: DisplayMode::new(3024, 1964, 120_000),
+            scale_num: 2,
+            scale_den: 1,
+            safe_area: Some(ClientSafeArea {
+                x: 0,
+                y: 24,
+                width: 3024,
+                height: 1940,
+            }),
+        };
+        let msg = ControlMessage::ClientDisplayMetrics(metrics.clone());
+        let bytes = encode_reliable(&msg).unwrap();
+        let decoded: ControlMessage = decode_reliable(&bytes).unwrap();
+        assert_eq!(decoded, ControlMessage::ClientDisplayMetrics(metrics));
+    }
+
+    #[test]
     fn round_trip_cursor_shape_control() {
         // CursorShape rides the reliable control stream (sprite payloads
         // are too large for the 1200-byte cursor datagram budget).
@@ -667,6 +688,64 @@ mod tests {
             ControlMessage::DisplayList { displays: d2 } => assert_eq!(d2, displays),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn display_scale_ratio_must_be_nonzero() {
+        let display = crate::pb::DisplayDescriptor {
+            id: 1,
+            name: "display".into(),
+            position_x: 0,
+            position_y: 0,
+            scale_num: 0,
+            scale_den: 1,
+            primary: true,
+            current_mode: Some(crate::pb::DisplayMode {
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60_000,
+            }),
+            available_modes: vec![],
+            can_set_mode: false,
+        };
+        let msg = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::DisplayList(
+                crate::pb::DisplayList {
+                    displays: vec![display],
+                },
+            )),
+        };
+
+        let err = decode_reliable::<ControlMessage>(&msg.encode_to_vec()).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::Wire("display scale numerator is zero")
+        ));
+    }
+
+    #[test]
+    fn client_display_scale_ratio_must_be_nonzero() {
+        let msg = crate::pb::ControlMessage {
+            kind: Some(crate::pb::control_message::Kind::ClientDisplayMetrics(
+                crate::pb::ClientDisplayMetrics {
+                    display_id: 0,
+                    mode: Some(crate::pb::DisplayMode {
+                        width: 3024,
+                        height: 1964,
+                        refresh_millihz: 120_000,
+                    }),
+                    scale_num: 2,
+                    scale_den: 0,
+                    safe_area: None,
+                },
+            )),
+        };
+
+        let err = decode_reliable::<ControlMessage>(&msg.encode_to_vec()).unwrap_err();
+        assert!(matches!(
+            err,
+            CodecError::Wire("client scale denominator is zero")
+        ));
     }
 
     #[test]

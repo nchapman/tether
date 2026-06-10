@@ -38,8 +38,9 @@ use tether_protocol::MonoNanos;
 
 use crate::cursor::{fnv1a_64, CursorEvent, CursorPosition, CursorShapeEvent, CursorSource};
 use crate::{
-    damage::NativeDamage, CaptureError, CaptureHandle, CapturedDmaBuf, CapturedFrame, CpuFrame,
-    GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, PixelFormat, Result,
+    damage::NativeDamage, CaptureDisplayHints, CaptureError, CaptureHandle, CapturedDmaBuf,
+    CapturedFrame, CpuFrame, GpuCapturedFrame, GpuCapturedGuard, GpuCapturedSource, PixelFormat,
+    Result,
 };
 
 /// Initial target FPS the Linux backend reports. Real cadence is
@@ -69,10 +70,13 @@ const CAPTURE_CHANNEL_DEPTH: usize = 1;
 /// the user's desktop session. The call blocks (asynchronously) until the
 /// user grants or denies access.
 pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
-    let (node_id, fd, session) = open_portal().await?;
+    let (portal_stream, fd, session) = open_portal().await?;
+    let node_id = portal_stream.node_id;
     tracing::info!(
         node_id,
         dmabuf_modifiers = dmabuf_modifiers.len(),
+        host_logical_position = ?portal_stream.display_hints.host_logical_position,
+        host_logical_size = ?portal_stream.display_hints.host_logical_size,
         "portal handshake complete; spawning pipewire thread"
     );
 
@@ -132,7 +136,9 @@ pub async fn start(dmabuf_modifiers: Vec<u64>) -> Result<CaptureHandle> {
         shape_rx,
         position_state,
     });
-    Ok(CaptureHandle::from_parts(rx, target_fps).with_cursor_source(cursor_source))
+    Ok(CaptureHandle::from_parts(rx, target_fps)
+        .with_cursor_source(cursor_source)
+        .with_display_hints(portal_stream.display_hints))
 }
 
 /// Receiver-side wiring for the PipeWire cursor extractor. The
@@ -281,7 +287,13 @@ fn select_cursor_mode(available: BitFlags<CursorMode>) -> Option<CursorMode> {
     }
 }
 
-async fn open_portal() -> Result<(u32, OwnedFd, Session<Screencast>)> {
+#[derive(Clone, Copy, Debug)]
+struct PortalStreamInfo {
+    node_id: u32,
+    display_hints: CaptureDisplayHints,
+}
+
+async fn open_portal() -> Result<(PortalStreamInfo, OwnedFd, Session<Screencast>)> {
     let proxy = Screencast::new().await?;
     // Query supported cursor modes up front. GNOME 45+ and KDE
     // Plasma 6 both advertise Metadata, but legacy portals fall
@@ -339,6 +351,18 @@ async fn open_portal() -> Result<(u32, OwnedFd, Session<Screencast>)> {
         .ok_or_else(|| CaptureError::Portal("portal returned no streams".into()))?
         .to_owned();
     let node_id = stream.pipe_wire_node_id();
+    let display_hints = CaptureDisplayHints {
+        host_logical_size: positive_i32_pair_to_u32(stream.size()),
+        host_logical_position: stream.position(),
+    };
+    tracing::info!(
+        node_id,
+        stream_id = stream.id(),
+        source_type = ?stream.source_type(),
+        host_logical_position = ?display_hints.host_logical_position,
+        host_logical_size = ?display_hints.host_logical_size,
+        "portal stream selected"
+    );
     let fd = proxy
         .open_pipe_wire_remote(&session, Default::default())
         .await?;
@@ -346,7 +370,22 @@ async fn open_portal() -> Result<(u32, OwnedFd, Session<Screencast>)> {
     // caller can close it on teardown; dropping it here would leak it on
     // the portal until process exit. The `proxy` can drop — `close` goes
     // through the session's own proxy.
-    Ok((node_id, fd, session))
+    Ok((
+        PortalStreamInfo {
+            node_id,
+            display_hints,
+        },
+        fd,
+        session,
+    ))
+}
+
+fn positive_i32_pair_to_u32(value: Option<(i32, i32)>) -> Option<(u32, u32)> {
+    let (width, height) = value?;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
 }
 
 struct UserData {

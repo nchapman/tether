@@ -42,8 +42,8 @@ use tether_gpuconvert::{
 use tether_ipc::{EngineEvent, Reporter};
 use tether_protocol::audio::AudioPacket;
 use tether_protocol::control::{
-    ChromaSubsampling, CodecKind, ControlMessage, DisplayDescriptor, DisplayModeStatus,
-    GoodbyeCode, VideoProfile, VideoStreamId, Viewport,
+    ChromaSubsampling, ClientDisplayMetrics, CodecKind, ControlMessage, DisplayDescriptor,
+    DisplayModeStatus, GoodbyeCode, VideoProfile, VideoStreamId, Viewport,
 };
 use tether_protocol::video::{
     FrameFragmenter, HostFrameTimingBuilder, InputEchoBatch, VideoFrameMeta, VideoPacket,
@@ -58,7 +58,7 @@ use tether_session::{
 use tether_transport::{AbrSnapshot, Connection, Datagram, Server};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod pairing;
 use pairing::{ActiveSession, Authorized, PairingState, RefusedReason};
@@ -132,25 +132,16 @@ const TEST_PATTERN_WIDTH: u32 = 320;
 const TEST_PATTERN_HEIGHT: u32 = 240;
 const TEST_PATTERN_FPS: u32 = 60;
 
-fn initial_display_descriptors(use_test_pattern: bool) -> Vec<DisplayDescriptor> {
+fn initial_display_descriptors(use_test_pattern: bool) -> anyhow::Result<Vec<DisplayDescriptor>> {
     if use_test_pattern {
-        return vec![tether_capture::test_pattern_display(
+        return Ok(vec![tether_capture::test_pattern_display(
             TEST_PATTERN_WIDTH,
             TEST_PATTERN_HEIGHT,
             TEST_PATTERN_FPS.saturating_mul(1000),
-        )];
+        )]);
     }
 
-    match tether_capture::display_list() {
-        Ok(displays) => displays,
-        Err(e) => {
-            warn!(
-                error = %e,
-                "display topology enumeration failed; advertising synthetic primary display"
-            );
-            vec![tether_capture::test_pattern_display(1280, 720, 60_000)]
-        }
-    }
+    tether_capture::display_list().map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Upper bound on the per-connection authorization exchange (allowlist resume
@@ -191,6 +182,24 @@ struct ViewportState {
     /// sequence and only acts when this advances — saves the slot
     /// comparison work when nothing changed.
     seq: u64,
+}
+
+impl ViewportState {
+    fn update_if_changed(&mut self, next: Option<Viewport>) -> bool {
+        if self.viewport == next {
+            return false;
+        }
+        self.viewport = next;
+        self.seq = self.seq.wrapping_add(1);
+        true
+    }
+}
+
+fn client_display_metrics_changed(
+    last: Option<&ClientDisplayMetrics>,
+    next: &ClientDisplayMetrics,
+) -> bool {
+    last != Some(next)
 }
 
 /// One window of client-side telemetry. Mirrors the fields in
@@ -530,8 +539,17 @@ async fn main() -> anyhow::Result<()> {
         // ends use the fixed default Opus config (48 kHz stereo).
         let audio_config = (audio_enabled && tether_audio::capture::is_supported())
             .then(|| tether_audio::OpusConfig::default().wire_config());
-        let display_descriptors =
-            Arc::new(StdMutex::new(initial_display_descriptors(use_test_pattern)));
+        let initial_displays = match initial_display_descriptors(use_test_pattern) {
+            Ok(displays) => displays,
+            Err(e) => {
+                error!(error = ?e, "display topology enumeration failed");
+                reporter.emit(&EngineEvent::Error {
+                    message: format!("display topology enumeration failed: {e}"),
+                });
+                continue;
+            }
+        };
+        let display_descriptors = Arc::new(StdMutex::new(initial_displays));
         let cfg = HostSessionConfig {
             server_name: "tether-host".to_string(),
             audio_config,
@@ -727,6 +745,7 @@ async fn handle_client(
     let cursor_source: Box<dyn CursorSource> = capture_handle
         .take_cursor_source()
         .unwrap_or_else(|| Box::new(PlaceholderCursorSource::new()));
+    let display_hints = capture_handle.display_hints();
     let frames = capture_handle.into_rx();
 
     // Force-IDR signal + stream-readiness gate were created by
@@ -736,13 +755,13 @@ async fn handle_client(
     // each frame. Coalescing comes for free — N raises between two
     // takes produce one keyframe. See `tether_session::IdrSignal`.
 
-    // Shared display-dimensions channel: the capture thread learns the
-    // real host display size on the first frame and posts (w, h) here;
-    // the dims-follower task reads it and feeds the injector via
-    // set_display_size. We use a single-slot watch so the injector
-    // always reads the latest known dims even if it polls late.
+    // Shared display-geometry channel: the capture thread learns the real
+    // frame pixel grid on the first frame and combines it with any
+    // backend-reported host logical/compositor geometry. The follower feeds
+    // the injector with capture pixels and refreshes DisplayList with the
+    // scale that belongs to those pixels.
     let (display_dims_tx, display_dims_rx) =
-        tokio::sync::watch::channel::<Option<(u32, u32)>>(None);
+        tokio::sync::watch::channel::<Option<tether_capture::CaptureDisplayGeometry>>(None);
 
     // Cursor coordinate-frame watch: the encode loop posts
     // `(capture_w, capture_h, encode_w, encode_h)` on every encoder
@@ -820,6 +839,7 @@ async fn handle_client(
                 frames,
                 force_idr_for_send,
                 display_dims_tx,
+                display_hints,
                 cursor_frame_tx,
                 send_shutdown_for_thread,
                 chosen_profile,
@@ -893,7 +913,6 @@ async fn handle_client(
         let host_audio_available_ctl = audio_active;
         let latest_client_stats_for_ctl = latest_client_stats.clone();
         let latest_viewport_for_ctl = latest_viewport.clone();
-        let force_idr_for_viewport = force_idr.clone();
         let shutdown_notice_for_ctl = shutdown_notice_sent.clone();
         let session_summary_for_ctl = session_summary.clone();
         tasks.spawn(async move {
@@ -906,6 +925,7 @@ async fn handle_client(
             // are coalesced through IdrSignal anyway, so the cap
             // costs nothing in normal operation.
             let mut last_idr_request: Option<std::time::Instant> = None;
+            let mut last_client_display_metrics: Option<ClientDisplayMetrics> = None;
             const IDR_REQUEST_MIN_INTERVAL: std::time::Duration =
                 std::time::Duration::from_millis(250);
             loop {
@@ -1046,18 +1066,11 @@ async fn handle_client(
                         stream_id,
                         viewport: v,
                     }) => {
-                        info!(
-                            %stream_id,
-                            width = v.width,
-                            height = v.height,
-                            "client viewport changed"
-                        );
-                        // Latch the new viewport. The send thread
-                        // notices the seq bump on its next iteration
-                        // and rebuilds the encoder only if encode dims
-                        // actually change. We force an IDR regardless
-                        // so the client sees a clean cut on whatever
-                        // dimensions the backend chooses.
+                        // Latch the new viewport. The send thread notices the
+                        // seq bump on its next iteration and decides whether
+                        // the effective encode dims changed. Viewport changes
+                        // that still resolve to the current stream size are
+                        // pure presentation updates on the client.
                         let next = if v.is_valid() {
                             Some(v)
                         } else {
@@ -1070,9 +1083,17 @@ async fn handle_client(
                         };
                         let mut guard =
                             lock_host_state(&latest_viewport_for_ctl, "latest viewport");
-                        guard.viewport = next;
-                        guard.seq = guard.seq.wrapping_add(1);
+                        let changed = guard.update_if_changed(next);
                         drop(guard);
+                        if !changed {
+                            tracing::trace!(
+                                %stream_id,
+                                width = v.width,
+                                height = v.height,
+                                "duplicate viewport hint; skipping seq bump and IDR"
+                            );
+                            continue;
+                        }
                         if next.is_some()
                             && video_ready_requested_ctl.load(Ordering::Acquire)
                             && !stream_ready_ctl.load(Ordering::Acquire)
@@ -1084,13 +1105,45 @@ async fn handle_client(
                             );
                             stream_ready_ctl.store(true, Ordering::Release);
                         }
-                        tracing::debug!(
+                        if next.is_some() {
+                            info!(
+                                %stream_id,
+                                width = v.width,
+                                height = v.height,
+                                "client viewport changed"
+                            );
+                        }
+                        tracing::trace!(
+                            %stream_id,
                             width = v.width,
                             height = v.height,
-                            "SetViewportHint: forcing IDR; encoder rebuild fires only if \
-                             encode dims change"
+                            "SetViewportHint latched; send thread will decide effective resize"
                         );
-                        force_idr_for_viewport.raise();
+                    }
+                    Ok(ControlMessage::ClientDisplayMetrics(metrics)) => {
+                        if !client_display_metrics_changed(
+                            last_client_display_metrics.as_ref(),
+                            &metrics,
+                        ) {
+                            tracing::trace!(
+                                client_display_id = metrics.display_id,
+                                width = metrics.mode.width,
+                                height = metrics.mode.height,
+                                refresh_millihz = metrics.mode.refresh_millihz,
+                                "duplicate client display metrics; ignoring"
+                            );
+                            continue;
+                        }
+                        info!(
+                            client_display_id = metrics.display_id,
+                            width = metrics.mode.width,
+                            height = metrics.mode.height,
+                            refresh_millihz = metrics.mode.refresh_millihz,
+                            scale = format!("{}/{}", metrics.scale_num, metrics.scale_den),
+                            safe_area = ?metrics.safe_area,
+                            "client display metrics"
+                        );
+                        last_client_display_metrics = Some(metrics);
                     }
                     Ok(ControlMessage::SetDisplayMode {
                         request_id,
@@ -1235,17 +1288,18 @@ async fn handle_client(
                 // Copy the value out and drop the borrow guard before
                 // awaiting on the injector lock — `watch::Ref` is not Send,
                 // so holding it across an .await fails the Send bound.
-                let dims = *rx.borrow();
-                if let Some((w, h)) = dims {
-                    injector.lock().await.set_display_size(w, h);
+                let geometry = *rx.borrow();
+                if let Some(geometry) = geometry {
+                    injector
+                        .lock()
+                        .await
+                        .set_display_size(geometry.capture_width, geometry.capture_height);
                     let next = {
                         let mut guard =
                             lock_host_state(&display_descriptors, "display descriptors");
-                        let next = tether_capture::display_list_with_primary_mode(
+                        let next = tether_capture::display_list_with_capture_geometry(
                             guard.clone(),
-                            w,
-                            h,
-                            ENCODER_FPS.saturating_mul(1000),
+                            geometry,
                         );
                         if *guard == next {
                             None
@@ -1255,6 +1309,13 @@ async fn handle_client(
                         }
                     };
                     if let Some(displays) = next {
+                        info!(
+                            capture_width = geometry.capture_width,
+                            capture_height = geometry.capture_height,
+                            host_logical_position = ?geometry.host_logical_position,
+                            host_logical_size = ?geometry.host_logical_size,
+                            "display list update from capture geometry"
+                        );
                         if let Err(e) = conn
                             .send_control(&ControlMessage::DisplayList { displays })
                             .await
@@ -2802,6 +2863,16 @@ fn should_recreate_encoder(
     encode_changed && elapsed_since_rebuild >= VIEWPORT_REBUILD_THROTTLE
 }
 
+fn should_skip_unchanged_frame(
+    damage_unchanged: bool,
+    force_idr_pending: bool,
+    first_build: bool,
+    capture_changed: bool,
+    encode_changed: bool,
+) -> bool {
+    damage_unchanged && !force_idr_pending && !first_build && !capture_changed && !encode_changed
+}
+
 /// Compute the encoder-output dimensions for a given capture size
 /// and client viewport. The viewport bounds the longest edge; we
 /// preserve aspect ratio (letterbox at the client; never stretch)
@@ -3170,7 +3241,8 @@ fn run_capture_and_send(
     conn: Arc<Connection>,
     frames: FrameReceiver,
     force_idr: tether_session::IdrSignal,
-    display_dims_tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
+    display_dims_tx: tokio::sync::watch::Sender<Option<tether_capture::CaptureDisplayGeometry>>,
+    display_hints: tether_capture::CaptureDisplayHints,
     cursor_frame_tx: tokio::sync::watch::Sender<Option<CursorFrameDims>>,
     shutdown: Arc<AtomicBool>,
     chosen_profile: VideoProfile,
@@ -3228,6 +3300,7 @@ fn run_capture_and_send(
     // as `stats` and logged alongside it. See [`StageLatency`].
     let mut stage_latency = StageLatency::default();
     let mut slot: Option<EncoderSlot> = None;
+    let mut last_handled_viewport_seq = 0u64;
     // When the encoder was last rebuilt, for the viewport-rebuild throttle
     // (`VIEWPORT_REBUILD_THROTTLE`). Seeded in the past so the first
     // viewport-driven rebuild after startup is never throttled.
@@ -3288,18 +3361,6 @@ fn run_capture_and_send(
             }
         }
 
-        // Damage-skip gate. If the classifier says the frame is
-        // bit-identical to the previous one AND nobody is waiting on
-        // a forced IDR, drop it on the floor — the client's
-        // renderer is already showing this image. The IdrSignal peek
-        // here is non-consuming; the take() further down still owns
-        // the clear. Forced IDRs win over the damage skip
-        // unconditionally: a client mid-reconnect requests an IDR to
-        // bootstrap, and swallowing it would deadlock the session.
-        if matches!(damage.classify(&frame), DamageHint::Unchanged) && !force_idr.peek() {
-            continue;
-        }
-
         // Encoder is lazily created on the first frame (we don't know
         // capture resolution at startup) and recreated whenever the
         // capture source changes resolution mid-stream (Linux portal
@@ -3313,6 +3374,7 @@ fn run_capture_and_send(
             let g = lock_host_state(&latest_viewport, "latest viewport");
             (g.viewport, g.seq)
         };
+        let viewport_changed = current_viewport_seq != last_handled_viewport_seq;
         // Viewport-driven downscale applies per frame source:
         //   - CPU frames: `resize_bgra_bilinear` does the work below.
         //   - Linux GPU dma-buf: `tether-scaler` (Mitchell-Netravali
@@ -3338,15 +3400,62 @@ fn run_capture_and_send(
             .as_ref()
             .is_some_and(|s| s.width != encode_width || s.height != encode_height);
         // Throttle viewport-driven rebuilds (server-side defense); while
-        // deferred, encoding continues at the current dims (the client
-        // letterboxes) and a later iteration rebuilds to the newest viewport.
+        // deferred, an unchanged static desktop can still be damage-skipped.
+        // A later iteration rebuilds to the newest viewport once the throttle
+        // window passes.
         let needs_recreate = should_recreate_encoder(
             first_build,
             capture_changed,
             encode_changed,
             Instant::now().duration_since(last_encoder_rebuild),
         );
+        if viewport_changed {
+            info!(
+                viewport_seq = current_viewport_seq,
+                viewport = ?current_viewport,
+                capture_width = frame_width,
+                capture_height = frame_height,
+                encode_width,
+                encode_height,
+                first_build,
+                capture_changed,
+                encode_changed,
+                will_recreate_encoder = needs_recreate,
+                "viewport sizing decision"
+            );
+        }
 
+        // Damage-skip gate. If the classifier says the frame is bit-identical
+        // to the previous one AND nobody is waiting on a forced IDR or an
+        // effective dimension change, drop it on the floor — the client's
+        // renderer is already showing this image. Viewport updates that resolve
+        // to the current encode dims are handled by recording the seq; they do
+        // not need a host frame or keyframe. Viewport-driven encode changes only
+        // bypass damage-skip on the iteration that actually rebuilds; while
+        // throttled, static content stays skipped.
+        let rebuild_encode_changed = encode_changed && needs_recreate;
+        let damage_unchanged = matches!(damage.classify(&frame), DamageHint::Unchanged);
+        if should_skip_unchanged_frame(
+            damage_unchanged,
+            force_idr.peek(),
+            first_build,
+            capture_changed,
+            rebuild_encode_changed,
+        ) {
+            if viewport_changed {
+                last_handled_viewport_seq = current_viewport_seq;
+                tracing::trace!(
+                    viewport_seq = current_viewport_seq,
+                    encode_width,
+                    encode_height,
+                    encode_changed,
+                    "viewport update deferred or did not require an encoded frame"
+                );
+            }
+            continue;
+        }
+
+        let mut rebuilt_encoder = false;
         if needs_recreate {
             last_encoder_rebuild = Instant::now();
             // Drop the previous encoder BEFORE constructing its
@@ -3369,7 +3478,13 @@ fn run_capture_and_send(
                 );
                 fragmenter.bump_epoch();
             }
-            let _ = display_dims_tx.send(Some((frame_width, frame_height)));
+            let display_geometry = tether_capture::CaptureDisplayGeometry::new(
+                frame_width,
+                frame_height,
+                ENCODER_FPS.saturating_mul(1000),
+            )
+            .with_hints(display_hints);
+            let _ = display_dims_tx.send(Some(display_geometry));
             let _ = cursor_frame_tx.send(Some(CursorFrameDims {
                 capture_w: frame_width,
                 capture_h: frame_height,
@@ -3457,6 +3572,10 @@ fn run_capture_and_send(
                              (encode dims too small for the configured floor)"
                         );
                     }
+                    rebuilt_encoder = true;
+                    if viewport_changed {
+                        last_handled_viewport_seq = current_viewport_seq;
+                    }
                     #[cfg(target_os = "macos")]
                     let iosurface_encode_fourcc =
                         macos_iosurface_encode_fourcc(chosen_profile).unwrap_or(0);
@@ -3513,6 +3632,8 @@ fn run_capture_and_send(
                     return;
                 }
             };
+        } else if viewport_changed && !encode_changed {
+            last_handled_viewport_seq = current_viewport_seq;
         }
         let slot_mut = slot.as_mut().expect("slot populated above");
 
@@ -3527,7 +3648,7 @@ fn run_capture_and_send(
 
         // Swap-and-zero: at most one forced keyframe per request, even
         // if multiple ForceIdr messages arrive between encode calls.
-        let force_kf = force_idr.take();
+        let force_kf = force_idr.take() || rebuilt_encoder;
         timing.encode_submit();
         let encoded = match frame {
             CapturedFrame::Cpu(ref cpu) => {
@@ -4303,6 +4424,56 @@ mod tests {
     }
 
     #[test]
+    fn viewport_state_skips_duplicate_updates() {
+        let mut state = ViewportState::default();
+        let viewport = Some(Viewport::new(1920, 1080));
+
+        assert!(state.update_if_changed(viewport));
+        assert_eq!(state.seq, 1);
+        assert_eq!(state.viewport, viewport);
+
+        assert!(!state.update_if_changed(viewport));
+        assert_eq!(state.seq, 1);
+
+        assert!(state.update_if_changed(Some(Viewport::new(1280, 720))));
+        assert_eq!(state.seq, 2);
+
+        assert!(state.update_if_changed(None));
+        assert_eq!(state.seq, 3);
+        assert!(!state.update_if_changed(None));
+        assert_eq!(state.seq, 3);
+    }
+
+    #[test]
+    fn client_display_metrics_changed_skips_exact_duplicates() {
+        let base = ClientDisplayMetrics {
+            display_id: 0,
+            mode: tether_protocol::control::DisplayMode::new(2560, 1440, 60_000),
+            scale_num: 2,
+            scale_den: 1,
+            safe_area: None,
+        };
+        assert!(client_display_metrics_changed(None, &base));
+        assert!(!client_display_metrics_changed(Some(&base), &base));
+
+        let mut display_changed = base.clone();
+        display_changed.display_id = 1;
+        assert!(client_display_metrics_changed(
+            Some(&base),
+            &display_changed
+        ));
+
+        let mut mode_changed = base.clone();
+        mode_changed.mode = tether_protocol::control::DisplayMode::new(1920, 1080, 60_000);
+        assert!(client_display_metrics_changed(Some(&base), &mode_changed));
+
+        let mut scale_changed = base.clone();
+        scale_changed.scale_num = 3;
+        scale_changed.scale_den = 2;
+        assert!(client_display_metrics_changed(Some(&base), &scale_changed));
+    }
+
+    #[test]
     fn viewport_rebuild_throttle_defers_rapid_changes_only() {
         use std::time::Duration;
         let under = VIEWPORT_REBUILD_THROTTLE / 2;
@@ -4330,6 +4501,45 @@ mod tests {
         // A capture change is never throttled even if an encode change rode
         // along inside the window (real source change wins).
         assert!(should_recreate_encoder(false, true, true, under));
+    }
+
+    #[test]
+    fn throttled_viewport_resize_does_not_force_static_frame_encode() {
+        let needs_recreate =
+            should_recreate_encoder(false, false, true, VIEWPORT_REBUILD_THROTTLE / 2);
+        let rebuild_encode_changed = needs_recreate;
+        assert!(
+            should_skip_unchanged_frame(true, false, false, false, rebuild_encode_changed),
+            "throttled viewport-only encode change should still damage-skip unchanged content"
+        );
+    }
+
+    #[test]
+    fn unchanged_frame_skip_allows_only_effective_resize_or_idr_work() {
+        assert!(
+            should_skip_unchanged_frame(true, false, false, false, false),
+            "unchanged frame with no pending work should skip"
+        );
+        assert!(
+            !should_skip_unchanged_frame(true, false, false, false, true),
+            "effective encode-size change must not be skipped"
+        );
+        assert!(
+            !should_skip_unchanged_frame(true, true, false, false, false),
+            "pending IDR must not be skipped"
+        );
+        assert!(
+            !should_skip_unchanged_frame(true, false, true, false, false),
+            "first encoder build must not be skipped"
+        );
+        assert!(
+            !should_skip_unchanged_frame(true, false, false, true, false),
+            "capture-source resize must not be skipped"
+        );
+        assert!(
+            !should_skip_unchanged_frame(false, false, false, false, false),
+            "changed content must not be skipped"
+        );
     }
 
     #[test]
@@ -4395,6 +4605,26 @@ mod tests {
         assert_eq!(
             encode_dims_for_viewport(1280, 720, Some(Viewport::new(3840, 2160))),
             (1280, 720)
+        );
+    }
+
+    #[test]
+    fn encode_dims_logical_hidpi_viewport_does_not_upscale() {
+        // A 1x 1080p host shown at logical 100% on a 2x client reports
+        // a 3840x2160 density-correct viewport. The host still encodes
+        // native capture pixels; the client performs the presentation upscale.
+        assert_eq!(
+            encode_dims_for_viewport(1920, 1080, Some(Viewport::new(3840, 2160))),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn encode_dims_extremely_large_viewport_does_not_upscale() {
+        // Any overlarge viewport hint is capped by native capture dims.
+        assert_eq!(
+            encode_dims_for_viewport(3024, 1952, Some(Viewport::new(u32::MAX, u32::MAX))),
+            (3024, 1952)
         );
     }
 

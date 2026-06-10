@@ -34,6 +34,16 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use tether_protocol::control::{DisplayDescriptor, DisplayId, DisplayMode};
 
+#[cfg(target_os = "linux")]
+use smithay_client_toolkit::{
+    delegate_output, delegate_registry,
+    output::{OutputHandler, OutputInfo, OutputState},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+};
+#[cfg(target_os = "linux")]
+use wayland_client::{globals::registry_queue_init, protocol::wl_output, Connection, QueueHandle};
+
 /// Capture-source handle returned by every backend's `start()`. Bundles
 /// the [`CapturedFrame`] receiver with a runtime-mutable target-FPS
 /// atomic so the ABR / quality-tier controller can throttle capture
@@ -385,6 +395,16 @@ fn scale_from_capture_and_host_logical(
     (rel_delta <= 0.01).then(|| scale_to_ratio((scale_x + scale_y) * 0.5))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn scale_from_mode_and_logical_size(
+    mode_size: (u32, u32),
+    logical_size: Option<(u32, u32)>,
+    fallback_scale: f64,
+) -> (u16, u16) {
+    scale_from_capture_and_host_logical(mode_size.0, mode_size.1, logical_size)
+        .unwrap_or_else(|| scale_to_ratio(fallback_scale))
+}
+
 fn display_matches_host_logical_geometry(
     display: &DisplayDescriptor,
     host_logical_position: (i32, i32),
@@ -473,6 +493,43 @@ fn scaled_i32_pair_to_logical(
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn scaled_i32_pair_from_logical(
+    value: (i32, i32),
+    scale_num: u16,
+    scale_den: u16,
+) -> Option<(i32, i32)> {
+    if scale_num == 0 || scale_den == 0 {
+        return None;
+    }
+    Some((
+        i32::try_from(
+            div_round_i64(
+                i64::from(value.0) * i64::from(scale_num),
+                i64::from(scale_den),
+            )
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+        )
+        .unwrap_or(if value.0.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }),
+        i32::try_from(
+            div_round_i64(
+                i64::from(value.1) * i64::from(scale_num),
+                i64::from(scale_den),
+            )
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+        )
+        .unwrap_or(if value.1.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }),
+    ))
+}
+
 const fn div_round_u64(value: u64, divisor: u64) -> u64 {
     (value + (divisor / 2)) / divisor
 }
@@ -537,13 +594,203 @@ const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
 #[cfg(target_os = "linux")]
 fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
     use std::sync::OnceLock;
+
+    static DISPLAY_LIST: OnceLock<Vec<DisplayDescriptor>> = OnceLock::new();
+    if let Some(displays) = DISPLAY_LIST.get() {
+        return Ok(displays.clone());
+    }
+
+    let displays = wayland_display_list()
+        .inspect_err(|e| {
+            tracing::debug!(
+                error = %e,
+                "wayland output topology unavailable; falling back to winit monitor topology"
+            );
+        })
+        .or_else(|_| winit_display_list())?;
+    Ok(DISPLAY_LIST.get_or_init(|| displays).clone())
+}
+
+#[cfg(target_os = "linux")]
+struct WaylandOutputCollector {
+    registry_state: RegistryState,
+    output_state: OutputState,
+}
+
+#[cfg(target_os = "linux")]
+impl OutputHandler for WaylandOutputCollector {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+#[cfg(target_os = "linux")]
+delegate_output!(WaylandOutputCollector);
+
+#[cfg(target_os = "linux")]
+delegate_registry!(WaylandOutputCollector);
+
+#[cfg(target_os = "linux")]
+impl ProvidesRegistryState for WaylandOutputCollector {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+
+    registry_handlers! {
+        OutputState,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_display_list() -> Result<Vec<DisplayDescriptor>> {
+    let conn = Connection::connect_to_env()
+        .map_err(|e| CaptureError::Display(format!("wayland connect: {e}")))?;
+    let (globals, mut event_queue) = registry_queue_init(&conn)
+        .map_err(|e| CaptureError::Display(format!("wayland registry: {e}")))?;
+    let qh = event_queue.handle();
+    let registry_state = RegistryState::new(&globals);
+    let output_state = OutputState::new(&globals, &qh);
+    let mut collector = WaylandOutputCollector {
+        registry_state,
+        output_state,
+    };
+    event_queue
+        .roundtrip(&mut collector)
+        .map_err(|e| CaptureError::Display(format!("wayland output roundtrip: {e}")))?;
+
+    let mut displays = Vec::new();
+    for (idx, output) in collector.output_state.outputs().enumerate() {
+        let info = collector
+            .output_state
+            .info(&output)
+            .ok_or_else(|| CaptureError::Display("wayland output has no info".into()))?;
+        displays.push(wayland_output_to_descriptor(idx, &info)?);
+    }
+
+    if displays.is_empty() {
+        return Err(CaptureError::Display(
+            "no monitors reported by wayland".into(),
+        ));
+    }
+    Ok(displays)
+}
+
+#[cfg(target_os = "linux")]
+fn wayland_output_to_descriptor(idx: usize, info: &OutputInfo) -> Result<DisplayDescriptor> {
+    let mode = info
+        .modes
+        .iter()
+        .find(|mode| mode.current)
+        .or_else(|| info.modes.iter().find(|mode| mode.preferred))
+        .or_else(|| info.modes.first())
+        .ok_or_else(|| CaptureError::Display("wayland output has no modes".into()))?;
+    let mode_size = positive_u32_pair(mode.dimensions)
+        .ok_or_else(|| CaptureError::Display("wayland output mode has invalid size".into()))?;
+    let logical_size = positive_u32_pair(
+        info.logical_size
+            .ok_or_else(|| CaptureError::Display("wayland output has no logical size".into()))?,
+    )
+    .ok_or_else(|| CaptureError::Display("wayland output has invalid logical size".into()))?;
+    let logical_position = info
+        .logical_position
+        .ok_or_else(|| CaptureError::Display("wayland output has no logical position".into()))?;
+    let refresh_millihz = u32::try_from(mode.refresh_rate)
+        .ok()
+        .filter(|refresh| *refresh > 0)
+        .unwrap_or(60_000);
+    let (scale_num, scale_den) = scale_from_mode_and_logical_size(
+        mode_size,
+        Some(logical_size),
+        f64::from(info.scale_factor.max(1)),
+    );
+    let position =
+        scaled_i32_pair_from_logical(logical_position, scale_num, scale_den).unwrap_or((0, 0));
+    let current_mode = DisplayMode::new(mode_size.0, mode_size.1, refresh_millihz);
+    let name = info
+        .name
+        .clone()
+        .or_else(|| info.description.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            let label = [info.make.as_str(), info.model.as_str()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if label.is_empty() {
+                format!("display-{idx}")
+            } else {
+                label
+            }
+        });
+
+    tracing::debug!(
+        id = info.id,
+        name = %name,
+        mode_width_px = mode_size.0,
+        mode_height_px = mode_size.1,
+        logical_width = logical_size.0,
+        logical_height = logical_size.1,
+        logical_x = logical_position.0,
+        logical_y = logical_position.1,
+        scale_num,
+        scale_den,
+        "wayland output topology"
+    );
+
+    Ok(DisplayDescriptor {
+        id: DisplayId(u32::try_from(idx).unwrap_or(u32::MAX)),
+        primary: idx == 0,
+        name,
+        scale_num,
+        scale_den,
+        position,
+        current_mode,
+        available_modes: vec![current_mode],
+        can_set_mode: false,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn positive_u32_pair(value: (i32, i32)) -> Option<(u32, u32)> {
+    Some((u32::try_from(value.0).ok()?, u32::try_from(value.1).ok()?))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn winit_display_list() -> Result<Vec<DisplayDescriptor>> {
+    use std::sync::OnceLock;
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
     use winit::event_loop::{ActiveEventLoop, EventLoop};
     use winit::window::WindowId;
 
-    static DISPLAY_LIST: OnceLock<Vec<DisplayDescriptor>> = OnceLock::new();
-    if let Some(displays) = DISPLAY_LIST.get() {
+    static WINIT_DISPLAY_LIST: OnceLock<Vec<DisplayDescriptor>> = OnceLock::new();
+    if let Some(displays) = WINIT_DISPLAY_LIST.get() {
         return Ok(displays.clone());
     }
 
@@ -591,7 +838,9 @@ fn platform_display_list() -> Result<Vec<DisplayDescriptor>> {
             "no monitors reported by winit".into(),
         ));
     }
-    Ok(DISPLAY_LIST.get_or_init(|| collector.displays).clone())
+    Ok(WINIT_DISPLAY_LIST
+        .get_or_init(|| collector.displays)
+        .clone())
 }
 
 #[cfg(target_os = "linux")]
@@ -1015,6 +1264,30 @@ mod display_tests {
         assert_eq!(scale_to_ratio(1.5), (3, 2));
         assert_eq!(scale_to_ratio(2.0), (2, 1));
         assert_eq!(scale_to_ratio(0.0), (1, 1));
+    }
+
+    #[test]
+    fn scale_from_mode_and_logical_size_prefers_direct_logical_geometry() {
+        assert_eq!(
+            scale_from_mode_and_logical_size((1920, 1200), Some((1536, 960)), 2.0),
+            (5, 4)
+        );
+    }
+
+    #[test]
+    fn scale_from_mode_and_logical_size_falls_back_without_logical_geometry() {
+        assert_eq!(
+            scale_from_mode_and_logical_size((1920, 1200), None, 2.0),
+            (2, 1)
+        );
+    }
+
+    #[test]
+    fn logical_position_scales_to_physical_display_position() {
+        assert_eq!(
+            scaled_i32_pair_from_logical((1536, -960), 5, 4),
+            Some((1920, -1200))
+        );
     }
 }
 

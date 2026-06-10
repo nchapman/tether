@@ -72,11 +72,15 @@ contains the coordinate space.
 4. macOS capture/display enumeration must use backing-pixel APIs for
    `host_mode_px`/`host_capture_px`. Point-space APIs are only for input
    injection and cursor mapping.
-5. Linux portal capture must not assume the portal stream bounds are pixels.
-   `Stream::size`/`position` are compositor coordinates; pair them with the
-   PipeWire negotiated frame size to derive the scale that belongs to the live
-   `host_capture_px`. If the two sizes are equal, the captured stream is already
-   compositor-sized and the live display scale for presentation is `1/1`.
+5. Linux Wayland display enumeration must prefer compositor-reported
+   `xdg-output` logical size over winit monitor scale. winit's monitor scale is
+   the integer `wl_output.scale`, not necessarily the fractional window/content
+   scale. Linux portal capture must not assume the portal stream bounds are
+   pixels. `Stream::size`/`position` are compositor coordinates; pair them with
+   the PipeWire negotiated frame size to derive the scale that belongs to the
+   live `host_capture_px`. If the two sizes are equal, the captured stream is
+   already compositor-sized and the live display scale for presentation is
+   `1/1`.
 6. Client-side "native" means the selected client output's physical pixel mode,
    optionally minus a platform safe area. It does not mean the current Tether
    window size.

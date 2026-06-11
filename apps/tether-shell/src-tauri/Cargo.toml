@@ -1,6 +1,6 @@
 [package]
 name = "tether-shell"
-version = "0.3.1"
+version = "0.3.2"
 description = "Tether shell — control-plane UI and engine-process supervisor."
 edition = "2021"
 rust-version = "1.85"

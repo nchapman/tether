@@ -18,10 +18,10 @@ plugin against GitHub Releases.
 - **`.github/workflows/release.yml`** — on a `v*` tag: builds the engines,
   stages them as sidecars, and runs `tauri-action` to bundle, sign the updater
   manifest, and publish a **draft** GitHub Release with installers + `latest.json`.
-  A final `fix-appimage` job then strips the host-coupled `libwayland-*` libs
-  that Tauri's bundler embeds in the Linux AppImage (they shadow the user's
-  system copies and fail EGL init on newer GPU/Wayland stacks — e.g. Intel
-  Lunar Lake/`xe` — producing a blank window), then re-packs, re-signs, and
+  A final `fix-appimage` job then strips host-coupled `libwayland-*` and
+  `libva*` libs that Tauri's bundler embeds in the Linux AppImage (they shadow
+  the user's system copies and can break EGL init or VAAPI probing on newer
+  GPU/Wayland stacks — e.g. Intel Lunar Lake/`xe`), then re-packs, re-signs, and
   patches the AppImage signature in `latest.json`. Tauri exposes no bundle-time
   knob to exclude libraries, so this is done post-build; it runs after every
   platform so `latest.json` is already complete.
@@ -93,7 +93,8 @@ the secret above. **Never commit the private key.**
 FFmpeg is statically linked into the engines, but platform GPU/capture stacks
 are dynamic system libraries the installer does **not** ship:
 
-- **Linux:** a VAAPI driver, a Vulkan ICD, and a running PipeWire + portal stack.
+- **Linux:** libva, a VAAPI driver, a Vulkan ICD, and a running PipeWire +
+  portal stack.
 - **macOS:** none beyond the OS frameworks.
 - **Windows:** none beyond the OS (D3D11 / Media Foundation are system components).
 

@@ -3796,7 +3796,7 @@ dependencies = [
 
 [[package]]
 name = "tether-audio"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "cpal",
@@ -3813,7 +3813,7 @@ dependencies = [
 
 [[package]]
 name = "tether-capture"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ashpd",
  "crossbeam-channel",
@@ -3836,7 +3836,7 @@ dependencies = [
 
 [[package]]
 name = "tether-client"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3860,7 +3860,7 @@ dependencies = [
 
 [[package]]
 name = "tether-codec"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ash",
  "bytes",
@@ -3882,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "tether-decode"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "crossbeam-channel",
  "tether-codec",
@@ -3894,7 +3894,7 @@ dependencies = [
 
 [[package]]
 name = "tether-gpuconvert"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -3915,7 +3915,7 @@ dependencies = [
 
 [[package]]
 name = "tether-host"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -3943,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "tether-input"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "enigo",
  "evdev",
@@ -3956,7 +3956,7 @@ dependencies = [
 
 [[package]]
 name = "tether-ipc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3964,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "tether-pairing"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "tether-probe"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "pollster",
  "tether-capture",
@@ -3994,7 +3994,7 @@ dependencies = [
 
 [[package]]
 name = "tether-protocol"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bincode",
  "bytes",
@@ -4010,7 +4010,7 @@ dependencies = [
 
 [[package]]
 name = "tether-render"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -4038,7 +4038,7 @@ dependencies = [
 
 [[package]]
 name = "tether-scaler"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytemuck",
  "half",
@@ -4051,7 +4051,7 @@ dependencies = [
 
 [[package]]
 name = "tether-session"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -4068,7 +4068,7 @@ dependencies = [
 
 [[package]]
 name = "tether-transport"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4091,7 +4091,7 @@ dependencies = [
 
 [[package]]
 name = "tether-vaapi"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "pkg-config",
  "thiserror 2.0.18",

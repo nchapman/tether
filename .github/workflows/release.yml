@@ -87,12 +87,14 @@ jobs:
           #     requires the signing key — only layered on here, where it's set.
           args: --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.updater.conf.json
 
-  # The Tauri AppImage bundles host-coupled display libraries (libwayland-*)
-  # that shadow the user's system copies. On newer GPU/Wayland stacks (e.g.
-  # Intel Lunar Lake / xe) the bundled libs fail EGL init and the window is
-  # blank ("EGL_BAD_PARAMETER. Aborting"). Tauri exposes no way to exclude
-  # libraries at bundle time, so we strip them after the fact, re-pack,
-  # re-sign the AppImage, and patch its signature in the updater manifest.
+  # The Tauri AppImage bundles host-coupled display/media libraries
+  # (libwayland-*, libva*) that shadow the user's system copies. On newer
+  # GPU/Wayland stacks (e.g. Intel Lunar Lake / xe) the bundled Wayland libs
+  # fail EGL init and the window is blank ("EGL_BAD_PARAMETER. Aborting").
+  # Bundled libva can also break VAAPI decoder probing against newer distro
+  # drivers (GH #78). Tauri exposes no way to exclude libraries at bundle time,
+  # so we strip them after the fact, re-pack, re-sign the AppImage, and patch
+  # its signature in the updater manifest.
   # Runs after every platform finishes so latest.json is complete — no race
   # with the macOS/Windows jobs that also write it.
   fix-appimage:
@@ -114,15 +116,17 @@ jobs:
           mkdir dist
           gh release download "${{ github.ref_name }}" -D dist -p '*.AppImage' -p 'latest.json'
 
-      - name: Strip libwayland-* and re-pack
+      - name: Strip host-coupled libraries and re-pack
         working-directory: dist
         run: |
           set -euo pipefail
           appimage=$(ls *.AppImage)
           chmod +x "$appimage"
           "./$appimage" --appimage-extract >/dev/null
-          echo "removing bundled host-coupled Wayland libs:"
-          find squashfs-root -name 'libwayland-*.so*' -printf '  %P\n' -delete
+          echo "removing bundled host-coupled display/media libs:"
+          find squashfs-root \
+            \( -name 'libwayland-*.so*' -o -name 'libva*.so*' \) \
+            -printf '  %P\n' -delete
           curl -fsSL -o appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
@@ -131,8 +135,8 @@ jobs:
           rm -rf squashfs-root appimagetool
           # Sanity: the re-pack is a valid AppImage and the libs are actually gone.
           "./$appimage" --appimage-extract >/dev/null
-          if find squashfs-root -name 'libwayland-*.so*' | grep -q .; then
-            echo "::error::libwayland-* still present after re-pack"; exit 1
+          if find squashfs-root \( -name 'libwayland-*.so*' -o -name 'libva*.so*' \) | grep -q .; then
+            echo "::error::host-coupled display/media libs still present after re-pack"; exit 1
           fi
           rm -rf squashfs-root
           echo "re-packed $appimage cleanly"
